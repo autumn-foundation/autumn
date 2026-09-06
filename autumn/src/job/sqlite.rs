@@ -1616,26 +1616,32 @@ impl SqliteJobAdminBackend {
         use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
-        let mut conn = self.queue.ready().await?.get().await.map_err(|error| {
-            AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
-        })?;
         // Snapshot the tracking record before the UPDATE makes the retry
         // visible to workers, so the reset can detect a retry that finishes
         // faster than this function returns.
         //
-        // The UPDATE also restores a `pending`-window dedup key: claiming moved
-        // it to `pending_unique_key`, and re-enqueueing without it would leave
-        // the retried job undeduplicated while it waits.
-        let pre_retry_row = diesel::sql_query(format!(
-            "SELECT payload FROM autumn_jobs WHERE id = ? AND status = '{STATUS_FAILED}'"
-        ))
-        .bind::<diesel::sql_types::Text, _>(id)
-        .get_result::<PayloadRow>(&mut *conn)
-        .await
-        .optional()
-        .map_err(|error| {
-            AutumnError::internal_server_error_msg(format!("sqlite admin retry failed: {error}"))
-        })?;
+        // The read is scoped so its checkout is released before the tracking
+        // call below. The tracking store is backed by this same pool, and that
+        // pool is one slot for a private in-memory target, so holding this
+        // connection across the call would deadlock until
+        // `database.connect_timeout_secs` and then silently skip the reset.
+        let pre_retry_row = {
+            let mut conn = self.queue.ready().await?.get().await.map_err(|error| {
+                AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
+            })?;
+            diesel::sql_query(format!(
+                "SELECT payload FROM autumn_jobs WHERE id = ? AND status = '{STATUS_FAILED}'"
+            ))
+            .bind::<diesel::sql_types::Text, _>(id)
+            .get_result::<PayloadRow>(&mut *conn)
+            .await
+            .optional()
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "sqlite admin retry failed: {error}"
+                ))
+            })?
+        };
         let retry_snapshot = match &pre_retry_row {
             Some(row) => {
                 let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
@@ -1644,6 +1650,14 @@ impl SqliteJobAdminBackend {
             None => None,
         };
 
+        // A fresh checkout for the write, released again before
+        // `apply_retry_reset` needs one.
+        let mut conn = self.queue.ready().await?.get().await.map_err(|error| {
+            AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
+        })?;
+        // The UPDATE also restores a `pending`-window dedup key: claiming moved
+        // it to `pending_unique_key`, and re-enqueueing without it would leave
+        // the retried job undeduplicated while it waits.
         let now = self.clock.now().timestamp_millis();
         let updated = diesel::sql_query(format!(
             "UPDATE autumn_jobs \
@@ -1692,6 +1706,9 @@ impl SqliteJobAdminBackend {
                 "job '{id}' not found or not in failed state"
             )));
         };
+        // Same pool, same reason as above: let the write's checkout go before
+        // the tracking store asks for one.
+        drop(conn);
         // The record is terminal from the original run. Reset it to pending so
         // the retried attempt's progress calls surface.
         let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
@@ -1761,6 +1778,12 @@ impl SqliteJobAdminBackend {
         } else {
             self.registry.record_cancel(&row.name);
         }
+        // Release the checkout before the tracking store asks this same pool
+        // for one. That pool is a single slot for a private in-memory target,
+        // so holding it here would stall the cancel until
+        // `database.connect_timeout_secs` and then report success with the
+        // job's public status still pending.
+        drop(conn);
         // An operator can cancel before any worker claims the job, which never
         // reaches the handler — settle the tracked record here too.
         let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);

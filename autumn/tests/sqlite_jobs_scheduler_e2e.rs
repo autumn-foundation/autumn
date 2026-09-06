@@ -450,6 +450,7 @@ async fn distributed_lock_renews_while_held_on_sqlite() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 use autumn_web::config::{JobSqliteConfig, ProcessRole, split_role_requires_durable_backend};
+use autumn_web::job_tracking::{JobTrackingStore as _, SqliteJobTrackingStore};
 use autumn_web::reexports::diesel;
 
 /// One `BIGINT` column, for the counting assertions below.
@@ -476,6 +477,26 @@ async fn count(pool: &SqlitePool, sql: &str) -> i64 {
         .await
         .expect("count query")
         .value
+}
+
+/// A file-backed pool with exactly one connection.
+///
+/// That is the shape a private in-memory target is forced into
+/// (`build_sqlite_pool` pins `max_size = 1`), and it is what makes a checkout
+/// held across a second checkout deadlock. A file target keeps the database
+/// shareable so the test can still set up.
+fn build_single_slot_sqlite_pool(tmp: &tempfile::TempDir) -> SqlitePool {
+    let db_path = tmp.path().join("one_slot.db");
+    let config = DatabaseConfig {
+        url: Some(format!("sqlite://{}", db_path.display())),
+        pool_size: 1,
+        // Short, so a regression fails fast instead of hanging the suite.
+        connect_timeout_secs: 2,
+        ..Default::default()
+    };
+    create_pool(&config)
+        .expect("sqlite pool builds via build_sqlite_pool path")
+        .expect("a url is configured")
 }
 
 /// Whether the runtime has created the durable queue table yet.
@@ -1733,4 +1754,123 @@ async fn sqlite_scheduler_lease_is_refused_on_an_in_memory_database() {
             "the refusal names the requirement for {url}; got: {message}"
         );
     }
+}
+
+/// (26) The dashboard's retry and cancel never hold the queue's connection
+/// while the tracking store asks the same pool for one.
+///
+/// On a single-slot pool — the shape a private in-memory target is forced into
+/// — doing so stalls for `connect_timeout_secs` and then silently skips the
+/// tracking update, so the retried job's record stays terminal and the
+/// cancelled job's stays pending.
+#[tokio::test]
+async fn sqlite_job_admin_does_not_hold_the_pool_against_the_tracking_store() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_single_slot_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    // Enqueue-only: nothing must drain the rows this test drives by hand.
+    job::start_runtime(
+        vec![job_info("sqlite_admin_pool_job", 3, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        false,
+    )
+    .expect("the enqueue-only sqlite runtime starts");
+
+    let retried = autumn_web::job_tracking::enqueue_tracked(
+        "sqlite_admin_pool_job",
+        serde_json::json!({ "n": 1 }),
+    )
+    .await
+    .expect("tracked enqueue");
+    let cancelled = autumn_web::job_tracking::enqueue_tracked(
+        "sqlite_admin_pool_job",
+        serde_json::json!({ "n": 2 }),
+    )
+    .await
+    .expect("tracked enqueue");
+
+    let admin = job::job_admin_backend(&state).expect("the sqlite runtime installs a dashboard");
+    let ids = {
+        let snapshot = admin
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("admin snapshot");
+        assert_eq!(snapshot.enqueued.total, 2, "both jobs are queued");
+        snapshot
+            .enqueued
+            .records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Cancel one while it is still enqueued.
+    let cancel_id = ids.first().expect("an enqueued record").clone();
+    tokio::time::timeout(Duration::from_millis(1_500), admin.cancel(&cancel_id))
+        .await
+        .expect("cancel must not wait out the pool connect timeout")
+        .expect("cancel succeeds");
+
+    // Settle the other as failed, then retry it.
+    let retry_id = ids.get(1).expect("a second enqueued record").clone();
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query(
+            "UPDATE autumn_jobs SET status = 'failed', finished_at = enqueued_at, \
+             last_error = 'boom' WHERE id = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&retry_id)
+        .execute(&mut *conn)
+        .await
+        .expect("mark failed");
+    }
+    tokio::time::timeout(Duration::from_millis(1_500), admin.retry(&retry_id))
+        .await
+        .expect("retry must not wait out the pool connect timeout")
+        .expect("retry succeeds");
+
+    // The tracking writes actually landed — under the bug both are skipped and
+    // the records keep their pre-operation status.
+    let store = SqliteJobTrackingStore::new(pool, 3_600);
+    let cancelled_record = store
+        .get(&autumn_web::auth::hash_api_token(&cancelled.token))
+        .await
+        .expect("get")
+        .expect("the cancelled job's record is live");
+    assert!(
+        matches!(
+            cancelled_record.status,
+            autumn_web::job_tracking::TrackedJobStatus::Failed
+        ),
+        "a cancelled job's tracked status is settled, got {:?}",
+        cancelled_record.status
+    );
+
+    let retried_record = store
+        .get(&autumn_web::auth::hash_api_token(&retried.token))
+        .await
+        .expect("get")
+        .expect("the retried job's record is live");
+    assert!(
+        matches!(
+            retried_record.status,
+            autumn_web::job_tracking::TrackedJobStatus::Pending
+        ),
+        "a retried job's tracked status is reset so the new attempt can report, got {:?}",
+        retried_record.status
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
 }
