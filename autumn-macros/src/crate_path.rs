@@ -42,6 +42,32 @@
 //! to cover its *entire* expansion, not just the later [`finalize`] pass —
 //! recognizers run *during* the macro's own logic, inspecting input that may
 //! already carry an earlier macro's renamed output.
+//!
+//! # Scope: an override rewrites the *whole* annotated item, not just
+//! generated code (Codex review, #2552)
+//!
+//! `finalize` walks the macro's *entire* returned token stream, which
+//! includes the user's own re-emitted function/struct — not only the
+//! newly generated companion code — because the two are not structurally
+//! separable in general (a guard macro like `#[secured]` interleaves
+//! generated prologue statements into the user's own function body rather
+//! than keeping the two cleanly apart). In the overwhelmingly common case
+//! (automatic resolution, no explicit override) this is harmless and even
+//! helpful: `::autumn_web` isn't a valid path *at all* once the dependency
+//! is renamed, so any such path the user happened to hardcode themselves
+//! needs exactly this same rewrite to keep working.
+//!
+//! It matters only for the explicit `crate = "..."` override — the
+//! dual-version case, where `autumn_web` (unrenamed) and the override target
+//! are simultaneously valid, distinct dependencies. An item that applies an
+//! override and *also* contains the user's own fully-qualified `::autumn_web`
+//! reference (intending the *other*, unrenamed instance) has that reference
+//! rewritten to the override target too, potentially resolving to the wrong
+//! instance. The guidance: don't mix explicit references to both instances
+//! within one item that carries a `crate = "..."` override; give the
+//! non-default instance its own distinct name in the reference itself
+//! (whatever its own dependency key is) rather than writing bare
+//! `autumn_web` and relying on it staying unrenamed.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
