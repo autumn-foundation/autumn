@@ -78,11 +78,25 @@
 #     reachable page can still be badly placed.
 #
 # EDGES ARE READ PERMISSIVELY, on purpose: both `[text](docs/guide/x.md)` and a
-# bare `docs/guide/x.md` count, including inside fenced blocks, and a guide page
-# may link a sibling by relative filename (`](jobs.md)`, `](./jobs.md)`,
-# `](tutorial/03-forms.md)`, `](../guide/jobs.md)`). A gate that argues about
-# link syntax becomes a tax on writing docs; this one only ever asks whether
-# some findable path exists.
+# bare `docs/guide/x.md` count, and a guide page may link a sibling by relative
+# filename (`](jobs.md)`, `](./jobs.md)`, `](tutorial/03-forms.md)`,
+# `](../guide/jobs.md)`). A gate that argues about link syntax becomes a tax on
+# writing docs; this one only ever asks whether some findable path exists.
+#
+# THE LINE IS VISIBLE vs INVISIBLE, not clickable vs not. A path inside a code
+# fence or a code span still counts: it renders as text the reader can see,
+# read and paste, so the page is findable from it. A path inside an HTML
+# comment does not, and neither does one whose link was disabled with `\[`:
+# those render as nothing at all. That is the whole rule, and it is why the two
+# cases are handled so differently a few hundred lines below — comments are
+# stripped before extraction, fences are not.
+#
+# It also means this gate deliberately parts company with
+# `check-docs-links.sh`, which ignores fenced content because a sample link is
+# not a link it should validate. Everywhere else the two agree ON PURPOSE, down
+# to sharing this file's destination grammar: they run in the same CI job, so a
+# link that resolves in one and not the other would fail a contributor's page in
+# one breath and call it unreachable in the next.
 #
 # WAIVERS: a guide page is occasionally meant to be unlinked — an appendix
 # reached only from a release note, a page kept for an external inbound link.
@@ -109,7 +123,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 run_check() {
   local dir="$1"
   python3 - "$dir" <<'PYEOF'
-import os, posixpath, re, subprocess, sys
+import os, posixpath, re, subprocess, sys, urllib.parse
 
 root = sys.argv[1]
 
@@ -190,8 +204,17 @@ def read(f):
 # optional link title in any of its three delimiters.
 DEST_BARE = r'(?:[^()\s]|\([^()\s]*\))+'
 TITLE = r'''(?:\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\((?:[^()\\]|\\.)*\)))?'''
-MD_LINK = re.compile(
-    r'\]\(\s*(?:<([^<>]*)>|(' + DEST_BARE + r'))' + TITLE + r'\s*\)')
+DEST = r'\(\s*(?:<([^<>]*)>|(' + DEST_BARE + r'))' + TITLE + r'\s*\)'
+# The label has to be matched too, not just the `](…)` tail: `\[Mail](mail.md)`
+# renders as literal text, so treating it as a route would let a link someone
+# deliberately disabled go on hiding an orphan. `\.` keeps an escaped bracket
+# inside the label. The nesting form exists because a linked image puts one
+# link inside another — `[![alt](img.png)](page.md)` — where the flat pattern
+# finds only the image.
+FLAT = r'(?:[^\[\]\\]|\\.)'
+MD_LINK = re.compile(r'(?<!\\)\[' + FLAT + r'*\]' + DEST)
+MD_LINK_NESTED = re.compile(
+    r'(?<!\\)\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
@@ -271,8 +294,12 @@ def strip_comments(txt):
         tok = m.group(1)
         if not in_fence:
             parts.append(('prose', txt[pos:m.start()]))
-            in_fence, marker, pos = True, tok[0] * 3, m.start()
-        elif tok.startswith(marker):
+            # Keep the opener's character AND length: a ```` fence is not
+            # closed by a ``` line inside it, so recording only three
+            # characters would end the block early and treat the code after
+            # it as live prose.
+            in_fence, marker, pos = True, (tok[0], len(tok)), m.start()
+        elif tok[0] == marker[0] and len(tok) >= marker[1]:
             parts.append(('fence', txt[pos:m.end()]))
             in_fence, marker, pos = False, None, m.end()
     parts.append(('fence' if in_fence else 'prose', txt[pos:]))
@@ -305,7 +332,10 @@ def edges_from(f):
     base = posixpath.dirname(f)
 
     def add_relative(raw):
-        raw = UNESCAPE.sub(r'\1', raw.split('#', 1)[0].strip())
+        # Percent-decode before comparing to tracked filenames: `mail%20guide.md`
+        # addresses `mail guide.md`, and the sibling gate decodes it too.
+        raw = urllib.parse.unquote(raw.split('#', 1)[0].strip())
+        raw = UNESCAPE.sub(r'\1', raw)
         if not raw.endswith('.md'):
             return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
@@ -329,8 +359,9 @@ def edges_from(f):
         if t in traversable:
             out.add(t)
 
-    for m in MD_LINK.finditer(txt):
-        add_relative(m.group(1) if m.group(1) is not None else m.group(2))
+    for pattern in (MD_LINK, MD_LINK_NESTED):
+        for m in pattern.finditer(txt):
+            add_relative(m.group(1) if m.group(1) is not None else m.group(2))
 
     used = set()
     for m in REF_USE_FULL.finditer(txt):
@@ -648,6 +679,36 @@ self_test() {
   printf '# Jobs\n\nSee [mail](mail.md "the mail guide").\n' > "$c9y/docs/guide/jobs.md"
   git -C "$c9y" add -A && git -C "$c9y" commit -qm link-title
   check "a destination carrying a link title resolves" pass "$c9y"
+
+  # An escaped opening bracket renders literal text, so a link someone
+  # deliberately disabled must not go on conferring reachability.
+  local c9z="$tmp/c9z"; make_corpus "$c9z"
+  printf '# Jobs\n\nDisabled: \\[mail](mail.md)\n' > "$c9z/docs/guide/jobs.md"
+  git -C "$c9z" add -A && git -C "$c9z" commit -qm escaped-opener
+  check "an escaped link opener does not confer reachability" fail "$c9z"
+
+  # A linked image nests one link inside another; the outer target is the page.
+  local c9aa="$tmp/c9aa"; make_corpus "$c9aa"
+  printf '# Jobs\n\n[![alt](img.png)](mail.md)\n' > "$c9aa/docs/guide/jobs.md"
+  git -C "$c9aa" add -A && git -C "$c9aa" commit -qm nested-image-link
+  check "a linked image resolves its outer page target" pass "$c9aa"
+
+  # Percent-encoded destinations address the decoded filename.
+  local c9ab="$tmp/c9ab"; make_corpus "$c9ab"
+  mv "$c9ab/docs/guide/mail.md" "$c9ab/docs/guide/mail guide.md"
+  printf '# Jobs\n\nSee [mail](<mail%%20guide.md>).\n' > "$c9ab/docs/guide/jobs.md"
+  git -C "$c9ab" add -A && git -C "$c9ab" commit -qm percent-encoded
+  check "a percent-encoded destination resolves" pass "$c9ab"
+
+  # A ```` fence is not closed by a ``` line inside it. This matters for where
+  # PROSE begins again: an unclosed `<!--` still inside the outer fence is
+  # literal sample text, and mistaking the inner ``` for the closer would treat
+  # it as a real comment and blank out the live link that follows the block.
+  local c9ac="$tmp/c9ac"; make_corpus "$c9ac"
+  printf '# Jobs\n\n````md\n```\n<!-- sample\n```\n````\n\nSee [mail](mail.md).\n' \
+    > "$c9ac/docs/guide/jobs.md"
+  git -C "$c9ac" add -A && git -C "$c9ac" commit -qm longer-fence
+  check "a shorter run inside a longer fence does not end it" pass "$c9ac"
 
   # An ordinary docs page can sit mid-path: README -> hub -> guide. Dropping
   # that hop would report a reachable guide as an orphan.
