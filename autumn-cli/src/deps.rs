@@ -864,8 +864,15 @@ pub fn evaluate(root: &Path) -> Evaluation {
         };
     }
 
-    let Some(auditor) = auditor_version() else {
-        return Evaluation::AuditorMissing { checks };
+    let auditor = match auditor_version() {
+        Auditor::Version(version) => version,
+        Auditor::NotInstalled => return Evaluation::AuditorMissing { checks },
+        Auditor::Broken(reason) => {
+            return Evaluation::Unavailable {
+                reason: format!("{AUDITOR} is installed but not usable: {reason}"),
+                checks,
+            };
+        }
     };
 
     // A policy that names its own database is cargo-deny's to resolve: this
@@ -954,19 +961,49 @@ fn no_toolchain_installs(command: &mut Command) {
     command.env("RUSTUP_AUTO_INSTALL", "0");
 }
 
-/// The auditor's version, if it is installed.
+/// What probing the auditor found.
 ///
-/// Reported alongside the verdict: the scaffolded CI pins its auditor, a local
-/// run uses whatever is installed, and a reader comparing the two needs both.
-fn auditor_version() -> Option<String> {
+/// A missing optional tool and a broken one are different answers: the first is
+/// a pass reading "not evaluated", the second a warning. Collapsing them makes
+/// a corrupt install read as one that was simply never done (issue #1633).
+enum Auditor {
+    /// Installed and answering; the reported version string.
+    Version(String),
+    /// Not on PATH at all.
+    NotInstalled,
+    /// Present but unusable — the reason, for the reader.
+    Broken(String),
+}
+
+/// Probe the auditor.
+///
+/// Its version is reported alongside the verdict: the scaffolded CI pins its
+/// auditor, a local run uses whatever is installed, and a reader comparing the
+/// two needs both.
+fn auditor_version() -> Auditor {
     let mut command = Command::new(AUDITOR);
     no_toolchain_installs(&mut command);
-    let output = command.arg("--version").output().ok()?;
+    let output = match command.arg("--version").output() {
+        Ok(output) => output,
+        // Only "no such file" means the optional tool was never installed. Any
+        // other spawn error — not executable, wrong architecture, a permission
+        // denial — is a broken install, and reporting that as "not installed"
+        // turns it into a pass.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Auditor::NotInstalled;
+        }
+        Err(error) => return Auditor::Broken(one_line(&error.to_string())),
+    };
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().find(|line| !line.trim().is_empty());
+        return Auditor::Broken(match detail {
+            Some(line) => one_line(line),
+            None => format!("`{AUDITOR} --version` exited with {}", output.status),
+        });
     }
     let reported = String::from_utf8_lossy(&output.stdout);
-    Some(one_line(reported.lines().next().unwrap_or("cargo-deny")))
+    Auditor::Version(one_line(reported.lines().next().unwrap_or("cargo-deny")))
 }
 
 /// The first error the auditor logged, for an evaluation that produced no
@@ -1444,6 +1481,30 @@ mod tests {
         assert_eq!(
             severity_from_cvss(Some(&format!("CVSS:3.1/{METRICS}"))),
             Some(Severity::Medium)
+        );
+    }
+
+    #[test]
+    fn a_broken_auditor_is_not_reported_as_a_missing_one() {
+        // `AuditorMissing` passes, because no Autumn install path provides
+        // cargo-deny. A cargo-deny that is present but unusable — corrupt,
+        // wrong architecture, not executable — is a different answer, and
+        // grading it as the optional-tool pass hides a machine whose CI-parity
+        // claim is broken.
+        let broken = Evaluation::Unavailable {
+            reason: format!("{AUDITOR} is installed but not usable: Exec format error"),
+            checks: vec!["advisories".to_owned()],
+        };
+        let result = crate::doctor::check_dependencies_impl(&broken);
+        assert_eq!(result.status, crate::doctor::CheckStatus::Warn);
+
+        // …whereas a genuinely absent tool still passes.
+        let absent = Evaluation::AuditorMissing {
+            checks: vec!["advisories".to_owned()],
+        };
+        assert_eq!(
+            crate::doctor::check_dependencies_impl(&absent).status,
+            crate::doctor::CheckStatus::Pass
         );
     }
 
