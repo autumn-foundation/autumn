@@ -208,12 +208,28 @@ impl PluginActivityLog {
     }
 
     /// Every plugin this log has heard from.
+    ///
+    /// Both ledgers, not only the event ring. A busy plugin can evict a quiet
+    /// one's every event while the drop ledger still carries the count of what
+    /// was lost, and an operator surface that enumerates plugins here to ask
+    /// each for a [`summary`] would then skip the one plugin whose activity is
+    /// only visible as drops — reporting nothing for a plugin about which this
+    /// log knows something.
+    ///
+    /// [`summary`]: Self::summary
     #[must_use]
     pub fn plugins(&self) -> Vec<String> {
         let mut names: Vec<String> = {
             let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
             entries.iter().map(|(_, who, _)| who.clone()).collect()
         };
+        names.extend({
+            let dropped = self.dropped.lock().unwrap_or_else(PoisonError::into_inner);
+            dropped
+                .iter()
+                .map(|(_, who, _)| who.clone())
+                .collect::<Vec<_>>()
+        });
         names.sort();
         names.dedup();
         names
@@ -516,6 +532,32 @@ mod tests {
         assert!(
             summary.to_string().contains("NOT counted below"),
             "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_plugin_visible_only_as_drops_is_still_enumerated() {
+        // The ring is shared, so a busy plugin evicts a quiet one's every
+        // event while the drop ledger keeps the count. Enumerating only the
+        // ring then hides the quiet plugin from any operator surface that
+        // walks `plugins()` asking each for a summary — even though
+        // `summary("quiet", …)` has something to say about it.
+        let log = PluginActivityLog::new();
+        log.ingest_dropped("quiet", 7);
+        for _ in 0..MAX_LOG_EVENTS {
+            log.ingest("busy", [event("kv-get", CapabilityOutcome::Allowed)]);
+        }
+
+        let names = log.plugins();
+        assert!(
+            names.contains(&"quiet".to_owned()),
+            "a plugin the log can summarise must be one the log can name: {names:?}"
+        );
+        assert!(names.contains(&"busy".to_owned()), "{names:?}");
+        assert_eq!(
+            log.summary("quiet", Duration::from_secs(3600)).dropped,
+            7,
+            "and the summary it was omitted from is not empty"
         );
     }
 

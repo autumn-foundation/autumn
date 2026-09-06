@@ -40,7 +40,15 @@ pub const KV_PREFIX: &str = "plugin-kv";
 /// tenant is recoverable from what it is asked to do beyond what is in the key.
 pub trait KvStore: Send + Sync + 'static {
     /// Read one already-namespaced key.
-    fn get(&self, key: &str) -> Option<PluginValue>;
+    ///
+    /// # Errors
+    ///
+    /// One line for the guest and the audit ledger when the read did not
+    /// happen — an unreachable backend, a value that would not deserialize.
+    /// `Ok(None)` means the key is *absent*, which is a different answer: a
+    /// store that cannot tell the two apart reports an outage as a miss, and a
+    /// plugin's miss path may then overwrite state that was only unreachable.
+    fn get(&self, key: &str) -> Result<Option<PluginValue>, String>;
     /// Write one already-namespaced key.
     ///
     /// # Errors
@@ -107,6 +115,11 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
         CapabilityCall::KvGet { .. } => {
             let ceiling = runtime.quotas().kv_value_bytes as usize;
             match store.get(&physical) {
+                // A backend that could not answer is not a miss. Reporting it
+                // as `found: false` would run the guest's miss path over data
+                // that exists, and the audit ledger would record a read that
+                // never happened.
+                Err(detail) => CallResult::denied(id, DenialReason::BackendError, detail),
                 // Checked on the way *out* as well as in. A quota is the
                 // operator's current answer, and lowering one is meant to
                 // *reduce* authority — but the store keeps what was written
@@ -114,7 +127,7 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
                 // tightened `kv_value_bytes` would go on serving values over
                 // it, and a value large enough could overrun the reply queue
                 // and fail the request outright rather than being refused.
-                Some(value) if value.weight() > ceiling => CallResult::denied(
+                Ok(Some(value)) if value.weight() > ceiling => CallResult::denied(
                     id,
                     DenialReason::QuotaExceeded,
                     format!(
@@ -123,11 +136,11 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
                         value.weight()
                     ),
                 ),
-                Some(value) => CallResult::Ok {
+                Ok(Some(value)) => CallResult::Ok {
                     id,
                     value: CallValue::Value { value, found: true },
                 },
-                None => CallResult::Ok {
+                Ok(None) => CallResult::Ok {
                     id,
                     value: CallValue::Value {
                         value: PluginValue::Null,
@@ -288,13 +301,14 @@ impl MemoryKvStore {
 }
 
 impl KvStore for MemoryKvStore {
-    fn get(&self, key: &str) -> Option<PluginValue> {
-        self.entries
+    fn get(&self, key: &str) -> Result<Option<PluginValue>, String> {
+        Ok(self
+            .entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .map
             .get(key)
-            .cloned()
+            .cloned())
     }
 
     #[allow(
@@ -385,8 +399,19 @@ impl KvStore for CacheKvStore {
     // told its write succeeded, on the one backend the module documents for
     // more than one replica. The serde pair takes both paths: the downcast when
     // the backend keeps values, JSON when it keeps bytes.
-    fn get(&self, key: &str) -> Option<PluginValue> {
-        crate::cache::get_cached::<PluginValue>(self.0.as_ref(), key)
+    fn get(&self, key: &str) -> Result<Option<PluginValue>, String> {
+        // Always `Ok`, and that is this adapter's limit rather than the
+        // trait's: `get_cached` answers `Option`, so a backend that is *down*
+        // and a key that is *absent* arrive here as the same `None` and no
+        // amount of care in this function can separate them. Distinguishing
+        // them needs an acknowledged read on the `Cache` trait itself, which is
+        // shared with every other cache user and not this module's to change.
+        // The trait above can carry the answer the day that lands; a custom
+        // store that talks to its backend directly can report it today.
+        Ok(crate::cache::get_cached::<PluginValue>(
+            self.0.as_ref(),
+            key,
+        ))
     }
 
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
@@ -465,14 +490,54 @@ mod tests {
         let store = CacheKvStore(Arc::clone(&cache) as Arc<dyn crate::cache::Cache>);
         let key = namespaced_key("shop", Some("alpha"), "cart");
 
-        assert!(store.get(&key).is_none(), "nothing stored yet");
+        assert_eq!(store.get(&key), Ok(None), "nothing stored yet");
         let _ = store.set(&key, PluginValue::Text("A-1".to_owned()));
         assert_eq!(
             store.get(&key),
-            Some(PluginValue::Text("A-1".to_owned())),
+            Ok(Some(PluginValue::Text("A-1".to_owned()))),
             "a value written through a serializing backend must read back"
         );
         store.delete(&key);
-        assert!(store.get(&key).is_none(), "and delete must remove it");
+        assert_eq!(store.get(&key), Ok(None), "and delete must remove it");
+    }
+
+    /// A store that is *down* rather than empty.
+    #[derive(Debug)]
+    struct UnreachableKvStore;
+
+    impl KvStore for UnreachableKvStore {
+        fn get(&self, _key: &str) -> Result<Option<PluginValue>, String> {
+            Err("the key/value backend is unreachable".to_owned())
+        }
+
+        fn set(&self, _key: &str, _value: PluginValue) -> Result<(), String> {
+            Err("the key/value backend is unreachable".to_owned())
+        }
+
+        fn delete(&self, _key: &str) {}
+    }
+
+    #[test]
+    fn a_read_that_could_not_happen_is_not_an_absent_key() {
+        // The distinction the trait exists to carry. Before it did, an outage
+        // reached the guest as `found: false`: the plugin ran its miss path and
+        // could overwrite state that was only unreachable, while the audit
+        // ledger recorded a read that succeeded.
+        let store = UnreachableKvStore;
+        let key = namespaced_key("shop", Some("alpha"), "cart");
+        assert_eq!(
+            store.get(&key),
+            Err("the key/value backend is unreachable".to_owned()),
+            "a failed read must stay a failure, not collapse into None"
+        );
+
+        // And the in-memory store still says `Ok(None)` for a key that is
+        // genuinely absent, so the two answers really are distinguishable.
+        let present = MemoryKvStore::new();
+        assert_eq!(
+            present.get(&key),
+            Ok(None),
+            "an absent key is a successful read of nothing"
+        );
     }
 }

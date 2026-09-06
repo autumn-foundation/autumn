@@ -948,7 +948,7 @@ fn a_value_a_plugin_stores_round_trips_through_the_wire() {
                 Some("alpha"),
                 "cart",
             )),
-        Some(PluginValue::Text("one item".to_owned())),
+        Ok(Some(PluginValue::Text("one item".to_owned()))),
         "and it is a scalar, not its decimal spelling"
     );
 }

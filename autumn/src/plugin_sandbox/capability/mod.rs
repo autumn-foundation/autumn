@@ -1567,6 +1567,55 @@ path = "/shop/panel"
 
     // ── KV containment ───────────────────────────────────────────────
 
+    /// A `KvStore` that is down rather than empty.
+    #[derive(Debug)]
+    struct UnreachableKvStore;
+
+    impl KvStore for UnreachableKvStore {
+        fn get(&self, _key: &str) -> Result<Option<PluginValue>, String> {
+            Err("the key/value backend is unreachable".to_owned())
+        }
+
+        fn set(&self, _key: &str, _value: PluginValue) -> Result<(), String> {
+            Err("the key/value backend is unreachable".to_owned())
+        }
+
+        fn delete(&self, _key: &str) {}
+    }
+
+    #[test]
+    fn a_kv_backend_outage_reaches_the_guest_as_a_failure_not_a_miss() {
+        // `found: false` is an answer about the *data*; an outage is an answer
+        // about the *backend*. Collapsing the second into the first tells a
+        // plugin its cart is empty when the truth is that nobody could look,
+        // and the audit ledger then records a read that never happened.
+        let manifest = manifest(&everything());
+        let mut runtime = CapabilityRuntime::new(
+            &manifest,
+            CapabilityServices {
+                kv: Some(Arc::new(UnreachableKvStore) as Arc<dyn KvStore>),
+                ..CapabilityServices::none()
+            }
+            .for_tenant("alpha"),
+        );
+
+        let result = runtime.dispatch(&CapabilityCall::KvGet {
+            id: 1,
+            key: "cart".to_owned(),
+        });
+        assert!(
+            matches!(
+                result,
+                CallResult::Denied {
+                    id: 1,
+                    reason: DenialReason::BackendError,
+                    ..
+                }
+            ),
+            "an unreachable store must deny, not report an absent key: {result:?}"
+        );
+    }
+
     #[test]
     fn one_tenants_key_is_unreadable_when_another_is_active() {
         let store = MemoryKvStore::new();
