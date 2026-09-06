@@ -458,7 +458,7 @@ fn the_docs_never_promise_a_warning_for_a_state_that_passes() {
 /// Every fenced block in the guide must close on a line of its own.
 ///
 /// Regression: an edit left prose on the closing-fence line
-/// (```` ``` The line follows… ````). Under CommonMark that is not a closing
+/// (```` ``` The line follows… ````). Under `CommonMark` that is not a closing
 /// fence, so the block stayed open and swallowed the dependency-check,
 /// severity, dev-loop and offline sections into one code block. The link gate
 /// does not see this — it checks links, not fences — and neither does anything
