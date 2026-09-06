@@ -239,11 +239,12 @@ REF_DEF = re.compile(r'^ {0,3}\[([^\]]+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 #   full:      [text][label]
 #   collapsed: [label][]
 #   shortcut:  [label]        (not followed by `(`, `[` or `:`)
-# `(?<!\\)` for the same reason the inline pattern has it: `\[mail][]` renders
-# as literal text, so a reference link disabled that way must not keep its
-# definition alive and go on hiding an orphan.
-REF_USE_FULL = re.compile(r'(?<!\\)\[[^\]]*\]\[([^\]]*)\]')
-REF_USE_SHORTCUT = re.compile(r'(?<!\\)\[([^\]]+)\](?![\(\[:])')
+# `(?<![\\!])` for the same two reasons the inline pattern carries it:
+# `\[mail][]` renders as literal text, and `![mail][]` is an image whose
+# destination is a resource rather than a page. Neither must keep a definition
+# alive and go on hiding an orphan.
+REF_USE_FULL = re.compile(r'(?<![\\!])\[[^\]]*\]\[([^\]]*)\]')
+REF_USE_SHORTCUT = re.compile(r'(?<![\\!])\[([^\]]+)\](?![\(\[:])')
 
 
 def ref_label(s):
@@ -318,15 +319,29 @@ def strip_comments(txt):
     docs change. So fences are passed through untouched, and the run-to-EOF rule
     for an unclosed comment applies only to prose spans.
 
-    KNOWN LIMITATION: a four-space-INDENTED code block is not recognised, so an
-    unclosed `<!--` inside one is still read as a real comment. Detecting those
-    correctly needs the list-aware column tracking `check-docs-links.sh` carries
-    for its fence bounds, and a naive "four spaces means code" rule would do
-    harm in the more expensive direction — it would stop a genuinely commented-
-    out link inside a list item from being stripped, which is a false negative,
-    and this gate's whole job is to not be satisfiable by a line no reader can
-    follow. The sibling does not mask indented code either, so the two gates
-    agree; if it ever grows that machinery, this should borrow it."""
+    TWO KNOWN LIMITATIONS, both narrow, both false POSITIVES, and both left
+    deliberately because the available fixes cost more than the bugs:
+
+    1. A four-space-INDENTED code block is not recognised, so an unclosed
+       `<!--` inside one is read as a real comment. A naive "four spaces means
+       code" rule would stop a genuinely commented-out link inside a list item
+       from being stripped — a false NEGATIVE, and being unsatisfiable by a
+       line no reader can follow is this gate's whole job. `check-docs-links.sh`
+       does not mask indented code either, so the two agree.
+
+    2. `FENCE` matches at absolute column, so a fence opened inside a block
+       quote (`> ```html`) or indented under a list item is not seen as one.
+       An unclosed `<!--` in such a block is then read as a real comment and
+       truncates the rest of the page.
+
+    The sibling DOES solve (2), in ~120 lines of container-aware tracking
+    (`quote_depth`, `column`, `strip_fences`). Copying that here is the wrong
+    move: it would put a third copy of subtle CommonMark logic in the tree, and
+    the two copies would drift exactly the way this PR's own duplicated prose
+    did. The right fix is to lift the sibling's fence handling into something
+    both gates import — which is a shared-tooling change to the docs CI job,
+    not a line to smuggle into a reachability gate. Until then this stays a
+    documented gap rather than a re-derived near-copy."""
     parts = split_fences(txt)
 
     out = []
@@ -399,13 +414,22 @@ def edges_from(f):
         for m in pattern.finditer(txt):
             add_relative(m.group(1) if m.group(1) is not None else m.group(2))
 
+    # A reference USE inside code — `` `[mail][]` `` — is the one code case that
+    # does not count, and it is not an exception to the visible/invisible rule
+    # but an application of it. A bare `docs/guide/x.md` in a fence counts
+    # because the PATH is on screen; a reference use in a fence shows only the
+    # label, while the path lives in a definition that renders as nothing at
+    # all. Nothing a reader can see names the target, so it is not an edge.
+    ref_txt = ''.join(seg for kind, seg in split_fences(txt) if kind == 'prose')
+    ref_txt = CODE_SPAN.sub(' ', ref_txt)
+
     used = set()
-    for m in REF_USE_FULL.finditer(txt):
+    for m in REF_USE_FULL.finditer(ref_txt):
         # `[label][]` (collapsed) leaves group 1 empty; the label is the text.
         inner = m.group(1)
         used.add(ref_label(inner) if inner.strip()
                  else ref_label(m.group(0)[1:m.group(0).index(']')]))
-    for m in REF_USE_SHORTCUT.finditer(txt):
+    for m in REF_USE_SHORTCUT.finditer(ref_txt):
         used.add(ref_label(m.group(1)))
     for m in REF_DEF.finditer(txt):
         if ref_label(m.group(1)) not in used:
@@ -869,6 +893,30 @@ self_test() {
   printf '# Jobs\n\nSee [mail](mail.md?view=all#retries).\n' > "$c9ak/docs/guide/jobs.md"
   git -C "$c9ak" add -A && git -C "$c9ak" commit -qm query-and-anchor
   check "a destination carrying a query and an anchor resolves" pass "$c9ak"
+
+  # A reference use in code shows only the label; the path lives in a
+  # definition that renders as nothing, so nothing visible names the target.
+  local c9al="$tmp/c9al"; make_corpus "$c9al"
+  printf '# Jobs\n\nSyntax: `[mail][]`\n\n[mail]: mail.md\n' > "$c9al/docs/guide/jobs.md"
+  git -C "$c9al" add -A && git -C "$c9al" commit -qm ref-use-in-code-span
+  check "a reference use in inline code confers nothing" fail "$c9al"
+
+  local c9am="$tmp/c9am"; make_corpus "$c9am"
+  printf '# Jobs\n\n```\n[mail][]\n```\n\n[mail]: mail.md\n' > "$c9am/docs/guide/jobs.md"
+  git -C "$c9am" add -A && git -C "$c9am" commit -qm ref-use-in-fence
+  check "a reference use in a fence confers nothing" fail "$c9am"
+
+  # ...but a bare PATH in a fence still counts: the path itself is on screen.
+  local c9an="$tmp/c9an"; make_corpus "$c9an"
+  printf '# Jobs\n\n```\nsee docs/guide/mail.md\n```\n' > "$c9an/docs/guide/jobs.md"
+  git -C "$c9an" add -A && git -C "$c9an" commit -qm bare-path-in-fence
+  check "a bare path in a fence still counts as an edge" pass "$c9an"
+
+  # An image reference use is a resource, not navigation.
+  local c9ao="$tmp/c9ao"; make_corpus "$c9ao"
+  printf '# Jobs\n\n![mail][]\n\n[mail]: mail.md\n' > "$c9ao/docs/guide/jobs.md"
+  git -C "$c9ao" add -A && git -C "$c9ao" commit -qm image-ref-use
+  check "an image reference use confers nothing" fail "$c9ao"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
