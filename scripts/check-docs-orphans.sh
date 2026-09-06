@@ -1472,13 +1472,43 @@ def definition_labels(txt):
 # `<svg>`, which is the reported case and the one that is real.
 ANY_IMAGE = re.compile(
     r'!\[|<(?:img|svg|video|canvas|picture|object|embed)\b', re.I)
-# An element carrying `hidden`, through its closing tag: the browser shows
-# none of it, so nothing inside counts as a link's content.
-HIDDEN_SUBTREE = re.compile(
+# An element carrying `hidden`, and its OPENING tag only — the matching close
+# is found by a scan, because same-name nesting cannot be balanced by a regular
+# expression. `<span hidden><span></span>Mail</span>` closed at the INNER
+# `</span>` and handed `Mail` back as though it were a label.
+HIDDEN_OPEN = re.compile(
     r'<([A-Za-z][A-Za-z0-9-]*)(?:' + _TWS + r'+' + ATTR + r')*?'
     + _TWS + r'+hidden(?:' + _TWS + r'*=' + _TWS + r'*(?:' + _Q + r'|'
     + _Q1 + r'|[^\s"\'=<>`]+))?(?:' + _TWS + r'+' + ATTR + r')*'
-    + _TWS + r'*/?>.*?</\1' + _TWS + r'*>', re.I | re.S)
+    + _TWS + r'*/?>', re.I)
+
+
+def mask_hidden_subtrees(txt):
+    """Blank every `hidden` element, contents and all, space for space.
+
+    Nesting is why this is a scan: the close that ends a `hidden` element is
+    the one that balances it, not the first one with the same name.
+    """
+    out = txt
+    while True:
+        m = HIDDEN_OPEN.search(out)
+        if not m:
+            return out
+        name = m.group(1)
+        depth, pos, end = 1, m.end(), len(out)
+        tag = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
+        while depth:
+            t = tag.search(out, pos)
+            if not t:
+                break
+            depth += -1 if t.group(1) else 1
+            pos = t.end()
+            if not depth:
+                close = out.find('>', pos)
+                end = len(out) if close == -1 else close + 1
+        out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+
+
 # Any HTML tag, open or close, quote-aware so a `>` inside an attribute
 # does not end it early.
 ANY_TAG = re.compile(
@@ -1503,9 +1533,8 @@ def has_content(image_span, masked_span):
     # A `hidden` subtree is not shown, so neither its text nor an image inside
     # it is content. `<a href=…><span hidden>Mail</span></a>` renders an empty
     # link, and stripping tags left `Mail` behind looking like a label.
-    image_span = HIDDEN_SUBTREE.sub(lambda m: ' ' * len(m.group(0)), image_span)
-    masked_span = HIDDEN_SUBTREE.sub(
-        lambda m: ' ' * len(m.group(0)), masked_span)
+    image_span = mask_hidden_subtrees(image_span)
+    masked_span = mask_hidden_subtrees(masked_span)
     return bool(ANY_TAG.sub('', masked_span).strip()
                 or ANY_IMAGE.search(image_span))
 
@@ -3857,6 +3886,20 @@ self_test() {
     > "$c9il/docs/guide/jobs.md"
   git -C "$c9il" add -A && git -C "$c9il" commit -qm visible-subtree
   check "a visible subtree is link content" pass "$c9il"
+
+  # Nesting: the close that ends a hidden element is the one that BALANCES it.
+  local c9im="$tmp/c9im"; make_corpus "$c9im"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden><span></span>Mail</span></a>\n' \
+    > "$c9im/docs/guide/jobs.md"
+  git -C "$c9im" add -A && git -C "$c9im" commit -qm nested-hidden-subtree
+  check "a nested hidden subtree is masked whole" fail "$c9im"
+
+  # ...and text AFTER the hidden element closes is still content.
+  local c9in="$tmp/c9in"; make_corpus "$c9in"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden>x</span>Mail</a>\n' \
+    > "$c9in/docs/guide/jobs.md"
+  git -C "$c9in" add -A && git -C "$c9in" commit -qm text-after-hidden
+  check "text after a hidden element is still content" pass "$c9in"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
