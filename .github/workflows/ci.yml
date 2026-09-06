@@ -565,6 +565,17 @@ jobs:
           pg_dump --version
           pg_restore --version
           ssh -V
+      - name: Install diesel_cli (Linux)
+        if: runner.os == 'Linux'
+        # #1945: the cli_tests Docker sweep below now reaches
+        # `db_pull.rs`/`generate_lock_version_postgres.rs`/
+        # `generate_references_postgres.rs`/`migrate_down.rs`/`test_command.rs`
+        # and `db.rs`'s reset tests, which drive `autumn migrate`/`autumn db
+        # reset`/`autumn test` against Postgres — all of which shell out to
+        # the `diesel` CLI via `check_diesel_cli()` (`autumn-cli/src/migrate.rs`)
+        # and exit non-zero without it on PATH. Same install command as
+        # generator-conformance.yml's `scaffold-postgres` job.
+        run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         # 45 -> 75 (#1945): 46 more container-spinning `cli_tests` Docker
