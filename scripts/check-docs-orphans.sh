@@ -1472,6 +1472,13 @@ def definition_labels(txt):
 # `<svg>`, which is the reported case and the one that is real.
 ANY_IMAGE = re.compile(
     r'!\[|<(?:img|svg|video|canvas|picture|object|embed)\b', re.I)
+# An element carrying `hidden`, through its closing tag: the browser shows
+# none of it, so nothing inside counts as a link's content.
+HIDDEN_SUBTREE = re.compile(
+    r'<([A-Za-z][A-Za-z0-9-]*)(?:' + _TWS + r'+' + ATTR + r')*?'
+    + _TWS + r'+hidden(?:' + _TWS + r'*=' + _TWS + r'*(?:' + _Q + r'|'
+    + _Q1 + r'|[^\s"\'=<>`]+))?(?:' + _TWS + r'+' + ATTR + r')*'
+    + _TWS + r'*/?>.*?</\1' + _TWS + r'*>', re.I | re.S)
 # Any HTML tag, open or close, quote-aware so a `>` inside an attribute
 # does not end it early.
 ANY_TAG = re.compile(
@@ -1493,6 +1500,12 @@ def has_content(image_span, masked_span):
     # is markup, not content. `<a href=…><span></span></a>` has no text and no
     # clickable area, and counting its tag SOURCE as content made it a route —
     # the same nothing as `<a href=…></a>`, spelled with more bytes.
+    # A `hidden` subtree is not shown, so neither its text nor an image inside
+    # it is content. `<a href=…><span hidden>Mail</span></a>` renders an empty
+    # link, and stripping tags left `Mail` behind looking like a label.
+    image_span = HIDDEN_SUBTREE.sub(lambda m: ' ' * len(m.group(0)), image_span)
+    masked_span = HIDDEN_SUBTREE.sub(
+        lambda m: ' ' * len(m.group(0)), masked_span)
     return bool(ANY_TAG.sub('', masked_span).strip()
                 or ANY_IMAGE.search(image_span))
 
@@ -3830,6 +3843,20 @@ self_test() {
     > "$c9ij/docs/guide/jobs.md"
   git -C "$c9ij" add -A && git -C "$c9ij" commit -qm empty-shortcut-reference
   check "an empty shortcut reference is not an edge" fail "$c9ij"
+
+  # A `hidden` subtree shows nothing, so the anchor around it is empty.
+  local c9ik="$tmp/c9ik"; make_corpus "$c9ik"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden>Mail</span></a>\n' \
+    > "$c9ik/docs/guide/jobs.md"
+  git -C "$c9ik" add -A && git -C "$c9ik" commit -qm hidden-subtree
+  check "a hidden subtree is not link content" fail "$c9ik"
+
+  # ...while the same span without `hidden` is a route.
+  local c9il="$tmp/c9il"; make_corpus "$c9il"
+  printf '# Jobs\n\n<a href="mail.md"><span>Mail</span></a>\n' \
+    > "$c9il/docs/guide/jobs.md"
+  git -C "$c9il" add -A && git -C "$c9il" commit -qm visible-subtree
+  check "a visible subtree is link content" pass "$c9il"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"

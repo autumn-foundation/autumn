@@ -1265,7 +1265,11 @@ Two things to get right when generating this code:
       `OutboundWebhookHandler`.
     - No stable event or delivery ID is transmitted: nothing Autumn sends
       distinguishes a first attempt from a retry of the same event, and the
-      `Autumn-Signature` header's `t=` changes per attempt. (Do not enumerate
+      `Autumn-Signature` header's `t=` is recomputed per attempt but is
+      neither unique nor stable — it is a whole-second `Utc::now().timestamp()`
+      and the default retry backoff uses equal jitter (500-1000 ms on a 1000 ms
+      base), so two attempts can share a second and produce a byte-identical
+      signature. (Do not enumerate
       the headers — under `telemetry-otlp` the shared client also injects W3C
       `traceparent`/`tracestate`.) Receiver-side deduplication needs an ID the
       app mints into the payload itself.
