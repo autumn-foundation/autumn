@@ -454,3 +454,45 @@ fn the_docs_never_promise_a_warning_for_a_state_that_passes() {
         );
     }
 }
+
+/// Every fenced block in the guide must close on a line of its own.
+///
+/// Regression: an edit left prose on the closing-fence line
+/// (```` ``` The line follows… ````). Under CommonMark that is not a closing
+/// fence, so the block stayed open and swallowed the dependency-check,
+/// severity, dev-loop and offline sections into one code block. The link gate
+/// does not see this — it checks links, not fences — and neither does anything
+/// else in the suite, which is why the page rendered wrong with every test
+/// green.
+#[test]
+fn the_guides_code_fences_close_on_their_own_line() {
+    for guide in ["docs/guide/supply-chain.md"] {
+        let text = read_repo_file(guide);
+        let mut open: Option<usize> = None;
+        for (number, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("```") {
+                continue;
+            }
+            match open {
+                // An opening fence may carry an info string (```text).
+                None => open = Some(number + 1),
+                // A closing fence may carry nothing at all.
+                Some(start) => {
+                    assert!(
+                        trimmed.trim_end_matches('`').trim().is_empty(),
+                        "{guide}:{} closes the block opened at line {start} but carries \
+                         trailing text, so the fence does not close: {line}",
+                        number + 1
+                    );
+                    open = None;
+                }
+            }
+        }
+        assert!(
+            open.is_none(),
+            "{guide} leaves a code fence open at line {}",
+            open.unwrap_or_default()
+        );
+    }
+}

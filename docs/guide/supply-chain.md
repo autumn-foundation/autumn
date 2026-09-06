@@ -568,7 +568,9 @@ including for a freshly scaffolded app, which ships one pre-triaged waiver:
 
 ```text
 ✅ dependencies — no live findings; 1 waived (RUSTSEC-2023-0071) — cargo-deny 0.20.2; checks: advisories; advisory data 0 days old
-``` The line follows doctor's ordinary conventions, so
+```
+
+The line follows doctor's ordinary conventions, so
 `--json` carries the same detail string, capped at the first ten findings; run
 `cargo deny check` itself when you need every one. `--strict` promotes the
 check's warnings to exit 1 — stricter than the CI gate, where a cargo-deny
