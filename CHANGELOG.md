@@ -511,6 +511,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate in the publish gate (`scripts/check-posture-gate.sh`). See
   `docs/guide/posture-gate.md`.
 
+  `posture-gate.yml` and `ci.yml` still install the `autumn` CLI pinned to
+  the app's own `autumn-web` version by default (#2495): pinning alone left
+  every newly scaffolded gate red between a subcommand landing and the next
+  release, and stuck red afterwards until someone re-ran `autumn upgrade
+  --apply` — but always installing the latest published release instead
+  would trade that for a worse problem, running these gates under a CLI
+  this project's own compatibility check (`autumn doctor`) calls
+  incompatible the moment a minor release ships, with the gap only growing
+  as later, unrelated releases ship. So only `posture-gate.yml`'s verdict
+  job — which never compiles the pull request, only reads JSON — falls
+  back, for that run alone, when the pinned CLI lacks `routes posture`: it
+  probes forward through the next few releases and installs the first one
+  that has it, landing on a specific, bounded release rather than a moving
+  "latest" that keeps drifting from the app's own pin. The fallback does
+  not resolve itself — the workflow still installs the app's pinned
+  `autumn-web` version first on every run — so it keeps firing until the
+  app raises that pin (and reruns `autumn upgrade --apply`) to a release
+  that already has the command. `ci.yml`'s `a11y verify` and `routes audit`
+  steps (like
+  `posture-gate.yml`'s own `manifest` job) compile and introspect the pull
+  request's own code, so they never fall back — they now probe for their
+  subcommand the same way `posture-gate.yml`'s verdict job already did, and
+  fail with an actionable message naming the pin to raise, rather than a
+  raw unknown-subcommand error. Scaffolded workflow YAML only; no new or
+  changed CLI surface for agents to reach for. [no-plugin]
+
 - **Build-time authority envelope for agent-operable handlers (#1691):** an
   endpoint exposed as an MCP tool is an action an autonomous agent can take
   with no human in the loop, and nothing said what that action was *allowed*
