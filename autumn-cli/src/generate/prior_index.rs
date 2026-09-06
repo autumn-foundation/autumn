@@ -93,6 +93,14 @@ pub fn scan_prior_indexes(migrations_dir: &Path, table: &str) -> Vec<PriorIndex>
                 }
                 index.create_sql = rename_identifier(&index.create_sql, &old, &new);
             }
+        } else if let Some((old, new)) = parse_table_rename(normalized)
+            && old == *name
+        {
+            // The index moves with its table, so its replay SQL must name the
+            // new table or the rollback re-creates it against one that is gone.
+            for (_, index) in live.values_mut() {
+                index.create_sql = rename_identifier(&index.create_sql, &old, &new);
+            }
         } else if drops_table(normalized, name) {
             // Every index on the table goes with it.
             live.clear();
@@ -139,6 +147,12 @@ fn migration_statements(migrations_dir: &Path) -> Vec<(String, String)> {
 /// The name `table` carried before each statement, and the index of the first
 /// statement that belongs to this incarnation of the table.
 ///
+/// The incarnation begins at the `CREATE TABLE` that made it, or just after the
+/// `DROP TABLE` that ended the previous one — whichever the backward walk meets
+/// first. Without the `CREATE TABLE` boundary, a history that renames `posts`
+/// to `archived_posts` and then creates a NEW `posts` would attribute the
+/// archived table's indexes to the new one.
+///
 /// A timeless set of every name the table ever had is not enough: a rename frees
 /// the old name, and a later `CREATE TABLE` can reuse it for an unrelated table.
 /// Matching by name alone would then attribute that table's indexes to this one
@@ -148,7 +162,7 @@ fn migration_statements(migrations_dir: &Path) -> Vec<(String, String)> {
 fn table_identity(statements: &[(String, String)], table: &str) -> (Vec<String>, usize) {
     let mut names_at = vec![String::new(); statements.len()];
     let mut current = table.to_lowercase();
-    let mut from = 0;
+    let mut boundary: Option<usize> = None;
     for i in (0..statements.len()).rev() {
         let normalized = &statements[i].1;
         // Apply the rename before recording: at this statement the table still
@@ -159,11 +173,28 @@ fn table_identity(statements: &[(String, String)], table: &str) -> (Vec<String>,
             current = old;
         }
         names_at[i].clone_from(&current);
-        if from == 0 && drops_table(normalized, &current) {
-            from = i + 1;
+        if boundary.is_none() {
+            if creates_table(normalized, &current) {
+                // This incarnation of the table begins here.
+                boundary = Some(i);
+            } else if drops_table(normalized, &current) {
+                // The previous incarnation ended here.
+                boundary = Some(i + 1);
+            }
         }
     }
-    (names_at, from)
+    (names_at, boundary.unwrap_or(0))
+}
+
+/// Whether the statement creates `table`.
+fn creates_table(normalized: &str, table: &str) -> bool {
+    let Some(rest) = normalized.strip_prefix("create table ") else {
+        return false;
+    };
+    let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
+    rest.split([' ', '(', ';'])
+        .next()
+        .is_some_and(|named| normalize_identifier(named) == table)
 }
 
 /// `(old, new)` column names for an `ALTER TABLE <table> RENAME [COLUMN] <old>
@@ -416,13 +447,26 @@ fn identifier_tokens(sql: &str) -> Vec<String> {
     out
 }
 
-/// Record `token` unless what follows it opens a call. `lower (title)` is valid
-/// SQL, so the whitespace before the parenthesis is skipped.
+/// Words that are `CREATE INDEX` grammar, not column names. A table may well
+/// have a column called `desc` or `where`; recording the keyword as a reference
+/// would drop an index that never mentioned that column.
+const INDEX_GRAMMAR_KEYWORDS: &[&str] = &[
+    "asc", "collate", "desc", "where", "and", "or", "not", "is", "null", "in", "like", "glob",
+    "between", "on", "using", "true", "false",
+];
+
+/// Record `token` unless what follows it opens a call, or it is index grammar.
+/// `lower (title)` is valid SQL, so whitespace before the parenthesis is
+/// skipped.
 fn push_identifier(out: &mut Vec<String>, token: &str, rest: &str) {
     if rest.trim_start().starts_with('(') {
         return;
     }
-    out.push(token.to_lowercase());
+    let lowered = token.to_lowercase();
+    if INDEX_GRAMMAR_KEYWORDS.contains(&lowered.as_str()) {
+        return;
+    }
+    out.push(lowered);
 }
 
 #[cfg(test)]
@@ -725,6 +769,68 @@ mod tests {
             .map(|i| i.name)
             .collect();
         assert_eq!(names, vec!["idx_fresh"], "got {names:?}");
+    }
+
+    #[test]
+    fn index_grammar_keywords_are_not_column_references() {
+        // A table may have a column called `desc`; dropping it must not take an
+        // unrelated unique index on `title` with it.
+        let t = tree(&[(
+            "2026_01_01_000000_a",
+            "CREATE UNIQUE INDEX ux ON posts (title DESC) WHERE body IS NOT NULL;",
+        )]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        for keyword in ["desc", "where", "is", "not", "null"] {
+            assert!(!found[0].covers(keyword), "{keyword}: {found:?}");
+        }
+        assert!(found[0].covers("title"));
+        assert!(found[0].covers("body"));
+    }
+
+    #[test]
+    fn a_reused_name_after_a_rename_away_starts_a_new_incarnation() {
+        // The old `posts` is renamed aside and a NEW `posts` created. The
+        // archived table's index must not be attributed to the new table.
+        let t = tree(&[
+            (
+                "2026_01_01_000000_a",
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                 CREATE UNIQUE INDEX ux_old ON posts (title);",
+            ),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE posts RENAME TO archived_posts;",
+            ),
+            (
+                "2026_01_03_000000_c",
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+                 CREATE INDEX ix_new ON posts (title);",
+            ),
+        ]);
+        let names: Vec<String> = scan_prior_indexes(t.path(), "posts")
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(names, vec!["ix_new"], "got {names:?}");
+    }
+
+    #[test]
+    fn a_table_rename_rewrites_the_replay_sql() {
+        // The rollback would otherwise re-create the index on a table that no
+        // longer exists under that name.
+        let t = tree(&[
+            ("2026_01_01_000000_a", "CREATE INDEX i ON articles (title);"),
+            (
+                "2026_01_02_000000_b",
+                "ALTER TABLE articles RENAME TO posts;",
+            ),
+        ]);
+        let found = scan_prior_indexes(t.path(), "posts");
+        assert_eq!(
+            found[0].create_sql, "CREATE INDEX i ON posts (title);",
+            "got {:?}",
+            found[0].create_sql
+        );
     }
 
     #[test]

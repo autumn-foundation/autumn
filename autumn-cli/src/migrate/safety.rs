@@ -659,13 +659,13 @@ fn sqlite_unsupported_clause(normalized: &str) -> Option<SafetyFinding> {
              tablespaces. Use INTEGER PRIMARY KEY AUTOINCREMENT for an identity column; model \
              partitioning in the application.",
         )
-    } else if normalized.contains(" for update") || normalized.contains(" for share") {
+    } else if has_row_locking_clause(normalized) {
         (
             "SELECT … FOR UPDATE (unsupported on SQLite)",
             "SQLite has no row-level locking clause — a write transaction locks the whole \
              database. Drop the clause.",
         )
-    } else if normalized.contains("on conflict on constraint ") {
+    } else if without_string_literals(normalized).contains("on conflict on constraint ") {
         (
             "ON CONFLICT ON CONSTRAINT (unsupported on SQLite)",
             "SQLite's upsert target is a column list, not a constraint name. Write \
@@ -686,6 +686,15 @@ fn sqlite_unsupported_clause(normalized: &str) -> Option<SafetyFinding> {
         why: "SQLite has no syntax for this statement, so the migration fails at apply time.",
         next_action,
     })
+}
+
+/// Whether the statement carries a Postgres row-locking clause.
+///
+/// Searches the literal-blanked form: an INSERT of the text
+/// `'waiting for update'` is data, not a locking clause.
+fn has_row_locking_clause(normalized: &str) -> bool {
+    let bare = without_string_literals(normalized);
+    bare.contains(" for update") || bare.contains(" for share")
 }
 
 /// Whether the statement is a `CREATE [UNIQUE] INDEX`.
@@ -3027,6 +3036,22 @@ mod tests {
             "{ok} -> {:?}",
             sqlite_ops(ok)
         );
+    }
+
+    #[test]
+    fn sqlite_unsupported_clauses_ignore_string_literal_contents() {
+        for sql in [
+            "INSERT INTO audit_log(message) VALUES ('waiting for update');",
+            "INSERT INTO audit_log(message) VALUES ('on conflict on constraint x');",
+        ] {
+            assert!(
+                !classify_sql_for(DatabaseBackend::Sqlite, sql)
+                    .iter()
+                    .any(|f| f.risk == RiskLevel::Unsupported),
+                "{sql} is ordinary data, got {:?}",
+                sqlite_ops(sql)
+            );
+        }
     }
 
     #[test]

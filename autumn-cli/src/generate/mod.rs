@@ -349,15 +349,17 @@ pub fn detect_backend_for_profile(
 /// Backend detection for the OFFLINE preflights — `migrate check`, `deploy
 /// check`, `doctor` (issue #1906 review).
 ///
-/// Differs from [`detect_backend`] in two ways that those commands require:
+/// Resolves the URL from the same layers [`detect_backend`] does — real env,
+/// the project `.env`/`.env.<profile>`, and the profile-merged `autumn.toml` —
+/// but **never exits**. The hard-error `autumn.toml` reader is right for a
+/// command about to migrate a real database; a malformed local config must not
+/// abort an offline SQL check, nor truncate `autumn doctor --json` to zero bytes
+/// mid-report.
 ///
-/// - It never reads `.env`. `migrate check` analyzes SQL files only; letting a
-///   developer's local `.env` decide the dialect would give the same checkout
-///   opposite CI verdicts.
-/// - It never exits. The hard-error `autumn.toml` reader is right for a command
-///   about to migrate a real database, but a malformed local config must not
-///   abort an offline SQL check, nor truncate `autumn doctor --json` to zero
-///   bytes mid-report.
+/// `migrate check`'s documented contract is that a bad `.env` cannot abort it,
+/// not that the file goes unread — and a `SQLite` URL living only in `.env` is a
+/// shape both the runtime and the generator support, so skipping it would grade
+/// valid `SQLite` SQL under Postgres rules.
 ///
 /// Anything it cannot determine resolves to `Postgres`, the historical default.
 #[must_use]
@@ -373,7 +375,25 @@ pub fn detect_backend_offline(
         Some(&effective),
         crate::migrate::read_optional_toml_table,
     );
-    crate::migrate::resolve_primary_database_url_from_sources(|k| std::env::var(k), table.as_ref())
+    // Same precedence as `detect_backend_with`: the real environment wins, and
+    // `.env` only fills keys it does not define. A malformed `.env` is dropped
+    // rather than surfaced — this is a best-effort hint, and the commands that
+    // act on a real URL report it loudly themselves.
+    let base = FnEnv(&|k: &str| std::env::var(k));
+    let dotenv: std::collections::BTreeMap<String, String> =
+        autumn_web::dotenv::resolve_dotenv_vars_in(project_root, &effective, &base)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let env = |key: &str| {
+        std::env::var(key).or_else(|_| {
+            dotenv
+                .get(key)
+                .cloned()
+                .ok_or(std::env::VarError::NotPresent)
+        })
+    };
+    crate::migrate::resolve_primary_database_url_from_sources(env, table.as_ref())
         .as_deref()
         .and_then(DatabaseBackend::detect)
         .unwrap_or(DatabaseBackend::Postgres)
