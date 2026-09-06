@@ -1188,13 +1188,20 @@ impl Analyzer {
             Expr::Await(a) => self.awaited_expr_is_fresh_handle(&a.base),
             Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
             Expr::Field(f) => self.expr_is_handle(&f.base) || member_is_handle_accessor(&f.member),
-            Expr::MethodCall(mc) => {
-                let method = mc.method.to_string();
-                if HANDLE_ACCESSORS.contains(&method.as_str()) {
-                    return true;
-                }
-                HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
-            }
+            // Deliberately checks only `HANDLE_ACCESSORS`, never
+            // `HANDLE_BUILDERS`: reaching this arm means the call was
+            // *awaited* (peeled through `Expr::Await`/`Expr::Try` above), and
+            // the method-chain cost counter's own rule is that an awaited
+            // builder-named call "really did run" as the terminal query — "a
+            // user finder may share a builder's name." So `let rows =
+            // repo.page(1).await?;` is correctly counted as one query by
+            // that counter, but `rows` itself is the query's *result*, not a
+            // handle; matching `HANDLE_BUILDERS` here as well would promote
+            // `rows` too and miscount a later `rows.len()` as a second query
+            // (#2546 review, round 4). A `HANDLE_ACCESSORS` name is
+            // different: those never issue a query even when awaited — they
+            // only ever produce a handle to query with next.
+            Expr::MethodCall(mc) => HANDLE_ACCESSORS.contains(&mc.method.to_string().as_str()),
             _ => false,
         }
     }

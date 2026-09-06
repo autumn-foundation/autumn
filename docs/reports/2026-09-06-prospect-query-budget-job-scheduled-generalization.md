@@ -219,6 +219,34 @@ where every other `#[query_budget]` fixture lives (no new test harness):
   workspace's own contribution rule (a user-visible `#[query_budget]`
   behavior change under `## [Unreleased]` → `### Fixed`), flagged as
   missing by the same review pass.
+- **Update (fourth Codex review round) — the same over-promotion bug, one
+  layer deeper.** `awaited_expr_is_fresh_handle`'s own `MethodCall` arm
+  copied `expr_is_handle`'s two-branch check verbatim: a `HANDLE_ACCESSORS`
+  name *or* a `HANDLE_BUILDERS` name chained off a handle. The
+  `HANDLE_BUILDERS` branch is wrong here for the same reason the plain
+  `Expr::Await` arm was wrong in round three: reaching this helper at all
+  means the call was awaited, and the query-cost counter's own rule for an
+  awaited builder-named call is that it "really did run" as the terminal
+  query ("a user finder may share a builder's name" — e.g. an app defining
+  its own `async fn page(&self, n: i64) -> Result<Vec<Post>, _>`, colliding
+  with the builder-refinement name `page` in `HANDLE_BUILDERS`). So
+  `let rows = repo.page(1).await?;` was correctly counted as one query by
+  the counter, but `awaited_expr_is_fresh_handle` *also* promoted `rows`
+  itself to a handle, and a later `rows.len()` was miscounted as a second
+  query — verified by reading the counter's own comment ("A builder name
+  refines the next query rather than issuing one — unless the chain is
+  awaited here, in which case the terminal call really did run"). Fixed by
+  dropping the `HANDLE_BUILDERS` branch from `awaited_expr_is_fresh_handle`
+  entirely — only a `HANDLE_ACCESSORS` name survives an await/`?` peel into
+  a fresh handle, since those never issue a query even when awaited. New
+  compile-pass fixture: `query_budget_awaited_builder_name_not_promoted.rs`.
+
+  Four review rounds have now each found one distinct edge of the same
+  underlying shape (an awaited/`?`-unwrapped expression can mean three
+  different things — a fresh handle, an unopened `Result`, or an executed
+  query's result — and only the first should ever be promoted). Every round
+  landed a real fix plus a regression fixture pinning it; none was a
+  documentation-only response.
 
 ## 📊 Assay
 
@@ -234,13 +262,14 @@ autumn-web --test integration_tests`, default features `db,maud,htmx,...`):
 | `query_budget_real_scheduled_accessor_n_plus_one.rs` (real `#[scheduled]`) | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in ids` |
 | `query_budget_await_try_accessor_n_plus_one.rs` (`self.conn().await?` shape) | compile-fail | **compiled clean pre-fix (confirmed false negative); compile-fail post-fix** | same diagnostic, naming `execute`, pointing at `for _id in ids` |
 | `query_budget_bare_await_not_promoted.rs` (`store.conn().await` — no `?` — then `result.is_err()`) | compile-pass | **compile-pass** | clean build at `#[query_budget(0)]` |
+| `query_budget_awaited_builder_name_not_promoted.rs` (`repo.page(1).await?` — `page` is a `HANDLE_BUILDERS` name — then `rows.len()`) | compile-pass | **compile-pass** | clean build at `#[query_budget(1)]` |
 
 First run generated fresh `.stderr` snapshots via trybuild's standard
 `wip/`-then-promote flow (no snapshot existed yet, matching how every other
 compile-fail fixture in this suite was originally added); every subsequent
 run, after moving the generated snapshots into `tests/compile-fail/`,
 reproduced them byte-for-byte (`query_budget_compile_fail_tests ... ok`,
-~5s incremental with the full 8-fixture family). `compile_pass_tests` (61
+~5s incremental with the full 8-fixture family). `compile_pass_tests` (62
 fixtures including both controls) also passed clean. The
 `autumn-macros` fix was additionally checked against the crate's own
 `#[cfg(test)]` suite (`cargo test -p autumn-macros --lib`, 1087 tests) to
@@ -330,14 +359,17 @@ Fixtures: `autumn/tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs`
 `autumn/tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs`
 (all five with pinned `.stderr` snapshots), and
 `autumn/tests/compile-pass/query_budget_job_shaped_accessor_batched.rs`,
-`autumn/tests/compile-pass/query_budget_bare_await_not_promoted.rs`.
+`autumn/tests/compile-pass/query_budget_bare_await_not_promoted.rs`,
+`autumn/tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs`.
 Wired into `autumn/tests/integration/compile_fail.rs`'s existing
 `query_budget_compile_fail_tests` / `compile_pass_tests` functions. The
 `autumn-macros` fix itself is `expr_is_handle`'s `Expr::Try` arm (no
 `Expr::Await` arm at that level — see the third-review-round update above)
-plus the new `awaited_expr_is_fresh_handle` helper and
-`chain_root_is_handle`'s comment explaining why it deliberately does *not*
-peel the same way, all in `autumn-macros/src/query_budget.rs`.
+plus the new `awaited_expr_is_fresh_handle` helper (`HANDLE_ACCESSORS`
+names only — no `HANDLE_BUILDERS` branch, see the fourth-review-round
+update above) and `chain_root_is_handle`'s comment explaining why it
+deliberately does *not* peel the same way, all in
+`autumn-macros/src/query_budget.rs`.
 
 ## 🗄️ Dismantle
 

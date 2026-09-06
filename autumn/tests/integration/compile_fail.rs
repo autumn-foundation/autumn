@@ -469,6 +469,10 @@ fn compile_pass_tests() {
     // `Result` itself to a handle (PR #2546 review, round 3) — otherwise
     // `result.is_err()` here would be miscounted as a database query.
     t.pass("tests/compile-pass/query_budget_bare_await_not_promoted.rs");
+    // An awaited call whose name collides with a `HANDLE_BUILDERS` entry is
+    // the terminal query, not a handle-refining step (PR #2546 review,
+    // round 4) — its result must not be promoted to a handle either.
+    t.pass("tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
