@@ -776,7 +776,13 @@ impl SandboxResponse {
 /// the guest side it is a *protocol*, documented in this module and in
 /// `docs/guide/sandboxed-plugins.md`, that a guest implements from the prose —
 /// a `wasm32-wasip1` guest cannot link `autumn-web` at all.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is deliberately absent: a frame can carry a
+// [`PluginValue::Float`](super::capability::PluginValue), and `f64` is not
+// `Eq`. Nothing in this crate needs total equality on a frame — tests compare
+// them, which `PartialEq` does — and the alternative was dropping floating
+// point from the plugin value vocabulary, which would have made a price
+// unrepresentable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub(crate) enum HostFrame {
@@ -804,9 +810,43 @@ pub(crate) enum HostFrame {
         #[serde(rename = "body_b64", with = "body_b64")]
         body: Vec<u8>,
     },
+    /// One render slot to fill (issue #1632).
+    ///
+    /// A separate frame rather than a request with a magic path: a render hook
+    /// is not an HTTP request, it has no URL of its own, and its answer is a
+    /// fragment rather than a response. Sharing the request frame would have
+    /// meant a guest could answer a page render with a `Set-Cookie`-bearing
+    /// response, and the host would have to decide that is not what it meant.
+    Render {
+        /// The protocol version this frame speaks.
+        wire_version: u32,
+        /// The capabilities this host is honouring.
+        granted: Vec<SandboxCapability>,
+        /// The slot to fill, which the manifest must grant.
+        slot: String,
+        /// Whatever the host chose to tell the plugin about the page.
+        context: Vec<(String, String)>,
+    },
+    /// The answer to one capability call (issue #1632).
+    CallResult(super::capability::CallResult),
 }
 
 impl HostFrame {
+    /// Build the render frame for one slot.
+    #[must_use]
+    pub(crate) fn render(
+        slot: &str,
+        context: &[(String, String)],
+        granted: &[SandboxCapability],
+    ) -> Self {
+        Self::Render {
+            wire_version: WIRE_VERSION,
+            granted: granted.to_vec(),
+            slot: slot.to_owned(),
+            context: context.to_vec(),
+        }
+    }
+
     /// Build the request frame for `request`, stripping credentials and
     /// canonicalizing headers.
     #[must_use]
@@ -826,7 +866,8 @@ impl HostFrame {
 }
 
 /// A frame the guest sends back. Either one ends the exchange.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` absent for the same reason [`HostFrame`]'s is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub(crate) enum GuestFrame {
@@ -837,6 +878,29 @@ pub(crate) enum GuestFrame {
     Error {
         /// What went wrong, for the log.
         detail: String,
+    },
+    /// The plugin asking the host to do something on its behalf (issue #1632).
+    ///
+    /// **Not terminal.** Every other frame here ends the exchange; this one
+    /// suspends it: the host answers with a
+    /// [`HostFrame::CallResult`] appended to the guest's stdin, and the guest
+    /// reads it and carries on. That is what turns a one-shot dialogue into a
+    /// capability channel without adding a single import to the module.
+    Call(super::capability::CapabilityCall),
+    /// The plugin's answer to a [`HostFrame::Render`].
+    Fragment {
+        /// The fragment tree. See [`render`](super::capability::render) for why
+        /// it is a tree and not a string of HTML.
+        ///
+        /// Bounded while it is read, like the `attributes` and `children`
+        /// vectors inside it: `render` applies `MAX_NODES` to a tree serde has
+        /// already built, and `SandboxHost::execute` then clones it. This is
+        /// the root of that tree, so leaving it unbounded left the whole point
+        /// of bounding the branches unfinished.
+        #[serde(
+            deserialize_with = "super::capability::bounded_tree::<_, { super::capability::render::MAX_NODES }>"
+        )]
+        nodes: Vec<super::capability::FragmentNode>,
     },
 }
 
@@ -1355,7 +1419,10 @@ mod tests {
             path,
             body,
             ..
-        } = back;
+        } = back
+        else {
+            panic!("a request frame round-trips as a request frame")
+        };
         assert_eq!(wire_version, WIRE_VERSION);
         assert_eq!(granted, vec![SandboxCapability::HttpRequest]);
         assert_eq!(method, "GET");
@@ -1373,7 +1440,9 @@ mod tests {
         // which is the property that survives the next proxy vendor inventing
         // an identity header nobody has heard of.
         assert!(!json.contains("x-trace"), "{json}");
-        let HostFrame::Request { headers, .. } = frame;
+        let HostFrame::Request { headers, .. } = frame else {
+            panic!("`HostFrame::request` builds a request frame")
+        };
         assert_eq!(headers, vec![("accept".to_owned(), "text/html".to_owned())]);
     }
 
@@ -1386,7 +1455,10 @@ mod tests {
             ("accept".to_owned(), "second".to_owned()),
         ];
         let HostFrame::Request { headers, .. } =
-            HostFrame::request(&req, &[SandboxCapability::HttpRequest]);
+            HostFrame::request(&req, &[SandboxCapability::HttpRequest])
+        else {
+            panic!("`HostFrame::request` builds a request frame")
+        };
         assert_eq!(
             headers,
             vec![
@@ -1535,7 +1607,10 @@ mod tests {
             ("X-Trace".to_owned(), "abc".to_owned()),
         ];
         let HostFrame::Request { headers, .. } =
-            HostFrame::request(&req, &[SandboxCapability::HttpRequest]);
+            HostFrame::request(&req, &[SandboxCapability::HttpRequest])
+        else {
+            panic!("`HostFrame::request` builds a request frame")
+        };
         assert_eq!(
             headers,
             vec![("accept".to_owned(), "text/plain".to_owned())],
@@ -1555,7 +1630,10 @@ mod tests {
             ("user-agent".to_owned(), "curl".to_owned()),
         ];
         let HostFrame::Request { headers, .. } =
-            HostFrame::request(&req, &[SandboxCapability::HttpRequest]);
+            HostFrame::request(&req, &[SandboxCapability::HttpRequest])
+        else {
+            panic!("`HostFrame::request` builds a request frame")
+        };
         assert_eq!(headers.len(), 6, "{headers:?}");
     }
 

@@ -234,6 +234,19 @@ async fn main() {
 Use `.one_off_tasks(one_off_tasks![...])` for `#[task]` handlers invoked by
 `autumn task <name>`.
 
+`#[autumn_web::main]` takes optional arguments that tune the tokio runtime it
+builds — `flavor` (`"multi_thread"`, the default, or `"current_thread"`),
+`worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`,
+`thread_keep_alive = "30s"`, and `configure = path::to::fn`, a
+`fn(&mut tokio::runtime::Builder)` run after the others as the escape hatch for
+`Builder` methods the list doesn't name (unreleased). Numeric arguments take
+expressions, not only literals. Reach for them only with a measurement in hand:
+with no arguments the runtime is tokio's defaults, and the job runner,
+scheduled tasks, and mailer share it, so an undersized worker count throttles
+those too. An unknown, repeated, or zero-valued argument — or `worker_threads`
+under `flavor = "current_thread"`, where it would do nothing — is a compile
+error. See `docs/guide/getting-started.md` "Tuning the Tokio runtime".
+
 ## AppBuilder API
 
 | Method | Purpose |
@@ -2460,8 +2473,19 @@ name = "autumn-plugin-hello"
 version = "0.1.0"
 wire_version = 1
 prefix = "/hello"
-capabilities = ["http-request"]     # the only capability that exists in slice 1
+# `http-request` plus, since #1632: kv, http-outbound, db, jobs, render.
+capabilities = ["http-request", "kv", "http-outbound", "db", "jobs", "render"]
 sha256 = "0000…"                    # stamped by `autumn plugin package`
+
+[grants]                  # what each capability is scoped to; BOTH ways enforced
+hosts     = ["api.example.com"]   # http-outbound may call exactly these
+tables    = ["orders"]            # db owns exactly these, tenant-scoped
+job_types = ["reindex"]           # jobs may enqueue exactly these
+slots     = ["order-summary"]     # render may fill exactly these
+
+[quotas]                  # per request, operator-tunable; conservative defaults
+kv_reads = 64
+outbound_calls = 4
 
 [[routes]]
 method = "GET"
@@ -2480,14 +2504,60 @@ request_body_timeout_ms = 5_000  # a dribbled body cannot pin a permit (408)
 autumn plugin package --manifest plugin.toml --module hello.wasm --out hello.autumn-plugin
 autumn plugin inspect hello.autumn-plugin            # the consent screen; exits 1 if unfit
 autumn plugin inspect hello.autumn-plugin --format json
+# Review an upgrade AS an upgrade: prints what the new manifest asks for that
+# the approved one did not, and exits non-zero when authority grew (#1632).
+autumn plugin inspect new.autumn-plugin --against installed.autumn-plugin
 ```
 
 ```rust
-let hello = autumn_web::plugin_sandbox::SandboxedPlugin::from_file(
-    std::path::Path::new("plugins/hello.autumn-plugin"),
-)?;
+use std::sync::Arc;
+use autumn_web::plugin_sandbox::{
+    CapabilityServices, KvStore, MemoryKvStore, RenderSlots, SandboxedPlugin,
+};
+
+let hello = SandboxedPlugin::from_file(std::path::Path::new("plugins/hello.autumn-plugin"))?
+    // Capabilities are honoured against backends YOU wire. Anything unwired is
+    // answered `unavailable` and recorded — a refusal, never a silent success.
+    // The `as Arc<dyn KvStore>` is load-bearing: unsizing does not pass through
+    // `Option`, so `Some(MemoryKvStore::new())` will not coerce on its own.
+    .with_services(CapabilityServices {
+        kv: Some(MemoryKvStore::new() as Arc<dyn KvStore>),
+        ..CapabilityServices::none()
+    });
+
+// Render slots need both halves: the manifest names the slots the plugin will
+// fill, the app declares the slots that exist. `with` fails at boot on a
+// mismatch; `render` returns a String and never breaks the page.
+let slots = RenderSlots::declaring(["order-summary"]).with(Arc::new(hello.clone()))?;
+let fragment: String = slots.render("order-summary", &[]).await;
+
+// "What did this plugin do in the last hour" — one surface, shapes not values.
+// `Display`: the summary already knows its plugin and its window.
+let summary = hello.activity().summary("autumn-plugin-hello", std::time::Duration::from_secs(3600));
+println!("{summary}");
+
 autumn_web::app().plugin(hello).run().await;
 ```
+
+**Capabilities are data, not code (#1632).** A plugin granted every capability
+imports exactly what a plugin granted none imports — `fd_read` and `fd_write`.
+The guest asks over the NDJSON channel it already answers requests on:
+`{"op":"call","call":"kv-get","id":1,"key":"cart"}` in, `{"op":"call_result",
+"status":"ok"|"denied",…}` back, then its `response` frame. A refusal is a frame
+the guest can read (`capability-not-granted`, `not-in-grant`, `quota-exceeded`,
+`malformed`, `unavailable`, `backend-error`), never a trap — so a plugin over a
+ceiling degrades instead of 502ing.
+
+Scoping is **derivation, not checking**: the guest names a logical key, table,
+host or job type and the host derives `plugin-kv:<plugin>:<tenant>:<key>` /
+`plugin_<hex-escaped plugin>__<table>` from the manifest and the active tenant
+(the escape is injective, so a plugin *named* `shop_orders` owning `v2` cannot
+land on the table `shop` owning `orders_v2` already has). There is no
+field in the protocol where another tenant, another plugin, a host-app table or
+SQL would go, so cross-tenant access is unspellable rather than refused. Render
+hooks return a fragment **tree** the host renders (no HTML parser, so no parser
+differential; nothing needs `unsafe-inline`), and a hook that traps or overruns
+`render_bytes` omits the fragment rather than breaking the page.
 
 **What the runtime enforces.** The guest's entire authority is the WASI shim's
 import list: no filesystem, no network, no environment, no database, each
@@ -2524,8 +2594,17 @@ rest of the app.
   origin carries your origin's authority.
 - `SystemTime::now()` is a fixed instant; `random_get` is deterministic, seeded
   from the request. Neither is entropy.
-- One frame in, one frame out, NDJSON over stdio. A frame must end with `\n`
-  (`println!`, not `print!`) or the host reports a partial frame.
+- One frame in, one frame out, NDJSON over stdio — except a `call` frame, which
+  suspends rather than ends the exchange (the answer arrives on stdin). A frame
+  must end with `\n` (`println!`, not `print!`) or the host reports a partial
+  frame; a guest that writes calls without reading the answers is stopped.
+- A `[grants]` list and its capability must agree **both** ways: a `hosts` list
+  without `http-outbound` is refused, and so is `db` with no `tables`.
+- Outbound hosts are matched by exact equality — no suffix, no wildcard — and a
+  URL with userinfo, a non-http(s) scheme or an IP literal is refused outright.
+  Redirects are not followed on the plugin's behalf.
+- A plugin row may not carry `tenant_id` (it would choose its own tenant); a
+  `row_id` echoed back from `db-get` is stripped, so read-modify-write works.
 
 Guide: `docs/guide/sandboxed-plugins.md`. Trust model: `docs/plugins.md`.
 
@@ -2626,7 +2705,21 @@ autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.j
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
 autumn agents manifest           # agent authority manifest: one row per `#[agent_operable]` action with its grant, proved effects (writes, unbounded writes, cross-tenant reach, outbound, webhooks, jobs), provenance, and unused grant entries; plus every MCP-exposed tool with no envelope (#1691)
 autumn agents manifest --manifest agent-authority.json --check agent-authority.json   # write it, and fail on drift, on any ungoverned mutating MCP tool (`--allow-ungoverned`), or on an unaudited deployment that can act irreversibly (`--allow-unaudited`)
+autumn graph show                # the application architecture graph the macros declare: a node per `#[route]`/`#[static_get]`, `#[model]`, `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]`, each route with its mounted path and declared auth requirement, plus edges for repository→model and every model/table a route or job names (#1747)
+autumn graph touches posts       # which routes and jobs reach a model, table, or repository — transitively, so a handler that only takes `PgPostRepository` is included
+autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
+autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
+autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 ```
+
+Reach for `autumn graph` before reading a codebase to answer a structural
+question. It is derived from the macros at compile time and embedded in the
+binary, so it cannot drift from the code: `/actuator/graph` serves the same
+document from a running app (sensitive-gated, like `/actuator/env`). Edges from
+a route or job are read off that item's own tokens and are deliberately
+over-reported; the document carries its own `limits` section, and the biggest
+one is that a call into a helper in another module is not followed. See
+`docs/guide/architecture-graph.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)
 

@@ -31,6 +31,7 @@ mod experiments;
 mod export;
 mod flags;
 mod generate;
+mod graph;
 mod http;
 mod i18n;
 mod jobs;
@@ -379,6 +380,79 @@ pub struct AgentsManifestArgs {
     release: bool,
 }
 
+/// Arguments for `autumn graph` (issue #1747).
+///
+/// A separate `Args` struct for the same reason as [`AgentsManifestArgs`]:
+/// clap's derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct GraphArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON architecture graph to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON graph to stdout instead of the human report.
+    ///
+    /// Only meaningful for `show`: `touches` and `impact` are answers, not
+    /// documents.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed graph and exit non-zero on drift, so a
+    /// route that quietly lost its access to a table — or a declared element
+    /// that vanished from the graph — has to be reviewed rather than merged
+    /// silently. This is the CI gate.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). A model, route or job behind a
+    /// feature the build does not enable is not compiled in, so it cannot
+    /// appear in the graph.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Inspect the release binary rather than the debug one.
+    ///
+    /// The graph describes the binary that produced it, and a debug binary is
+    /// not the one that ships: an element behind `#[cfg(not(debug_assertions))]`
+    /// exists only in the release build. Run `--check` in CI under the profile
+    /// you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn graph`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum GraphSubcommands {
+    /// Print the whole architecture graph.
+    Show(GraphArgs),
+    /// Which routes and jobs touch a model, table or repository.
+    Touches {
+        /// Model name, table name, repository trait, or generated `Pg*` type.
+        name: String,
+        #[command(flatten)]
+        args: GraphArgs,
+    },
+    /// What a change to a model, table or repository would affect.
+    Impact {
+        /// Model name, table name, repository trait, or generated `Pg*` type.
+        name: String,
+        #[command(flatten)]
+        args: GraphArgs,
+    },
+}
+
 /// Subcommands for `autumn agents`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum AgentsSubcommands {
@@ -638,6 +712,17 @@ pub enum PluginSubcommands {
         /// Output format: `text` (default) or `json`.
         #[arg(long, default_value = "text", value_name = "FORMAT")]
         format: String,
+        /// The artifact currently installed, to review this one as an *upgrade*
+        /// (issue #1632).
+        ///
+        /// An upgrade is the moment a plugin's authority can grow without
+        /// anybody looking. With this, `inspect` prints exactly what the new
+        /// manifest asks for that the approved one did not — new capabilities,
+        /// new hosts, tables, job types, render slots, raised quotas — and
+        /// exits non-zero when there is anything, so an unattended install
+        /// stops rather than consenting on the operator's behalf.
+        #[arg(long, value_name = "ARTIFACT")]
+        against: Option<String>,
     },
 }
 
@@ -1847,6 +1932,25 @@ enum Commands {
     /// copy.
     #[command(name = "data-flow")]
     DataFlow(DataFlowArgs),
+
+    /// Query the application's architecture graph (#1747).
+    ///
+    /// Compiles the app and reads back the graph the framework derives from its
+    /// macros: a node for every `#[route]`/`#[static_get]`, `#[model]`,
+    /// `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]`, and an edge for
+    /// every repository→model declaration and every model, table or repository
+    /// a route or job names. Because the elements are declared through macros
+    /// autumn owns, no declared element can be missing.
+    ///
+    /// # Examples
+    ///
+    ///   autumn graph show
+    ///   autumn graph touches posts
+    ///   autumn graph impact Post
+    ///   autumn graph show --manifest architecture-graph.json
+    ///   autumn graph show --check architecture-graph.json --release
+    #[command(subcommand, verbatim_doc_comment)]
+    Graph(GraphSubcommands),
 
     /// Derive and enforce this build's capacity contract (issue #1733).
     ///
@@ -4710,6 +4814,28 @@ fn run_command(command: Commands) {
                 features,
             });
         }
+        Commands::Graph(command) => {
+            let (query, args) = match command {
+                GraphSubcommands::Show(args) => (graph::Query::Show, args),
+                GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
+                GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
+            };
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            graph::run(&graph::GraphOptions {
+                query,
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                features,
+                release: args.release,
+            });
+        }
         Commands::DataFlow(args) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -5094,12 +5220,20 @@ fn run_command(command: Commands) {
                     });
                     0
                 }
-                PluginSubcommands::Inspect { artifact, format } => {
+                PluginSubcommands::Inspect {
+                    artifact,
+                    format,
+                    against,
+                } => {
                     let format = format.parse().unwrap_or_else(|e| {
                         eprintln!("autumn plugin inspect: {e}");
                         std::process::exit(1);
                     });
-                    plugin_sandbox::run_inspect(std::path::Path::new(&artifact), &format);
+                    plugin_sandbox::run_inspect(
+                        std::path::Path::new(&artifact),
+                        &format,
+                        against.as_deref().map(std::path::Path::new),
+                    );
                     0
                 }
             };
@@ -8968,10 +9102,40 @@ mod tests {
             .expect("parses");
         match cli.command {
             Commands::Plugin {
-                action: PluginSubcommands::Inspect { artifact, format },
+                action:
+                    PluginSubcommands::Inspect {
+                        artifact,
+                        format,
+                        against,
+                    },
             } => {
                 assert_eq!(artifact, "hello.autumn-plugin");
                 assert_eq!(format, "text");
+                // No `--against`: reviewing an artifact on its own, not as an
+                // upgrade. The upgrade gate must not fire when nobody asked
+                // for it (issue #1632).
+                assert_eq!(against, None);
+            }
+            _ => panic!("expected plugin inspect"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_inspect_accepts_an_upgrade_baseline() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "inspect",
+            "shop-0.2.autumn-plugin",
+            "--against",
+            "shop-0.1.autumn-plugin",
+        ])
+        .expect("parses");
+        match cli.command {
+            Commands::Plugin {
+                action: PluginSubcommands::Inspect { against, .. },
+            } => {
+                assert_eq!(against.as_deref(), Some("shop-0.1.autumn-plugin"));
             }
             _ => panic!("expected plugin inspect"),
         }
