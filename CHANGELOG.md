@@ -1742,6 +1742,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SQLite pool construction accepted a target that names no backend (issue
+  #1905):** under `--features sqlite`, `build_sqlite_pool` guarded only
+  against a Postgres target. Everything else fell through to
+  `normalize_sqlite_target`, which strips the `sqlite:` / `sqlite://` schemes
+  and passes anything it does not recognize along verbatim — as a
+  **filename** — so a `mysql://…` URL, a typo of the scheme
+  (`sqllite:///app.db`) or a bare filesystem path (`/var/lib/app.db`) built a
+  pool over a junk file rather than refusing. On the ordinary boot path
+  `DatabaseConfig::validate` already rejects those shapes, so this was not a
+  live misboot for an app configured through `autumn.toml`; the gap was in
+  the **public** `create_pool` / `create_topology` / `create_shard_topology`
+  API, which a programmatically-built `DatabaseConfig` or a custom
+  `DatabasePoolProvider` reaches without that screen. The pool is the layer
+  that decides what the string *means*, so it now decides the same way
+  everything else does: it accepts only a target `DatabaseBackend::detect`
+  classifies as SQLite — the same predicate `autumn doctor`, the generator's
+  DDL mapping and `autumn migrate` use — and its refusal names both the
+  offending target and the accepted spellings (`sqlite:<path>`,
+  `sqlite://<path>`, `file:<path>`). This makes the runtime match the
+  published contract that a bare filesystem path is not a recognized SQLite
+  target.
+
+- **The SQLite backend's own unit tests never ran in CI (issue #1905):** the
+  `sqlite-runtime` job builds the crate, lints it with `clippy --lib`, then
+  runs `cargo test … --test <name>`. `--test` selects test *targets*, so the
+  ~26 `#[cfg(feature = "sqlite")]` unit tests inside the crate — pool sizing,
+  the replica rejections, in-memory/read-only target classification, provider
+  dispatch — were compiled on every run and executed on none. Under that
+  blind spot the ungated pool and topology tests sitting beside them had
+  rotted into 10 hard failures against the backend flip, because their
+  fixtures hard-code `postgres://` URLs the SQLite pool refuses. Those
+  fixtures are now backend-parametric (the mechanics they assert — `max_size`,
+  the connect-timeout → wait/create mapping, replica retention, the read-pool
+  fallback — are backend-independent, so they now run on *both* backends
+  rather than being silenced on one), and the job gained a
+  `--features sqlite --lib` step covering every module that carries
+  SQLite-specific logic. The `sqlite_json_field_conversion` `[[test]]` target
+  (#1341), declared in `autumn/Cargo.toml` and named by no CI lane, is now
+  run by the integration step alongside its siblings.
+
+
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body

@@ -1531,16 +1531,48 @@ fn build_sqlite_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
-    // Under the `sqlite` feature the runtime targets SQLite. A Postgres URL here
-    // is a misconfiguration — refuse with an actionable message rather than
-    // trying to open a file literally named "postgres://…".
-    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Postgres)
-    {
-        return Err(PoolError::UnsupportedBackend(format!(
-            "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but the \
-             configured database URL is a Postgres target; configure a `sqlite:` URL instead \
-             (target: {url:?})"
-        )));
+    // Under the `sqlite` feature the runtime targets SQLite, so the URL must
+    // actually NAME a SQLite target. Everything past this point treats the
+    // string as a filename: `normalize_sqlite_target` strips the `sqlite:` /
+    // `sqlite://` schemes and passes anything else through verbatim, so an
+    // unguarded target is opened as a file whose name happens to be that
+    // string. Refuse anything `DatabaseBackend::detect` does not classify as
+    // SQLite, with a message that names the offending target and the fix.
+    //
+    // Two shapes reach this guard and both used to fail open:
+    //
+    //   * A Postgres target — a build/config mismatch, and the message says so
+    //     specifically rather than talking about schemes.
+    //   * Anything `detect` returns `None` for: another backend's URL
+    //     (`mysql://…`), a typo of the scheme (`sqllite:///app.db`), or a bare
+    //     filesystem path (`/var/lib/app.db`), which `DatabaseBackend`
+    //     deliberately does not recognize. `DatabaseConfig::validate` rejects
+    //     these too, so the ordinary `AutumnConfig::load` boot path never
+    //     reaches this arm — but `create_pool`, `create_topology` and
+    //     `create_shard_topology` are public and a programmatically-built
+    //     `DatabaseConfig` or a custom `DatabasePoolProvider` gets here without
+    //     that screen. Accepting them would split the runtime from every other
+    //     consumer of the same URL — `autumn doctor`, the generator's DDL
+    //     mapping and `autumn migrate` all classify through `detect` and would
+    //     report "no recognized backend" while this pool quietly served a
+    //     database out of a junk file.
+    match crate::config::DatabaseBackend::detect(url) {
+        Some(crate::config::DatabaseBackend::Sqlite) => {}
+        Some(crate::config::DatabaseBackend::Postgres) => {
+            return Err(PoolError::UnsupportedBackend(format!(
+                "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but \
+                 the configured database URL is a Postgres target; configure a `sqlite:` URL \
+                 instead (target: {url:?})"
+            )));
+        }
+        None => {
+            return Err(PoolError::UnsupportedBackend(format!(
+                "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but \
+                 the configured database URL names no recognized database backend; configure a \
+                 SQLite target spelled `sqlite:<path>`, `sqlite://<path>`, or `file:<path>` — a \
+                 bare filesystem path is not accepted (target: {url:?})"
+            )));
+        }
     }
 
     let timeout = Duration::from_secs(connect_timeout_secs);
@@ -4221,12 +4253,56 @@ mod tests {
         assert_eq!(via_provider.is_none(), via_function.is_none());
     }
 
+    // ── Backend-neutral test targets ─────────────────────────────
+    //
+    // The pool/topology mechanics below — max_size, the connect-timeout →
+    // wait/create mapping, replica retention, the read-pool fallback — are
+    // backend-independent, so they must hold on whichever backend
+    // `RuntimeConnection` resolves to. They used to hard-code
+    // `postgres://…`, which `build_sqlite_pool` refuses outright, so under
+    // `--features sqlite` every one of them panicked. Nothing noticed,
+    // because no CI lane ran the lib tests under that feature (fixed in the
+    // `sqlite-runtime` job alongside this change). Routing them through these
+    // helpers runs the same assertions on both backends instead of silencing
+    // them on one.
+    //
+    // The SQLite spelling is a SHARED-CACHE in-memory target on purpose: it is
+    // in-memory (no files, no cleanup) but `sqlite_target_is_memory` exempts
+    // `cache=shared` from the single-slot rule, so the configured `max_size`
+    // still reaches the pool and the sizing assertions stay meaningful.
+    // deadpool is lazy, so no connection is ever opened by these tests.
+    #[cfg(not(feature = "sqlite"))]
+    fn test_primary_url(name: &str) -> String {
+        format!("postgres://localhost/{name}")
+    }
+    #[cfg(feature = "sqlite")]
+    fn test_primary_url(name: &str) -> String {
+        format!("sqlite:file:{name}?mode=memory&cache=shared")
+    }
+
+    /// A replica target for `primary`.
+    ///
+    /// On Postgres a replica is a genuinely distinct database. SQLite has no
+    /// replication in this pool architecture, so `reject_unusable_sqlite_replica`
+    /// only accepts a replica that normalizes to the SAME target as the primary
+    /// — which is exactly what these mechanics tests need (two pools, distinct
+    /// sizes) and is asserted in its own right by the
+    /// `create_topology_rejects_*_sqlite_replica` tests above.
+    #[cfg(not(feature = "sqlite"))]
+    fn test_replica_url(_primary: &str, name: &str) -> String {
+        format!("postgres://localhost/{name}")
+    }
+    #[cfg(feature = "sqlite")]
+    fn test_replica_url(primary: &str, _name: &str) -> String {
+        primary.to_owned()
+    }
+
     // ── Pool creation tests ──────────────────────────────────────
 
     #[tokio::test]
     async fn default_pool_provider_respects_url_config() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             ..Default::default()
         };
         let provider = DieselDeadpoolPoolProvider::new();
@@ -4250,7 +4326,7 @@ mod tests {
     #[test]
     fn create_pool_with_url_returns_some() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             ..Default::default()
         };
         let pool = create_pool(&config).expect("should build pool from valid config");
@@ -4324,6 +4400,46 @@ mod tests {
             panic!("a Postgres url must refuse under the sqlite feature");
         };
         assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // A target that names NEITHER backend must refuse too, not be opened as a
+    // file whose name happens to be that string. `normalize_sqlite_target`
+    // strips only the `sqlite:`/`sqlite://` schemes and passes anything else
+    // through verbatim, so before this guard a `mysql:app.db` URL — or a typo
+    // like `sqllite:///app.db` — became a SQLite *filename*. Worse, every other
+    // consumer of the URL (`autumn doctor`, the generator's DDL mapping,
+    // `autumn migrate`) classifies it through `DatabaseBackend::detect`, which
+    // returns `None` for these shapes: the tooling would report "no recognized
+    // backend" while the runtime quietly served a database out of a junk file.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_with_unrecognized_url_refuses_under_sqlite_feature() {
+        for url in [
+            "mysql://localhost/app",
+            "mysql:app.db",
+            // A near-miss typo of the sqlite scheme.
+            "sqllite:///var/lib/app.db",
+            // A bare filesystem path: deliberately NOT a recognized target (see
+            // `DatabaseBackend`), so it must not silently become one here.
+            "/var/lib/app.db",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.into()),
+                ..Default::default()
+            };
+            let Err(err) = create_pool(&config) else {
+                panic!("an unrecognized url must refuse under the sqlite feature: {url}");
+            };
+            assert!(
+                matches!(err, PoolError::UnsupportedBackend(_)),
+                "expected UnsupportedBackend for {url}, got: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("sqlite:") && msg.contains(url),
+                "message must name the offending target and the accepted scheme, got: {msg}"
+            );
+        }
     }
 
     // A SQLite runtime has no primary/replica replication in this pool
@@ -4737,7 +4853,7 @@ mod tests {
     #[test]
     fn pool_respects_max_size() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             pool_size: 5,
             ..Default::default()
         };
@@ -4750,7 +4866,7 @@ mod tests {
     #[test]
     fn pool_clamps_size_to_one_if_zero() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             pool_size: 0,
             ..Default::default()
         };
@@ -4768,9 +4884,10 @@ mod tests {
 
     #[test]
     fn database_topology_builds_primary_and_replica_pools() {
+        let primary = test_primary_url("primary");
         let config = DatabaseConfig {
-            primary_url: Some("postgres://localhost/primary".into()),
-            replica_url: Some("postgres://localhost/replica".into()),
+            primary_url: Some(primary.clone()),
+            replica_url: Some(test_replica_url(&primary, "replica")),
             primary_pool_size: Some(6),
             replica_pool_size: Some(2),
             ..Default::default()
@@ -4791,7 +4908,7 @@ mod tests {
     #[test]
     fn database_topology_single_url_builds_only_primary_pool() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/single".into()),
+            url: Some(test_primary_url("single")),
             pool_size: 5,
             ..Default::default()
         };
@@ -4808,7 +4925,7 @@ mod tests {
     #[test]
     fn config_runtime_drift_pool_applies_connect_timeout_to_wait_and_create() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             connect_timeout_secs: 7,
             ..Default::default()
         };
@@ -4844,7 +4961,7 @@ mod tests {
     #[test]
     fn database_topology_read_pool_falls_back_to_primary() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/read-fallback".into()),
+            url: Some(test_primary_url("read-fallback")),
             pool_size: 3,
             ..Default::default()
         };
@@ -4881,7 +4998,7 @@ mod tests {
     #[tokio::test]
     async fn database_topology_primary_only_has_no_replica() {
         let config = DatabaseConfig {
-            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
+            primary_url: Some(test_primary_url("db")),
             ..DatabaseConfig::default()
         };
         let topology = create_topology(&config).unwrap().unwrap();
@@ -4897,9 +5014,10 @@ mod tests {
 
     #[tokio::test]
     async fn database_topology_from_pools_retains_replica() {
+        let primary = test_primary_url("primary");
         let config = DatabaseConfig {
-            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
-            replica_url: Some("postgres://user:pass@localhost/db_replica".to_string()),
+            primary_url: Some(primary.clone()),
+            replica_url: Some(test_replica_url(&primary, "db_replica")),
             ..DatabaseConfig::default()
         };
         let topology = create_topology(&config).unwrap().unwrap();
