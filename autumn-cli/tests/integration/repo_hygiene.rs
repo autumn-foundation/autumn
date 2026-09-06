@@ -1040,17 +1040,28 @@ fn sqlite_test_targets_are_ci_named() {
     // bare name, and only in live YAML: `strip_yaml_comments` removes commented
     // -out invocations and prose mentions, so neither can satisfy the check.
     let workflows_dir = root.join(".github/workflows");
-    let mut invocations = String::new();
+    let mut workflow_source = String::new();
     for entry in std::fs::read_dir(&workflows_dir)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflows_dir.display()))
         .flatten()
     {
         if let Ok(body) = std::fs::read_to_string(entry.path()) {
-            invocations.push_str(&strip_yaml_comments(&body).replace('\\', " "));
-            invocations.push(' ');
+            workflow_source.push_str(&strip_yaml_comments(&body).replace('\\', " "));
+            workflow_source.push(' ');
         }
     }
-    let invocations = invocations.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Whole tokens, not a substring: `--test sim_chaos_crash` must not satisfy
+    // the check for `sim_chaos`, or dropping the standalone entry for a target
+    // whose name prefixes another would leave that suite silently unrun.
+    let tokens: Vec<&str> = workflow_source.split_whitespace().collect();
+    let is_invoked = |target: &str| {
+        tokens
+            .windows(2)
+            .any(|pair| pair.first() == Some(&"--test") && pair.get(1) == Some(&target))
+            || tokens
+                .iter()
+                .any(|token| token.strip_prefix("--test=") == Some(target))
+    };
 
     // Pair each `[[test]]` name with its path, then keep only the sqlite-gated
     // ones.
@@ -1085,7 +1096,7 @@ fn sqlite_test_targets_are_ci_named() {
 
     for target in gated {
         assert!(
-            invocations.contains(&format!("--test {target}")),
+            is_invoked(&target),
             "a CI workflow must run `--test {target}`; a sqlite-gated target missing from \
              the sqlite job's named list compiles to an empty binary and never runs — \
              see issue #1908",
