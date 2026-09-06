@@ -278,9 +278,17 @@ LABEL_MAX_OPT = '{0,999}'
 # is therefore not an edge, so a stale image reference cannot keep an orphan
 # alive. The nested pattern still resolves the outer target of a linked image,
 # `[![alt](img.png)](page.md)`, which IS navigation.
-MD_LINK = re.compile(r'(?<![\\!])\[' + FLAT + r'*\]' + DEST)
+# The LABEL is captured because an empty one is not a route: `[](x.md)`
+# renders an anchor with no content, so there is nothing on screen and
+# nothing to click, and counting it let an invisible link conceal a real
+# orphan. Whitespace-only counts as empty, which is the rule the sibling
+# already applies (`strip_empty_links`, check-migration-guides.sh:502-509).
+# An IMAGE label is not empty — `[![alt](img.png)](page.md)` renders a
+# clickable image — and needs no exception, since the label text is not
+# blank.
+MD_LINK = re.compile(r'(?<![\\!])\[(' + FLAT + r'*)\]' + DEST)
 MD_LINK_NESTED = re.compile(
-    r'(?<![\\!])\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]' + DEST)
+    r'(?<![\\!])\[((?:' + FLAT + r'|\[' + FLAT + r'*\])*)\]' + DEST)
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
@@ -930,6 +938,7 @@ RAW_BLOCK_TYPE7 = re.compile(
 # ANCHOR_TAG needs it: `<a title="1 > 0" href="mail.md">` hid the href behind a
 # quoted `>`, so a link the reader CAN click stopped counting — the direction
 # that reports a reachable page as an orphan.
+ANCHOR_CLOSE = re.compile(r'</a' + _TWS + r'*>', re.I)
 ANCHOR_HREF = re.compile(
     r'<a(?:' + _TWS + r'+' + ATTR + r')*?'
     + _TWS + r'+href' + _TWS + r'*=' + _TWS +
@@ -1408,7 +1417,8 @@ def edges_from(f):
     # 1. Escapes fold FIRST — see `fold_escapes` for which three and why. It
     #    has to precede masking, or `mask_invisible` reads `\![x](y.md)` as an
     #    image and blanks a live link.
-    txt = fold_escapes(read(f))
+    raw = fold_escapes(read(f))
+    txt = raw
     # 2. Raw HTML is identified BEFORE comments. A `<!--` inside a closed
     #    `<script>` is script data, not a Markdown comment, and parsing comments
     #    first truncated the document at it. This order also settles the
@@ -1508,7 +1518,14 @@ def edges_from(f):
 
     for pattern in (MD_LINK, MD_LINK_NESTED):
         for m in pattern.finditer(md_txt):
-            add_relative(m.group(1) if m.group(1) is not None else m.group(2))
+            # Emptiness is judged on the text BEFORE masking. Every masker
+            # replaces space for space, so the offsets still line up — and a
+            # label holding an image has been blanked by then, which would
+            # otherwise read as empty and drop the one link the reader can
+            # actually click on `[![alt](img.png)](page.md)`.
+            if not raw[m.start(1):m.end(1)].strip():
+                continue
+            add_relative(m.group(2) if m.group(2) is not None else m.group(3))
 
     # Anchors read `txt`, NOT the raw-block-stripped view. A type-6 block
     # suppresses MARKDOWN inside it, but its raw HTML is passed through and
@@ -1522,9 +1539,18 @@ def edges_from(f):
     # what an anchor is; the other only says where its destination sits.
     for tag in ANCHOR_TAG.finditer(txt):
         m = ANCHOR_HREF.search(tag.group(0))
-        if m:
-            add_relative(next(g for g in m.groups() if g is not None),
-                         markdown=False)
+        if not m:
+            continue
+        # An anchor with no content is nothing to click, the same as `[](x.md)`
+        # — the href is metadata and the reader is left with an empty element.
+        # An `<img>` inside IS content, which falls out of testing for
+        # non-whitespace rather than for text.
+        close = ANCHOR_CLOSE.search(raw, tag.end())
+        inner = raw[tag.end():close.start()] if close else raw[tag.end():]
+        if not inner.strip():
+            continue
+        add_relative(next(g for g in m.groups() if g is not None),
+                     markdown=False)
 
     # A reference USE inside code — `` `[mail][]` `` — is the one code case that
     # does not count, and it is not an exception to the visible/invisible rule
@@ -3330,6 +3356,39 @@ self_test() {
     > "$c9gy/README.md"
   git -C "$c9gy" add -A && git -C "$c9gy" commit -qm entity-in-code-span
   check "a character reference in a code span stays literal" fail "$c9gy"
+
+  # `[](x.md)` renders an anchor with no content: nothing to see, nothing to
+  # click, so it is not a route.
+  local c9gz="$tmp/c9gz"; make_corpus "$c9gz"
+  printf '# Jobs\n\n[](mail.md)\n' > "$c9gz/docs/guide/jobs.md"
+  git -C "$c9gz" add -A && git -C "$c9gz" commit -qm empty-label-link
+  check "an empty link label is not an edge" fail "$c9gz"
+
+  # ...and whitespace is empty, the rule the sibling gate already applies.
+  local c9ha="$tmp/c9ha"; make_corpus "$c9ha"
+  printf '# Jobs\n\n[ ](mail.md)\n' > "$c9ha/docs/guide/jobs.md"
+  git -C "$c9ha" add -A && git -C "$c9ha" commit -qm blank-label-link
+  check "a whitespace-only link label is not an edge" fail "$c9ha"
+
+  # ...but an IMAGE label is content — a clickable image — even though the
+  # image itself is masked as invisible before the link scan runs.
+  local c9hb="$tmp/c9hb"; make_corpus "$c9hb"
+  printf '# Jobs\n\n[![alt](img.png)](mail.md)\n' > "$c9hb/docs/guide/jobs.md"
+  git -C "$c9hb" add -A && git -C "$c9hb" commit -qm image-label-link
+  check "an image label is a clickable route" pass "$c9hb"
+
+  # An empty raw anchor is the same nothing.
+  local c9hc="$tmp/c9hc"; make_corpus "$c9hc"
+  printf '# Jobs\n\n<a href="mail.md"></a>\n' > "$c9hc/docs/guide/jobs.md"
+  git -C "$c9hc" add -A && git -C "$c9hc" commit -qm empty-anchor
+  check "an empty raw anchor is not an edge" fail "$c9hc"
+
+  # ...and one wrapping an image is a link the reader can click.
+  local c9hd="$tmp/c9hd"; make_corpus "$c9hd"
+  printf '# Jobs\n\n<a href="mail.md"><img src="i.png"></a>\n' \
+    > "$c9hd/docs/guide/jobs.md"
+  git -C "$c9hd" add -A && git -C "$c9hd" commit -qm anchor-wrapping-image
+  check "a raw anchor wrapping an image is a route" pass "$c9hd"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
