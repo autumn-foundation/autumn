@@ -285,8 +285,9 @@ def normalize(p):
 # terminated comment still strips only itself.
 HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
 UNCLOSED = '<!--'
-# A fence opener/closer: ``` or ~~~ , up to three spaces of indent.
-FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})', re.M)
+# A fence opener/closer: ``` or ~~~ , up to three spaces of indent, plus the
+# rest of the line — which decides whether the line is a fence at all.
+FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$', re.M)
 # A code span is a run of backticks closed by an equal-length run; both
 # delimiters must be complete runs. Same shape as the sibling gate's.
 CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)', re.S)
@@ -296,15 +297,24 @@ def split_fences(txt):
     """Split into ('prose'|'fence', text) segments, in order."""
     parts, pos, in_fence, marker = [], 0, False, None
     for m in FENCE.finditer(txt):
-        tok = m.group(1)
+        tok, rest = m.group(1), m.group(2)
         if not in_fence:
+            # A backtick info string may not itself contain a backtick, so
+            # ```` ```md`invalid ```` opens nothing — it is ordinary prose, and
+            # treating it as a fence would swallow the real links after it.
+            if tok[0] == '`' and '`' in rest:
+                continue
             parts.append(('prose', txt[pos:m.start()]))
             # Keep the opener's character AND length: a ```` fence is not
             # closed by a ``` line inside it, so recording only three
             # characters would end the block early and treat the code after
             # it as live prose.
             in_fence, marker, pos = True, (tok[0], len(tok)), m.start()
-        elif tok[0] == marker[0] and len(tok) >= marker[1]:
+        elif (tok[0] == marker[0] and len(tok) >= marker[1]
+              and not rest.strip()):
+            # A CLOSING fence may be followed only by whitespace, so
+            # ```` ```not-a-closer ```` leaves the block open. Closing early
+            # would hand the fence's contents back to the prose scanners.
             parts.append(('fence', txt[pos:m.end()]))
             in_fence, marker, pos = False, None, m.end()
     parts.append(('fence' if in_fence else 'prose', txt[pos:]))
@@ -917,6 +927,21 @@ self_test() {
   printf '# Jobs\n\n![mail][]\n\n[mail]: mail.md\n' > "$c9ao/docs/guide/jobs.md"
   git -C "$c9ao" add -A && git -C "$c9ao" commit -qm image-ref-use
   check "an image reference use confers nothing" fail "$c9ao"
+
+  # A backtick info string may not contain a backtick, so this opens no fence
+  # and the link after it is ordinary live prose.
+  local c9ap="$tmp/c9ap"; make_corpus "$c9ap"
+  printf '# Jobs\n\n```md`invalid\n\nSee [mail](mail.md).\n' > "$c9ap/docs/guide/jobs.md"
+  git -C "$c9ap" add -A && git -C "$c9ap" commit -qm invalid-info-string
+  check "an invalid backtick info string opens no fence" pass "$c9ap"
+
+  # A closing fence may be followed only by whitespace, so a waiver between a
+  # look-alike line and the real closer is still inside the fence.
+  local c9aq="$tmp/c9aq"; make_corpus "$c9aq"
+  printf '# Mail\n\n```\n```not-a-closer\n<!-- orphan-allow: example -->\n```\n' \
+    > "$c9aq/docs/guide/mail.md"
+  git -C "$c9aq" add -A && git -C "$c9aq" commit -qm trailing-text-closer
+  check "a closing fence with trailing text does not end the block" fail "$c9aq"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
