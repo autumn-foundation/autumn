@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exhaustive `match` on `SchedulerBackend` needs one line — see the
   [migration guide](docs/migrations/next.md).
 
+- **sqlite:** connections opened at the same instant against a brand-new
+  database file no longer fail with "database is locked". `PRAGMA journal_mode
+  = WAL` takes an exclusive lock and SQLite does not run the busy handler for
+  it, so the `busy_timeout` set one pragma earlier never covered it: whichever
+  connection lost that race failed setup, and the request behind it got a 500.
+  The journal mode is a persistent property of the file, so the setup now
+  retries briefly and every retry after the winner is a no-op. Reachable
+  whenever several subsystems open the database at boot, which the durable
+  SQLite job runtime above does.
+
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
   `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new

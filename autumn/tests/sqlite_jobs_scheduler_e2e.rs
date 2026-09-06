@@ -1874,3 +1874,58 @@ async fn sqlite_job_admin_does_not_hold_the_pool_against_the_tracking_store() {
     shutdown.cancel();
     job::clear_global_job_client();
 }
+
+/// (27) Connections created at the same instant against a brand-new file all
+/// succeed.
+///
+/// `PRAGMA journal_mode = WAL` takes an exclusive lock, and `SQLite` does not run
+/// the busy handler for it, so the `busy_timeout` set one pragma earlier does
+/// not cover it. Every loser of that race used to fail connection setup with
+/// "database is locked", which surfaced as a 500 from whichever subsystem asked
+/// first — the job queue's schema pass, its maintenance tasks, and the tracking
+/// store all reach for a connection at boot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sqlite_pool_serves_connections_opened_at_the_same_instant() {
+    /// Enough concurrent openers to lose the WAL race reliably.
+    const OPENERS: usize = 8;
+
+    // Repeat: the window is one statement wide, so a single round can miss it.
+    for round in 0..40 {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("cold_start.db");
+        let config = DatabaseConfig {
+            url: Some(format!("sqlite://{}", db_path.display())),
+            // One slot per opener, so every one of them creates a connection
+            // rather than waiting for a slot.
+            pool_size: OPENERS,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("sqlite pool builds")
+            .expect("a url is configured");
+
+        // A barrier, not a spawn loop: without it the first opener finishes the
+        // WAL switch before the rest start, and the race never happens.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(OPENERS));
+        let mut openers = tokio::task::JoinSet::new();
+        for _ in 0..OPENERS {
+            let pool = pool.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            openers.spawn(async move {
+                barrier.wait().await;
+                pool.get()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+        }
+
+        while let Some(joined) = openers.join_next().await {
+            let opened = joined.expect("the opener task runs");
+            assert!(
+                opened.is_ok(),
+                "every connection opened on a cold file must succeed, round {round}: {opened:?}"
+            );
+        }
+    }
+}
