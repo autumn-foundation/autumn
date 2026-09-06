@@ -278,9 +278,15 @@ REF_DEF = re.compile(
     r'(?![ \t]*(?:"[^"\n]*$|\'[^\'\n]*$|\([^)\n]*$))', re.M)
 # The same, extended to the optional title — on the destination's line or the
 # one after it, per CommonMark. Used only to blank the definition's full span.
+# The title is `TITLE` itself, not a second spelling of it. Its own copy let a
+# quoted body cross a blank line, so `[old]: url "title` / blank / `[Mail][m]`
+# swallowed a LIVE reference use into the definition's blanked span — the
+# definition it used then looked unused, and the page it pointed at was
+# reported as an orphan the reader can in fact click. A blank line ends the
+# paragraph and there is no title, which is what `TITLE` already encodes.
 REF_DEF_FULL = re.compile(
     r'^ {0,3}\[(?:[^\[\]\\]|\\.)+\]:(?:[ \t]*\n?[ \t]*)(?:<[^<>\r\n]*>|\S+)'
-    r'(?:[ \t]*\n?[ \t]*(?:"[^"]*"|\'[^\']*\'|\([^()]*\)))?', re.M)
+    + TITLE, re.M)
 # ...but a definition only becomes a link the reader can click when some label
 # USES it. A leftover `[old]: mail.md` with no `[…][old]` anywhere renders as
 # nothing at all, so counting it as an edge would let an obsolete line launder a
@@ -552,29 +558,37 @@ PRE_BLOCK = re.compile(
     r'^ {0,3}<(?:' + TYPE1_TAGS + r')\b[^>]*>.*?</(?:' + TYPE1_TAGS + r')\s*>[^\n]*'
     r'|^ {0,3}<(?:' + TYPE1_TAGS + r')\b[^>]*>.*',
     re.S | re.I | re.M)
+# One HTML attribute, as CommonMark defines it. The unquoted value is the part
+# worth spelling out: it admits no whitespace and none of `"`, `'`, `=`, `<`,
+# `>` or a backtick, so `<span a==>` is malformed and is ordinary paragraph
+# text. `[^\s>]+` accepted it, a type-7 block opened on a line that opens none,
+# and the link under it was masked away — a live route reported as an orphan.
+# (A BLOCK tag is different: `<div a==>` opens a type-6 block whatever its
+# attributes look like, because that start condition only reads the tag NAME.
+# The distinction is why this belongs to type 7 and not to `RAW_BLOCK`.)
+# Every place that walks a tag shares this, since the four that had their own
+# copy of `[^\s>]+` are exactly the four this file has had to fix in lockstep.
+ATTR_ASSIGNED = (r'[A-Za-z_:][-\w:.]*'
+                 r'\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+)')
+ATTR = r'[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s"\'=<>`]+))?'
 # Every attribute value EXCEPT `href`. An attribute is not rendered text, so a
 # path, a reference label or a comment marker parked in one — `<span
 # data-note="[mail](mail.md)">` — is invisible and confers nothing. `href` is
 # excluded because `<a href=…>` is real navigation the anchor extractor reads.
 # This subsumes the old `src`-only rule, which was the same idea applied to one
 # attribute name.
-ATTR_VALUE = re.compile(
-    r'\b(?!href\b)[A-Za-z_:][-\w:.]*\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+ATTR_VALUE = re.compile(r'\b(?!href\b)' + ATTR_ASSIGNED, re.I)
 # The same with no exception, for tags that are not anchors. `href` is spared
 # only on `<a>`: on `<link rel="alternate" href="…">` it names a resource the
 # page references invisibly, not somewhere the reader can click.
-ATTR_VALUE_ANY = re.compile(
-    r'\b[A-Za-z_:][-\w:.]*\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+ATTR_VALUE_ANY = re.compile(r'\b' + ATTR_ASSIGNED, re.I)
 # The attribute grammar is HTML_TAG's, not `[^>]*`, for the reason HTML_TAG
 # already carries: a quoted `>` does not end a tag. `<a title="1 > 0"
 # data-note="docs/guide/mail.md">` ended here inside `title`, so `data-note`
 # fell outside the anchor bounds, was never masked, and its invisible path kept
 # an orphan alive. Fixing HTML_TAG and leaving this one is the same
 # rule-applied-to-one-sibling mistake this file keeps making.
-ANCHOR_TAG = re.compile(
-    r'<a'
-    r'(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*'
-    r'\s*/?>', re.I)
+ANCHOR_TAG = re.compile(r'<a(?:\s+' + ATTR + r')*\s*/?>', re.I)
 # The `](…)` destination of a rendered link, blanked before the bare-path scan.
 LINK_DEST = re.compile(r'\]' + DEST)
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
@@ -584,9 +598,7 @@ LINK_DEST = re.compile(r'\]' + DEST)
 # `<span title="1 > 0" data-note="…">` is one tag, and stopping at the quoted
 # character would leave the later attributes outside the masking bounds.
 HTML_TAG = re.compile(
-    r'<[A-Za-z][A-Za-z0-9-]*'
-    r'(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*'
-    r'\s*/?>')
+    r'<[A-Za-z][A-Za-z0-9-]*(?:\s+' + ATTR + r')*\s*/?>')
 # A raw HTML BLOCK of any tag — CommonMark type 6. Its contents are raw HTML,
 # so `[mail]` inside `<div>…</div>` stays literal and resolves no reference.
 # Unlike the hidden tags the text is still VISIBLE, so this bounds Markdown
@@ -641,9 +653,7 @@ RAW_BLOCK = re.compile(
 RAW_BLOCK_TYPE7 = re.compile(
     # A malformed `<x =>` is ordinary text, not a tag, so it opens nothing —
     # the attribute grammar is HTML_TAG's rather than a permissive `[^\n]*?`.
-    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*'
-    r'(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*'
-    r'\s*/?>[ \t]*$'
+    r'^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s+' + ATTR + r')*\s*/?>[ \t]*$'
     r'(?:\n(?![ \t]*$)[^\n]*)*',
     re.M)
 # A raw anchor IS navigation, so its destination is resolved like any other —
@@ -655,8 +665,8 @@ RAW_BLOCK_TYPE7 = re.compile(
 # quoted `>`, so a link the reader CAN click stopped counting — the direction
 # that reports a reachable page as an orphan.
 ANCHOR_HREF = re.compile(
-    r'<a(?:\s+[A-Za-z_:][-\w:.]*(?:\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+))?)*?'
-    r'\s+href\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
+    r'<a(?:\s+' + ATTR + r')*?'
+    r'\s+href\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))', re.I)
 
 
 ATX_HEADING = re.compile(r'^ {0,3}#{1,6}(?:\s|$)')
@@ -2183,6 +2193,31 @@ self_test() {
   else
     echo "  FAILED: an empty marker is reported as having no reason" >&2
   fi
+
+  # `<span a==>` is malformed — an unquoted value admits no `=` — so it opens
+  # no type-7 block and the link under it still renders.
+  local c9ef="$tmp/c9ef"; make_corpus "$c9ef"
+  printf '# Jobs\n\n<span a==>\nSee [mail](mail.md).\n' > "$c9ef/docs/guide/jobs.md"
+  git -C "$c9ef" add -A && git -C "$c9ef" commit -qm bad-unquoted-attr
+  check "an invalid unquoted attribute opens no raw block" pass "$c9ef"
+
+  # ...but a BLOCK tag opens one whatever its attributes look like: that start
+  # condition reads the tag name and nothing else.
+  local c9eg="$tmp/c9eg"; make_corpus "$c9eg"
+  printf '# Jobs\n\n<div a==>\nSee [mail](mail.md).\n' > "$c9eg/docs/guide/jobs.md"
+  git -C "$c9eg" add -A && git -C "$c9eg" commit -qm bad-attr-block-tag
+  check "a block tag opens a raw block whatever its attributes" fail "$c9eg"
+
+  # A definition's title cannot cross a blank line, so a reference use below one
+  # is not swallowed into the definition's span.
+  # The closing quote is load-bearing: without one there is nothing for an
+  # unbounded body to reach, the bug does not show, and the test would be
+  # verifying its own gap rather than the rule.
+  local c9eh="$tmp/c9eh"; make_corpus "$c9eh"
+  printf '# Jobs\n\n[old]: https://example.test "title\n\nSee [mail][m].\n\n"\n\n[m]: mail.md\n' \
+    > "$c9eh/docs/guide/jobs.md"
+  git -C "$c9eh" add -A && git -C "$c9eh" commit -qm def-title-across-blank
+  check "a use below a blank line is not swallowed by a title" pass "$c9eh"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
