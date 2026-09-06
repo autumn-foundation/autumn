@@ -1320,6 +1320,32 @@ def strip_quote_markers(txt):
     `check-migration-guides.sh` carries and this file does not — the gap
     already recorded for fences in `strip_comments`. Left alone, indented code
     stays correct.
+
+    KNOWN GAP, and the only one here that is a false NEGATIVE — the four in
+    `strip_comments` all merely block a valid change, while this one can let a
+    real orphan through. Reported with a worked case and confirmed against
+    markdown-it:
+
+        - note
+        ⏎
+            [old]: docs/guide/mail.md
+
+    renders as `<p>note</p>` alone. The definition is inside the item (four
+    absolute spaces is two past a `- ` item's content column, short of the four
+    that would make it code), so nothing is on screen — but `REF_DEF_FULL`
+    anchors at `^ {0,3}`, does not match at four, and leaves the destination in
+    the bare-path scan, where it counts as navigation. Six spaces there IS code
+    and must keep counting, so the two cannot be told apart by indent alone.
+
+    Not fixed here, and the reason is the shape of the fix rather than its
+    size. Blanking cannot do it: unlike a `>` marker, this indentation is
+    ALREADY spaces, so a length-preserving substitution changes nothing. It
+    needs the content column threaded into the anchor of both definition
+    patterns and into every arm of `block_starts`, across the four views built
+    on this function — the block layer, which is where the rules derived from
+    the spec in this file have gone wrong most often, and where a mistake
+    blanks text the reader can see. That is the port of the awk container
+    tracker this PR already names as a follow-up, not a patch.
     """
     return QUOTE_PREFIX.sub(lambda m: ' ' * len(m.group(0)), txt)
 
