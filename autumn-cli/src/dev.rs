@@ -605,13 +605,6 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // the terminal errors remain the primary feedback for this case.
     let (built, diagnostics) = cargo_build_capturing(package);
 
-    // Dependency findings (issue #1633). Started after the build so its
-    // `cargo metadata` cannot contend with the build for Cargo's package-cache
-    // lock, and polled — never awaited — so nothing here delays startup or the
-    // rebuild loop. Quiet by default: an advisory-clean, policy-clean tree adds
-    // nothing to this output.
-    let mut dependency_audit = DependencyAudit::start(Path::new("."));
-
     if !built {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
         if let Some(state) = reload_state.as_mut()
@@ -628,6 +621,14 @@ pub fn run(package: Option<&str>, show_config: bool) {
         reload_state.as_ref().map(DevReloadState::path),
         show_config,
     );
+
+    // Dependency findings (issue #1633). Started once every synchronous step
+    // that runs Cargo is done — the build, and `find_binary`'s own `cargo
+    // metadata` — because cargo-deny runs `cargo metadata` too and the two
+    // contend for Cargo's package-cache lock. From here it is only polled,
+    // never awaited, so nothing delays startup or the rebuild loop. Quiet by
+    // default: an advisory-clean, policy-clean tree adds nothing.
+    let mut dependency_audit = DependencyAudit::start(Path::new("."));
 
     let normalized_dirs = sanitize_custom_watch_dirs(load_dev_config(Path::new(AUTUMN_TOML)));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
