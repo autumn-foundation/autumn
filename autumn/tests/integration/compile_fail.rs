@@ -303,6 +303,10 @@ fn query_budget_compile_fail_tests() {
     // two macros actually compose against each other.
     t.compile_fail("tests/compile-fail/query_budget_real_job_accessor_n_plus_one.rs");
     t.compile_fail("tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs");
+    // A handle obtained through an async/fallible accessor (PR #2546 review,
+    // round 2): `self.conn().await?`, the real shape in
+    // `autumn-search/src/postgres.rs`'s `write_documents`.
+    t.compile_fail("tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs");
 }
 
 /// Every `#[agent_operable]` / `authority_grant!` compile-fail fixture, with

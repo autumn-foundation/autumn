@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does `#[query_budget]`'s handle-tracking already reach job/scheduled-shaped code? (pursue: 2/2 fixtures caught, zero code change vs. Keystone's ≤3-day spike line)
+# ⛏️ Prospect: does `#[query_budget]`'s handle-tracking already reach job/scheduled-shaped code? (pursue: 4/4 fixtures caught, one small verified `autumn-macros` fix, vs. Keystone's ≤3-day spike line)
 
 ## 🎯 Question
 
@@ -146,6 +146,60 @@ where every other `#[query_budget]` fixture lives (no new test harness):
   `pg_claim_next_job` were not read closely enough to classify. The "closes
   5/8" number in Keystone's memo is **not** independently confirmed by this
   assay — only that the walker mechanism itself is not the blocker.
+- **Update (second Codex review round) — a real soundness bug found and
+  fixed, not just a documentation gap.** Checking one of the 3 defects named
+  above against real code (`autumn-search/src/postgres.rs:365`,
+  `PostgresSearchStore::write_documents`), the review pointed out its handle
+  binds as `let mut conn = self.conn().await?;` — an async, fallible
+  accessor — and that neither `expr_is_handle` nor `chain_root_is_handle`
+  peeled `Expr::Await`/`Expr::Try` before checking the method name. Verified
+  by reading both functions: confirmed correct. The practical effect is not
+  a diagnostic ("this is unprovable") but a **silent false negative** —
+  `conn` never enters the tracked-handle set at all, so
+  `bind_all(...).execute(&mut conn)` inside the chunk loop at line 575 is
+  never recognized as a query, and `#[query_budget]` on this function would
+  report a clean build regardless of the real query count. This is strictly
+  worse than the tool's own stated soundness contract
+  ("Anything the analysis cannot read is reported, never assumed
+  query-free") — this case was neither read nor reported, just silently
+  dropped.
+
+  Fixed in `autumn-macros/src/query_budget.rs`: `expr_is_handle` now peels
+  `Expr::Await`/`Expr::Try` through a new, deliberately *narrower* helper
+  (`awaited_expr_is_fresh_handle`) rather than recursing into the full
+  `expr_is_handle`. The narrower helper matters — the first attempt at this
+  fix (peeling through the full recursive checks, including
+  `chain_root_is_handle`) caused two real regressions, both caught by
+  **existing** tests before this PR's own fixtures could hide them:
+  `query_budget_over_budget.rs` (a compile-fail trybuild fixture) and
+  `query_budget::tests::a_deferred_repository_future_is_counted_once` (a
+  `#[cfg(test)]` unit test) both started miscounting a plain `.len()` call
+  on an already-awaited query *result* as a second query, because peeling
+  let the awaited expression fall through to a bare `Expr::Path` and
+  re-derive handle-ness from `chain_root_is_handle`'s unrelated "future
+  built but not yet awaited" tracking. The shipped fix omits `Expr::Path`
+  from the peeled check specifically to avoid this — see the inline
+  comments on `expr_is_handle`, `awaited_expr_is_fresh_handle`, and
+  `chain_root_is_handle` in the diff for the full reasoning.
+
+  New regression fixture: `query_budget_await_try_accessor_n_plus_one.rs`,
+  reproducing `write_documents`' exact shape (diesel-async
+  `query.execute(&mut conn)` argument-style, `conn` bound via
+  `self.conn().await?`). Confirmed the bug pre-fix (compiled clean — the
+  false negative) and the fix post-fix (compile-fails with the standard
+  N+1 diagnostic), by literally stashing and restoring the
+  `autumn-macros` change and rerunning the trybuild suite both ways.
+
+  **This changes the report's framing in one place:** "zero
+  `autumn-macros` changes" (in the title's parenthetical and the Verdict
+  below) was true through the first review round but is no longer the
+  overall state of this PR — a small, targeted, test-covered fix landed
+  as part of verifying a reviewer's finding. It does not change the
+  **verdict** (still pursue, still no design-level engineering needed for
+  the job/scheduled generalization question itself), but it does mean the
+  walker is measurably more correct after this assay than before it, for
+  any code — job/scheduled-shaped or not — that obtains a handle through
+  an async/fallible accessor.
 
 ## 📊 Assay
 
@@ -159,31 +213,41 @@ autumn-web --test integration_tests`, default features `db,maud,htmx,...`):
 | `query_budget_job_shaped_accessor_batched.rs` | compile-pass | **compile-pass** | clean build |
 | `query_budget_real_job_accessor_n_plus_one.rs` (real `#[job]`) | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in args.recipient_ids` |
 | `query_budget_real_scheduled_accessor_n_plus_one.rs` (real `#[scheduled]`) | compile-fail | **compile-fail** | same diagnostic, pointing at `for id in ids` |
+| `query_budget_await_try_accessor_n_plus_one.rs` (`self.conn().await?` shape) | compile-fail | **compiled clean pre-fix (confirmed false negative); compile-fail post-fix** | same diagnostic, naming `execute`, pointing at `for _id in ids` |
 
 First run generated fresh `.stderr` snapshots via trybuild's standard
 `wip/`-then-promote flow (no snapshot existed yet, matching how every other
 compile-fail fixture in this suite was originally added); every subsequent
 run, after moving the generated snapshots into `tests/compile-fail/`,
 reproduced them byte-for-byte (`query_budget_compile_fail_tests ... ok`,
-~5s incremental with the 7-fixture family). `compile_pass_tests` (60
-fixtures including the batched control) also passed clean in the same
-session.
+~5s incremental with the full 8-fixture family). `compile_pass_tests` (60
+fixtures including the batched control) also passed clean. The
+`autumn-macros` fix was additionally checked against the crate's own
+`#[cfg(test)]` suite (`cargo test -p autumn-macros --lib`, 1087 tests) to
+catch exactly the kind of regression the first attempt at this fix
+introduced — see the stubs-list update above for how that regression was
+found and corrected before this report's numbers were finalized.
 
-No worst-case/adversarial probing beyond this: the question is a binary
-mechanism-exists/doesn't, not a performance or scale claim, so the two
-fixtures plus their batched control are the whole admissible evidence set —
-adding more shapes (nested accessors, `if`/`match` branches reaching
-`state.db()`) would be re-confirming behavior the existing route-handler
-fixtures already pin for the identical walker code path, not testing
-anything specific to the job/scheduled shape.
+Worst-case probing beyond the original two accessor shapes came from the
+review itself, not from this assay's own design: the `.await?`-wrapped
+accessor case was found by a reviewer reading real production code, not by
+this assay's own adversarial-input pass. That is itself worth naming
+plainly — the original apparatus's "no worst-case probing beyond this"
+line (still true of the job/scheduled generalization question) undersold
+how much of the surrounding walker code the accessor-tracking mechanism
+actually touches, which the review exposed.
 
 ## 🏁 Verdict: **pursue**, with a correction to the premise
 
-**4/4 compile-fail fixtures caught the N+1 (2 signature-shaped, 2 with the
-real `#[job]`/`#[scheduled]` attributes), 1/1 control built clean, zero
-changes to `autumn-macros`.** Against the pre-set line, this is an
-unambiguous pursue —
-but the mechanism is not the one item 3 asked about. There is no such thing
+**4/4 signature/attribute-shaped fixtures caught the N+1 (2 signature-shaped,
+2 with the real `#[job]`/`#[scheduled]` attributes), 1/1 control built
+clean, with the generalization itself requiring zero `autumn-macros`
+changes.** A 5th fixture, added from the review's own reading of real
+production code, found a genuine soundness bug in the walker (async/fallible
+accessor bindings silently untracked) — fixed with a small, targeted,
+regression-tested change; see the stubs-list update above. Against the
+pre-set line, this is an unambiguous pursue — but the mechanism is not the
+one item 3 asked about. There is no such thing
 as "a `#[job]`/`#[scheduled]` function's own handle argument" to generalize
 to: `#[job]` structurally enforces `(AppState, Args[, JobContext])` and
 `#[scheduled]` enforces `(AppState)`; neither can ever take a typed
@@ -209,14 +273,15 @@ For whoever picks up Keystone's item 3 next:
 1. **Audit, not build.** For each of the 5 background-job defects (only 3
    checked here — see stubs list), read the actual handle-obtaining call at
    the query site and classify it: reached via a `HANDLE_ACCESSORS` name
-   (already covered, confirmed by this assay) vs. an app-specific accessor
-   (still excluded, matches the doc's own named boundary). This is a reading
-   task, hours not days.
+   (already covered, confirmed by this assay — including through
+   `.await?`, as of this PR's fix) vs. an app-specific accessor (still
+   excluded, matches the doc's own named boundary). This is a reading task,
+   hours not days.
 2. **Annotate.** For the covered subset, add `#[query_budget(N)]` directly to
    the query-issuing function (not necessarily the `#[job]`/`#[scheduled]`
    entry point itself, if it's a plain helper one or more calls deep — the
    doc already supports annotating "plain helper functions, not just
-   routes"). No `autumn-macros` change required.
+   routes"). No further `autumn-macros` change required beyond this PR's fix.
 3. **Update the doc.** `docs/guide/query-budgets.md`'s "Scope of the first
    slice" currently reads as a blanket exclusion of "background jobs,
    `#[scheduled]` tasks" — this assay shows that's only true for the
@@ -235,16 +300,22 @@ reversible, decidable in a PR.
 ```bash
 cargo test -p autumn-web --test integration_tests query_budget_compile_fail_tests -- --nocapture
 cargo test -p autumn-web --test integration_tests compile_pass_tests -- --nocapture
+cargo test -p autumn-macros --lib
 ```
 
 Fixtures: `autumn/tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs`,
 `autumn/tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs`,
 `autumn/tests/compile-fail/query_budget_real_job_accessor_n_plus_one.rs`,
-`autumn/tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs`
-(all four with pinned `.stderr` snapshots), and
+`autumn/tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs`,
+`autumn/tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs`
+(all five with pinned `.stderr` snapshots), and
 `autumn/tests/compile-pass/query_budget_job_shaped_accessor_batched.rs`.
 Wired into `autumn/tests/integration/compile_fail.rs`'s existing
-`query_budget_compile_fail_tests` / `compile_pass_tests` functions.
+`query_budget_compile_fail_tests` / `compile_pass_tests` functions. The
+`autumn-macros` fix itself is `expr_is_handle`'s `Expr::Await`/`Expr::Try`
+arms plus the new `awaited_expr_is_fresh_handle` helper and
+`chain_root_is_handle`'s comment explaining why it deliberately does *not*
+peel the same way, all in `autumn-macros/src/query_budget.rs`.
 
 ## 🗄️ Dismantle
 

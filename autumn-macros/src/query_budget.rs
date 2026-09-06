@@ -1119,6 +1119,22 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr_is_handle(&r.expr),
             Expr::Paren(p) => self.expr_is_handle(&p.expr),
             Expr::Group(g) => self.expr_is_handle(&g.expr),
+            // `self.conn().await?` is a common shape for a fallible/async
+            // handle accessor (a pooled connection getter) — without peeling
+            // `.await`/`?`, `conn` in `let mut conn = self.conn().await?;`
+            // silently falls through to "not a handle," and every later
+            // query issued through `conn` goes uncounted with no diagnostic
+            // at all (#2546 review). Deliberately recurses into the
+            // *narrower* `awaited_expr_is_fresh_handle`, not `expr_is_handle`
+            // itself: peeling through to a bare `Expr::Path` here would
+            // re-derive handle-ness from `chain_root_is_handle`'s "deferred
+            // future" tracking (`let pending = repo.find_all(); let rows =
+            // pending.await?;`) and wrongly mark `rows` — the resolved
+            // `Vec<Post>` — as a handle too, miscounting a harmless
+            // `rows.len()` as another query (caught by the existing
+            // `a_deferred_repository_future_is_counted_once` unit test).
+            Expr::Await(a) => self.awaited_expr_is_fresh_handle(&a.base),
+            Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_handle(&u.expr),
             // A field of a handle is a handle (`db.inner`), and so is a field
             // that conventionally holds one (`self.repo`, `state.db`) — a
@@ -1149,6 +1165,32 @@ impl Analyzer {
         }
     }
 
+    /// The peeled target of a `.await`/`?`: does *this* expression freshly
+    /// produce a handle, as opposed to naming a variable that was already
+    /// tracked by `chain_root_is_handle`'s deferred-future provenance?
+    /// Deliberately omits `Expr::Path` (and anything that bottoms out in
+    /// one) — see the comment on `expr_is_handle`'s `Expr::Await`/`Expr::Try`
+    /// arms for why re-deriving handle-ness from a bound name here is wrong.
+    fn awaited_expr_is_fresh_handle(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Reference(r) => self.awaited_expr_is_fresh_handle(&r.expr),
+            Expr::RawAddr(r) => self.awaited_expr_is_fresh_handle(&r.expr),
+            Expr::Paren(p) => self.awaited_expr_is_fresh_handle(&p.expr),
+            Expr::Group(g) => self.awaited_expr_is_fresh_handle(&g.expr),
+            Expr::Await(a) => self.awaited_expr_is_fresh_handle(&a.base),
+            Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
+            Expr::Field(f) => self.expr_is_handle(&f.base) || member_is_handle_accessor(&f.member),
+            Expr::MethodCall(mc) => {
+                let method = mc.method.to_string();
+                if HANDLE_ACCESSORS.contains(&method.as_str()) {
+                    return true;
+                }
+                HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
+            }
+            _ => false,
+        }
+    }
+
     /// Does a block *evaluate to* a handle — i.e. does its tail expression?
     fn block_tail_is_handle(&self, block: &Block) -> bool {
         match block.stmts.last() {
@@ -1165,6 +1207,22 @@ impl Analyzer {
             }
             Expr::Paren(p) => self.chain_root_is_handle(&p.expr),
             Expr::Group(g) => self.chain_root_is_handle(&g.expr),
+            // Deliberately does NOT peel `Expr::Await`/`Expr::Try` the way
+            // `expr_is_handle` does: this function backs `bind_handles`'
+            // "future built but not yet awaited" tracking (`let fut =
+            // repo.find_all();` — the doc's "a repository future is counted
+            // where it is built, not where it is awaited"), where *any*
+            // chain rooted at a handle should keep provenance even through a
+            // non-accessor terminal call. Peeling here would make an
+            // already-awaited, already-resolved query result (`let posts =
+            // repo.find_all().await?;`) register as a handle too — `posts`
+            // is a `Vec<Post>`, and a bare `.len()` on it was miscounted as
+            // a third query before this comment was added (regression
+            // caught by the existing `query_budget_over_budget.rs`
+            // fixture). `expr_is_handle`'s own `Expr::Await`/`Expr::Try` arms
+            // already cover the real gap (an accessor call like
+            // `self.conn().await?`) without this broader, unawaited-chain
+            // reach.
             _ => false,
         }
     }
@@ -1184,6 +1242,13 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr_carries_handle(&r.expr),
             Expr::Paren(p) => self.expr_carries_handle(&p.expr),
             Expr::Group(g) => self.expr_carries_handle(&g.expr),
+            // No separate `Expr::Await`/`Expr::Try` arms: the `expr_is_handle`
+            // check above already covers them via `awaited_expr_is_fresh_handle`,
+            // which deliberately does not fall through to a bare `Expr::Path`
+            // — recursing into the full `expr_carries_handle` here instead
+            // would reach `Expr::Path` through its own `Expr::Await`/`Expr::Try`
+            // (if added) and reintroduce the same false-positive this file
+            // documents on `expr_is_handle`.
             _ => false,
         }
     }
