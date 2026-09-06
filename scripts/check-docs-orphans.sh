@@ -430,6 +430,10 @@ def strip_comments(txt):
 HIDDEN_HTML = re.compile(
     r'<(script|style|template)\b[^>]*>.*?</\1\s*>', re.S | re.I)
 SRC_ATTR = re.compile(r'\bsrc\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+# A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
+# pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
+# ordinary Markdown link the sibling gate resolves.
+HTML_TAG = re.compile(r'<[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?/?>')
 # A raw anchor IS navigation, so its destination is resolved like any other —
 # through `add_relative`, which means `<a href="mail.md">` and
 # `<a href="../guide/mail.md">` work, not just the repo-root spelling the
@@ -438,8 +442,12 @@ ANCHOR_HREF = re.compile(
     r'<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.I)
 
 
-def mask_hidden_html(txt):
-    """Blank non-rendered raw HTML — in PROSE, and not inside a code span.
+def mask_invisible(txt):
+    """Blank everything a reader cannot see — in PROSE, and not inside a code
+    span. This is the ONE place that decides what is invisible, because scoping
+    one masker and leaving a sibling document-wide is a bug this gate has
+    shipped twice: raw HTML was scoped and images were not, so an image sample
+    in a fence lost its visible destination while a `<script>` sample kept it.
 
     Inside a fence, `<script src="/static/js/x.js">` is a sample the reader can
     see and copy, which is the same reason a bare path in a fence counts. Five
@@ -457,16 +465,30 @@ def mask_hidden_html(txt):
             out.append(seg)
             continue
         protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
-        for pat in (HIDDEN_HTML, SRC_ATTR):
+        tags = [(m.start(), m.end()) for m in HTML_TAG.finditer(seg)]
+
+        def blank(pat, bound=None):
+            nonlocal seg
             pieces, last = [], 0
             for m in pat.finditer(seg):
                 if any(a <= m.start() < b for a, b in protected):
+                    continue
+                if bound is not None and not any(
+                        a <= m.start() < b for a, b in bound):
                     continue
                 pieces.append(seg[last:m.start()])
                 pieces.append(' ' * (m.end() - m.start()))
                 last = m.end()
             pieces.append(seg[last:])
             seg = ''.join(pieces)
+
+        blank(HIDDEN_HTML)
+        blank(SRC_ATTR, bound=tags)
+        # Images last, and here rather than at the bare-path scan, so a
+        # `![alt](x.md)` SAMPLE in a fence or code span keeps its visible
+        # destination while a rendered image does not.
+        blank(IMAGE_INLINE)
+        blank(IMAGE_REF)
         out.append(seg)
     return ''.join(out)
 
@@ -522,12 +544,9 @@ def edges_from(f):
     # gate has made three times — reference definitions bypassing the usage
     # check, and hidden HTML bypassing the link scan — so the masking happens
     # once, here, and nothing downstream reads `txt` for navigation again.
-    txt = mask_hidden_html(txt)
+    txt = mask_invisible(txt)
 
     scan = REF_DEF.sub(lambda m: ' ' * len(m.group(0)), txt)
-    blank = lambda m: ' ' * len(m.group(0))
-    scan = IMAGE_INLINE.sub(blank, scan)
-    scan = IMAGE_REF.sub(blank, scan)
     for m in BARE.finditer(scan):
         t = normalize(m.group(1))
         if t in traversable:
@@ -1235,6 +1254,25 @@ self_test() {
     > "$c9bm/docs/guide/jobs.md"
   git -C "$c9bm" add -A && git -C "$c9bm" commit -qm less-than-in-prose
   check "a less-than in prose does not eat the reference use" pass "$c9bm"
+
+  # An image SAMPLE in code is visible text; only a rendered image is masked.
+  local c9bn="$tmp/c9bn"; make_corpus "$c9bn"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\nWrite `![Mail](docs/guide/mail.md)` for an image.\n' \
+    > "$c9bn/README.md"
+  git -C "$c9bn" add -A && git -C "$c9bn" commit -qm image-sample-in-code-span
+  check "an image sample in inline code stays visible" pass "$c9bn"
+
+  local c9bo="$tmp/c9bo"; make_corpus "$c9bo"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n```md\n![Mail](docs/guide/mail.md)\n```\n' \
+    > "$c9bo/README.md"
+  git -C "$c9bo" add -A && git -C "$c9bo" commit -qm image-sample-in-fence
+  check "an image sample in a fence stays visible" pass "$c9bo"
+
+  # A `src` query parameter is not an HTML attribute.
+  local c9bp="$tmp/c9bp"; make_corpus "$c9bp"
+  printf '# Jobs\n\nSee [mail](mail.md?src=guide).\n' > "$c9bp/docs/guide/jobs.md"
+  git -C "$c9bp" add -A && git -C "$c9bp" commit -qm src-query-param
+  check "a src query parameter does not break the link" pass "$c9bp"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
