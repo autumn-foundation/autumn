@@ -1015,6 +1015,20 @@ fn strip_yaml_comments(yaml: &str) -> String {
     out
 }
 
+/// Values a cargo command gives to `flag`, in both the `--flag value` and
+/// `--flag=value` spellings. Values are whole tokens, so `--test sim_chaos_crash`
+/// yields `sim_chaos_crash` and never satisfies a lookup for `sim_chaos`.
+fn flag_values<'a>(tokens: &[&'a str], flag: &str) -> Vec<&'a str> {
+    let eq = format!("{flag}=");
+    let mut values: Vec<&str> = tokens
+        .windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1])
+        .collect();
+    values.extend(tokens.iter().filter_map(|t| t.strip_prefix(eq.as_str())));
+    values
+}
+
 /// Every `sqlite`-gated `[[test]]` target in `autumn/Cargo.toml` must be named
 /// in a CI workflow (issue #1908).
 ///
@@ -1028,7 +1042,10 @@ fn strip_yaml_comments(yaml: &str) -> String {
 ///
 /// Membership is read from each target's own `#![cfg(...)]` gate rather than a
 /// name prefix, so a sqlite target named otherwise is still covered and a
-/// backend-independent `sim_*` target is not wrongly demanded.
+/// backend-independent `sim_*` target is not wrongly demanded. Coverage means a
+/// live cargo command that enables the `sqlite` feature AND names the target:
+/// a commented-out line, a prose mention, a prefix of another target's name, or
+/// a `--test` without the feature all leave the target dark and must fail here.
 #[test]
 fn sqlite_test_targets_are_ci_named() {
     let root = workspace_root();
@@ -1036,31 +1053,59 @@ fn sqlite_test_targets_are_ci_named() {
     let manifest = std::fs::read_to_string(&manifest_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
 
-    // Match the `--test <name>` invocation flag across every workflow, not the
-    // bare name, and only in live YAML: `strip_yaml_comments` removes commented
-    // -out invocations and prose mentions, so neither can satisfy the check.
+    // Collect the cargo commands every workflow actually runs. `strip_yaml_comments`
+    // drops commented-out invocations and prose mentions; joining `\`-continued
+    // lines keeps one wrapped command as one command, so a target is credited only
+    // to the invocation that names it.
     let workflows_dir = root.join(".github/workflows");
-    let mut workflow_source = String::new();
+    let mut commands: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&workflows_dir)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflows_dir.display()))
         .flatten()
     {
-        if let Ok(body) = std::fs::read_to_string(entry.path()) {
-            workflow_source.push_str(&strip_yaml_comments(&body).replace('\\', " "));
-            workflow_source.push(' ');
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut pending = String::new();
+        for line in strip_yaml_comments(&body).lines() {
+            let trimmed = line.trim_end();
+            if let Some(head) = trimmed.strip_suffix('\\') {
+                pending.push_str(head);
+                pending.push(' ');
+            } else {
+                pending.push_str(trimmed);
+                commands.push(std::mem::take(&mut pending));
+            }
+        }
+        if !pending.is_empty() {
+            commands.push(pending);
         }
     }
-    // Whole tokens, not a substring: `--test sim_chaos_crash` must not satisfy
-    // the check for `sim_chaos`, or dropping the standalone entry for a target
-    // whose name prefixes another would leave that suite silently unrun.
-    let tokens: Vec<&str> = workflow_source.split_whitespace().collect();
+
+    // A command covers a target only when it BOTH enables the `sqlite` feature and
+    // names the target. Without the feature the target's crate-level
+    // `#![cfg(feature = "sqlite")]` compiles it to an empty binary that exits 0, so
+    // a feature-less `--test <target>` is not coverage.
+    let sqlite_commands: Vec<Vec<&str>> = commands
+        .iter()
+        .map(|command| command.split_whitespace().collect::<Vec<_>>())
+        .filter(|tokens| {
+            tokens.contains(&"cargo")
+                && tokens.contains(&"test")
+                && (tokens.contains(&"--all-features")
+                    || flag_values(tokens, "--features").iter().any(|value| {
+                        value
+                            .trim_matches(['"', '\''])
+                            .split(',')
+                            .any(|feature| feature.trim() == "sqlite")
+                    }))
+        })
+        .collect();
+
     let is_invoked = |target: &str| {
-        tokens
-            .windows(2)
-            .any(|pair| pair.first() == Some(&"--test") && pair.get(1) == Some(&target))
-            || tokens
-                .iter()
-                .any(|token| token.strip_prefix("--test=") == Some(target))
+        sqlite_commands
+            .iter()
+            .any(|tokens| flag_values(tokens, "--test").contains(&target))
     };
 
     // Pair each `[[test]]` name with its path, then keep only the sqlite-gated
