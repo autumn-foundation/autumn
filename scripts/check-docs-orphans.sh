@@ -206,12 +206,14 @@ def read(f):
 # destination; one level missed it, the link was never recognised, its
 # destination was left unblanked, and the bare-path scan read a repo path out
 # of the query string — an invisible non-route marking a page reachable.
-# Built to a fixed depth because a regular expression cannot count. cmark caps
-# its own nesting at 32; six is far past anything a docs URL does, and past it
-# the link is simply not recognised, which is the direction that reports a
-# reachable page rather than hiding an orphan. Atomic groups keep the nested
+# Built to a fixed depth because a regular expression cannot count, and built
+# to THE SAME depth cmark uses — 32 — so the two agree about every destination
+# either can parse. A shallower cap was the obvious shortcut and the wrong one:
+# it left this file naming 32 in a comment while implementing six, and a
+# destination between the two would have gone unrecognised and unblanked.
+# Depth N accepts nesting N exactly, measured. Atomic groups keep the nested
 # quantifiers from backtracking exponentially on a destination that does not
-# balance.
+# balance; at 32 the pattern is 684 characters and the corpus run is unchanged.
 def _nested_parens(depth):
     body = r'[^()\s]'
     for _ in range(depth):
@@ -219,7 +221,7 @@ def _nested_parens(depth):
     return body
 
 
-DEST_BARE = r'(?:' + _nested_parens(6) + r')+'
+DEST_BARE = r'(?:' + _nested_parens(32) + r')+'
 # A title may wrap lines but not contain a BLANK one, and the whitespace before
 # it is bounded the same way as the destination's: a blank line ends the
 # paragraph, so `[x](y.md\n\n "t")` renders no link at all. Bounding `_WS` and
@@ -488,29 +490,67 @@ FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$', re.M)
 CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)', re.S)
 
 
-def comment_block_spans(txt):
-    """Line ranges covered by a line-initial HTML comment block.
+# The CommonMark type-1 tags. Declared here rather than beside the block
+# pattern that used to own them, because the line scan below needs them
+# first — one vocabulary, read in the order the file is executed.
+TYPE1_TAGS = r'pre|textarea|script|style'
+FENCE_ONLY = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$')
+# Type-1 openers and their end condition, line-anchored. The close need not
+# match the opener — the spec says so — which is why this is one alternation.
+TYPE1_OPEN_LINE = re.compile(
+    r'^ {0,3}<(?:' + TYPE1_TAGS + r')(?=[\s>]|$)', re.I)
+TYPE1_CLOSE_LINE = re.compile(r'</(?:' + TYPE1_TAGS + r')\s*>', re.I)
 
-    Fences and comments are both leaf blocks, so whichever OPENS first wins —
-    and this file previously only enforced half of that. Putting fences first
-    stopped a fenced `<!--` sample from commenting out the file; the mirror
-    case then broke, and a ``` displayed INSIDE a comment opened a real fence
-    that swallowed everything after the comment closed. The repo's migration
-    gate hit the same pair in its own review rounds
+
+def raw_block_line_spans(txt):
+    """Line ranges covered by a line-initial raw block — a comment, or type 1.
+
+    Fences and raw blocks are all leaf blocks, so whichever OPENS first wins,
+    and this scan is where that is decided for whole lines. It has been wrong
+    in three directions in turn. Fences first let a ``` shown INSIDE a comment
+    open a real fence that swallowed everything after the comment closed.
+    Comments first let a fenced `<!--` sample comment out the file. And with
+    only comments here, a ``` inside `<script>` split the script in two before
+    `mask_invisible` could reach it, leaving a region the browser never renders
+    marked as a visible fence — where a bare path then counted as a route.
+    The repo's migration gate hit the same family in its own review rounds
     (`…_treats_fences_inside_comments_as_comment_content`).
+
+    So the scan tracks fence state as well, and simply does not open a raw
+    block inside one: `<script>` demonstrated in a fence is a code sample whose
+    text is on screen, and the fence keeps it.
     """
-    spans, pos, start = [], 0, None
+    spans, pos, start, kind = [], 0, None, None
+    in_fence, marker = False, None
     for line in txt.split('\n'):
         end = pos + len(line)
-        if start is None:
-            if line.lstrip().startswith('<!--'):
-                start = pos
+        if kind is not None:
+            if ('-->' in line if kind == 'comment'
+                    else TYPE1_CLOSE_LINE.search(line)):
+                spans.append((start, end))
+                start, kind = None, None
+        elif in_fence:
+            m = FENCE_ONLY.match(line)
+            if (m and m.group(1)[0] == marker[0]
+                    and len(m.group(1)) >= marker[1]
+                    and not m.group(2).strip()):
+                in_fence, marker = False, None
+        else:
+            m = FENCE_ONLY.match(line)
+            stripped = line.lstrip()
+            if m and not (m.group(1)[0] == '`' and '`' in m.group(2)):
+                in_fence, marker = True, (m.group(1)[0], len(m.group(1)))
+            elif (stripped.startswith('<!--')
+                  and len(line) - len(stripped) <= 3):
+                start, kind = pos, 'comment'
                 if '-->' in line:
                     spans.append((start, end))
-                    start = None
-        elif '-->' in line:
-            spans.append((start, end))
-            start = None
+                    start, kind = None, None
+            elif TYPE1_OPEN_LINE.match(line):
+                start, kind = pos, 'type1'
+                if TYPE1_CLOSE_LINE.search(line):
+                    spans.append((start, end))
+                    start, kind = None, None
         pos = end + 1
     if start is not None:
         spans.append((start, len(txt)))
@@ -519,12 +559,12 @@ def comment_block_spans(txt):
 
 def split_fences(txt):
     """Split into ('prose'|'fence', text) segments, in order."""
-    commented = comment_block_spans(txt)
+    blocked = raw_block_line_spans(txt)
     parts, pos, in_fence, marker = [], 0, False, None
     for m in FENCE.finditer(txt):
         tok, rest = m.group(1), m.group(2)
-        # A fence delimiter inside a comment block is comment content.
-        if any(a <= m.start() < b for a, b in commented):
+        # A fence delimiter inside a raw block is that block's content.
+        if any(a <= m.start() < b for a, b in blocked):
             continue
         if not in_fence:
             # A backtick info string may not itself contain a backtick, so
@@ -689,7 +729,7 @@ HIDDEN_TAGS = r'script|style|template'
 # the other order — a `<!--` inside a closed `<script>` is script data, not a
 # comment, and parsing comments first truncated the document at it.
 # This is the third place in this file that needed the same rule; `split_fences`
-# and `comment_block_spans` settle fences against comments the same way.
+# and `raw_block_line_spans` settle fences against comments the same way.
 # `\b` is not the boundary this needs: a hyphen is a non-word character, so it
 # sits happily between `script` and `-widget` and `<script-widget>` was read as
 # an unclosed `<script>`, blanking the rest of the page. A custom element is a
@@ -726,7 +766,6 @@ FIRST_OPENER = re.compile(
 # Anchored to the start of a line (up to three spaces) because that is the
 # START condition: a mid-line `see <pre> for details` opens no block, and the
 # Markdown under it still renders.
-TYPE1_TAGS = r'pre|textarea|script|style'
 PRE_BLOCK = re.compile(
     r'^ {0,3}<(?:' + TYPE1_TAGS + r')' + TAG_NAME_END +
     r'.*?</(?:' + TYPE1_TAGS + r')\s*>[^\n]*'
@@ -3211,6 +3250,29 @@ self_test() {
   printf '# Jobs\n\n<!--> [mail](mail.md) -->\n' > "$c9gs/docs/guide/jobs.md"
   git -C "$c9gs" add -A && git -C "$c9gs" commit -qm invalid-comment-line-initial
   check "the same text line-initial still opens a block" fail "$c9gs"
+
+  # A fence marker inside `<script>` is the script's content, not a fence, so
+  # the region stays hidden and a path in it is not on screen.
+  local c9gt="$tmp/c9gt"; make_corpus "$c9gt"
+  printf '# Jobs\n\n<script>\n```\ndocs/guide/mail.md\n```\n</script>\n' \
+    > "$c9gt/docs/guide/jobs.md"
+  git -C "$c9gt" add -A && git -C "$c9gt" commit -qm fence-in-script
+  check "a fence marker inside a script opens no fence" fail "$c9gt"
+
+  # ...and the mirror: a `<script>` shown INSIDE a fence is a code sample whose
+  # text the reader can see, so the fence keeps it.
+  local c9gu="$tmp/c9gu"; make_corpus "$c9gu"
+  printf '# Jobs\n\n```\n<script>\ndocs/guide/mail.md\n</script>\n```\n' \
+    > "$c9gu/docs/guide/jobs.md"
+  git -C "$c9gu" add -A && git -C "$c9gu" commit -qm script-in-fence
+  check "a script shown inside a fence stays visible" pass "$c9gu"
+
+  # A destination may nest parentheses as deeply as cmark allows.
+  local c9gv="$tmp/c9gv"; make_corpus "$c9gv"
+  printf '# Jobs\n\n[ext](https://example.test/a(b(c(d(e(f(g(h)))))))?q=docs/guide/mail.md)\n' \
+    > "$c9gv/docs/guide/jobs.md"
+  git -C "$c9gv" add -A && git -C "$c9gv" commit -qm deep-nested-dest
+  check "a deeply nested destination is not scanned as a bare path" fail "$c9gv"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
