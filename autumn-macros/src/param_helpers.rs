@@ -93,6 +93,122 @@ fn type_name_starts_with(ty: &syn::Type, prefix: &str) -> bool {
     segment.ident.to_string().starts_with(prefix)
 }
 
+/// Whether `attr`'s path — or, if `attr` is `#[cfg_attr(predicate, ...)]`,
+/// any attribute it conditionally applies — has a last path segment in
+/// `names`.
+///
+/// `cfg_attr` is a built-in attribute the compiler does not resolve until
+/// after every attribute *macro* has finished expanding, so a still-live
+/// `#[cfg_attr(feature = "auth", secured("admin"))]` sitting below an outer
+/// macro like `#[static_get]`/`#[ws]` reaches that macro's `input_fn.attrs`
+/// completely unexpanded — its path is `cfg_attr`, not `secured`. A scan
+/// that only compares `attr.path()` against a guard's own name never sees
+/// it, so a guard gated behind a feature flag this way would silently slip
+/// past a "reject this attribute combination" check that every plainly-
+/// written guard attribute is caught by (Codex review on #2513, ninth
+/// finding).
+pub fn attr_or_cfg_attr_matches_any(attr: &syn::Attribute, names: &[&str]) -> bool {
+    let path_matches = |path: &syn::Path| {
+        path.segments
+            .last()
+            .is_some_and(|segment| names.contains(&segment.ident.to_string().as_str()))
+    };
+    if attr.path().is_ident("cfg_attr") {
+        // `cfg_attr(predicate, attr1, attr2, ...)` — the first item is the
+        // cfg predicate itself, everything after it is an attribute to
+        // apply when the predicate holds.
+        let Ok(nested) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return false;
+        };
+        return nested.iter().skip(1).any(|meta| path_matches(meta.path()));
+    }
+    path_matches(attr.path())
+}
+
+/// Marker `#[static_get]` injects into the body of every handler it accepts
+/// (whenever it isn't already rejecting a guard it recognized by name or by
+/// expansion artifact) so that a still-unexpanded guard attribute below it —
+/// including one imported under an alias, e.g.
+/// `use ::autumn_web::secured as auth;` then `#[auth("admin")]` — can, once
+/// IT expands in turn, detect that it is wrapping a function `#[static_get]`
+/// already committed to serving from a static-first cache the guard's check
+/// can never run against.
+///
+/// `attr_or_cfg_attr_matches_any` catches every *plainly spelled* guard
+/// attribute below `#[static_get]`, expanded or not, but a proc-macro
+/// attribute is invoked on raw syntax before the compiler resolves imports —
+/// there is no API for a proc macro to ask "does this path actually name
+/// `autumn_web::secured`", so an aliased import's spelling is fundamentally
+/// invisible to a name-based scan (Codex review on #2513, tenth finding).
+/// This marker sidesteps that: it doesn't matter what name a guard was
+/// invoked under, because the guard's OWN macro (`secured_macro`/
+/// `step_up_macro`/`throttle_macro`/`authorize_macro`, via
+/// `reject_if_incompatible_route_marker`) checks for it — mirroring the
+/// `__AUTUMN_STEP_UP_MAX_AGE`/`__AUTUMN_THROTTLE_ROUTE_ID` body-marker-const
+/// technique this crate already uses to communicate across a macro
+/// expansion boundary.
+pub const STATIC_ROUTE_HANDLER_MARKER: &str = "__AUTUMN_STATIC_ROUTE_HANDLER_MARKER";
+
+/// Same purpose as [`STATIC_ROUTE_HANDLER_MARKER`], emitted by `#[ws]`
+/// instead: lets a still-unexpanded guard attribute below `#[ws]` — alias
+/// included — detect, once it expands, that it is wrapping a WebSocket
+/// upgrade handler whose `impl WsHandler` return type the guard's
+/// unconditional rewrite to `Response` is incompatible with.
+pub const WS_HANDLER_MARKER: &str = "__AUTUMN_WS_HANDLER_MARKER";
+
+/// Whether `func`'s body contains a `const` item statement named
+/// `marker_name`, at the top level or nested inside a wrapper another
+/// attribute macro that expanded in between generated — an intervening
+/// `#[cached]`, for instance, re-homes the entire original body (marker
+/// included) inside a `(|| async move { … })().await` closure IIFE
+/// (`cached_macro`'s `compute`), one level deeper than a top-level-only scan
+/// would look (Codex review on #2513, eleventh finding). Delegates to
+/// `edge::stmts_have_marker`, the same recursive walk `#[edge]`'s own marker
+/// detection already relies on, so every wrapper shape this crate's macros
+/// generate is handled in exactly one place.
+pub fn has_body_const_marker(func: &ItemFn, marker_name: &str) -> bool {
+    crate::edge::stmts_have_marker(&func.block.stmts, marker_name)
+}
+
+/// Emit an inert `#[allow(dead_code)] const #marker: () = ();` as the first
+/// statement of `func`'s body — the write side of [`has_body_const_marker`].
+pub fn prepend_body_const_marker(func: &mut ItemFn, marker_name: &str) {
+    let marker_ident = syn::Ident::new(marker_name, proc_macro2::Span::call_site());
+    func.block.stmts.insert(
+        0,
+        syn::parse_quote! {
+            #[allow(dead_code)]
+            const #marker_ident: () = ();
+        },
+    );
+}
+
+/// Called by each of `secured_macro`/`step_up_macro`/`throttle_macro`/
+/// `authorize_macro` immediately after parsing their own `input_fn`: if it
+/// already carries [`STATIC_ROUTE_HANDLER_MARKER`] or [`WS_HANDLER_MARKER`],
+/// this guard is expanding on a function a route macro further out already
+/// committed to `#[static_get]`/`#[ws]` — reject with the same
+/// incompatibility error those macros use for a guard they can identify by
+/// name, so an aliased import gets caught too (see
+/// [`STATIC_ROUTE_HANDLER_MARKER`]'s doc comment).
+pub fn reject_if_incompatible_route_marker(func: &ItemFn) -> Option<proc_macro2::TokenStream> {
+    if has_body_const_marker(func, STATIC_ROUTE_HANDLER_MARKER) {
+        return Some(
+            syn::Error::new_spanned(&func.sig, crate::static_route::INCOMPATIBLE_GUARD_MSG)
+                .to_compile_error(),
+        );
+    }
+    if has_body_const_marker(func, WS_HANDLER_MARKER) {
+        return Some(
+            syn::Error::new_spanned(&func.sig, crate::ws::INCOMPATIBLE_GUARD_MSG)
+                .to_compile_error(),
+        );
+    }
+    None
+}
+
 /// Test-only helper: pull the `fn` named `name` out of a macro's generated
 /// output.
 ///

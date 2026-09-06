@@ -429,10 +429,12 @@ impl ResolvedDeployConfig {
         })
     }
 
-    /// Persistent per-app dir shared across releases (holds the secret env file
-    /// and, since #1952, the uploaded config manifest\[s\]). The deployed systemd
-    /// unit sets `AUTUMN_MANIFEST_DIR` to this path so the app's config loader
-    /// reads the uploaded `autumn.toml` here at boot.
+    /// Persistent per-app dir shared across releases (holds the secret env
+    /// file). The config manifest(s) uploaded for #1952 are NOT here — they are
+    /// uploaded into each release's own dir ([`Self::releases_dir`]) so a
+    /// rollback reads the manifest that shipped with the release it rolls back
+    /// to; the deployed systemd unit points `AUTUMN_MANIFEST_DIR` at that
+    /// release dir, not at this one.
     #[must_use]
     pub fn shared_dir(&self) -> String {
         format!("{}/shared", self.app_dir)
@@ -2332,6 +2334,12 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
 /// three project-wide graders run once. With at most one entry this is the
 /// pre-#1621 single-host report verbatim, down to the absent `scope` suffix (AC-1;
 /// proved by `deploy_check_output_is_identical_for_host_and_a_single_entry_hosts_list`).
+///
+/// Also prints the same config-manifest notice `deploy up` prints (#1952
+/// check/up parity) — a confirmation naming the manifest(s) that will be
+/// uploaded, or a loud warning when there is no local `autumn.toml` at all.
+/// Purely informational: it is not one of the graded `checks` and never
+/// affects the failure count or exit code.
 fn run_check(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
@@ -2343,6 +2351,17 @@ fn run_check(
     let fleet = ResolvedFleet::from_targets(resolved, hosts);
     let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
     let failed = report_preflight(&checks);
+
+    // Mirror `deploy up`'s config-manifest signal here too (#1952 check/up
+    // parity): `check` is the documented way to catch a broken deploy BEFORE
+    // touching the server, so an operator running only `check` must see the same
+    // "no autumn.toml found" warning (or upload confirmation) `up` would print,
+    // not discover it only once `up` actually runs. Purely informational — it
+    // never affects `failed`/the exit code, exactly like `up` never blocks on it.
+    eprintln!(
+        "{}",
+        manifest_preflight_notice(&locate_manifest_uploads(resolved))
+    );
 
     if failed == 0 {
         eprintln!("\u{2705} All {} preflight check(s) passed.", checks.len());

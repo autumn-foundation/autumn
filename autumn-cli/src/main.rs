@@ -31,6 +31,7 @@ mod experiments;
 mod export;
 mod flags;
 mod generate;
+mod graph;
 mod http;
 mod i18n;
 mod jobs;
@@ -377,6 +378,79 @@ pub struct AgentsManifestArgs {
     /// `--check` in CI under the profile you deploy.
     #[arg(long)]
     release: bool,
+}
+
+/// Arguments for `autumn graph` (issue #1747).
+///
+/// A separate `Args` struct for the same reason as [`AgentsManifestArgs`]:
+/// clap's derive builds every inline variant field inside one
+/// `Commands::augment_subcommands` frame, which is already close to libtest's
+/// thread-stack limit.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct GraphArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON architecture graph to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON graph to stdout instead of the human report.
+    ///
+    /// Only meaningful for `show`: `touches` and `impact` are answers, not
+    /// documents.
+    #[arg(long)]
+    json: bool,
+    /// Compare against a committed graph and exit non-zero on drift, so a
+    /// route that quietly lost its access to a table — or a declared element
+    /// that vanished from the graph — has to be reviewed rather than merged
+    /// silently. This is the CI gate.
+    #[arg(long, value_name = "PATH")]
+    check: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable; a
+    /// comma-separated list also works). A model, route or job behind a
+    /// feature the build does not enable is not compiled in, so it cannot
+    /// appear in the graph.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Inspect the release binary rather than the debug one.
+    ///
+    /// The graph describes the binary that produced it, and a debug binary is
+    /// not the one that ships: an element behind `#[cfg(not(debug_assertions))]`
+    /// exists only in the release build. Run `--check` in CI under the profile
+    /// you deploy.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn graph`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum GraphSubcommands {
+    /// Print the whole architecture graph.
+    Show(GraphArgs),
+    /// Which routes and jobs touch a model, table or repository.
+    Touches {
+        /// Model name, table name, repository trait, or generated `Pg*` type.
+        name: String,
+        #[command(flatten)]
+        args: GraphArgs,
+    },
+    /// What a change to a model, table or repository would affect.
+    Impact {
+        /// Model name, table name, repository trait, or generated `Pg*` type.
+        name: String,
+        #[command(flatten)]
+        args: GraphArgs,
+    },
 }
 
 /// Subcommands for `autumn agents`.
@@ -1858,6 +1932,25 @@ enum Commands {
     /// copy.
     #[command(name = "data-flow")]
     DataFlow(DataFlowArgs),
+
+    /// Query the application's architecture graph (#1747).
+    ///
+    /// Compiles the app and reads back the graph the framework derives from its
+    /// macros: a node for every `#[route]`/`#[static_get]`, `#[model]`,
+    /// `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]`, and an edge for
+    /// every repository→model declaration and every model, table or repository
+    /// a route or job names. Because the elements are declared through macros
+    /// autumn owns, no declared element can be missing.
+    ///
+    /// # Examples
+    ///
+    ///   autumn graph show
+    ///   autumn graph touches posts
+    ///   autumn graph impact Post
+    ///   autumn graph show --manifest architecture-graph.json
+    ///   autumn graph show --check architecture-graph.json --release
+    #[command(subcommand, verbatim_doc_comment)]
+    Graph(GraphSubcommands),
 
     /// Derive and enforce this build's capacity contract (issue #1733).
     ///
@@ -4719,6 +4812,28 @@ fn run_command(command: Commands) {
                 json: args.json,
                 strict: args.strict,
                 features,
+            });
+        }
+        Commands::Graph(command) => {
+            let (query, args) = match command {
+                GraphSubcommands::Show(args) => (graph::Query::Show, args),
+                GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
+                GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
+            };
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            graph::run(&graph::GraphOptions {
+                query,
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                manifest: args.manifest.as_deref(),
+                json: args.json,
+                check: args.check.as_deref(),
+                features,
+                release: args.release,
             });
         }
         Commands::DataFlow(args) => {
