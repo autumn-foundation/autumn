@@ -18,8 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Commit the manifest — it is the baseline a later checkout compares against.
   A project generated before the manifest existed keeps the previous
   behaviour: compare against the current render only, `--force` to override.
+  Each entry also records the command that wrote it, so the digest counts only
+  when the same arguments are repeated — `autumn destroy model Post` after
+  `autumn generate model Post title:String` is still refused, and files written
+  by `autumn new --starter`, which uses the same machinery, are never a
+  generator's to delete.
   A side effect of the digest being taken over LF-normalised text: a CRLF
-  checkout of a generated file (`core.autocrlf`) no longer reads as an edit.
+  checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
+  whether or not a manifest entry backs it.
 
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so

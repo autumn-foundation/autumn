@@ -65,11 +65,13 @@ fn rerecord(project: &Path, contents: &str) {
     let path = project.join(MANIFEST);
     let text = fs::read_to_string(&path).expect("manifest");
     let mut doc: toml::Table = text.parse().expect("manifest is TOML");
-    let files = doc
+    let entry = doc
         .get_mut("files")
         .and_then(toml::Value::as_table_mut)
-        .expect("[files] table");
-    files.insert(OWNED.to_owned(), toml::Value::String(digest(contents)));
+        .and_then(|files| files.get_mut(OWNED))
+        .and_then(toml::Value::as_table_mut)
+        .expect("an entry for the owned file");
+    entry.insert("digest".to_owned(), toml::Value::String(digest(contents)));
     fs::write(&path, toml::to_string(&doc).unwrap()).unwrap();
 }
 
@@ -83,14 +85,37 @@ fn generate_records_a_digest_for_every_file_it_owns() {
         !manifest.contains("src/main.rs"),
         "a shared Modify target is never owned: {manifest}"
     );
+    let doc: toml::Table = manifest.parse().unwrap();
     assert_eq!(
         digest(&fs::read_to_string(project.join(OWNED)).unwrap()),
-        {
-            let doc: toml::Table = manifest.parse().unwrap();
-            doc["files"][OWNED].as_str().unwrap().to_owned()
-        },
+        doc["files"][OWNED]["digest"].as_str().unwrap(),
         "the recorded digest is the digest of what was written"
     );
+    assert_eq!(
+        doc["files"][OWNED]["invocation"].as_str().unwrap(),
+        "model\u{1f}Post\u{1f}title:String",
+        "the command that wrote it is recorded with it"
+    );
+}
+
+#[test]
+fn destroy_with_different_arguments_is_refused() {
+    // `destroy` mirrors `generate` argument-for-argument. Omitting the fields
+    // renders a different model, and the recorded digest must not stand in for
+    // arguments the user did not repeat — the `schema.rs` and `Cargo.toml`
+    // reverts are derived from those fields and would silently no-op.
+    let (_tmp, project) = project_with_model("prov-wrong-args");
+    let older_output = "// what an older CLI's template rendered\n";
+    fs::write(project.join(OWNED), older_output).unwrap();
+    rerecord(&project, older_output);
+
+    let output = run_autumn(&project, &["destroy", "model", "Post"]);
+
+    assert!(
+        !output.status.success(),
+        "different arguments, no tolerance"
+    );
+    assert!(project.join(OWNED).exists());
 }
 
 #[test]

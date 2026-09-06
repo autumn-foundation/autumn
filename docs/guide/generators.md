@@ -2055,6 +2055,15 @@ in place. `destroy` deletes an owned file when the content matches that digest,
 or matches what the current templates render. It reports `Diverged` and stops
 when the content matches neither.
 
+Each entry also records the command that wrote it, so the digest only counts
+when you repeat the same arguments — which is what `destroy` asks for anyway.
+`autumn destroy model Post` after `autumn generate model Post title:String`
+renders a different model and is refused, rather than deleting the file while
+the `schema.rs` and `Cargo.toml` reverts, which are derived from those fields,
+quietly do nothing. It also keeps one command from claiming another's files:
+`autumn new --starter` writes through the same machinery, and no generator
+owns what it wrote.
+
 Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
 against. Without it, `destroy` can only compare against the current templates —
 so a CLI upgrade that changed a template makes every untouched file that

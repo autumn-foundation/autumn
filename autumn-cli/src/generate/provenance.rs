@@ -65,18 +65,70 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// One recorded file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Entry {
+    /// Digest of the file as it was written.
+    digest: String,
+    /// The command that wrote it, normalised by [`current_invocation`].
+    ///
+    /// `destroy` honours the digest only for the same command with the same
+    /// arguments — the contract its help text already states. Without this the
+    /// digest is keyed by path alone, so `autumn destroy model Post` with the
+    /// fields omitted would delete the model file it can no longer render
+    /// while the `schema.rs` and `Cargo.toml` reverts, which ARE derived from
+    /// those fields, silently do nothing: a half-destroyed project where the
+    /// pre-#1835 code refused outright. It also keeps one command from
+    /// claiming another's output — `autumn new --starter` writes files through
+    /// this same engine, and `autumn destroy auth` must not delete them.
+    invocation: String,
+}
+
 /// The on-disk shape of [`MANIFEST_PATH`].
 #[derive(Default, Serialize, Deserialize)]
 struct ManifestFile {
-    /// Project-relative path → digest of the file as `generate` wrote it.
+    /// Project-relative path → what was written there, and by what.
     #[serde(default)]
-    files: BTreeMap<String, String>,
+    files: BTreeMap<String, Entry>,
+}
+
+/// This process's command line, reduced to what identifies the resource.
+///
+/// Stable across CLI versions, unlike anything derived from the argument
+/// structs: it is the user's own words. The `generate`/`destroy` verb drops out
+/// so the two spellings of one resource agree, and `--force`/`--dry-run` drop
+/// out because they legitimately differ between the two runs.
+#[must_use]
+pub fn current_invocation() -> String {
+    normalize_invocation(
+        std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    )
+}
+
+fn normalize_invocation(args: impl Iterator<Item = String>) -> String {
+    let mut verb_seen = false;
+    let mut parts = Vec::new();
+    for arg in args {
+        if !verb_seen && (arg == "generate" || arg == "destroy") {
+            verb_seen = true;
+            continue;
+        }
+        if matches!(arg.as_str(), "--force" | "--dry-run") {
+            continue;
+        }
+        parts.push(arg);
+    }
+    // Unit separator: no shell argument carries one, so two argument lists
+    // cannot collide by concatenation.
+    parts.join("\u{1f}")
 }
 
 /// What `autumn generate` recorded about the files it owns.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Provenance {
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, Entry>,
 }
 
 impl Provenance {
@@ -99,8 +151,8 @@ impl Provenance {
         }
     }
 
-    /// Whether a digest is recorded for this project-relative key.
-    #[must_use]
+    /// Whether an entry is recorded for this project-relative key.
+    #[cfg(test)]
     pub fn contains(&self, key: &str) -> bool {
         self.entries.contains_key(key)
     }
@@ -111,21 +163,32 @@ impl Provenance {
         self.entries.is_empty()
     }
 
-    /// Whether `digest` is what `generate` recorded for `path`.
+    /// Whether `invocation` wrote exactly `digest` to `path`.
     ///
-    /// False when nothing is recorded — an unproven file is never assumed ours.
+    /// False when nothing is recorded — an unproven file is never assumed ours
+    /// — and false when a different command recorded it (see [`Entry`]).
     #[must_use]
-    pub fn is_ours(&self, root: &Path, path: &Path, digest: &str) -> bool {
-        key(root, path).is_some_and(|k| self.entries.get(&k).is_some_and(|d| d == digest))
+    pub fn is_ours(&self, root: &Path, path: &Path, digest: &str, invocation: &str) -> bool {
+        key(root, path).is_some_and(|k| {
+            self.entries
+                .get(&k)
+                .is_some_and(|e| e.digest == digest && e.invocation == invocation)
+        })
     }
 
-    /// Record `digest` as the content `generate` wrote to `path`.
+    /// Record `digest` as the content `invocation` wrote to `path`.
     ///
     /// A path outside `root` cannot be keyed and is dropped: the manifest
     /// describes one project, and destroy would never look it up.
-    pub fn record(&mut self, root: &Path, path: &Path, digest: String) {
+    pub fn record(&mut self, root: &Path, path: &Path, digest: String, invocation: &str) {
         if let Some(k) = key(root, path) {
-            self.entries.insert(k, digest);
+            self.entries.insert(
+                k,
+                Entry {
+                    digest,
+                    invocation: invocation.to_owned(),
+                },
+            );
         }
     }
 
@@ -258,17 +321,66 @@ mod tests {
         tempfile::TempDir::new().unwrap()
     }
 
+    const OWNER: &str = "model\u{1f}Post\u{1f}title:String";
+
     #[test]
     fn records_and_reloads_a_digest() {
         let dir = tmp();
         let file = dir.path().join("src/models/post.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("// model\n"));
+        p.record(dir.path(), &file, text_digest("// model\n"), OWNER);
         p.save(dir.path()).unwrap();
 
         let reloaded = Provenance::load(dir.path());
-        assert!(reloaded.is_ours(dir.path(), &file, &text_digest("// model\n")));
-        assert!(!reloaded.is_ours(dir.path(), &file, &text_digest("// edited\n")));
+        assert!(reloaded.is_ours(dir.path(), &file, &text_digest("// model\n"), OWNER));
+        assert!(!reloaded.is_ours(dir.path(), &file, &text_digest("// edited\n"), OWNER));
+    }
+
+    #[test]
+    fn a_different_command_never_owns_a_recorded_file() {
+        let dir = tmp();
+        let file = dir.path().join("src/models/post.rs");
+        let mut p = Provenance::default();
+        p.record(dir.path(), &file, text_digest("// model\n"), OWNER);
+
+        assert!(!p.is_ours(
+            dir.path(),
+            &file,
+            &text_digest("// model\n"),
+            "model\u{1f}Post"
+        ));
+    }
+
+    #[test]
+    fn the_invocation_drops_the_verb_and_the_run_only_flags() {
+        let normalize = |args: &[&str]| normalize_invocation(args.iter().map(|a| (*a).to_owned()));
+        assert_eq!(
+            normalize(&["generate", "model", "Post", "title:String"]),
+            normalize(&["destroy", "model", "Post", "title:String", "--force"]),
+        );
+        assert_eq!(
+            normalize(&["generate", "model", "Post", "--dry-run"]),
+            normalize(&["generate", "model", "Post"]),
+        );
+        assert_ne!(
+            normalize(&["generate", "model", "Post", "title:String"]),
+            normalize(&["destroy", "model", "Post"]),
+            "omitted fields are different arguments"
+        );
+        assert_ne!(
+            normalize(&["new", "--starter", "saas", "app"]),
+            normalize(&["destroy", "auth", "User"]),
+            "a starter scaffold never owns a generator's output"
+        );
+    }
+
+    #[test]
+    fn arguments_cannot_collide_by_concatenation() {
+        let normalize = |args: &[&str]| normalize_invocation(args.iter().map(|a| (*a).to_owned()));
+        assert_ne!(
+            normalize(&["model", "Post Tag"]),
+            normalize(&["model", "Post", "Tag"])
+        );
     }
 
     #[test]
@@ -285,14 +397,32 @@ mod tests {
     fn an_unrecorded_file_is_never_ours() {
         let dir = tmp();
         let p = Provenance::default();
-        assert!(!p.is_ours(dir.path(), &dir.path().join("x.rs"), &text_digest("")));
+        assert!(!p.is_ours(
+            dir.path(),
+            &dir.path().join("x.rs"),
+            &text_digest(""),
+            OWNER
+        ));
     }
 
     #[test]
     fn a_path_outside_the_project_is_dropped() {
         let dir = tmp();
         let mut p = Provenance::default();
-        p.record(dir.path(), Path::new("/etc/passwd"), text_digest(""));
+        p.record(dir.path(), Path::new("/etc/passwd"), text_digest(""), OWNER);
+        assert_eq!(p, Provenance::default());
+    }
+
+    #[test]
+    fn a_path_escaping_through_parent_segments_is_dropped() {
+        let dir = tmp();
+        let mut p = Provenance::default();
+        p.record(
+            dir.path(),
+            &dir.path().join("../secret.toml"),
+            text_digest(""),
+            OWNER,
+        );
         assert_eq!(p, Provenance::default());
     }
 
@@ -309,7 +439,7 @@ mod tests {
         let dir = tmp();
         let file = dir.path().join("a.rs");
         let mut p = Provenance::default();
-        p.record(dir.path(), &file, text_digest("x"));
+        p.record(dir.path(), &file, text_digest("x"), OWNER);
         p.save(dir.path()).unwrap();
         assert!(dir.path().join(MANIFEST_PATH).is_file());
 
@@ -326,11 +456,13 @@ mod tests {
             dir.path(),
             &dir.path().join("migrations/a/up.sql"),
             "1".to_owned(),
+            OWNER,
         );
         p.record(
             dir.path(),
             &dir.path().join("migrations/ab/up.sql"),
             "2".to_owned(),
+            OWNER,
         );
         p.forget_dir(dir.path(), &dir.path().join("migrations/a"));
 
@@ -351,7 +483,12 @@ mod tests {
         .unwrap();
 
         let mut p = Provenance::default();
-        p.record(dir.path(), &dir.path().join("a.rs"), text_digest("x"));
+        p.record(
+            dir.path(),
+            &dir.path().join("a.rs"),
+            text_digest("x"),
+            OWNER,
+        );
 
         assert!(p.save(dir.path()).is_err());
         assert!(!outside.path().join("escaped.toml").exists());
