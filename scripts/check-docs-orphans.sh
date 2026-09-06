@@ -1509,6 +1509,34 @@ VOID_ELEMENTS = frozenset((
 # `Mail` was masked to the end of the anchor.
 NOT_HIDDEN_BY_ATTR = frozenset(('svg', 'math'))
 
+# Elements whose CONTENTS the tokenizer reads as text, so a tag spelled inside
+# one is not a tag. `<span hidden><textarea></span>Secret</textarea></span>`
+# renders nothing — that `</span>` is textarea text — but the balancing scan
+# stopped at it and handed `Secret` back as a label, hiding an orphan.
+# Membership was measured, not taken from the spec: for each candidate,
+# `<E id=E></span>Secret</E>` and then whether `E.textContent` still contains
+# the literal `</span>`. `pre` and `code` do not (they only LOOK verbatim);
+# these ten do.
+RAW_TEXT_NAMES = frozenset((
+    'textarea', 'title', 'script', 'style', 'xmp', 'iframe', 'noembed',
+    'noframes', 'noscript', 'plaintext'))
+RAW_TEXT_OPEN = re.compile(
+    r'<(' + '|'.join(sorted(RAW_TEXT_NAMES)) + r')(?=[\s/>])(?:' + _TWS + r'+'
+    + ATTR + r')*' + _TWS + r'*/?>', re.I)
+
+
+def _raw_text_end(txt, name, at):
+    """Where an element's raw-text contents stop.
+
+    `plaintext` has no end: the tokenizer never leaves it, so everything after
+    it is text — including its own apparent close tag.
+    """
+    if name.lower() == 'plaintext':
+        return len(txt)
+    m = re.compile(r'</' + re.escape(name) + r'(?=[\s>])[^>]*>', re.I).search(
+        txt, at)
+    return m.end() if m else len(txt)
+
 
 def mask_hidden_subtrees(txt):
     """Blank every `hidden` element, contents and all, space for space.
@@ -1537,6 +1565,14 @@ def mask_hidden_subtrees(txt):
             out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
             at = end
             continue
+        if lname in RAW_TEXT_NAMES:
+            # Its own contents are text, so there is no nesting to balance:
+            # the first close ends it, and a same-name spelling inside is
+            # just more text.
+            end = _raw_text_end(out, name, m.end())
+            out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+            at = end
+            continue
         # Running out of closes is not a bug here: an unclosed element is
         # closed implicitly by its parent, so masking to the end of the span
         # is what the browser shows — `<a …><span hidden>Mail</a>` is empty.
@@ -1544,6 +1580,13 @@ def mask_hidden_subtrees(txt):
         tag = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
         while depth:
             t = tag.search(out, pos)
+            # A raw-text element opening BEFORE the next same-name tag means
+            # that tag is inside it, and so is text rather than structure:
+            # skip its contents before counting anything.
+            r = RAW_TEXT_OPEN.search(out, pos)
+            if r and (not t or r.start() < t.start()):
+                pos = _raw_text_end(out, r.group(1), r.end())
+                continue
             if not t:
                 break
             depth += -1 if t.group(1) else 1
@@ -1846,6 +1889,17 @@ def edges_from(f):
             continue
         close = ANCHOR_CLOSE.search(raw, tag.end())
         stop = close.start() if close else len(raw)
+        # An anchor cannot contain an anchor: the parser closes this one the
+        # moment the next `<a` opens, so the outer element ends there and its
+        # content is whatever came before. `<a href="mail.md"><a
+        # href="https://example.com">Inner</a></a>` leaves the outer anchor
+        # with an EMPTY innerHTML in Chromium, but the first `</a>` was read
+        # as its close and `Inner` counted as its label — an edge to a page
+        # nothing actually links. The opener is looked for in `txt` rather
+        # than `raw` so a commented-out `<a` cannot cut a live link short.
+        nested = ANCHOR_TAG.search(txt, tag.end())
+        if nested and nested.start() < stop:
+            stop = nested.start()
         if not has_content(img_view[tag.end():stop], txt[tag.end():stop]):
             continue
         add_relative(next(g for g in m.groups() if g is not None),
@@ -4049,6 +4103,49 @@ self_test() {
   printf '# Jobs\n\n<a href="mail.md">&#60;span&#62;</a>\n' > "$c9iw/docs/guide/jobs.md"
   git -C "$c9iw" add -A && git -C "$c9iw" commit -qm entity-spelled-tag-text
   check "an entity-spelled tag is visible text, not markup" pass "$c9iw"
+
+  # An anchor cannot contain an anchor: the parser closes the outer one when
+  # the inner opens, so the outer has no content at all (Chromium reports an
+  # empty innerHTML). The first `</a>` was being read as the outer's close.
+  local c9jb="$tmp/c9jb"; make_corpus "$c9jb"
+  printf '# Jobs\n\n<a href="mail.md"><a href="https://example.com">Inner</a></a>\n' \
+    > "$c9jb/docs/guide/jobs.md"
+  git -C "$c9jb" add -A && git -C "$c9jb" commit -qm nested-anchor
+  check "a nested anchor is not the outer's label" fail "$c9jb"
+
+  # ...but the bound is whichever comes FIRST. An anchor that closes before
+  # the next one opens keeps its own content, and text after it belongs to
+  # nobody: taking the next opener unconditionally would read `text` as the
+  # empty anchor's label.
+  local c9jc="$tmp/c9jc"; make_corpus "$c9jc"
+  printf '# Jobs\n\n<a href="mail.md"></a>text <a href="https://example.com">X</a>\n' \
+    > "$c9jc/docs/guide/jobs.md"
+  git -C "$c9jc" add -A && git -C "$c9jc" commit -qm empty-anchor-then-text
+  check "text after an empty anchor is not its label" fail "$c9jc"
+
+  # ...and a commented-out opener is not an opener, which is why the search
+  # runs over the masked view rather than the raw source.
+  local c9jd="$tmp/c9jd"; make_corpus "$c9jd"
+  printf '# Jobs\n\n<a href="mail.md"><!-- <a href="x"> -->Mail</a>\n' \
+    > "$c9jd/docs/guide/jobs.md"
+  git -C "$c9jd" add -A && git -C "$c9jd" commit -qm commented-anchor-opener
+  check "a commented-out opener does not cut a link short" pass "$c9jd"
+
+  # A tag spelled inside raw text is not a tag. `</span>` here is textarea
+  # CONTENT, so the hidden span never closes and the anchor renders nothing.
+  local c9je="$tmp/c9je"; make_corpus "$c9je"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden><textarea></span>Secret</textarea></span></a>\n' \
+    > "$c9je/docs/guide/jobs.md"
+  git -C "$c9je" add -A && git -C "$c9je" commit -qm rcdata-close-spelling
+  check "a close spelled inside raw text is not a close" fail "$c9je"
+
+  # ...while a hidden raw-text element ends at its own first close, so the
+  # label after it is still content.
+  local c9jf="$tmp/c9jf"; make_corpus "$c9jf"
+  printf '# Jobs\n\n<a href="mail.md"><textarea hidden></textarea>Mail</a>\n' \
+    > "$c9jf/docs/guide/jobs.md"
+  git -C "$c9jf" add -A && git -C "$c9jf" commit -qm hidden-raw-text-element
+  check "a hidden raw-text element ends at its close" pass "$c9jf"
 
   # A reference WITHOUT its semicolon is visible text, in a raw anchor too.
   # The HTML tokenizer would decode `&#32` to a space, but it never sees this:
