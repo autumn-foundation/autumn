@@ -45,12 +45,43 @@ const SQL_SHAPES: &[(&str, &str, bool)] = &[
     ("INSERT", "INTO", true),
     ("UPDATE", "SET", true),
     ("DELETE", "FROM", true),
-    ("TRUNCATE", "TABLE", true),
+    // `TRUNCATE` is absent on purpose: Postgres makes its `TABLE` keyword
+    // optional, so it has no companion every real statement carries. It is
+    // matched on its whole grammar instead — see [`TRUNCATE_CLAUSE_WORDS`].
 ];
 
 /// Verbs that make any statement containing them a mutation, wherever they
 /// appear — used for `WITH`, whose leading verb says nothing about its effect.
 const SQL_MUTATION_VERBS: &[&str] = &["DELETE", "INSERT", "TRUNCATE", "UPDATE"];
+
+/// The optional keywords a `TRUNCATE` statement may carry.
+///
+/// `TRUNCATE` cannot use the companion test the other shapes do, because
+/// Postgres spells the companion optional:
+///
+/// ```text
+/// TRUNCATE [ TABLE ] [ ONLY ] name [ * ] [, …]
+///          [ RESTART IDENTITY | CONTINUE IDENTITY ] [ CASCADE | RESTRICT ]
+/// ```
+///
+/// `TRUNCATE posts` is a complete statement, and demanding `TABLE` dropped it
+/// — losing the table symbol *and* the mutation evidence, so a job that clears
+/// a table showed no dependency on it at all (Codex round 15). A missing edge
+/// is the one failure this module cannot afford.
+///
+/// What stands in for the companion is the rest of the grammar: every word
+/// after the verb is either one of these keywords or a table name, and a table
+/// name is an identifier. A word that is neither — a number, punctuation-free
+/// prose that starts with a digit — says the literal is a sentence, not a
+/// statement. That is a narrower net than the companion test, not a wider one
+/// in every direction: a short all-identifier imperative ("Truncate long
+/// titles") still reads as a statement and would claim mutation. The trade is
+/// deliberate and one-sided — that literal has to lead a `#[job]` body to cost
+/// anything, and it costs an over-stated `access` on an edge, where the missing
+/// alternative costs the edge itself.
+const TRUNCATE_CLAUSE_WORDS: &[&str] = &[
+    "CASCADE", "CONTINUE", "IDENTITY", "ONLY", "RESTART", "RESTRICT", "TABLE",
+];
 
 /// Identifiers that are evidence the item mutates something.
 ///
@@ -315,6 +346,28 @@ fn sql_words(literal: &str) -> Vec<String> {
     words
 }
 
+/// Whether the words following a leading `TRUNCATE` are a statement's operands
+/// rather than the rest of an English sentence.
+///
+/// True when every word is a [`TRUNCATE_CLAUSE_WORDS`] keyword or an
+/// identifier, and at least one is a name rather than a keyword — a statement
+/// truncates something.
+fn is_truncate_operands(rest: &[&str]) -> bool {
+    let mut named_a_table = false;
+    for word in rest {
+        if TRUNCATE_CLAUSE_WORDS.contains(word) {
+            continue;
+        }
+        // Words are already split on everything but `[A-Z0-9_]`, so the only
+        // way one fails to be an identifier is by leading with a digit.
+        if !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            return false;
+        }
+        named_a_table = true;
+    }
+    named_a_table
+}
+
 /// The SQL statement shape a literal matches, if any; `true` when it mutates.
 ///
 /// Word-boundary aware in both directions, so `"selection"` is not a `SELECT`
@@ -326,6 +379,10 @@ fn sql_shape(literal: &str) -> Option<bool> {
         .filter(|w| !w.is_empty());
     let first = words.next()?;
     let rest: Vec<&str> = words.collect();
+    // `TRUNCATE` is matched on its whole grammar rather than a companion.
+    if first == "TRUNCATE" {
+        return is_truncate_operands(&rest).then_some(true);
+    }
     let (_, _, mutating) = SQL_SHAPES
         .iter()
         .find(|(verb, companion, _)| first == *verb && rest.contains(companion))?;
@@ -799,6 +856,49 @@ mod tests {
         let literal =
             "\"WITH recent AS (SELECT id FROM posts) SELECT * FROM recent -- never DELETE\"";
         assert_eq!(sql_shape(literal), Some(false));
+    }
+
+    /// Postgres makes `TABLE` optional, so `TRUNCATE posts` is a complete
+    /// statement. Requiring the companion dropped the whole literal — no table
+    /// symbol and no mutation evidence, so the job lost its table dependency
+    /// outright. A missing edge is the one failure this module cannot afford
+    /// (Codex round 15).
+    #[test]
+    fn truncate_without_the_optional_table_keyword_is_still_a_statement() {
+        let bare = "\"TRUNCATE posts\"";
+        assert_eq!(sql_shape(bare), Some(true), "bare TRUNCATE");
+        assert!(
+            sql_symbols(bare).contains(&"posts".to_owned()),
+            "the truncated table must still be a candidate"
+        );
+
+        // The spelled-out form and every optional clause keep working.
+        let spelled = "\"TRUNCATE TABLE posts\"";
+        assert_eq!(sql_shape(spelled), Some(true), "TRUNCATE TABLE");
+        assert!(sql_symbols(spelled).contains(&"posts".to_owned()));
+
+        let clauses = "\"TRUNCATE ONLY posts, comments RESTART IDENTITY CASCADE\"";
+        assert_eq!(sql_shape(clauses), Some(true), "every optional clause");
+        let symbols = sql_symbols(clauses);
+        assert!(symbols.contains(&"posts".to_owned()));
+        assert!(symbols.contains(&"comments".to_owned()));
+    }
+
+    /// What replaces the companion test. Without `TABLE` to lean on, the guard
+    /// against prose is the rest of the grammar: every word after `TRUNCATE` in
+    /// a real statement is a clause keyword or a table name, so a word that can
+    /// be neither says the literal is a sentence.
+    #[test]
+    fn a_truncate_sentence_is_not_a_statement() {
+        assert_eq!(
+            sql_shape("\"Truncate the summary to 200 characters\""),
+            None,
+            "prose must not be scanned, and must not claim mutation"
+        );
+        assert_eq!(
+            sql_shape("\"Truncate a title that runs past 80 chars\""),
+            None
+        );
     }
 
     #[test]
