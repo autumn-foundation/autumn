@@ -536,7 +536,14 @@ HIDDEN_TAGS = r'script|style|template'
 # comment, and parsing comments first truncated the document at it.
 # This is the third place in this file that needed the same rule; `split_fences`
 # and `comment_block_spans` settle fences against comments the same way.
-FIRST_OPENER = re.compile(r'(<!--)|(<(' + HIDDEN_TAGS + r')\b[^>]*>)', re.I)
+# `\b` is not the boundary this needs: a hyphen is a non-word character, so it
+# sits happily between `script` and `-widget` and `<script-widget>` was read as
+# an unclosed `<script>`, blanking the rest of the page. A custom element is a
+# perfectly ordinary tag whose contents render. CommonMark's own start
+# condition is the name followed by whitespace, `>` or the end of the line.
+TAG_NAME_END = r'(?=[\s>]|$)'
+FIRST_OPENER = re.compile(
+    r'(<!--)|(<(' + HIDDEN_TAGS + r')' + TAG_NAME_END + r'[^>]*>)', re.I)
 # `<pre>` and `<textarea>` are CommonMark type-1 raw blocks alongside script and
 # style, so Markdown inside them is literal — but unlike script and style their
 # contents are SHOWN. A path in a `<pre>` block is on screen and still counts,
@@ -555,8 +562,9 @@ FIRST_OPENER = re.compile(r'(<!--)|(<(' + HIDDEN_TAGS + r')\b[^>]*>)', re.I)
 # Markdown under it still renders.
 TYPE1_TAGS = r'pre|textarea|script|style'
 PRE_BLOCK = re.compile(
-    r'^ {0,3}<(?:' + TYPE1_TAGS + r')\b[^>]*>.*?</(?:' + TYPE1_TAGS + r')\s*>[^\n]*'
-    r'|^ {0,3}<(?:' + TYPE1_TAGS + r')\b[^>]*>.*',
+    r'^ {0,3}<(?:' + TYPE1_TAGS + r')' + TAG_NAME_END + r'[^>]*>'
+    r'.*?</(?:' + TYPE1_TAGS + r')\s*>[^\n]*'
+    r'|^ {0,3}<(?:' + TYPE1_TAGS + r')' + TAG_NAME_END + r'[^>]*>.*',
     re.S | re.I | re.M)
 # One HTML attribute, as CommonMark defines it. The unquoted value is the part
 # worth spelling out: it admits no whitespace and none of `"`, `'`, `=`, `<`,
@@ -672,6 +680,13 @@ ANCHOR_HREF = re.compile(
 ATX_HEADING = re.compile(r'^ {0,3}#{1,6}(?:\s|$)')
 THEMATIC_BREAK = re.compile(r'^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$')
 FENCE_LINE = re.compile(r'^ {0,3}(?:`{3,}|~{3,})')
+# A Setext underline turns the paragraph ABOVE it into a heading, so it closes
+# that paragraph and leaves none open. Only `---` was handled, and only by
+# accident of being a thematic break too; `Links` / `=====` / `[m]: mail.md`
+# left the paragraph open and the definition below it unrecognised, reporting a
+# page the reader can click as an orphan. A single `=` or `-` underlines, which
+# is why this is not the thematic-break rule with a different name.
+SETEXT_UNDERLINE = re.compile(r'^ {0,3}(?:=+|-+)[ \t]*$')
 # Four columns of indent is a code block — but only where a paragraph is not
 # already open, since indented code cannot interrupt one. Tabs expand to
 # four-column stops, which is what makes a single leading tab count.
@@ -733,6 +748,11 @@ def block_starts(txt):
             # keeps a RUN of them working — only the first follows a blank
             # line. Rejecting the second of `[first]: jobs.md` / `[mail]:
             # mail.md` reported a page the reader can reach as an orphan.
+            para_open = False
+        elif para_open and SETEXT_UNDERLINE.match(line):
+            # It needs an open paragraph to underline: with none, `===` is
+            # ordinary text and `---` is a thematic break, which the next arm
+            # already settles.
             para_open = False
         elif (ATX_HEADING.match(line) or THEMATIC_BREAK.match(line)
                 or FENCE_LINE.match(line)):
@@ -2218,6 +2238,36 @@ self_test() {
     > "$c9eh/docs/guide/jobs.md"
   git -C "$c9eh" add -A && git -C "$c9eh" commit -qm def-title-across-blank
   check "a use below a blank line is not swallowed by a title" pass "$c9eh"
+
+  # A custom element is not a script: the tag name ends at the hyphen.
+  local c9ei="$tmp/c9ei"; make_corpus "$c9ei"
+  printf '# Jobs\n\n<script-widget> See [mail](mail.md). </script-widget>\n' \
+    > "$c9ei/docs/guide/jobs.md"
+  git -C "$c9ei" add -A && git -C "$c9ei" commit -qm custom-element
+  check "a custom element is not a script tag" pass "$c9ei"
+
+  # ...and a real one, needing no attributes to be one, still hides its body.
+  local c9ej="$tmp/c9ej"; make_corpus "$c9ej"
+  printf '# Jobs\n\n<script> See [mail](mail.md). </script>\n' \
+    > "$c9ej/docs/guide/jobs.md"
+  git -C "$c9ej" add -A && git -C "$c9ej" commit -qm real-script-inline
+  check "a real script tag still hides its body" fail "$c9ej"
+
+  # A Setext underline completes the heading above it, so the definition below
+  # starts a block rather than continuing a paragraph.
+  local c9ek="$tmp/c9ek"; make_corpus "$c9ek"
+  printf '# Jobs\n\nSee [mail][m].\n\nLinks\n=====\n[m]: mail.md\n' \
+    > "$c9ek/docs/guide/jobs.md"
+  git -C "$c9ek" add -A && git -C "$c9ek" commit -qm setext-underline
+  check "a definition under a Setext heading resolves" pass "$c9ek"
+
+  # ...but `===` with no paragraph above it underlines nothing, so a definition
+  # after it is still continuing ordinary text.
+  local c9el="$tmp/c9el"; make_corpus "$c9el"
+  printf '# Jobs\n\nSee [mail][m].\n\n=====\n[m]: mail.md\n' \
+    > "$c9el/docs/guide/jobs.md"
+  git -C "$c9el" add -A && git -C "$c9el" commit -qm setext-no-paragraph
+  check "an underline with nothing above it completes no heading" fail "$c9el"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
