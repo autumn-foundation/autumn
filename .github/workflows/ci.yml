@@ -1222,7 +1222,21 @@ jobs:
         run: |
           set -euo pipefail
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          # `--skip compile_fail::`, the same skip the `test` job uses, for a
+          # reason specific to coverage: a trybuild case compiles its fixture
+          # as a separate crate in a NESTED cargo process, which this run does
+          # not instrument, so the whole module contributes no coverage signal
+          # at all. It is not free, either — it was 1066s of this lane, and it
+          # writes ~16 GB into `target/tests/trybuild` (measured on the
+          # trybuild shards, which drop that tree afterwards for exactly this
+          # reason) on top of an instrumented tree that is already the most
+          # disk-hungry build in the workflow. It failed here as `31 of 31
+          # tests failed` while `Trybuild pass_b` was green in the same run, so
+          # the fixtures are fine and this was an artifact of the environment,
+          # not a regression. `compile_fail::` still runs, and still gates
+          # merge, in the four `trybuild` shards.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            -- --skip compile_fail::
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage (plugin-sandbox + sqlite)
         if: matrix.lane == 'sandbox-sqlite'
