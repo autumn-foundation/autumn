@@ -35,12 +35,15 @@ pub fn returns_mail(method: &ImplItemFn) -> bool {
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>();
 
+    // A 2- or 3-segment path's leading segment is only ever literally
+    // "autumn_web" when unrenamed; compare against the actively resolved
+    // name instead so a fully qualified return type still recognizes under
+    // a rename or `crate = "..."` override (#1828).
+    let crate_root = crate::crate_path::current_target();
     match segments.as_slice() {
         [mail] => mail == "Mail",
-        [autumn_web, mail] => autumn_web == "autumn_web" && mail == "Mail",
-        [autumn_web, module, mail] => {
-            autumn_web == "autumn_web" && module == "mail" && mail == "Mail"
-        }
+        [root, mail] => *root == crate_root && mail == "Mail",
+        [root, module, mail] => *root == crate_root && module == "mail" && mail == "Mail",
         _ => false,
     }
 }

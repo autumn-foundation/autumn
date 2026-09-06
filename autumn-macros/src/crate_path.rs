@@ -10,17 +10,44 @@
 //!
 //! Rather than threading a resolved path through every `quote!` call site,
 //! this module rewrites the *final* token stream each macro entry point in
-//! `lib.rs` returns: every bare `::autumn_web` path segment (and every
-//! `"::autumn_web…"` substring inside a string literal, for attribute values
-//! like `#[serde(deserialize_with = "...")]` built via `format!`) is replaced
-//! with the resolved name. The ~3000 `::autumn_web` references throughout the
-//! rest of this crate never change; they keep meaning "the real `autumn-web`
-//! crate, however the invoking crate's `Cargo.toml` names it."
+//! `lib.rs` returns: every bare `::autumn_web` path segment is replaced with
+//! the resolved name. The ~3000 `::autumn_web` references throughout the rest
+//! of this crate never change; they keep meaning "the real `autumn-web`
+//! crate, however the invoking crate's `Cargo.toml` names it." Only *tokens*
+//! are rewritten this way, never string literal contents: a `::`-rooted path
+//! is unambiguously a path reference wherever it appears, but a string
+//! literal in the final expansion may be data the macro is simply re-emitting
+//! verbatim from the user's own source (a route path, a doc comment, literal
+//! text a handler returns) — blindly rewriting a substring inside it risks
+//! corrupting that data on a false-positive match (Codex review, #2552).
+//!
+//! The handful of call sites that build a string *containing* a crate-rooted
+//! path (`#[serde(deserialize_with = "::autumn_web::form::...")]`,
+//! `#[serde(crate = "::autumn_web::reexports::serde")]`) instead read
+//! [`current_target`] directly, so they construct the resolved string from
+//! the start rather than needing a later post-hoc rewrite.
+//!
+//! Beyond generated code, several modules ([`crate::idempotency_guard`],
+//! [`crate::agent_authority`], [`crate::mailer`], [`crate::ws`]) *recognize*
+//! `::autumn_web`-rooted paths — e.g. to detect that an earlier-expanded
+//! stacked macro (`#[authorize]` before `#[secured]`) already injected a
+//! particular guard call, so a later macro doesn't duplicate or miss it. Once
+//! that earlier macro's own output has been rewritten to a renamed target,
+//! recognizing it against the literal `"autumn_web"` breaks the same way
+//! generation would (Codex review, #2552) — these also call
+//! [`current_target`] instead of hardcoding the default.
+//!
+//! [`set_target`] is what makes the resolved name available to both: every
+//! macro entry point in `lib.rs` calls it (via the returned guard's binding)
+//! to cover its *entire* expansion, not just the later [`finalize`] pass —
+//! recognizers run *during* the macro's own logic, inspecting input that may
+//! already carry an earlier macro's renamed output.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use proc_macro_crate::{FoundCrate, crate_name};
-use proc_macro2::{Group, Ident, Literal, Spacing, TokenStream, TokenTree};
+use proc_macro2::{Group, Ident, Spacing, TokenStream, TokenTree};
 
 /// The name generated code falls back to when no rename is detected, no
 /// override is given, or resolution fails for any reason (e.g. this crate's
@@ -145,12 +172,40 @@ fn match_crate_override(tokens: &[TokenTree], i: usize) -> Option<Result<String,
     Some(Ok(value))
 }
 
-/// Rewrite every macro-generated `::autumn_web` path to the resolved crate
-/// name — the given override if present, otherwise the automatically
-/// detected one.
-pub fn finalize(ts: TokenStream, crate_override: Option<&str>) -> TokenStream {
-    // Not `crate_override.map_or_else(default_name, |name| name)`: rustc
-    // unifies the `|name| name` branch's return lifetime with
+thread_local! {
+    // A macro invocation never spans threads and never runs concurrently
+    // with another (rustc calls one macro function to completion before
+    // calling the next), so a single cell — not a stack — is enough. It
+    // still resets on drop rather than at the *next* `set_target` call so a
+    // panic mid-expansion can't leave a stale value for whatever the
+    // compiler process's next unrelated macro invocation reads.
+    static CURRENT_TARGET: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// RAII guard returned by [`set_target`]; restores the previous target on
+/// drop (including on unwind), so a nested or short-circuiting return can't
+/// leave a stale target for whatever this same compiler process expands
+/// next.
+pub struct TargetGuard {
+    previous: Option<String>,
+}
+
+impl Drop for TargetGuard {
+    fn drop(&mut self) {
+        CURRENT_TARGET.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Set the crate-name target for the rest of the current scope (until the
+/// returned guard drops) — the given override, or the automatically detected
+/// default when `None`. Bind the result (`let _guard = ...;`), covering the
+/// entire expansion: both the later [`finalize`] pass over this macro's own
+/// output, and any nested call into this crate's own generators or
+/// recognizers, which need the same resolved name while *they* run, not just
+/// once their result is finalized.
+pub fn set_target(crate_override: Option<&str>) -> TargetGuard {
+    // Not `crate_override.map_or_else(default_name, ToOwned::to_owned)`:
+    // rustc unifies the closure branch's return lifetime with
     // `crate_override`'s short borrow before it considers coercing
     // `default_name`'s `fn() -> &'static str` into that same bound, so the
     // "clean" clippy-suggested form fails to compile with a spurious
@@ -161,17 +216,38 @@ pub fn finalize(ts: TokenStream, crate_override: Option<&str>) -> TokenStream {
         Some(name) => name,
         None => default_name(),
     };
+    let previous = CURRENT_TARGET.with(|cell| cell.borrow_mut().replace(target.to_owned()));
+    TargetGuard { previous }
+}
+
+/// The crate-name target the innermost enclosing [`set_target`] scope set,
+/// or the unrenamed default if none is active (e.g. a unit test in this
+/// crate calling a generator or recognizer directly, without going through
+/// `lib.rs`'s macro entry points).
+pub fn current_target() -> String {
+    CURRENT_TARGET.with(|cell| {
+        cell.borrow()
+            .clone()
+            .unwrap_or_else(|| DEFAULT_NAME.to_owned())
+    })
+}
+
+/// Rewrite every macro-generated `::autumn_web` path to [`current_target`].
+/// A no-op whenever that target is the unrenamed default — the overwhelming
+/// majority of expansions, since a rename or override is rare.
+pub fn finalize(ts: TokenStream) -> TokenStream {
+    let target = current_target();
     if target == DEFAULT_NAME {
         return ts;
     }
-    rewrite(ts, target)
+    rewrite(ts, &target)
 }
 
-/// Recursively walk a token stream, rewriting `:: autumn_web` path segments
-/// (never a bare, non-`::`-prefixed `autumn_web` — that form is under the
+/// Recursively walk a token stream, rewriting `:: autumn_web` path segments —
+/// never a bare, non-`::`-prefixed `autumn_web` (that form is under the
 /// user's own control, e.g. inside a handler body this crate re-emits
-/// verbatim, and is out of scope here) and string literals containing
-/// `"::autumn_web"`.
+/// verbatim, and is out of scope here), and never a string literal's
+/// contents (data, not a path reference — see the module doc).
 fn rewrite(ts: TokenStream, target: &str) -> TokenStream {
     let tokens: Vec<TokenTree> = ts.into_iter().collect();
     let mut out: Vec<TokenTree> = Vec::with_capacity(tokens.len());
@@ -199,10 +275,6 @@ fn rewrite(ts: TokenStream, target: &str) -> TokenStream {
                 out.push(tokens[i].clone());
                 i += 1;
             }
-            TokenTree::Literal(lit) => {
-                out.push(rewrite_literal(lit, target));
-                i += 1;
-            }
             other => {
                 out.push(other.clone());
                 i += 1;
@@ -210,28 +282,6 @@ fn rewrite(ts: TokenStream, target: &str) -> TokenStream {
         }
     }
     TokenStream::from_iter(out)
-}
-
-/// Rewrite a `"::autumn_web::…"` substring inside a string literal's *value*
-/// (not its raw token text, so escaping stays correct) — both the shape
-/// `format!("::autumn_web::form::{base}")`-built attribute values take (e.g.
-/// `#[serde(deserialize_with = "...")]`) and, via a raw string, `///` doc
-/// comments (`#[doc = r"...[`Foo`](::autumn_web::bar::Foo)..."]`) mentioning
-/// the crate by name.
-fn rewrite_literal(lit: &Literal, target: &str) -> TokenTree {
-    let repr = lit.to_string();
-    // A cheap pre-filter before the real (quote-style-aware) parse below: no
-    // non-string literal (integer, char, byte-string, ...) can contain this
-    // substring, so this never rejects a literal actually worth rewriting.
-    if repr.contains("::autumn_web")
-        && let Ok(syn::Lit::Str(s)) = syn::parse_str::<syn::Lit>(&repr)
-    {
-        let replaced = s.value().replace("::autumn_web", &format!("::{target}"));
-        let mut new_lit = Literal::string(&replaced);
-        new_lit.set_span(lit.span());
-        return TokenTree::Literal(new_lit);
-    }
-    TokenTree::Literal(lit.clone())
 }
 
 #[cfg(test)]
@@ -280,23 +330,47 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_string_literal_path() {
+    fn rewrite_never_touches_string_literal_contents() {
+        // A string literal is data, not a path reference, even when its
+        // contents happen to look like one — e.g. a route path re-emitted
+        // verbatim (`#[get("/proxy/::autumn_web")]`) or a handler literally
+        // returning that text. Rewriting substrings inside it would corrupt
+        // that data on a false-positive match (Codex review, #2552), so
+        // `rewrite` must leave every literal's token text byte-for-byte
+        // alone regardless of what it contains.
         let input = quote! {
-            #[serde(deserialize_with = "::autumn_web::form::deserialize_naive_datetime_local")]
+            let a = "hello autumn_web world";
+            let b = "::autumn_web::form::deserialize_naive_datetime_local";
+            let c = "/proxy/::autumn_web";
         };
-        let out = rewrite(input, "renamed_web");
-        let s = ts_string(&out);
-        assert!(
-            s.contains("\"::renamed_web::form::deserialize_naive_datetime_local\""),
-            "got: {s}"
-        );
+        let out = rewrite(input.clone(), "renamed_web");
+        assert_eq!(ts_string(&out), ts_string(&input));
     }
 
     #[test]
-    fn rewrite_string_literal_leaves_unrelated_strings_alone() {
-        let input = quote! { let x = "hello autumn_web world"; };
-        let out = rewrite(input.clone(), "renamed_web");
-        assert_eq!(ts_string(&out), ts_string(&input));
+    fn set_target_default_when_no_scope_active() {
+        assert_eq!(current_target(), "autumn_web");
+    }
+
+    #[test]
+    fn set_target_applies_an_explicit_override() {
+        let _guard = set_target(Some("web_renamed"));
+        assert_eq!(current_target(), "web_renamed");
+    }
+
+    #[test]
+    fn set_target_restores_previous_value_on_drop() {
+        assert_eq!(current_target(), "autumn_web");
+        {
+            let _guard = set_target(Some("outer"));
+            assert_eq!(current_target(), "outer");
+            {
+                let _guard = set_target(Some("inner"));
+                assert_eq!(current_target(), "inner");
+            }
+            assert_eq!(current_target(), "outer");
+        }
+        assert_eq!(current_target(), "autumn_web");
     }
 
     #[test]
@@ -306,14 +380,15 @@ mod tests {
         // default resolves to "autumn_web" and finalize should not touch the
         // stream at all.
         let input = quote! { fn foo() -> ::autumn_web::Route { } };
-        let out = finalize(input.clone(), None);
+        let out = finalize(input.clone());
         assert_eq!(ts_string(&out), ts_string(&input));
     }
 
     #[test]
-    fn finalize_applies_an_explicit_override() {
+    fn finalize_applies_the_active_target() {
+        let _guard = set_target(Some("web_renamed"));
         let input = quote! { fn foo() -> ::autumn_web::Route { } };
-        let out = finalize(input, Some("web_renamed"));
+        let out = finalize(input);
         let s = ts_string(&out);
         assert!(s.contains("web_renamed"));
         assert!(!s.contains("autumn_web"));
@@ -494,21 +569,28 @@ mod tests {
     // (e.g. through a helper that doesn't route through `quote!` the way
     // every test elsewhere in this file assumes).
 
-    /// The contract these pipeline tests check: no `::autumn_web` (crate-root
-    /// anchored path, in tokens or inside a string literal) survives
-    /// `finalize`. A *bare*, non-`::`-prefixed mention of `autumn_web` — e.g.
-    /// inside a doc comment's prose, like `` `autumn_web::encryption` `` in a
-    /// generated `///` link — is deliberately left untouched, the same as a
-    /// bare token ident (see `rewrite_leaves_unprefixed_ident_alone` above):
-    /// it is not a path we generated and control, just informational text,
-    /// and rewriting substrings inside arbitrary prose risks false positives
-    /// with no compile-correctness upside.
-    fn assert_no_rooted_autumn_web_path(s: &str) {
-        assert!(!s.contains("::autumn_web"), "leaked `::autumn_web` in: {s}");
+    /// The contract these pipeline tests check: no genuine `::autumn_web`
+    /// *token* path (crate-root anchored) survives `finalize`. `to_string()`
+    /// renders a real `:: Ident ::` token sequence with spaces around the
+    /// identifier (`":: renamed_autumn_web ::"`, matching e.g.
+    /// `rewrite_bare_path_segment_to_override` above); a doc comment or other
+    /// string literal's *contents* render with no such surrounding space,
+    /// however they read, since a literal is one opaque token — so this
+    /// specifically will not (and must not) flag those. Doc comments
+    /// generated by these pipelines legitimately still say `::autumn_web`
+    /// after a rename (string literals are never rewritten — see the module
+    /// doc); that's an accepted, purely cosmetic trade-off against the
+    /// alternative of risking corruption of a user's own string data.
+    fn assert_no_leaked_autumn_web_token_path(s: &str) {
+        assert!(
+            !s.contains(":: autumn_web"),
+            "leaked `::autumn_web` token path in: {s}"
+        );
     }
 
     #[test]
     fn route_macro_pipeline_has_no_leaked_autumn_web_after_override() {
+        let _guard = set_target(Some("renamed_autumn_web"));
         let generated = crate::route::route_macro(
             "GET",
             "get",
@@ -519,15 +601,16 @@ mod tests {
                 }
             },
         );
-        let rewritten = finalize(generated, Some("renamed_autumn_web"));
+        let rewritten = finalize(generated);
         let s = ts_string(&rewritten);
-        assert_no_rooted_autumn_web_path(&s);
+        assert_no_leaked_autumn_web_token_path(&s);
         assert!(s.contains("renamed_autumn_web"), "got: {s}");
     }
 
     #[test]
     #[cfg(feature = "db")]
     fn model_macro_pipeline_has_no_leaked_autumn_web_after_override() {
+        let _guard = set_target(Some("renamed_autumn_web"));
         let item = quote! {
             struct Post {
                 #[id]
@@ -536,22 +619,59 @@ mod tests {
             }
         };
         let generated = crate::model::model_macro(quote! {}, item);
-        let rewritten = finalize(generated, Some("renamed_autumn_web"));
+        let rewritten = finalize(generated);
         let s = ts_string(&rewritten);
-        assert_no_rooted_autumn_web_path(&s);
+        assert_no_leaked_autumn_web_token_path(&s);
         assert!(s.contains("renamed_autumn_web"), "got: {s}");
+        // The `deserialize_with`/`#[serde(crate = "...")]` string values this
+        // pipeline builds (issue #1828's original literal-rewrite targets)
+        // must reflect the active target too — proving `current_target()` at
+        // the source beats the removed post-hoc literal rewrite.
+        assert!(
+            s.contains("renamed_autumn_web :: reexports :: serde"),
+            "got: {s}"
+        );
     }
 
     #[test]
     #[cfg(feature = "db")]
     fn repository_macro_pipeline_has_no_leaked_autumn_web_after_override() {
+        let _guard = set_target(Some("renamed_autumn_web"));
         let generated = crate::repository::repository_macro(
             quote! { Post },
             quote! { pub trait PostRepository {} },
         );
-        let rewritten = finalize(generated, Some("renamed_autumn_web"));
+        let rewritten = finalize(generated);
         let s = ts_string(&rewritten);
-        assert_no_rooted_autumn_web_path(&s);
+        assert_no_leaked_autumn_web_token_path(&s);
         assert!(s.contains("renamed_autumn_web"), "got: {s}");
+    }
+
+    /// Regression test for the exact scenario a Codex review on #2552 found:
+    /// stacking `#[authorize]` above `#[secured]` under a rename must still
+    /// let the route macro recognize the replay guard `#[authorize]`'s own
+    /// (already-finalized, already-renamed) expansion injected, rather than
+    /// missing it because the recognizer only knew the literal
+    /// `"autumn_web"`.
+    #[test]
+    fn replay_guard_recognized_after_stacked_macro_rename() {
+        let _guard = set_target(Some("renamed_autumn_web"));
+        // Simulate what `#[authorize]` (or `#[secured]`/`#[step_up]`) leaves
+        // behind once ITS OWN `finalize` has already run: a block whose
+        // early-return replay check is rooted at the *renamed* crate, not
+        // `autumn_web` literally.
+        let block: syn::Block = syn::parse_quote! {{
+            const __AUTUMN_IDEMPOTENCY_REPLAY_GUARD: () = ();
+            if let ::core::option::Option::Some(__autumn_response) =
+                ::renamed_autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
+            {
+                return __autumn_response;
+            }
+        }};
+        assert!(
+            crate::idempotency_guard::block_has_replay_guard(&block),
+            "recognizer must accept the actively-resolved crate name, not just the literal \
+             \"autumn_web\""
+        );
     }
 }
