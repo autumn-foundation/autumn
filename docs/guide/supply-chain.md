@@ -522,17 +522,21 @@ derives its check list from the file:
 ```bash
 checks="advisories"
 for section in bans licenses sources; do
-  if grep -qE "^[[:space:]]*\[$section\]" deny.toml; then
+  if grep -qE "^[[:space:]]*(\[\[?[[:space:]]*)?[\"']?$section[\"']?[[:space:]]*[].=]" deny.toml; then
     checks="$checks $section"
   fi
 done
 cargo deny --offline check $checks
 ```
 
-`autumn doctor` derives it by the same rule — the same set of TOML spellings,
-verified against the workflow's own shell by
-`doctor_and_the_generated_workflow_derive_the_same_checks` — so the policy in
-force is the same on both sides.
+`autumn doctor` reaches the same answer by parsing the file as TOML, which is
+exact where grep can only approximate: `[bans]`, `[ bans ]`, `["bans"]`,
+`[bans.build]`, `[[bans.deny]]`, `bans.deny = …` and `bans = { … }` all declare
+the same table. The two are held together by a test —
+`doctor_and_the_generated_workflow_derive_the_same_checks` runs *this shell* and
+`autumn doctor` over every one of those spellings and requires the same answer —
+so a rule that drifts fails the build rather than silently un-enforcing your
+policy.
 
 ### `autumn doctor` — the dependency check
 
@@ -607,12 +611,13 @@ dependency finding. Output is rationed:
   auditor, a missing database, or a missing policy file; `autumn doctor` is
   where those are reported.
 
-The evaluation runs on its own thread from the moment dev starts, and is read
-only after the initial `cargo build` — which is far longer than the audit — so
-a cold start never waits on the auditor. A result that is still not ready five
-seconds after that build is dropped and nothing is printed. The auditor process
-itself is left to finish; dropping the result costs startup nothing, but it is
-not a kill.
+Nothing waits on the audit. It starts *after* the initial `cargo build` — run
+beside the build, its `cargo metadata` contends with Cargo's package-cache lock
+and slows the build itself — and the watch loop then polls for the result
+without blocking, printing it the moment it lands. A verdict that has not
+arrived within thirty seconds is dropped. So the audit costs the dev loop no
+latency at all, on a cold start or a rebuild; the trade is that the line can
+appear a second or two after the server does.
 
 ### Offline and air-gapped
 

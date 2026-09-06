@@ -513,25 +513,64 @@ impl DevReloadState {
     }
 }
 
-/// How long `autumn dev` waits for the dependency policy evaluation.
+/// How long `autumn dev` keeps looking for a dependency verdict (issue #1633).
 ///
-/// The wait is paid AFTER the initial build, which is far longer than the
-/// audit, so the audit is normally already done and this costs nothing. It is
-/// never paid before the build: dependency findings must not slow a cold start
-/// (issue #1633).
-const DEPENDENCY_AUDIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Nothing waits on the audit. It starts after the initial build — running it
+/// beside the build makes its `cargo metadata` contend with Cargo's
+/// package-cache lock and slow the build itself — and the watch loop then polls
+/// for the result without blocking. A verdict that has not arrived by this
+/// deadline is dropped and the dev loop says nothing.
+const DEPENDENCY_AUDIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Startup lines for an evaluation that may not have finished in time.
 fn dependency_startup_lines(eval: Option<&crate::deps::Evaluation>) -> Vec<String> {
     eval.map(crate::deps::dev_lines).unwrap_or_default()
 }
 
+/// A dependency evaluation running beside the dev loop.
+///
+/// Polled, never awaited: [`report`](Self::report) returns immediately whether
+/// or not a verdict has arrived, so the watch loop never stalls on the auditor.
+struct DependencyAudit {
+    receiver: mpsc::Receiver<crate::deps::Evaluation>,
+    deadline: std::time::Instant,
+    done: bool,
+}
+
+impl DependencyAudit {
+    fn start(root: &Path) -> Self {
+        Self {
+            receiver: crate::deps::spawn_evaluation(root),
+            deadline: std::time::Instant::now() + DEPENDENCY_AUDIT_DEADLINE,
+            done: false,
+        }
+    }
+
+    /// Print the verdict once, if one has arrived. Never blocks.
+    fn report(&mut self) {
+        if self.done {
+            return;
+        }
+        match self.receiver.try_recv() {
+            Ok(evaluation) => {
+                self.done = true;
+                for line in dependency_startup_lines(Some(&evaluation)) {
+                    eprintln!("{line}");
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.done = true,
+            // Still running. Give up once the deadline passes so a wedged
+            // auditor cannot keep this poll alive for the whole session.
+            Err(mpsc::TryRecvError::Empty) => {
+                self.done = std::time::Instant::now() >= self.deadline;
+            }
+        }
+    }
+}
+
 /// Run the dev server with file watching.
 pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("\u{1F342} autumn dev\n");
-
-    // Start the dependency audit first so it overlaps the rest of startup.
-    let dependency_audit = crate::deps::spawn_evaluation(Path::new("."));
 
     // Warn when maintenance mode is currently active so the operator is not
     // surprised by 503 responses during local development.
@@ -566,14 +605,12 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // the terminal errors remain the primary feedback for this case.
     let (built, diagnostics) = cargo_build_capturing(package);
 
-    // Dependency findings (issue #1633), reported after the build so a cold
-    // start never waits on the auditor. Quiet by default: an advisory-clean,
-    // policy-clean tree adds nothing here, and nothing below ever blocks the
-    // rebuild loop.
-    let evaluation = crate::deps::await_evaluation(&dependency_audit, DEPENDENCY_AUDIT_TIMEOUT);
-    for line in dependency_startup_lines(evaluation.as_ref()) {
-        eprintln!("{line}");
-    }
+    // Dependency findings (issue #1633). Started after the build so its
+    // `cargo metadata` cannot contend with the build for Cargo's package-cache
+    // lock, and polled — never awaited — so nothing here delays startup or the
+    // rebuild loop. Quiet by default: an advisory-clean, policy-clean tree adds
+    // nothing to this output.
+    let mut dependency_audit = DependencyAudit::start(Path::new("."));
 
     if !built {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
@@ -638,6 +675,8 @@ pub fn run(package: Option<&str>, show_config: bool) {
             eprintln!("\n  Shutting down...");
             break;
         }
+
+        dependency_audit.report();
 
         if !process_events(
             &rx,
@@ -3852,26 +3891,64 @@ watch_dirs = ["views", "locales"]
     }
 
     #[test]
-    fn the_audit_timeout_is_bounded() {
-        // A dev loop that stalls on an auditor is worse than one that says
-        // nothing.
-        assert!(DEPENDENCY_AUDIT_TIMEOUT <= Duration::from_secs(10));
+    fn the_audit_deadline_is_bounded() {
+        // A poll that outlives the session is a leak; a verdict nobody will
+        // read is not worth keeping.
+        assert!(DEPENDENCY_AUDIT_DEADLINE <= Duration::from_secs(60));
     }
 
     #[test]
-    fn the_dependency_wait_is_paid_after_the_build_not_before_it() {
-        // A cold start must not wait on the auditor. The source order is the
-        // contract: the audit is awaited only after `cargo_build_capturing`.
+    fn the_dependency_audit_starts_after_the_build_and_is_never_awaited() {
+        // Running the auditor beside the build makes its `cargo metadata`
+        // contend with Cargo's package-cache lock and slow the build. Awaiting
+        // it anywhere would delay startup or a rebuild.
+        // Only the module's own code, not this test — the needles below
+        // otherwise match the assertions that look for them.
         let source = include_str!("dev.rs");
-        let build = source
+        let code = &source[..source.find("#[cfg(test)]").expect("test module")];
+        let build = code
             .find("let (built, diagnostics) = cargo_build_capturing(package);")
             .expect("initial build");
-        let wait = source
-            .find("crate::deps::await_evaluation(&dependency_audit")
-            .expect("dependency wait");
+        let start = code
+            .find("let mut dependency_audit = DependencyAudit::start(")
+            .expect("audit start");
         assert!(
-            build < wait,
-            "the dependency wait must come after the initial build"
+            build < start,
+            "the audit must start after the initial build"
         );
+        assert!(
+            !code.contains("await_evaluation"),
+            "the dev loop must poll the audit, never await it"
+        );
+    }
+
+    #[test]
+    fn a_dependency_audit_that_never_answers_stops_being_polled() {
+        let (sender, receiver) = mpsc::channel();
+        let mut audit = DependencyAudit {
+            receiver,
+            deadline: std::time::Instant::now(),
+            done: false,
+        };
+        audit.report();
+        assert!(audit.done, "an expired deadline must end the polling");
+        drop(sender);
+    }
+
+    #[test]
+    fn a_dependency_audit_reports_its_verdict_once() {
+        let (sender, receiver) = mpsc::channel();
+        let mut audit = DependencyAudit {
+            receiver,
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+            done: false,
+        };
+        audit.report();
+        assert!(!audit.done, "a pending audit stays pending");
+        sender
+            .send(crate::deps::Evaluation::NoPolicy)
+            .expect("send");
+        audit.report();
+        assert!(audit.done, "a delivered verdict ends the polling");
     }
 }

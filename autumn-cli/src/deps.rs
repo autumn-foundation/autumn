@@ -127,35 +127,64 @@ pub enum Evaluation {
 /// optional sections are opt-in, so an app that leaves them commented out gets
 /// the same command locally that its CI runs.
 pub fn policy_checks(policy: &str) -> Vec<String> {
+    let declared = declared_sections(policy);
     let mut checks = vec!["advisories".to_owned()];
     checks.extend(
         OPTIONAL_CHECKS
             .iter()
-            .filter(|section| declares_section(policy, section))
+            .filter(|section| declared.iter().any(|key| key == *section))
             .map(|section| (*section).to_owned()),
     );
     checks
 }
 
-/// True when `policy` declares `section` on an uncommented line.
-fn declares_section(policy: &str, section: &str) -> bool {
-    policy
-        .lines()
-        .any(|line| line_declares(code_of(line), section))
+/// The top-level table keys the policy declares.
+///
+/// Parsed as TOML, so every spelling that reaches cargo-deny is seen the same
+/// way: `[bans]`, `[ bans ]`, `["bans"]`, `[bans.build]`, `[[bans.deny]]`,
+/// `bans.deny = …` and `bans = { … }` all declare the key `bans`.
+///
+/// A policy that does not parse falls back to a line scan. cargo-deny refuses
+/// to load such a file anyway, so the fallback only has to avoid claiming the
+/// sections vanished.
+fn declared_sections(policy: &str) -> Vec<String> {
+    if let Ok(table) = policy.parse::<toml::Table>() {
+        return table.keys().cloned().collect();
+    }
+    OPTIONAL_CHECKS
+        .iter()
+        .filter(|section| {
+            policy
+                .lines()
+                .any(|line| line_declares(code_of(line), section))
+        })
+        .map(|section| (*section).to_owned())
+        .collect()
 }
 
 /// True when one policy line declares `section`, in any TOML spelling.
 ///
-/// `[bans]`, `[ bans ]`, `[bans.build]`, `[[bans.deny]]`, `bans.deny = …` and
-/// `bans = { … }` all configure the same check. The scaffolded workflow matches
-/// the same set, so the two derivations agree.
+/// The fallback for an unparseable policy, and the rule the scaffolded workflow
+/// mirrors in shell — grep cannot parse TOML.
 fn line_declares(code: &str, section: &str) -> bool {
     let body = code
         .strip_prefix("[[")
         .or_else(|| code.strip_prefix('['))
         .map_or(code, ascii_trim_start);
+    // Quoted keys: ["bans"] and ['bans'].
+    let (body, quote) = match body.chars().next() {
+        Some(q @ ('"' | '\'')) => (&body[q.len_utf8()..], Some(q)),
+        _ => (body, None),
+    };
     let Some(rest) = body.strip_prefix(section) else {
         return false;
+    };
+    let rest = match quote {
+        Some(quote) => match rest.strip_prefix(quote) {
+            Some(rest) => rest,
+            None => return false,
+        },
+        None => rest,
     };
     matches!(ascii_trim_start(rest).chars().next(), Some(']' | '.' | '='))
 }
@@ -183,28 +212,24 @@ fn ascii_trim_start(text: &str) -> &str {
 
 /// A custom `db-path` declared by the policy, if any.
 ///
-/// Read from the raw line, not from [`code_of`]: a path may contain `#`.
-/// `~` and `$CARGO_HOME` are expanded, as cargo-deny expands them.
+/// Parsed as TOML, so quoting and escapes are the parser's problem rather than
+/// this code's. `~` and `$CARGO_HOME` are expanded, as cargo-deny expands them.
 pub fn policy_db_path(policy: &str) -> Option<String> {
-    policy.lines().find_map(|line| {
-        let line = ascii_trim(line);
-        if line.starts_with('#') {
-            return None;
-        }
-        let value = ascii_trim(line.strip_prefix("db-path")?).strip_prefix('=')?;
-        let value = ascii_trim(value);
-        // TOML basic and literal strings.
-        let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-        let value = &value[quote.len_utf8()..];
-        let value = &value[..value.find(quote)?];
-        (!value.is_empty()).then(|| expand_path(value))
-    })
+    let value = policy
+        .parse::<toml::Table>()
+        .ok()?
+        .get("advisories")?
+        .get("db-path")?
+        .as_str()?
+        .to_owned();
+    (!value.is_empty()).then(|| expand_path(&value))
 }
 
 /// Expand the path prefixes cargo-deny accepts in `db-path`.
 fn expand_path(path: &str) -> String {
-    let home = env_var("HOME");
-    let cargo_home = env_var("CARGO_HOME").or_else(|| home.as_ref().map(|h| format!("{h}/.cargo")));
+    let home =
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_string_lossy().into_owned());
+    let cargo_home = crate::upgrade::cargo_home().map(|dir| dir.to_string_lossy().into_owned());
     expand_path_with(path, home.as_deref(), cargo_home.as_deref())
 }
 
@@ -224,11 +249,6 @@ pub fn expand_path_with(path: &str, home: Option<&str>, cargo_home: Option<&str>
         }
     }
     path.to_owned()
-}
-
-/// A set, non-empty environment variable.
-fn env_var(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|value| !value.is_empty())
 }
 
 // ── CVSS v3 base score ───────────────────────────────────────────────────────
@@ -623,15 +643,13 @@ pub fn newest_db_mtime(dbs_dir: &Path) -> Option<SystemTime> {
 }
 
 /// Where cargo-deny keeps the `RustSec` database when the policy names no path.
+///
+/// Cargo's own home, resolved the way Cargo resolves it: on Windows `$HOME` is
+/// normally unset and the home comes from the user profile.
 fn default_db_dir() -> PathBuf {
-    // `var_os` reports a set-but-empty variable as `Some("")`, which would make
-    // the database path relative and report a present database as missing.
-    let set = |key: &str| std::env::var_os(key).filter(|value| !value.is_empty());
-    let cargo_home = set("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| set("HOME").map(|home| PathBuf::from(home).join(".cargo")))
-        .unwrap_or_else(|| PathBuf::from(".cargo"));
-    cargo_home.join("advisory-dbs")
+    crate::upgrade::cargo_home()
+        .unwrap_or_else(|| PathBuf::from(".cargo"))
+        .join("advisory-dbs")
 }
 
 // ── Dev-loop output ──────────────────────────────────────────────────────────
@@ -1003,8 +1021,6 @@ mod tests {
     fn a_custom_db_path_is_read_from_the_policy() {
         let policy = "[advisories]\ndb-path = \"/srv/advisory-db\"\n";
         assert_eq!(policy_db_path(policy).as_deref(), Some("/srv/advisory-db"));
-        assert_eq!(policy_db_path("[advisories]\n"), None);
-        assert_eq!(policy_db_path("# db-path = \"/nope\"\n"), None);
     }
 
     // ── CVSS v3 base score ───────────────────────────────────────────────────
@@ -1299,6 +1315,8 @@ mod tests {
             "[[bans.deny]]\n",
             "bans.deny = []\n",
             "bans = { multiple-versions = \"allow\" }\n",
+            "[\"bans\"]\n",
+            "['bans']\n",
         ] {
             assert!(
                 policy_checks(policy).contains(&"bans".to_owned()),
@@ -1316,13 +1334,21 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_indentation_is_not_treated_as_whitespace() {
-        // Rust's `trim` strips U+00A0; POSIX `[[:space:]]` does not. A rule the
-        // scaffolded workflow cannot mirror is a rule the two disagree on.
-        assert_eq!(
-            policy_checks("\u{00A0}[bans]\n"),
-            vec!["advisories".to_owned()]
-        );
+    fn an_unparseable_policy_falls_back_to_a_line_scan() {
+        // cargo-deny refuses to load such a file, so the fallback only has to
+        // avoid claiming the declared sections vanished.
+        let broken = "[bans]\nthis is not toml =\n";
+        assert!(broken.parse::<toml::Table>().is_err());
+        assert!(policy_checks(broken).contains(&"bans".to_owned()));
+    }
+
+    #[test]
+    fn the_line_scan_fallback_ignores_non_ascii_indentation() {
+        // Rust's `trim` strips U+00A0; POSIX `[[:space:]]` does not. The
+        // fallback is the rule the scaffolded workflow mirrors in shell, so it
+        // must not see what grep cannot.
+        assert!(!line_declares(code_of("\u{00A0}[bans]"), "bans"));
+        assert!(line_declares(code_of("  [bans]"), "bans"));
     }
 
     #[test]
@@ -1350,15 +1376,21 @@ mod tests {
 
     #[test]
     fn a_db_path_is_read_through_quoting_and_comments() {
-        // TOML literal strings, and a path containing `#`.
+        // The parser handles TOML literal strings, escapes and trailing
+        // comments; hand-slicing the source text did not.
         assert_eq!(
-            policy_db_path("db-path = '/srv/db#1'\n").as_deref(),
+            policy_db_path("[advisories]\ndb-path = '/srv/db#1'\n").as_deref(),
             Some("/srv/db#1")
         );
         assert_eq!(
-            policy_db_path("db-path = \"/srv/db\" # mirrored nightly\n").as_deref(),
+            policy_db_path("[advisories]\ndb-path = \"/srv/db\" # mirrored nightly\n").as_deref(),
             Some("/srv/db")
         );
+        // cargo-deny reads this key from `[advisories]`; a stray top-level one
+        // configures nothing.
+        assert_eq!(policy_db_path("db-path = \"/srv/db\"\n"), None);
+        assert_eq!(policy_db_path("[advisories]\n"), None);
+        assert_eq!(policy_db_path("# db-path = \"/nope\"\n"), None);
     }
 
     #[test]

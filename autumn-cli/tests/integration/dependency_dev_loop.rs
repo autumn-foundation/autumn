@@ -319,6 +319,8 @@ const SECTION_SPELLINGS: &[(&str, bool)] = &[
     ("bans.deny = []\n", true),
     ("bans = { multiple-versions = \"allow\" }\n", true),
     ("  [bans]\n", true),
+    ("[\"bans\"]\n", true),
+    ("['bans']\n", true),
     ("[bansible]\n", false),
     ("# [bans]\n", false),
     ("#[bans]\n", false),
