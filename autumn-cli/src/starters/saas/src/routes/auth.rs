@@ -51,20 +51,31 @@ const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfN
 /// cannot create a duplicate account — no client-side JavaScript involved. A
 /// new token is minted on every render (including this error re-render), so the
 /// corrected resubmit carries a fresh token rather than a spent one.
-fn signup_page(min_len: usize, submit_token: &str, error: Option<&str>) -> Markup {
+///
+/// `email` re-fills the address the user already typed so a rejected password
+/// doesn't also cost them re-typing an unrelated field. `messages` renders as
+/// a list rather than a single blob of text: joined into one `<p>` they used
+/// to collapse into a run-on sentence (HTML collapses the `\n` join to a
+/// single space), which defeated the point of reporting every failure at
+/// once (issue #1345.6).
+fn signup_page(min_len: usize, submit_token: &str, email: &str, messages: &[String]) -> Markup {
     layout(
         "Sign up",
         false,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Create your account" }
-            @if let Some(error) = error {
-                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            @if !messages.is_empty() {
+                ul class="mb-4 text-sm text-red-600 list-disc pl-5" role="alert" {
+                    @for message in messages {
+                        li { (message) }
+                    }
+                }
             }
             form action="/signup" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
                 input type="hidden" name="_submit_token" value=(submit_token);
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -89,7 +100,8 @@ pub async fn signup_form(State(state): State<AppState>, submit_token: SubmitToke
     signup_page(
         state.config_arc().auth.password.min_length,
         submit_token.token(),
-        None,
+        "",
+        &[],
     )
 }
 
@@ -108,14 +120,22 @@ pub async fn signup(
     // Cap input lengths so an attacker cannot drive bcrypt/DB work with huge
     // payloads (254 is the RFC-5321 email maximum; 128 is a generous password cap).
     if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg(
-            "Enter a valid email address (max 254 characters)",
-        ));
+        return Ok(signup_page(
+            state.config_arc().auth.password.min_length,
+            submit_token.token(),
+            &email,
+            &["Enter a valid email address (max 254 characters)".to_owned()],
+        )
+        .into_response());
     }
     if form.password.len() > 128 {
-        return Err(AutumnError::unprocessable_msg(
-            "Password must be at most 128 characters",
-        ));
+        return Ok(signup_page(
+            state.config_arc().auth.password.min_length,
+            submit_token.token(),
+            &email,
+            &["Password must be at most 128 characters".to_owned()],
+        )
+        .into_response());
     }
     // Enforce the configured password policy (length, weak-list, similarity to
     // the email, and optional HIBP breach check). On failure, re-render the form
@@ -136,15 +156,11 @@ pub async fn signup(
         // Show EVERY failure (e.g. both "too short" and "too common"), not just
         // the first, so the user can fix all problems at once (issue #1345.6).
         let messages = validation.messages();
-        let message = if messages.is_empty() {
-            "Invalid password".to_owned()
-        } else {
-            messages.join("\n")
-        };
         return Ok(signup_page(
             password_cfg.min_length,
             submit_token.token(),
-            Some(&message),
+            &email,
+            &messages,
         )
         .into_response());
     }
@@ -173,17 +189,27 @@ pub async fn signup(
 
 // ── Login ────────────────────────────────────────────────────────────────────
 
-#[get("/login")]
-pub async fn login_form() -> Markup {
+/// Render the login form, optionally with an `email` to re-fill and an
+/// authentication `error` to show inline.
+///
+/// Mirrors `signup_page`: a failed login used to `Err(...)` straight to the
+/// framework's generic full-page error screen (`ErrorPageFilter`), which
+/// threw the user off the login page entirely — losing the email they'd
+/// typed and giving no adjacent, actionable way to retry — instead of
+/// keeping them on the form the way a rejected signup already does.
+fn login_page(email: &str, error: Option<&str>) -> Markup {
     layout(
         "Log in",
         false,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Log in" }
+            @if let Some(error) = error {
+                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            }
             form action="/login" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -208,6 +234,11 @@ pub async fn login_form() -> Markup {
     )
 }
 
+#[get("/login")]
+pub async fn login_form() -> Markup {
+    login_page("", None)
+}
+
 #[post("/login")]
 pub async fn login(
     State(state): State<AppState>,
@@ -220,7 +251,7 @@ pub async fn login(
     // Reject over-long inputs before any DB query or bcrypt work — they can never
     // match a stored account and only waste CPU.
     if email.len() > 254 || form.password.len() > 128 {
-        return Err(AutumnError::unauthorized_msg("Invalid email or password"));
+        return Ok(login_page(&email, Some("Invalid email or password")).into_response());
     }
 
     let user: Option<User> = users::table
@@ -230,7 +261,6 @@ pub async fn login(
         .await
         .optional()?;
 
-    let invalid = || AutumnError::unauthorized_msg("Invalid email or password");
     // Always run a bcrypt verification so the response time is constant whether
     // or not the email exists — prevents a timing side-channel that reveals
     // which accounts are registered.
@@ -238,11 +268,11 @@ pub async fn login(
         Some(u) => u,
         None => {
             let _ = verify_password(&form.password, DUMMY_HASH).await;
-            return Err(invalid());
+            return Ok(login_page(&email, Some("Invalid email or password")).into_response());
         }
     };
     if !verify_password(&form.password, &user.password_hash).await? {
-        return Err(invalid());
+        return Ok(login_page(&email, Some("Invalid email or password")).into_response());
     }
 
     establish_session(&session, &user).await;
