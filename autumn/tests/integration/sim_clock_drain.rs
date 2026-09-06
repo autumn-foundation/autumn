@@ -72,8 +72,6 @@ async fn backoff_job_fires_in_virtual_time_with_zero_wall_sleep(mut sim: Sim) {
     job::clear_global_job_client();
     BACKOFF_RUNS.store(0, Ordering::SeqCst);
 
-    let wall_start = Instant::now();
-
     // Mount the app on the paused runtime with the sim's virtual clock (starting
     // at the fixed sim epoch) and the in-process job runtime.
     sim.build(
@@ -99,8 +97,20 @@ async fn backoff_job_fires_in_virtual_time_with_zero_wall_sleep(mut sim: Sim) {
 
     // Jump virtual time forward 24h. This fires the retry backoff sleep AND
     // steps the injected wall clock the same 24h — with no real sleeping.
+    //
+    // The wall-clock budget starts *here*, not at the top of the test, and stops
+    // as soon as the retry has drained. That window — the 24h advance and the
+    // drain it fires — is the one the assertion below is actually about, and it
+    // is where the sibling sim tests start their clocks too
+    // (`sim_strict_wall_clock`, `sim_advance_to`; this test was the outlier).
+    // Started any earlier it also covers `sim.build`, which mounts an app and
+    // pays the one-time warm-up for every lazy static behind it — cheap on a
+    // quiet machine, but enough to blow a 1s budget under `llvm-cov`
+    // instrumentation, which is how the coverage job caught it.
+    let wall_start = Instant::now();
     sim.advance(TWENTY_FOUR_HOURS).await;
     sim.run_to_idle().await;
+    let wall_elapsed = wall_start.elapsed();
 
     // The retry fired and succeeded, all in virtual time.
     assert_eq!(
@@ -115,8 +125,8 @@ async fn backoff_job_fires_in_virtual_time_with_zero_wall_sleep(mut sim: Sim) {
     assert_eq!(after.text(), "2020-01-02T00:00:00+00:00");
 
     // ...while essentially no wall-clock time elapsed: the 24h backoff was slept
-    // in virtual time, never on the real clock.
-    let wall_elapsed = wall_start.elapsed();
+    // in virtual time, never on the real clock. (`wall_elapsed` was captured
+    // above, the moment the retry drained.)
     assert!(
         wall_elapsed < Duration::from_secs(1),
         "expected near-zero wall time for a 24h virtual backoff, but {wall_elapsed:?} elapsed"
