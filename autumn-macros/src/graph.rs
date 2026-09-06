@@ -37,11 +37,9 @@ use quote::quote;
 /// the example app does, and every real statement does.
 const SQL_SHAPES: &[(&str, &[&str], bool)] = &[
     ("SELECT", &["FROM"], false),
-    // A `WITH` statement is read-only only if nothing in it mutates: the
-    // statement after the CTEs, or a CTE body, can be an `INSERT`/`UPDATE`/
-    // `DELETE`/`MERGE`. `sql_shape` re-checks those verbs for this shape rather
-    // than trusting the `false` here.
-    ("WITH", &["SELECT"], false),
+    // `WITH` is absent on purpose: it leads a statement whose effect and whose
+    // required words both live in the CTEs it introduces, not in a fixed
+    // companion. See [`is_cte_statement`].
     ("INSERT", &["INTO"], true),
     ("UPDATE", &["SET"], true),
     ("DELETE", &["FROM"], true),
@@ -59,6 +57,12 @@ const SQL_SHAPES: &[(&str, &[&str], bool)] = &[
 /// Verbs that make any statement containing them a mutation, wherever they
 /// appear — used for `WITH`, whose leading verb says nothing about its effect.
 const SQL_MUTATION_VERBS: &[&str] = &["DELETE", "INSERT", "MERGE", "TRUNCATE", "UPDATE"];
+
+/// Verbs that can head a CTE body or the statement that follows the CTEs.
+///
+/// Used only to tell a `WITH` statement from an English sentence: what makes
+/// one a statement is that it actually runs something.
+const SQL_STATEMENT_VERBS: &[&str] = &["DELETE", "INSERT", "MERGE", "SELECT", "UPDATE", "VALUES"];
 
 /// The optional keywords a `TRUNCATE` statement may carry.
 ///
@@ -352,6 +356,24 @@ fn sql_words(literal: &str) -> Vec<String> {
     words
 }
 
+/// Whether the words following a leading `WITH` are a CTE statement rather than
+/// the rest of an English sentence.
+///
+/// The `WITH` shape used to demand a `SELECT`, which quietly assumed a CTE
+/// statement reads something. It need not: `WITH removed AS (DELETE FROM posts
+/// RETURNING id) UPDATE counters SET value = 0` writes twice and reads nothing,
+/// and demanding `SELECT` threw the whole literal away — both tables lost, not
+/// merely mis-accessed (Codex round 17).
+///
+/// What is actually invariant is the CTE binding: every CTE names itself with
+/// `AS`, and every CTE statement runs at least one [`SQL_STATEMENT_VERBS`]
+/// verb. Requiring the pair costs no recall — no valid `WITH` statement omits
+/// either — and a sentence starting "With …" that borrows one alone ("with the
+/// draft saved as a copy", "with luck the update lands") still reads as prose.
+fn is_cte_statement(rest: &[&str]) -> bool {
+    rest.contains(&"AS") && rest.iter().any(|w| SQL_STATEMENT_VERBS.contains(w))
+}
+
 /// Whether the words following a leading `TRUNCATE` are a statement's operands
 /// rather than the rest of an English sentence.
 ///
@@ -385,18 +407,21 @@ fn sql_shape(literal: &str) -> Option<bool> {
         .filter(|w| !w.is_empty());
     let first = words.next()?;
     let rest: Vec<&str> = words.collect();
-    // `TRUNCATE` is matched on its whole grammar rather than a companion.
+    // Two verbs are matched on their whole grammar rather than a companion.
     if first == "TRUNCATE" {
         return is_truncate_operands(&rest).then_some(true);
+    }
+    if first == "WITH" {
+        // A CTE statement writes if anything in it does — a CTE body and the
+        // statement after the CTEs can each be an `INSERT`/`UPDATE`/`DELETE`/
+        // `MERGE`, and the leading `WITH` says nothing either way.
+        return is_cte_statement(&rest)
+            .then(|| rest.iter().any(|w| SQL_MUTATION_VERBS.contains(w)));
     }
     let (_, _, mutating) = SQL_SHAPES.iter().find(|(verb, companions, _)| {
         first == *verb && companions.iter().all(|c| rest.contains(c))
     })?;
-    // `WITH old AS (SELECT …) DELETE FROM posts …` is a write. Its leading verb
-    // is `WITH`, so the table alone cannot say; the mutation verbs can.
-    let mutating =
-        *mutating || (first == "WITH" && rest.iter().any(|w| SQL_MUTATION_VERBS.contains(w)));
-    Some(mutating)
+    Some(*mutating)
 }
 
 /// Whether a string literal reads as a SQL statement.
@@ -862,6 +887,39 @@ mod tests {
         let literal =
             "\"WITH recent AS (SELECT id FROM posts) SELECT * FROM recent -- never DELETE\"";
         assert_eq!(sql_shape(literal), Some(false));
+    }
+
+    /// A CTE statement need not read anything. `WITH removed AS (DELETE FROM
+    /// posts RETURNING id) UPDATE counters SET value = 0` is valid Postgres and
+    /// mutates two tables, but the `WITH` shape demanded a `SELECT`, so the
+    /// literal was rejected before the mutation scan ever ran — losing both
+    /// tables, not merely mis-stating their access (Codex round 17).
+    #[test]
+    fn a_write_only_cte_statement_is_still_a_statement() {
+        let literal = "\"WITH removed AS (DELETE FROM posts RETURNING id) \
+                       UPDATE counters SET value = 0\"";
+        assert_eq!(sql_shape(literal), Some(true), "both halves write");
+        let symbols = sql_symbols(literal);
+        assert!(symbols.contains(&"posts".to_owned()), "the CTE's table");
+        assert!(symbols.contains(&"counters".to_owned()), "the outer table");
+    }
+
+    /// What replaces the `SELECT` companion. Every CTE binds its name with
+    /// `AS`, and every CTE statement runs at least one statement verb, so the
+    /// pair is what a sentence starting "With …" has to clear — and prose that
+    /// borrows one of them alone does not.
+    #[test]
+    fn a_with_sentence_is_not_a_statement() {
+        assert_eq!(
+            sql_shape("\"With the draft saved as a copy\""),
+            None,
+            "`as` without a statement verb is prose"
+        );
+        assert_eq!(
+            sql_shape("\"With luck the update lands before the deadline\""),
+            None,
+            "a statement verb without `AS` is prose"
+        );
     }
 
     /// Postgres 15 added `MERGE`, the upsert every other dialect spells
