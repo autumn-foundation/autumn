@@ -348,7 +348,7 @@ def strip_comments(txt):
     docs change. So fences are passed through untouched, and the run-to-EOF rule
     for an unclosed comment applies only to prose spans.
 
-    TWO KNOWN LIMITATIONS, both narrow, both false POSITIVES, and both left
+    THREE KNOWN LIMITATIONS, all narrow, all false POSITIVES, and all left
     deliberately because the available fixes cost more than the bugs:
 
     1. A four-space-INDENTED code block is not recognised, so an unclosed
@@ -362,6 +362,16 @@ def strip_comments(txt):
        quote (`> ```html`) or indented under a list item is not seen as one.
        An unclosed `<!--` in such a block is then read as a real comment and
        truncates the rest of the page.
+
+    3. Code spans are masked before comments are located, so a comment whose
+       terminator sits inside backticks — `<!-- note ``-->`` -->` — has that
+       terminator blanked, reads as unclosed, and truncates the page. The
+       ordering is deliberate and is what makes case (1) of the fenced/inline
+       fixes work: a `<!--` shown as a sample must not open a comment. Getting
+       both right needs comment and code-span parsing interleaved with
+       CommonMark's precedence between raw HTML and code spans, which is a
+       parser, not a guard — and the failure mode of getting that subtly wrong
+       is silently dropping real comments, a false negative.
 
     The sibling DOES solve (2), in ~120 lines of container-aware tracking
     (`quote_depth`, `column`, `strip_fences`). Copying that here is the wrong
@@ -404,6 +414,12 @@ def edges_from(f):
     # but with a same-LENGTH placeholder here because reference-definition spans
     # are blanked by offset further down and the positions must stay valid.
     txt = txt.replace('\\\\', '\x00\x00')
+    # `\![Mail](mail.md)` renders a literal `!` and a CLICKABLE link — the
+    # backslash stops the `!` opening an image. The image guard is a fixed-width
+    # lookbehind and cannot see that the `!` is itself escaped, so an escaped
+    # marker is folded away here too and the bracket is then read as the link it
+    # is. Same length, same reason as the pair fold above.
+    txt = txt.replace('\\!', '\x01\x01')
     out = set()
     base = posixpath.dirname(f)
 
@@ -415,7 +431,8 @@ def edges_from(f):
         # would fail the `.md` test below and call a live link an orphan.
         raw = raw.split('#', 1)[0].split('?', 1)[0].strip()
         raw = urllib.parse.unquote(raw)
-        raw = UNESCAPE.sub(r'\1', raw.replace('\x00\x00', '\\\\'))
+        raw = raw.replace('\x00\x00', '\\\\').replace('\x01\x01', '\\!')
+        raw = UNESCAPE.sub(r'\1', raw)
         if not raw.endswith('.md'):
             return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
@@ -1010,6 +1027,18 @@ self_test() {
     > "$c9av/docs/guide/jobs.md"
   git -C "$c9av" add -A && git -C "$c9av" commit -qm first-definition-wins
   check "the first of duplicate definitions resolves" pass "$c9av"
+
+  # An escaped `!` does not open an image, so the bracket is a real link.
+  local c9aw="$tmp/c9aw"; make_corpus "$c9aw"
+  printf '# Jobs\n\nLiteral bang: \\![mail](mail.md)\n' > "$c9aw/docs/guide/jobs.md"
+  git -C "$c9aw" add -A && git -C "$c9aw" commit -qm escaped-image-marker
+  check "an escaped image marker leaves a live link" pass "$c9aw"
+
+  # ...and an unescaped one still does not confer reachability.
+  local c9ax="$tmp/c9ax"; make_corpus "$c9ax"
+  printf '# Jobs\n\n![mail](mail.md)\n' > "$c9ax/docs/guide/jobs.md"
+  git -C "$c9ax" add -A && git -C "$c9ax" commit -qm unescaped-image-still-excluded
+  check "an unescaped image marker still excludes the destination" fail "$c9ax"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
