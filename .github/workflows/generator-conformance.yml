@@ -38,6 +38,27 @@ on:
       - "autumn-cli/src/db/**"
       - "autumn-cli/src/schema/**"
       - "autumn-cli/tests/integration/db_scrub.rs"
+      # cli_tests per-test triage (#1945): each of these gates a specific
+      # test file compile-and-serve's own job now invokes explicitly (see
+      # that job's "cli_tests per-test triage" step block), so a change to
+      # only the test file or its non-`generate/`-covered implementation
+      # would otherwise never trigger this workflow. `autumn routes audit`
+      # (routes_audit.rs) and `autumn serve --daemon` (serve.rs) are not
+      # under any glob above; the rest are covered by `src/generate/**` but
+      # listed anyway to match this file's per-test-file convention.
+      - "autumn-cli/src/routes_audit.rs"
+      - "autumn-cli/src/serve.rs"
+      - "autumn-cli/tests/integration/api_scaffold.rs"
+      - "autumn-cli/tests/integration/cloud_native_scaffold.rs"
+      - "autumn-cli/tests/integration/generate_position_scaffold.rs"
+      - "autumn-cli/tests/integration/scaffold_belongs_to.rs"
+      - "autumn-cli/tests/integration/scaffold_bulk_delete.rs"
+      - "autumn-cli/tests/integration/scaffold_form_for.rs"
+      - "autumn-cli/tests/integration/scaffold_rich_text.rs"
+      - "autumn-cli/tests/integration/scaffold_search.rs"
+      - "autumn-cli/tests/integration/scaffold_trash.rs"
+      - "autumn-cli/tests/integration/seed_model_linking.rs"
+      - "autumn-cli/tests/integration/serve.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -75,6 +96,27 @@ on:
       - "autumn-cli/src/db/**"
       - "autumn-cli/src/schema/**"
       - "autumn-cli/tests/integration/db_scrub.rs"
+      # cli_tests per-test triage (#1945): each of these gates a specific
+      # test file compile-and-serve's own job now invokes explicitly (see
+      # that job's "cli_tests per-test triage" step block), so a change to
+      # only the test file or its non-`generate/`-covered implementation
+      # would otherwise never trigger this workflow. `autumn routes audit`
+      # (routes_audit.rs) and `autumn serve --daemon` (serve.rs) are not
+      # under any glob above; the rest are covered by `src/generate/**` but
+      # listed anyway to match this file's per-test-file convention.
+      - "autumn-cli/src/routes_audit.rs"
+      - "autumn-cli/src/serve.rs"
+      - "autumn-cli/tests/integration/api_scaffold.rs"
+      - "autumn-cli/tests/integration/cloud_native_scaffold.rs"
+      - "autumn-cli/tests/integration/generate_position_scaffold.rs"
+      - "autumn-cli/tests/integration/scaffold_belongs_to.rs"
+      - "autumn-cli/tests/integration/scaffold_bulk_delete.rs"
+      - "autumn-cli/tests/integration/scaffold_form_for.rs"
+      - "autumn-cli/tests/integration/scaffold_rich_text.rs"
+      - "autumn-cli/tests/integration/scaffold_search.rs"
+      - "autumn-cli/tests/integration/scaffold_trash.rs"
+      - "autumn-cli/tests/integration/seed_model_linking.rs"
+      - "autumn-cli/tests/integration/serve.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
