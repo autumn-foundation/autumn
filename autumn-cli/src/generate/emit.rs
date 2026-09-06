@@ -593,9 +593,10 @@ impl Plan {
     /// Create an empty plan rooted at `project_root`.
     #[must_use]
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
+        let project_root = project_root.into();
         Self {
-            project_root: project_root.into(),
-            invocation: provenance::current_invocation(),
+            invocation: provenance::current_invocation(&project_root),
+            project_root,
             actions: Vec::new(),
             warnings: Vec::new(),
             reverts: Vec::new(),
@@ -2748,10 +2749,12 @@ mod tests {
     #[test]
     fn provenance_accumulates_across_generator_runs() {
         let (tmp, mut first) = fixture();
+        first.invocation = "model\u{1f}Post".to_owned();
         first.create(tmp.path().join("src/models/post.rs"), "// post\n");
         first.execute(Flags::default()).unwrap();
 
         let mut second = Plan::new(tmp.path());
+        second.invocation = "model\u{1f}Comment".to_owned();
         second.create(tmp.path().join("src/models/comment.rs"), "// comment\n");
         second.execute(Flags::default()).unwrap();
 
@@ -2767,11 +2770,13 @@ mod tests {
     fn destroying_one_resource_keeps_another_resources_provenance() {
         let (tmp, mut first) = fixture();
         let post = tmp.path().join("src/models/post.rs");
+        first.invocation = "model\u{1f}Post".to_owned();
         first.create(post.clone(), "// post\n");
         first.execute(Flags::default()).unwrap();
 
         let mut second = Plan::new(tmp.path());
         let comment = tmp.path().join("src/models/comment.rs");
+        second.invocation = "model\u{1f}Comment".to_owned();
         second.create(comment.clone(), "// comment\n");
         second.execute(Flags::default()).unwrap();
 
@@ -2993,6 +2998,51 @@ mod tests {
 
         assert!(target.exists());
         assert!(!outside.path().join("escaped.toml").exists());
+    }
+
+    #[test]
+    fn editing_the_generator_config_drops_the_baseline() {
+        // `autumn.generate.toml` never appears in the arguments, so an edited
+        // recipe would otherwise leave a textually identical `destroy` looking
+        // like the same inputs while the plan is rebuilt from different fields
+        // (Codex review of PR #2551).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = tmp.path().join("autumn.generate.toml");
+        fs::write(&config, "[scaffold.Post]\nfields = [\"title:String\"]\n").unwrap();
+        // Built after the config exists: the identity is captured when the
+        // plan is, as it is in a real run.
+        let mut generated = Plan::new(tmp.path());
+        let target = tmp.path().join("src/models/post.rs");
+        generated.create(target.clone(), "// built from the first recipe\n");
+        generated.execute(Flags::default()).unwrap();
+
+        fs::write(&config, "[scaffold.Post]\nfields = [\"body:Text\"]\n").unwrap();
+        let mut destroy = Plan::new(tmp.path());
+        destroy.create(target.clone(), "// built from the second recipe\n");
+        let err = destroy.revert(Flags::default()).unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn an_unchanged_generator_config_keeps_the_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("autumn.generate.toml"),
+            "[scaffold.Post]\nfields = [\"title:String\"]\n",
+        )
+        .unwrap();
+        let mut generated = Plan::new(tmp.path());
+        let target = tmp.path().join("src/models/post.rs");
+        generated.create(target.clone(), "// v1 template\n");
+        generated.execute(Flags::default()).unwrap();
+
+        let mut destroy = Plan::new(tmp.path());
+        destroy.create(target.clone(), "// v2 template\n");
+        destroy.revert(Flags::default()).unwrap();
+
+        assert!(!target.exists());
     }
 
     #[test]

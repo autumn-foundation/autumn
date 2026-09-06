@@ -91,10 +91,15 @@ fn generate_records_a_digest_for_every_file_it_owns() {
         doc["files"][OWNED]["digest"].as_str().unwrap(),
         "the recorded digest is the digest of what was written"
     );
-    assert_eq!(
-        doc["files"][OWNED]["invocation"].as_str().unwrap(),
-        "model\u{1f}Post\u{1f}title:String",
-        "the command that wrote it is recorded with it"
+    // The recorded identity is the arguments plus a fingerprint of the
+    // generator config they resolve from, so only the prefix is fixed here.
+    assert!(
+        doc["files"][OWNED]["invocation"]
+            .as_str()
+            .unwrap()
+            .starts_with("model\u{1f}Post\u{1f}title:String\u{1e}"),
+        "the command that wrote it is recorded with it: {:?}",
+        doc["files"][OWNED]["invocation"]
     );
 }
 

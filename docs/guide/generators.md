@@ -2055,8 +2055,12 @@ in place. `destroy` deletes an owned file when the content matches that digest,
 or matches what the current templates render. It reports `Diverged` and stops
 when the content matches neither.
 
-Each entry also records the command that wrote it, so the digest only counts
-when you repeat the same arguments — which is what `destroy` asks for anyway.
+Each entry also records the inputs that produced it — the command's arguments,
+and a fingerprint of the `autumn.generate.toml` they resolve from — so the
+digest only counts when you repeat the same arguments against the same recipe,
+which is what `destroy` asks for anyway. Editing the recipe drops the baseline
+for every resource, back to comparing against the current templates: a stale
+baseline is worse than no baseline.
 `autumn destroy model Post` after `autumn generate model Post title:String`
 renders a different model and is refused, rather than deleting the file while
 the `schema.rs` and `Cargo.toml` reverts, which are derived from those fields,

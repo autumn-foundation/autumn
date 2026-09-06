@@ -23,9 +23,11 @@
 //! exactly the previous behaviour, `--force` included.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use super::config::GENERATE_CONFIG_FILENAME;
 
 /// Project-relative location of the generator provenance manifest.
 ///
@@ -33,6 +35,14 @@ use serde::{Deserialize, Serialize};
 /// out of the one directory a developer reads. Meant to be committed — its
 /// value is being the baseline a later checkout compares against.
 pub const MANIFEST_PATH: &str = ".autumn/generated.toml";
+
+/// Joins the parts of one argument list. No shell argument carries a unit
+/// separator, so two lists cannot collide by concatenation.
+const UNIT_SEPARATOR: char = '\u{1f}';
+
+/// Joins the argument list to the config fingerprint, and one config source to
+/// the next.
+const RECORD_SEPARATOR: char = '\u{1e}';
 
 /// Line endings normalised, so a CRLF checkout is not read as an edit.
 ///
@@ -92,19 +102,63 @@ struct ManifestFile {
     files: BTreeMap<String, Entry>,
 }
 
-/// This process's command line, reduced to what identifies the resource.
+/// What identifies the generator inputs of this run, for a project at `root`.
 ///
-/// Stable across CLI versions, unlike anything derived from the argument
-/// structs: it is the user's own words. The `generate`/`destroy` verb drops out
-/// so the two spellings of one resource agree, and `--force`/`--dry-run` drop
-/// out because they legitimately differ between the two runs.
+/// Two parts, because the arguments alone are not the whole input:
+///
+/// - This process's command line, reduced to what names the resource. Stable
+///   across CLI versions, unlike anything derived from the argument structs:
+///   it is the user's own words. The `generate`/`destroy` verb drops out so the
+///   two spellings of one resource agree, and `--force`/`--dry-run` drop out
+///   because they legitimately differ between the two runs.
+/// - A digest of the generator config those arguments resolve from — the
+///   auto-discovered [`GENERATE_CONFIG_FILENAME`], which does not appear in the
+///   arguments at all, and any file a `--config` names. Without it, editing the
+///   recipe between `generate` and a textually identical `destroy` would leave
+///   the arguments looking unchanged while the plan is rebuilt from different
+///   fields: `destroy` would accept the old owned files by digest and then
+///   apply shared-file reverts the original generation never made.
+///
+/// Editing the config for any resource therefore drops the baseline for all of
+/// them, back to comparing against the current render. Deliberate: a stale
+/// baseline is worse than no baseline.
 #[must_use]
-pub fn current_invocation() -> String {
-    normalize_invocation(
-        std::env::args_os()
-            .skip(1)
-            .map(|arg| arg.to_string_lossy().into_owned()),
-    )
+pub fn current_invocation(root: &Path) -> String {
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let inputs = normalize_invocation(args.iter().cloned());
+    let config = config_fingerprint(root, &args);
+    format!("{inputs}{RECORD_SEPARATOR}{config}")
+}
+
+/// A digest over every generator config file this run could have read.
+fn config_fingerprint(root: &Path, args: &[String]) -> String {
+    let mut sources = vec![root.join(GENERATE_CONFIG_FILENAME)];
+    let mut next_is_path = false;
+    for arg in args {
+        if next_is_path {
+            sources.push(PathBuf::from(arg));
+            next_is_path = false;
+        } else if let Some(path) = arg.strip_prefix("--config=") {
+            sources.push(PathBuf::from(path));
+        } else if arg == "--config" {
+            next_is_path = true;
+        }
+    }
+    sources.sort();
+    sources.dedup();
+
+    let mut material = String::new();
+    for source in sources {
+        let contents = std::fs::read(&source).map_or_else(|_| "absent".to_owned(), |b| digest(&b));
+        material.push_str(&source.to_string_lossy());
+        material.push(UNIT_SEPARATOR);
+        material.push_str(&contents);
+        material.push(RECORD_SEPARATOR);
+    }
+    digest(material.as_bytes())
 }
 
 fn normalize_invocation(args: impl Iterator<Item = String>) -> String {
@@ -120,9 +174,7 @@ fn normalize_invocation(args: impl Iterator<Item = String>) -> String {
         }
         parts.push(arg);
     }
-    // Unit separator: no shell argument carries one, so two argument lists
-    // cannot collide by concatenation.
-    parts.join("\u{1f}")
+    parts.join(&UNIT_SEPARATOR.to_string())
 }
 
 /// What `autumn generate` recorded about the files it owns.
@@ -182,6 +234,9 @@ impl Provenance {
     /// describes one project, and destroy would never look it up.
     pub fn record(&mut self, root: &Path, path: &Path, digest: String, invocation: &str) {
         if let Some(k) = key(root, path) {
+            // Keyed by path, so the newest writer replaces the previous one:
+            // a file has exactly one owner, and the manifest cannot grow an
+            // entry per regeneration.
             self.entries.insert(
                 k,
                 Entry {
