@@ -1235,6 +1235,16 @@ def decode_visible(txt):
     return ''.join(out)
 
 
+def _blank_href(m):
+    """Blank an anchor's href VALUE, keeping the tag around it intact."""
+    whole = m.group(0)
+    for g in range(1, 4):
+        if m.group(g) is not None:
+            a = m.start(g) - m.start()
+            return whole[:a] + ' ' * (m.end(g) - m.start(g)) + whole[a + (m.end(g) - m.start(g)):]
+    return whole
+
+
 def blank_link_dests(txt):
     """Blank the DESTINATION of every rendered link, leaving its label alone.
 
@@ -1422,8 +1432,13 @@ def definition_labels(txt):
     return out
 
 
-# An image, in either spelling, inside a link's rendered content.
-ANY_IMAGE = re.compile(r'!\[|<img\b', re.I)
+# Content a link can show that is not TEXT: a Markdown image, or an element
+# that paints. An icon-only link is a real link — `<a href=…><svg>…</svg></a>`
+# is visible and clickable — and stripping every tag left it looking empty.
+# Only elements that reliably render are listed; an `<input type=hidden>`
+# is markup, not content.
+ANY_IMAGE = re.compile(
+    r'!\[|<(?:img|svg|video|canvas|picture|iframe|object|embed)\b', re.I)
 # Any HTML tag, open or close, quote-aware so a `>` inside an attribute
 # does not end it early.
 ANY_TAG = re.compile(
@@ -1623,6 +1638,15 @@ def edges_from(f):
     # is `MD_LINK`'s to resolve, and it resolves to an external URL. Prose only:
     # the same text in a fence shows the path and still counts.
     scan = blank_link_dests(txt)
+    # An `href` value is not visible text either. It is spared from masking
+    # so the anchor extractor can read it — and that extractor now REJECTS
+    # an anchor with no content, which left `<a href="docs/guide/mail.md">`
+    # `</a>` recording its path here instead, through the very check that
+    # had just refused it. Blanked for this view only; the anchor loop still
+    # reads `txt`.
+    scan = ''.join(
+        seg if kind != 'prose' else ANCHOR_HREF.sub(_blank_href, seg)
+        for kind, seg in split_fences(scan))
     # Only where a block can START. A definition cannot interrupt a
     # paragraph, so after ordinary prose `[mail]: docs/guide/mail.md` is not
     # one — it renders as visible text, and its path is a route the reader
@@ -3687,6 +3711,26 @@ self_test() {
   printf '# Jobs\n\n<span title=x>\nSee [mail](mail.md).\n' > "$c9hy/docs/guide/jobs.md"
   git -C "$c9hy" add -A && git -C "$c9hy" commit -qm type7-one-line-tag
   check "the same tag on one line opens a type-7 block" fail "$c9hy"
+
+  # An href value is not visible text, so an EMPTY anchor confers nothing even
+  # when its destination spells a repo path.
+  local c9hz="$tmp/c9hz"; make_corpus "$c9hz"
+  printf '# Jobs\n\n<a href="docs/guide/mail.md"></a>\n' > "$c9hz/docs/guide/jobs.md"
+  git -C "$c9hz" add -A && git -C "$c9hz" commit -qm empty-anchor-repo-href
+  check "an empty anchor with a repo-path href is not an edge" fail "$c9hz"
+
+  # ...while the same href in a NON-empty anchor is still a route.
+  local c9ia="$tmp/c9ia"; make_corpus "$c9ia"
+  printf '# Jobs\n\n<a href="docs/guide/mail.md">mail</a>\n' > "$c9ia/docs/guide/jobs.md"
+  git -C "$c9ia" add -A && git -C "$c9ia" commit -qm anchor-repo-href-with-text
+  check "a repo-path href in a real anchor still counts" pass "$c9ia"
+
+  # An icon-only link is a link: an inline SVG paints and is clickable.
+  local c9ib="$tmp/c9ib"; make_corpus "$c9ib"
+  printf '# Jobs\n\n<a href="mail.md"><svg><circle r="2"/></svg></a>\n' \
+    > "$c9ib/docs/guide/jobs.md"
+  git -C "$c9ib" add -A && git -C "$c9ib" commit -qm icon-only-link
+  check "an icon-only SVG link is a route" pass "$c9ib"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
