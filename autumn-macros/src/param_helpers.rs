@@ -93,6 +93,40 @@ fn type_name_starts_with(ty: &syn::Type, prefix: &str) -> bool {
     segment.ident.to_string().starts_with(prefix)
 }
 
+/// Whether `attr`'s path — or, if `attr` is `#[cfg_attr(predicate, ...)]`,
+/// any attribute it conditionally applies — has a last path segment in
+/// `names`.
+///
+/// `cfg_attr` is a built-in attribute the compiler does not resolve until
+/// after every attribute *macro* has finished expanding, so a still-live
+/// `#[cfg_attr(feature = "auth", secured("admin"))]` sitting below an outer
+/// macro like `#[static_get]`/`#[ws]` reaches that macro's `input_fn.attrs`
+/// completely unexpanded — its path is `cfg_attr`, not `secured`. A scan
+/// that only compares `attr.path()` against a guard's own name never sees
+/// it, so a guard gated behind a feature flag this way would silently slip
+/// past a "reject this attribute combination" check that every plainly-
+/// written guard attribute is caught by (Codex review on #2513, ninth
+/// finding).
+pub fn attr_or_cfg_attr_matches_any(attr: &syn::Attribute, names: &[&str]) -> bool {
+    let path_matches = |path: &syn::Path| {
+        path.segments
+            .last()
+            .is_some_and(|segment| names.contains(&segment.ident.to_string().as_str()))
+    };
+    if attr.path().is_ident("cfg_attr") {
+        // `cfg_attr(predicate, attr1, attr2, ...)` — the first item is the
+        // cfg predicate itself, everything after it is an attribute to
+        // apply when the predicate holds.
+        let Ok(nested) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return false;
+        };
+        return nested.iter().skip(1).any(|meta| path_matches(meta.path()));
+    }
+    path_matches(attr.path())
+}
+
 /// Test-only helper: pull the `fn` named `name` out of a macro's generated
 /// output.
 ///

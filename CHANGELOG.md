@@ -1872,6 +1872,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`::autumn_web::reexports::axum::response::Response`) instead of just the
   final identifier.
 
+- **macros: `#[static_get]`/`#[ws]` missed a `#[secured]`/`#[step_up]`/
+  `#[throttle]`/`#[authorize]` guard hidden behind
+  `#[cfg_attr(predicate, ...)]`:** both rejections' "guard still a live,
+  unexpanded attribute below the route macro" check compared each
+  attribute's own path against the guard names directly, so it correctly
+  caught a bare `#[secured("admin")]` written below `#[static_get]`/`#[ws]`
+  but missed the identical case written as
+  `#[cfg_attr(feature = "auth", secured("admin"))]` — `cfg_attr` is a
+  built-in attribute the compiler does not resolve until after every
+  attribute macro has finished expanding, so the outer route macro sees a
+  live `cfg_attr` attribute, not `secured`, and let the combination through
+  uncaught (ninth Codex finding on #2513). Fixed by teaching the shared scan
+  (`param_helpers::attr_or_cfg_attr_matches_any`, now used by both
+  `static_route.rs` and `ws.rs`) to also look inside a `cfg_attr`'s own
+  argument list for a wrapped guard attribute.
+
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body

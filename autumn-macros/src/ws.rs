@@ -151,11 +151,16 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // yet) but `input_fn.attrs` still carrying the guard attribute; that
     // guard then rewrites `echo`'s return type to `Response` *after* this
     // macro has already generated a wrapper expecting `impl WsHandler`
-    // (second Codex review pass on #2513). Check both.
+    // (second Codex review pass on #2513). Check both. This scan must also
+    // see a guard hidden behind `#[cfg_attr(predicate, secured(..))]`:
+    // `cfg_attr` is not resolved until after every attribute macro has
+    // finished expanding, so a plain `attr.path()` name check sees only
+    // `cfg_attr`, never the guard it wraps (Codex review on #2513, ninth
+    // finding, same gap as `static_route.rs`'s identical scan) —
+    // `param_helpers::attr_or_cfg_attr_matches_any` looks inside `cfg_attr`'s
+    // own argument list for this reason.
     let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
-        attr.path().segments.last().is_some_and(|segment| {
-            INCOMPATIBLE_GUARD_ATTRS.contains(&segment.ident.to_string().as_str())
-        })
+        crate::param_helpers::attr_or_cfg_attr_matches_any(attr, &INCOMPATIBLE_GUARD_ATTRS)
     });
     // `#[authorize]` above `#[ws]` (already expanded) slips past both checks
     // above: unlike the other three guards it emits no separate gate sibling
@@ -439,6 +444,30 @@ mod tests {
         assert!(
             generated.contains("cannot be combined with"),
             "the error must explain why the combination is rejected: {generated}"
+        );
+    }
+
+    #[test]
+    fn ws_rejects_a_secured_attribute_wrapped_in_cfg_attr() {
+        // Same gap as `static_route.rs`'s identical scan: a guard hidden
+        // behind `#[cfg_attr(predicate, secured(..))]` below `#[ws]` is just
+        // as live and unexpanded as a bare `#[secured]` attribute in the
+        // same position — `cfg_attr` is not resolved until after every
+        // attribute macro has finished expanding. Ninth Codex finding on
+        // #2513.
+        let generated = ws_macro(
+            quote! { "/echo" },
+            quote! {
+                #[cfg_attr(feature = "auth", secured("admin"))]
+                async fn echo() -> impl WsHandler { |socket| async move {} }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[secured] guard wrapped in #[cfg_attr] below #[ws] must also be a compile \
+             error: {generated}"
         );
     }
 

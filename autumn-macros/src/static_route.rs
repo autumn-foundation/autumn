@@ -207,8 +207,15 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `unexpanded_guard_attr` catches `#[static_get]` outermost, the guard
     // still a live attribute below it — confirmed reachable in real
     // compiled code by the identical, already-shipped `#[edge]`-vs-guard
-    // rejection's own trybuild fixture (`edge_with_secured.rs`). But a
-    // guard written *above* `#[static_get]` (the more natural order) is a
+    // rejection's own trybuild fixture (`edge_with_secured.rs`). This scan
+    // must also see a guard hidden behind `#[cfg_attr(predicate, secured(..))]`:
+    // `cfg_attr` itself is not resolved until after every attribute macro
+    // has finished expanding, so a plain `attr.path()` name check sees only
+    // `cfg_attr`, never the guard it wraps, letting a feature-gated guard
+    // slip past this rejection entirely (Codex review on #2513, ninth
+    // finding) — `param_helpers::attr_or_cfg_attr_matches_any` looks inside
+    // `cfg_attr`'s own argument list for this reason. But a guard written
+    // *above* `#[static_get]` (the more natural order) is a
     // materially different case: by the time the real compiler invokes
     // `static_get_macro`, the guard has already fully expanded and consumed
     // itself, so there is no live attribute left to find, and — contrary to
@@ -230,9 +237,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // recovery the `#[get]`/`#[post]` route macro already relies on for
     // this exact scenario).
     let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
-        attr.path().segments.last().is_some_and(|segment| {
-            INCOMPATIBLE_GUARD_ATTRS.contains(&segment.ident.to_string().as_str())
-        })
+        crate::param_helpers::attr_or_cfg_attr_matches_any(attr, &INCOMPATIBLE_GUARD_ATTRS)
     });
     let already_expanded_guard = crate::param_helpers::has_any_guard_gate_param(&input_fn)
         || crate::api_doc::extract_secured_info(&input_fn).0;
@@ -422,6 +427,31 @@ mod tests {
         assert!(
             generated.contains("compile_error"),
             "a live, unexpanded #[secured] attribute below #[static_get] must also be a \
+             compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_secured_attribute_wrapped_in_cfg_attr() {
+        // A guard hidden behind `#[cfg_attr(predicate, secured(..))]` below
+        // `#[static_get]` is just as live and unexpanded as a bare
+        // `#[secured]` attribute in the same position — `cfg_attr` is not
+        // resolved until after every attribute macro has finished expanding.
+        // Ninth Codex finding on #2513: a scan that only compared
+        // `attr.path()` against the guard's own name saw `cfg_attr`, not
+        // `secured`, and let this slip through uncaught.
+        let generated = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[cfg_attr(feature = "auth", secured("admin"))]
+                async fn private() -> &'static str { "private" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[secured] guard wrapped in #[cfg_attr] below #[static_get] must also be a \
              compile error: {generated}"
         );
     }
