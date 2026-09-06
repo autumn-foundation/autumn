@@ -623,9 +623,17 @@ pub fn age_days(then: SystemTime, now: SystemTime) -> u64 {
 
 /// Newest modification time among the database checkouts under `dbs_dir`.
 ///
-/// A fetch into an existing checkout writes inside `.git`; it never touches the
-/// checkout's own directory, whose mtime is therefore the clone date. Reading
-/// the root alone reports a database fetched this morning as months old.
+/// Three candidates per checkout, newest wins:
+///
+/// * `.git/FETCH_HEAD` — written by every fetch, including one that finds
+///   nothing new, so it answers "when did we last fetch" rather than "when did
+///   the data last change". Absent after a fresh clone.
+/// * `.git` — updated when a fetch writes refs or objects.
+/// * the checkout root — updated when a fetch rewrites the working tree.
+///
+/// Measured against cargo-deny 0.20.2, whose gix-based fetch updates all three;
+/// the root alone would still be the clone date on a fetch that only wrote
+/// inside `.git`.
 pub fn newest_db_mtime(dbs_dir: &Path) -> Option<SystemTime> {
     std::fs::read_dir(dbs_dir)
         .ok()?
@@ -634,7 +642,7 @@ pub fn newest_db_mtime(dbs_dir: &Path) -> Option<SystemTime> {
         .filter_map(|entry| {
             let checkout = entry.path();
             let git = checkout.join(".git");
-            [git, checkout]
+            [git.join("FETCH_HEAD"), git, checkout]
                 .into_iter()
                 .filter_map(|path| path.metadata().ok()?.modified().ok())
                 .max()
@@ -1414,6 +1422,24 @@ mod tests {
         let repo = outer.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("git");
         assert_eq!(find_policy_root(&repo), None);
+    }
+
+    #[test]
+    fn a_fetch_marker_newer_than_the_checkout_sets_the_age() {
+        // `.git/FETCH_HEAD` is written by every fetch, including one that finds
+        // nothing new. It is the freshest signal available and must win over an
+        // older checkout directory.
+        let dbs = tempfile::tempdir().expect("tempdir");
+        let git = dbs.path().join("advisory-db-abc").join(".git");
+        std::fs::create_dir_all(&git).expect("git dir");
+        let from_dirs = newest_db_mtime(dbs.path()).expect("mtime");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(git.join("FETCH_HEAD"), "ref").expect("fetch marker");
+        let from_marker = newest_db_mtime(dbs.path()).expect("mtime");
+        assert!(
+            from_marker >= from_dirs,
+            "the fetch marker must not read older than the checkout"
+        );
     }
 
     #[test]
