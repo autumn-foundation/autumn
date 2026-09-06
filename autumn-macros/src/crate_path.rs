@@ -70,7 +70,6 @@
 //! `autumn_web` and relying on it staying unrenamed.
 
 use std::cell::RefCell;
-use std::sync::OnceLock;
 
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::{Group, Ident, Spacing, TokenStream, TokenTree};
@@ -82,9 +81,15 @@ const DEFAULT_NAME: &str = "autumn_web";
 
 /// Resolve the name `autumn-web` should be referred to as from the crate
 /// currently being compiled, honoring a Cargo `package = "autumn-web"`
-/// rename. Pure — does not cache — so tests can exercise it against a fixture
-/// `Cargo.toml` (via `CARGO_MANIFEST_DIR`) without disturbing the cached
-/// value `default_name` uses.
+/// rename.
+///
+/// Deliberately uncached on this side: `crate_name` already maintains its own
+/// process-wide cache keyed by manifest directory and `Cargo.toml`
+/// modification time, so a second cache here would only save a cheap
+/// mutex-lock-and-lookup — not worth the risk of it going stale relative to
+/// `crate_name`'s own invalidation, or (Codex review, #2552) getting
+/// initialized from a test's temporarily-swapped `CARGO_MANIFEST_DIR` and
+/// staying poisoned with that fixture's answer for the rest of the process.
 pub fn resolve_autumn_web_name() -> String {
     match crate_name("autumn-web") {
         Ok(FoundCrate::Name(name)) => name,
@@ -96,15 +101,6 @@ pub fn resolve_autumn_web_name() -> String {
         // to today's unconditional behavior either way.
         Ok(FoundCrate::Itself) | Err(_) => DEFAULT_NAME.to_owned(),
     }
-}
-
-/// Cached wrapper around [`resolve_autumn_web_name`] for the common,
-/// no-override call path — `CARGO_MANIFEST_DIR` cannot change between
-/// invocations of the same compiler process, and re-parsing `Cargo.toml` on
-/// every single macro invocation in a large crate would add up.
-fn default_name() -> &'static str {
-    static RESOLVED: OnceLock<String> = OnceLock::new();
-    RESOLVED.get_or_init(resolve_autumn_web_name)
 }
 
 /// Parse a `crate = "..."` override out of a macro's top-level attribute
@@ -230,19 +226,9 @@ impl Drop for TargetGuard {
 /// recognizers, which need the same resolved name while *they* run, not just
 /// once their result is finalized.
 pub fn set_target(crate_override: Option<&str>) -> TargetGuard {
-    // Not `crate_override.map_or_else(default_name, ToOwned::to_owned)`:
-    // rustc unifies the closure branch's return lifetime with
-    // `crate_override`'s short borrow before it considers coercing
-    // `default_name`'s `fn() -> &'static str` into that same bound, so the
-    // "clean" clippy-suggested form fails to compile with a spurious
-    // "borrowed data escapes outside of function" (E0521). The explicit
-    // match sidesteps the inference order entirely.
-    #[allow(clippy::option_if_let_else)]
-    let target: &str = match crate_override {
-        Some(name) => name,
-        None => default_name(),
-    };
-    let previous = CURRENT_TARGET.with(|cell| cell.borrow_mut().replace(target.to_owned()));
+    let target: String =
+        crate_override.map_or_else(resolve_autumn_web_name, std::borrow::ToOwned::to_owned);
+    let previous = CURRENT_TARGET.with(|cell| cell.borrow_mut().replace(target));
     TargetGuard { previous }
 }
 
@@ -294,7 +280,7 @@ fn rewrite(ts: TokenStream, target: &str) -> TokenStream {
                 {
                     out.push(tokens[i].clone());
                     out.push(tokens[i + 1].clone());
-                    out.push(TokenTree::Ident(Ident::new(target, id.span())));
+                    out.push(TokenTree::Ident(ident_for_target(target, id.span())));
                     i += 3;
                     continue;
                 }
@@ -308,6 +294,23 @@ fn rewrite(ts: TokenStream, target: &str) -> TokenStream {
         }
     }
     TokenStream::from_iter(out)
+}
+
+/// Build the replacement `Ident` for `target`, using a raw identifier
+/// (`r#type`) when it's a Rust keyword. `target` usually comes from
+/// [`current_target`], which for the automatic (no-override) path is
+/// whatever `proc_macro_crate` returns for the invoking crate's own
+/// dependency key — unlike an explicit `crate = "..."` override (validated
+/// in [`match_crate_override`]), that key was never checked against being a
+/// bare, non-raw-identifier-safe Rust identifier, so a dependency renamed to
+/// a keyword (`type = { package = "autumn-web" }`, unusual but valid TOML)
+/// would otherwise panic `Ident::new` (Codex review, #2552).
+fn ident_for_target(target: &str, span: proc_macro2::Span) -> Ident {
+    if syn::parse_str::<Ident>(target).is_ok() {
+        Ident::new(target, span)
+    } else {
+        Ident::new_raw(target, span)
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +330,19 @@ mod tests {
         let s = ts_string(&out);
         assert!(s.contains(":: renamed_web :: Route"), "got: {s}");
         assert!(!s.contains("autumn_web"), "got: {s}");
+    }
+
+    #[test]
+    fn rewrite_uses_a_raw_identifier_for_a_keyword_target() {
+        // A dependency renamed to a bare Rust keyword (`type = { package =
+        // "autumn-web" }`) is unusual but valid TOML; `proc_macro_crate`
+        // returns it verbatim (only dashes are sanitized), so the token
+        // rewrite must not hand a keyword straight to `Ident::new` (which
+        // panics) — it needs the raw-identifier form instead.
+        let input = quote! { fn foo() -> ::autumn_web::Route { } };
+        let out = rewrite(input, "type");
+        let s = ts_string(&out);
+        assert!(s.contains(":: r#type :: Route"), "got: {s}");
     }
 
     #[test]
@@ -585,6 +601,47 @@ mod tests {
             resolve_autumn_web_name,
         );
         assert_eq!(name, "autumn_web_05");
+    }
+
+    #[test]
+    fn set_target_none_re_resolves_fresh_every_call_no_stale_cache() {
+        // Regression test (Codex review, #2552): `set_target(None)` must
+        // read `resolve_autumn_web_name()` fresh on every call rather than
+        // caching it process-wide — a cache here would risk permanently
+        // poisoning every subsequent (unrelated) `set_target(None)` call in
+        // this test binary with whichever fixture happened to be active the
+        // first time it ran.
+        let first = with_fixture_manifest(
+            r#"
+                [package]
+                name = "downstream"
+                version = "0.1.0"
+
+                [dependencies]
+                web_one = { package = "autumn-web", version = "0.1" }
+            "#,
+            || {
+                let _guard = set_target(None);
+                current_target()
+            },
+        );
+        assert_eq!(first, "web_one");
+
+        let second = with_fixture_manifest(
+            r#"
+                [package]
+                name = "downstream"
+                version = "0.1.0"
+
+                [dependencies]
+                web_two = { package = "autumn-web", version = "0.1" }
+            "#,
+            || {
+                let _guard = set_target(None);
+                current_target()
+            },
+        );
+        assert_eq!(second, "web_two");
     }
 
     // Whole-pipeline checks: feed a realistic input through one of this
