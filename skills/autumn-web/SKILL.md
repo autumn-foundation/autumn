@@ -2639,7 +2639,21 @@ autumn data-flow --manifest data-flow-manifest.json --check data-flow-manifest.j
 autumn data-flow --release --check data-flow-manifest.json   # audit the profile you deploy: a boundary behind `#[cfg(not(debug_assertions))]` exists only in the release build, so a debug-built manifest would certify edges the shipped binary does not have (and miss the ones it does)
 autumn agents manifest           # agent authority manifest: one row per `#[agent_operable]` action with its grant, proved effects (writes, unbounded writes, cross-tenant reach, outbound, webhooks, jobs), provenance, and unused grant entries; plus every MCP-exposed tool with no envelope (#1691)
 autumn agents manifest --manifest agent-authority.json --check agent-authority.json   # write it, and fail on drift, on any ungoverned mutating MCP tool (`--allow-ungoverned`), or on an unaudited deployment that can act irreversibly (`--allow-unaudited`)
+autumn graph show                # the application architecture graph the macros declare: a node per `#[route]`/`#[static_get]`, `#[model]`, `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]`, each route with its mounted path and declared auth requirement, plus edges for repository→model and every model/table a route or job names (#1747)
+autumn graph touches posts       # which routes and jobs reach a model, table, or repository — transitively, so a handler that only takes `PgPostRepository` is included
+autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
+autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
+autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 ```
+
+Reach for `autumn graph` before reading a codebase to answer a structural
+question. It is derived from the macros at compile time and embedded in the
+binary, so it cannot drift from the code: `/actuator/graph` serves the same
+document from a running app (sensitive-gated, like `/actuator/env`). Edges from
+a route or job are read off that item's own tokens and are deliberately
+over-reported; the document carries its own `limits` section, and the biggest
+one is that a call into a helper in another module is not followed. See
+`docs/guide/architecture-graph.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)
 

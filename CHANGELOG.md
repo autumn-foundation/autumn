@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **graph:** a queryable architecture graph derived from the app's own macros
+  (issue #1747). Autumn already declares every architectural element through
+  proc-macros it owns, but none of that survived expansion as something you
+  could ask a question of. It does now: `#[route]`/`#[static_get]`,
+  `#[model]`, `#[repository]` and `#[job]`/`#[scheduled]`/`#[task]` each
+  register a node, and the framework assembles them into a typed graph at link
+  time — nodes for every declared element (each route carrying its mounted path
+  and declared auth requirement, each model its table), edges for
+  repository→model declarations, for the repository a handler takes as an
+  extractor, and for every model, table or raw-SQL table name a route or job
+  body mentions. `autumn graph show|touches <NAME>|impact <NAME>` answers
+  against it — "which routes and jobs touch `posts`", "what does changing
+  `Post` break" — and `--check` fails the build when a declared element or an
+  edge quietly disappears. The same graph is served from `/actuator/graph`
+  (sensitive-gated, like `/env`) so a running single binary can answer
+  questions about itself with no side file to go stale. Because node identity
+  comes from the declaration, nothing can fall out silently:
+  `examples/reddit-clone/tests/architecture_graph.rs` censuses the reference
+  app's *sources* for every declaring attribute, runs the binary's own graph
+  dump, and fails when the two disagree — including a hand-verified
+  ground-truth list that pins `impact Post` to total recall over both access
+  styles the app uses (repository extractors and raw Diesel), the
+  `#[repository(api = …)]` auto-API routes, and a scheduled task that reaches
+  the table only through `sql_query("UPDATE posts …")`. Edges from a route or
+  job are a name-based derivation over that item's own tokens, deliberately
+  biased toward over-reporting; every edge carries its provenance
+  (`declaration`/`signature`/`body`) and the document carries the derivation's
+  limits, so it cannot be read as more than it is. See
+  `docs/guide/architecture-graph.md`.
 - **macros:** `#[autumn_web::main]` takes optional arguments that reach the
   Tokio runtime it builds. Previously the attribute discarded its argument
   list entirely (`_attr`), so the only way to size a worker pool, name the
@@ -1484,6 +1513,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
+  instead of the last step of `Test (ubuntu-latest)`:** as step 16 of that job
+  it inherited a disk already filled by the whole workspace build plus eight
+  feature-flipped rebuilds, and died compiling its own dependencies
+  (`bollard`, `bollard-stubs`, a re-linked `autumn-web`) with `No space left on
+  device` and 23–41 MB free — before a single test body ran, with steps 1–15
+  and both the macOS and Windows legs green. The two steps move verbatim (the
+  diff is purely additive: a job boundary inserted in front of them), so the
+  same commands run the same sweep, on a runner whose disk they are the only
+  claimant of. Branch protection still names only the per-OS `Test (…)` checks,
+  so `Test (Docker)` needs adding there to block merge again. [no-plugin] —
+  CI-only; no API, behaviour or feature change. (#1747)
 - **acme:** [no-plugin] Internal cleanup, no behavior change (#1864): the owner-only
   temp-write-then-rename idiom, previously duplicated between
   `acme::store::FsAcmeStore` and the failure-capture capsule writer, is now
@@ -1775,6 +1816,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ci: `live_upgrade` no longer fails because the hot-upgrade example inherits
+  the dev profile's 1-second drain budget:** the test asserts the production
+  guarantee that a predecessor drains and exits 0 after handing over, but ran
+  under the `dev` profile, which shortens `shutdown_timeout_secs` from the 30s
+  default to 1s so Ctrl-C is snappy while developing. The load loop keeps
+  driving traffic for 3.5s past the cutover, so that budget expires while
+  requests are still arriving and whatever is in flight is aborted
+  (`exit_code: 1`) — nothing wrong with the upgrade path, just a budget shorter
+  than the load window. The test now pins `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS`
+  to the production default, exactly as it already pins the prestop grace.
+  Reproduced locally under CPU oversubscription (which also disproved the
+  intuitive "slow cutover" explanation — it reproduces with the cutover
+  completing in 135 ms), and verified non-hiding: under the same load the
+  connection assertions still fired on their own, so the drain budget was not
+  what was holding them up. Independent of, and complementary to, the
+  refused/reset split below — that one classifies *which* connection failures
+  count, this one stops the predecessor being killed mid-drain.
+  [no-plugin] — test-only; no API or behaviour change. (#1747, #2372, #2462)
 - **`autumn new`'s starter template shipped three cookie-consent routes that
   failed `autumn routes audit` (issue #1214 follow-up):** the cookie-consent
   banner feature added `POST /consent/accept`, `POST /consent/reject`, and
