@@ -233,8 +233,11 @@ REF_DEF = re.compile(r'^ {0,3}\[([^\]]+)\]:\s*(?:<([^<>]*)>|(\S+))', re.M)
 #   full:      [text][label]
 #   collapsed: [label][]
 #   shortcut:  [label]        (not followed by `(`, `[` or `:`)
-REF_USE_FULL = re.compile(r'\[[^\]]*\]\[([^\]]*)\]')
-REF_USE_SHORTCUT = re.compile(r'\[([^\]]+)\](?![\(\[:])')
+# `(?<!\\)` for the same reason the inline pattern has it: `\[mail][]` renders
+# as literal text, so a reference link disabled that way must not keep its
+# definition alive and go on hiding an orphan.
+REF_USE_FULL = re.compile(r'(?<!\\)\[[^\]]*\]\[([^\]]*)\]')
+REF_USE_SHORTCUT = re.compile(r'(?<!\\)\[([^\]]+)\](?![\(\[:])')
 
 
 def ref_label(s):
@@ -282,13 +285,8 @@ FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})', re.M)
 CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)', re.S)
 
 
-def strip_comments(txt):
-    """Remove HTML comments, but only where Markdown would treat them as
-    comments. Inside a fenced code block `<!--` is literal text — an
-    illustrative unclosed one in a sample must not comment out the live links
-    that follow the closing fence, which is a false positive that would block a
-    docs change. So fences are passed through untouched, and the run-to-EOF rule
-    for an unclosed comment applies only to prose spans."""
+def split_fences(txt):
+    """Split into ('prose'|'fence', text) segments, in order."""
     parts, pos, in_fence, marker = [], 0, False, None
     for m in FENCE.finditer(txt):
         tok = m.group(1)
@@ -303,6 +301,27 @@ def strip_comments(txt):
             parts.append(('fence', txt[pos:m.end()]))
             in_fence, marker, pos = False, None, m.end()
     parts.append(('fence' if in_fence else 'prose', txt[pos:]))
+    return parts
+
+
+def strip_comments(txt):
+    """Remove HTML comments, but only where Markdown would treat them as
+    comments. Inside a fenced code block `<!--` is literal text — an
+    illustrative unclosed one in a sample must not comment out the live links
+    that follow the closing fence, which is a false positive that would block a
+    docs change. So fences are passed through untouched, and the run-to-EOF rule
+    for an unclosed comment applies only to prose spans.
+
+    KNOWN LIMITATION: a four-space-INDENTED code block is not recognised, so an
+    unclosed `<!--` inside one is still read as a real comment. Detecting those
+    correctly needs the list-aware column tracking `check-docs-links.sh` carries
+    for its fence bounds, and a naive "four spaces means code" rule would do
+    harm in the more expensive direction — it would stop a genuinely commented-
+    out link inside a list item from being stripped, which is a false negative,
+    and this gate's whole job is to not be satisfiable by a line no reader can
+    follow. The sibling does not mask indented code either, so the two gates
+    agree; if it ever grows that machinery, this should borrow it."""
+    parts = split_fences(txt)
 
     out = []
     for kind, seg in parts:
@@ -392,9 +411,24 @@ while frontier:
 
 WAIVER = re.compile(r'<!--\s*orphan-allow:\s*(.+?)\s*-->', re.S)
 
+
+def waiver_view(txt):
+    """The text a waiver may legitimately live in: prose, with code removed.
+
+    A page that DOCUMENTS the marker — showing `<!-- orphan-allow: … -->` in a
+    fence or a code span, as this script's own header and failure message do —
+    would otherwise exempt itself by explaining the escape hatch. The exemption
+    is the one place a false negative is most expensive, since it is how a page
+    opts out of the check entirely, so it is matched only where an HTML comment
+    would actually be an HTML comment.
+    """
+    kept = [seg for kind, seg in split_fences(txt) if kind == 'prose']
+    return CODE_SPAN.sub(' ', ''.join(kept))
+
+
 defects, waived = [], 0
 for n in sorted(node_set - seen):
-    m = WAIVER.search(read(n))
+    m = WAIVER.search(waiver_view(read(n)))
     if m and m.group(1).strip():
         waived += 1
     else:
@@ -771,6 +805,29 @@ self_test() {
   printf '# Mail\n\n<!-- orphan-allow: -->\n' > "$c16/docs/guide/mail.md"
   git -C "$c16" add -A && git -C "$c16" commit -qm waiver-no-reason
   check "a waiver with no reason does not exempt the page" fail "$c16"
+
+  # A disabled collapsed reference link must not keep its definition alive.
+  local c9ad="$tmp/c9ad"; make_corpus "$c9ad"
+  printf '# Jobs\n\nDisabled: \\[mail][]\n\n[mail]: mail.md\n' > "$c9ad/docs/guide/jobs.md"
+  git -C "$c9ad" add -A && git -C "$c9ad" commit -qm escaped-collapsed-ref
+  check "an escaped collapsed reference use confers nothing" fail "$c9ad"
+
+  local c9ae="$tmp/c9ae"; make_corpus "$c9ae"
+  printf '# Jobs\n\nDisabled: \\[mail]\n\n[mail]: mail.md\n' > "$c9ae/docs/guide/jobs.md"
+  git -C "$c9ae" add -A && git -C "$c9ae" commit -qm escaped-shortcut-ref
+  check "an escaped shortcut reference use confers nothing" fail "$c9ae"
+
+  # A page DOCUMENTING the waiver syntax must not thereby exempt itself.
+  local c9af="$tmp/c9af"; make_corpus "$c9af"
+  printf '# Mail\n\nWrite `<!-- orphan-allow: why -->` to waive a page.\n' \
+    > "$c9af/docs/guide/mail.md"
+  git -C "$c9af" add -A && git -C "$c9af" commit -qm waiver-in-code-span
+  check "a waiver shown in inline code does not exempt the page" fail "$c9af"
+
+  local c9ag="$tmp/c9ag"; make_corpus "$c9ag"
+  printf '# Mail\n\n```\n<!-- orphan-allow: example -->\n```\n' > "$c9ag/docs/guide/mail.md"
+  git -C "$c9ag" add -A && git -C "$c9ag" commit -qm waiver-in-fence
+  check "a waiver shown in a fence does not exempt the page" fail "$c9ag"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
