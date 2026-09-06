@@ -1610,6 +1610,7 @@ STYLE_ATTR_OPEN = re.compile(
 # PROPERTY and changes nothing, so an unbounded match rejected a live link.
 _DISPLAY_DECL = re.compile(r'(?<![-\w])display' + _TWS + r'*:([^;]*)', re.I)
 _IMPORTANT = re.compile(r'!' + _TWS + r'*important' + _TWS + r'*$', re.I)
+_CSS_COMMENT = re.compile(r'/\*.*?\*/|/\*.*', re.S)
 
 
 def _display_none(style):
@@ -1629,6 +1630,12 @@ def _display_none(style):
     deliberately is not. Inline CSS in this corpus is rare and invalid inline
     CSS rarer still.
     """
+    # CSS comments are not declarations. `color:red; /* display:none; */`
+    # renders a visible 30px link, but reading the comment as a declaration
+    # rejected it. An unterminated `/*` runs to the end of the attribute, so
+    # both forms are blanked — space for space, since nothing here depends on
+    # the length but the habit is what keeps offsets safe elsewhere.
+    style = _CSS_COMMENT.sub(lambda c: ' ' * len(c.group(0)), style)
     winner, winner_important = None, False
     for m in _DISPLAY_DECL.finditer(style):
         value = m.group(1).strip()
@@ -1745,9 +1752,27 @@ FOREIGN_ROOTS = frozenset(('svg', 'math'))
 # FIRST element's `textContent` still contains text written after the second
 # opener. `div` and `span` do (they nest properly and are correctly absent);
 # these fifteen do not.
-SELF_CLOSING_ON_REOPEN = frozenset((
+_OPTIONAL_END = (
     'p', 'li', 'dd', 'dt', 'td', 'th', 'tr', 'rt', 'rp', 'option', 'optgroup',
-    'thead', 'tbody', 'tfoot', 'caption', 'colgroup'))
+    'thead', 'tbody', 'tfoot', 'caption', 'colgroup')
+# `p` is the one with a WIDE closer set: any block element ends it, not just
+# another `p`. `<p hidden>Secret<div>Mail</div>` leaves `Mail` visible, and
+# recognising only a second `<p>` masked it to the end of the anchor.
+# Measured, not read off the spec, and the spec would have misled: `details`
+# is listed there as closing a paragraph and in Chromium does NOT, while
+# `dir`, `listing` and `search` do. Inline elements (`span`, `em`, `a`, `code`)
+# do not, which is what keeps this from swallowing ordinary markup.
+_P_CLOSERS = frozenset((
+    'address', 'article', 'aside', 'blockquote', 'dir', 'div', 'dl',
+    'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3',
+    'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'listing', 'main', 'menu',
+    'nav', 'ol', 'p', 'pre', 'search', 'section', 'table', 'ul', 'xmp'))
+# What ENDS each element that has an optional end tag. The rest close only on
+# their own name, which was measured too: a `<div>` does not end an `<li>`, and
+# `dd`/`dt` end each other but nothing else. `p` is genuinely the odd one.
+IMPLICIT_CLOSERS = {name: frozenset((name,)) for name in _OPTIONAL_END}
+IMPLICIT_CLOSERS['p'] = _P_CLOSERS
+IMPLICIT_CLOSERS['dd'] = IMPLICIT_CLOSERS['dt'] = frozenset(('dd', 'dt'))
 
 RAW_TEXT_NAMES = frozenset((
     'textarea', 'title', 'script', 'style', 'xmp', 'iframe', 'noembed',
@@ -1835,7 +1860,14 @@ def element_end(txt, m, name):
     if lname in RAW_TEXT_NAMES:
         return _raw_text_end(txt, name, m.end())
     depth, pos, end = 1, m.end(), len(txt)
-    tag = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
+    # The scan looks for this element's own tags AND, when it has an optional
+    # end tag, for the openers that implicitly end it. For `p` those are 33
+    # block elements, so a `<div>` has to be visible to this search or the
+    # implicit close below can never fire.
+    closers = IMPLICIT_CLOSERS.get(lname, frozenset((lname,)))
+    names = '|'.join(re.escape(n) for n in sorted(closers | {lname}))
+    tag = re.compile(r'<(/?)(?:' + names + r')(?=[\s/>]|$)', re.I)
+    own = re.compile(r'<(/?)' + re.escape(name) + r'(?=[\s/>]|$)', re.I)
     while depth:
         t = tag.search(txt, pos)
         # A raw-text element opening BEFORE the next same-name tag means that
@@ -1855,10 +1887,16 @@ def element_end(txt, m, name):
                 and gt != -1 and txt[gt - 1] == '/'):
             pos = gt + 1
             continue
-        # A second opener of an element that cannot nest in itself ENDS the
-        # first one rather than opening a level inside it.
-        if not t.group(1) and lname in SELF_CLOSING_ON_REOPEN:
+        # An opener that implicitly ends this element stops the span here
+        # rather than opening a level inside it.
+        if not t.group(1) and lname in IMPLICIT_CLOSERS:
             return t.start()
+        # A CLOSE tag for something else is not this element's close, and an
+        # opener reached here is this element's own: only its own tags move
+        # the depth.
+        if not own.match(txt, t.start()):
+            pos = t.end()
+            continue
         depth += -1 if t.group(1) else 1
         pos = t.end()
         if not depth:
@@ -4524,6 +4562,28 @@ self_test() {
   git -C "$c9ku" add -A && git -C "$c9ku" commit -qm li-reopened
   check "a reopened li ends the hidden one" pass "$c9ku"
 
+  # ...and a `p` is ended by any BLOCK element, not only another `p`.
+  local c9kx="$tmp/c9kx"; make_corpus "$c9kx"
+  printf '# Jobs\n\n<a href="mail.md"><p hidden>Secret<div>Mail</div></a>\n' \
+    > "$c9kx/docs/guide/jobs.md"
+  git -C "$c9kx" add -A && git -C "$c9kx" commit -qm p-closed-by-div
+  check "a div ends a hidden p" pass "$c9kx"
+
+  # ...but an INLINE element does not, which is what stops this from
+  # swallowing ordinary markup inside a hidden paragraph.
+  local c9ky="$tmp/c9ky"; make_corpus "$c9ky"
+  printf '# Jobs\n\n<a href="mail.md"><p hidden>Secret<span>Mail</span></a>\n' \
+    > "$c9ky/docs/guide/jobs.md"
+  git -C "$c9ky" add -A && git -C "$c9ky" commit -qm p-not-closed-by-span
+  check "a span does not end a hidden p" fail "$c9ky"
+
+  # ...and the wide closer set belongs to `p` alone: a div does NOT end an li.
+  local c9kz="$tmp/c9kz"; make_corpus "$c9kz"
+  printf '# Jobs\n\n<a href="mail.md"><ul><li hidden>Secret<div>Mail</div></li></ul></a>\n' \
+    > "$c9kz/docs/guide/jobs.md"
+  git -C "$c9kz" add -A && git -C "$c9kz" commit -qm li-not-closed-by-div
+  check "a div does not end a hidden li" fail "$c9kz"
+
   # ...but `span` and `div` DO nest, so this is a property of those elements
   # rather than a general "a second opener ends the first".
   local c9kv="$tmp/c9kv"; make_corpus "$c9kv"
@@ -4703,6 +4763,19 @@ self_test() {
     > "$c9ka/docs/guide/jobs.md"
   git -C "$c9ka" add -A && git -C "$c9ka" commit -qm cascade-case-insensitive
   check "the cascade is read case-insensitively" pass "$c9ka"
+
+  # A CSS comment is not a declaration, terminated or not.
+  local c9la="$tmp/c9la"; make_corpus "$c9la"
+  printf '# Jobs\n\n<a style="color:red; /* display:none; */" href="mail.md">Mail</a>\n' \
+    > "$c9la/docs/guide/jobs.md"
+  git -C "$c9la" add -A && git -C "$c9la" commit -qm css-comment
+  check "a commented-out declaration does not hide" pass "$c9la"
+
+  local c9lb="$tmp/c9lb"; make_corpus "$c9lb"
+  printf '# Jobs\n\n<a style="color:red; /* display:none;" href="mail.md">Mail</a>\n' \
+    > "$c9lb/docs/guide/jobs.md"
+  git -C "$c9lb" add -A && git -C "$c9lb" commit -qm css-comment-unterminated
+  check "an unterminated CSS comment runs to the end" pass "$c9lb"
 
   # `--display` is a custom PROPERTY and changes nothing, so the match needs a
   # property boundary — a substring test rejected this live link.
