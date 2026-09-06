@@ -40,8 +40,8 @@ pub const MANIFEST_PATH: &str = ".autumn/generated.toml";
 /// separator, so two lists cannot collide by concatenation.
 const UNIT_SEPARATOR: char = '\u{1f}';
 
-/// Joins the argument list to the config fingerprint, and one config source to
-/// the next.
+/// Joins the argument list to the config fingerprint and the backend, and one
+/// config source's digest to the next.
 const RECORD_SEPARATOR: char = '\u{1e}';
 
 /// Line endings normalised, so a CRLF checkout is not read as an edit.
@@ -176,6 +176,14 @@ fn backend_fingerprint(root: &Path) -> &'static str {
 
 /// A digest over every generator config file this run could have read.
 fn config_fingerprint(root: &Path, args: &[String]) -> String {
+    // The auto-discovered file first, then every `--config` in the order it was
+    // given. A fixed order rather than a sorted one, and CONTENTS only — no
+    // path: `root` is an absolute path, so naming the sources would tie the
+    // identity to where the project happens to sit on disk, and a manifest
+    // written in `/home/alice/app` would be refused after a clone to
+    // `/work/app`. The later checkout is exactly what this manifest is
+    // committed for. The `--config` path itself is already in the arguments,
+    // which are part of the identity, so nothing is lost by leaving it out.
     let mut sources = vec![root.join(GENERATE_CONFIG_FILENAME)];
     let mut next_is_path = false;
     for arg in args {
@@ -188,14 +196,15 @@ fn config_fingerprint(root: &Path, args: &[String]) -> String {
             next_is_path = true;
         }
     }
-    sources.sort();
-    sources.dedup();
 
     let mut material = String::new();
-    for source in sources {
-        let contents = std::fs::read(&source).map_or_else(|_| "absent".to_owned(), |b| digest(&b));
-        material.push_str(&source.to_string_lossy());
-        material.push(UNIT_SEPARATOR);
+    let mut seen: Vec<&Path> = Vec::new();
+    for source in &sources {
+        if seen.contains(&source.as_path()) {
+            continue; // named twice; one contribution is enough.
+        }
+        seen.push(source);
+        let contents = std::fs::read(source).map_or_else(|_| "absent".to_owned(), |b| digest(&b));
         material.push_str(&contents);
         material.push(RECORD_SEPARATOR);
     }
@@ -533,6 +542,124 @@ mod tests {
             OWNER,
         );
         assert_eq!(p, Provenance::default());
+    }
+
+    #[test]
+    fn the_identity_does_not_depend_on_where_the_project_sits() {
+        // The manifest is committed so a LATER CHECKOUT has a baseline. An
+        // identity that named its absolute config paths would refuse every
+        // clone that landed on a different path (Codex review of PR #2551).
+        let here = tmp();
+        let there = tmp();
+        for root in [here.path(), there.path()] {
+            std::fs::write(
+                root.join(GENERATE_CONFIG_FILENAME),
+                "[scaffold.Post]\nfields = [\"title:String\"]\n",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            current_invocation(here.path()),
+            current_invocation(there.path())
+        );
+    }
+
+    #[test]
+    fn the_identity_still_moves_when_the_config_contents_differ() {
+        let here = tmp();
+        let there = tmp();
+        std::fs::write(
+            here.path().join(GENERATE_CONFIG_FILENAME),
+            "[scaffold.Post]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            there.path().join(GENERATE_CONFIG_FILENAME),
+            "[scaffold.Tag]\n",
+        )
+        .unwrap();
+
+        assert_ne!(
+            current_invocation(here.path()),
+            current_invocation(there.path())
+        );
+    }
+
+    #[test]
+    fn an_absent_config_is_distinguishable_from_a_present_one() {
+        let absent = tmp();
+        let present = tmp();
+        std::fs::write(
+            present.path().join(GENERATE_CONFIG_FILENAME),
+            "[scaffold.Post]\n",
+        )
+        .unwrap();
+
+        assert_ne!(
+            current_invocation(absent.path()),
+            current_invocation(present.path())
+        );
+    }
+
+    /// Clears the database environment so a project's own `autumn.toml`
+    /// decides the backend, matching the emit tests' `no_db_env`.
+    fn no_db_env<R>(f: impl FnOnce() -> R) -> R {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            f,
+        )
+    }
+
+    #[test]
+    fn the_identity_moves_with_the_database_backend() {
+        // The backend appears in no argument, and it decides the SQL a
+        // migration holds and the `schema.rs` block a `SchemaTable` revert
+        // expects — so a project moved between SQLite and Postgres must lose
+        // its baseline rather than half-destroy (Codex review of PR #2551).
+        let sqlite = tmp();
+        let postgres = tmp();
+        std::fs::write(
+            sqlite.path().join("autumn.toml"),
+            "[database]\nurl = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            postgres.path().join("autumn.toml"),
+            "[database]\nurl = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+
+        no_db_env(|| {
+            assert_ne!(
+                current_invocation(sqlite.path()),
+                current_invocation(postgres.path())
+            );
+        });
+    }
+
+    #[test]
+    fn two_projects_on_the_same_backend_share_an_identity() {
+        let here = tmp();
+        let there = tmp();
+        for root in [here.path(), there.path()] {
+            std::fs::write(
+                root.join("autumn.toml"),
+                "[database]\nurl = \"sqlite://app.db\"\n",
+            )
+            .unwrap();
+        }
+
+        no_db_env(|| {
+            assert_eq!(
+                current_invocation(here.path()),
+                current_invocation(there.path())
+            );
+        });
     }
 
     #[test]
