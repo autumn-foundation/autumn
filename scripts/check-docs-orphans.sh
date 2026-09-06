@@ -1530,6 +1530,54 @@ HIDDEN_OPEN = re.compile(
     + _Q1 + r'|[^\s"\'=<>`]+))?(?:' + _TWS + r'+' + ATTR + r')*'
     + _TWS + r'*/?>', re.I)
 
+# The other way an element is not shown: `style="display:none"`. Unlike the
+# `hidden` ATTRIBUTE this is a CSS declaration, so it reaches SVG and MathML
+# too — Chromium reports `<svg style="display:none" width=40 height=40>` as
+# `display: none` with a 0x0 box, where the same element carrying `hidden`
+# still paints. That is why `NOT_HIDDEN_BY_ATTR` is not consulted for this
+# pattern: the exclusion is a property of the attribute, not of hiding.
+# Deliberately narrow — only a literal `display:none` in an inline style. This
+# is not a CSS engine and does not pretend to be one: a stylesheet, a class, or
+# a computed rule is invisible to it, and a page hiding a link that way is a
+# gap this cannot see.
+_DISPLAY_NONE = r'display' + _TWS + r'*:' + _TWS + r'*none'
+STYLE_HIDDEN_OPEN = re.compile(
+    r'<([A-Za-z][A-Za-z0-9-]*)(?:' + _TWS + r'+' + ATTR + r')*?'
+    + _TWS + r'+style' + _TWS + r'*=' + _TWS + r'*'
+    r'(?:"[^"]*' + _DISPLAY_NONE + r'[^"]*"'
+    r"|'[^']*" + _DISPLAY_NONE + r"[^']*')"
+    r'(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
+
+
+def hidden_open(view, src, at):
+    """The next opening tag that hides itself, by attribute or by inline CSS.
+
+    Two strings because neither alone works. `hidden` is a bare attribute NAME
+    and survives into the masked view, but `display:none` lives in an attribute
+    VALUE, and those are blanked upstream so a tag boundary can be found before
+    quoted markup is mistaken for markup — by here the tag reads
+    `style="        "`. So the CSS is looked for in `src`, where the text is
+    intact, and a hit counts only where the masked view still has a `<` at that
+    offset. That second test is what keeps a `<span style="display:none">`
+    written inside a comment or a script from masking anything: the view has
+    already blanked it, and the offsets line up because every view here is
+    length-preserving.
+    """
+    a = HIDDEN_OPEN.search(view, at)
+    b, pos = None, at
+    while True:
+        c = STYLE_HIDDEN_OPEN.search(src, pos)
+        if not c:
+            break
+        if c.start() < len(view) and view[c.start()] == '<':
+            b = c
+            break
+        pos = c.start() + 1
+    if a and b:
+        return a if a.start() <= b.start() else b
+    return a or b
+
+
 # HTML void elements. They have no close tag and no contents, so a `hidden` one
 # ENDS AT ITS OPENING TAG — it hides itself and nothing after it. Searching for
 # the close that does not exist ran the scan below off the end of the span, so
@@ -1586,23 +1634,30 @@ def _raw_text_end(txt, name, at):
     return m.end() if m else len(txt)
 
 
-def mask_hidden_subtrees(txt):
+def mask_hidden_subtrees(txt, src=None):
     """Blank every `hidden` element, contents and all, space for space.
 
     Nesting is why this is a scan: the close that ends a `hidden` element is
     the one that balances it, not the first one with the same name.
     """
     out = txt
+    # `src` carries the same span with attribute VALUES intact, for the inline
+    # CSS that the masked view has already blanked. Both are blanked in step so
+    # a subtree is not found twice.
+    ref = out if src is None else src
     # Where to resume. A tag can be passed over rather than masked, so the
     # scan cannot restart from zero and rely on blanks to make progress.
     at = 0
     while True:
-        m = HIDDEN_OPEN.search(out, at)
+        m = hidden_open(out, ref, at)
         if not m:
             return out
         name = m.group(1)
         lname = name.lower()
-        if lname in NOT_HIDDEN_BY_ATTR:
+        # Only the ATTRIBUTE spares svg and math. `display:none` is CSS and
+        # hides them like anything else, so the exclusion is scoped to the
+        # pattern that matched rather than to the tag name alone.
+        if lname in NOT_HIDDEN_BY_ATTR and m.re is HIDDEN_OPEN:
             # The attribute does not apply, so this is ordinary visible
             # content: step over the tag without masking anything.
             at = m.end()
@@ -1611,6 +1666,7 @@ def mask_hidden_subtrees(txt):
             # No subtree to balance: the element is the whole of itself.
             end = m.end()
             out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+            ref = ref[:m.start()] + ' ' * (end - m.start()) + ref[end:]
             at = end
             continue
         if lname in RAW_TEXT_NAMES:
@@ -1619,6 +1675,7 @@ def mask_hidden_subtrees(txt):
             # just more text.
             end = _raw_text_end(out, name, m.end())
             out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+            ref = ref[:m.start()] + ' ' * (end - m.start()) + ref[end:]
             at = end
             continue
         # Running out of closes is not a bug here: an unclosed element is
@@ -1643,6 +1700,7 @@ def mask_hidden_subtrees(txt):
                 close = out.find('>', pos)
                 end = len(out) if close == -1 else close + 1
         out = out[:m.start()] + ' ' * (end - m.start()) + out[end:]
+        ref = ref[:m.start()] + ' ' * (end - m.start()) + ref[end:]
         at = end
 
 
@@ -1653,7 +1711,7 @@ ANY_TAG = re.compile(
     r'|</[A-Za-z][A-Za-z0-9-]*' + _TWS + r'*>', re.I)
 
 
-def has_content(image_span, masked_span):
+def has_content(image_span, masked_span, raw_span=None):
     """Whether a link's content leaves the reader anything to click.
 
     Two views, because neither alone is right. The MASKED one has comments,
@@ -1670,8 +1728,10 @@ def has_content(image_span, masked_span):
     # A `hidden` subtree is not shown, so neither its text nor an image inside
     # it is content. `<a href=…><span hidden>Mail</span></a>` renders an empty
     # link, and stripping tags left `Mail` behind looking like a label.
-    image_span = mask_hidden_subtrees(image_span)
-    masked_span = mask_hidden_subtrees(masked_span)
+    # The RAW span goes along only so inline `display:none` can be read; the
+    # views themselves are what get blanked.
+    image_span = mask_hidden_subtrees(image_span, raw_span)
+    masked_span = mask_hidden_subtrees(masked_span, raw_span)
     # `&#32;` is a space on screen, so `[&#32;](mail.md)` is an anchor with
     # nothing in it — the same nothing as `[ ](mail.md)`, which was already
     # rejected. Testing the undecoded source saw four non-blank characters and
@@ -1906,7 +1966,8 @@ def edges_from(f):
             # Offsets line up across both views because every masker replaces
             # space for space.
             if not has_content(img_view[m.start(1):m.end(1)],
-                               md_txt[m.start(1):m.end(1)]):
+                               md_txt[m.start(1):m.end(1)],
+                               raw[m.start(1):m.end(1)]):
                 continue
             add_relative(m.group(2) if m.group(2) is not None else m.group(3))
 
@@ -1933,9 +1994,20 @@ def edges_from(f):
         # the opening tag. `<a hidden href="mail.md">Mail</a>` has a label but
         # no link: Chromium gives it a 0x0 box, and the edge was recorded from
         # the `Mail` inside it.
-        if HIDDEN_OPEN.fullmatch(tag.group(0)):
+        # `hidden` is a bare attribute name and survives masking, but the
+        # inline CSS lives in a VALUE, which is blanked upstream — so that half
+        # is read off `raw` at the same offsets. A tag cannot contain a comment,
+        # so taking the raw slice here needs no further guard.
+        if (HIDDEN_OPEN.fullmatch(tag.group(0))
+                or STYLE_HIDDEN_OPEN.fullmatch(raw[tag.start():tag.end()])):
             continue
-        close = ANCHOR_CLOSE.search(raw, tag.end())
+        # The close is looked for in the MASKED view, not `raw`: an apparent
+        # `</a>` inside a script or a comment is content, not a boundary, and
+        # the browser keeps the label after it inside the live anchor.
+        # `<a href="mail.md"><script>const fake="</a>";</script>Mail</a>`
+        # renders a 30px clickable `Mail`, but stopping at the spelling left
+        # the anchor looking empty and reported a real route as an orphan.
+        close = ANCHOR_CLOSE.search(txt, tag.end())
         stop = close.start() if close else len(raw)
         # An anchor cannot contain an anchor: the parser closes this one the
         # moment the next `<a` opens, so the outer element ends there and its
@@ -1948,7 +2020,8 @@ def edges_from(f):
         nested = ANCHOR_TAG.search(txt, tag.end())
         if nested and nested.start() < stop:
             stop = nested.start()
-        if not has_content(img_view[tag.end():stop], txt[tag.end():stop]):
+        if not has_content(img_view[tag.end():stop], txt[tag.end():stop],
+                           raw[tag.end():stop]):
             continue
         add_relative(next(g for g in m.groups() if g is not None),
                      markdown=False)
@@ -1997,7 +2070,8 @@ def edges_from(f):
         # inline form and the raw anchor already required it; this was the
         # third spelling of the same link and the one left out.
         if not has_content(img_view[m.start(1):m.end(1)],
-                           uses_txt[m.start(1):m.end(1)]):
+                           uses_txt[m.start(1):m.end(1)],
+                           raw[m.start(1):m.end(1)]):
             continue
         inner = m.group(2)
         lbl = ref_label(inner) if inner.strip() else ref_label(m.group(1))
@@ -2027,7 +2101,8 @@ def edges_from(f):
         # The inline form, the raw anchor and the full reference all required
         # content already; this was the fourth spelling and the one left out.
         if not has_content(img_view[m.start(1):m.end(1)],
-                           shortcut_txt[m.start(1):m.end(1)]):
+                           shortcut_txt[m.start(1):m.end(1)],
+                           raw[m.start(1):m.end(1)]):
             continue
         lbl = ref_label(m.group(1))
         if lbl is not None:
@@ -4151,6 +4226,58 @@ self_test() {
   printf '# Jobs\n\n<a href="mail.md">&#60;span&#62;</a>\n' > "$c9iw/docs/guide/jobs.md"
   git -C "$c9iw" add -A && git -C "$c9iw" commit -qm entity-spelled-tag-text
   check "an entity-spelled tag is visible text, not markup" pass "$c9iw"
+
+  # Inline `display:none` hides a link as surely as the attribute does.
+  local c9jl="$tmp/c9jl"; make_corpus "$c9jl"
+  printf '# Jobs\n\n<a style="display:none" href="mail.md">Mail</a>\n' \
+    > "$c9jl/docs/guide/jobs.md"
+  git -C "$c9jl" add -A && git -C "$c9jl" commit -qm anchor-display-none
+  check "an anchor hidden by inline CSS is not a route" fail "$c9jl"
+
+  # ...and so does a descendant carrying it.
+  local c9jm="$tmp/c9jm"; make_corpus "$c9jm"
+  printf '# Jobs\n\n<a href="mail.md"><span style="display:none">Mail</span></a>\n' \
+    > "$c9jm/docs/guide/jobs.md"
+  git -C "$c9jm" add -A && git -C "$c9jm" commit -qm descendant-display-none
+  check "a subtree hidden by inline CSS is not content" fail "$c9jm"
+
+  # CSS is not the `hidden` attribute: it DOES reach an SVG. The pair of this
+  # and `a hidden attribute does not hide an svg` is the whole distinction.
+  local c9jn="$tmp/c9jn"; make_corpus "$c9jn"
+  printf '# Jobs\n\n<a href="mail.md"><svg style="display:none" width="9" height="9"></svg></a>\n' \
+    > "$c9jn/docs/guide/jobs.md"
+  git -C "$c9jn" add -A && git -C "$c9jn" commit -qm svg-display-none
+  check "inline CSS does hide an svg" fail "$c9jn"
+
+  # It is the declaration that hides, not the word: `display:block` is a route.
+  local c9jo="$tmp/c9jo"; make_corpus "$c9jo"
+  printf '# Jobs\n\n<a style="display:block" href="mail.md">Mail</a>\n' \
+    > "$c9jo/docs/guide/jobs.md"
+  git -C "$c9jo" add -A && git -C "$c9jo" commit -qm display-block
+  check "display:block is still a route" pass "$c9jo"
+
+  # ...and a hidden span written inside a COMMENT hides nothing, which is what
+  # the masked-view check on the tag position is for.
+  local c9jp="$tmp/c9jp"; make_corpus "$c9jp"
+  printf '# Jobs\n\n<a href="mail.md"><!-- <span style="display:none"> -->Mail</a>\n' \
+    > "$c9jp/docs/guide/jobs.md"
+  git -C "$c9jp" add -A && git -C "$c9jp" commit -qm commented-display-none
+  check "a commented-out hidden span hides nothing" pass "$c9jp"
+
+  # A `</a>` spelled inside a script is script text, so the anchor stays open
+  # and the label after it is live.
+  local c9jq="$tmp/c9jq"; make_corpus "$c9jq"
+  printf '# Jobs\n\n<a href="mail.md"><script>const fake="</a>";</script>Mail</a>\n' \
+    > "$c9jq/docs/guide/jobs.md"
+  git -C "$c9jq" add -A && git -C "$c9jq" commit -qm scripted-fake-close
+  check "a close spelled in a script does not end an anchor" pass "$c9jq"
+
+  # ...and the same inside a comment.
+  local c9jr="$tmp/c9jr"; make_corpus "$c9jr"
+  printf '# Jobs\n\n<a href="mail.md"><!-- </a> -->Mail</a>\n' \
+    > "$c9jr/docs/guide/jobs.md"
+  git -C "$c9jr" add -A && git -C "$c9jr" commit -qm commented-fake-close
+  check "a close spelled in a comment does not end an anchor" pass "$c9jr"
 
   # Whitespace just inside angle brackets is syntax, not part of the URL.
   # Reported as the opposite — that `[Mail](<mail.md >)` navigates to
