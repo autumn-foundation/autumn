@@ -353,6 +353,8 @@ def ref_label(s):
     return ' '.join(s.split()).lower()
 # A bare repo path. The leading guard keeps `…/docs/guide/x.md` inside a longer
 # path from matching at the wrong offset.
+# A URI scheme, for the destinations that leave the site entirely.
+SCHEME = re.compile(r'[A-Za-z][A-Za-z0-9+.-]*:')
 BARE = re.compile(
     r'(?<![\w/.-])((?:docs|skills|agents|examples)/[A-Za-z0-9._/-]+\.md)')
 
@@ -991,6 +993,17 @@ def edges_from(f):
                .replace('\x02\x02', '\\<'))
         raw = UNESCAPE.sub(r'\1', raw)
         if not raw.endswith('.md'):
+            return
+        # A destination that leaves the site cannot make a guide page
+        # reachable, however much of a repo path it happens to spell.
+        # `//docs/guide/mail.md` is PROTOCOL-RELATIVE: the browser reads `docs`
+        # as a hostname and navigates away. Stripping its slashes produced
+        # exactly the tracked path and recorded an edge to a page the link does
+        # not go to — a real orphan passing the gate. A destination with an
+        # explicit scheme is the same thing said out loud; it survives today
+        # only because `normalize` happens not to collapse it onto a tracked
+        # path, which is an accident to stop depending on.
+        if raw.startswith('//') or SCHEME.match(raw):
             return
         # An absolute-looking `/docs/guide/x.md` is a site path, not a file path.
         raw = raw.lstrip('/') if raw.startswith('/') else raw
@@ -2344,6 +2357,27 @@ self_test() {
     > "$c9er/docs/guide/jobs.md"
   git -C "$c9er" add -A && git -C "$c9er" commit -qm def-trailing-garbage
   check "a definition with trailing garbage defines nothing" fail "$c9er"
+
+  # A protocol-relative destination leaves the site: `docs` is a hostname.
+  local c9es="$tmp/c9es"; make_corpus "$c9es"
+  printf '# Jobs\n\n<a href="//docs/guide/mail.md">mail</a>\n' \
+    > "$c9es/docs/guide/jobs.md"
+  git -C "$c9es" add -A && git -C "$c9es" commit -qm protocol-relative
+  check "a protocol-relative destination is not an edge" fail "$c9es"
+
+  # ...and one with an explicit scheme is the same thing said out loud.
+  local c9et="$tmp/c9et"; make_corpus "$c9et"
+  printf '# Jobs\n\nSee [mail](https://example.test/docs/guide/mail.md).\n' \
+    > "$c9et/docs/guide/jobs.md"
+  git -C "$c9et" add -A && git -C "$c9et" commit -qm absolute-url
+  check "an absolute URL spelling a repo path is not an edge" fail "$c9et"
+
+  # ...but a single-slash site path is still a path into this repo.
+  local c9eu="$tmp/c9eu"; make_corpus "$c9eu"
+  printf '# Jobs\n\n<a href="/docs/guide/mail.md">mail</a>\n' \
+    > "$c9eu/docs/guide/jobs.md"
+  git -C "$c9eu" add -A && git -C "$c9eu" commit -qm site-root-path
+  check "a site-root path still counts as an edge" pass "$c9eu"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
