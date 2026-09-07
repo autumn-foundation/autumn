@@ -274,8 +274,10 @@ Three accessors, on any `AutumnError`:
   otherwise. It is a `HashMap`, so sort the keys before you render them.
 - `code()` returns the stable code the `problem+json` body carries —
   `autumn.validation_failed`, `autumn.not_found`, and so on.
-- `message()` returns the wrapped error's message alone, which is what the
-  body's `detail` shows.
+- `message()` returns the wrapped error's message alone. It is not redacted:
+  a `5xx` response outside a dev profile shows a generic `detail`, but this
+  still returns the wrapped error. Check `status()` before you show it to a
+  client.
 
 `Display` appends the failing fields to `message()`, sorted by field name.
 Keep untrusted text out of your `#[validate(message = "...")]` strings: this

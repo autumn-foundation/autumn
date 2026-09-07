@@ -1277,8 +1277,10 @@ resolver, a `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl):
   messages, `None` when the error did not come from validation
 - `code() -> Cow<'static, str>` - the same stable code the `problem+json`
   body carries (`autumn.validation_failed`, `autumn.not_found`, ...)
-- `message() -> String` - the wrapped error's message alone, which is what
-  the body's `detail` shows
+- `message() -> String` - the wrapped error's message alone. Not redacted:
+  a `5xx` body shows a generic `detail` outside a dev profile, but this
+  returns the wrapped error, so check `status()` before showing it to a
+  client
 - `source_chain() -> Vec<String>`
 - `downcast_ref::<T>()` / `downcast_chain_ref::<T>()`
 

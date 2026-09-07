@@ -140,7 +140,8 @@ pub struct ProblemFieldError {
 /// not put untrusted text in them: `Display` output reaches logs.
 ///
 /// [`message`](AutumnError::message) returns the wrapped error's message
-/// alone. The `application/problem+json` body uses that string, not this one.
+/// alone. The response body renders that string, not this one, and redacts
+/// it for a `5xx` outside a dev profile. Neither is redacted here.
 ///
 /// # Why no `Error` impl
 ///
@@ -760,10 +761,15 @@ impl AutumnError {
 
     /// The wrapped error's message, without the validation fields.
     ///
-    /// The same string the `application/problem+json` `detail` carries.
     /// [`Display`](std::fmt::Display) appends the failing fields on top of
-    /// this and is for a human reader; use `message` where the string is
+    /// this and is for a human reader. Use `message` where the string is
     /// stored, broadcast, or compared across versions.
+    ///
+    /// **Not redacted.** For a `4xx` this is the `application/problem+json`
+    /// `detail`, but a `5xx` response outside a dev profile replaces that
+    /// `detail` with a generic line, and this still returns the wrapped
+    /// error — a database or infrastructure message. Check
+    /// [`status`](Self::status) before you send it to a client.
     ///
     /// # Examples
     ///
@@ -2033,6 +2039,17 @@ mod tests {
             );
         }
         assert!(first.contains("邮箱: 无效"), "{first}");
+    }
+
+    #[test]
+    fn message_is_not_redacted_for_a_server_error() {
+        // The doc caveat, pinned: outside a dev profile the response replaces
+        // a 5xx `detail`, but `message` still returns the wrapped error.
+        let err = AutumnError::internal_server_error_msg("password=hunter2 in dsn");
+        assert_eq!(err.message(), "password=hunter2 in dsn");
+
+        let redacted = problem_details(err.status(), err.message(), None, None, None, None, false);
+        assert_eq!(redacted.detail, "Internal server error");
     }
 
     #[test]
