@@ -877,16 +877,23 @@ def _toml_lines(manifest):
 
     The flag exists for root-level lines, which `_toml_table` reads as dotted
     keys before any header has been seen; `_find_key` uses the same rows.
+
+    `depth` is passed through rather than dropped. Dropping it let a dotted key
+    NESTED in an inline table — `package.readme` written inside a
+    `metadata = {` block — be read as a root-level `package.readme`, seeding a
+    file Cargo does not publish while it auto-detects `README.md`. The walker
+    had already computed the answer; this consumer threw it away, which is the
+    same failure as two places disagreeing, with one of them silent.
     """
     table = None
-    for line, _pos, live, _depth, rest in _toml_rows(manifest):
+    for line, _pos, live, depth, rest in _toml_rows(manifest):
         if rest:
             name = _header_name(rest)
             if name is not None:
                 table = _toml_key_path(name)
-                yield table, '', True
+                yield table, '', True, 0
                 continue
-        yield table, line, live
+        yield table, line, live, depth
 
 
 def _toml_table(manifest, name):
@@ -915,12 +922,14 @@ def _toml_table(manifest, name):
     rows = list(_toml_lines(manifest))
     out = []
     seen = False
-    for idx, (table, line, live) in enumerate(rows):
+    for idx, (table, line, live, depth) in enumerate(rows):
         if table == want:
             seen = True
             out.append(line)
             continue
-        if table is not None or not live:
+        # A root-level dotted key or inline table is only that at depth zero;
+        # deeper, it belongs to the value it is written inside.
+        if table is not None or not live or depth > 0:
             continue
         k = _line_key(line)
         if k is None:
@@ -8158,6 +8167,19 @@ self_test() {
   printf '# Decoy\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ng/pkg/README.md"
   git -C "$c9ng" add -A && git -C "$c9ng" commit -qm quotes-before-terminator
   check "quotes before a multi-line terminator belong to the value" fail "$c9ng"
+
+  # A dotted key NESTED inside an inline table is not a root-level key: this
+  # `package.readme` belongs to `metadata`, and Cargo auto-detects `README.md`
+  # for the package. Reading it at the root seeded a file no registry
+  # publishes, while the real README carries no link.
+  local c9nh="$tmp/c9nh"; make_corpus "$c9nh"
+  mkdir -p "$c9nh/pkg"
+  printf 'package = {\nname = "pkg",\nmetadata = {\npackage.readme = "PRIVATE.md"\n}\n}\n' \
+    > "$c9nh/pkg/Cargo.toml"
+  printf '# Real\n\ntext\n' > "$c9nh/pkg/README.md"
+  printf '# Private\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9nh/pkg/PRIVATE.md"
+  git -C "$c9nh" add -A && git -C "$c9nh" commit -qm nested-dotted-root-key
+  check "a dotted key nested in an inline table is not root-level" fail "$c9nh"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
