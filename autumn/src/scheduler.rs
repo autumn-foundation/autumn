@@ -52,6 +52,18 @@ pub trait SchedulerCoordinator: Send + Sync {
     /// Stable replica identifier surfaced in actuator metadata.
     fn replica_id(&self) -> &str;
 
+    /// Whether this coordinator coordinates across a fleet of replicas,
+    /// rather than a single process (issue #1864).
+    ///
+    /// Lets a call site ask the coordinator directly instead of matching the
+    /// [`SchedulerBackend`] config enum. The default derives it from
+    /// [`Self::backend`], so existing implementors — including test doubles —
+    /// need no changes; override it only if a future backend's `backend()`
+    /// string diverges from its fleet-distribution semantics.
+    fn is_fleet_distributed(&self) -> bool {
+        self.backend() == "postgres"
+    }
+
     /// Try to acquire permission to run `task_name` for `tick_key`.
     fn try_acquire<'a>(
         &'a self,
@@ -470,5 +482,42 @@ mod tests {
     #[test]
     fn cron_tick_key_uses_task_name_and_second() {
         assert_eq!(cron_tick_key("digest", 1_700_000_000), "digest:1700000000");
+    }
+
+    // Issue #1864: `is_fleet_distributed` is a default trait method derived
+    // from `backend()`, so a plain in-process coordinator needs no override
+    // to report `false`.
+    #[test]
+    fn in_process_coordinator_is_not_fleet_distributed() {
+        let coordinator = InProcessSchedulerCoordinator::new("replica-1");
+        assert_eq!(coordinator.backend(), "in_process");
+        assert!(!coordinator.is_fleet_distributed());
+    }
+
+    // `PostgresAdvisorySchedulerCoordinator` (feature `db`) needs a live pool
+    // to construct — covered by the testcontainer-backed
+    // `tests/integration/scheduled_coordination.rs` suite instead. This
+    // exercises the same default-method derivation (`backend() == "postgres"`)
+    // via a minimal double, without a database.
+    #[test]
+    fn a_coordinator_reporting_the_postgres_backend_string_is_fleet_distributed() {
+        struct FakePostgresCoordinator;
+        impl SchedulerCoordinator for FakePostgresCoordinator {
+            fn backend(&self) -> &'static str {
+                "postgres"
+            }
+            fn replica_id(&self) -> &'static str {
+                "replica-1"
+            }
+            fn try_acquire<'a>(
+                &'a self,
+                _task_name: &'a str,
+                _tick_key: &'a str,
+                _coordination: TaskCoordination,
+            ) -> SchedulerFuture<'a, AutumnResult<Option<SchedulerLease>>> {
+                Box::pin(async { Ok(None) })
+            }
+        }
+        assert!(FakePostgresCoordinator.is_fleet_distributed());
     }
 }

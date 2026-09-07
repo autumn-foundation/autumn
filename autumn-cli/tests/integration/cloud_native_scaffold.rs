@@ -395,9 +395,65 @@ fn ci_workflow_runs_a11y_verify() {
         ci.contains("scripts/install.sh"),
         "ci.yml must install the autumn CLI via the install script"
     );
+}
+
+/// Issue #2495: `ci.yml`'s `a11y verify` and `routes audit` steps compile
+/// and introspect the pull request's own code, the same as
+/// posture-gate.yml's `manifest` job — so unlike that job's `posture`
+/// sibling (which only ever reads JSON, and does probe forward for a
+/// compatible release), `ci.yml` must keep installing the CLI pinned to
+/// this app's `autumn-web` version and never silently reach for a CLI this
+/// project's own compatibility check (`autumn doctor`) would call
+/// incompatible.
+#[test]
+fn ci_workflow_always_installs_the_cli_pinned_to_app_version() {
+    let temp_dir = scaffold("ci-pinned-cli-app");
+    let project_dir = temp_dir.path().join("ci-pinned-cli-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
     assert!(
         ci.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        "ci.yml must pin the installed CLI to this app's autumn version"
+        "ci.yml must install the CLI pinned to this app's autumn version: {ci}"
+    );
+    assert!(
+        !ci.contains("trunk-dev") && !ci.contains("for bump in"),
+        "ci.yml must never fall back to a CLI this project's own \
+         compatibility check would call incompatible: {ci}"
+    );
+}
+
+/// A raw `autumn a11y verify` / `autumn routes audit` invocation against a
+/// CLI that lacks the subcommand fails with a cryptic "unknown subcommand"
+/// error. Mirroring `posture-gate.yml`'s existing `routes posture --help`
+/// probe (#2467), both must be checked for and fail with an actionable
+/// `::error::` message before either gate actually runs.
+#[test]
+fn ci_workflow_probes_for_a11y_and_routes_audit_before_running_them() {
+    let temp_dir = scaffold("ci-probe-app");
+    let project_dir = temp_dir.path().join("ci-probe-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("a11y verify --help"),
+        "ci.yml must probe for `a11y verify` before running it: {ci}"
+    );
+    assert!(
+        ci.contains("routes audit --help"),
+        "ci.yml must probe for `routes audit` before running it: {ci}"
+    );
+    assert!(
+        ci.contains("::error::"),
+        "ci.yml's probe must fail with an actionable ::error:: message, not \
+         a bare exit: {ci}"
+    );
+
+    let probe_pos = ci.find("a11y verify --help").expect("a11y probe present");
+    let run_pos = ci
+        .rfind("a11y verify .")
+        .expect("a11y verify invocation present");
+    assert!(
+        probe_pos < run_pos,
+        "the a11y probe must run before `autumn a11y verify` itself: {ci}"
     );
 }
 

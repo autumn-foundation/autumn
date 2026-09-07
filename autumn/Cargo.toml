@@ -222,6 +222,14 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
 acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2", "dep:reqwest"]
+# Real-ACME end-to-end coverage against a Pebble container (issue #1863).
+# Turns on `testcontainers`' `host-port-exposure` tunnel — the SSH sidecar
+# that lets a container reach a `127.0.0.1`-bound listener on this host —
+# and implies `acme` + `test-support`. Kept out of both of THOSE features so
+# an ordinary `cargo test -p autumn-web --features test-support` (or a plain
+# `--workspace` run) does not pull in `host-port-exposure`'s `russh`/crypto
+# dependency subtree; only the dedicated Pebble CI step enables it.
+acme-pebble = ["acme", "test-support", "testcontainers/host-port-exposure"]
 # Origin-side half of the edge capsule (issue #1790). Adds the `autumn_web::edge`
 # re-export of the `autumn-edge` crate, the `CacheEdgeKv` adapter that projects
 # the app's `Cache` onto the `EdgeKv` seam, and `AppBuilder::with_edge_kv`, which
@@ -532,6 +540,16 @@ required-features = ["db"]
 name = "csrf_verify"
 harness = false
 
+# Per-route `#[throttle]` rate-limiter workload for profilers (issue #1350):
+# drives real GET traffic through a `#[throttle]`-guarded handler and an
+# identical unthrottled handler, interleaved, so a profiler can attribute the
+# limiter's own per-request cost against the same ingress stack
+# `request_pipeline.rs` already measures. Asserts nothing beyond "not denied"
+# — see the file header for the exact commands.
+[[bench]]
+name = "throttle_check"
+harness = false
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
@@ -577,6 +595,10 @@ path = "tests/sandbox_header_alloc_gate.rs"
 # bytes must not be expanded into a 192 KiB replacement string to keep 512
 # characters of it. Its own binary for the same reason as the header gate —
 # `allocation-counter` installs a process-wide `#[global_allocator]`.
+[[test]]
+name = "sandbox_render_alloc_gate"
+path = "tests/sandbox_render_alloc_gate.rs"
+
 [[test]]
 name = "sandbox_stderr_alloc_gate"
 path = "tests/sandbox_stderr_alloc_gate.rs"
@@ -892,6 +914,19 @@ path = "tests/sqlite_dependent_destroy.rs"
 name = "sqlite_read_only_tx"
 path = "tests/sqlite_read_only_tx.rs"
 
+# DB-backed sessions store on SQLite (issue #1908): the `generate auth` tracked-
+# sessions store binds `::autumn_web::RuntimeBackend` instead of `diesel::pg::Pg`,
+# so it accepts the SQLite `RuntimeConnection`. Mirrors the generated DDL, schema
+# block and store functions and runs them against a real SQLite database — login
+# tracking, the revocation gate, `last_seen_at` refresh, rotation rebinding, and
+# the three revoke paths. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_tracked_sessions`.
+[[test]]
+name = "sqlite_tracked_sessions"
+path = "tests/sqlite_tracked_sessions.rs"
+
 # Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
 # `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-
 # transactional) SQLite pool from the recorded URL instead of dropping it and
@@ -1090,6 +1125,12 @@ path = "tests/cache_global_integration.rs"
 [[test]]
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
+
+# Isolated: installs a process-global cache backend and depends on it surviving
+# across two requests, which any concurrent `TestApp::build` would clear.
+[[test]]
+name = "capsule_cache_effect"
+path = "tests/capsule_cache_effect.rs"
 
 # Isolated: loom model-checking binary. Empty under a normal build
 # (`#![cfg(loom_models)]`); only compiles/runs under

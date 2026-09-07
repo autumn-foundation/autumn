@@ -895,6 +895,260 @@ fn generator_conformance_ci_gate_is_configured() {
     );
 }
 
+// ── cli_tests per-test triage (issue #1945) ───────────────────────────────
+
+#[test]
+fn cli_tests_docker_ignored_tests_are_ci_swept() {
+    let root = workspace_root();
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci_yml = std::fs::read_to_string(&ci_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", ci_path.display()));
+
+    // A newly-added `#[ignore = "requires Docker (testcontainers)"]` test in
+    // ANY `autumn-cli/tests/integration/*.rs` module must run in CI with no
+    // workflow edit, the same guarantee the autumn-web sweep already gives
+    // (#1923). That only holds if ci.yml's cli_tests invocation is a BARE
+    // `--ignored` sweep (discovers every ignored test in the binary) rather
+    // than a specific-test filter — matched as the literal invocation tail,
+    // not a substring of the surrounding comment, so deleting the sweep
+    // itself would still fail this even though "cli_tests" stays mentioned
+    // in prose above it.
+    let invocation = ci_yml
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        invocation
+            .contains("cargo test -p autumn-cli --test cli_tests -- --ignored --test-threads=1"),
+        "ci.yml must run a BARE `--ignored` sweep over `cli_tests` so a newly-added \
+         Docker `#[ignore]`d test runs automatically; see issue #1945",
+    );
+}
+
+#[test]
+fn cli_tests_cold_start_ignored_tests_are_ci_named() {
+    let root = workspace_root();
+    let generator_conformance_path = root.join(".github/workflows/generator-conformance.yml");
+    let generator_conformance = std::fs::read_to_string(&generator_conformance_path)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read {}: {err}",
+                generator_conformance_path.display()
+            )
+        });
+
+    // Unlike the Docker-gated tests above, these `#[ignore]`d tests each
+    // scaffold and cargo-check/build/run a fresh project — too slow for the
+    // fast Docker sweep, and ci.yml's cli_tests invocation explicitly
+    // `--skip`s each of them by exact name for that reason. So each one must
+    // be named explicitly in generator-conformance.yml (matching every other
+    // generator-shaped gate above) or it never runs anywhere — the gap issue
+    // #1945 flagged as the `cli_tests` binary's remaining per-test triage.
+    //
+    // Matched as the full `<name> -- --ignored --exact` INVOCATION, not the
+    // bare name (same rationale and normalization as
+    // `generator_conformance_ci_gate_is_configured` above): a bare substring
+    // check would stay green after cargo lost its `--ignored --exact` flags,
+    // gained a typo that selects zero tests, or the whole `run:` step was
+    // deleted while the test name lingered in a comment.
+    let invocations = generator_conformance
+        .replace('\\', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for test_name in [
+        "integration::api_scaffold::api_scaffold_cargo_checks",
+        "integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate",
+        "integration::cloud_native_scaffold::scaffolded_api_app_passes_routes_audit_gate",
+        "integration::generate_position_scaffold::unscoped_position_generated_project_cargo_checks",
+        "integration::generate_position_scaffold::scoped_position_generated_project_cargo_checks",
+        "integration::generate_position_scaffold::soft_delete_position_generated_project_cargo_checks",
+        "integration::scaffold_belongs_to::belongs_to_scaffold_cargo_checks",
+        "integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks",
+        "integration::scaffold_rich_text::richtext_scaffold_cargo_checks",
+        "integration::scaffold_search::searchable_scaffold_cargo_checks",
+        "integration::scaffold_trash::trash_generated_project_cargo_checks",
+        "integration::seed_model_linking::linked_seed_binary_cargo_checks",
+        "integration::serve::serve_daemon_start_status_stop_over_unix_socket",
+        "integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks",
+        "integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks",
+    ] {
+        assert!(
+            invocations.contains(&format!("{test_name} -- --ignored --exact")),
+            "generator-conformance.yml must INVOKE `{test_name}` (not merely name it \
+             in a comment) via --ignored --exact; this cli_tests test is CI-gated, \
+             not abandoned — see issue #1945",
+        );
+    }
+}
+
+/// Drop YAML comment text from a workflow file.
+///
+/// The coverage guard below matches `--test <name>` against workflow source, so
+/// without this a target whose invocation was commented out — or merely
+/// mentioned in prose — would satisfy it while no job runs the target, which is
+/// the very hole the guard exists to close.
+///
+/// A `#` opens a comment when it starts the line or follows whitespace and is
+/// not inside a quoted string; a `#` inside a shell word (`$#`) is left alone.
+fn strip_yaml_comments(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len());
+    for line in yaml.lines() {
+        let (mut in_single, mut in_double, mut after_ws) = (false, false, true);
+        let mut end = line.len();
+        for (idx, ch) in line.char_indices() {
+            match ch {
+                '\'' if !in_double => in_single = !in_single,
+                '"' if !in_single => in_double = !in_double,
+                '#' if !in_single && !in_double && after_ws => {
+                    end = idx;
+                    break;
+                }
+                _ => {}
+            }
+            after_ws = ch.is_whitespace();
+        }
+        out.push_str(line.get(..end).unwrap_or(line));
+        out.push('\n');
+    }
+    out
+}
+
+/// Values a cargo command gives to `flag`, in both the `--flag value` and
+/// `--flag=value` spellings. Values are whole tokens, so `--test sim_chaos_crash`
+/// yields `sim_chaos_crash` and never satisfies a lookup for `sim_chaos`.
+fn flag_values<'a>(tokens: &[&'a str], flag: &str) -> Vec<&'a str> {
+    let eq = format!("{flag}=");
+    let mut values: Vec<&str> = tokens
+        .windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1])
+        .collect();
+    values.extend(tokens.iter().filter_map(|t| t.strip_prefix(eq.as_str())));
+    values
+}
+
+/// Every `sqlite`-gated `[[test]]` target in `autumn/Cargo.toml` must be named
+/// in a CI workflow (issue #1908).
+///
+/// These targets are `#![cfg(feature = "sqlite")]`, so the default
+/// `cargo test --workspace` compiles each to an empty, passing binary. The
+/// backend flip makes a bare `cargo test --features sqlite` unsafe, so the
+/// sqlite job enumerates its targets BY NAME. A target added to `Cargo.toml` but
+/// not to that list therefore never runs anywhere and fails silently forever —
+/// which is how `sqlite_tracked_sessions` shipped dark. This closes the gap for
+/// every future target.
+///
+/// Membership is read from each target's own `#![cfg(...)]` gate rather than a
+/// name prefix, so a sqlite target named otherwise is still covered and a
+/// backend-independent `sim_*` target is not wrongly demanded. Coverage means a
+/// live cargo command that enables the `sqlite` feature AND names the target:
+/// a commented-out line, a prose mention, a prefix of another target's name, or
+/// a `--test` without the feature all leave the target dark and must fail here.
+#[test]
+fn sqlite_test_targets_are_ci_named() {
+    let root = workspace_root();
+    let manifest_path = root.join("autumn/Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
+
+    // Collect the cargo commands every workflow actually runs. `strip_yaml_comments`
+    // drops commented-out invocations and prose mentions; joining `\`-continued
+    // lines keeps one wrapped command as one command, so a target is credited only
+    // to the invocation that names it.
+    let workflows_dir = root.join(".github/workflows");
+    let mut commands: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&workflows_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflows_dir.display()))
+        .flatten()
+    {
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut pending = String::new();
+        for line in strip_yaml_comments(&body).lines() {
+            let trimmed = line.trim_end();
+            if let Some(head) = trimmed.strip_suffix('\\') {
+                pending.push_str(head);
+                pending.push(' ');
+            } else {
+                pending.push_str(trimmed);
+                commands.push(std::mem::take(&mut pending));
+            }
+        }
+        if !pending.is_empty() {
+            commands.push(pending);
+        }
+    }
+
+    // A command covers a target only when it BOTH enables the `sqlite` feature and
+    // names the target. Without the feature the target's crate-level
+    // `#![cfg(feature = "sqlite")]` compiles it to an empty binary that exits 0, so
+    // a feature-less `--test <target>` is not coverage.
+    let sqlite_commands: Vec<Vec<&str>> = commands
+        .iter()
+        .map(|command| command.split_whitespace().collect::<Vec<_>>())
+        .filter(|tokens| {
+            tokens.contains(&"cargo")
+                && tokens.contains(&"test")
+                && (tokens.contains(&"--all-features")
+                    || flag_values(tokens, "--features").iter().any(|value| {
+                        value
+                            .trim_matches(['"', '\''])
+                            .split(',')
+                            .any(|feature| feature.trim() == "sqlite")
+                    }))
+        })
+        .collect();
+
+    let is_invoked = |target: &str| {
+        sqlite_commands
+            .iter()
+            .any(|tokens| flag_values(tokens, "--test").contains(&target))
+    };
+
+    // Pair each `[[test]]` name with its path, then keep only the sqlite-gated
+    // ones.
+    let mut name: Option<&str> = None;
+    let mut gated = Vec::new();
+    for line in manifest.lines().map(str::trim) {
+        if let Some(value) = line
+            .strip_prefix("name = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            name = Some(value);
+        } else if let Some(path) = line
+            .strip_prefix("path = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            && let Some(target) = name.take()
+        {
+            let source = std::fs::read_to_string(root.join("autumn").join(path))
+                .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
+            if source
+                .lines()
+                .take_while(|l| !l.starts_with("use ") && !l.starts_with("mod "))
+                .any(|l| l.starts_with("#![cfg(") && l.contains(r#"feature = "sqlite""#))
+            {
+                gated.push(target.to_owned());
+            }
+        }
+    }
+    assert!(
+        gated.len() > 20,
+        "expected the sqlite-gated [[test]] targets to be discovered, found {gated:?}"
+    );
+
+    for target in gated {
+        assert!(
+            is_invoked(&target),
+            "a CI workflow must run `--test {target}`; a sqlite-gated target missing from \
+             the sqlite job's named list compiles to an empty binary and never runs — \
+             see issue #1908",
+        );
+    }
+}
+
 #[test]
 fn contributing_documents_ignored_generator_tests() {
     let root = workspace_root();

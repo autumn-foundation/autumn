@@ -586,9 +586,18 @@ fn pat_binds_inner_response(pat: &Pat) -> bool {
 /// including the `IntoResponse::into_response(…)` call, parens, and invisible
 /// groups they may sit behind — and yield the inner block.
 ///
-/// Shared with `api_doc`'s marker walks: each guard that expands *before*
-/// another buries the earlier guard's marker consts one wrapper level deeper,
-/// so a walk that does not descend through this shape silently loses them.
+/// Also unwraps the unrelated `(|| async move { … })().await` closure-IIFE
+/// wrapper `#[cached]` puts a handler's original body inside
+/// (`cached_macro`'s `compute`): a marker injected by an earlier-expanding
+/// attribute (e.g. `#[static_get]`'s `STATIC_ROUTE_HANDLER_MARKER`) ends up
+/// buried one level deeper than usual when `#[cached]` sits between it and
+/// the guard that needs to see it, same as the guard-generated wrapper above
+/// (Codex review on #2513, eleventh finding).
+///
+/// Shared with `api_doc`'s marker walks: each guard or wrapper that expands
+/// *before* another buries the earlier one's marker consts one wrapper level
+/// deeper, so a walk that does not descend through this shape silently loses
+/// them.
 pub fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
     match expr {
         Expr::Async(expr_async) => Some(&expr_async.block),
@@ -608,9 +617,30 @@ pub fn expr_nested_async_body(expr: &Expr) -> Option<&Block> {
         {
             call.args.first().and_then(expr_nested_async_body)
         }
+        // `(|| async move { … })()` / `(|| async move { … })().await` — a
+        // zero-argument call of an inline closure, the `#[cached]` IIFE
+        // shape. The closure itself is never `async`; its body is the async
+        // block being wrapped.
+        Expr::Call(call) if call.args.is_empty() => match unwrap_group_paren(&call.func) {
+            Expr::Closure(closure) => expr_nested_async_body(&closure.body),
+            _ => None,
+        },
         Expr::Group(group) => expr_nested_async_body(&group.expr),
         Expr::Paren(paren) => expr_nested_async_body(&paren.expr),
         _ => None,
+    }
+}
+
+/// Strip any invisible `Group`/`Paren` wrapper down to the expression they
+/// enclose, without following any other wrapper shape (unlike
+/// [`expr_nested_async_body`], which only unwraps a specific known set of
+/// *async* wrappers and returns the inner `Block` rather than the `Expr`
+/// itself).
+fn unwrap_group_paren(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Group(group) => unwrap_group_paren(&group.expr),
+        Expr::Paren(paren) => unwrap_group_paren(&paren.expr),
+        other => other,
     }
 }
 
@@ -753,12 +783,33 @@ fn path_expr_matches(expr: &Expr, expected: &[&str]) -> bool {
 }
 
 fn path_matches(path: &syn::Path, expected: &[&str]) -> bool {
-    path.segments.len() == expected.len()
+    if path.segments.len() != expected.len() {
+        return false;
+    }
+    // Only an `expected` path actually rooted at the framework crate (some
+    // call sites match a `core::...`/`std::...` path instead, e.g. the
+    // `Option`/`Result` patterns above) needs its leading segment compared
+    // against the actively resolved name rather than the literal
+    // `"autumn_web"` — once a rename or `crate = "..."` override (#1828) is
+    // in effect, that's what an earlier-expanded stacked macro's own
+    // (already-finalized) output is rooted at instead (Codex review, #2552).
+    let root_matches = if expected.first() == Some(&"autumn_web") {
+        path.segments.first().is_some_and(|segment| {
+            segment.ident == crate::crate_path::current_target_path_segment()
+        })
+    } else {
+        path.segments
+            .first()
+            .zip(expected.first())
+            .is_some_and(|(segment, expected)| segment.ident == *expected)
+    };
+    root_matches
         && path
             .segments
             .iter()
-            .zip(expected)
-            .all(|(segment, expected)| segment.ident == expected)
+            .skip(1)
+            .zip(&expected[1..])
+            .all(|(segment, expected)| segment.ident == *expected)
 }
 
 fn path_ends_with(path: &syn::Path, expected: &str) -> bool {

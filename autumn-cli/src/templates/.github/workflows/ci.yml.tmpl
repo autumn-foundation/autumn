@@ -15,10 +15,12 @@
 #
 # Also enforced: `autumn a11y verify` (accessibility), `autumn routes audit`
 # (route auth-coverage security manifest) — both run against the prebuilt
-# `autumn` CLI installed mid-job — and `cargo deny check advisories`, which
-# fails the build when any crate in this app's dependency tree carries a known
-# RustSec security advisory. That audit reads `deny.toml` at the repository
-# root; waive an advisory by adding an entry there, never by weakening or
+# `autumn` CLI installed mid-job — and `cargo deny check`, which fails the
+# build when any crate in this app's dependency tree carries a known RustSec
+# security advisory. That audit reads `deny.toml` at the repository root and
+# checks whatever that file declares: advisories always, plus `[licenses]`,
+# `[bans]` or `[sources]` once you uncomment them. `autumn doctor` runs the
+# same policy locally. Waive a finding in `deny.toml`, never by weakening or
 # deleting the step.
 #
 # The companion `.github/workflows/posture-gate.yml` takes the next step on
@@ -147,25 +149,65 @@ jobs:
 
       # Runs against the database fetched above, so a failure here is a real
       # advisory rather than a network blip.
-      - name: Audit dependencies (RustSec advisories)
-        run: cargo deny --offline check advisories
+      #
+      # The check list is derived from `deny.toml`: advisories always, plus
+      # every optional section the policy declares. `autumn doctor` derives it
+      # the same way, so uncommenting `[licenses]`, `[bans]` or `[sources]`
+      # widens the local check and this gate together — a lockfile cannot pass
+      # locally and fail here for a dependency reason.
+      - name: Audit dependencies (RustSec advisories and declared policy)
+        run: |
+          # Matches every TOML spelling of a section header or key: [bans],
+          # [ bans ], ["bans"], ['bans'], [bans.build], [[bans.deny]],
+          # bans.deny = …, bans = { … }. `autumn doctor` parses the file as
+          # TOML and reaches the same answer; grep cannot, so the two are held
+          # together by a test that runs this loop and doctor over the same
+          # policies. A commented line never matches.
+          checks="advisories"
+          for section in bans licenses sources; do
+            if grep -qE "^[[:space:]]*(\[\[?[[:space:]]*)?[\"']?$section[\"']?[[:space:]]*[].=]" deny.toml; then
+              checks="$checks $section"
+            fi
+          done
+          echo "policy sections in force: $checks"
+          cargo deny --offline check $checks
 
-      # Accessibility gate: install the prebuilt `autumn` CLI matching this app's
-      # autumn-web version and scan raw html! markup for a11y violations. This is an
-      # enforcing gate — it runs against the pinned autumn release's prebuilt binary,
-      # so an a11y violation fails the job.
+      # Accessibility gate: install the release pinned to this app's own
+      # autumn-web version and scan raw html! markup for a11y violations.
+      # This is an enforcing gate: an a11y violation fails the job. Unlike
+      # posture-gate.yml's verdict job (issue #2495), this step and `routes
+      # audit` below get no "latest release" fallback: both compile and
+      # introspect the pull request's own code, the same as posture-gate.yml's
+      # `manifest` job, so — like that job — nothing here may run under a CLI
+      # this project's own compatibility check (`autumn doctor`) would call
+      # incompatible with this app's autumn-web version.
       - name: Accessibility (a11y) verify
         run: |
           curl -fsSL "https://raw.githubusercontent.com/autumn-foundation/autumn/v{{autumn_version}}/scripts/install.sh" \
             | sh -s -- --version "v{{autumn_version}}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # `a11y verify` and `routes audit` (used by the next step) are
+          # assumed to exist in the release pinned to this app's autumn-web
+          # version. Say so and fail — never skip — if either hasn't shipped
+          # in that release yet, rather than failing later with an
+          # unknown-subcommand error: a gate that waves a pull request
+          # through because its own tooling is too old is worse than one
+          # that is red.
+          if ! "$HOME/.local/bin/autumn" a11y verify --help >/dev/null 2>&1; then
+            echo "::error::the autumn CLI pinned to this app's autumn-web version (v{{autumn_version}}) has no \`a11y verify\` command yet, so this gate cannot run. Raise this app's autumn-web version and this workflow's pin to the release that introduced it."
+            exit 1
+          fi
+          if ! "$HOME/.local/bin/autumn" routes audit --help >/dev/null 2>&1; then
+            echo "::error::the autumn CLI pinned to this app's autumn-web version (v{{autumn_version}}) has no \`routes audit\` command yet, so the next step cannot run. Raise this app's autumn-web version and this workflow's pin to the release that introduced it."
+            exit 1
+          fi
           "$HOME/.local/bin/autumn" a11y verify .
 
       # Route auth-coverage gate (default-deny posture, issue #1604): every
       # mounted route must carry a proven security classification (`gated`,
       # `public`, or framework-owned) before it merges. A route someone forgot
       # to annotate fails the build here instead of shipping silently. Reuses
-      # the prebuilt CLI installed by the a11y step above.
+      # the CLI installed and probed by the a11y step above.
       - name: Route auth coverage (security manifest)
         run: autumn routes audit
 

@@ -285,15 +285,13 @@ fn inline_list_items(
             bold,
             italic,
         });
-        // If this item's content starts with a block boundary (e.g.
-        // `<li><p>Child</p></li>`), `inline_spans` pushes a break *before*
-        // it — normally correct (separating one block from the one before
-        // it), but here `out` already ends with the marker's own `Run`, so
-        // that leading break lands directly between the marker and its
-        // first line of content instead of before a preceding sibling,
-        // splitting them across two lines. Strip exactly that one leading
-        // break (never more — anything after it is legitimate inter-block
-        // spacing within the item's own content).
+        // If this item's content starts with a block boundary — `<li><p>Child</p></li>` —
+        // `inline_spans` pushes a break before it. That is normally correct, separating
+        // one block from the one before it, but here `out` already ends with the marker's
+        // own `Run`, so the leading break lands between the marker and its first line of
+        // content instead of before a preceding sibling, splitting them across two lines.
+        // Strip exactly that one leading break, never more: anything after it is
+        // legitimate inter-block spacing within the item's own content.
         let content_start = out.len();
         inline_spans(children, bold, italic, depth + 1, out);
         if out.get(content_start) == Some(&Span::Break) {
@@ -426,20 +424,19 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                     continue;
                 }
                 match tag.as_str() {
-                    // `p`/`li` cannot legally nest another block element in
-                    // HTML (a nested block inside them is already malformed
-                    // input), so flattening their content to one implicit
-                    // paragraph is a reasonable degrade — and `li`'s normal
-                    // path is `extract_list_items` below, not here; this arm
-                    // only sees a stray `<li>` outside a `<ul>`/`<ol>`.
-                    // `dt`/`dd` (a description list's term/value pair) are
-                    // the same shape: each is its own block-level unit whose
-                    // content is normally inline, so it gets its own
-                    // paragraph rather than gluing onto its sibling term or
-                    // value — without this, `<dl><dt>Title</dt><dd>My
-                    // Post</dd>...</dl>` (as emitted by scaffold detail
-                    // views, e.g. a `property_list` widget) renders as one
-                    // run of unbroken text with no row boundaries at all.
+                    // `p` and `li` cannot legally nest another block element in
+                    // HTML — a nested block inside them is already malformed
+                    // input — so flattening their content to one implicit
+                    // paragraph is a reasonable degrade. `li`'s normal path is
+                    // `extract_list_items` below, not here; this arm sees only a
+                    // stray `<li>` outside a `<ul>`/`<ol>`. `dt` and `dd`, a
+                    // description list's term and value, are the same shape: each
+                    // is its own block-level unit whose content is normally
+                    // inline, so it gets its own paragraph rather than gluing onto
+                    // its sibling. Without this,
+                    // `<dl><dt>Title</dt><dd>My Post</dd>...</dl>`, as scaffold
+                    // detail views emit from a `property_list` widget, renders as
+                    // one run of unbroken text with no row boundaries.
                     "p" | "li" | "dt" | "dd" => {
                         flush(&mut pending, out);
                         let mut spans = Vec::new();
@@ -447,28 +444,27 @@ fn flatten_blocks(nodes: &[Node], depth: u32, out: &mut Vec<Block>) {
                         trim_trailing_break(&mut spans);
                         out.push(Block::Paragraph(spans));
                     }
-                    // `div`/`blockquote`/`dl` commonly wrap *other block
-                    // elements* (`<div><h1>...</h1><p>...</p></div>`,
-                    // `<blockquote><p>...</p></blockquote>`, a `<dl>`'s
-                    // `<dt>`/`<dd>` children) — recursing through
-                    // `flatten_blocks` (rather than flattening every
-                    // descendant through `inline_spans` into one paragraph,
-                    // which would merge a heading and two paragraphs into a
-                    // single run of unbroken text) lets nested block tags
-                    // still produce their own blocks. When the children are
-                    // purely inline (e.g. `<div><span>hi</span></div>`),
-                    // `flatten_blocks`'s own pending/flush accumulator
-                    // produces exactly the same single implicit paragraph
-                    // this used to build directly. HTML5's semantic
-                    // sectioning/landmark elements (`section`/`article`/
-                    // `main`/`header`/`footer`/`nav`/`aside`) commonly wrap
-                    // block content the same way a `<div>` does — without
-                    // them here, adjacent elements of loose text
-                    // (`<main><section>Summary</section><section>Details</section></main>`,
-                    // and equally `<aside>Summary</aside><aside>Details</aside>`)
-                    // fell through to the generic transparent-passthrough
-                    // arm and accumulated into one pending paragraph with no
-                    // separator (`SummaryDetails`).
+                    // `div`, `blockquote`, and `dl` commonly wrap other block
+                    // elements — `<div><h1>...</h1><p>...</p></div>`,
+                    // `<blockquote><p>...</p></blockquote>`, a `<dl>`'s `<dt>`
+                    // and `<dd>` children. Recursing through `flatten_blocks`,
+                    // rather than flattening every descendant through
+                    // `inline_spans` into one paragraph, lets nested block tags
+                    // produce their own blocks; otherwise a heading and two
+                    // paragraphs merge into a single run of unbroken text. When
+                    // the children are purely inline
+                    // (`<div><span>hi</span></div>`), `flatten_blocks`'s own
+                    // pending/flush accumulator produces exactly the same single
+                    // implicit paragraph this used to build directly.
+                    //
+                    // HTML5's sectioning and landmark elements — `section`,
+                    // `article`, `main`, `header`, `footer`, `nav`, `aside` —
+                    // commonly wrap block content the way a `<div>` does. Without
+                    // them here, adjacent elements of loose text fell through to
+                    // the generic transparent-passthrough arm and accumulated
+                    // into one pending paragraph with no separator, rendering
+                    // `<aside>Summary</aside><aside>Details</aside>` as
+                    // `SummaryDetails`.
                     "div" | "blockquote" | "dl" | "section" | "article" | "main" | "header"
                     | "footer" | "nav" | "aside" => {
                         flush(&mut pending, out);
@@ -609,31 +605,30 @@ fn words_of(spans: &[Span]) -> Vec<Word> {
                 glue_next_unbreakable = false;
             }
             Span::Run { text, bold, italic } => {
-                // Must agree with the split predicate below on what counts as
-                // a "real" (breakable) whitespace boundary — NBSP doesn't,
-                // since it's deliberately kept *inside* the resulting token
-                // rather than split off. Using the blanket `char::is_whitespace`
-                // here (which NBSP also satisfies) would say a span starting/
-                // ending with NBSP has a "real" separator at that edge, gluing
-                // it to nothing — so `wrap` inserts its own extra plain space
-                // next to a token that already renders the NBSP as one, and
-                // allows a line break at a boundary the NBSP was meant to make
-                // unbreakable.
+                // Must agree with the split predicate below on what counts as a
+                // real, breakable whitespace boundary. NBSP does not, since it is
+                // deliberately kept inside the resulting token rather than split
+                // off. The blanket `char::is_whitespace`, which NBSP also
+                // satisfies, would say a span starting or ending with NBSP has a
+                // real separator at that edge, gluing it to nothing — so `wrap`
+                // inserts its own extra plain space next to a token that already
+                // renders the NBSP as one, and allows a line break at a boundary
+                // the NBSP was meant to make unbreakable.
                 let is_breakable_ws = |c: char| c.is_whitespace() && !is_non_breaking_space(c);
                 let starts_with_ws = text.starts_with(is_breakable_ws);
                 let ends_with_ws = text.ends_with(is_breakable_ws);
                 let starts_with_nbsp = text.starts_with(is_non_breaking_space);
                 let ends_with_nbsp = text.ends_with(is_non_breaking_space);
                 let mut emitted_any = false;
-                // Split on breakable whitespace only — NBSP and its other
-                // non-breaking variants (`&nbsp;`/U+00A0, U+2007, U+202F —
-                // see `is_non_breaking_space`) satisfy `char::is_whitespace()`
-                // so `split_whitespace()` would treat them as an ordinary word
-                // separator, discarding the entire point of a *non*-breaking
-                // space: it stays inside the resulting token instead, so a
-                // line can never break between the words it joins (it still
-                // renders as a real space — `char_width_1000em` gives it the
-                // same width as a plain space — the token is just atomic).
+                // Split on breakable whitespace only. NBSP and its non-breaking
+                // variants (`&nbsp;`/U+00A0, U+2007, U+202F — see
+                // `is_non_breaking_space`) satisfy `char::is_whitespace()`, so
+                // `split_whitespace()` would treat them as ordinary word
+                // separators, discarding the whole point of a non-breaking space.
+                // It stays inside the resulting token instead, so a line can never
+                // break between the words it joins. It still renders as a real
+                // space — `char_width_1000em` gives it a plain space's width — the
+                // token is simply atomic.
                 for (i, w) in text
                     .split(is_breakable_ws)
                     .filter(|w| !w.is_empty())
@@ -1374,21 +1369,18 @@ mod tests {
 
     #[test]
     fn oversized_token_does_not_split_immediately_adjacent_to_an_embedded_nbsp() {
-        // Regression: an oversized token (already too wide for one line, so
-        // it goes through `split_into_fitting_chunks`'s plain character
-        // splitter) that happens to contain an embedded NBSP had no NBSP
-        // awareness — if the natural per-character width boundary fell
-        // right after the NBSP, it ended up as the last character of one
-        // chunk and whatever followed it started the next, breaking
-        // exactly the boundary NBSP forbids. A first fix moved the NBSP
-        // itself to the next chunk instead, which merely relocated the
-        // forbidden break to *before* the NBSP (leaving a rendered leading
-        // space at the start of the next line, and still splitting the
-        // pair) — the character before the NBSP must move along with it.
-        // A repro matching the reported one: 67 `A`s followed by `&nbsp;B`
-        // — the 67 As plus the NBSP fit within the content width, but
-        // adding `B` doesn't, so the naive split lands right after the
-        // NBSP.
+        // Regression: an oversized token — already too wide for one line, so it
+        // goes through `split_into_fitting_chunks`'s plain character splitter —
+        // containing an embedded NBSP had no NBSP awareness. If the natural
+        // per-character width boundary fell right after the NBSP, the NBSP ended
+        // up as the last character of one chunk and whatever followed it started
+        // the next, breaking exactly the boundary NBSP forbids. A first fix moved
+        // the NBSP itself to the next chunk, which merely relocated the forbidden
+        // break to before the NBSP, leaving a rendered leading space at the start
+        // of the next line and still splitting the pair: the character before the
+        // NBSP must move with it. Repro: 67 `A`s followed by `&nbsp;B` — the 67 As
+        // plus the NBSP fit within the content width, but adding `B` does not, so
+        // the naive split lands right after the NBSP.
         let text = format!("{}\u{00A0}B", "A".repeat(67));
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
@@ -1440,16 +1432,14 @@ mod tests {
 
     #[test]
     fn oversized_token_does_not_split_when_the_incoming_character_is_the_nbsp() {
-        // Regression: overflow can be triggered by the NBSP *arriving* as
-        // the current character, not just by it already sitting at the end
-        // of the accumulated chunk — `current` doesn't yet end with an
-        // NBSP at that point, so the existing NBSP-adjacency guard (keyed
-        // off `current.ends_with(NBSP)`) never fired, and the boundary
-        // landed right before the NBSP the same way it used to land right
-        // after one. A repro matching the reported one: 67 `A`s followed
-        // by `i&nbsp;B` — the As plus `i` fit within the content width,
-        // but adding the NBSP doesn't, so the naive split lands right
-        // before it.
+        // Regression: overflow can be triggered by the NBSP arriving as the current
+        // character, not only by it already sitting at the end of the accumulated
+        // chunk. `current` does not yet end with an NBSP at that point, so the
+        // NBSP-adjacency guard keyed off `current.ends_with(NBSP)` never fired, and
+        // the boundary landed right before the NBSP the way it used to land right
+        // after one. Repro: 67 `A`s followed by `i&nbsp;B` — the As plus `i` fit
+        // within the content width, but adding the NBSP does not, so the naive split
+        // lands right before it.
         let text = format!("{}i\u{00A0}B", "A".repeat(67));
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(67), font_size_pt, false)
@@ -1472,16 +1462,14 @@ mod tests {
 
     #[test]
     fn oversized_token_moves_the_entire_nbsp_connected_chain_not_just_one_neighbor() {
-        // Regression: when an oversized token contains *multiple* NBSPs,
-        // the previous fix only pulled one preceding character back before
-        // emitting the chunk — if that character was itself connected to
-        // an earlier NBSP, the emitted chunk still ended in that earlier
-        // NBSP, just relocating which NBSP boundary got broken rather than
-        // fixing the underlying bug. A repro matching the reported one: 66
-        // `A`s followed by `&nbsp;B&nbsp;C` — the As plus the first NBSP
-        // plus `B` fit within the content width, but adding the second
-        // NBSP doesn't, so the naive split used to land the first chunk
-        // right after the first NBSP, breaking that boundary too.
+        // Regression: when an oversized token contains several NBSPs, the previous
+        // fix pulled only one preceding character back before emitting the chunk. If
+        // that character was itself connected to an earlier NBSP, the emitted chunk
+        // still ended in that earlier NBSP, relocating which boundary got broken
+        // rather than fixing the bug. Repro: 66 `A`s followed by `&nbsp;B&nbsp;C` —
+        // the As plus the first NBSP plus `B` fit within the content width, but
+        // adding the second NBSP does not, so the naive split used to land the first
+        // chunk right after the first NBSP.
         let text = format!("{}\u{00A0}B\u{00A0}C", "A".repeat(66));
         let font_size_pt = 11.0;
         let max_width_pt = text_width_pt(&"A".repeat(66), font_size_pt, false)
@@ -1576,15 +1564,13 @@ mod tests {
 
     #[test]
     fn other_unicode_non_breaking_space_variants_also_keep_their_words_on_one_line() {
-        // Regression: `is_breakable_ws`/`words_of`'s NBSP handling only
-        // exempted U+00A0 — but U+2007 FIGURE SPACE and U+202F NARROW
-        // NO-BREAK SPACE are both whitespace per Unicode's `White_Space`
-        // property (so `char::is_whitespace()` alone can't tell them
-        // apart from an ordinary breakable space) and both common in
-        // localized number formatting (aligned digit columns; French-style
-        // thousands separators like `10 000`) — without special-casing
-        // them the same way as U+00A0, a line could break inside such a
-        // number.
+        // Regression: `is_breakable_ws` and `words_of` exempted only U+00A0, but
+        // U+2007 FIGURE SPACE and U+202F NARROW NO-BREAK SPACE are both whitespace
+        // per Unicode's `White_Space` property — so `char::is_whitespace()` alone
+        // cannot tell them from an ordinary breakable space — and both are common in
+        // localized number formatting: aligned digit columns, and French-style
+        // thousands separators like `10 000`. Without special-casing them the way
+        // U+00A0 is handled, a line could break inside such a number.
         for nbsp in ['\u{2007}', '\u{202F}'] {
             let text = format!("10{nbsp}000");
             let words = words_of(&[Span::Run {
@@ -1617,15 +1603,14 @@ mod tests {
 
     #[test]
     fn non_breaking_space_leading_a_styled_span_still_glues_to_the_previous_word() {
-        // Regression: `Hello<strong>&nbsp;world</strong>` — the leading NBSP
-        // stays inside the second span's token (`"\u{00A0}world"`, per the
-        // fix above), but `starts_with_ws`/`ends_with_ws` used the blanket
-        // `char::is_whitespace()` predicate, which NBSP also satisfies. That
-        // treated the span boundary as a "real" separator and set `glue:
-        // false` — so `wrap` would insert its own plain space next to a
-        // token that already renders the NBSP as one (a visible double
-        // space), and would allow a line break exactly where the NBSP was
-        // meant to forbid one.
+        // Regression: in `Hello<strong>&nbsp;world</strong>` the leading NBSP stays
+        // inside the second span's token (`"\u{00A0}world"`, per the fix above), but
+        // `starts_with_ws`/`ends_with_ws` used the blanket `char::is_whitespace()`
+        // predicate, which NBSP also satisfies. That treated the span boundary as a
+        // real separator and set `glue: false`, so `wrap` would insert its own plain
+        // space next to a token that already renders the NBSP as one — a visible
+        // double space — and would allow a line break exactly where the NBSP forbids
+        // one.
         let words = words_of(&[
             Span::Run {
                 text: "Hello".to_owned(),
@@ -1770,24 +1755,19 @@ mod tests {
 
     #[test]
     fn unbreakable_word_that_is_individually_oversized_stays_glued_to_its_predecessor() {
-        // Regression: `Hello<strong>&nbsp;` followed by a long unbroken run
-        // of characters is individually wider than a whole line on its
-        // own. Fixed in two rounds:
-        // 1. The oversized-token branch used to run *before* the
-        //    unbreakable check, so it unconditionally flushed `current`
-        //    ("Hello") as its own finished line (losing the glue to the
-        //    NBSP-led word) and then character-split the oversized word
-        //    with no notion of the NBSP boundary at all. Fixed by checking
+        // Regression: `Hello<strong>&nbsp;` followed by a long unbroken run of
+        // characters wider than a whole line. Fixed in two rounds:
+        // 1. The oversized-token branch ran before the unbreakable check, so it
+        //    unconditionally flushed `current` ("Hello") as its own finished line,
+        //    losing the glue to the NBSP-led word, and then character-split the
+        //    oversized word with no notion of the NBSP boundary. Fixed by checking
         //    `unbreakable` first.
-        // 2. That first fix then went too far the other way: it glued the
-        //    *entire* oversized word onto "Hello" with no splitting at
-        //    all, so the whole run rendered as one unsplit, unbounded
-        //    token — overflowing and clipped, not merely spilling a
-        //    little past the margin. The NBSP only forbids a break right
-        //    at its own boundary; the rest of the run has no such
-        //    constraint, so it's still character-split — just with its
-        //    first chunk kept glued to "Hello", the same protected
-        //    boundary as before.
+        // 2. That fix went too far the other way: it glued the entire oversized word
+        //    onto "Hello" with no splitting, so the whole run rendered as one
+        //    unsplit, unbounded token — overflowing and clipped, not merely spilling
+        //    past the margin. The NBSP forbids a break only at its own boundary, so
+        //    the rest of the run is still character-split, with its first chunk kept
+        //    glued to "Hello".
         let words = vec![
             Word::Text {
                 text: "Hello".to_owned(),

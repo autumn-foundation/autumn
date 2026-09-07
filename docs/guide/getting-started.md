@@ -172,6 +172,11 @@ release's scaffold produced the framework-owned files above, so a later
 [`autumn upgrade`](upgrading.md#scaffold-files) can tell a template that moved
 from a file you edited, and never overwrite your work.
 
+A sibling file, `.autumn/generated.toml`, appears after your first `autumn
+generate`. Commit it too: it does the same job for generated code, so
+[`autumn destroy`](generators.md#undoing-a-generator-autumn-destroy) can tell
+its own output from your edits.
+
 The files that matter right now:
 
 | Path                       | Purpose                                          |
@@ -355,7 +360,9 @@ The pieces:
   is opt-in via `database.auto_migrate` (see
   [migrations](migrations.md)).
 - **`#[autumn_web::main]`** sets up the Tokio runtime — a thin wrapper around
-  `#[tokio::main]` that also records the build profile.
+  `#[tokio::main]` that also records the build profile. It takes optional
+  arguments for tuning that runtime (see
+  [tuning the Tokio runtime](#tuning-the-tokio-runtime) below).
 
 Handlers are ordinary async functions. They can return anything Axum can turn
 into a response: `&str`, `String`, `Json<T>`, `Markup` (Maud HTML), or your own
@@ -1291,6 +1298,81 @@ Omit the `[database]` section (or leave both `primary_url` and `url` unset) and
 Autumn starts with no pool. Handlers that use `Db` return 503 Service
 Unavailable. That is useful for static sites, database-free APIs, and early
 development.
+
+### Tuning the Tokio runtime
+
+`#[autumn_web::main]` owns the `tokio::runtime::Builder` call, so the knobs you
+would otherwise abandon the macro to reach are attribute arguments. All of them
+are optional; with none, the runtime is
+`Builder::new_multi_thread().enable_all()` — tokio's own defaults, which is
+what most apps should keep.
+
+| Argument | Value | `tokio::runtime::Builder` call |
+|----------|-------|--------------------------------|
+| `flavor` | `"multi_thread"` (default) or `"current_thread"` | picks the constructor |
+| `worker_threads` | `usize` expression | `worker_threads` (multi-thread only) |
+| `max_blocking_threads` | `usize` expression | `max_blocking_threads` |
+| `thread_name` | `Into<String>` expression | `thread_name` |
+| `thread_stack_size` | `usize` expression, in bytes | `thread_stack_size` |
+| `thread_keep_alive` | duration string, e.g. `"30s"` | `thread_keep_alive` |
+| `configure` | path to `fn(&mut Builder)` | runs last, after everything above |
+
+```rust,no_run
+use autumn_web::prelude::*;
+
+#[get("/")]
+#[public]
+async fn index() -> &'static str { "ok" }
+
+#[autumn_web::main(
+    worker_threads = 4,
+    max_blocking_threads = 64,
+    thread_name = "autumn-worker",
+    thread_keep_alive = "30s"
+)]
+async fn main() {
+    autumn_web::app().routes(routes![index]).run().await;
+}
+```
+
+The numeric arguments take arbitrary expressions, not only literals, so a
+worker count can be computed at startup:
+
+```rust,ignore
+#[autumn_web::main(worker_threads = std::thread::available_parallelism().map_or(4, |n| n.get()))]
+```
+
+`configure` is the escape hatch for `Builder` methods the table does not name —
+`on_thread_start`, `on_thread_stop`, `global_queue_interval`, and the rest. It
+names a function taking `&mut tokio::runtime::Builder`, and it runs *after* the
+declarative arguments, so it can also override them:
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::reexports::tokio;
+
+#[get("/")]
+#[public]
+async fn index() -> &'static str { "ok" }
+
+fn tune_runtime(builder: &mut tokio::runtime::Builder) {
+    builder.on_thread_start(|| eprintln!("runtime thread started"));
+}
+
+#[autumn_web::main(configure = tune_runtime)]
+async fn main() {
+    autumn_web::app().routes(routes![index]).run().await;
+}
+```
+
+A typo'd argument, a repeated one, a literal `0` thread count, or a
+`worker_threads` paired with `flavor = "current_thread"` (where it would do
+nothing) are all compile errors rather than knobs that silently fail to apply.
+
+Reach for these only with a measurement in hand. Autumn's own background work —
+the job runner, scheduled tasks, the mailer — shares this runtime, so a worker
+count set below what the machine offers throttles those alongside your
+handlers.
 
 ### Escape hatch: mounting raw Axum routers
 
