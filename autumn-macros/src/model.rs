@@ -19,8 +19,8 @@ use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
 use crate::schema::{
-    apply_serde_rename_all_rule, emit_schema_fn_body, emit_schema_fn_body_ext,
-    emit_schema_fn_body_full, field_is_translatable, field_serde_serialize_rename, has_attr,
+    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
+    field_has_skip_serializing_if, field_is_translatable, field_serde_serialize_rename, has_attr,
     is_option_type, serde_rename_all_serialize_rule, type_name_str,
 };
 
@@ -7487,22 +7487,38 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .copied()
         .collect();
-    let query_struct_schema_body =
-        emit_schema_fn_body(&serializable_field_refs, false, schema_rename_all_rule);
+    // `skip_serializing_if` is the third member of the omission family, after
+    // the unconditional `skip` / `skip_serializing` filtered above. It differs
+    // in kind: the field DOES appear in some responses, so the property stays —
+    // it just cannot be `required`, because a response that trips the predicate
+    // omits it and a strict client would reject that response.
+    let query_struct_schema_body = emit_schema_fn_body_full(
+        &serializable_field_refs,
+        false,
+        &[],
+        schema_rename_all_rule,
+        &|f: &Field| field_has_skip_serializing_if(f),
+    );
     // `NewModel` carries `#[serde(default)]` on every non-`Option` `bool` (see
     // the `bool_default` wiring in the struct emitter), so a POST body may omit
     // one and get `false`. Requiredness has to follow that, not the Rust type,
     // or a generated client is forced to send a value the server does not need.
-    let new_struct_schema_body = emit_schema_fn_body_full(
+    // RAW identifiers, not the model's serde names. The `New*` / `Update*`
+    // structs deliberately do not inherit `#[serde(rename_all)]` or a field
+    // `#[serde(rename)]` — pinned by `form_for_derive.rs` — so a body is decoded
+    // under the bare Rust identifiers. Advertising the model's renamed keys
+    // would make every generated POST/PUT fail with a missing-field error.
+    let new_struct_schema_body = emit_schema_fn_body_named(
         &fields_for_new,
         false,
         &[],
-        schema_rename_all_rule,
+        None,
         &|f: &Field| !is_option_type(&f.ty) && type_name_str(&f.ty) == "bool",
+        true,
     );
     let update_struct_schema_body = {
         let extra: &[&&Field] = lock_version_field.as_slice();
-        emit_schema_fn_body_ext(&fields_for_new, true, extra, schema_rename_all_rule)
+        emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true)
     };
     let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
         .iter()

@@ -135,6 +135,26 @@ pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
     }
 }
 
+/// Whether a field carries `#[serde(skip_serializing_if = "...")]`, so a
+/// response omits it whenever the predicate matches.
+///
+/// Distinct from an unconditional `skip` / `skip_serializing`: the field DOES
+/// appear in some responses, so its property belongs in the schema — it simply
+/// cannot be `required`, because a legitimate response may leave it out.
+pub fn field_has_skip_serializing_if(field: &syn::Field) -> bool {
+    let mut conditional = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing_if") {
+                conditional = true;
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    conditional
+}
+
 /// Apply an enum-level `#[serde(rename_all = "...")]` casing rule to a
 /// (`PascalCase`) variant identifier, mirroring `serde_derive`'s
 /// `RenameRule::apply_to_variant`.
@@ -623,6 +643,42 @@ pub fn emit_schema_fn_body_full(
     rename_all_rule: Option<&str>,
     treat_as_optional: &dyn Fn(&Field) -> bool,
 ) -> TokenStream {
+    emit_schema_fn_body_named(
+        fields,
+        all_optional,
+        extra_required,
+        rename_all_rule,
+        treat_as_optional,
+        false,
+    )
+}
+
+/// As [`emit_schema_fn_body_full`], plus `raw_field_names`: advertise each
+/// property under its bare Rust identifier, ignoring every serde rename.
+///
+/// Needed for the `New*` / `Update*` companions. Those structs deliberately do
+/// NOT inherit the model's `#[serde(rename_all)]` or field-level
+/// `#[serde(rename)]` — a behaviour pinned by
+/// `autumn/tests/integration/form_for_derive.rs` — so a schema built with the
+/// model's rename metadata would advertise `authorName` for a body serde only
+/// accepts as `author_name`, and every generated client's POST would fail with
+/// a missing-field error (issue #802).
+pub fn emit_schema_fn_body_named(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+    rename_all_rule: Option<&str>,
+    treat_as_optional: &dyn Fn(&Field) -> bool,
+    raw_field_names: bool,
+) -> TokenStream {
+    let resolve_name = |f: &Field| -> Option<String> {
+        if raw_field_names {
+            let raw = f.ident.as_ref()?.to_string();
+            Some(raw.strip_prefix("r#").unwrap_or(&raw).to_owned())
+        } else {
+            schema_property_name(f, rename_all_rule)
+        }
+    };
     // Resolve each field's advertised property name once — through the shared
     // serde helpers so the schema honors `#[serde(rename)]` /
     // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
@@ -632,8 +688,8 @@ pub fn emit_schema_fn_body_full(
         .iter()
         .chain(extra_required.iter())
         .map(|f| {
-            let field_name = schema_property_name(f, rename_all_rule)
-                .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
+            let field_name =
+                resolve_name(f).unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
             let schema_expr = emit_json_schema_tokens_for_field(f);
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
@@ -647,11 +703,11 @@ pub fn emit_schema_fn_body_full(
         fields
             .iter()
             .filter(|f| !is_option_type(&f.ty) && !treat_as_optional(f))
-            .filter_map(|f| schema_property_name(f, rename_all_rule))
+            .filter_map(|f| resolve_name(f))
             .collect()
     };
     for f in extra_required {
-        if let Some(name) = schema_property_name(f, rename_all_rule) {
+        if let Some(name) = resolve_name(f) {
             required_names.push(name);
         }
     }

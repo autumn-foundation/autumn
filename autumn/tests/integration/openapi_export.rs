@@ -244,6 +244,38 @@ fn opaque_predicate_distinguishes_a_fieldless_struct_from_a_placeholder() {
     })));
 }
 
+// ── Requiredness follows serde, not the Rust type ──────────────────
+
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
+struct ConditionallyOmitted {
+    always: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    sometimes: Vec<String>,
+}
+
+#[test]
+fn a_conditionally_omitted_field_keeps_its_property_but_is_not_required() {
+    let schema = <ConditionallyOmitted as OpenApiSchema>::schema();
+
+    // The property stays — the field DOES appear in some responses.
+    assert!(
+        schema["properties"]["sometimes"].is_object(),
+        "conditionally omitted is not the same as absent: {schema}"
+    );
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(required.contains(&"always"), "{schema}");
+    assert!(
+        !required.contains(&"sometimes"),
+        "a response tripping the predicate omits it, so a strict client must not \
+         demand it: {schema}"
+    );
+}
+
 // ── Scalar field types that are not Rust primitives ────────────────
 
 // Only `OpenApiSchema` — the derive under test needs no serde impls, and this
