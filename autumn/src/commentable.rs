@@ -293,6 +293,13 @@ impl CommentableSpec {
             pk_of: |comment| comment.id,
             live_of: |_| true,
             tenant_column: None,
+            // Neutral derivation fields: a comment counter is a plain counter
+            // cache, so every live row contributes 1 and nothing is filtered
+            // out — which keeps the generated SQL byte-identical.
+            contrib_of: |_| 1,
+            contrib_sql: "1",
+            filter_sql: "",
+            derivation: None,
         }
     }
 }

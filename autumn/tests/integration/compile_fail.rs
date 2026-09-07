@@ -137,6 +137,25 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_counter_cache_duplicate_column.rs");
 
+    // Derivations (#1769): one `filter` declaration is lowered to both a Rust
+    // predicate and a SQL predicate, so the grammar admits only what provably
+    // lowers the same way in both, its identifiers must name real fields, and
+    // `sum` needs a non-nullable integer. `column` is required and, as for a
+    // counter cache, two declarations onto one parent column would
+    // double-count every insert.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_bad_filter.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_filter_non_field.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_missing_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_unknown_key.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_sum_non_integer.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_duplicate_column.rs");
+
     // Model-declared dependent cascades (#1702): `dependent = <action>` /
     // `on_delete = <action>` is a `has_many`/`has_one` option, only the four
     // documented actions are accepted, and it cannot ride on a `through =`
@@ -650,6 +669,13 @@ fn compile_pass_tests_b() {
     // boundary is a plain value again and reaches the `Json` sink.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/classified_declassify.rs");
+
+    // Derivations (#1769): every production of the filter grammar, both
+    // transforms, a model carrying a counter cache and derivations at once, and
+    // one with neither — each branch of the shared spec emitter, with the two
+    // lowerings of every filter asserted at run time.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_derivation.rs");
 }
 
 #[cfg(feature = "db")]

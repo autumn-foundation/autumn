@@ -346,6 +346,10 @@ pub mod sharding;
 #[cfg(feature = "db")]
 pub(crate) mod counter_cache;
 
+/// Maintained derived read models — `#[derivation]` (#1769).
+#[cfg(feature = "db")]
+pub mod derivation;
+
 // Threaded, polymorphic comments — autumn's fifth association kind (#1367).
 // Documented from inside the module: an outer `///` here would make rustdoc
 // resolve the module's own intra-doc links in *this* scope instead of the
