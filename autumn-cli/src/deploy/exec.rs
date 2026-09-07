@@ -1785,37 +1785,48 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
     let release_parent = parent_dir(&in_release);
     let current = format!("{}/{relative}", cfg.current_symlink());
     let service = &cfg.service_name;
+
+    // Diagnostics are built HERE, from raw paths, and shell-quoted ONCE as whole
+    // words. Interpolating already-quoted paths inside a double-quoted `echo`
+    // would leave them expandable — single quotes are literal there — so a
+    // database path containing `$(…)` would run a command on the deploy host.
+    let refusal = format!(
+        "autumn deploy: {current} is a live SQLite database. The data file must live at \
+         {shared} to survive a deploy, and moving it while the app runs is not safe, so \
+         this deploy stopped."
+    );
+    let recovery = format!(
+        "Run this on the host once, then deploy again: systemctl stop \
+         {service}-blue.service {service}-green.service; mv {current}* {shared_parent}/"
+    );
+    let occupied =
+        format!("autumn deploy: refusing to move {in_release} aside: {superseded} already exists");
+
     Some(RemoteCommand::new(
         "link-data",
         format!(
-            "mkdir -p {shared_parent} {release_parent} && \
-             if [ ! -e {shared} ] && [ -e {current} ] && [ ! -L {current} ]; then \
-             echo \"autumn deploy: {current} is a live SQLite database. The data file \
-             must live at {shared} to survive a deploy, and moving it while the app \
-             runs is not safe, so this deploy stopped.\" >&2; \
-             echo \"Run this on the host once, then deploy again: systemctl stop \
-             {service}-blue.service {service}-green.service; \
-             mv {current}* {shared_parent}/\" >&2; \
-             exit 1; \
+            "mkdir -p {shared_parent_q} {release_parent_q} && \
+             if [ ! -e {shared_q} ] && [ -e {current_q} ] && [ ! -L {current_q} ]; then \
+             echo {refusal_q} >&2; echo {recovery_q} >&2; exit 1; \
              fi && \
-             if [ -e {in_release} ] && [ ! -L {in_release} ]; then \
-             if [ -e {superseded} ]; then \
-             echo \"autumn deploy: refusing to move {in_release} aside: \
-             {superseded} already exists\" >&2; exit 1; \
-             fi; \
-             mv -f {in_release} {superseded} || exit 1; \
+             if [ -e {in_release_q} ] && [ ! -L {in_release_q} ]; then \
+             if [ -e {superseded_q} ]; then echo {occupied_q} >&2; exit 1; fi; \
+             mv -f {in_release_q} {superseded_q} || exit 1; \
              for s in -wal -shm -journal; do \
-             if [ -e {in_release}$s ]; then \
-             mv -f {in_release}$s {superseded}$s || exit 1; fi; \
+             if [ -e {in_release_q}$s ]; then \
+             mv -f {in_release_q}$s {superseded_q}$s || exit 1; fi; \
              done; \
              fi && \
-             rm -f {in_release} && ln -s {shared} {in_release}",
-            shared_parent = shell_quote(&shared_parent),
-            release_parent = shell_quote(&release_parent),
-            shared = shell_quote(&shared),
-            superseded = shell_quote(&superseded),
-            current = shell_quote(&current),
-            in_release = shell_quote(&in_release),
+             rm -f {in_release_q} && ln -s {shared_q} {in_release_q}",
+            shared_parent_q = shell_quote(&shared_parent),
+            release_parent_q = shell_quote(&release_parent),
+            shared_q = shell_quote(&shared),
+            superseded_q = shell_quote(&superseded),
+            current_q = shell_quote(&current),
+            in_release_q = shell_quote(&in_release),
+            refusal_q = shell_quote(&refusal),
+            recovery_q = shell_quote(&recovery),
+            occupied_q = shell_quote(&occupied),
         ),
     ))
 }
@@ -7359,15 +7370,18 @@ mod tests {
             "it must stop the deploy: {}",
             op.shell
         );
-        // The message must name the fix, including the units to stop.
+        // The message must name the fix, including the units to stop and the move.
         assert!(
-            op.shell.contains("systemctl stop 'myapp'-blue.service")
-                || op.shell.contains("systemctl stop myapp-blue.service"),
+            op.shell
+                .contains("systemctl stop myapp-blue.service myapp-green.service"),
             "the message must name the units to stop: {}",
             op.shell
         );
         assert!(
-            op.shell.contains("mv '/srv/autumn/myapp/current/app.db'*"),
+            op.shell.contains(
+                "mv /srv/autumn/myapp/current/app.db* \
+                 /srv/autumn/myapp/shared/data/"
+            ),
             "the message must name the move, sidecars included: {}",
             op.shell
         );
@@ -7378,6 +7392,33 @@ mod tests {
             "the op must never relocate the live database itself: {}",
             op.shell
         );
+    }
+
+    /// Every interpolated value is a shell-quoted WORD. A quoted path nested
+    /// inside a double-quoted `echo` would still expand — single quotes are
+    /// literal there — so a database path holding `$(…)` would run a command on
+    /// the deploy host.
+    #[test]
+    fn the_data_link_op_never_expands_a_configured_path() {
+        let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
+        let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
+        assert!(
+            !op.shell.contains('"'),
+            "no double quotes: a shell-quoted path inside them still expands: {}",
+            op.shell
+        );
+        // The substitution survives only inside single quotes, where it is inert.
+        for (index, _) in op.shell.match_indices("$(touch pwned)") {
+            let before = op.shell.get(..index).unwrap_or_default();
+            assert_eq!(
+                before.matches('\'').count() % 2,
+                1,
+                "every occurrence must sit inside a single-quoted word: {}",
+                op.shell
+            );
+        }
+        // `$s`, our own loop variable, is the only thing left expandable.
+        assert!(op.shell.contains("for s in -wal -shm -journal"));
     }
 
     /// The op must never delete a database file. A rollback target deployed
@@ -7414,6 +7455,11 @@ mod tests {
             op.shell
                 .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db.superseded' ]"),
             "an existing superseded copy must be refused, not overwritten: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains("already exists"),
+            "and it must say so: {}",
             op.shell
         );
     }
