@@ -360,6 +360,32 @@ fn split_rename_message(key: &str) -> String {
 /// variants with a single, symmetric spelling. Anything else is refused rather
 /// than approximated — a confidently wrong contract is worse than no derive,
 /// since a generated client acts on it.
+/// Refuse a variant carrying `#[serde(untagged)]`.
+///
+/// serde accepts `untagged` at the VARIANT level as well as the container
+/// level, and it means the same thing for that one variant: a unit variant so
+/// marked serializes as `null`, not as its name. The container-level check
+/// above reads `input.attrs` only, so a mixed enum — ordinary variants plus one
+/// untagged catch-all — slipped through and published every variant as a
+/// string, including the one that is `null` on the wire (issue #802).
+fn reject_untagged_variants(data: &syn::DataEnum) -> syn::Result<()> {
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::serde_bare_word(&v.attrs, &["untagged"]).is_some())
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] cannot describe a variant marked `#[serde(untagged)]`: \
+             serde writes it as `null` rather than as its name, so the closed string set the \
+             derive would publish is wrong for this variant and a client decodes the wrong \
+             type. Write the `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a unit variant carrying `#[serde(alias = "…")]`.
 ///
 /// Split out of [`reject_undescribable_enum`] to keep that function within the
@@ -475,6 +501,7 @@ fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::
     }
 
     reject_aliased_variants(data)?;
+    reject_untagged_variants(data)?;
 
     // A split rename is the same asymmetry as a directional skip: one schema,
     // two disagreeing wire spellings. Advertising the serialize side would have
@@ -672,6 +699,51 @@ mod tests {
         })
         .expect_err("an alias behind a list-valued sibling must still be found");
         assert!(err.contains("alias"), "{err}");
+    }
+
+    /// serde honours `untagged` at the VARIANT level too, where it makes that
+    /// one variant serialize as `null` instead of its name. The container-level
+    /// guard reads `input.attrs` and never saw it.
+    #[test]
+    fn a_variant_level_untagged_is_refused() {
+        let err = audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                Retired,
+                #[serde(untagged)]
+                Unknown,
+            }
+        })
+        .expect_err("a variant-level untagged must be refused");
+        assert!(err.contains("untagged"), "{err}");
+    }
+
+    /// The container-level form must still be caught — the new variant scan is
+    /// an addition, not a replacement.
+    #[test]
+    fn a_container_level_untagged_is_still_refused() {
+        let err = audit_enum(&parse_quote! {
+            #[serde(untagged)]
+            enum Status {
+                Active,
+                Retired,
+            }
+        })
+        .expect_err("a container-level untagged must still be refused");
+        assert!(err.contains("untagged"), "{err}");
+    }
+
+    /// A plain unit enum is the whole point of the derive and must survive both
+    /// scans untouched.
+    #[test]
+    fn a_plain_unit_enum_is_still_describable() {
+        audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                Retired,
+            }
+        })
+        .expect("a plain unit enum must stay describable");
     }
 
     /// `rename` changes BOTH directions, so it stays describable — the guard
