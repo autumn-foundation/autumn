@@ -1518,10 +1518,33 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
   cannot leak.
 - Non-goals: not fair (no FIFO), not a lease (no heartbeat — use the scheduler
   for long-lived leader election), not row-level (use `with_lock`), Postgres
-  only.
+  only — under the `sqlite` feature `from_state` refuses rather than pretending
+  to hold a lock (see below).
 
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
+
+## Postgres-only subsystems on a SQLite app (unreleased, issue #1905)
+
+Some subsystems are Postgres-only by construction: they open a
+`diesel::PgConnection` and issue `pg_notify` / `pg_advisory_xact_lock` / `jsonb`
+SQL. Autumn never picks an implementation for you, so wire them
+backend-conditionally rather than assuming Postgres.
+
+- `PgFlagStore` / `PgExperimentStore` / `PgConfigStore`:
+  `from_database_config(&config.database)` returns `None` unless the configured
+  primary names Postgres. `.expect()` on it fails at BOOT on a `sqlite://`
+  target — pick `InMemoryFlagStore` / `InMemoryConfigStore` on that arm instead.
+- `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
+  (`effective_primary_url()` returns the target whatever backend it names).
+- `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`
+  feature: SQLite has no cross-connection advisory lock. Single-host mutual
+  exclusion is a `Mutex`.
+- `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite
+  build's state cannot produce — use the in-process coordinator.
+
+`docs/guide/sqlite-in-production.md` carries a support-matrix row per
+subsystem; `docs/guide/feature-flags.md` shows the branching shape.
 
 ## The plugin API stability contract (unreleased, issue #1601)
 

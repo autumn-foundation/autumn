@@ -7874,10 +7874,12 @@ impl ShardConfig {
 
 /// Which database engine a configured connection target names.
 ///
-/// Autumn recognizes two backends. Postgres is the fully wired runtime; `SQLite`
-/// (issue #1614) is recognized at config time so a `SQLite` target validates and
-/// is reported honestly, while the runtime pool that would serve it refuses at
-/// boot until the pool rework lands (see [`create_pool`](crate::db::create_pool)).
+/// Autumn recognizes two backends. Postgres is the default runtime; `SQLite`
+/// (issue #1614) is served by the runtime built with the crate's `sqlite`
+/// cargo feature. Detection here is backend-neutral and always compiled, so a
+/// `SQLite` target validates on either build; a build that cannot serve the
+/// detected backend refuses at pool construction with a message naming the
+/// feature (see [`create_pool`](crate::db::create_pool)).
 ///
 /// # Detection rules
 ///
@@ -7896,10 +7898,10 @@ impl ShardConfig {
 ///   `sqlite://` (or `sqlite:` / `file:`) scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseBackend {
-    /// `PostgreSQL` — the fully wired runtime backend.
+    /// `PostgreSQL` — the default runtime backend.
     Postgres,
-    /// `SQLite` — recognized at config time; the runtime pool is not yet wired
-    /// (issue #1614).
+    /// `SQLite` — served by a build compiled with the `sqlite` feature
+    /// (issue #1614); refused at pool construction by any other build.
     Sqlite,
 }
 
@@ -8325,6 +8327,25 @@ impl DatabaseConfig {
         self.primary_url.as_deref().or(self.url.as_deref())
     }
 
+    /// Resolved primary/write database URL, but only when it names Postgres.
+    ///
+    /// Autumn ships subsystems that are Postgres-only by construction — the
+    /// `PgFlagStore`, `PgExperimentStore` and `PgConfigStore` open a
+    /// `diesel::PgConnection` and issue `pg_notify` / `pg_advisory_xact_lock` /
+    /// `jsonb` SQL. Handing one a `SQLite` target builds a store that fails on
+    /// first use with a connection error naming a driver the operator never
+    /// chose. This accessor is what those constructors screen on, so an
+    /// unsupported target yields "no store" at construction instead.
+    ///
+    /// Fails closed: a target [`DatabaseBackend::detect`] cannot classify is
+    /// refused too, rather than handed to a Postgres driver on the chance that
+    /// it might work.
+    #[must_use]
+    pub fn effective_primary_postgres_url(&self) -> Option<&str> {
+        self.effective_primary_url()
+            .filter(|url| DatabaseBackend::detect(url) == Some(DatabaseBackend::Postgres))
+    }
+
     /// Resolved primary/write role pool size.
     #[must_use]
     pub fn effective_primary_pool_size(&self) -> usize {
@@ -8504,9 +8525,11 @@ impl DatabaseConfig {
         ] {
             // A SQLite target (issue #1614) is now a recognized shape and
             // passes this per-field check; only strings that are neither a
-            // Postgres nor a SQLite target are rejected here. The message is
-            // unchanged for the Postgres-shaped forms so existing deployments
-            // and diagnostics see byte-for-byte identical errors.
+            // Postgres nor a SQLite target are rejected here. The message's
+            // GUIDANCE half is unchanged — everything up to "got" — so existing
+            // diagnostics that match on it still match; the target it quotes is
+            // now redacted (see below), because a rejected string is by
+            // definition one whose secrets this code cannot enumerate.
             if let Some(url) = url
                 && DatabaseBackend::detect(url).is_none()
             {
@@ -8515,10 +8538,16 @@ impl DatabaseConfig {
                 } else {
                     field
                 };
+                // Redacted: this is the refusal a normal `autumn.toml`
+                // misconfiguration hits, and it reaches `tracing::error!` at
+                // boot — one line after the startup summary masked the same
+                // URL. A target this branch could not classify is, by
+                // definition, not a shape we can enumerate the secrets of.
+                let target = crate::db_url::redact_target(url);
                 return Err(ConfigError::Validation(format!(
                     "Invalid {label}: must start with postgres:// or postgresql://, or be a \
                      keyword/value connection string \
-                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
+                     (e.g. \"host=db user=app dbname=app sslmode=require\"), got {target:?}"
                 )));
             }
         }
@@ -8563,11 +8592,12 @@ impl DatabaseConfig {
                 if let Some(url) = url
                     && !is_pg_connection_string(url)
                 {
+                    let target = crate::db_url::redact_target(url);
                     return Err(ConfigError::Validation(format!(
                         "Invalid database.shards[{idx}].{field}: must start with \
                          postgres:// or postgresql://, or be a keyword/value \
                          connection string \
-                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {url:?}"
+                         (e.g. \"host=db user=app dbname=app sslmode=require\"), got {target:?}"
                     )));
                 }
             }
@@ -11440,6 +11470,50 @@ mod tests {
             }
             _ => panic!("Expected ConfigError::Validation"),
         }
+    }
+
+    // The boot refusal an ordinary `autumn.toml` misconfiguration hits. It
+    // reaches `tracing::error!`, so under `log.format = "json"` whatever it
+    // names lands in the structured log stream — one line after the startup
+    // summary masked the very same URL.
+    #[test]
+    fn database_config_validate_does_not_echo_credentials() {
+        for url in [
+            "mysql://user:hunter2@localhost:3306/db",
+            "redis://:hunter2@localhost:6379",
+            "amqp://app:hunter2@broker/vhost",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.to_owned()),
+                ..Default::default()
+            };
+            let Err(ConfigError::Validation(msg)) = config.validate() else {
+                panic!("{url} must be refused");
+            };
+            assert!(!msg.contains("hunter2"), "password leaked in: {msg}");
+            // Still actionable: the operator can tell which URL to go fix.
+            assert!(msg.contains("localhost") || msg.contains("broker"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn database_shard_url_validation_does_not_echo_credentials() {
+        let config = DatabaseConfig {
+            shards: vec![ShardConfig {
+                name: "shard0".to_owned(),
+                primary_url: "mysql://user:hunter2@localhost:3306/db".to_owned(),
+                slots: None,
+                replica_url: None,
+                primary_pool_size: None,
+                replica_pool_size: None,
+                replica_fallback: None,
+            }],
+            ..Default::default()
+        };
+        let Err(ConfigError::Validation(msg)) = config.validate() else {
+            panic!("a non-Postgres shard url must be refused");
+        };
+        assert!(!msg.contains("hunter2"), "password leaked in: {msg}");
     }
 
     #[test]

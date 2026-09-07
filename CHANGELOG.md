@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SQLite runtime honesty (issues #1905 / #2539).** The runtime landed in
+  #2537; three things still behaved or read as though it had not.
+
+  **Its own unit tests now run.** `cargo test -p autumn-web --features sqlite
+  --lib` failed 52 tests, so the CI lane ran a module filter rather than a bare
+  `--lib` — which meant a newly added module could rot the same way the pool
+  tests already had, silently, because nothing ran it. Fixtures spelled
+  `postgres://` inline, which `build_sqlite_pool` correctly refuses, so they
+  panicked at construction. They now spell their target through a shared
+  `crate::test_urls` helper that picks one per backend, and the tests whose
+  SUBJECT is refused on SQLite (a distinct `replica_url`, the Postgres job
+  backend) are `#[cfg(not(feature = "sqlite"))]` with a SQLite counterpart
+  where one exists. The lane runs a bare `--lib`: 5607 tests under `sqlite`,
+  5648 under the default.
+
+  **Boot errors no longer echo credentials.** `DatabaseConfig::validate`
+  printed the offending URL raw, and it is the refusal an ordinary
+  `autumn.toml` misconfiguration actually hits — reaching `tracing::error!` one
+  line after the startup summary masked the same URL. The tree's three
+  redactors are consolidated into one (`db_url`), closing two holes on the way:
+  the message redactor recognized `postgres://` tokens only, so a
+  `mysql://user:pw@host` in a driver error went out whole; and the target
+  redactor returned any `sqlite://` target verbatim, including
+  `sqlite://user:hunter2@host/app.db`, since backend detection classifies by
+  scheme alone.
+
+  Redaction is now by allowlist per recognized backend rather than wholesale,
+  so the boot summary keeps what operators read it for: a Postgres target keeps
+  `sslmode`, `application_name`, `connect_timeout` and the other policy
+  parameters (`sslpassword` and anything unlisted go), a SQLite target keeps
+  its filename plus `mode`, `cache`, `immutable`, `vfs`, `nolock`, and a target
+  whose backend is unrecognized still loses its whole query string, because its
+  key names cannot be enumerated.
+
+  **The Postgres-only stores refuse a SQLite target.** `PgFlagStore`,
+  `PgExperimentStore` and `PgConfigStore` open a `diesel::PgConnection` and
+  issue `pg_notify` / `pg_advisory_xact_lock` / `jsonb` SQL.
+  `from_database_config` accepted a `sqlite://` URL and built a store that
+  failed on first use with a driver error naming a backend the operator never
+  chose; it now screens through the new
+  `DatabaseConfig::effective_primary_postgres_url` and returns `None`. **Note
+  the timing change:** an app that writes
+  `.with_flag_store(PgFlagStore::from_database_config(&cfg)?.expect(…))` and is
+  pointed at a SQLite target now fails at boot rather than at the first flag
+  read. Autumn never selects a store for you — pick the in-memory store on that
+  arm (`docs/guide/feature-flags.md` shows the shape).
+  `docs/guide/sqlite-in-production.md` gains a matrix row per affected
+  subsystem.
+
 - **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file
   whose generator template changed since the project was generated (issue
   #1835). `generate` now records a digest of every file it owns in
@@ -51,6 +100,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature, which `STABILITY.md` places outside SemVer.
 
 ### Added
+
+- **`scripts/check-sqlite-unification.sh`** — the `sqlite` feature is a backend
+  flip, so one dependency edge enabling it (`autumn-web = { …, features =
+  ["sqlite"] }`, or a feature forwarding `autumn-web/sqlite` under another
+  name) swaps `db::RuntimeConnection` for every consumer in the graph and
+  breaks the Postgres default. That invariant was prose, a `sqlite`-excluding
+  feature list in CI, and review; nothing read the manifests. The gate scans
+  every `Cargo.toml` in the tree, allows autumn-cli's own same-named opt-in
+  feature, and is self-testing with no toolchain. Wired into CI's `lint` job
+  and `scripts/pre-push-check.sh`, which skips the sqlite lane entirely.
+  [no-plugin] — a repo gate, no agent-facing surface.
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded

@@ -5729,6 +5729,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    // Postgres-only: the fixture gives one shard a DISTINCT replica_url, and
+    // both layers refuse that on SQLite — `database_backend_consistency` at
+    // config time, `reject_unusable_sqlite_replica` at topology build. The
+    // replica is the blocker: native sharding is Postgres-only too, but it is
+    // refused at BOOT rather than by the topology builder, so the shards alone
+    // would not fail here. Same treatment `db::`'s replica tests got, rather
+    // than a fixture swap that would assert a configuration production refuses.
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     #[cfg(feature = "db")]
     async fn actuator_metrics_returns_per_shard_stats_when_sharded() {
@@ -5796,11 +5804,14 @@ mod tests {
         let mut state = test_state();
 
         // `RuntimeConnection` is `AsyncPgConnection` in the default build and a
-        // SQLite connection under `--features sqlite`; using the alias keeps this
-        // test compiling on both (it only exercises pool metrics, and is not run
-        // under the sqlite feature).
+        // SQLite connection under `--features sqlite`, and this test RUNS on
+        // both. It builds the manager directly rather than through
+        // `create_pool`, so nothing would refuse a target meant for the other
+        // backend — hence the target comes from `test_urls`, not a literal.
+        // Only pool metrics are exercised; deadpool is lazy, so no connection
+        // is opened.
         let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
-            "postgres://postgres:postgres@localhost:5432/postgres",
+            crate::test_urls::primary("actuator_metrics"),
         );
         let pool = Pool::builder(manager).build().unwrap();
 

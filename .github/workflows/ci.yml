@@ -117,6 +117,15 @@ jobs:
         # module-wide `allow` spoof or a crate-local `clippy.toml` that would
         # shadow the config entirely. No toolchain, ~2 seconds, self-testing.
         run: ./scripts/check-determinism-gate.sh
+      - name: SQLite feature-unification gate
+        # The `sqlite` backend flip (#1614) is safe only while NO manifest
+        # enables it through a dependency edge — cargo unifies features
+        # globally, so one such edge swaps `db::RuntimeConnection` for every
+        # consumer in the graph. Until this gate, that invariant was prose plus
+        # the `sqlite`-excluding feature lists below, and nothing read the
+        # manifests. No toolchain, ~1 second, self-testing.
+        run: ./scripts/check-sqlite-unification.sh
+
       - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
         # that bypass the typed a11y primitives and lack an accessible name.
@@ -1281,8 +1290,10 @@ jobs:
           # backend-flip #1614 fixed, so coverage must keep compiling it.
           # Isolated to `-p autumn-web` so the sqlite flip can never leak onto
           # the Pg-assuming workspace crates. A named sqlite `[[test]]` target
-          # keeps it off the pg-URL lib unit tests (which assume Postgres) —
-          # the same rule the `sqlite-runtime` job follows.
+          # keeps THIS lane narrow; it is no longer "the same rule the
+          # `sqlite-runtime` job follows" — #1905 made the lib unit tests
+          # backend-parametric, so that job now runs a bare `--lib`. Those
+          # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
           cargo llvm-cov report --lcov --output-path lcov.info
@@ -1334,9 +1345,9 @@ jobs:
       - name: Check MSRV compiles
         run: cargo check --workspace
 
-  # SQLite runtime lane gate (issue #1614, AC#11). This is the ONLY place in CI
-  # that enables autumn-web's `sqlite` feature, and it does so via an EXPLICIT
-  # `--features sqlite` on each dedicated invocation below — NEVER via
+  # SQLite runtime lane gate (issue #1614, AC#11). Enables autumn-web's
+  # `sqlite` feature via an EXPLICIT `--features sqlite` on each dedicated
+  # invocation below — NEVER via
   # `--all-features` and never via a workspace dependency edge. `sqlite` is a
   # backend-flip feature: it flips `db::RuntimeConnection` from `AsyncPgConnection`
   # to a SQLite connection, so unifying it with the Postgres-assuming features
@@ -1345,9 +1356,15 @@ jobs:
   # No Postgres `services:` / Docker: the sqlite tests use tempfile/in-memory
   # SQLite with no external DB. The job builds + lints autumn-web under the
   # sqlite backend and runs the sqlite integration suite by NAMED `[[test]]`
-  # target — a bare `cargo test --features sqlite` is unsafe (it would compile
-  # the Postgres `integration_tests` binary and the pg-URL lib unit tests under
-  # the flipped backend and fail).
+  # target — a bare `cargo test --features sqlite` is unsafe because it would
+  # compile the Postgres `integration_tests` binary under the flipped backend.
+  # The crate's own LIB unit tests are a different matter: #1905 made their
+  # fixtures backend-parametric, so the lib step below runs a bare `--lib`.
+  #
+  # This is not quite the only place CI enables `sqlite` — the coverage job
+  # has a dedicated `--features "sqlite,mail"` lane — but both are EXPLICIT
+  # per-invocation, never `--all-features` and never a dependency edge (which
+  # `scripts/check-sqlite-unification.sh` now enforces).
   sqlite-runtime:
     name: SQLite runtime (feature=sqlite)
     runs-on: ubuntu-latest
@@ -1376,32 +1393,24 @@ jobs:
         # tests — the pool sizing, replica-rejection, target-classification and
         # provider-dispatch coverage that lives inside `autumn/src/db.rs`,
         # `app.rs` and `repository_commit_hooks.rs`. Until this step existed
-        # those ~26 tests were compiled (by the clippy steps above) but never
+        # those tests were compiled (by the clippy steps above) but never
         # executed, and the ungated pool/topology tests alongside them had
         # rotted into hard failures under the backend flip without anyone
-        # noticing. Same shape as the other feature-gated `--lib <module>::`
-        # lanes above (markdown, i18n, tls, acme).
+        # noticing.
         #
-        # Module-filtered, NOT a bare `--lib`: the rest of the crate's unit
-        # tests still build their fixtures on hard-coded `postgres://` URLs,
-        # which `build_sqlite_pool` correctly refuses. Making those
-        # backend-parametric is tracked separately; the filter names every
-        # module that carries SQLite-specific logic, so nothing sqlite-gated is
-        # left unexecuted. The two `app::` tests are named individually because
-        # the rest of `app::tests` is in that not-yet-parametric set.
-        run: |
-          cargo test -p autumn-web --features sqlite --lib -- \
-            db:: \
-            config:: \
-            migrate:: \
-            counter_cache:: \
-            commentable:: \
-            ledger:: \
-            repository_commit_hooks:: \
-            substrate:: \
-            sqlite_sharding_unsupported_guard_tests \
-            app::tests::custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout \
-            app::tests::custom_pool_provider_no_database_mode_boots_with_statement_timeout
+        # A BARE `--lib`, no filter list (#1905): fixtures now spell their
+        # target through `crate::test_urls`, which picks a Postgres or SQLite
+        # target per backend. The tests `#[cfg(not(feature = "sqlite"))]`
+        # excludes from this lane are the ones whose SUBJECT this build refuses
+        # — a fixture carrying a distinct `replica_url`, and the Postgres job
+        # backend — not everything Postgres-only: the `sharding::` suite IS
+        # parametrised and runs here, because `create_shard_set` applies no
+        # backend screen and its routing/slot/seed machinery is
+        # backend-independent (see the fixture comment in `sharding.rs` for
+        # what that does and does not claim). A filter list would let a
+        # newly-added module rot the same way the pool tests did — silently,
+        # because nothing runs it.
+        run: cargo test -p autumn-web --features sqlite --lib
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,

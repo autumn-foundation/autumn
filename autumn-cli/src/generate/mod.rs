@@ -114,8 +114,8 @@ fn format_collisions(paths: &[PathBuf]) -> String {
 /// `#[id]` fields — so on `SQLite` an inserted row would get a NULL/omitted id
 /// (a non-integer `PRIMARY KEY` is not implicitly `NOT NULL` in `SQLite`).
 /// Making it work needs app-side UUID generation in the repository insert
-/// codegen, which is runtime-adjacent and belongs to the deferred `SQLite`
-/// runtime slice (issue #1905). Rather than emit a `TEXT PRIMARY KEY` column
+/// codegen, which the `SQLite` runtime slice deferred and #2555 now carries.
+/// Rather than emit a `TEXT PRIMARY KEY` column
 /// that silently accepts NULL ids, generation fails here with an actionable
 /// message (AC #4).
 #[must_use]
@@ -138,8 +138,8 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
          `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, but SQLite has no uuid type nor a \
          gen_random_uuid() default, and the generated `New*` insert type omits `#[id]` \
          fields — so inserted rows would get NULL/omitted ids. App-side UUID generation is \
-         part of the deferred SQLite runtime slice, tracked in \
-         https://github.com/autumn-foundation/autumn/issues/1905 — re-run without `--id uuid` to use \
+         tracked in \
+         https://github.com/autumn-foundation/autumn/issues/2555 — re-run without `--id uuid` to use \
          the default INTEGER PRIMARY KEY AUTOINCREMENT, or target a Postgres database."
             .to_owned(),
     )
@@ -153,7 +153,7 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
 /// `[[database.shards]]` topology. But `DatabaseConfig::validate_backend_consistency`
 /// rejects *any* `database.shards` against a `SQLite` primary, so no valid
 /// `SQLite` config can ever use a generated sharded resource. Unlike UUID ids
-/// (#1905) or the unsupported field kinds (#1924) — and unlike FTS, now
+/// (#2555) or the unsupported field kinds (#1924) — and unlike FTS, now
 /// supported on `SQLite` via FTS5 (#1910) — this is **not** a deferred slice:
 /// `SQLite` is single-host / single-writer, so
 /// horizontal sharding is Postgres-only and permanently out of scope for

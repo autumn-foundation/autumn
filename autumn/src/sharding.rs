@@ -2227,10 +2227,25 @@ mod tests {
         );
     }
 
+    // Backend-parametric: `build_sqlite_pool` refuses a `postgres://` target,
+    // so an inline spelling here made every shard test panic at fixture
+    // construction under `--features sqlite`. The routing, slot-map, seed and
+    // health-registration assertions below are backend-independent and now run
+    // on both. Pools are lazy, so nothing connects unless a test checks out.
+    //
+    // WHICH LAYER THIS EXERCISES. `create_shard_set` is public API and applies
+    // no backend screen, which is what lets these tests run on either backend.
+    // A shard topology is nonetheless Postgres-only in PRODUCTION:
+    // `sqlite_sharding_unsupported_guard` (app.rs) refuses any SQLite shard
+    // primary at boot, and `database_backend_consistency` refuses `shards`
+    // beside a SQLite primary at config time. So these tests say "the routing
+    // and pool machinery is backend-independent", not "SQLite sharding is
+    // supported" — and if a screen is ever added to `create_shard_set` itself,
+    // they are meant to fail loudly and be gated then.
     fn shard_config(name: &str) -> ShardConfig {
         ShardConfig {
             name: name.to_owned(),
-            primary_url: format!("postgres://localhost/{name}"),
+            primary_url: crate::test_urls::primary(name),
             slots: None,
             replica_url: None,
             primary_pool_size: None,
@@ -2340,9 +2355,19 @@ mod tests {
 
     #[tokio::test]
     async fn db_for_and_read_for_attempt_routed_checkouts() {
-        // No server is listening, so both calls must surface checkout
-        // failures (not routing errors) after resolving the shard.
-        let shards = shards_handle(&["alpha"]);
+        // Nothing can be reached, so both calls must surface checkout
+        // failures (not routing errors) after resolving the shard. The target
+        // is spelled per backend: the default fixture's SQLite target is a
+        // live in-memory database, which would make both checkouts SUCCEED and
+        // the assertions vacuous.
+        let mut config = sharded_config(&["alpha"]);
+        config.connect_timeout_secs = 1;
+        config.shards[0].primary_url = crate::test_urls::unreachable("alpha");
+        let shards = shards_handle_from(
+            create_shard_set(&config, Arc::new(HashShardRouter))
+                .expect("build")
+                .expect("configured"),
+        );
         let Err(error) = shards.db_for("tenant-1").await else {
             panic!("checkout must fail without a server");
         };
@@ -2576,6 +2601,18 @@ mod tests {
 
     // ── read_pool / replica fallback semantics ──────────────────────────
 
+    // ── Postgres-only fixtures ───────────────────────────────────────────
+    //
+    // Everything from here that carries a `replica_url` is `#[cfg(not(feature
+    // = "sqlite"))]`. A SQLite read replica is refused at both layers —
+    // `database_backend_consistency` rejects any `replica_url` beside a SQLite
+    // primary, and `reject_unusable_sqlite_replica` rejects one that is
+    // in-memory or names a different file — so there is no SQLite spelling to
+    // swap in. Gated rather than parametrised, so no test asserts a
+    // configuration production refuses; the same treatment `db::`'s two
+    // replica tests already got. The primary-only fixtures above run on both
+    // backends.
+    #[cfg(not(feature = "sqlite"))]
     fn shard_with_replica(fallback: ReplicaFallback) -> Shard {
         let mut config = sharded_config(&["a"]);
         config.shards[0].replica_url = Some("postgres://localhost/a_ro".to_owned());
@@ -2594,6 +2631,7 @@ mod tests {
         assert!(shard.replica_pool().is_none());
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn read_pool_requires_readiness_check_before_replica_traffic() {
         let shard = shard_with_replica(ReplicaFallback::Primary);
@@ -2607,6 +2645,7 @@ mod tests {
         assert!(shard.runtime().detail().is_none());
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn read_pool_fails_closed_under_fail_readiness() {
         let shard = shard_with_replica(ReplicaFallback::FailReadiness);
@@ -2627,9 +2666,13 @@ mod tests {
 
     // ── read_route: per-shard ReadRoute snapshot (issue #1274) ───────────
 
+    // Sizes only the Postgres-only replica fixtures below assert on.
+    #[cfg(not(feature = "sqlite"))]
     const PRIMARY_SIZE: usize = 7;
+    #[cfg(not(feature = "sqlite"))]
     const REPLICA_SIZE: usize = 3;
 
+    #[cfg(not(feature = "sqlite"))]
     /// A one-shard set whose primary and replica pools have *distinct*
     /// `max_size` so `read_route()` reveals which pool it selected.
     fn shard_with_sized_replica(fallback: ReplicaFallback) -> Shard {
@@ -2646,6 +2689,7 @@ mod tests {
 
     /// `max_size` of the pool a `ReadPool` route would acquire from, or
     /// `None` for the `Primary` / `Unavailable` variants.
+    #[cfg(not(feature = "sqlite"))]
     fn read_pool_size(route: &crate::repository::ReadRoute) -> Option<usize> {
         match route {
             crate::repository::ReadRoute::ReadPool(pool) => Some(pool.status().max_size),
@@ -2665,6 +2709,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn read_route_targets_replica_when_ready() {
         let shard = shard_with_sized_replica(ReplicaFallback::Primary);
@@ -2677,6 +2722,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn read_route_falls_back_to_primary_when_unready_and_policy_allows() {
         // Replica configured but never checked → fallback policy applies.
@@ -2688,6 +2734,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn read_route_is_unavailable_when_unready_and_fallback_forbidden() {
         let shard = shard_with_sized_replica(ReplicaFallback::FailReadiness);
@@ -2700,6 +2747,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn repository_seed_snapshots_the_shard_read_route() {
         let shard = shard_with_sized_replica(ReplicaFallback::Primary);
@@ -2728,8 +2776,12 @@ mod tests {
     // ── Shards routing surface ──────────────────────────────────────────
 
     fn shards_handle(names: &[&str]) -> Shards {
+        shards_handle_from(shard_set(names))
+    }
+
+    fn shards_handle_from(set: ShardSet) -> Shards {
         Shards {
-            set: shard_set(names),
+            set,
             ctx: crate::db::RequestDbContext {
                 statement_timeout: None,
                 route_key: Some("GET /test".to_owned()),
@@ -2750,6 +2802,7 @@ mod tests {
         assert!(error.to_string().contains("beta"));
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     async fn read_for_fails_closed_without_checkout_under_fail_readiness() {
         let mut config = sharded_config(&["a"]);
@@ -2849,6 +2902,7 @@ mod tests {
 
     // ── per-shard health indicator ──────────────────────────────────────
 
+    #[cfg(not(feature = "sqlite"))]
     fn shard_with_unreachable_replica(fallback: ReplicaFallback) -> Shard {
         let mut config = sharded_config(&["a"]);
         // Nothing listens on these URLs; keep the failing checks fast.
@@ -2861,6 +2915,7 @@ mod tests {
         set.get(ShardId(0)).expect("shard").clone()
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     async fn shard_indicator_gates_readiness_for_fail_readiness_replica() {
         use crate::actuator::HealthIndicator as _;
@@ -2877,6 +2932,7 @@ mod tests {
         assert!(output.details.contains_key("replica_detail"));
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     async fn shard_indicator_reports_down_when_primary_unreachable() {
         use crate::actuator::HealthIndicator as _;
@@ -2895,6 +2951,34 @@ mod tests {
         assert!(
             !output.status.is_healthy(),
             "unreachable primary must report Down even under primary fallback"
+        );
+        assert_eq!(output.details["primary_ready"], serde_json::json!(false));
+        assert!(output.details.contains_key("primary_detail"));
+    }
+
+    // The primary-connectivity gate, on both backends. The two indicator tests
+    // above reach it through the unreachable-REPLICA fixture, which SQLite has
+    // no spelling for; this one needs no replica, and "unreachable" is spelled
+    // per backend (nothing listens on TCP port 1 / `sqlite3_open` cannot create
+    // a file in a directory that does not exist).
+    #[tokio::test]
+    async fn shard_indicator_reports_down_when_primary_cannot_be_reached() {
+        use crate::actuator::HealthIndicator as _;
+
+        let mut config = sharded_config(&["a"]);
+        config.connect_timeout_secs = 1;
+        config.shards[0].primary_url = crate::test_urls::unreachable("a");
+        let set = create_shard_set(&config, Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        let shard = set.get(ShardId(0)).expect("shard").clone();
+
+        let output = ShardHealthIndicator::new(shard).check().await;
+
+        assert!(
+            !output.status.is_healthy(),
+            "an unreachable primary fails all writes and primary reads, so \
+             /ready must not stay green"
         );
         assert_eq!(output.details["primary_ready"], serde_json::json!(false));
         assert!(output.details.contains_key("primary_detail"));
@@ -2929,6 +3013,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn total_max_connections_sums_every_pool() {
         let mut config = sharded_config(&["a", "b"]);
@@ -2940,6 +3025,21 @@ mod tests {
             .expect("configured");
         // a primary (7) + b primary (7) + b replica (3).
         assert_eq!(set.total_max_connections(), 17);
+    }
+
+    // The replica-free half of the sum, on both backends. The fixture above
+    // needs a replica to make the total interesting and so is Postgres-only;
+    // `cache=shared` is exempt from the single-slot clamp, so a configured
+    // `pool_size` reaches a SQLite pool too and the arithmetic still holds.
+    #[test]
+    fn total_max_connections_sums_every_primary_pool() {
+        let mut config = sharded_config(&["a", "b"]);
+        config.pool_size = 7;
+        let set = create_shard_set(&config, Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        // a primary (7) + b primary (7).
+        assert_eq!(set.total_max_connections(), 14);
     }
 
     // ── ShardRepositorySeed (#1273) ─────────────────────────────────────
@@ -3073,6 +3173,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn replica_read_pool_is_none_when_unready_even_under_primary_fallback() {
         // The key difference from read_pool(): even with ReplicaFallback::Primary,
@@ -3084,6 +3185,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn replica_read_pool_is_none_when_unready_under_fail_readiness() {
         let shard = shard_with_sized_replica(ReplicaFallback::FailReadiness);
@@ -3093,6 +3195,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn replica_read_pool_targets_replica_when_ready() {
         let shard = shard_with_sized_replica(ReplicaFallback::Primary);
@@ -3124,6 +3227,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     async fn read_replica_for_fails_when_replica_unready_under_primary_fallback() {
         // Unlike read_for, read_replica_for must NOT fall back to the primary.

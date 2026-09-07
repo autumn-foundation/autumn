@@ -4237,9 +4237,9 @@ fn check_db_role_connectivity(
 ) -> CheckResult {
     // A `sqlite://` target is a valid backend (#1614): it names a local file, not a
     // host:port service, so TCP reachability and the "switch to postgres://" hint do
-    // not apply. The SQLite runtime pool is deferred to #1905; doctor only confirms
-    // the target here, and must not mislead a SQLite app into thinking its URL is
-    // malformed.
+    // not apply. The runtime pool that serves such a target is built under the
+    // `sqlite` feature (#1905); doctor only confirms the target here, and must not
+    // mislead a SQLite app into thinking its URL is malformed.
     //
     // But SQLite is single-writer and single-host: `DatabaseConfig::validate` rejects
     // it as a read replica, alongside a Postgres role, or in any mixed-backend

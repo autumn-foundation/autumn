@@ -12210,19 +12210,17 @@ fn format_middleware_list(config: &AutumnConfig) -> String {
     items.join(", ")
 }
 
-/// Mask a database URL password for safe logging.
+/// Mask a database URL for safe logging in the startup summary.
+///
+/// Delegates to the shared redactor ([`crate::db_url::redact_target`]), which
+/// also covers the shapes this function's own `Url::password()` check never saw
+/// — a `?password=` query parameter, a libpq keyword/value string, a `SQLite`
+/// target with userinfo.
 fn mask_database_url(url: &str, pool_size: usize) -> String {
-    if let Ok(mut parsed_url) = url::Url::parse(url) {
-        if parsed_url.password().is_some() {
-            let _ = parsed_url.set_password(Some("****"));
-            return format!("{parsed_url} (pool_size={pool_size})");
-        }
-        format!("{parsed_url} (pool_size={pool_size})")
-    } else {
-        // Fallback: If URL parsing fails, mask the entire URL string to prevent any
-        // potential data exposure (e.g. if the malformed string still contained a password)
-        format!("**** (pool_size={pool_size})")
-    }
+    format!(
+        "{} (pool_size={pool_size})",
+        crate::db_url::redact_target(url)
+    )
 }
 
 /// Build the configuration summary string.
@@ -13283,6 +13281,16 @@ mod tests {
         );
     }
 
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
+    // swapped, so the test never asserts a configuration production refuses;
+    // same treatment `db::`'s replica tests got.
+    #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[test]
     fn build_state_applies_replica_fallback_policy_to_read_routing() {
@@ -13347,6 +13355,16 @@ mod tests {
         assert!(!state.role().serves_http());
     }
 
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
+    // swapped, so the test never asserts a configuration production refuses;
+    // same treatment `db::`'s replica tests got.
+    #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn custom_pool_provider_preserves_configured_replica_topology() {
@@ -13544,7 +13562,8 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "db")]
+    // Only the two Postgres-only shard tests use this fixture.
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
     fn sharded_test_config() -> AutumnConfig {
         let mut config = AutumnConfig::default();
         config.database.primary_url = Some("postgres://localhost/control".to_owned());
@@ -13573,6 +13592,16 @@ mod tests {
         config
     }
 
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
+    // swapped, so the test never asserts a configuration production refuses;
+    // same treatment `db::`'s replica tests got.
+    #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn setup_database_builds_shard_set_from_config() {
@@ -13627,6 +13656,16 @@ mod tests {
         assert!(["shard0", "shard1"].contains(&routed.name()));
     }
 
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
+    // swapped, so the test never asserts a configuration production refuses;
+    // same treatment `db::`'s replica tests got.
+    #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn custom_pool_provider_builds_shard_topologies() {
@@ -14725,6 +14764,16 @@ mod tests {
             .plugin_migrations("plugin-b", PLUGIN_MIGRATIONS);
     }
 
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
+    // swapped, so the test never asserts a configuration production refuses;
+    // same treatment `db::`'s replica tests got.
+    #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[test]
     fn configure_replica_migration_check_stores_recheck_urls() {
@@ -14765,6 +14814,16 @@ mod tests {
         assert_eq!(check.replica_url, "postgres://localhost/replica");
     }
 
+    // Postgres-only fixture: it configures a distinct `replica_url`, which
+    // SQLite refuses at both layers — `database_backend_consistency` at config
+    // time, and `reject_unusable_sqlite_replica` at topology build, which takes
+    // only a replica naming the same file as its primary. That replica is the
+    // blocker; the shards some of these fixtures also declare are refused at
+    // BOOT (`sqlite_sharding_unsupported_guard`) but not by the topology
+    // builder, so they would not fail here on their own. Gated rather than
+    // swapped, so the test never asserts a configuration production refuses;
+    // same treatment `db::`'s replica tests got.
+    #[cfg(not(feature = "sqlite"))]
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn replica_migration_readiness_marks_ready_endpoint_degraded() {
@@ -16881,6 +16940,25 @@ mod tests {
         assert!(!masked3.contains("secret"));
         assert!(masked3.contains("postgres://:****@localhost:5432/mydb"));
     }
+    // The point of routing this through the shared redactor: a SQLite operator
+    // reads their own path back out of the boot summary, and a Postgres
+    // operator keeps the connection policy they debug TLS with — while the
+    // shapes that carry a secret still go.
+    #[test]
+    fn mask_database_url_keeps_the_diagnostic_parts_of_a_target() {
+        let sqlite = mask_database_url("sqlite:///var/lib/app.db", 1);
+        assert!(sqlite.contains("sqlite:///var/lib/app.db"), "{sqlite}");
+
+        let read_only = mask_database_url("sqlite://file:app.db?mode=ro", 1);
+        assert!(read_only.contains("mode=ro"), "{read_only}");
+
+        let pg = mask_database_url("postgres://app@db/app?sslmode=verify-full", 10);
+        assert!(pg.contains("sslmode=verify-full"), "{pg}");
+
+        let secret = mask_database_url("postgres://app@db/app?sslpassword=hunter2", 10);
+        assert!(!secret.contains("hunter2"), "{secret}");
+    }
+
     #[test]
     fn mask_database_url_invalid_url_fallback() {
         let masked = mask_database_url("this is completely invalid as a URL with supersecret", 10);
