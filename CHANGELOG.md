@@ -52,6 +52,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
+  (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
+  its query functions by `diesel::pg::Pg`, which rejects the SQLite
+  `RuntimeConnection`, so the store did not compile on a SQLite app. Every such
+  bound in the generated auth surface (the four session revoke/list functions and
+  the seven remember-me chain functions) is now
+  `::autumn_web::RuntimeBackend` — the alias that resolves to `diesel::pg::Pg` by
+  default and `diesel::sqlite::Sqlite` under the `sqlite` feature — so the
+  scaffolded store compiles and runs on whichever backend the app selected.
+  Postgres behaviour is unchanged; the alias resolves to the same backend it
+  already used. The scaffolded `docs/guide/session-management.md` also emits its
+  operator SQL in the app's own dialect: the stale-row sweep is
+  `datetime('now', '-90 days')` on SQLite (was Postgres-only `NOW() - INTERVAL`),
+  and its retrofit `CREATE TABLE` is now rendered from the same helper as the
+  migration, so the two cannot drift. The scaffolded `docs/guide/oauth.md`
+  documents its `oauth_identities` schema in the app's dialect for the same
+  reason. A new `sqlite_tracked_sessions` test runs the generated store's shape
+  against a real, file-backed SQLite database over a multi-connection pool —
+  login tracking, the revocation gate (including a revoke committed on another
+  connection), the `UNIQUE` digest guard, `last_seen_at` refresh, rotation
+  rebinding, the three revoke paths, the documented retention sweep across both
+  timestamp encodings, and `ON DELETE CASCADE` on account deletion. A
+  `sqlite_test_targets_are_ci_named` hygiene test now fails the build if any
+  `sqlite`-gated `[[test]]` target is missing from the CI job that names them,
+  so a future target cannot ship dark. Guide:
+  `docs/guide/sqlite-in-production.md`.
 - **cli:** dependency advisories and policy reach the dev loop (issue #1633).
   `autumn doctor` gains a `dependencies` check that grades the app's lockfile
   against its own `deny.toml` — the same policy file, waiver store, check list

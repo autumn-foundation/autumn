@@ -110,7 +110,11 @@ mailer --list-unsubscribe` are backend-aware too (#1927): on a SQLite app they
 scaffold SQLite-dialect migrations (`INTEGER PRIMARY KEY AUTOINCREMENT`,
 `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of being rejected,
 and the generated auth session store is typed against
-`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). Field
+`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). That
+store's query functions also bind `::autumn_web::RuntimeBackend` rather than
+`diesel::pg::Pg` (#1908), so the tracked-sessions store compiles and runs on the
+SQLite connection; the scaffolded session-management and OAuth guides emit
+their operator SQL in the app's dialect too. Field
 kinds with no working diesel SQLite conversion in the generated app's feature
 set — `Uuid`, `Attachment`, `Decimal`, `DateTime` (`DateTime<Utc>`), and
 `enum{…}` — are still **rejected at generate time** (with an actionable error)
