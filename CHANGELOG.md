@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A side effect of the digest being taken over LF-normalised text: a CRLF
   checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
   whether or not a manifest entry backs it.
+- **`autumn migrate check` classifies against the app's own backend** (issue
+  #1906). The safety classifier was Postgres-only and gave SQLite apps incorrect
+  advice: it recommended `CREATE INDEX CONCURRENTLY`, which SQLite has no syntax
+  for; it flagged every `DROP INDEX` as blocking, though on SQLite it is a cheap
+  catalog edit *and* a precondition of `DROP COLUMN`, so the generator's own
+  remove-column migrations failed the gate; and it rated `ADD COLUMN NOT NULL`
+  without a default merely "potentially blocking" where SQLite rejects it
+  outright. `check` now detects the backend and applies SQLite's rules. A new
+  `unsupported` risk level marks statements the backend cannot run at all —
+  `ALTER COLUMN` in any spelling, `TRUNCATE`, `CONCURRENTLY`, inline
+  `UNIQUE`/`PRIMARY KEY` on `ADD COLUMN`, a non-constant `ADD COLUMN` default, a
+  multi-action `ALTER TABLE`, sequences, types, extensions, materialized views,
+  `COMMENT ON`, `GRANT`/`REVOKE`, `MERGE`, a writing CTE and the Postgres-only
+  `CREATE INDEX`/`CREATE TABLE` clauses — and fails the `up.sql` gate, since they
+  cannot apply. Postgres classification is unchanged.
 
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
@@ -114,6 +129,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-upgrade), where automatic detection is ambiguous, every attribute macro
   additionally accepts an explicit `crate = "..."` override, e.g.
   `#[get("/x", crate = "autumn_web_05")]`.
+- **`Remove…From…` drops a pre-existing index on SQLite** (issue #1906). SQLite
+  refuses `DROP COLUMN` while any index names the column. The generator only
+  knew the conventional `idx_<table>_<col>` name, so a composite, partial,
+  expression or hand-named index from an earlier migration broke the migration
+  at apply time. `generate migration Remove…From…` now replays the project's
+  `migrations/*/up.sql` in timestamp order to recover the indexes live on the
+  table, emits `DROP INDEX IF EXISTS` for each one that names a removed column
+  before the `DROP COLUMN`, and re-creates them in `down.sql` after the column
+  is restored. Indexes created outside `migrations/` stay invisible. Postgres
+  output is unchanged — it cascades index drops with the column.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,

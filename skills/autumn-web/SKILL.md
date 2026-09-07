@@ -3155,6 +3155,39 @@ on `/actuator/health` under the `sqlite-replication` indicator; the indicator go
 Verification is a **real restore** on an interval, not a checksum. See
 `docs/guide/sqlite-in-production.md`.
 
+### SQLite migration dialect and `migrate check` (issue #1906)
+
+`autumn migrate check` classifies migration SQL against the app's own backend.
+On SQLite it never recommends `CREATE INDEX CONCURRENTLY` (no such syntax) and
+does not flag a plain `DROP INDEX` (a cheap catalog edit, and a precondition of
+`DROP COLUMN`). A new `unsupported` risk level marks statements SQLite rejects
+outright, and fails the gate:
+
+| Statement | Why SQLite rejects it | Write instead |
+| --- | --- | --- |
+| `ALTER TABLE … ALTER COLUMN …` (any form) | SQLite's `ALTER TABLE` supports only `RENAME`, `ADD COLUMN`, `DROP COLUMN` | Rebuild the table — `autumn schema diff --write-migration` emits it |
+| `ADD COLUMN … NOT NULL` with no `DEFAULT` | Cannot backfill existing rows | Give a constant `DEFAULT`, or add the column nullable |
+| `ADD COLUMN … UNIQUE` / `PRIMARY KEY` | Inline constraint not allowed | Add the column, then `CREATE UNIQUE INDEX` |
+| `ADD COLUMN … DEFAULT CURRENT_TIMESTAMP` or `DEFAULT (expr)` | The default must be a constant | Use a literal, or backfill with `UPDATE` |
+| More than one action in one `ALTER TABLE` | SQLite takes one action per statement | Split into one `ALTER TABLE` per action |
+| `TRUNCATE` | No such statement | `DELETE FROM <table>;` |
+| Sequences, types, extensions, materialized views, `COMMENT ON`, `GRANT`/`REVOKE` | Postgres-only objects | Remove, or gate the migration to Postgres |
+
+One rule Autumn deliberately does **not** report: SQLite rejects an added
+`REFERENCES` column with a non-NULL default only when `PRAGMA foreign_keys` is
+ON, and the migration connection leaves it OFF, so the statement applies.
+
+`DROP COLUMN` also fails on SQLite when the column is a primary key, is `UNIQUE`,
+is named by any index (including a partial index's `WHERE`), or appears in a
+`CHECK`, generated column, view or trigger. `autumn generate migration
+Remove…From…` handles the index case: it reads the project's earlier
+`migrations/*/up.sql`, emits `DROP INDEX IF EXISTS` for every live index that
+names the removed column — composite, partial, expression and hand-named
+included — before the `DROP COLUMN`, and re-creates them in `down.sql`. An index
+created outside `migrations/` stays invisible; drop it in the same migration.
+
+Postgres classification and generated Postgres DDL are unchanged.
+
 ### VPS deploys and fleets — `autumn deploy` (0.6.0; fleets 0.7.0, issues #1607/#1621)
 
 `autumn deploy {check | plan | up | rollback | status | maintenance on|off}`
