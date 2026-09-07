@@ -397,6 +397,68 @@ fn a_reshaped_model_does_not_register_its_field_schema() {
     );
 }
 
+// ── serde_json::Value is unconstrained JSON (issue #802) ───────────────
+
+mod schema_jsonb {
+    autumn_web::reexports::diesel::table! {
+        payload_rows (id) {
+            id -> Int8,
+            payload -> Jsonb,
+            optional_payload -> Nullable<Jsonb>,
+        }
+    }
+}
+
+use schema_jsonb::payload_rows;
+
+#[autumn_web::model(table = "payload_rows")]
+pub struct PayloadRow {
+    #[id]
+    pub id: i64,
+    pub payload: serde_json::Value,
+    pub optional_payload: Option<serde_json::Value>,
+}
+
+/// A `json`/`jsonb` column may hold an object, array, string, number, boolean
+/// or null, so any `"type"` would be a lie for some rows. Before this the field
+/// fell through to a `$ref` nothing registers, which the back-fill resolved to
+/// the `{"type":"object"}` placeholder — so every array-valued or scalar-valued
+/// row violated the model's own schema.
+#[test]
+fn a_json_value_field_is_unconstrained() {
+    let schema =
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<PayloadRow>())
+            .expect("the model registers its read schema");
+    let prop = &schema["properties"]["payload"];
+
+    assert!(
+        prop.get("type").is_none(),
+        "arbitrary JSON must carry no `type` constraint: {prop}"
+    );
+    assert!(
+        prop.get("$ref").is_none(),
+        "it must not point at a component nothing registers: {prop}"
+    );
+}
+
+/// `Option<serde_json::Value>` must NOT be wrapped in the usual
+/// `oneOf [T, null]`: the unconstrained schema already admits null, and `oneOf`
+/// requires EXACTLY ONE branch to match — so the wrapper would reject the very
+/// null it exists to permit.
+#[test]
+fn an_optional_json_value_is_not_wrapped_in_one_of() {
+    let schema =
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<PayloadRow>())
+            .expect("the model registers its read schema");
+    let prop = &schema["properties"]["optional_payload"];
+
+    assert!(
+        prop.get("oneOf").is_none(),
+        "null matches both branches, so `oneOf` would reject it: {prop}"
+    );
+    assert!(prop.get("type").is_none(), "it stays unconstrained: {prop}");
+}
+
 // ── New* datetime matches its own deserializer (issue #802) ────────────
 
 mod schema_datetime {

@@ -578,6 +578,13 @@ pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
 pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
     if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
+        // `Option<serde_json::Value>` must NOT be wrapped. The unconstrained
+        // schema already admits null, and `oneOf` demands that EXACTLY ONE
+        // branch match — so `oneOf [{unconstrained}, {"type":"null"}]` would
+        // reject the very null it is meant to permit, because null matches both.
+        if is_serde_json_value(&type_name_str(&inner)) {
+            return unconstrained_json_tokens(&inner);
+        }
         let inner_tokens = emit_json_schema_tokens(&inner);
         return quote! {{
             let __inner = #inner_tokens;
@@ -604,6 +611,10 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // this was one untyped field on almost every model on an API boundary
     // (issue #802). Each maps to the standard OpenAPI `format` for what serde
     // actually writes.
+    if is_serde_json_value(&name) {
+        return unconstrained_json_tokens(ty);
+    }
+
     if let Some((json_type, format, description)) = scalar_json_schema(&name) {
         let format_insert = format.map(|f| {
             quote! { __scalar.insert("format".to_owned(), #f.into()); }
@@ -675,6 +686,36 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// description is less specific but true. `NaiveDate` keeps `date`, whose RFC
 /// 3339 production (`full-date`) has no offset to begin with, and `DateTime<Tz>`
 /// keeps `date-time` because chrono does write an offset for it.
+/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?
+///
+/// Matched on the LAST PATH SEGMENT for the same reason the scalar table is: a
+/// proc macro sees only the tokens as written, and `use serde_json::Value;` is
+/// the normal spelling. A colliding application type is handled the same way
+/// too — the runtime check consults the derived-schema inventory first, so a
+/// `Value` of one's own carrying `#[derive(OpenApiSchema)]` wins.
+fn is_serde_json_value(name: &str) -> bool {
+    name == "Value"
+}
+
+/// The schema for arbitrary JSON: no constraint at all.
+///
+/// A `json` / `jsonb` column may legitimately hold an object, an array, a
+/// string, a number, a boolean or null, so any `"type"` here would be a lie for
+/// some rows. Emitting only a description leaves the schema unconstrained,
+/// which is the honest answer and is true of BOTH directions (issue #802).
+fn unconstrained_json_tokens(ty: &syn::Type) -> TokenStream {
+    quote! {{
+        match ::autumn_web::openapi::registered_derived_schema(
+            ::core::any::type_name::<#ty>()
+        ) {
+            ::core::option::Option::Some(__derived) => __derived,
+            ::core::option::Option::None => ::autumn_web::reexports::serde_json::json!({
+                "description": "Arbitrary JSON: an object, array, string, number, boolean or null.",
+            }),
+        }
+    }}
+}
+
 fn scalar_json_schema(
     name: &str,
 ) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
