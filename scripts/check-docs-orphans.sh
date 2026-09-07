@@ -491,64 +491,35 @@ def _inline_table(value):
     s = value.lstrip()
     if not s.startswith('{'):
         return None
-    entries = []
-    cur = ''
+    # A multi-line inline table is joined line by line, so a comment inside it
+    # ends at the newline rather than at the end of the whole text. Each line
+    # is classified on its own for that reason, and the offsets re-based.
+    live = set()
+    base = 0
+    for chunk in s.split('\n'):
+        chunk_live, _at, _ml = _toml_live(chunk)
+        live |= {base + j for j in chunk_live}
+        base += len(chunk) + 1
     depth = 0
-    quote = None
-    esc = False
-    closed = False
-    comment = False
-    for ch in s[1:]:
-        if quote is not None:
-            cur += ch
-            # A BASIC string takes escapes, so `"not \", publish = true"` is
-            # one value and not a string followed by an entry. Missing that
-            # read the text inside a description as a real `publish` key —
-            # silent, and a scanner written beside `_scan_toml_line` rather
-            # than sharing its rules, which is how the two came to disagree.
-            if esc:
-                esc = False
-            elif quote == '"' and ch == '\\':
-                esc = True
-            elif ch == quote:
-                quote = None
+    start = 1
+    entries = []
+    for i in range(1, len(s)):
+        if i not in live:
             continue
-        if comment:
-            # A `}` inside a COMMENT is not the end of the table. Cargo accepts
-            # `# note } here` between entries and still reports the keys after
-            # it; closing there dropped them and read the package as
-            # publishable. The comment runs to the newline, which exists here
-            # because a multi-line inline table is joined line by line.
-            if ch == '\n':
-                comment = False
-                cur += ch
-            continue
-        if ch == '#':
-            comment = True
-        elif ch in '"\'':
-            quote = ch
-            cur += ch
-        elif ch in '[{':
+        c = s[i]
+        if c in '[{':
             depth += 1
-            cur += ch
-        elif ch in ']':
+        elif c == ']':
             depth -= 1
-            cur += ch
-        elif ch == '}':
+        elif c == '}':
             if depth == 0:
-                closed = True
-                break
+                entries.append(s[start:i])
+                return [e.strip() for e in entries if e.strip()]
             depth -= 1
-            cur += ch
-        elif ch == ',' and depth == 0:
-            entries.append(cur)
-            cur = ''
-        else:
-            cur += ch
-    if not closed:
-        return None
-    entries.append(cur)
-    return [e.strip() for e in entries if e.strip()]
+        elif c == ',' and depth == 0:
+            entries.append(s[start:i])
+            start = i + 1
+    return None                              # unterminated: read on
 
 
 def _inherits(value):
@@ -629,26 +600,8 @@ def _header_name(line):
     if not s.startswith('['):
         return None
     i = 2 if s.startswith('[[') else 1
-    j = i
-    n = len(s)
-    quote = None
-    esc = False
-    end = None
-    while j < n:
-        c = s[j]
-        if quote is not None:
-            if esc:
-                esc = False
-            elif quote == '"' and c == '\\':
-                esc = True
-            elif c == quote:
-                quote = None
-        elif c in '"\'':
-            quote = c
-        elif c == ']':
-            end = j
-            break
-        j += 1
+    live, _at, _ml = _toml_live(s)
+    end = next((j for j in sorted(live) if j >= i and s[j] == ']'), None)
     if end is None:
         return None
     rest = s[end + 1:]
@@ -745,6 +698,54 @@ def _ml_close(text, tok, start=0):
     return -1
 
 
+def _toml_live(text):
+    """`(live, comment_at, open_ml)` — which characters of `text` are TOML.
+
+    `live` is the set of indices outside every string form and outside a
+    comment; `comment_at` is where an unquoted `#` starts one, or None;
+    `open_ml` is a multi-line delimiter left unterminated, or None.
+
+    ONE walker, because three separate ones is what this rule kept being wrong
+    about. `_scan_toml_line`, `_inline_table` and `_header_name` each grew
+    their own notion of "what is quoted" and each was wrong at least once — a
+    scanner missing escapes, a scanner missing comments, a scanner missing the
+    triple-quoted form and so ending a string at the first ordinary quote
+    inside it. Every one of those was the same defect in a different copy, and
+    fixing them one at a time is what made the next one predictable.
+    """
+    live = set()
+    comment_at = None
+    open_ml = None
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        # Triple delimiters first: each starts with a character that would
+        # otherwise open a single-line string.
+        if text.startswith('"""', i) or text.startswith("'''", i):
+            tok = text[i:i + 3]
+            close = _ml_close(text, tok, i + 3)
+            if close < 0:
+                open_ml = tok
+                break
+            i = close + 3
+        elif c == '#':
+            comment_at = i
+            break
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+            i += 1
+        elif c == "'":
+            close = text.find("'", i + 1)
+            i = n if close < 0 else close + 1
+        else:
+            live.add(i)
+            i += 1
+    return live, comment_at, open_ml
+
+
 def _scan_toml_line(line):
     """`(comment_start, open_delimiter, depth_delta)` for one line of TOML.
 
@@ -770,35 +771,14 @@ def _scan_toml_line(line):
     So both are measured, not argued: self-tests pin the comment and
     single-line-string cases and fail against a scanner lacking this.
     """
-    i = 0
-    n = len(line)
+    live, comment_at, open_ml = _toml_live(line)
     depth = 0
-    while i < n:
-        # A triple delimiter has to be tested before the single quote that
-        # starts it, or every one of them opens a single-line string instead.
-        if line.startswith('"""', i) or line.startswith("'''", i):
-            tok = line[i:i + 3]
-            close = _ml_close(line, tok, i + 3)
-            if close < 0:
-                return None, tok, depth
-            i = close + 3
-        elif line[i] == '#':
-            return i, None, depth            # comment runs to end of line
-        elif line[i] == '"':
-            i += 1
-            while i < n and line[i] != '"':  # basic strings take escapes
-                i += 2 if line[i] == '\\' else 1
-            i += 1
-        elif line[i] == "'":
-            close = line.find("'", i + 1)    # literal strings do not
-            i = n if close < 0 else close + 1
-        else:
-            if line[i] in '{[':
-                depth += 1
-            elif line[i] in '}]':
-                depth -= 1
-            i += 1
-    return None, None, depth
+    for i in live:
+        if line[i] in '{[':
+            depth += 1
+        elif line[i] in '}]':
+            depth -= 1
+    return comment_at, open_ml, depth
 
 
 def _strip_toml_comments(text):
@@ -8096,6 +8076,18 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9na/pkg/README.md"
   git -C "$c9na" add -A && git -C "$c9na" commit -qm comment-brace-inline
   check "a brace in a comment does not close an inline table" fail "$c9na"
+
+  # A TRIPLE-quoted string inside an inline table holds ordinary quotes and
+  # braces: Cargo reads this description whole and reports `publish: []`. A
+  # scanner tracking only single quote characters ended the string at the
+  # first `"` inside it and closed the table at the following `}`.
+  local c9nb="$tmp/c9nb"; make_corpus "$c9nb"
+  mkdir -p "$c9nb/pkg"
+  printf '%s\n' 'package = { name = "pkg", description = """hello " } still string""", publish = false, readme = "README.md" }' \
+    > "$c9nb/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9nb/pkg/README.md"
+  git -C "$c9nb" add -A && git -C "$c9nb" commit -qm triple-quote-inline-table
+  check "a triple-quoted value inside an inline table is one value" fail "$c9nb"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
