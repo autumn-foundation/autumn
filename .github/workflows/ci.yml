@@ -363,7 +363,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.85.5
+      - uses: taiki-e/install-action@v2.87.5
         with:
           tool: cargo-deny@0.20.2
       # Advisories go through the shared gate (issue #1600) so PR CI, the
@@ -1274,7 +1274,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.87.5
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)
