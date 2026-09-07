@@ -538,9 +538,25 @@ impl SampleAmount {
 }
 
 impl SampleRole {
-    /// Whether rows of this table are removed at all.
-    const fn is_subsetted(self) -> bool {
-        matches!(self, Self::Root(_) | Self::Related | Self::NeverInclude)
+    /// Whether rows of this table are actually removed.
+    ///
+    /// A root asked for 100% keeps every row, so its `DELETE ... WHERE NOT
+    /// EXISTS (keep)` matches nothing. Treating it as removing would refuse a
+    /// framework table that references it — a reference that cannot break,
+    /// because nothing goes away — and would give it an ordering constraint it
+    /// does not have. It still *descends*: the point of `users=100%` is to keep
+    /// every user and subset what hangs off them.
+    ///
+    /// Only an exact percentage is recognised. A `Count` large enough to cover
+    /// the table is the same no-op in practice, but that depends on the row
+    /// count at run time, and a refusal must not hinge on data that can change
+    /// between planning and applying.
+    fn is_subsetted(self) -> bool {
+        match self {
+            Self::Root(SampleAmount::Percent(p)) => p < 100.0,
+            Self::Root(SampleAmount::Count(_)) | Self::Related | Self::NeverInclude => true,
+            Self::AlwaysInclude => false,
+        }
     }
 
     /// Whether the walk may descend from this table into its children *at all*.
@@ -2425,6 +2441,72 @@ mod tests {
             tables.iter().any(|t| t.starts_with("autumn_job_tracking:")),
             "the propagated deferral must be checked too: {tables:?}"
         );
+    }
+
+    #[test]
+    fn a_hundred_percent_root_removes_nothing_so_an_outside_reference_is_fine() {
+        // `users=100%` keeps every row, so its DELETE matches nothing and a
+        // framework table referencing it cannot break. Refusing here would
+        // reject a valid run over a reference that is never dangled.
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Percent(100.0))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            role_of(&plan, "users"),
+            SampleRole::Root(SampleAmount::Percent(100.0))
+        );
+    }
+
+    #[test]
+    fn a_partial_root_still_refuses_the_same_outside_reference() {
+        // The contrast that makes the case above meaningful: at 99% rows DO go
+        // away, so the unpurged framework table is refused as before.
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Percent(99.0))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, SampleError::OutsideTableReferencesSampled { .. }),
+            "a partial root must still be treated as removing rows: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_hundred_percent_root_still_descends_into_its_children() {
+        // The behaviour that must NOT change: `users=100%` is still a root the
+        // walk descends from, so `comments` is reachable rather than uncovered.
+        let (tables, keys) = schema();
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Percent(100.0))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert_eq!(role_of(&plan, "comments"), SampleRole::Related);
     }
 
     #[test]

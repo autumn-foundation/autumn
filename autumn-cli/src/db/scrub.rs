@@ -242,6 +242,12 @@ pub enum ScrubError {
         /// The schema names, sorted.
         schemas: Vec<String>,
     },
+    /// The target uses legacy `INHERITS` table inheritance, which the sample
+    /// cannot model: a statement naming the parent silently reaches the child.
+    LegacyInheritance {
+        /// `child (inherits parent)` descriptions, sorted.
+        tables: Vec<String>,
+    },
     /// The target has row-level security on a table the scrub would rewrite.
     RowLevelSecurity {
         /// The table names, sorted.
@@ -471,6 +477,19 @@ impl std::fmt::Display for ScrubError {
                  not check. Scrub those schemas separately, or drop them from the copy.",
                 schemas.len(),
                 bullet_list(schemas),
+            ),
+            Self::LegacyInheritance { tables } => write!(
+                f,
+                "This database uses legacy table inheritance on {} table(s):\n{}\n  \
+                 Unlike a declarative partition, an inheritance child is an ordinary table \
+                 that the sample plans separately — while `DELETE FROM parent` and \
+                 `SELECT ... FROM parent` reach its rows too, because they are not written \
+                 `ONLY parent`. Parent and child would then select rows independently and \
+                 delete each other's, and the run would report a success it cannot stand \
+                 behind. Sample a copy without the inheritance, or drop the child tables \
+                 from it.",
+                tables.len(),
+                bullet_list(tables),
             ),
             Self::RowLevelSecurity { tables } => write!(
                 f,
@@ -2335,6 +2354,18 @@ fn classify_and_apply(
                 tables: unreachable,
             });
         }
+
+        // Before the sample is planned, not after. An inheritance child has no
+        // foreign key of its own — legacy `INHERITS` does not carry constraints
+        // down — so the coverage check would otherwise report it as unreachable
+        // and advise naming it as a root, which is precisely the arrangement
+        // that corrupts. Only the sample is refused: the column rewrites are
+        // per-row UPDATEs that reach the child's rows correctly either way.
+        if !args.sample.is_empty() && !facts.legacy_inheritance.is_empty() {
+            return Err(ScrubError::LegacyInheritance {
+                tables: facts.legacy_inheritance,
+            });
+        }
         let plan = build_plan(&ClassificationInputs {
             tables: &tables,
             config: &sources.config,
@@ -2417,12 +2448,20 @@ fn classify_and_apply(
         // it points at, except where the sample must empty its child first), so
         // a reader auditing the dry run has to see the real sequence: printing
         // a deferred purge early would show SQL that fails if it were run.
+        //
+        // The BEGIN/COMMIT is part of that sequence, not decoration. `execute`
+        // runs all of this in one transaction, and the sample's keep-sets are
+        // `CREATE TEMPORARY TABLE ... ON COMMIT DROP`: pasted into psql's
+        // autocommit, each one would be committed and dropped before the seed
+        // INSERT that follows it. Without the envelope the advertised "exact
+        // SQL" is not runnable.
         for (label, url, plan, facts, sampling) in &plans {
             let no_deferral = BTreeSet::new();
             let deferred: &BTreeSet<String> =
                 sampling.as_ref().map_or(&no_deferral, |s| &s.purge_after);
             let purges = purge_statements(&facts.framework_tables, &sources.config);
             let phases = emptying_phases(&purges, deferred, sampling.as_ref());
+            eprintln!("  BEGIN;");
             for (_, statement) in &phases.before {
                 eprintln!("  {statement};");
             }
@@ -2454,7 +2493,10 @@ fn classify_and_apply(
             for (_, statement) in &phases.final_pass {
                 eprintln!("  {statement};");
             }
+            eprintln!("  COMMIT;");
             if sampling.is_some() {
+                // Deliberately outside the envelope, as in `execute`: VACUUM
+                // (FULL) cannot run inside a transaction block.
                 eprintln!(
                     "  -- then VACUUM (FULL, ANALYZE) on every subsetted table, so the files \
                      shrink to the sample"
@@ -2834,6 +2876,9 @@ pub struct DatabaseFacts {
     /// updates only the rows its policies expose — a fail-open a scrub cannot
     /// tolerate.
     pub rls_tables: BTreeSet<String>,
+    /// Legacy `INHERITS` children as `child (inherits parent)`, sorted. Empty
+    /// for a declaratively partitioned schema, which the sample does model.
+    pub legacy_inheritance: Vec<String>,
     /// Tables carrying user-defined triggers, which can copy pre-scrub values
     /// into another table mid-scrub.
     pub triggered_tables: BTreeSet<String>,
@@ -3188,6 +3233,31 @@ fn probe_database_facts(
         BTreeSet::new()
     };
 
+    // A declarative partition is also a `pg_inherits` child, so the partition
+    // case is excluded explicitly — those the sample models through the parent
+    // on purpose. What is left is legacy `INHERITS`, which it cannot.
+    let legacy_inheritance: Vec<String> = {
+        let partition_filter = if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
+            "AND NOT child.relispartition"
+        } else {
+            ""
+        };
+        let rows: Vec<NameRow> = sql_query(format!(
+            "SELECT child.relname || ' (inherits ' || parent.relname || ')' AS name \
+             FROM pg_inherits i \
+             JOIN pg_class child ON child.oid = i.inhrelid \
+             JOIN pg_namespace cns ON cns.oid = child.relnamespace AND cns.nspname = 'public' \
+             JOIN pg_class parent ON parent.oid = i.inhparent \
+             JOIN pg_namespace pns ON pns.oid = parent.relnamespace AND pns.nspname = 'public' \
+             WHERE child.relkind IN ('r', 'p', 'f') {partition_filter}"
+        ))
+        .load(&mut conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?;
+        let mut names: Vec<String> = rows.into_iter().map(|r| r.name).collect();
+        names.sort();
+        names
+    };
+
     let rls_tables = names(
         "SELECT rel.relname AS name FROM pg_class rel \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
@@ -3297,6 +3367,7 @@ fn probe_database_facts(
         nulls_not_distinct_columns,
         partitions,
         rls_tables,
+        legacy_inheritance,
         triggered_tables,
         materialized_views,
         other_schemas,

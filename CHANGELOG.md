@@ -90,7 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the rewrites run, so a purge that ran only beforehand would report the
   table emptied while it held real data. That final pass covers `[sample]
   never_include` tables too — both settings promise a table ends up empty, and
-  both are now enforced after every write rather than only before. A foreign key declared on a partition rather than
+  both are now enforced after every write rather than only before. Legacy
+  `INHERITS` inheritance is refused for a sampled run (a statement naming the
+  parent reaches the child, which the plan models separately); an exact `100%`
+  root counts as removing no rows, so it no longer trips the outside-reference
+  refusal; and `--dry-run` wraps its SQL in `BEGIN`/`COMMIT`, without which the
+  printed `ON COMMIT DROP` keep-sets could not be run as shown. A foreign key declared on a partition rather than
   cloned onto it from its partitioned parent is likewise refused, rather than
   dropped from the walk and the integrity re-check as if it were a clone. The
   re-check honours each constraint's own NULL rule, so a partly-NULL composite

@@ -1504,6 +1504,55 @@ async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
     );
 }
 
+/// Legacy `INHERITS` is refused rather than sampled wrong.
+///
+/// An inheritance child is an ordinary table the plan would sample separately,
+/// but `DELETE FROM parent` reaches its rows too — the statements are not
+/// written `ONLY parent`. Parent and child would select independently and
+/// delete each other's rows, so the run refuses instead.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_legacy_table_inheritance() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "legacy_inherit").await;
+    client
+        .batch_execute("CREATE TABLE archived_comments () INHERITS (comments);")
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/legacy_inherit");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("archived_comments") && stderr.contains("inherits"),
+        "the refusal must name the inheriting table: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused run must not have deleted anything"
+    );
+
+    // A scrub WITHOUT --sample is unaffected: the rewrites are per-row UPDATEs
+    // that reach the child's rows correctly either way.
+    run_autumn_ok(dir, &["db", "scrub"], &envs);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "the unsampled scrub must still run and scrub the PII"
+    );
+}
+
 /// The same leak, through a `never_include` table rather than a purged one.
 ///
 /// `never_include` promises the table ends up empty. The sample empties it, but

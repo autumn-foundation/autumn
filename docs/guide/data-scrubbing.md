@@ -304,11 +304,22 @@ Sampling refuses before it deletes anything when it cannot prove the result:
   by a table the sample empties (so its purge must run last). The only valid
   order interleaves the sample's own deletes around the purge, which one atomic
   sample between two purge passes cannot express;
+- **legacy `INHERITS` table inheritance** anywhere in `public`. A declarative
+  partition the sample models through its parent on purpose; an inheritance
+  child is an ordinary table it would plan separately, while `DELETE FROM
+  parent` reaches the child's rows anyway — the statements are not written `ONLY
+  parent` — so the two would delete each other's selections. A scrub *without*
+  `--sample` is unaffected and still runs;
 - a **foreign key declared on a partition** rather than on its partitioned
   parent. The sample plays a partition's rows through that parent, whose rows
   span every partition, so it cannot honour a key binding one partition alone.
   Declare the key on the partitioned parent — Postgres then clones it to each
   partition, and the clone is followed through the parent as usual.
+
+A root asked for exactly `100%` keeps every row, so it counts as removing none:
+a framework table referencing it is not refused, and it carries no delete-order
+constraint. It still descends, which is the point — `users=100%` keeps every user
+and subsets what hangs off them.
 
 `autumn db scrub --check --sample users=1%` proves the plan is complete and
 writes nothing — run it in CI next to the classification check. The foreign key
