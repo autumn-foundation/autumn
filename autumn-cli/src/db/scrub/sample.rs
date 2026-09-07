@@ -48,10 +48,16 @@ use super::super::{quote_ident, quote_literal};
 // nothing classified.
 use super::qualified_ident as qualified;
 
-/// Ceiling on closure passes. The keep-sets only grow and are bounded by the
-/// row count, so the walk always converges; this turns a hypothetical
-/// non-convergence into an error instead of a hung command.
-const MAX_PASSES: usize = 1000;
+/// Ceiling on closure passes, purely defensive.
+///
+/// Each pass either selects at least one new row or ends the walk, and the
+/// keep-sets are bounded by the row count, so convergence is guaranteed and this
+/// bound should never be reached. It exists to turn a hypothetical
+/// non-convergence into an error rather than a hung command — so it must sit far
+/// above any legitimate depth: one pass descends one level, and a self-
+/// referential hierarchy is exactly as deep as it is. A bound near a plausible
+/// depth would reject a valid tree for being tall.
+const MAX_PASSES: usize = 100_000;
 
 // ─── Specs ──────────────────────────────────────────────────────────────────
 
@@ -1380,6 +1386,27 @@ impl SamplePlan {
             .iter()
             .filter(|t| t.role.is_subsetted())
             .map(|t| t.table.as_str())
+            .collect()
+    }
+
+    /// The tables `never_include` promises will be EMPTY, as `(table, DELETE)`.
+    ///
+    /// The sample empties them, but that runs before the column rewrites, and a
+    /// trigger on a scrubbed table can insert into one afterwards — carrying the
+    /// original PII into a table the run reported as emptied. So the caller
+    /// re-runs these after every write, exactly as it re-runs `[framework]
+    /// purge`: a promise of emptiness is only true if it is enforced last.
+    #[must_use]
+    pub fn emptied_tables(&self) -> Vec<(&str, String)> {
+        self.tables
+            .iter()
+            .filter(|t| t.role == SampleRole::NeverInclude)
+            .map(|t| {
+                (
+                    t.table.as_str(),
+                    format!("DELETE FROM {}", qualified(&t.table)),
+                )
+            })
             .collect()
     }
 

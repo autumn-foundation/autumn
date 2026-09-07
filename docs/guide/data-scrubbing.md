@@ -331,11 +331,14 @@ size after the subsetted tables are compacted:
     Table size: 402.1 GB → 1.4 GB (0.3% of the source).
 ```
 
-`[framework] purge` empties its tables **again after the column rewrites**, and
-that final pass is the one the guarantee rests on. Earlier passes exist only to
+`[framework] purge` and `[sample] never_include` both empty their tables **again
+after the column rewrites**, and that final pass is the one the guarantee rests
+on. Earlier passes exist only to
 make the sample's deletes possible; a trigger on a scrubbed table — an audit or
 history trigger copying `OLD` values — can write fresh rows carrying the original
-PII into a purged table while the rewrites run, long after those. (The scrub
+PII into either kind of table while the rewrites run, long after those. Both
+settings promise the same thing — this table ends up empty — so both are enforced
+last. (The scrub
 still warns when a table it writes to carries user-defined triggers: emptying the
 destination cannot help a trigger that writes somewhere the purge list does not
 name.)

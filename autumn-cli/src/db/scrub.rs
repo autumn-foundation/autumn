@@ -2422,13 +2422,14 @@ fn classify_and_apply(
             let deferred: &BTreeSet<String> =
                 sampling.as_ref().map_or(&no_deferral, |s| &s.purge_after);
             let purges = purge_statements(&facts.framework_tables, &sources.config);
-            for (_, statement) in purges.iter().filter(|(t, _)| !deferred.contains(t)) {
+            let phases = emptying_phases(&purges, deferred, sampling.as_ref());
+            for (_, statement) in &phases.before {
                 eprintln!("  {statement};");
             }
             if let Some(sampling) = sampling {
                 report_sample_sql(url, label, sampling)?;
             }
-            for (_, statement) in purges.iter().filter(|(t, _)| deferred.contains(t)) {
+            for (_, statement) in &phases.after_sample {
                 eprintln!("  {statement};");
             }
             for table in &plan.tables {
@@ -2447,6 +2448,11 @@ fn classify_and_apply(
                         }
                     );
                 }
+            }
+            // Last, exactly as `execute` runs it: the pass that makes "emptied"
+            // true even if a rewrite trigger just re-filled one of these tables.
+            for (_, statement) in &phases.final_pass {
+                eprintln!("  {statement};");
             }
             if sampling.is_some() {
                 eprintln!(
@@ -3346,6 +3352,55 @@ fn report_framework_tables(present: &[String], config: &ScrubConfig) {
 }
 
 /// The `DELETE FROM` statements for the opted-in framework tables that exist.
+/// The three emptying passes, in the order `execute` runs them.
+///
+/// `execute` and `--dry-run` both read this, because they drifted apart twice:
+/// the dry run kept printing a purge order the executor no longer used, and then
+/// missed the final pass entirely. One definition means the printed SQL is the
+/// executed SQL by construction rather than by review.
+///
+/// - **before** — purges that are safe first, so the sample's deletes can remove
+///   the rows they point at;
+/// - **`after_sample`** — purges the sample's own emptied rows reference, which
+///   have to wait for it;
+/// - **`final_pass`** — every purge again, plus the `never_include` tables, run
+///   after all writes. This is the pass that makes "emptied" true: a trigger on
+///   a scrubbed table can insert the original PII into either kind of table
+///   while the rewrites run.
+fn emptying_phases<'a>(
+    purges: &'a [(String, String)],
+    deferred: &BTreeSet<String>,
+    sampling: Option<&'a sample::SamplePlan>,
+) -> EmptyingPhases<'a> {
+    let owned = |t: &'a (String, String)| (t.0.as_str(), t.1.clone());
+    let mut final_pass: Vec<(&str, String)> = purges.iter().map(owned).collect();
+    final_pass.extend(
+        sampling
+            .map(sample::SamplePlan::emptied_tables)
+            .unwrap_or_default(),
+    );
+    EmptyingPhases {
+        before: purges
+            .iter()
+            .filter(|(t, _)| !deferred.contains(t))
+            .map(owned)
+            .collect(),
+        after_sample: purges
+            .iter()
+            .filter(|(t, _)| deferred.contains(t))
+            .map(owned)
+            .collect(),
+        final_pass,
+    }
+}
+
+/// The emptying passes `emptying_phases` returns, as `(table, statement)`.
+struct EmptyingPhases<'a> {
+    before: Vec<(&'a str, String)>,
+    after_sample: Vec<(&'a str, String)>,
+    final_pass: Vec<(&'a str, String)>,
+}
+
 fn purge_statements(present: &[String], config: &ScrubConfig) -> Vec<(String, String)> {
     present
         .iter()
@@ -3545,10 +3600,11 @@ fn execute(
         // Rows removed are accumulated across all passes and reported once.
         let no_deferral = BTreeSet::new();
         let deferred: &BTreeSet<String> = sampling.map_or(&no_deferral, |s| &s.purge_after);
+        let phases = emptying_phases(purges, deferred, sampling);
         let mut purged_rows: BTreeMap<&str, usize> = BTreeMap::new();
-        for (table, statement) in purges.iter().filter(|(t, _)| !deferred.contains(t)) {
+        for (table, statement) in &phases.before {
             let rows = sql_query(statement).execute(conn)?;
-            *purged_rows.entry(table.as_str()).or_default() += rows;
+            *purged_rows.entry(*table).or_default() += rows;
         }
         // Then the subset, so the rewrites below touch only the rows that
         // survive it — and so no combination of flags can commit a row that was
@@ -3559,9 +3615,9 @@ fn execute(
         // The deferred purges, now that the sample has emptied what referenced
         // them. Empty unless a plan deferred one, so an unsampled scrub still
         // runs every purge in the single pass above.
-        for (table, statement) in purges.iter().filter(|(t, _)| deferred.contains(t)) {
+        for (table, statement) in &phases.after_sample {
             let rows = sql_query(statement).execute(conn)?;
-            *purged_rows.entry(table.as_str()).or_default() += rows;
+            *purged_rows.entry(*table).or_default() += rows;
         }
         for table in &plan.tables {
             if let Some(sql) = &table.sql {
@@ -3573,15 +3629,16 @@ fn execute(
                 counts.push((format!("{}.{}", table.table, rewrite.column), rows));
             }
         }
-        // The authoritative purge, after every rewrite. An `UPDATE` trigger on a
-        // scrubbed table — or a `DELETE` trigger fired by the sample — can copy
-        // `OLD` values into an audit or history table, so a purge that ran only
-        // before those would report a table emptied while it holds rows carrying
-        // the original PII. Emptying again here is what makes `[framework]
-        // purge` mean what it says; the passes above only order the deletes.
-        for (table, statement) in purges {
+        // The authoritative pass, after every rewrite: every purge again AND the
+        // `never_include` tables. An `UPDATE` trigger on a scrubbed table — or a
+        // `DELETE` trigger fired by the sample — can copy `OLD` values into
+        // either kind, so emptying only beforehand would report a table emptied
+        // while it holds rows carrying the original PII. Both promises are
+        // "this table ends up empty", so both are enforced here, last; the
+        // passes above exist only to order the sample's own deletes.
+        for (table, statement) in &phases.final_pass {
             let rows = sql_query(statement).execute(conn)?;
-            *purged_rows.entry(table.as_str()).or_default() += rows;
+            *purged_rows.entry(*table).or_default() += rows;
         }
         for (table, rows) in purged_rows {
             counts.push((format!("{table} (emptied)"), rows));

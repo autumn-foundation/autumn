@@ -1504,6 +1504,49 @@ async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
     );
 }
 
+/// The same leak, through a `never_include` table rather than a purged one.
+///
+/// `never_include` promises the table ends up empty. The sample empties it, but
+/// that runs before the column rewrites, so a trigger on a scrubbed table can
+/// insert the original PII into it afterwards. Both promises — `[framework]
+/// purge` and `never_include` — are re-enforced after every write.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_trigger_cannot_refill_a_never_include_table_with_pii() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "never_trigger").await;
+    // `audit_logs` is the fixture's never_include table.
+    client
+        .batch_execute(
+            "CREATE FUNCTION audit_user() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO audit_logs (actor_email, action) VALUES (OLD.email, 'update'); \
+                RETURN NEW; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER users_audit BEFORE UPDATE ON users \
+                FOR EACH ROW EXECUTE FUNCTION audit_user();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/never_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "never_include promises an empty table even when a trigger refills it"
+    );
+}
+
 /// A purge the sample's own emptied rows reference has to wait for the sample.
 ///
 /// `[framework] purge` runs at the START of the transaction so a framework table
