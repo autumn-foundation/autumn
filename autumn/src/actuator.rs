@@ -5698,6 +5698,72 @@ mod tests {
     }
 
     #[cfg(feature = "db")]
+    #[test]
+    fn actuator_derivations_200_body_is_an_array_of_status_objects() {
+        // The endpoint answers `Json(Vec<DerivationStatus>)`, so this pins the
+        // body an operator and a dashboard parse. The no-pool and hidden cases
+        // are covered below; this is the success shape, which needs no database.
+        let statuses = vec![
+            crate::derivation::DerivationStatus {
+                name: "posts.published_comment_count".to_owned(),
+                definition_hash: Some("a".repeat(64)),
+                stored_hash: Some("a".repeat(64)),
+                backfill_state: Some(crate::derivation::BackfillState::Complete),
+                checkpoint: Some(42),
+                backfilled_rows: 7,
+                updated_at: Some("2026-09-07 00:00:00+00".to_owned()),
+                drift: Some(0),
+                drift_error: None,
+            },
+            crate::derivation::DerivationStatus {
+                name: "posts.removed".to_owned(),
+                definition_hash: None,
+                stored_hash: Some("b".repeat(64)),
+                backfill_state: Some(crate::derivation::BackfillState::Unregistered),
+                checkpoint: None,
+                backfilled_rows: 0,
+                updated_at: None,
+                drift: None,
+                drift_error: Some("column does not exist".to_owned()),
+            },
+        ];
+        let body = serde_json::to_value(&statuses).expect("serialize the 200 body");
+        let rows = body.as_array().expect("the body is a JSON array");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("each row is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "backfill_state",
+                    "backfilled_rows",
+                    "checkpoint",
+                    "definition_hash",
+                    "drift",
+                    "drift_error",
+                    "name",
+                    "stored_hash",
+                    "updated_at",
+                ],
+                "{row}"
+            );
+        }
+        assert_eq!(rows[0]["backfill_state"], serde_json::json!("complete"));
+        assert_eq!(rows[0]["drift"], serde_json::json!(0));
+        // A state row this binary declares no derivation for: reported, with no
+        // definition hash and no drift figure.
+        assert_eq!(rows[1]["backfill_state"], serde_json::json!("unregistered"));
+        assert!(rows[1]["definition_hash"].is_null());
+        assert!(rows[1]["drift"].is_null());
+    }
+
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn actuator_derivations_reports_no_pool_as_unavailable() {
         // 503, not 404: an operator has to be able to tell "this build has no

@@ -43,17 +43,24 @@ argument is the parent model type. Every other key follows in any order.
 | `transform` | `count` | `count`, or `sum(<field>)` over a child field |
 | `filter` | none | the predicate deciding which child rows contribute |
 | `fk` | the `#[belongs_to]` leg to that parent, else `{snake(Parent)}_id` | the child column naming the parent |
+| `parent_table` | inferred from the parent type (`Post` gives `posts`) | the parent's table, for a parent that overrides its own |
 | `tenant` | none | tenant-discriminator column, as `counter_cache_tenant` |
 | `name` | `{parent_table}.{column}` | the registry name, used by the state table and the actuator |
+
+Each key may appear once. A repeated key is a compile error rather than a
+silent last-one-wins.
 
 `sum(<field>)` requires a non-nullable integer field (`i8`, `i16`, `i32` or
 `i64`). A nullable or floating-point sum is a compile error, because the Rust
 and the SQL lowering would disagree on it.
 
-Two derivations that maintain one `(parent table, column)` pair are a compile
-error, as is a derivation colliding with a counter cache on the same model: both
-would move the column twice. Two derivations sharing a `name` are a startup
-error, because they would share one state row.
+Two derivations that maintain one `(parent table, column)` pair on the same
+model are a compile error, as is a derivation colliding with a counter cache
+there: both would move the column twice. Across models, that collision and two
+derivations sharing a `name` are caught by the registry check every entry point
+runs, including the boot path before it opens a connection, so the process stops
+with both module paths named rather than double-counting or sharing one state
+row.
 
 ## The filter grammar
 
@@ -81,8 +88,8 @@ placeholder for whichever alias the statement gives the child table.
 A field may be `bool`, an integer or `String`, or the `Option` form of one of
 those. Every `Option` form follows SQL's NULL semantics: a NULL row satisfies no
 comparison, so it contributes nothing. That is why an `Option` inequality lowers
-to `is_some_and` rather than `!=`. A plain `!=` in Rust would count the NULL row
-that SQL excludes, and the two lowerings would drift apart.
+to `is_some_and` rather than `!=`, which in Rust would count the NULL row SQL
+excludes.
 
 A string literal is single-quoted for SQL, and an embedded `'` is doubled. A
 literal `{` or `}` in a string is rejected, because it could forge the `{c}`
@@ -129,13 +136,12 @@ the derived write fails, the row mutation rolls back with it.
 | `dependent` cascades on the parent | as for a counter cache, per affected child |
 
 A row the filter rejects contributes `0`, so inserting, editing or deleting it
-issues no statement. Two equal contributions issue none either. The old
+issues no statement, and two equal contributions issue none either. The old
 contribution is read by SQL before the update, from the row that is about to
 change, because that row is gone once the `UPDATE` lands. The arithmetic is one
 atomic `UPDATE parents SET col = col + $1`, never a read-modify-write, so N
 concurrent inserts yield exactly N. Re-parenting applies its two deltas in
-ascending parent id, so two transactions swapping children between the same
-parents cannot deadlock.
+ascending parent id, so two transactions swapping children cannot deadlock.
 
 ## Content addressing and backfill
 
@@ -151,23 +157,32 @@ Changing the filter, the transform, the column or the foreign key changes the
 hash. Renaming the derivation, moving the file or reformatting the filter source
 does not, so a cosmetic edit never triggers a backfill.
 
-At startup, after migrations, the framework calls `ensure_derivations`. That
-compares each registered hash with the hash stored in `_autumn_derivations`. A
-derivation whose hash matches is left alone, which keeps a boot from
-re-backfilling what it already backfilled. A derivation with no row, or with a
-different hash, is enqueued as `pending` with its checkpoint cleared. The
-framework then spawns `run_backfill` in the background with default options.
-Failures there are logged and swallowed: a derivation whose backfill has not run
-yet is stale, not broken, and the actuator reports exactly that.
+At startup, after migrations, the framework checks the registry and then calls
+`ensure_derivations`. That compares each registered hash with the hash stored in
+`_autumn_derivations`. A derivation whose hash matches is left alone, which
+keeps a boot from re-backfilling what it already backfilled. A derivation with
+no row, or with a different hash, is enqueued as `pending` with its checkpoint
+cleared. The framework then sweeps it in a background task, a few batches per
+pooled connection. A sharded app reconciles and sweeps on every shard primary as
+well as on the control primary.
 
-`run_backfill` pages parent ids outside any transaction, then repairs one page
-and advances that derivation's checkpoint inside one transaction. The checkpoint
-can therefore never describe a batch that did not commit, so a killed process
-resumes from the last committed batch. The repair assigns the ground truth
-rather than adjusting it, so re-running a batch is idempotent anyway. Each batch
-also locks the parents it rebuilds before it reads their children, so a backfill
-against live traffic neither clobbers a committed delta nor reads a half-applied
-one.
+A registry collision stops the boot, because double counting is data
+corruption. A database failure does not: it is logged, the sweep for that target
+is skipped, and a derivation whose backfill has not run yet is stale rather than
+broken, which the actuator reports exactly.
+
+`run_backfill` does one batch per transaction. The batch locks the state row
+first, so that row is both the cursor and the mutex: replicas take turns on one
+sweep instead of each running their own. It then pages parent ids after the
+committed checkpoint, assigns the ground truth to that page and advances the
+checkpoint, all in that transaction. The checkpoint therefore never describes a
+batch that did not commit, so a killed process resumes from the last committed
+one, and the repair assigns rather than adjusts, so re-running a batch is
+idempotent anyway. Every state write is guarded by name **and** hash, so a
+definition that changed under a running sweep is dropped rather than marked
+complete with the old values. Each batch also locks the parents it rebuilds
+before it reads their children, so a backfill against live traffic neither
+clobbers a committed delta nor reads a half-applied one.
 
 ```rust,ignore
 use autumn_web::derivation::{BackfillOptions, run_backfill};
@@ -175,12 +190,13 @@ use autumn_web::derivation::{BackfillOptions, run_backfill};
 // The defaults: batch_size 1000 parents per transaction, max_batches None.
 let report = run_backfill(&mut conn, &BackfillOptions::default()).await?;
 report.completed;     // names that reached `complete` in this call
-report.in_progress;   // names still `running`, each keeping its checkpoint
+report.in_progress;   // names still pending or running, each with its checkpoint
 report.rows_repaired; // parent rows actually written
 ```
 
-`batch_size` bounds how long a batch holds row locks. `max_batches` stops the
-sweep early, which is how a caller paces a repair by hand.
+`batch_size` bounds how long a batch holds row locks. `max_batches` bounds the
+call rather than the sweep, which is how a caller paces a repair by hand: the
+next call resumes from the committed checkpoints.
 
 ## Status and repair
 
@@ -193,15 +209,24 @@ answers `503` rather than `404`.
 [
   { "name": "posts.published_comment_count",
     "definition_hash": "3f0a...", "stored_hash": "3f0a...",
-    "backfill_state": "complete", "checkpoint": null,
-    "backfilled_rows": 5, "updated_at": "2026-09-07 12:00:00+00",
-    "drift": 0 }
+    "backfill_state": "complete", "checkpoint": 4200,
+    "backfilled_rows": 4200, "updated_at": "2026-09-07 12:00:00+00",
+    "drift": 0, "drift_error": null }
 ]
 ```
 
 `stored_hash` and `backfill_state` are `null` when no state row exists yet.
-`backfill_state` is otherwise `pending`, `running` or `complete`. `drift: 0` on
-every row is the healthy answer. A nonzero one names the derivation to repair:
+`backfill_state` is otherwise `pending`, `running` or `complete`, plus a
+report-only `unregistered` for a state row this binary declares no derivation
+for. Such a row reports `definition_hash: null` and stays in place, because only
+an operator can tell a removed derivation from a rolling deploy. `checkpoint`
+stays populated after the sweep completes, and `backfilled_rows` counts parents
+visited rather than written. `drift: 0` is the healthy answer; a nonzero one
+names the derivation to repair. The scan stops at `DRIFT_SCAN_LIMIT` (10,000
+rows), so a figure equal to it means "at least that many", and a scan that could
+not run reports `drift: null` with the reason in `drift_error`. That last case
+is usually a derived column whose migration has not been applied yet, and the
+other derivations are still reported.
 
 ```rust,ignore
 use autumn_web::derivation::{derivation_status, recompute};
@@ -213,8 +238,8 @@ let repaired = recompute(&mut conn, "posts.published_comment_count").await?;
 `recompute` runs the same batched, lock-then-assign sweep the counter cache
 uses. It is idempotent, and it returns how many parent rows it wrote. A healthy
 derivation reports `0` and writes nothing. An unregistered name is an error, not
-a silent no-op. Each drift figure is one aggregate statement, but that statement
-is a full scan of the parent table, so treat `/actuator/derivations` as an
+a silent no-op. Each drift figure is one aggregate statement, capped as above,
+but it still reads the parent table, so treat `/actuator/derivations` as an
 operator endpoint and do not scrape it.
 
 ## Testing
@@ -228,12 +253,14 @@ resp.assert_no_n_plus_one();   // or: resp.queries(), resp.assert_max_queries(1)
 ```
 
 The framework's own evidence is
-[`autumn/tests/integration/model_derivation.rs`](../../autumn/tests/integration/model_derivation.rs).
-It covers the filtered count and sum, same-transaction rollback, 50 concurrent
-inserts, re-parenting, filter flips, hash reconciliation, a killed and resumed
-backfill, status, recompute and the query count. CI runs it in the Docker sweep.
-Set `AUTUMN_TEST_PG_URL` to run it against a Postgres you already have, instead
-of a testcontainer:
+[`autumn/tests/integration/model_derivation.rs`](../../autumn/tests/integration/model_derivation.rs):
+the filtered count and sum, same-transaction rollback, 50 concurrent inserts,
+re-parenting, filter flips, hash reconciliation, a killed and resumed backfill,
+status, recompute and the query count. CI runs it in the Docker sweep. Set
+`AUTUMN_TEST_PG_URL` to run it against a Postgres you already have, instead of a
+testcontainer:
+
+<!-- config-key-allow: AUTUMN_TEST_PG_URL — a test-harness variable read by the framework's own suite, not an application config key -->
 
 ```console
 $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
@@ -252,10 +279,11 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
 - **`i64` columns.** The maintained column is `BIGINT`/`i64`, and a summed field
   must be a non-nullable `i8`, `i16`, `i32` or `i64`.
 - **Parent conventions are not compile-checked.** The parent table comes from
-  the type name (`Post` gives `posts`) and the parent primary key is `id`.
-  `#[model]` on the child cannot see the parent's fields, so a parent `table =
-  "..."` override, or a missing or mistyped column, surfaces as a database error
-  on the first mutation.
+  the type name (`Post` gives `posts`), and `parent_table = "..."` overrides it
+  for a parent that overrides its own. The parent primary key is always `id`.
+  `#[model]` on the child cannot see the parent's fields, so a wrong table name
+  or a missing or mistyped column surfaces as a database error on the first
+  mutation.
 - **A single primary key, and one database.** The child needs a scalar `#[id]`,
   and the parent `UPDATE` runs on the child's connection, so a sharded setup
   must keep parent and child on the same shard.

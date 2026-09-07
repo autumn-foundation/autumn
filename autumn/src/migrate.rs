@@ -2695,12 +2695,30 @@ fn run_pending_locked_inner(
     })
 }
 
+/// The framework migration sets every **shard** target requires.
+///
+/// One list, so [`run_pending_shard_framework_migrations`] (the apply path) and
+/// [`pending_shard_framework_migrations`] (the status path) cannot disagree about
+/// what a shard needs. Adding a shard-required set means adding it here.
+#[cfg(feature = "db")]
+fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
+    [
+        &crate::version_history::VERSION_HISTORY_MIGRATIONS,
+        &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+        &crate::derivation::DERIVATION_MIGRATIONS,
+    ]
+}
+
 /// Apply the framework migrations required on every **shard** target.
 ///
-/// Shard databases hold tenant data and must have the version-history and
-/// commit-hook queue tables, but do **not** host the full control-plane schema
-/// (API tokens, sessions, job queues, etc.). This function applies only those
-/// two migration sets under the migration advisory lock.
+/// Shard databases hold tenant data and must have the version-history,
+/// commit-hook queue and derivation-state tables, but do **not** host the full
+/// control-plane schema (API tokens, sessions, job queues, etc.). This function
+/// applies only those three migration sets under the migration advisory lock.
+///
+/// The derivation set belongs here for the same reason as the other two: a
+/// `#[derivation]` is maintained by the repository that writes the tenant rows,
+/// so its backfill state has to live on the shard those rows live on.
 ///
 /// Called by `autumn migrate` when iterating over `[[database.shards]]`
 /// entries, in contrast to [`run_pending`] with [`FRAMEWORK_MIGRATIONS`]
@@ -2722,21 +2740,10 @@ pub fn run_pending_shard_framework_migrations(
     #[cfg(feature = "db")]
     {
         let mut applied: Vec<String> = Vec::new();
-
-        let vh_result = run_pending(
-            database_url,
-            EmbeddedMigrationsRef(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
-        )?;
-        applied.extend(vh_result.applied);
-
-        let ch_result = run_pending(
-            database_url,
-            EmbeddedMigrationsRef(
-                &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
-            ),
-        )?;
-        applied.extend(ch_result.applied);
-
+        for set in shard_framework_migration_sets() {
+            let result = run_pending(database_url, EmbeddedMigrationsRef(set))?;
+            applied.extend(result.applied);
+        }
         Ok(MigrationResult { applied })
     }
     #[cfg(not(feature = "db"))]
@@ -2748,8 +2755,8 @@ pub fn run_pending_shard_framework_migrations(
     }
 }
 
-/// Names of pending shard-required framework migrations (version-history +
-/// commit-hook queue) on `database_url`.
+/// Names of pending shard-required framework migrations (version-history,
+/// commit-hook queue and derivation state) on `database_url`.
 ///
 /// The status counterpart to [`run_pending_shard_framework_migrations`]: used
 /// by `autumn migrate status --shard ...` so a shard reports only the framework
@@ -2767,16 +2774,9 @@ pub fn pending_shard_framework_migrations(
     #[cfg(feature = "db")]
     {
         let mut pending: Vec<String> = Vec::new();
-        pending.extend(pending_migrations(
-            database_url,
-            EmbeddedMigrationsRef(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
-        )?);
-        pending.extend(pending_migrations(
-            database_url,
-            EmbeddedMigrationsRef(
-                &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
-            ),
-        )?);
+        for set in shard_framework_migration_sets() {
+            pending.extend(pending_migrations(database_url, EmbeddedMigrationsRef(set))?);
+        }
         Ok(pending)
     }
     #[cfg(not(feature = "db"))]
@@ -3072,6 +3072,32 @@ pub(crate) fn auto_migrate_sqlite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shard holds tenant rows, so it needs every framework table the
+    /// repositories that write those rows touch. Missing one leaves
+    /// `autumn migrate --shard` reporting a clean shard that a boot then fails
+    /// on, so the list is asserted rather than left to review.
+    #[cfg(feature = "db")]
+    #[test]
+    fn every_shard_required_framework_table_is_in_the_shard_set() {
+        let names: Vec<String> = shard_framework_migration_sets()
+            .into_iter()
+            .flat_map(|set| {
+                migration_versions_and_names::<Pg>(set).expect("enumerate an embedded set")
+            })
+            .map(|(_, name)| name)
+            .collect();
+        for required in [
+            "20260526000000_create_version_history",
+            "20260515000000_create_repository_commit_hook_queue",
+            "20260907000000_create_derivations",
+        ] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "`{required}` must reach every shard target: {names:?}"
+            );
+        }
+    }
 
     // ── Migration-version collision auto-resolution (plugin/app/framework) ─
 

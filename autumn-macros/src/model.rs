@@ -1294,7 +1294,9 @@ fn derivation_fk(
     }
     let legs: Vec<&Association> = assocs
         .iter()
-        .filter(|a| a.kind == AssocKind::BelongsTo && a.target == decl.target && a.through.is_none())
+        .filter(|a| {
+            a.kind == AssocKind::BelongsTo && a.target == decl.target && a.through.is_none()
+        })
         .collect();
     // Two legs to one parent (`Message` -> `sender` / `recipient`) give no
     // ground to prefer either key, and guessing would count the wrong parent.
@@ -1319,10 +1321,7 @@ fn derivation_fk(
     if let Some(assoc) = legs.first() {
         return Ok(assoc.fk.clone());
     }
-    Ok(format!(
-        "{}_id",
-        pascal_to_snake(&decl.target.to_string())
-    ))
+    Ok(format!("{}_id", pascal_to_snake(&decl.target.to_string())))
 }
 
 /// Reject a `#[derivation]` that maintains a `(parent table, column)` pair
@@ -10489,7 +10488,6 @@ mod tests {
         assert_eq!(decls.len(), 2);
     }
 
-
     // ── #1769 review follow-ups (M1-M12) ──────────────────────────────────
 
     #[test]
@@ -10544,9 +10542,8 @@ mod tests {
     #[test]
     fn derivation_parent_table_override_is_recorded() {
         let model: syn::Ident = syn::parse_quote!(Comment);
-        let attrs: Vec<syn::Attribute> = vec![
-            syn::parse_quote!(#[derivation(Post, column = "c", parent_table = "articles")]),
-        ];
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", parent_table = "articles")])];
         let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
         assert_eq!(derivation_parent_table(&decls[0]), "articles");
         assert_eq!(

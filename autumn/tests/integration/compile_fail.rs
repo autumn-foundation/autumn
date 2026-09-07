@@ -155,6 +155,23 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_derivation_sum_non_integer.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_derivation_duplicate_column.rs");
+    // The two macro-time guards that carry the injection argument: the
+    // maintained column is spliced into `UPDATE <parent> SET ...`, and a brace
+    // in a filter literal could forge the `{c}` child-alias placeholder.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_bad_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_brace_literal.rs");
+    // A filter names the column after the Rust field, so a field renamed by
+    // `#[diesel(column_name = ...)]` cannot appear in one.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_diesel_column_name.rs");
+    // Two `#[belongs_to]` legs to one parent leave the default foreign key
+    // ambiguous, and `tenant` names a column of the child.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_ambiguous_fk.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_tenant_non_field.rs");
 
     // Model-declared dependent cascades (#1702): `dependent = <action>` /
     // `on_delete = <action>` is a `has_many`/`has_one` option, only the four

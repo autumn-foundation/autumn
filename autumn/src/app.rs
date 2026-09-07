@@ -10382,11 +10382,18 @@ async fn setup_database(
     .await;
 
     // Derivations (#1769): the state table exists by now, so reconcile each
-    // declared `#[derivation]` against it and repair whatever changed. Nothing
-    // here is fatal — a derivation whose backfill has not run yet is stale, not
-    // broken, and `/actuator/derivations` reports exactly that.
+    // declared `#[derivation]` against it and repair whatever changed. A
+    // registry collision stops the boot; a database failure only logs, because
+    // a derivation whose backfill has not run is stale rather than broken and
+    // `/actuator/derivations` reports exactly that.
     if runtime_boot && crate::derivation::has_derivation_descriptors() {
-        start_derivation_backfill(topology.as_ref()).await;
+        if let Err(e) =
+            start_derivation_backfill(topology.as_ref(), shards.as_ref()).await
+        {
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            return Err(e);
+        }
     }
 
     let (replica_readiness, replica_migration_check) = if topology
@@ -10444,66 +10451,168 @@ async fn setup_database(
     })
 }
 
-/// Reconcile the declared derivations, then repair them in the background.
+/// Batches one boot backfill round runs before it returns its connection.
+///
+/// The connection goes back to the pool between rounds. A `SQLite` pool is often
+/// size 1, so a sweep that held its only connection would stall every request
+/// for the length of the sweep.
+#[cfg(feature = "db")]
+const BOOT_BACKFILL_BATCHES: usize = 8;
+
+/// Rounds one boot backfill task runs before it gives up.
+///
+/// Each round that leaves work behind has committed `BOOT_BACKFILL_BATCHES`
+/// checkpoints, and a checkpoint only moves forward, so the sweep terminates on
+/// its own. This is the guard that keeps a pathological loop from spinning
+/// forever anyway.
+#[cfg(feature = "db")]
+const BOOT_BACKFILL_MAX_ROUNDS: usize = 100_000;
+
+/// Reconcile the declared derivations on every primary, then repair them in the
+/// background.
 ///
 /// Reconciliation runs inline because it is two statements per derivation and
 /// the answer decides what the backfill has to do. The backfill itself is
 /// spawned: it sweeps whole parent tables, so blocking the boot on it would
-/// delay serving traffic that the maintained columns are already correct for.
+/// delay serving traffic the maintained columns are already correct for.
 ///
-/// Every failure is logged and swallowed. A derivation that cannot be
-/// reconciled leaves the maintained column exactly as it was — stale at worst —
-/// and refusing to boot over that would take an application down for a
-/// denormalised read model it may not even serve yet.
+/// A sharded app reconciles and repairs on **every shard primary** as well as on
+/// the control primary. The state-table migration is applied to shards too, and
+/// shards are where the tenant rows live, so a shard that never reconciled would
+/// hold a stale derived column forever.
+///
+/// A registry collision is returned to the caller and stops the boot. Two
+/// derivations on one parent column double count every mutation, which is data
+/// corruption, so booting on it is worse than not booting.
+///
+/// A database failure is logged and skipped instead. The backfill is **not**
+/// spawned for a target whose reconcile failed: the sweep reads the state the
+/// reconcile writes, so sweeping after a failed reconcile would work from a
+/// stale answer.
 #[cfg(feature = "db")]
-async fn start_derivation_backfill(topology: Option<&crate::db::DatabaseTopology>) {
-    let Some(topology) = topology else {
-        return;
-    };
-    let pool = topology.primary().clone();
-    match pool.get().await {
-        Ok(mut conn) => match crate::derivation::ensure_derivations(&mut conn).await {
-            Ok(enqueued) if !enqueued.is_empty() => tracing::info!(
-                derivations = ?enqueued,
-                "derivation definitions changed; backfill enqueued"
-            ),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                %error,
-                "could not reconcile derivation definitions; \
-                 see /actuator/derivations"
-            ),
-        },
-        Err(error) => {
-            tracing::warn!(%error, "no connection to reconcile derivation definitions");
-            return;
+async fn start_derivation_backfill(
+    topology: Option<&crate::db::DatabaseTopology>,
+    shards: Option<&crate::sharding::ShardSet>,
+) -> Result<(), String> {
+    // No connection needed, so a collision is caught before any data is touched.
+    crate::derivation::check_registered_derivations()
+        .map_err(|error| format!("Invalid `#[derivation]` registry: {error}"))?;
+
+    let mut targets: Vec<(String, crate::db::Pool<crate::db::RuntimeConnection>)> = Vec::new();
+    if let Some(topology) = topology {
+        targets.push(("control".to_owned(), topology.primary().clone()));
+    }
+    if let Some(shards) = shards {
+        for shard in shards.iter() {
+            targets.push((
+                format!("shard {}", shard.name()),
+                shard.primary_pool().clone(),
+            ));
         }
     }
 
-    tokio::spawn(async move {
+    for (label, pool) in targets {
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
             Err(error) => {
-                tracing::warn!(%error, "no connection to backfill derivations");
-                return;
+                tracing::warn!(
+                    %error,
+                    database = %label,
+                    "no connection to reconcile derivation definitions"
+                );
+                continue;
             }
         };
-        match crate::derivation::run_backfill(
-            &mut conn,
-            &crate::derivation::BackfillOptions::default(),
-        )
-        .await
-        {
-            Ok(report) => {
-                if !report.completed.is_empty() || report.rows_repaired > 0 {
+        match crate::derivation::ensure_derivations(&mut conn).await {
+            Ok(enqueued) => {
+                if !enqueued.is_empty() {
                     tracing::info!(
-                        completed = ?report.completed,
-                        rows_repaired = report.rows_repaired,
-                        "derivation backfill finished"
+                        database = %label,
+                        derivations = ?enqueued,
+                        "derivation definitions changed; backfill enqueued"
                     );
                 }
             }
-            Err(error) => tracing::warn!(%error, "derivation backfill failed"),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    database = %label,
+                    "could not reconcile derivation definitions; \
+                     see /actuator/derivations"
+                );
+                continue;
+            }
+        }
+        drop(conn);
+        spawn_derivation_backfill(label, pool);
+    }
+    Ok(())
+}
+
+/// Sweep one target's enqueued derivations in the background, a few batches per
+/// pooled connection.
+///
+/// The loop is what keeps the connection borrowed briefly. Each round checks out
+/// a connection, runs [`BOOT_BACKFILL_BATCHES`] batches, returns the connection
+/// and repeats while the report still lists work. Several replicas doing this
+/// cooperate: each batch locks the derivation's state row, so they take turns on
+/// one sweep instead of racing.
+#[cfg(feature = "db")]
+fn spawn_derivation_backfill(
+    label: String,
+    pool: crate::db::Pool<crate::db::RuntimeConnection>,
+) {
+    tokio::spawn(async move {
+        let options = crate::derivation::BackfillOptions {
+            max_batches: Some(BOOT_BACKFILL_BATCHES),
+            ..crate::derivation::BackfillOptions::default()
+        };
+        let mut completed: Vec<String> = Vec::new();
+        let mut rows_repaired = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        database = %label,
+                        "no connection to backfill derivations"
+                    );
+                    return;
+                }
+            };
+            let report = match crate::derivation::run_backfill(&mut conn, &options).await {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::warn!(%error, database = %label, "derivation backfill failed");
+                    return;
+                }
+            };
+            drop(conn);
+            completed.extend(report.completed);
+            rows_repaired += report.rows_repaired;
+            if report.in_progress.is_empty() {
+                break;
+            }
+            rounds += 1;
+            if rounds >= BOOT_BACKFILL_MAX_ROUNDS {
+                tracing::warn!(
+                    database = %label,
+                    pending = ?report.in_progress,
+                    "derivation backfill gave up after {BOOT_BACKFILL_MAX_ROUNDS} rounds; \
+                     see /actuator/derivations"
+                );
+                break;
+            }
+        }
+        if !completed.is_empty() || rows_repaired > 0 {
+            tracing::info!(
+                database = %label,
+                completed = ?completed,
+                rows_repaired,
+                "derivation backfill finished"
+            );
         }
     });
 }

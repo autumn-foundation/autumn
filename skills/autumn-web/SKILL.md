@@ -756,7 +756,9 @@ unchanged parent. The filter grammar is `field`, `!field`, `field OP <int|bool|
 string literal>`, `field.is_some()`/`is_none()`, `a && b` and parentheses over
 `bool`/integer/`String` fields and their `Option` forms; each filter is lowered
 to both Rust and SQL, and string ordering comparisons and float literals are
-compile errors. Other keys: `fk`, `tenant`, `name`. The parent column is the
+compile errors. Other keys, each at most once: `fk`, `parent_table` (for a
+parent that overrides its table; the parent pk is always `id`), `tenant`,
+`name`. The parent column is the
 app's migration (`BIGINT NOT NULL DEFAULT 0`); the `_autumn_derivations` state
 table ships as a framework migration and is applied automatically. Each
 derivation is content-addressed, so a changed filter enqueues a resumable,

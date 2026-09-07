@@ -349,6 +349,19 @@ fn check_unique_columns(defs: &[&DerivationDef]) -> AutumnResult<()> {
     Ok(())
 }
 
+/// Check the linked registry without touching a database.
+///
+/// The boot path calls this before it opens a connection, so a duplicate name
+/// or two derivations on one parent column stop the process rather than reach
+/// the data. Both are programming errors.
+///
+/// # Errors
+///
+/// Returns an error naming both offenders and their module paths.
+pub fn check_registered_derivations() -> AutumnResult<()> {
+    check_registry(&registered_derivations())
+}
+
 // ── State ───────────────────────────────────────────────────────────────────
 
 /// How far a derivation's backfill has got.
@@ -575,11 +588,12 @@ impl Default for BackfillOptions {
 pub struct BackfillReport {
     /// Derivations that reached `complete` in this call.
     pub completed: Vec<String>,
-    /// Derivations still `running` when the call returned, because
-    /// [`BackfillOptions::max_batches`] stopped it. Each keeps its checkpoint.
+    /// Every derivation still pending or running when the call returned,
+    /// because [`BackfillOptions::max_batches`] stopped it. Each keeps its
+    /// committed checkpoint, so the next call resumes rather than restarts.
     pub in_progress: Vec<String>,
-    /// Parent rows actually repaired — a value that already agreed with the
-    /// source of truth is not counted, and is not written.
+    /// Parent rows actually repaired. A value that already agreed with the
+    /// source of truth is neither counted here nor written.
     pub rows_repaired: usize,
 }
 
@@ -1075,7 +1089,7 @@ mod tests {
 
     #[test]
     fn drift_is_one_aggregate_over_the_parent_table() {
-        let sql = crate::counter_cache::drift_sql(&sum_def().sql_view());
+        let sql = crate::counter_cache::drift_sql(&sum_def().sql_view(), DRIFT_SCAN_LIMIT);
         assert!(
             sql.starts_with("SELECT COUNT(*) AS count FROM \"dv_posts\""),
             "{sql}"
@@ -1105,8 +1119,200 @@ mod tests {
                 serde_json::to_string(&state).expect("serialize"),
                 format!("\"{state}\"")
             );
+            assert!(state.is_sweepable() != (state == BackfillState::Complete));
         }
         assert_eq!(BackfillState::parse("done"), None);
+
+        // `unregistered` is reported, never stored: the state table's `CHECK`
+        // does not admit it, so a row carrying it is a corrupt row.
+        assert_eq!(BackfillState::Unregistered.as_str(), "unregistered");
+        assert_eq!(BackfillState::parse("unregistered"), None);
+        assert!(!BackfillState::Unregistered.is_sweepable());
+        assert_eq!(
+            serde_json::to_string(&BackfillState::Unregistered).expect("serialize"),
+            "\"unregistered\""
+        );
+    }
+
+    #[test]
+    fn two_derivations_on_one_parent_column_are_rejected() {
+        // Both would apply their own delta on every mutation, so the column
+        // would count twice. That is data corruption, not staleness, which is
+        // why the boot path refuses to start on it.
+        let first = count_def();
+        let mut second = count_def();
+        second.name = "dv_posts.published_comment_count_again";
+        second.model = "DvOtherComment";
+        second.module_path = "other::module";
+        second.filter_sql = "";
+        let err = check_unique_columns(&[&first, &second])
+            .expect_err("one column cannot carry two derivations");
+        let message = err.to_string();
+        assert!(message.contains("dv_posts.published_comment_count"), "{message}");
+        assert!(message.contains("other::module"), "{message}");
+        assert!(message.contains("count twice"), "{message}");
+
+        // A second derivation on another column of the same parent is fine.
+        let mut sibling = count_def();
+        sibling.name = "dv_posts.visible_score";
+        sibling.column = "visible_score";
+        check_unique_columns(&[&first, &sibling]).expect("two columns, two derivations");
+
+        // `check_registry` runs both checks, so it catches this one too.
+        check_registry(&[&first, &second]).expect_err("the registry check covers columns");
+    }
+
+    #[test]
+    fn a_filtered_count_recompute_counts_only_matching_rows() {
+        let sql = crate::counter_cache::recompute_update_sql(&count_def().sql_view(), "1,2");
+        assert_eq!(
+            sql,
+            "UPDATE \"dv_posts\" SET \"published_comment_count\" = \
+             (SELECT COUNT(*) FROM \"dv_comments\" AS __autumn_cc_child \
+              WHERE __autumn_cc_child.\"post_id\" = \"dv_posts\".\"id\" \
+                AND (__autumn_cc_child.\"published\" = TRUE)) \
+             WHERE \"dv_posts\".\"id\" IN (1,2) \
+               AND \"dv_posts\".\"published_comment_count\" "
+                .to_owned()
+                + IS_DISTINCT_FROM
+                + " (SELECT COUNT(*) FROM \"dv_comments\" AS __autumn_cc_child \
+              WHERE __autumn_cc_child.\"post_id\" = \"dv_posts\".\"id\" \
+                AND (__autumn_cc_child.\"published\" = TRUE))"
+        );
+    }
+
+    #[test]
+    fn a_sum_recompute_sums_the_contribution() {
+        let sql = crate::counter_cache::recompute_update_sql(&sum_def().sql_view(), "5");
+        assert!(
+            sql.starts_with(
+                "UPDATE \"dv_posts\" SET \"visible_score\" = \
+                 (SELECT COALESCE(SUM(__autumn_cc_child.\"score\"), 0) \
+                  FROM \"dv_comments\" AS __autumn_cc_child"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "AND (__autumn_cc_child.\"published\" = TRUE) \
+                 AND (__autumn_cc_child.\"score\" > 0))"
+            ),
+            "both conjuncts of the filter must survive: {sql}"
+        );
+        assert!(sql.contains("\"dv_posts\".\"id\" IN (5)"), "{sql}");
+    }
+
+    #[test]
+    fn drift_is_one_aggregate_over_the_parent_table() {
+        let sql = crate::counter_cache::drift_sql(&sum_def().sql_view(), DRIFT_SCAN_LIMIT);
+        assert!(
+            sql.starts_with("SELECT COUNT(*) AS count FROM \"dv_posts\""),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(&format!("\"visible_score\" {IS_DISTINCT_FROM}")),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_backfill_pages_a_thousand_parents_at_a_time_by_default() {
+        let options = BackfillOptions::default();
+        assert_eq!(options.batch_size, 1000);
+        assert!(options.max_batches.is_none(), "the default runs to the end");
+    }
+
+    #[test]
+    fn a_backfill_state_round_trips_through_its_stored_spelling() {
+        for state in [
+            BackfillState::Pending,
+            BackfillState::Running,
+            BackfillState::Complete,
+        ] {
+            assert_eq!(BackfillState::parse(state.as_str()), Some(state));
+            assert_eq!(
+                serde_json::to_string(&state).expect("serialize"),
+                format!("\"{state}\"")
+            );
+            assert!(state.is_sweepable() != (state == BackfillState::Complete));
+        }
+        assert_eq!(BackfillState::parse("done"), None);
+
+        // `unregistered` is reported, never stored: the state table's `CHECK`
+        // does not admit it, so a row carrying it is a corrupt row.
+        assert_eq!(BackfillState::Unregistered.as_str(), "unregistered");
+        assert_eq!(BackfillState::parse("unregistered"), None);
+        assert!(!BackfillState::Unregistered.is_sweepable());
+        assert_eq!(
+            serde_json::to_string(&BackfillState::Unregistered).expect("serialize"),
+            "\"unregistered\""
+        );
+    }
+
+    #[test]
+    fn two_derivations_on_one_parent_column_are_rejected() {
+        // Both would apply their own delta on every mutation, so the column
+        // would count twice. That is data corruption, not staleness, which is
+        // why the boot path refuses to start on it.
+        let first = count_def();
+        let mut second = count_def();
+        second.name = "dv_posts.published_comment_count_again";
+        second.model = "DvOtherComment";
+        second.module_path = "other::module";
+        second.filter_sql = "";
+        let err = check_unique_columns(&[&first, &second])
+            .expect_err("one column cannot carry two derivations");
+        let message = err.to_string();
+        assert!(message.contains("dv_posts.published_comment_count"), "{message}");
+        assert!(message.contains("other::module"), "{message}");
+        assert!(message.contains("count twice"), "{message}");
+
+        // A second derivation on another column of the same parent is fine.
+        let mut sibling = count_def();
+        sibling.name = "dv_posts.visible_score";
+        sibling.column = "visible_score";
+        check_unique_columns(&[&first, &sibling]).expect("two columns, two derivations");
+
+        // `check_registry` runs both checks, so it catches this one too.
+        check_registry(&[&first, &second]).expect_err("the registry check covers columns");
+    }
+
+    #[test]
+    fn a_status_row_serializes_every_field_the_actuator_documents() {
+        let status = DerivationStatus {
+            name: "dv_posts.published_comment_count".to_owned(),
+            definition_hash: Some(count_def().definition_hash()),
+            stored_hash: None,
+            backfill_state: Some(BackfillState::Pending),
+            checkpoint: None,
+            backfilled_rows: 0,
+            updated_at: None,
+            drift: Some(DRIFT_SCAN_LIMIT),
+            drift_error: None,
+        };
+        let json = serde_json::to_value(&status).expect("serialize");
+        let object = json.as_object().expect("a status is a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "backfill_state",
+                "backfilled_rows",
+                "checkpoint",
+                "definition_hash",
+                "drift",
+                "drift_error",
+                "name",
+                "stored_hash",
+                "updated_at",
+            ]
+        );
+        // An absent value is reported as `null` rather than dropped, so a
+        // consumer can tell "not measured" from "zero".
+        assert!(object["stored_hash"].is_null());
+        assert!(object["drift_error"].is_null());
+        assert_eq!(object["drift"], serde_json::json!(DRIFT_SCAN_LIMIT));
     }
 
     #[test]

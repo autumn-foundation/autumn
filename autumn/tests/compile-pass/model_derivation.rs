@@ -7,6 +7,11 @@
 //!   first, unfiltered, and the derivations follow in declaration order.
 //! * `Membership` declares an unfiltered `count` with no `#[belongs_to]` at
 //!   all, so the foreign key resolves by the `{snake(Parent)}_id` convention.
+//! * `Reaction` covers the `fk`, `name` and `tenant` overrides: two
+//!   `#[belongs_to]` legs to one parent leave the default foreign key
+//!   ambiguous, so each derivation names its own.
+//! * `Bookmark` covers `parent_table`, for a parent whose table name does not
+//!   follow the convention.
 //! * `Plain` declares neither, proving a model without them still resolves to
 //!   the empty blanket impl.
 use autumn_web::model;
@@ -23,6 +28,8 @@ diesel::table! {
         long_comment_count -> BigInt,
         anonymous_comment_count -> BigInt,
         visible_score -> BigInt,
+        reaction_count -> BigInt,
+        origin_weight -> BigInt,
     }
 }
 
@@ -53,6 +60,30 @@ diesel::table! {
 }
 
 diesel::table! {
+    reactions (id) {
+        id -> BigInt,
+        post_id -> BigInt,
+        origin_id -> BigInt,
+        tenant_id -> BigInt,
+        weight -> BigInt,
+    }
+}
+
+diesel::table! {
+    archive_posts (id) {
+        id -> BigInt,
+        bookmark_count -> BigInt,
+    }
+}
+
+diesel::table! {
+    bookmarks (id) {
+        id -> BigInt,
+        archive_id -> BigInt,
+    }
+}
+
+diesel::table! {
     plains (id) {
         id -> BigInt,
         post_id -> BigInt,
@@ -78,6 +109,10 @@ pub struct Post {
     pub anonymous_comment_count: i64,
     #[default]
     pub visible_score: i64,
+    #[default]
+    pub reaction_count: i64,
+    #[default]
+    pub origin_weight: i64,
 }
 
 #[model]
@@ -113,6 +148,44 @@ pub struct Membership {
     #[id]
     pub id: i64,
     pub team_id: i64,
+}
+
+#[model]
+#[belongs_to(Post, fk = post_id, name = post)]
+#[belongs_to(Post, fk = origin_id, name = origin)]
+#[derivation(Post, column = "reaction_count", fk = post_id, tenant = "tenant_id")]
+#[derivation(
+    Post,
+    column = "origin_weight",
+    fk = origin_id,
+    name = "posts.origin_weight_total",
+    transform = sum(weight)
+)]
+pub struct Reaction {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub origin_id: i64,
+    pub tenant_id: i64,
+    pub weight: i64,
+}
+
+/// A parent whose table name does not follow the `{snake(Type)}s` convention,
+/// so a derivation onto it needs `parent_table = "..."`.
+#[model(table = "archive_posts")]
+pub struct Archive {
+    #[id]
+    pub id: i64,
+    #[default]
+    pub bookmark_count: i64,
+}
+
+#[model]
+#[derivation(Archive, column = "bookmark_count", parent_table = "archive_posts")]
+pub struct Bookmark {
+    #[id]
+    pub id: i64,
+    pub archive_id: i64,
 }
 
 #[model]
@@ -229,6 +302,48 @@ fn main() {
         "teams.member_count"
     );
     assert_eq!((specs[0].contrib_of)(&Membership { id: 1, team_id: 4 }), 1);
+
+    // Every override at once. The two `#[belongs_to]` legs to `Archive` leave
+    // the default foreign key ambiguous, so each derivation names its own.
+    let reaction = Reaction {
+        id: 1,
+        post_id: 9,
+        origin_id: 11,
+        tenant_id: 3,
+        weight: 4,
+    };
+    let specs = Reaction::counter_caches();
+    assert_eq!(specs.len(), 2);
+
+    // `fk` and `tenant`: the tenant column reaches the spec and the
+    // definition, and an i64 sum is read without widening.
+    let reactions = &specs[0];
+    assert_eq!(reactions.fk_column, "post_id");
+    assert_eq!(reactions.tenant_column, Some("tenant_id"));
+    assert_eq!(reactions.contrib_sql, "1");
+    assert_eq!((reactions.contrib_of)(&reaction), 1);
+    let def = reactions.derivation.expect("registered definition");
+    assert_eq!(def.name, "posts.reaction_count");
+    assert_eq!(def.tenant_column, Some("tenant_id"));
+
+    let origins = &specs[1];
+    assert_eq!(origins.fk_column, "origin_id");
+    assert_eq!(origins.contrib_sql, "{c}.\"weight\"");
+    assert_eq!((origins.contrib_of)(&reaction), 4);
+    assert_eq!(
+        origins.derivation.expect("registered definition").name,
+        "posts.origin_weight_total"
+    );
+
+    // `parent_table`: the override reaches the spec, the definition and the
+    // default name, in place of the inferred `archives`.
+    let specs = Bookmark::counter_caches();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].parent_table, "archive_posts");
+    assert_eq!(specs[0].fk_column, "archive_id");
+    let def = specs[0].derivation.expect("registered definition");
+    assert_eq!(def.parent_table, "archive_posts");
+    assert_eq!(def.name, "archive_posts.bookmark_count");
 
     // Neither declaration -> the empty blanket impl.
     assert!(Plain::counter_caches().is_empty());
