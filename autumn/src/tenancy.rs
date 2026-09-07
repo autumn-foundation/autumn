@@ -39,7 +39,10 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
             .ok_or_else(|| {
                 crate::AutumnError::service_unavailable_msg("Config is not available")
             })?;
-        let tenant_id = extract_tenant_from_parts(parts, &config).await?;
+        let domains = state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
+        let tenant_id =
+            extract_tenant_from_parts_with_domains(parts, &config, domains.as_deref().map(AsRef::as_ref))
+                .await?;
         Ok(Self(tenant_id))
     }
 }
@@ -70,7 +73,37 @@ pub async fn extract_tenant_from_parts(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
+    extract_tenant_from_parts_with_domains(parts, config, None).await
+}
+
+/// [`extract_tenant_from_parts`], plus the custom-domain registry (#1635).
+///
+/// A hostname a tenant connected is not a subdomain of `tenancy.base_domain`,
+/// so subdomain resolution would reject it. Consulting the registry FIRST — and
+/// only for a domain that has reached `Active` — is what routes
+/// `app.clientco.com` to its owning tenant while an unregistered outside host
+/// keeps its 400.
+///
+/// Callers holding an `AppState` pass `state.extension::<Arc<CustomDomainRegistry>>()`;
+/// `None` is the pre-#1635 behaviour.
+#[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+pub async fn extract_tenant_from_parts_with_domains(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    domains: Option<&crate::custom_domain::CustomDomainRegistry>,
+) -> Result<String, crate::AutumnError> {
     if let Some(tenant_id) = replayed_tenant() {
+        return Ok(tenant_id);
+    }
+    // The registry is consulted before the configured source so a connected
+    // domain routes whatever `tenancy.source` is: a `Host` that a tenant owns
+    // identifies that tenant more directly than any header or claim could.
+    if config.tenancy.enabled
+        && let Some(registry) = domains
+        && let Some(host) = request_host(parts)
+        && let Some(tenant_id) = registry.tenant_for_host(&host)
+    {
+        record_tenant(&tenant_id);
         return Ok(tenant_id);
     }
     // A capsule with no recorded tenant falls through to the real resolver.
@@ -113,6 +146,27 @@ fn record_tenant(tenant_id: &str) {
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
 const fn record_tenant(_tenant_id: &str) {}
+
+/// The request's effective host, preferring the proxy-resolved one.
+///
+/// The `X-Forwarded-Host` a trusted upstream set (resolved into
+/// [`crate::security::ResolvedClientIdentity`]) wins over the raw `Host`
+/// header, so a deployment behind a load balancer sees the name the client
+/// actually asked for. `None` when neither is present or the header is not
+/// UTF-8.
+fn request_host(parts: &axum::http::request::Parts) -> Option<String> {
+    parts
+        .extensions
+        .get::<crate::security::ResolvedClientIdentity>()
+        .and_then(|id| id.host.clone())
+        .or_else(|| {
+            parts
+                .headers
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(ToOwned::to_owned)
+        })
+}
 
 // Tenant extraction logic based on configuration
 #[allow(
@@ -161,32 +215,21 @@ async fn extract_tenant_from_parts_inner(
             Ok(val)
         }
         "subdomain" => {
-            // Prefer the proxy-resolved host (honours X-Forwarded-Host from trusted
-            // upstreams); fall back to the raw Host header when the layer has not run.
-            let host_owned: String = parts
-                .extensions
-                .get::<crate::security::ResolvedClientIdentity>()
-                .and_then(|id| id.host.clone())
-                .map_or_else(
-                    || {
-                        parts
-                            .headers
-                            .get(axum::http::header::HOST)
-                            .ok_or_else(|| {
-                                crate::AutumnError::bad_request_msg(
-                                    "Missing Host header for subdomain tenancy",
-                                )
-                            })
-                            .and_then(|h| {
-                                h.to_str().map(ToOwned::to_owned).map_err(|_| {
-                                    crate::AutumnError::bad_request_msg(
-                                        "Invalid UTF-8 in Host header",
-                                    )
-                                })
-                            })
-                    },
-                    Ok,
-                )?;
+            let host_owned = match request_host(parts) {
+                Some(host) => host,
+                // A present-but-undecodable `Host` is a different operator
+                // problem from an absent one, so it keeps its own message.
+                None if parts.headers.contains_key(axum::http::header::HOST) => {
+                    return Err(crate::AutumnError::bad_request_msg(
+                        "Invalid UTF-8 in Host header",
+                    ));
+                }
+                None => {
+                    return Err(crate::AutumnError::bad_request_msg(
+                        "Missing Host header for subdomain tenancy",
+                    ));
+                }
+            };
 
             let host = host_owned.as_str();
             let host_only = host.split(':').next().unwrap_or(host).trim();
@@ -569,7 +612,14 @@ pub async fn tenancy_middleware(
         return next.run(Request::from_parts(parts, body)).await;
     }
 
-    let tenant_id = match extract_tenant_from_parts(&mut parts, &config).await {
+    let domains = state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
+    let tenant_id = match extract_tenant_from_parts_with_domains(
+        &mut parts,
+        &config,
+        domains.as_deref().map(AsRef::as_ref),
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             // For browser logins, bounce a missing/unauthenticated tenant to the

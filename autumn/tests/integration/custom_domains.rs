@@ -499,7 +499,7 @@ async fn renewal_is_due_per_domain_and_one_failure_leaves_the_others_alone() {
 #[cfg(feature = "tls")]
 mod sni {
     use super::{CustomDomainRegistry, MemoryCustomDomainStore, NOW};
-    use crate::tls_support::{CERT_PEM, KEY_PEM, RENEWED_CERT_PEM, RENEWED_KEY_PEM};
+    use super::super::tls_support::{CERT_PEM, KEY_PEM, RENEWED_CERT_PEM, RENEWED_KEY_PEM};
     use autumn_web::custom_domain::{CustomDomainCertCache, SniCertResolver};
     use std::sync::Arc;
 
