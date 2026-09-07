@@ -7,6 +7,7 @@ mod db_pull;
 mod db_scrub;
 mod dependency_audit;
 mod deploy;
+mod destroy_provenance;
 mod edge;
 mod generate_json_postgres;
 mod generate_lock_version_postgres;
