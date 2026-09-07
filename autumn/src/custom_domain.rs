@@ -502,6 +502,7 @@ impl MemoryCustomDomainStore {
     }
 
     /// Every stored record, without an await — for assertions.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn load_all_blocking(&self) -> Vec<CustomDomain> {
         read_lock(&self.records).values().cloned().collect()
@@ -510,7 +511,7 @@ impl MemoryCustomDomainStore {
 
 impl CustomDomainStore for MemoryCustomDomainStore {
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>> {
-        Box::pin(async move { Ok(self.load_all_blocking()) })
+        Box::pin(async move { Ok(read_lock(&self.records).values().cloned().collect()) })
     }
 
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>> {
@@ -649,6 +650,11 @@ pub enum RegisterError {
         /// The tenant that owns it.
         tenant: String,
     },
+    /// The deployment already owns this hostname, so no tenant may claim it.
+    Reserved {
+        /// The reserved pattern the hostname matched.
+        pattern: String,
+    },
     /// The record could not be persisted.
     Store(String),
 }
@@ -665,6 +671,11 @@ impl std::fmt::Display for RegisterError {
             Self::Conflict { tenant } => {
                 write!(f, "hostname is already connected to tenant {tenant}")
             }
+            Self::Reserved { pattern } => write!(
+                f,
+                "hostname is reserved by this deployment ({pattern}); a tenant cannot connect a \
+                 name the operator already serves"
+            ),
             Self::Store(msg) => write!(f, "failed to persist the custom domain: {msg}"),
         }
     }
@@ -683,6 +694,15 @@ pub struct CustomDomainRegistry {
     store: Arc<dyn CustomDomainStore>,
     index: RwLock<HashMap<String, CustomDomain>>,
     max_domains: usize,
+    /// Hostnames and wildcard patterns no tenant may claim.
+    reserved: Vec<String>,
+    /// Whether [`load`](Self::load) has completed successfully.
+    ///
+    /// The retention prune deletes certificates for hostnames the registry
+    /// does not know, so it must never run over an index that failed to
+    /// hydrate: that index knows nothing, and every tenant certificate would
+    /// read as an orphan.
+    hydrated: std::sync::atomic::AtomicBool,
 }
 
 impl CustomDomainRegistry {
@@ -693,7 +713,63 @@ impl CustomDomainRegistry {
             store,
             index: RwLock::new(HashMap::new()),
             max_domains,
+            reserved: Vec::new(),
+            hydrated: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Refuse registration of these hostnames and wildcard patterns.
+    ///
+    /// The deployment's own certificate names and tenancy base domain belong
+    /// here. Without them a tenant can connect another tenant's subdomain —
+    /// which the operator's own wildcard already points at this deployment, so
+    /// it verifies and issues — and from then on every request for that host
+    /// resolves to the tenant that registered it.
+    ///
+    /// A pattern matches the name itself and, unless it is a bare apex, every
+    /// name below it: `myapp.com` reserves `myapp.com` and `acme.myapp.com`
+    /// alike. `*.myapp.com` reserves the subtree but not the apex.
+    #[must_use]
+    pub fn with_reserved(mut self, patterns: impl IntoIterator<Item = String>) -> Self {
+        self.reserved = patterns
+            .into_iter()
+            .map(|p| p.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        self
+    }
+
+    /// The reserved pattern `host` matches, if any.
+    fn reserved_match(&self, host: &str) -> Option<String> {
+        self.reserved
+            .iter()
+            .find(|pattern| {
+                pattern.strip_prefix("*.").map_or_else(
+                    // A bare name reserves itself AND everything under it: an
+                    // operator listing `myapp.com` means the whole zone, not
+                    // just the apex.
+                    || host == *pattern || host.ends_with(&format!(".{pattern}")),
+                    |suffix| host == suffix || host.ends_with(&format!(".{suffix}")),
+                )
+            })
+            .cloned()
+    }
+
+    /// The registry an app is serving with, if custom domains are enabled.
+    ///
+    /// The one supported way for application code to reach it — registering a
+    /// tenant hostname, rendering status, offboarding.
+    #[must_use]
+    pub fn from_state(state: &crate::AppState) -> Option<Arc<Self>> {
+        state
+            .extension::<Arc<Self>>()
+            .map(|outer| Arc::clone(&*outer))
+    }
+
+    /// Whether the index has been hydrated from the store.
+    #[must_use]
+    pub fn is_hydrated(&self) -> bool {
+        self.hydrated.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Hydrate the index from the store. Returns how many records loaded.
@@ -708,6 +784,8 @@ impl CustomDomainRegistry {
         for record in records {
             index.insert(record.hostname.clone(), record);
         }
+        self.hydrated
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(index.len())
     }
 
@@ -734,9 +812,16 @@ impl CustomDomainRegistry {
                 "tenant id must not be empty".to_owned(),
             ));
         }
+        if let Some(pattern) = self.reserved_match(&host) {
+            return Err(RegisterError::Reserved { pattern });
+        }
 
-        {
-            let index = read_lock(&self.index);
+        // Claim the hostname in the index FIRST, under one write lock, and only
+        // then persist. Writing the store first let a losing racer's record
+        // reach disk anyway: the winner served in memory while the loser's
+        // tenant came back after a restart, silently taking the hostname over.
+        let record = {
+            let mut index = write_lock(&self.index);
             if let Some(existing) = index.get(&host) {
                 if existing.tenant == tenant {
                     return Ok(existing.clone());
@@ -750,30 +835,18 @@ impl CustomDomainRegistry {
                     max: self.max_domains,
                 });
             }
-        }
+            let record = CustomDomain::new(host.clone(), tenant.to_owned(), now_unix);
+            index.insert(host.clone(), record.clone());
+            record
+        };
 
-        let record = CustomDomain::new(host.clone(), tenant.to_owned(), now_unix);
-        self.store
-            .save(&record)
-            .await
-            .map_err(|e| RegisterError::Store(e.to_string()))?;
-        // Re-check under the write lock: two concurrent registrations of the
-        // same hostname must not both succeed, and the cap must hold.
-        let mut index = write_lock(&self.index);
-        if let Some(existing) = index.get(&host) {
-            if existing.tenant == tenant {
-                return Ok(existing.clone());
-            }
-            return Err(RegisterError::Conflict {
-                tenant: existing.tenant.clone(),
-            });
+        if let Err(e) = self.store.save(&record).await {
+            // Roll the claim back: a hostname that is not durable must not
+            // route, or it would disappear on the next restart with no record
+            // of why.
+            write_lock(&self.index).remove(&host);
+            return Err(RegisterError::Store(e.to_string()));
         }
-        if index.len() >= self.max_domains {
-            return Err(RegisterError::LimitReached {
-                max: self.max_domains,
-            });
-        }
-        index.insert(host, record.clone());
         Ok(record)
     }
 
@@ -901,7 +974,7 @@ impl CustomDomainRegistry {
     /// # Errors
     ///
     /// Propagates the store's write error.
-    pub async fn record_issuing(&self, hostname: &str, _now_unix: i64) -> io::Result<()> {
+    pub async fn record_issuing(&self, hostname: &str) -> io::Result<()> {
         self.mutate(hostname, |d| {
             if d.status == DomainStatus::Verified {
                 d.status = DomainStatus::Issuing;
@@ -1055,8 +1128,8 @@ impl CustomDomainRegistry {
 /// default build.
 #[must_use]
 pub const fn needs_renewal(not_after_unix: i64, renew_before_days: u32, now_unix: i64) -> bool {
-    let window = renew_before_days as i64 * 86_400;
-    not_after_unix.saturating_sub(window) <= now_unix
+    let window = (renew_before_days as i64).saturating_mul(86_400);
+    not_after_unix.saturating_sub(now_unix) < window
 }
 
 /// The retry delay after `consecutive_failures` failures: `base * 2^(n-1)`,
@@ -1165,6 +1238,12 @@ impl IssuanceLimiter {
             max_backoff_secs,
             attempts: RwLock::new(Attempts::default()),
         }
+    }
+
+    /// The longest backoff this limiter will impose.
+    #[must_use]
+    pub const fn max_backoff(&self) -> u64 {
+        self.max_backoff_secs
     }
 
     /// The backoff delay for a domain with `consecutive_failures` failures.
@@ -1419,6 +1498,34 @@ pub trait CustomDomainPruner: Send + Sync {
         cutoff_unix: i64,
         dry_run: bool,
     ) -> futures::future::BoxFuture<'a, Result<u64, String>>;
+
+    /// Offboard one hostname completely: stop routing and serving, halt
+    /// renewal, and delete the stored certificate and its private key.
+    ///
+    /// [`CustomDomainRegistry::remove`] only forgets the registration; the
+    /// certificate lives in the ACME store, which the registry cannot reach.
+    /// This is the offboarding an application should call.
+    fn offboard_domain<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> futures::future::BoxFuture<'a, io::Result<bool>>;
+
+    /// Offboard every domain a tenant owns. Returns how many went.
+    fn offboard_tenant_domains<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> futures::future::BoxFuture<'a, io::Result<usize>>;
+}
+
+impl dyn CustomDomainPruner {
+    /// The offboarding surface an app is serving with, if custom domains are
+    /// enabled.
+    #[must_use]
+    pub fn from_state(state: &crate::AppState) -> Option<Arc<Self>> {
+        state
+            .extension::<Arc<Self>>()
+            .map(|outer| Arc::clone(&*outer))
+    }
 }
 
 // ── SNI certificate selection ────────────────────────────────────────────
@@ -1770,10 +1877,7 @@ mod tests {
             .record_verified("app.clientco.com", 100)
             .await
             .unwrap();
-        registry
-            .record_issuing("app.clientco.com", 100)
-            .await
-            .unwrap();
+        registry.record_issuing("app.clientco.com").await.unwrap();
         registry
             .record_failure("app.clientco.com", 100, "CA said no", 300)
             .await

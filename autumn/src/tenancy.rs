@@ -88,9 +88,18 @@ pub async fn extract_tenant_from_parts(
 /// `app.clientco.com` to its owning tenant while an unregistered outside host
 /// keeps its 400.
 ///
-/// Callers holding an `AppState` pass `state.extension::<Arc<CustomDomainRegistry>>()`;
+/// Applies only to `tenancy.source = "subdomain"`, where the `Host` header is
+/// already what identifies the tenant. Under a credential-backed source
+/// (`header`, `session`, `jwt`) the registry is not consulted at all.
+///
+/// Callers holding an `AppState` pass
+/// [`CustomDomainRegistry::from_state`](crate::custom_domain::CustomDomainRegistry::from_state);
 /// `None` is the pre-#1635 behaviour.
-#[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+///
+/// # Errors
+///
+/// Returns the same rejection as [`extract_tenant_from_parts`] when the
+/// configured source cannot resolve a tenant.
 pub async fn extract_tenant_from_parts_with_domains(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
@@ -99,10 +108,13 @@ pub async fn extract_tenant_from_parts_with_domains(
     if let Some(tenant_id) = replayed_tenant() {
         return Ok(tenant_id);
     }
-    // The registry is consulted before the configured source so a connected
-    // domain routes whatever `tenancy.source` is: a `Host` that a tenant owns
-    // identifies that tenant more directly than any header or claim could.
+    // Only under `source = "subdomain"`, where the `Host` header is ALREADY the
+    // tenant signal. Under `header`/`session`/`jwt` the tenant comes from a
+    // credential the client cannot forge, and letting a connected `Host`
+    // outrank it would let any authenticated user reach another tenant's data
+    // by setting one header.
     if config.tenancy.enabled
+        && config.tenancy.source == "subdomain"
         && let Some(registry) = domains
         && let Some(host) = request_host(parts)
         && let Some(tenant_id) = registry.tenant_for_host(&host)
@@ -616,36 +628,32 @@ pub async fn tenancy_middleware(
         return next.run(Request::from_parts(parts, body)).await;
     }
 
-    let domains = state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
-    let tenant_id = match extract_tenant_from_parts_with_domains(
-        &mut parts,
-        &config,
-        domains.as_deref().map(AsRef::as_ref),
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            // For browser logins, bounce a missing/unauthenticated tenant to the
-            // configured login page instead of returning a raw 401. Only do this
-            // for clients that accept HTML (navigating browsers): API clients
-            // (e.g. `Accept: application/json`) expect the 401 so their error
-            // handling isn't broken by a 303 to a login page. Other error classes
-            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
-            // are not masked as login redirects.
-            if e.status() == axum::http::StatusCode::UNAUTHORIZED
-                && let Some(target) = &config.tenancy.login_redirect
-                && parts
-                    .headers
-                    .get(axum::http::header::ACCEPT)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|accept| accept.contains("text/html"))
-            {
-                return axum::response::Redirect::to(target).into_response();
+    let domains = crate::custom_domain::CustomDomainRegistry::from_state(&state);
+    let tenant_id =
+        match extract_tenant_from_parts_with_domains(&mut parts, &config, domains.as_deref()).await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // For browser logins, bounce a missing/unauthenticated tenant to the
+                // configured login page instead of returning a raw 401. Only do this
+                // for clients that accept HTML (navigating browsers): API clients
+                // (e.g. `Accept: application/json`) expect the 401 so their error
+                // handling isn't broken by a 303 to a login page. Other error classes
+                // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
+                // are not masked as login redirects.
+                if e.status() == axum::http::StatusCode::UNAUTHORIZED
+                    && let Some(target) = &config.tenancy.login_redirect
+                    && parts
+                        .headers
+                        .get(axum::http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|accept| accept.contains("text/html"))
+                {
+                    return axum::response::Redirect::to(target).into_response();
+                }
+                return e.into_response();
             }
-            return e.into_response();
-        }
-    };
+        };
 
     // Tag the request-scoped log context (#1169) so every subsequent event
     // automatically carries the resolved tenant id.

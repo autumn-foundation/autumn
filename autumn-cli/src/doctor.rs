@@ -8850,7 +8850,8 @@ pub fn run(opts: DoctorOptions) {
                     name: "custom_domains",
                     status: CheckStatus::Pass,
                     detail: Some(
-                        "no [server.tls.acme.custom_domains] section: tenants cannot connect                          their own domains"
+                        "no [server.tls.acme.custom_domains] section: tenants cannot connect their \
+                         own domains"
                             .to_owned(),
                     ),
                     hint: None,
@@ -8884,7 +8885,8 @@ pub fn run(opts: DoctorOptions) {
                         {
                             let detail = result.detail.take().unwrap_or_default();
                             result.detail = Some(format!(
-                                "{detail} (probed the first {MAX_CUSTOM_DOMAIN_PROBES} of {total}                                  registered domains)"
+                                "{detail} (probed the first {MAX_CUSTOM_DOMAIN_PROBES} of {total} \
+                                 registered domains)"
                             ));
                         }
                         result

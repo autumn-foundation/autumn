@@ -7291,12 +7291,17 @@ pub struct CustomDomainsConfig {
     pub ingress_hostname: Option<String>,
 
     /// The ingress IPv4 addresses tenants point apex domains at with A records.
+    ///
+    /// Held as strings and parsed by [`validate`](Self::validate), matching
+    /// `[server.tls.acme.dns] resolvers`: a typed address here aborts the
+    /// config schema walk that `autumn doctor` and strict-config checking
+    /// build on.
     #[serde(default)]
-    pub ingress_ipv4: Vec<std::net::Ipv4Addr>,
+    pub ingress_ipv4: Vec<String>,
 
     /// The ingress IPv6 addresses, for AAAA records.
     #[serde(default)]
-    pub ingress_ipv6: Vec<std::net::Ipv6Addr>,
+    pub ingress_ipv6: Vec<String>,
 
     /// Directory holding the domain registry. Default: `config/acme/domains`.
     #[serde(default = "default_custom_domains_dir")]
@@ -7370,43 +7375,73 @@ impl CustomDomainsConfig {
             && self.ingress_ipv6.is_empty()
         {
             return Err(
-                "[server.tls.acme.custom_domains] needs somewhere for tenants to point DNS: set                  ingress_hostname (the CNAME target for tenant subdomains) and/or                  ingress_ipv4 / ingress_ipv6 (the A/AAAA records apex domains need). Without                  one, no tenant can be given usable DNS instructions and no domain can ever                  verify"
+                "[server.tls.acme.custom_domains] needs somewhere for tenants to point DNS: set \
+                 ingress_hostname (the CNAME target for tenant subdomains) and/or ingress_ipv4 / \
+                 ingress_ipv6 (the A/AAAA records apex domains need). Without one, no tenant can \
+                 be given usable DNS instructions and no domain can ever verify"
                     .to_owned(),
             );
         }
+        for (key, values) in [
+            ("ingress_ipv4", &self.ingress_ipv4),
+            ("ingress_ipv6", &self.ingress_ipv6),
+        ] {
+            for value in values {
+                let parsed = if key == "ingress_ipv4" {
+                    value.trim().parse::<std::net::Ipv4Addr>().is_ok()
+                } else {
+                    value.trim().parse::<std::net::Ipv6Addr>().is_ok()
+                };
+                if !parsed {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] {key} entry `{value}` is not a valid \
+                         address; a tenant would be given a DNS record that points nowhere"
+                    ));
+                }
+            }
+        }
         if self.max_domains == 0 {
             return Err(
-                "[server.tls.acme.custom_domains] max_domains must be at least 1; 0 rejects                  every registration"
+                "[server.tls.acme.custom_domains] max_domains must be at least 1; 0 rejects every \
+                 registration"
                     .to_owned(),
             );
         }
         if self.cert_cache_size == 0 {
             return Err(
-                "[server.tls.acme.custom_domains] cert_cache_size must be at least 1: a                  zero-sized cache would re-read every certificate on every handshake"
+                "[server.tls.acme.custom_domains] cert_cache_size must be at least 1: a zero-sized \
+                 cache would re-read every certificate on every handshake"
                     .to_owned(),
             );
         }
         if self.issuance_per_domain_per_day == 0 || self.issuance_global_per_hour == 0 {
             return Err(
-                "[server.tls.acme.custom_domains] issuance_per_domain_per_day and                  issuance_global_per_hour must both be at least 1; 0 refuses every order and no                  domain can ever become active"
+                "[server.tls.acme.custom_domains] issuance_per_domain_per_day and \
+                 issuance_global_per_hour must both be at least 1; 0 refuses every order and no \
+                 domain can ever become active"
                     .to_owned(),
             );
         }
         if self.failure_backoff_secs == 0 {
             return Err(
-                "[server.tls.acme.custom_domains] failure_backoff_secs must be at least 1: a                  zero backoff retries a permanently broken domain every tick and burns the CA's                  rate limits"
+                "[server.tls.acme.custom_domains] failure_backoff_secs must be at least 1: a zero \
+                 backoff retries a permanently broken domain every tick and burns the CA's rate \
+                 limits"
                     .to_owned(),
             );
         }
         if self.max_failure_backoff_secs < self.failure_backoff_secs {
             return Err(format!(
-                "[server.tls.acme.custom_domains] max_failure_backoff_secs ({}) must be at least                  failure_backoff_secs ({}): the cap is applied to the doubling delay, so a                  smaller cap silently disables the backoff",
+                "[server.tls.acme.custom_domains] max_failure_backoff_secs ({}) must be at least \
+                 failure_backoff_secs ({}): the cap is applied to the doubling delay, so a smaller \
+                 cap silently disables the backoff",
                 self.max_failure_backoff_secs, self.failure_backoff_secs
             ));
         }
         if self.poll_interval_secs == 0 {
             return Err(
-                "[server.tls.acme.custom_domains] poll_interval_secs must be at least 1; 0 spins                  the orchestrator"
+                "[server.tls.acme.custom_domains] poll_interval_secs must be at least 1; 0 spins \
+                 the orchestrator"
                     .to_owned(),
             );
         }
@@ -7414,6 +7449,10 @@ impl CustomDomainsConfig {
     }
 
     /// The ingress this deployment tells tenants to point at.
+    ///
+    /// An address that does not parse is dropped here; [`validate`](Self::validate)
+    /// has already refused the configuration, so the app never reaches this
+    /// with a bad value.
     #[must_use]
     pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
         crate::custom_domain::ExpectedIngress {
@@ -7422,8 +7461,16 @@ impl CustomDomainsConfig {
                 .as_ref()
                 .map(|h| h.trim().to_owned())
                 .filter(|h| !h.is_empty()),
-            ipv4: self.ingress_ipv4.clone(),
-            ipv6: self.ingress_ipv6.clone(),
+            ipv4: self
+                .ingress_ipv4
+                .iter()
+                .filter_map(|a| a.trim().parse().ok())
+                .collect(),
+            ipv6: self
+                .ingress_ipv6
+                .iter()
+                .filter_map(|a| a.trim().parse().ok())
+                .collect(),
         }
     }
 }
@@ -15646,6 +15693,7 @@ path = "/healthz"
             renew_before_days: default_acme_renew_before_days(),
             ca_root_path: None,
             dns: None,
+            custom_domains: None,
         }
     }
 

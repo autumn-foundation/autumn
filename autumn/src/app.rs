@@ -4658,6 +4658,7 @@ impl AppBuilder {
                             listener,
                             tls_cfg,
                             acme_cfg,
+                            config.tenancy.base_domain.as_deref(),
                             &config.credentials,
                             https_port,
                             acme_status.clone(),
@@ -5058,9 +5059,10 @@ impl AppBuilder {
             let reporter = compose_acme_alert_reporter(reporter, &state);
             renewal_task.recovery = Some(make_acme_alert_recovery(&state));
             let renewal_shutdown = server_shutdown.child_token();
+            let renewal_coordinator = std::sync::Arc::clone(&coordinator);
             tokio::spawn(async move {
                 renewal_task
-                    .run(coordinator, reporter, renewal_shutdown)
+                    .run(renewal_coordinator, reporter, renewal_shutdown)
                     .await;
             });
 
@@ -5068,7 +5070,14 @@ impl AppBuilder {
             // resolution can route a connected `Host`, register the health
             // indicator and the retention pruner, and spawn the orchestrator.
             if let Some(cd) = custom_domains {
-                spawn_custom_domain_task(cd, tokens, &state, server_shutdown.child_token());
+                spawn_custom_domain_task(
+                    cd,
+                    tokens,
+                    std::sync::Arc::clone(&coordinator),
+                    leadership_degraded,
+                    &state,
+                    server_shutdown.child_token(),
+                );
             }
         }
 
@@ -9009,6 +9018,7 @@ async fn build_acme_tls_listener(
     tcp: tokio::net::TcpListener,
     tls_cfg: &crate::config::TlsConfig,
     acme_cfg: &crate::config::AcmeConfig,
+    tenancy_base_domain: Option<&str>,
     credentials: &crate::credentials::CredentialsStore,
     https_port: u16,
     status: Option<crate::acme::renewal::AcmeStatus>,
@@ -9068,19 +9078,30 @@ async fn build_acme_tls_listener(
     // so the deployment's certificate keeps serving its own names unchanged.
     let custom_domains = match acme_cfg.custom_domains.as_ref() {
         Some(cd_cfg) if cd_cfg.enabled => {
-            let registry = std::sync::Arc::new(crate::custom_domain::CustomDomainRegistry::new(
-                std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
-                    cd_cfg.store_dir.clone(),
-                )),
-                cd_cfg.max_domains,
-            ));
+            // Reserve everything this deployment already serves. Without it a
+            // tenant registers another tenant's subdomain — which the
+            // operator's own wildcard already points here, so it verifies and
+            // issues — and every request for that host then resolves to
+            // whoever registered it.
+            let mut reserved = acme_cfg.domains.clone();
+            reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
+            let registry = std::sync::Arc::new(
+                crate::custom_domain::CustomDomainRegistry::new(
+                    std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
+                        cd_cfg.store_dir.clone(),
+                    )),
+                    cd_cfg.max_domains,
+                )
+                .with_reserved(reserved),
+            );
             match registry.load().await {
                 Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
                 // A registry that cannot be read is not fatal: the deployment's
                 // own certificate still serves, and an app that re-registers
                 // its domains repopulates it. Serving nothing would be worse.
                 Err(e) => tracing::error!(
-                    "failed to load the tenant custom-domain registry: {e}; connected domains                      will not route until they are re-registered"
+                    "failed to load the tenant custom-domain registry: {e}; connected domains will \
+                     not route until they are re-registered"
                 ),
             }
             Some(CustomDomainBindState {
@@ -9333,6 +9354,8 @@ fn compose_acme_alert_reporter(
 fn spawn_custom_domain_task(
     bind_state: CustomDomainBindState,
     tokens: crate::acme::challenge::Http01Tokens,
+    coordinator: std::sync::Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    leadership_degraded: bool,
     state: &AppState,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
@@ -9380,6 +9403,8 @@ fn spawn_custom_domain_task(
         // it raises #1610's alert naming the domain and its tenant.
         reporter: make_custom_domain_reporter(state),
         recovery: Some(make_custom_domain_recovery(state)),
+        coordinator,
+        leadership_degraded,
         cert_store_paths: Some(store),
         // The deployment's own certificate shares this store and has no
         // registry record; naming it keeps the retention prune from deleting

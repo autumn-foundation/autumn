@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use autumn_web::acme::store::{CertId, FsAcmeStore};
+use autumn_web::acme::store::{AcmeStore as _, CertId, FsAcmeStore};
 
 use autumn_web::acme::tenant_domains::CustomDomainTask;
 use autumn_web::custom_domain::{
@@ -136,6 +136,9 @@ fn harness_with_limiter(
         Arc::new(MemoryCustomDomainStore::new()),
         100,
     ));
+    // `load()` marks the registry hydrated, which the retention prune requires
+    // before it will delete anything.
+    futures::executor::block_on(registry.load()).unwrap();
     let cache = Arc::new(CustomDomainCertCache::new(8));
     let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&alerts);
@@ -160,6 +163,10 @@ fn harness_with_limiter(
             let sink = Arc::clone(&recovered);
             move || sink.lock().unwrap().push("recovered".to_owned())
         })),
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
         cert_store_paths: Some(store),
         retained_cert_ids: HashSet::new(),
     };
@@ -171,6 +178,39 @@ fn harness_with_limiter(
         alerts,
         recovered: recovered_out,
         _dir: dir,
+    }
+}
+
+/// A task over caller-supplied stores, for the restart and scale tests.
+fn task_over(
+    registry: Arc<CustomDomainRegistry>,
+    cache: Arc<CustomDomainCertCache>,
+    certs: Arc<FsAcmeStore>,
+    verifier: Arc<dyn DomainVerifier>,
+    issuer: Arc<dyn DomainIssuer>,
+) -> CustomDomainTask {
+    CustomDomainTask {
+        registry,
+        cache,
+        certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier,
+        issuer,
+        limiter: Arc::new(IssuanceLimiter::new(5, 5000, 300, 86_400)),
+        ingress: ExpectedIngress {
+            hostname: Some("ingress.myapp.com".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        },
+        renew_before_days: 30,
+        reporter: Arc::new(|_| {}),
+        recovery: None,
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
+        cert_store_paths: Some(certs),
+        retained_cert_ids: HashSet::new(),
     }
 }
 
@@ -387,6 +427,20 @@ async fn only_domains_inside_the_renew_window_are_reissued() {
         TableVerifier::new(&[]),
         Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
     );
+    // Both already hold a certificate, so only the renew window decides.
+    for host in ["soon.clientco.com", "later.clientco.com"] {
+        h.task
+            .certs
+            .save_cert(
+                &CertId::from_domains(&[host.to_owned()]),
+                &autumn_web::acme::store::StoredCert {
+                    chain_pem: CERT_PEM.to_owned(),
+                    key_pem: KEY_PEM.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+    }
     // Expires in 10 days: inside the 30-day window.
     h.registry
         .register("soon.clientco.com", "tenant-a", NOW)
@@ -769,5 +823,373 @@ async fn a_handshake_for_a_domain_past_the_cache_loads_its_certificate_from_disk
         "and be cached after"
     );
     // An unregistered hostname is still refused without ever touching disk.
+    assert!(resolver.certificate_for("attacker.example.net").is_none());
+}
+
+#[tokio::test]
+async fn an_active_domain_whose_certificate_vanished_is_reordered() {
+    // A torn write, a partial restore or a manual delete leaves the record
+    // `Active` with a far-future `notAfter`. The domain is refused at the
+    // handshake but is NOT due for renewal, so without a recovery pass it stays
+    // hard down for as long as that window is away.
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    assert_eq!(issuer.count(), 1);
+
+    // Lose the certificate behind the task's back.
+    h.task
+        .certs
+        .delete_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+        .await
+        .unwrap();
+    h.cache.remove("app.clientco.com");
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Active,
+        "the record still claims a certificate that is gone"
+    );
+
+    h.task.tick(NOW + 1).await;
+    assert_eq!(
+        issuer.count(),
+        2,
+        "the missing certificate must be re-ordered"
+    );
+    assert!(h.cache.get("app.clientco.com").is_some());
+}
+
+#[tokio::test]
+async fn a_renewal_is_skipped_when_the_domain_no_longer_points_here() {
+    // Verification gates the FIRST order. Without re-checking, a tenant who
+    // repointed their domain is renewed forever — each cycle spending an order
+    // plus a failed validation against the shared ACME account.
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_elsewhere())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task
+        .certs
+        .save_cert(
+            &CertId::from_domains(&["app.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .record_active("app.clientco.com", NOW, NOW + 10 * 86_400)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert_eq!(
+        issuer.count(),
+        0,
+        "a domain that moved away must not be renewed"
+    );
+}
+
+#[tokio::test]
+async fn a_degraded_leadership_refuses_to_order_and_says_why() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.leadership_degraded = true;
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert_eq!(
+        issuer.count(),
+        0,
+        "every replica ordering the same certificate would race the CA"
+    );
+    let record = h.registry.get("app.clientco.com").unwrap();
+    assert!(
+        record
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("coordinator"),
+        "{record:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_ordered_for_an_offboarded_domain_is_discarded() {
+    // The order takes a round trip. If the domain is offboarded meanwhile,
+    // installing would resurrect the deleted certificate and promote a record
+    // that was never verified.
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    h.task.offboard("app.clientco.com").await.unwrap();
+
+    // Re-registered by a DIFFERENT tenant while the old order was in flight.
+    h.registry
+        .register("app.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+    let installed = h
+        .task
+        .certs
+        .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+        .await
+        .unwrap();
+    assert!(installed.is_none(), "offboarding deleted the certificate");
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::PendingDns,
+        "the new tenant starts from pending, not from the old tenant's certificate"
+    );
+}
+
+#[tokio::test]
+async fn the_prune_refuses_to_run_when_the_registry_never_hydrated() {
+    use autumn_web::custom_domain::CustomDomainPruner as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    // A registry that was never `load()`ed stands in for one whose load failed.
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    store
+        .save_cert(
+            &CertId::from_domains(&["app.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let task = CustomDomainTask {
+        registry,
+        cache: Arc::new(CustomDomainCertCache::new(4)),
+        certs: Arc::clone(&store) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier: TableVerifier::new(&[]),
+        issuer: ScriptedIssuer::new(&[]),
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        ingress: ExpectedIngress::default(),
+        renew_before_days: 30,
+        reporter: Arc::new(|_| {}),
+        recovery: None,
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
+        cert_store_paths: Some(store.clone()),
+        retained_cert_ids: HashSet::new(),
+    };
+
+    assert!(
+        task.prune(NOW + 86_400, false).await.is_err(),
+        "an index that never loaded would treat every certificate as an orphan"
+    );
+    assert!(
+        store
+            .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing may be deleted"
+    );
+}
+
+// ── AC5/AC6: restart and scale, against the real on-disk stores ──────────
+
+#[tokio::test]
+async fn a_restart_serves_every_connected_domain_without_reordering() {
+    use autumn_web::custom_domain::{CustomDomainStore as _, FsCustomDomainStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let registry_dir = dir.path().join("domains");
+    let certs = Arc::new(FsAcmeStore::new(dir.path().join("acme"), "staging"));
+    let issuer = ScriptedIssuer::new(&[]);
+
+    // First boot: connect two domains and let them go active.
+    {
+        let store = Arc::new(FsCustomDomainStore::new(&registry_dir));
+        let registry = Arc::new(CustomDomainRegistry::new(store, 100));
+        registry.load().await.unwrap();
+        let task = task_over(
+            Arc::clone(&registry),
+            Arc::new(CustomDomainCertCache::new(8)),
+            Arc::clone(&certs),
+            TableVerifier::new(&[
+                ("a.clientco.com", points_here()),
+                ("b.clientco.com", points_here()),
+            ]),
+            Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        );
+        registry
+            .register("a.clientco.com", "tenant-a", NOW)
+            .await
+            .unwrap();
+        registry
+            .register("b.clientco.com", "tenant-b", NOW)
+            .await
+            .unwrap();
+        task.tick(NOW).await;
+        assert_eq!(issuer.count(), 2);
+    }
+
+    // Second boot: fresh registry and cache over the SAME directories.
+    let store = Arc::new(FsCustomDomainStore::new(&registry_dir));
+    assert_eq!(
+        store.load_all().await.unwrap().len(),
+        2,
+        "records must survive"
+    );
+    let registry = Arc::new(CustomDomainRegistry::new(store, 100));
+    assert_eq!(registry.load().await.unwrap(), 2);
+    let cache = Arc::new(CustomDomainCertCache::new(8));
+    let task = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&certs),
+        TableVerifier::new(&[]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+
+    // Routing survives.
+    assert_eq!(
+        registry.tenant_for_host("a.clientco.com").as_deref(),
+        Some("tenant-a")
+    );
+    // Serving survives: the certificates load back from the store.
+    for host in ["a.clientco.com", "b.clientco.com"] {
+        assert!(task.warm(host).await, "{host} must reload from the store");
+        assert!(cache.get(host).is_some());
+    }
+    // And nothing was re-ordered.
+    task.tick(NOW + 1).await;
+    assert_eq!(issuer.count(), 2, "a restart must not re-order anything");
+}
+
+#[tokio::test]
+async fn a_thousand_domains_serve_the_right_certificate_through_a_cache_of_two_hundred() {
+    use autumn_web::acme::tenant_domains::FsSniCertSource;
+    use autumn_web::custom_domain::SniCertResolver;
+
+    const DOMAINS: usize = 1000;
+    const CACHE: usize = 200;
+
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        DOMAINS,
+    ));
+    registry.load().await.unwrap();
+
+    // Half the domains get the base fixture, half the renewed one, so "the
+    // RIGHT certificate" is checkable rather than just "a certificate".
+    for i in 0..DOMAINS {
+        let host = format!("tenant{i}.clientco.com");
+        let renewed = i % 2 == 1;
+        let (chain, key) = if renewed {
+            (RENEWED_CERT_PEM, RENEWED_KEY_PEM)
+        } else {
+            (CERT_PEM, KEY_PEM)
+        };
+        certs
+            .save_cert(
+                &CertId::from_domains(&[host.clone()]),
+                &autumn_web::acme::store::StoredCert {
+                    chain_pem: chain.to_owned(),
+                    key_pem: key.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .register(&host, &format!("tenant-{i}"), NOW)
+            .await
+            .unwrap();
+        registry
+            .record_active(&host, NOW, NOW + 80 * 86_400)
+            .await
+            .unwrap();
+    }
+
+    let cache = Arc::new(CustomDomainCertCache::new(CACHE));
+    let provider = autumn_web::tls::crypto_provider();
+    let base = Arc::new(autumn_web::tls::ReloadableCertResolver::new(
+        autumn_web::tls::certified_key_from_pem(CERT_PEM.as_bytes(), KEY_PEM.as_bytes(), &provider)
+            .unwrap(),
+    ));
+    let resolver = SniCertResolver::new(
+        base,
+        vec!["myapp.com".to_owned()],
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+    )
+    .with_source(Arc::new(FsSniCertSource::new(
+        Arc::clone(&certs),
+        Arc::clone(&provider),
+    )));
+
+    // The expected leaf DER for each half, to compare what SNI actually served.
+    let plain =
+        autumn_web::tls::certified_key_from_pem(CERT_PEM.as_bytes(), KEY_PEM.as_bytes(), &provider)
+            .unwrap()
+            .cert[0]
+            .to_vec();
+    let renewed = autumn_web::tls::certified_key_from_pem(
+        RENEWED_CERT_PEM.as_bytes(),
+        RENEWED_KEY_PEM.as_bytes(),
+        &provider,
+    )
+    .unwrap()
+    .cert[0]
+        .to_vec();
+
+    // Every domain resolves correctly, in an order that guarantees the cache
+    // is thrashed — 1,000 lookups through 200 slots.
+    for i in 0..DOMAINS {
+        let host = format!("tenant{i}.clientco.com");
+        let served = resolver
+            .certificate_for(&host)
+            .unwrap_or_else(|| panic!("{host} must be served"));
+        let expected = if i % 2 == 1 { &renewed } else { &plain };
+        assert_eq!(
+            served.cert[0].as_ref(),
+            expected.as_slice(),
+            "{host} was served the wrong certificate"
+        );
+    }
+    assert_eq!(cache.len(), CACHE, "the cache stayed bounded throughout");
+    // An unregistered name is still refused, at scale.
     assert!(resolver.certificate_for("attacker.example.net").is_none());
 }

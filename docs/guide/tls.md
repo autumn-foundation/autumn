@@ -746,31 +746,45 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 
 Your app owns the screens; autumn owns the state. Register a hostname when a
 tenant asks for it, show them what the framework says to publish, and render
-the status:
+the status.
+
+Autumn refuses a hostname the deployment already serves — anything under
+`[server.tls.acme] domains` or `[tenancy] base_domain` — so one tenant cannot
+connect another's subdomain. **Per-tenant quotas are yours**: `max_domains` is
+deployment-wide, so cap registrations per tenant in your own code if one tenant
+must not be able to spend the whole budget.
 
 ```rust
-use autumn_web::custom_domain::{CustomDomainRegistry, DnsInstructions};
+use autumn_web::custom_domain::{CustomDomainPruner, CustomDomainRegistry, DnsInstructions};
 
-let registry = state
-    .extension::<std::sync::Arc<CustomDomainRegistry>>()
-    .expect("custom domains are enabled");
+let registry = CustomDomainRegistry::from_state(&state).expect("custom domains are enabled");
+let ingress = config.server.tls.as_ref()
+    .and_then(|t| t.acme.as_ref())
+    .and_then(|a| a.custom_domains.as_ref())
+    .map(|cd| cd.ingress())
+    .unwrap_or_default();
 
-// 1. Connect. Your app decides who may — plan, entitlement, ownership.
+// 1. Connect. Your app decides who may — plan, entitlement, per-tenant quota.
 let domain = registry.register("app.clientco.com", &tenant_id, now_unix).await?;
 
-// 2. Show the tenant exactly what to publish.
+// 2. Show the tenant exactly what to publish. Fields are tab-separated.
 let instructions = DnsInstructions::for_hostname(&domain.hostname, &ingress)?;
-println!("{}", instructions.render());   // app.clientco.com  CNAME  ingress.myapp.com
+println!("{}", instructions.render());   // app.clientco.com\tCNAME\tingress.myapp.com
 
 // 3. Render status, including why it is stuck.
 for d in registry.list_for_tenant(&tenant_id) {
     println!("{} — {} {}", d.hostname, d.status, d.failure_reason.unwrap_or_default());
 }
 
-// 4. Offboard. Routing, serving and renewal stop; the certificate is deleted.
-registry.remove("app.clientco.com").await?;
-registry.remove_tenant(&tenant_id).await?;   // every domain the tenant owns
+// 4. Offboard. Routing, serving and renewal stop AND the certificate is deleted.
+let domains = <dyn CustomDomainPruner>::from_state(&state).expect("custom domains are enabled");
+domains.offboard_domain("app.clientco.com").await?;
+domains.offboard_tenant_domains(&tenant_id).await?;   // every domain the tenant owns
 ```
+
+`registry.remove` forgets the registration only — routing and serving stop, but
+the certificate stays in the ACME store. Offboard through `CustomDomainPruner`
+so the private key goes too.
 
 The states are `pending_dns` → `verified` → `issuing` → `active`. There is no
 separate failed state: a domain that fails carries a `failure_reason` and a
@@ -817,15 +831,24 @@ its certificate back from the store and caches it. Nothing requires every
 certificate to be resident, so `cert_cache_size` is a memory knob, not a
 correctness one.
 
-Like the rest of the ACME path, custom domains assume a **single host**: the
-HTTP-01 token map and the certificate store are per-process, and the
-custom-domain loop does not leader-elect. Behind a load balancer, use
-[reverse-proxy termination](#terminating-tls-at-a-reverse-proxy) instead.
+Custom domains live **inside** the ACME TLS listener, so they exist only where
+autumn terminates TLS itself. Behind
+[reverse-proxy termination](#terminating-tls-at-a-reverse-proxy) there is no
+registry and no `Host`-based tenant routing — the proxy owns the certificates
+and your app owns the mapping.
+
+Ordering is leader-elected per domain through the same `SchedulerCoordinator`
+the deployment's own renewal uses, so replicas do not race the CA. Everything
+else about the ACME path is still single-host: the HTTP-01 token map and the
+certificate store are per-process, so behind a load balancer the CA's
+validation request usually reaches a replica that never published the token.
+Run custom domains on a single host.
 
 ### Offboarding and retention
 
-`remove` (or `remove_tenant`) stops routing, stops serving, halts renewal, drops
-the cached certificate and deletes the stored pair. Beyond that, the
+`offboard_domain` (or `offboard_tenant_domains`) stops routing, stops serving,
+halts renewal, drops the cached certificate and deletes the stored pair. Beyond
+that, the
 `custom_domains`
 [retention dataset](./data-retention.md) prunes two things the app cannot: a
 registration that never reached DNS verification within its window, and a stored

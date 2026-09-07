@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_web::config::AutumnConfig;
 use autumn_web::custom_domain::{
-    CustomDomainRegistry, DnsInstructions, DomainStatus, ExpectedIngress, IssuanceDecision,
-    IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore, ObservedTarget, RegisterError,
-    VerificationOutcome, grade_dns_verification, normalize_hostname,
+    CustomDomainRegistry, CustomDomainStore as _, DnsInstructions, DomainStatus, ExpectedIngress,
+    IssuanceDecision, IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore, ObservedTarget,
+    RegisterError, VerificationOutcome, grade_dns_verification, normalize_hostname,
 };
 use autumn_web::tenancy::extract_tenant_from_parts_with_domains;
 use axum::http::Request;
@@ -140,10 +140,7 @@ async fn a_domain_walks_pending_to_active_and_is_queryable_at_every_step() {
         DomainStatus::Verified
     );
 
-    registry
-        .record_issuing("app.clientco.com", NOW + 61)
-        .await
-        .unwrap();
+    registry.record_issuing("app.clientco.com").await.unwrap();
     assert_eq!(
         registry.get("app.clientco.com").unwrap().status,
         DomainStatus::Issuing
@@ -461,7 +458,7 @@ async fn removing_a_domain_stops_routing_serving_and_renewal() {
     assert!(registry.tenant_for_host("app.clientco.com").is_none());
     assert!(registry.due_for_renewal(NOW + 86_400, 30).is_empty());
     assert!(
-        store.load_all_blocking().is_empty(),
+        store.load_all().await.unwrap().is_empty(),
         "the record must be deleted, not orphaned"
     );
 
@@ -625,4 +622,88 @@ mod sni {
         cache.remove("c.test");
         assert!(cache.get("c.test").is_none());
     }
+}
+
+// ── Tenant isolation (review findings) ───────────────────────────────────
+
+#[tokio::test]
+async fn a_tenant_cannot_connect_a_hostname_the_deployment_already_owns() {
+    // Without this, a low-tier tenant registers `acme.myapp.com` — another
+    // tenant's subdomain — and, because the operator's own wildcard already
+    // points it here, it verifies, issues, and from then on every request for
+    // that host resolves to the ATTACKER's tenant.
+    let store = Arc::new(MemoryCustomDomainStore::new());
+    let registry = Arc::new(
+        CustomDomainRegistry::new(store, 1000)
+            .with_reserved(["myapp.com".to_owned(), "*.myapp.com".to_owned()]),
+    );
+
+    for reserved in [
+        "myapp.com",
+        "www.myapp.com",
+        "acme.myapp.com",
+        "MyApp.com",
+        "deep.nested.myapp.com",
+    ] {
+        let err = registry
+            .register(reserved, "tenant-evil", NOW)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RegisterError::Reserved { .. }),
+            "{reserved} must not be registrable: {err:?}"
+        );
+    }
+
+    // A genuinely third-party hostname is unaffected.
+    assert!(
+        registry
+            .register("app.clientco.com", "tenant-a", NOW)
+            .await
+            .is_ok()
+    );
+    // And so is a name that merely ends with the same letters.
+    assert!(
+        registry
+            .register("notmyapp.com", "tenant-a", NOW)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn a_custom_domain_never_overrides_an_authenticated_tenant_source() {
+    // The registry answers on `Host`, which the client controls. Under
+    // `jwt`/`session`/`header` tenancy the tenant comes from a verified
+    // credential, so a `Host` a tenant connected must NOT outrank it —
+    // otherwise any logged-in user reaches another tenant's data by setting a
+    // header.
+    let registry = registry();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_active("app.clientco.com", NOW, NOW + 86_400)
+        .await
+        .unwrap();
+
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "header".to_owned();
+    config.tenancy.header_name = "x-tenant-id".to_owned();
+
+    let req = Request::builder()
+        .header("Host", "app.clientco.com")
+        .header("x-tenant-id", "tenant-b")
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    assert_eq!(
+        extract_tenant_from_parts_with_domains(&mut parts, &config, Some(&registry))
+            .await
+            .unwrap(),
+        "tenant-b",
+        "the configured tenancy source must win over a client-supplied Host"
+    );
 }

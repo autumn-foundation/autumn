@@ -40,7 +40,12 @@ use crate::custom_domain::{
     CustomDomainCertCache, CustomDomainRegistry, DomainIssuer, DomainVerifier, ExpectedIngress,
     IssuanceLimiter, IssuedCertificate, apply_verification, grade_dns_verification,
 };
+use crate::scheduler::SchedulerCoordinator;
+use crate::task::TaskCoordination;
 use rustls::crypto::CryptoProvider;
+
+/// The scheduled-task name custom-domain leases and alerts are keyed on.
+pub const CUSTOM_DOMAIN_TASK: &str = "custom_domain_certificates";
 
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
@@ -161,6 +166,16 @@ pub struct CustomDomainTask {
     /// Invoked once no domain carries a failure any more, so the operator
     /// alert the reporter raised is cleared rather than left standing.
     pub recovery: Option<RecoveryFn>,
+    /// Leader election, so only one replica orders per domain.
+    ///
+    /// The same coordinator the deployment's own renewal uses. Without it every
+    /// replica orders every tenant's certificate against the one shared ACME
+    /// account.
+    pub coordinator: Arc<dyn SchedulerCoordinator>,
+    /// Set when a distributed scheduler backend was configured but this process
+    /// could not build its coordinator. Mirrors `AcmeRenewalTask`: ordering
+    /// under a per-process lease would race every other replica.
+    pub leadership_degraded: bool,
     /// The certificate store as a filesystem store, when it is one, so the
     /// retention prune can enumerate stored pairs. `None` disables orphan
     /// pruning rather than guessing at another store's layout.
@@ -193,7 +208,12 @@ impl CustomDomainTask {
         // certificates on the first handshake instead of after an order.
         self.warm_all().await;
         loop {
-            self.tick(now_unix()).await;
+            // The tick is inside the `select!`: a pass over a thousand domains
+            // is long, and shutdown must not wait for it.
+            tokio::select! {
+                () = self.tick(now_unix()) => {}
+                () = shutdown.cancelled() => break,
+            }
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
                 () = shutdown.cancelled() => break,
@@ -210,13 +230,69 @@ impl CustomDomainTask {
             self.issue_one(&domain.hostname, &domain.tenant, now_unix)
                 .await;
         }
+        // Renewal re-verifies first. A tenant who repointed or gave up their
+        // domain would otherwise be renewed forever: every cycle spends an
+        // order plus a failed validation against the shared ACME account, for a
+        // certificate that reaches nobody.
         for domain in self
             .registry
             .due_for_renewal(now_unix, self.renew_before_days)
         {
+            if !self.still_points_here(&domain.hostname).await {
+                continue;
+            }
             self.issue_one(&domain.hostname, &domain.tenant, now_unix)
                 .await;
         }
+        // An active domain whose stored certificate has gone (a torn write, a
+        // partial restore, a manual delete) is refused at the handshake but is
+        // NOT due for renewal — its recorded `notAfter` may be months away — so
+        // without this it stays hard down until that window opens.
+        for domain in self.registry.list() {
+            if domain.is_servable()
+                && domain.is_due(now_unix)
+                && !self.certificate_present(&domain.hostname)
+            {
+                tracing::warn!(
+                    hostname = %domain.hostname,
+                    "custom domain is active but its certificate is missing; re-ordering"
+                );
+                self.issue_one(&domain.hostname, &domain.tenant, now_unix)
+                    .await;
+            }
+        }
+    }
+
+    /// Is `hostname`'s certificate still available to serve?
+    ///
+    /// Two `stat` calls, and only for a store this task can enumerate. A store
+    /// it cannot answers `true`, so a non-filesystem store is never wrongly
+    /// re-ordered.
+    fn certificate_present(&self, hostname: &str) -> bool {
+        self.cache.get(hostname).is_some()
+            || self
+                .cert_store_paths
+                .as_ref()
+                .is_none_or(|fs| fs.find_cert_for_domains(&[hostname.to_owned()]).is_some())
+    }
+
+    /// Does `hostname` still resolve to this deployment?
+    ///
+    /// A lookup that returns nothing answers `true`: a resolver blip must not
+    /// stop a healthy renewal, and the CA's own validation is the real gate.
+    async fn still_points_here(&self, hostname: &str) -> bool {
+        let observed = self.verifier.observe(hostname).await;
+        if matches!(observed, crate::custom_domain::ObservedTarget::None) {
+            return true;
+        }
+        if grade_dns_verification(&observed, &self.effective_ingress().await).is_verified() {
+            return true;
+        }
+        tracing::warn!(
+            hostname,
+            "skipping renewal: the domain no longer points at this deployment"
+        );
+        false
     }
 
     /// Check where one hostname points and record the result.
@@ -273,6 +349,24 @@ impl CustomDomainTask {
 
     /// Order (or renew) one hostname's certificate, budget permitting.
     async fn issue_one(&self, hostname: &str, tenant: &str, now_unix: i64) {
+        // A distributed scheduler backend was configured but this process fell
+        // back to a per-process coordinator. Ordering now would give every
+        // replica its own lease, so all of them would order the SAME
+        // certificate against the one shared account. Refuse, and say why.
+        if self.leadership_degraded {
+            self.record_failure(
+                hostname,
+                tenant,
+                now_unix,
+                "refusing to order: a distributed scheduler backend is configured but its \
+                 coordinator is unavailable in this process, so a lease would not exclude the \
+                 other replicas",
+                true,
+            )
+            .await;
+            return;
+        }
+
         // The budget is checked BEFORE any network call, so a spent budget
         // costs the CA nothing. The failure backoff is already applied by
         // `is_due` on the record, so the budget is the only thing left to ask.
@@ -285,7 +379,36 @@ impl CustomDomainTask {
             return;
         }
 
-        if let Err(e) = self.registry.record_issuing(hostname, now_unix).await {
+        // One replica per hostname orders. `Fleet` grants unconditionally on
+        // the in-process backend (correct for a single replica) and to exactly
+        // one replica on a distributed one.
+        let tick_key = format!("custom-domain:{hostname}");
+        let lease = match self
+            .coordinator
+            .try_acquire(CUSTOM_DOMAIN_TASK, &tick_key, TaskCoordination::Fleet)
+            .await
+        {
+            Ok(Some(lease)) => lease,
+            // Another replica leads for this domain. Adopt whatever it has
+            // already written rather than ordering a second certificate.
+            Ok(None) => {
+                self.warm(hostname).await;
+                return;
+            }
+            Err(e) => {
+                self.record_failure(
+                    hostname,
+                    tenant,
+                    now_unix,
+                    format!("leader election failed: {e}"),
+                    true,
+                )
+                .await;
+                return;
+            }
+        };
+
+        if let Err(e) = self.registry.record_issuing(hostname).await {
             tracing::warn!(
                 hostname,
                 "failed to persist custom-domain issuing state: {e}"
@@ -293,7 +416,13 @@ impl CustomDomainTask {
         }
         self.limiter.record_attempt(hostname, now_unix);
 
-        let issued = match self.issuer.issue(hostname).await {
+        let outcome = self.issuer.issue(hostname).await;
+        // Always release the lease, whatever the order did.
+        if let Err(e) = lease.release().await {
+            tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
+        }
+
+        let issued = match outcome {
             Ok(issued) => issued,
             Err(e) => {
                 self.record_failure(hostname, tenant, now_unix, e, true)
@@ -302,7 +431,7 @@ impl CustomDomainTask {
             }
         };
 
-        if let Err(e) = self.install(hostname, &issued, now_unix).await {
+        if let Err(e) = self.install(hostname, tenant, &issued, now_unix).await {
             self.record_failure(hostname, tenant, now_unix, e, true)
                 .await;
         }
@@ -315,9 +444,30 @@ impl CustomDomainTask {
     async fn install(
         &self,
         hostname: &str,
+        tenant: &str,
         issued: &IssuedCertificate,
         now_unix: i64,
     ) -> Result<(), String> {
+        // The order took a network round trip. If the app offboarded the domain
+        // — or another tenant registered it — meanwhile, installing would
+        // resurrect a deleted certificate and promote a record straight to
+        // active that was never verified, past the gate this module exists to
+        // enforce. Discard instead.
+        match self.registry.get(hostname) {
+            Some(record) if record.tenant == tenant => {}
+            Some(record) => {
+                return Err(format!(
+                    "discarding the certificate: {hostname} now belongs to tenant {}",
+                    record.tenant
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "discarding the certificate: {hostname} was offboarded while the order ran"
+                ));
+            }
+        }
+
         let stored = StoredCert {
             chain_pem: issued.chain_pem.clone(),
             key_pem: issued.key_pem.clone(),
@@ -338,6 +488,28 @@ impl CustomDomainTask {
             .await
             .map_err(|e| format!("failed to persist the active state for {hostname}: {e}"))?;
         tracing::info!(hostname, not_after, "custom domain is active");
+        // Backstop: a certificate already inside its renew-before window the
+        // moment it is issued — a CA issuing a shorter lifetime than
+        // `renew_before_days` — would be re-ordered every tick until the budget
+        // stopped it, then again the next day, forever. Park it and say why.
+        if crate::custom_domain::needs_renewal(not_after, self.renew_before_days, now_unix) {
+            let backoff = i64::try_from(self.limiter.max_backoff()).unwrap_or(i64::MAX);
+            let _ = self
+                .registry
+                .record_failure(
+                    hostname,
+                    now_unix,
+                    format!(
+                        "the issued certificate is already inside its renew-before window ({} \
+                         days); lower [server.tls.acme] renew_before_days below the certificate \
+                         lifetime",
+                        self.renew_before_days
+                    ),
+                    backoff,
+                )
+                .await;
+            return Ok(());
+        }
         // Clear the operator alert only once NOTHING is failing: with a
         // thousand domains, recovering one while another is still broken must
         // not retract an alert that is still true.
@@ -393,11 +565,39 @@ impl CustomDomainTask {
     /// unroutable and unservable by then, so leaving it registered would be
     /// worse.
     pub async fn offboard(&self, hostname: &str) -> std::io::Result<bool> {
-        let removed = self.registry.remove(hostname).await?;
-        self.cache.remove(hostname);
-        self.limiter.forget(hostname);
-        if let Err(e) = self.certs.delete_cert(&cert_id_for(hostname)).await {
-            tracing::warn!(hostname, "failed to delete the offboarded certificate: {e}");
+        // Normalise once, up front: the registry normalises internally, but the
+        // cache key, the budget history and the certificate id all derive from
+        // the raw string, so `offboard("APP.ClientCo.com.")` would drop the
+        // record and leave the private key on disk.
+        let Ok(host) = crate::custom_domain::normalize_hostname(hostname) else {
+            return Ok(false);
+        };
+        let removed = self.registry.remove(&host).await?;
+        self.cache.remove(&host);
+        self.limiter.forget(&host);
+        if let Err(e) = self.certs.delete_cert(&cert_id_for(&host)).await {
+            tracing::warn!(hostname = %host, "failed to delete the offboarded certificate: {e}");
+        }
+        Ok(removed)
+    }
+
+    /// Offboard every domain a tenant owns. Returns how many were removed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the registry store's delete error.
+    pub async fn offboard_tenant(&self, tenant: &str) -> std::io::Result<usize> {
+        let hostnames: Vec<String> = self
+            .registry
+            .list_for_tenant(tenant)
+            .into_iter()
+            .map(|d| d.hostname)
+            .collect();
+        let mut removed = 0;
+        for hostname in hostnames {
+            if self.offboard(&hostname).await? {
+                removed += 1;
+            }
         }
         Ok(removed)
     }
@@ -409,6 +609,10 @@ impl CustomDomainTask {
     /// the bounded cache re-reads its certificate here instead of the
     /// deployment needing every certificate resident at boot.
     pub async fn warm(&self, hostname: &str) -> bool {
+        let Ok(host) = crate::custom_domain::normalize_hostname(hostname) else {
+            return false;
+        };
+        let hostname = host.as_str();
         if !self.registry.is_servable(hostname) {
             return false;
         }
@@ -464,6 +668,17 @@ impl crate::custom_domain::CustomDomainPruner for CustomDomainTask {
         dry_run: bool,
     ) -> futures::future::BoxFuture<'a, Result<u64, String>> {
         Box::pin(async move {
+            // An index that failed to hydrate knows nothing, so EVERY tenant
+            // certificate would read as an orphan and be deleted. One transient
+            // read error at boot must not cost the deployment every private key
+            // it holds.
+            if !self.registry.is_hydrated() {
+                return Err(
+                    "refusing to prune: the custom-domain registry did not load at boot, so \
+                     every certificate would look orphaned"
+                        .to_owned(),
+                );
+            }
             let mut removed = 0_u64;
             // Abandoned connections: a tenant was handed DNS instructions and
             // never published the record. Nothing else ever deletes these.
@@ -485,6 +700,20 @@ impl crate::custom_domain::CustomDomainPruner for CustomDomainTask {
             removed += self.prune_orphan_certs(dry_run)?;
             Ok(removed)
         })
+    }
+
+    fn offboard_domain<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<bool>> {
+        Box::pin(self.offboard(hostname))
+    }
+
+    fn offboard_tenant_domains<'a>(
+        &'a self,
+        tenant: &'a str,
+    ) -> futures::future::BoxFuture<'a, std::io::Result<usize>> {
+        Box::pin(self.offboard_tenant(tenant))
     }
 }
 
@@ -514,13 +743,21 @@ impl CustomDomainTask {
             if live.contains(id.as_str()) || self.retained_cert_ids.contains(id.as_str()) {
                 continue;
             }
-            removed += 1;
-            if !dry_run {
-                for path in [&chain, &key] {
-                    if let Err(e) = std::fs::remove_file(path) {
-                        tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
-                    }
+            if dry_run {
+                removed += 1;
+                continue;
+            }
+            let mut deleted = true;
+            for path in [&chain, &key] {
+                if let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
+                    deleted = false;
                 }
+            }
+            // Count only what actually went: the retention report must not
+            // claim a deletion that failed.
+            if deleted {
+                removed += 1;
             }
         }
         Ok(removed)

@@ -272,6 +272,7 @@ resilience.circuit_breaker.hosts
 retention
 retention.audit_archives
 retention.commit_hooks
+retention.custom_domains
 retention.experiment_assignments
 retention.idempotency
 retention.job_history
@@ -390,6 +391,19 @@ server.tls.acme
 server.tls.acme.ca_root_path
 server.tls.acme.cache_dir
 server.tls.acme.contact_email
+server.tls.acme.custom_domains
+server.tls.acme.custom_domains.cert_cache_size
+server.tls.acme.custom_domains.enabled
+server.tls.acme.custom_domains.failure_backoff_secs
+server.tls.acme.custom_domains.ingress_hostname
+server.tls.acme.custom_domains.ingress_ipv4
+server.tls.acme.custom_domains.ingress_ipv6
+server.tls.acme.custom_domains.issuance_global_per_hour
+server.tls.acme.custom_domains.issuance_per_domain_per_day
+server.tls.acme.custom_domains.max_domains
+server.tls.acme.custom_domains.max_failure_backoff_secs
+server.tls.acme.custom_domains.poll_interval_secs
+server.tls.acme.custom_domains.store_dir
 server.tls.acme.directory
 server.tls.acme.dns
 server.tls.acme.dns.command
