@@ -370,7 +370,11 @@ reference satisfies the default `MATCH SIMPLE` and is skipped, but violates
 adds over Postgres itself is catching a constraint a migration left `NOT VALID`,
 where the server never revisits the rows that predate it. Afterwards each
 subsetted table is rewritten with `VACUUM (FULL, ANALYZE)` — deleting rows on its
-own frees no disk, and the point of a sample is the disk.
+own frees no disk, and the point of a sample is the disk. `[framework] purge`
+tables are rewritten and measured with them: they sit outside the sample's own
+universe, but the run empties them, and an emptied offline-sync buffer is often
+the largest thing it removes — leaving it out would report a laptop-sized result
+for a database still holding that buffer's whole file.
 
 `--dry-run` prints that whole sequence as SQL you can actually run, so the walk
 prints as the loop it is — a `DO` block that repeats the pass and stops on one

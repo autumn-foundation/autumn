@@ -1618,6 +1618,85 @@ async fn sampling_refuses_legacy_table_inheritance() {
     );
 }
 
+/// A purged framework table is compacted and measured like any other.
+///
+/// `[framework] purge` empties its tables, and `DELETE` frees no file space, so
+/// an emptied offline-sync buffer keeps its whole file until something rewrites
+/// it. It sits outside the classified universe the sample plans over, so both
+/// the compaction and the size report used to skip it — leaving the command
+/// reporting a laptop-sized result for a database still holding the largest
+/// thing the run removed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_compacts_and_measures_the_purged_framework_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_purge_size").await;
+    // Deliberately far larger than every app table put together, so "the run
+    // reclaimed almost everything" and "the run reclaimed almost nothing" are
+    // not close enough to confuse.
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            INSERT INTO autumn_jobs (args) \
+                SELECT repeat('x', 900) FROM generate_series(1, 8000);",
+        )
+        .await
+        .unwrap();
+    let jobs_size = "SELECT pg_total_relation_size('autumn_jobs')::bigint";
+    let before = count(&client, jobs_size).await;
+    assert!(
+        before > 4 * 1024 * 1024,
+        "the fixture must be big enough to notice: {before} byte(s)"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project_sources(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_purge_size");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    // The dry run advertises the exact SQL, so the purged table has to appear in
+    // the printed compaction too — an operator running it must reclaim the same
+    // disk the command does.
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        dry_err.contains(r#"VACUUM (FULL, ANALYZE) "public"."autumn_jobs""#),
+        "the printed compaction must cover the purged table: {dry_err}"
+    );
+
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the purge must still empty it"
+    );
+    let after = count(&client, jobs_size).await;
+    assert!(
+        after * 8 < before,
+        "the purged table's file must actually shrink: {before} -> {after} byte(s)\n{stderr}"
+    );
+    // And the size report has to have counted it on the way in, or it describes
+    // a reclamation it did not measure.
+    assert!(
+        stderr.contains("Table size: ") && stderr.contains(" MB \u{2192} "),
+        "the reported source size must include the purged table: {stderr}"
+    );
+}
+
 /// The printed dry run has to be the loop, not the statements plus a comment.
 ///
 /// `walk_statements` is one pass; `apply` repeats it to a fixpoint. Within a

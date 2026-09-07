@@ -72,7 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference cycle between tables, and a framework-owned table referencing a
   sampled one all abort with a non-zero exit that names the offenders — before a
   row is removed. Each run reports per-table row counts, the total against the
-  source, and the size after the subsetted tables are compacted, and re-verifies
+  source, and the size after every table it emptied or subsetted is compacted —
+  `[framework] purge` targets included, since `DELETE` frees no file space and an
+  emptied buffer is often the largest thing the run removes — and re-verifies
   every foreign key inside the transaction so a violation rolls the run back.
   `--check` and `--dry-run` cover the sample too and still write nothing.
   One ordering change reaches every scrub, sampled or not: `[framework] purge`

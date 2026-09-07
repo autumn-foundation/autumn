@@ -1652,11 +1652,26 @@ pub struct SampleOutcome {
 /// # Errors
 ///
 /// Returns the database error.
-pub fn data_size(conn: &mut PgConnection, plan: &SamplePlan) -> Result<i64, diesel::result::Error> {
-    let names = plan
+pub fn data_size(
+    conn: &mut PgConnection,
+    plan: &SamplePlan,
+    also: &[String],
+) -> Result<i64, diesel::result::Error> {
+    // `also` carries the tables the scrub empties from OUTSIDE the sample —
+    // `[framework] purge`. They are not in the plan, but the run empties them
+    // and compacts them, so leaving them out would report a laptop-sized result
+    // for a database still holding a purged buffer's whole file.
+    let mut measured: Vec<&str> = plan
         .tables
         .iter()
-        .map(|t| quote_literal(&t.table))
+        .map(|t| t.table.as_str())
+        .chain(also.iter().map(String::as_str))
+        .collect();
+    measured.sort_unstable();
+    measured.dedup();
+    let names = measured
+        .into_iter()
+        .map(quote_literal)
         .collect::<Vec<_>>()
         .join(", ");
     if names.is_empty() {
@@ -1735,8 +1750,15 @@ impl From<diesel::result::Error> for SampleFailure {
 ///
 /// Returns [`SampleFailure::Refused`] when the sample is refused, or
 /// [`SampleFailure::Db`] when a statement fails.
-pub fn apply(conn: &mut PgConnection, plan: &SamplePlan) -> Result<SampleOutcome, SampleFailure> {
-    let size_before = data_size(conn, plan)?;
+pub fn apply(
+    conn: &mut PgConnection,
+    plan: &SamplePlan,
+    also_emptied: &[String],
+) -> Result<SampleOutcome, SampleFailure> {
+    // Measured before the sample's deletes, and correct for `also_emptied` even
+    // though those purges have already run: `DELETE` frees no file space, so a
+    // purged table still occupies its full size here.
+    let size_before = data_size(conn, plan, also_emptied)?;
 
     let before = source_counts(conn, plan)?;
 

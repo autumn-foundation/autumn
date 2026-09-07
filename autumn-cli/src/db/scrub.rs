@@ -2515,7 +2515,7 @@ fn classify_and_apply(
             // the command promises.
             if let Some(sampling) = sampling {
                 eprintln!("  SET lock_timeout = '{COMPACT_LOCK_TIMEOUT}';");
-                for table in sampling.subsetted_tables() {
+                for table in compacted_tables(sampling, &purged_tables(&purges)) {
                     eprintln!("  VACUUM (FULL, ANALYZE) {};", qualified_ident(table));
                 }
             }
@@ -2550,7 +2550,8 @@ fn classify_and_apply(
             );
         }
     };
-    let mut pending_compaction: Vec<(&str, &str, &sample::SamplePlan, i64)> = Vec::new();
+    let mut pending_compaction: Vec<(&str, &str, &sample::SamplePlan, Vec<String>, i64)> =
+        Vec::new();
     for (label, url, plan, facts, sampling) in &plans {
         let purges = purge_statements(&facts.framework_tables, &sources.config);
         let (applied, sampled) = execute(
@@ -2569,7 +2570,13 @@ fn classify_and_apply(
         }
         if let (Some(sampling), Some(sampled)) = (sampling.as_ref(), sampled) {
             report_sample_outcome(label, &sampled);
-            pending_compaction.push((url.as_str(), label.as_str(), sampling, sampled.size_before));
+            pending_compaction.push((
+                url.as_str(),
+                label.as_str(),
+                sampling,
+                purged_tables(&purges),
+                sampled.size_before,
+            ));
         }
     }
 
@@ -2605,8 +2612,8 @@ fn classify_and_apply(
     // step that makes the live subset actually laptop-sized, and it can only run
     // after the commit: VACUUM FULL rewrites each table and cannot join a
     // transaction.
-    for (url, label, sampling, size_before) in pending_compaction {
-        report_reclaimed_size(url, label, sampling, size_before);
+    for (url, label, sampling, purged, size_before) in pending_compaction {
+        report_reclaimed_size(url, label, sampling, &purged, size_before);
     }
 
     eprintln!("\n\u{2713} Scrub complete.");
@@ -2743,7 +2750,13 @@ fn report_sample_outcome(label: &str, outcome: &sample::SampleOutcome) {
 /// whose data is already right, and to do it on the one step that waits for an
 /// `ACCESS EXCLUSIVE` lock. The wait is bounded for the same reason; an idle
 /// connection left open against the target would otherwise block it forever.
-fn report_reclaimed_size(url: &str, label: &str, plan: &sample::SamplePlan, before: i64) {
+fn report_reclaimed_size(
+    url: &str,
+    label: &str,
+    plan: &sample::SamplePlan,
+    purged: &[String],
+    before: i64,
+) {
     let Ok(mut conn) = probe_connection(url, label, "compact the sampled tables") else {
         warn_not_compacted(before, "could not connect to compact the sampled tables");
         return;
@@ -2758,7 +2771,7 @@ fn report_reclaimed_size(url: &str, label: &str, plan: &sample::SamplePlan, befo
     // A full-copy table is never deleted from, so it has nothing to reclaim.
     // `data_size` still measures it on both sides, which keeps the ratio
     // comparable.
-    for table in plan.subsetted_tables() {
+    for table in compacted_tables(plan, purged) {
         // Not in a transaction, and deliberately: VACUUM FULL takes an
         // exclusive lock and rewrites the table, neither of which a transaction
         // block permits.
@@ -2769,7 +2782,7 @@ fn report_reclaimed_size(url: &str, label: &str, plan: &sample::SamplePlan, befo
             return;
         }
     }
-    let Ok(after) = sample::data_size(&mut conn, plan) else {
+    let Ok(after) = sample::data_size(&mut conn, plan, purged) else {
         warn_not_compacted(before, "could not measure the compacted size");
         return;
     };
@@ -3514,6 +3527,35 @@ fn emptying_phases<'a>(
     }
 }
 
+/// The tables `[framework] purge` empties, as owned names.
+///
+/// They sit outside the classified universe the sample plans over, so every
+/// place that reasons about "what this run empties" has to add them back.
+fn purged_tables(purges: &[(String, String)]) -> Vec<String> {
+    purges.iter().map(|(table, _)| table.clone()).collect()
+}
+
+/// Every table the run rewrites with `VACUUM (FULL, ANALYZE)` after the commit.
+///
+/// Deleting rows frees no file space, so a table this run emptied still costs
+/// the source's disk until it is rewritten — and the size report is measured
+/// over this same set, so a table missing here is one the run reports as
+/// reclaimed while its file is untouched. `[framework] purge` targets belong in
+/// it for exactly that reason: an emptied offline-sync buffer is often the
+/// largest thing the run removes.
+///
+/// Shared with the dry run, so the printed compaction is the executed one.
+fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> Vec<&'a str> {
+    let mut tables: Vec<&str> = plan
+        .subsetted_tables()
+        .into_iter()
+        .chain(purged.iter().map(String::as_str))
+        .collect();
+    tables.sort_unstable();
+    tables.dedup();
+    tables
+}
+
 /// Every table the run locks, deduplicated and ordered, as `LOCK TABLE` SQL.
 ///
 /// Shared with the dry run: an operator pasting the printed sequence into a
@@ -3779,7 +3821,7 @@ fn execute(
         // survive it — and so no combination of flags can commit a row that was
         // sampled but not scrubbed: both happen in this one transaction.
         if let Some(sampling) = sampling {
-            outcome = Some(sample::apply(conn, sampling)?);
+            outcome = Some(sample::apply(conn, sampling, &purged_tables(purges))?);
         }
         // The deferred purges, now that the sample has emptied what referenced
         // them. Empty unless a plan deferred one, so an unsampled scrub still
