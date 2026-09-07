@@ -255,6 +255,15 @@ pub enum ScrubError {
         /// The role the connection reports.
         role: String,
     },
+    /// `--dry-run` cannot print a connection boundary for a target, because its
+    /// connection string is in keyword form and no password can be removed from
+    /// that with certainty. Without the boundary the printed script would run
+    /// this target's destructive plan against whatever database the pasting
+    /// session happens to be connected to.
+    UnprintableTarget {
+        /// The target labels, sorted.
+        targets: Vec<String>,
+    },
     /// A table this run promises to empty carries a user-defined trigger or
     /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
     /// write, so anything it writes lands after every rewrite and is never
@@ -507,6 +516,21 @@ impl std::fmt::Display for ScrubError {
                  from it.",
                 tables.len(),
                 bullet_list(tables),
+            ),
+            Self::UnprintableTarget { targets } => write!(
+                f,
+                "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
+                 Each block it prints is destructive, and the `\\connect` line above it \
+                 is what points psql at the right database. These targets are configured \
+                 with a keyword-form connection string (`host=... password=...`), which \
+                 cannot be printed with its password removed for certain — libpq allows \
+                 whitespace around the `=` and quoted values with escapes — so the \
+                 boundary is withheld. A script without it does not fail: it runs this \
+                 target's plan against whichever database the pasting session is already \
+                 on, which in a multi-target stream is the previous target. Configure the \
+                 target as a URI (`postgres://user@host/db`), or run without `--dry-run`.",
+                targets.len(),
+                bullet_list(targets),
             ),
             Self::ReplicaSessionRole { role } => write!(
                 f,
@@ -2525,6 +2549,22 @@ fn classify_and_apply(
         return Ok(());
     }
     if args.dry_run {
+        // Refuse before printing anything, if any target's boundary cannot be
+        // emitted. The alternative — a comment saying "connect yourself" above
+        // a BEGIN and a page of DELETEs — reads as advice and behaves as a
+        // loaded gun: pasted, it runs against whatever database the session is
+        // already on. Fail closed here, like every other promise in this
+        // command that cannot be arranged safely.
+        let unprintable: Vec<String> = plans
+            .iter()
+            .filter(|(_, url, _, _, _)| password_free_conninfo(url).is_none())
+            .map(|(label, _, _, _, _)| (*label).clone())
+            .collect();
+        if !unprintable.is_empty() {
+            return Err(ScrubError::UnprintableTarget {
+                targets: unprintable,
+            });
+        }
         // Printed in the order `execute` runs them: purges, then the sample,
         // then the rewrites — and, like `execute`, holding back the purges the
         // plan defers until after the sample. The order is load-bearing (a
@@ -2550,7 +2590,9 @@ fn classify_and_apply(
             // transaction against whichever database the session happens to be
             // connected to — sampling one of them repeatedly, with row counts
             // taken from the others, and leaving the rest untouched.
-            eprintln!("  {}", psql_connect(label, url));
+            for line in psql_connect(label, url) {
+                eprintln!("  {line}");
+            }
             eprintln!("  BEGIN;");
             // The same session pins `execute` sets, before anything reads or
             // writes: without them a role-level `search_path` resolves the
@@ -2646,8 +2688,10 @@ fn classify_and_apply(
             );
         }
     };
-    let mut pending_compaction: Vec<(&str, &str, &sample::SamplePlan, Vec<String>, i64)> =
-        Vec::new();
+    // The refreshed materialized views ride along beside the purge targets: the
+    // size report has to measure them, though compaction does not touch them
+    // (`REFRESH` already rewrote each one's heap).
+    let mut pending_compaction: Vec<PendingCompaction<'_>> = Vec::new();
     for (label, url, plan, facts, sampling) in &plans {
         let purges = purge_statements(&facts.framework_tables, &sources.config);
         let (applied, sampled) = execute(
@@ -2671,6 +2715,7 @@ fn classify_and_apply(
                 label.as_str(),
                 sampling,
                 purged_tables(&purges),
+                facts.materialized_views.clone(),
                 sampled.size_before,
             ));
         }
@@ -2708,8 +2753,8 @@ fn classify_and_apply(
     // step that makes the live subset actually laptop-sized, and it can only run
     // after the commit: VACUUM FULL rewrites each table and cannot join a
     // transaction.
-    for (url, label, sampling, purged, size_before) in pending_compaction {
-        report_reclaimed_size(url, label, sampling, &purged, size_before);
+    for (url, label, sampling, purged, refreshed, size_before) in pending_compaction {
+        report_reclaimed_size(url, label, sampling, &purged, &refreshed, size_before);
     }
 
     eprintln!("\n\u{2713} Scrub complete.");
@@ -2851,6 +2896,7 @@ fn report_reclaimed_size(
     label: &str,
     plan: &sample::SamplePlan,
     purged: &[String],
+    refreshed: &[String],
     before: i64,
 ) {
     let Ok(mut conn) = probe_connection(url, label, "compact the sampled tables") else {
@@ -2878,7 +2924,12 @@ fn report_reclaimed_size(
             return;
         }
     }
-    let Ok(after) = sample::data_size(&mut conn, plan, purged) else {
+    // Measured over the same set as `size_before`: the purge targets AND the
+    // materialized views this run refreshed. Compaction above deliberately
+    // skips the views — REFRESH rewrote each heap already — but leaving them
+    // out of the measurement is what let the report announce a laptop-sized
+    // result for a database a refreshed view still dominated.
+    let Ok(after) = sample::data_size(&mut conn, plan, &also_measured(purged, refreshed)) else {
         warn_not_compacted(before, "could not measure the compacted size");
         return;
     };
@@ -3752,6 +3803,37 @@ fn purged_tables(purges: &[(String, String)]) -> Vec<String> {
     purges.iter().map(|(table, _)| table.clone()).collect()
 }
 
+/// One target's deferred compaction: its URL and label, the sample plan, the
+/// `[framework] purge` targets, the materialized views the run refreshed, and
+/// the size measured before any of it ran.
+///
+/// Compaction can only happen after the commit — `VACUUM FULL` cannot join a
+/// transaction — so every target's inputs are carried out of the loop that
+/// scrubbed it.
+type PendingCompaction<'a> = (
+    &'a str,
+    &'a str,
+    &'a sample::SamplePlan,
+    Vec<String>,
+    Vec<String>,
+    i64,
+);
+
+/// Every relation the size report measures beside the sample's own tables.
+///
+/// The `[framework] purge` targets, because `DELETE` frees no file space so an
+/// emptied buffer keeps its whole file until compaction rewrites it — and the
+/// materialized views the run refreshes, because a view is rebuilt from
+/// whatever survives the sample and one over reference data does not shrink at
+/// all. Both sides of the ratio use this same set, or the ratio compares
+/// different things.
+fn also_measured(purged: &[String], refreshed: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = purged.iter().chain(refreshed).cloned().collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// Every table the run rewrites with `VACUUM (FULL, ANALYZE)` after the commit.
 ///
 /// Deleting rows frees no file space, so a table this run emptied still costs
@@ -3790,20 +3872,27 @@ fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> V
 /// Only the password is removed. If it cannot be removed with certainty the
 /// line is not emitted at all: a comment naming the target is a lesser failure
 /// than a printed credential.
-fn psql_connect(label: &str, url: &str) -> String {
+fn psql_connect(label: &str, url: &str) -> Vec<String> {
     password_free_conninfo(url).map_or_else(
         || {
-            format!(
-                "-- connect to the {label} target yourself before running the block \
-                 below; its connection string is in keyword form, which cannot be \
-                 printed without risking its password"
-            )
+            // Unreachable: the dry run refuses up front when any target's
+            // boundary cannot be printed. Kept, and made to STOP rather than to
+            // advise, because the failure mode if that guard is ever bypassed is
+            // a destructive block running against the previous target. A comment
+            // does not stop a paste; `\quit` does.
+            vec![
+                format!(
+                    "\\echo '{label}: no printable connection string (keyword form) \
+                     -- connect to this target yourself, then delete the \\quit below'"
+                ),
+                "\\quit".to_owned(),
+            ]
         },
         |conninfo| {
-            format!(
+            vec![format!(
                 "\\connect -reuse-previous=off {}",
                 quote_psql_arg(&conninfo)
-            )
+            )]
         },
     )
 }
@@ -4173,7 +4262,11 @@ fn execute(
         // survive it — and so no combination of flags can commit a row that was
         // sampled but not scrubbed: both happen in this one transaction.
         if let Some(sampling) = sampling {
-            outcome = Some(sample::apply(conn, sampling, &purged_tables(purges))?);
+            outcome = Some(sample::apply(
+                conn,
+                sampling,
+                &also_measured(&purged_tables(purges), materialized_views),
+            )?);
         }
         // The deferred purges, now that the sample has emptied what referenced
         // them. Empty unless a plan deferred one, so an unsampled scrub still
@@ -4260,6 +4353,32 @@ mod tests {
 
     // ── The dry run's session and connection preamble ──────────────────────
 
+    /// Both sides of the size ratio measure the same set of relations.
+    ///
+    /// The purge targets keep their whole file until compaction rewrites them,
+    /// and a refreshed materialized view is rebuilt from whatever survives the
+    /// sample — a view over reference data does not shrink at all. Measuring
+    /// base tables only reported `488.0 kB -> 232.0 kB` on a database still
+    /// holding a 44 MB refreshed view.
+    #[test]
+    fn the_measured_set_covers_purges_and_refreshed_views_once_each() {
+        let purged = vec!["autumn_jobs".to_owned(), "shared".to_owned()];
+        let refreshed = vec!["shared".to_owned(), "big_report".to_owned()];
+        assert_eq!(
+            super::also_measured(&purged, &refreshed),
+            vec![
+                "autumn_jobs".to_owned(),
+                "big_report".to_owned(),
+                "shared".to_owned()
+            ],
+            "every relation the run touches outside the plan, and each one once"
+        );
+        assert!(
+            super::also_measured(&[], &[]).is_empty(),
+            "and an unsampled target with neither measures nothing extra"
+        );
+    }
+
     #[test]
     fn the_connect_boundary_carries_the_whole_endpoint_and_no_password() {
         // A bare `\\connect dbname` inherits host, port and user, so a fleet whose
@@ -4268,7 +4387,8 @@ mod tests {
         let line = super::psql_connect(
             "control",
             "postgres://scrubby:hunter2@db1.internal:6543/app",
-        );
+        )
+        .join("\n");
         assert!(
             line.starts_with(r#"\connect -reuse-previous=off ""#),
             "the boundary must inherit nothing from the previous connection: {line}"
@@ -4289,7 +4409,8 @@ mod tests {
         let overridden = super::psql_connect(
             "control",
             "postgres://authority/app?host=queryhost&dbname=copy",
-        );
+        )
+        .join("\n");
         assert!(
             overridden.contains("host=queryhost") && overridden.contains("dbname=copy"),
             "an override must survive into the printed boundary: {overridden}"
@@ -4305,7 +4426,7 @@ mod tests {
             "host=db2.internal dbname=app password = hunter2",
             "host=db2 password='two words' dbname=app",
         ] {
-            let line = super::psql_connect("control", keyword);
+            let line = super::psql_connect("control", keyword).join("\n");
             assert!(
                 !line.contains("hunter2") && !line.contains("two words"),
                 "no keyword form may print its password: {line}"
@@ -4318,12 +4439,22 @@ mod tests {
                 line.contains("control"),
                 "the operator must still be told which target it was: {line}"
             );
+            // And it must STOP the paste, not merely advise. The dry run refuses
+            // before printing anything for such a target, so this branch is
+            // unreachable in practice; if that guard is ever bypassed, a comment
+            // would let a destructive block run against the previous target and
+            // `\quit` will not.
+            assert!(
+                line.contains("\\quit"),
+                "a boundary that cannot be printed must halt psql: {line}"
+            );
         }
 
         // A URI carries the password two ways, and the query form is the
         // EFFECTIVE one where both appear — so clearing the userinfo alone
         // prints the credential that actually authenticates.
-        let in_query = super::psql_connect("control", "postgres://bob@db/app?password=secret2");
+        let in_query =
+            super::psql_connect("control", "postgres://bob@db/app?password=secret2").join("\n");
         assert!(
             !in_query.contains("secret2"),
             "a query-string password must be stripped too: {in_query}"
@@ -4331,7 +4462,8 @@ mod tests {
         let both = super::psql_connect(
             "control",
             "postgres://alice:secret1@db/app?password=secret2&sslpassword=k3y&application_name=x",
-        );
+        )
+        .join("\n");
         assert!(
             !both.contains("secret1") && !both.contains("secret2") && !both.contains("k3y"),
             "every credential form must go: {both}"

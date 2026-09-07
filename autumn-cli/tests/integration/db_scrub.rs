@@ -2041,6 +2041,136 @@ async fn sampling_refuses_legacy_table_inheritance() {
     );
 }
 
+/// `--dry-run` refuses a target whose connection boundary it cannot print.
+///
+/// The printed script is destructive, and the `\connect` line above each block
+/// is the only thing pointing psql at the right database. A keyword-form
+/// connection string cannot be printed with its password removed for certain,
+/// so the boundary is withheld — and a block without it does not fail when
+/// pasted: it runs THIS target's plan against whatever database the session is
+/// already on. The command refuses rather than advertising such a script.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_dry_run_refuses_a_target_it_cannot_print_a_boundary_for() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "unprintable").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let keyword =
+        format!("host={host} port={port} user=postgres password=postgres dbname=unprintable");
+    let envs = [("AUTUMN_DATABASE__URL", keyword.as_str())];
+
+    let (stdout, stderr) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=50%"],
+        &envs,
+    );
+    assert!(
+        stderr.contains("--dry-run") && stderr.contains("control"),
+        "the refusal must say which target it cannot print: {stderr}"
+    );
+    // The point of refusing is that nothing runnable is advertised. Before the
+    // fix the output carried a `-- connect yourself` comment and then the whole
+    // destructive block.
+    for output in [&stdout, &stderr] {
+        assert!(
+            !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+            "no destructive block may be printed without its boundary: {output}"
+        );
+    }
+
+    // And the same target scrubs normally: this is a printing refusal, not a
+    // rejection of keyword-form connection strings.
+    let (_o, ok) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        ok.contains("Scrub complete"),
+        "a keyword-form target must still scrub: {ok}"
+    );
+}
+
+/// The size report covers the materialized views the run refreshes.
+///
+/// A view is rebuilt from whatever survives the sample, so one over reference
+/// data — an `always_include` table — is exactly as large afterwards as before.
+/// Measuring the sampled base tables alone therefore answers the report's one
+/// question ("does this fit on a laptop?") with a number that omits the largest
+/// thing in the database, while naming the refreshed view three lines above.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_size_report_counts_a_refreshed_materialized_view() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "matview_size").await;
+    // Padded so the view dwarfs the base tables, and built over `countries`,
+    // which `[sample] always_include` keeps whole — so REFRESH rebuilds it at
+    // full size and the sample reclaims nothing from it.
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW big_report AS \
+                SELECT g AS id, c.name, repeat('x', 900) AS pad \
+                FROM countries c CROSS JOIN generate_series(1, 15000) g;",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/matview_size");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let view_bytes = count(
+        &client,
+        "SELECT pg_total_relation_size('big_report')::bigint",
+    )
+    .await;
+    assert!(
+        view_bytes > 8 * 1024 * 1024,
+        "the fixture must make the view the dominant relation, not a rounding \
+         error against the base tables: {view_bytes} bytes"
+    );
+
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("big_report (materialized view refreshed)"),
+        "the run must refresh the view, or this test is measuring nothing: {stderr}"
+    );
+
+    // The view survives the sample at full size, so both sides of the ratio
+    // must exceed it. Before the fix the line read `488.0 kB -> 232.0 kB` on a
+    // database still holding 44 MB.
+    let size_line = stderr
+        .lines()
+        .find(|line| line.contains("Table size:"))
+        .unwrap_or_else(|| panic!("the run must report a size: {stderr}"));
+    let after_view = count(
+        &client,
+        "SELECT pg_total_relation_size('big_report')::bigint",
+    )
+    .await;
+    assert!(
+        after_view > 8 * 1024 * 1024,
+        "the refreshed view must still be the dominant relation: {after_view} bytes"
+    );
+    for figure in size_line
+        .split("Table size:")
+        .nth(1)
+        .unwrap()
+        .split('\u{2192}')
+    {
+        assert!(
+            figure.contains("MB") || figure.contains("GB"),
+            "both sides of the ratio must count the view that dominates the \
+             database, not just the sampled base tables: {size_line}"
+        );
+    }
+}
+
 /// A purged framework table is compacted and measured like any other.
 ///
 /// `[framework] purge` empties its tables, and `DELETE` frees no file space, so

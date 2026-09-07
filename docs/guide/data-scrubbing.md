@@ -400,8 +400,25 @@ universe, but the run empties them, and an emptied offline-sync buffer is often
 the largest thing it removes — leaving it out would report a laptop-sized result
 for a database still holding that buffer's whole file.
 
-`--dry-run` prints that whole sequence as SQL you can actually run, so the walk
-prints as the loop it is — a `DO` block that repeats the pass and stops on one
+The materialized views the run refreshes are measured too, on both sides of the
+ratio. A view is rebuilt from whatever survives the sample, so one over a table
+`always_include` keeps whole does not shrink at all; measuring the sampled base
+tables alone reported `488.0 kB → 232.0 kB` on a database whose refreshed view
+still held 44 MB. They are measured but not compacted — `REFRESH` has already
+rewritten each one's heap.
+
+`--dry-run` prints that whole sequence as SQL you can actually run. Each
+target's block is preceded by a `\connect` line, because the printed stream is
+one file and the blocks are destructive: without it, pasting runs every target's
+transaction against whichever database the session happens to be on. That line
+carries the target's whole connection string with its password removed — and
+where the password cannot be removed with certainty, which is any keyword-form
+string (`host=... password=...`, where libpq allows whitespace around the `=`
+and quoted values with escapes), the run **refuses** rather than print a
+destructive block with no boundary above it. Configure such a target as a URI to
+use `--dry-run` on it; scrubbing it without `--dry-run` is unaffected.
+
+The walk prints as the loop it is — a `DO` block that repeats the pass and stops on one
 that selects nothing — rather than as a single pass with a comment saying to
 repeat it. The difference is not cosmetic: within a pass the statements run in
 list order, and that order comes from the catalog, so one pass reaches only as

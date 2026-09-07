@@ -99,7 +99,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scrubbed. No ordering avoids it and no postcondition catches it — a trigger
   body can write anywhere — so a `DELETE` trigger, or an `ON DELETE` rewrite
   rule, on a table the run empties is now refused before anything is written,
-  `--check` and `--dry-run` included. Drop or disable it on the copy. See the
+  `--check` and `--dry-run` included. Drop or disable it on the copy. `--dry-run`
+  also refuses a target configured with a keyword-form connection string
+  (`host=... password=...`): each printed block is destructive and the `\connect`
+  line above it is what points `psql` at the right database, but a keyword-form
+  string cannot be printed with its password removed for certain, so the
+  boundary is withheld — and a block without one runs against whichever database
+  the pasting session is already on. Configure such a target as a URI to use
+  `--dry-run`. The size report now also counts the materialized views the run
+  refreshes: a view is rebuilt from whatever survives the sample, so one over
+  reference data does not shrink, and measuring the sampled base tables alone
+  reported `488.0 kB → 232.0 kB` on a database still holding a 44 MB view.
+  A `--sample` spec splits at its LAST `=`, so a table whose quoted name
+  contains one (`events=2026`) can be named as a root. See the
   [migration guide](docs/migrations/next.md#scrub-a-delete-trigger-or-rule-on-a-table-autumn-db-scrub-empties-is-refused). Legacy
   `INHERITS` inheritance is refused for a sampled run (a statement naming the
   parent reaches the child, which the plan models separately); an exact `100%`

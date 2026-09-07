@@ -523,8 +523,12 @@ pub fn parse_spec(raw: &str) -> Result<SampleSpec, SampleError> {
         spec: raw.to_owned(),
         detail: detail.to_owned(),
     };
+    // Split at the LAST `=`, not the first: an amount never contains one, but a
+    // quoted table name may (`CREATE TABLE "events=2026"` is legal), and
+    // splitting at the first left no spelling at all for such a root — the
+    // remainder parsed as the amount and failed.
     let (table, amount) = raw
-        .split_once('=')
+        .rsplit_once('=')
         .ok_or_else(|| invalid("no `=` between the table and the amount"))?;
     let table = table.trim();
     if table.is_empty() {
@@ -1790,13 +1794,22 @@ pub struct SampleOutcome {
     pub size_before: i64,
 }
 
-/// The on-disk size of every table the sample touches, indexes and TOAST
+/// The on-disk size of every relation the run touches, indexes and TOAST
 /// included.
 ///
 /// Deliberately not `pg_database_size`: that is dominated by the system
 /// catalogs and template data on a small database, so it would report a 99%
 /// "saving" of nothing. The question a sample answers is how much of the app's
 /// own data the copy carries.
+///
+/// `also` carries the relations the run touches from OUTSIDE the plan: the
+/// `[framework] purge` targets it empties, and the materialized views it
+/// refreshes. Both belong on both sides of the ratio. A refreshed view is the
+/// less obvious one and the more misleading to omit — it is rebuilt from
+/// whatever survives the sample, so a view over reference data stays exactly as
+/// large as before while the report, measuring base tables only, announces a
+/// laptop-sized result. Measured: a 44 MB view over an `always_include` table,
+/// reported as `488.0 kB -> 232.0 kB` on a database still holding 44 MB.
 ///
 /// # Errors
 ///
@@ -1806,10 +1819,9 @@ pub fn data_size(
     plan: &SamplePlan,
     also: &[String],
 ) -> Result<i64, diesel::result::Error> {
-    // `also` carries the tables the scrub empties from OUTSIDE the sample —
-    // `[framework] purge`. They are not in the plan, but the run empties them
-    // and compacts them, so leaving them out would report a laptop-sized result
-    // for a database still holding a purged buffer's whole file.
+    // Names, not relkinds: `pg_total_relation_size` answers for a materialized
+    // view the same way it answers for a table, and the walk below reaches a
+    // partitioned parent's leaves either way.
     let mut measured: Vec<&str> = plan
         .tables
         .iter()
@@ -1902,12 +1914,12 @@ impl From<diesel::result::Error> for SampleFailure {
 pub fn apply(
     conn: &mut PgConnection,
     plan: &SamplePlan,
-    also_emptied: &[String],
+    also_measured: &[String],
 ) -> Result<SampleOutcome, SampleFailure> {
-    // Measured before the sample's deletes, and correct for `also_emptied` even
-    // though those purges have already run: `DELETE` frees no file space, so a
-    // purged table still occupies its full size here.
-    let size_before = data_size(conn, plan, also_emptied)?;
+    // Measured before the sample's deletes, and correct for the purge targets in
+    // `also_measured` even though those purges have already run: `DELETE` frees
+    // no file space, so a purged table still occupies its full size here.
+    let size_before = data_size(conn, plan, also_measured)?;
 
     let before = source_counts(conn, plan)?;
 
@@ -2090,6 +2102,31 @@ mod tests {
 
     #[test]
     fn spec_parses_an_absolute_count() {
+        assert_eq!(
+            parse_spec("users=500").unwrap(),
+            root("users", SampleAmount::Count(500))
+        );
+    }
+
+    /// A table name may contain `=`; an amount never does.
+    ///
+    /// `CREATE TABLE "events=2026"` is legal `PostgreSQL`, and every identifier
+    /// path in this module already quotes rather than assumes. Splitting the
+    /// spec at the FIRST `=` left such a table with no spelling at all: the
+    /// remainder parsed as the amount and was rejected, so the root could not
+    /// be named however it was written.
+    #[test]
+    fn spec_splits_a_table_name_containing_the_delimiter() {
+        assert_eq!(
+            parse_spec("events=2026=500").unwrap(),
+            root("events=2026", SampleAmount::Count(500))
+        );
+        assert_eq!(
+            parse_spec("events=2026=1%").unwrap(),
+            root("events=2026", SampleAmount::Percent(1.0))
+        );
+        // And the ordinary case is unchanged, which is the whole reason the
+        // last `=` is the safe one to split at.
         assert_eq!(
             parse_spec("users=500").unwrap(),
             root("users", SampleAmount::Count(500))
