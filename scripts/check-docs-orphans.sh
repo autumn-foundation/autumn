@@ -405,9 +405,8 @@ _VAL_BOOL = re.compile(r'[ \t]*(false|true)\b')
 #
 # Quoted KEYS need none of this: TOML allows basic and literal strings as keys
 # but not the multi-line forms, so `_line_key` stays as it is.
-_VAL_STRING = re.compile(
-    r'[ \t]*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\''
-    r'|"((?:[^"\\]|\\.)*)"|\'([^\']*)\')', re.S)
+_VAL_SINGLE_STRING = re.compile(
+    r'[ \t]*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\')')
 
 
 def _trim_ml(text):
@@ -417,19 +416,30 @@ def _trim_ml(text):
     return text[1:] if text.startswith('\n') else text
 
 
-def _string_value(m):
-    """The value of whichever form `_VAL_STRING` matched.
+def _value_string(value):
+    """The string a value begins with, decoded, or None if it is not one.
+
+    The multi-line forms are found with `_ml_close` rather than a non-greedy
+    pattern, because `(.*?)\"\"\"` stops at the FIRST three quotes and TOML lets
+    one or two sit before the terminator. One notion of where a multi-line
+    string ends, shared with every scanner, instead of a second in a regex.
 
     Escapes are decoded for the two BASIC forms and left alone for the two
     literal ones, which is the whole difference between them.
     """
-    if m.group(1) is not None:
-        return _decode_basic(_trim_ml(m.group(1)))
-    if m.group(2) is not None:
-        return _trim_ml(m.group(2))
-    if m.group(3) is not None:
-        return _decode_basic(m.group(3))
-    return m.group(4)
+    s = value.lstrip()
+    for tok in ('"""', "'''"):
+        if s.startswith(tok):
+            close = _ml_close(s, tok, 3)
+            if close < 0:
+                return None
+            body = _trim_ml(s[3:close])
+            return _decode_basic(body) if tok == '"""' else body
+    m = _VAL_SINGLE_STRING.match(value)
+    if m is None:
+        return None
+    return (_decode_basic(m.group(1)) if m.group(1) is not None
+            else m.group(2))
 # A basic string carries ESCAPES, and Cargo decodes them before resolving the
 # path: `readme = "\\u0069ntro.md"` comes back out of `cargo metadata` as
 # `intro.md`. Returning the encoded source meant the tracked README was never
@@ -689,16 +699,24 @@ def _ml_close(text, tok, start=0):
     its own start. Nothing here measures that case either way, so it is stated
     rather than claimed safe.
     """
-    if tok == "'''":
-        return text.find(tok, start)
+    q = tok[0]
     j = start
     n = len(text)
     while j < n:
-        if text[j] == '\\':
+        if q == '"' and text[j] == '\\':
             j += 2
             continue
         if text.startswith(tok, j):
-            return j
+            run = j
+            while run < n and text[run] == q:
+                run += 1
+            # TOML allows one or two quotes to sit immediately BEFORE the
+            # terminator, so the last three of a run close the string:
+            # `'''README.md''''` is the path `README.md'` and `'''x'''''` is
+            # `x''`. Taking the first three dropped those characters from the
+            # path, which can name an adjacent decoy file instead of the one
+            # Cargo publishes. A run longer than five is not valid TOML.
+            return j + min(run - j - 3, 2)
         j += 1
     return -1
 
@@ -949,9 +967,8 @@ def _owning_workspace(package, pkg):
     """
     value = _find_key(package, ('workspace',))
     if value is not None:
-        m = _VAL_STRING.match(value)
-        if m is not None:
-            named = _string_value(m)
+        named = _value_string(value)
+        if named is not None:
             base = posixpath.normpath(
                 posixpath.join(pkg, named) if pkg else named)
             cand = 'Cargo.toml' if base in ('', '.') else base + '/Cargo.toml'
@@ -1019,9 +1036,9 @@ def _readme_paths(manifest, pkg):
         manifest = _toml_table(read(owner), 'workspace.package') or ''
         pkg = posixpath.dirname(owner)
     value = _find_key(manifest, ('readme',))
-    m = _VAL_STRING.match(value) if value is not None else None
-    if m is not None:
-        named = [_string_value(m)]
+    text = _value_string(value) if value is not None else None
+    if text is not None:
+        named = [text]
     else:
         b = _VAL_BOOL.match(value) if value is not None else None
         if b is not None and b.group(1) == 'false':
@@ -8128,6 +8145,19 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9nf/pkg/README.md"
   git -C "$c9nf" add -A && git -C "$c9nf" commit -qm bracket-in-list-comment
   check "a bracket in a comment does not close a publish list" pass "$c9nf"
+
+  # TOML lets one or two quotes sit immediately BEFORE a multi-line
+  # terminator, so `'''README.md''''` is the path `README.md'` — Cargo
+  # packages that file. Stopping at the first three quotes named the adjacent
+  # `README.md` instead, which here is a decoy carrying the only link to the
+  # page: the gate would pass on a file no registry publishes.
+  local c9ng="$tmp/c9ng"; make_corpus "$c9ng"
+  mkdir -p "$c9ng/pkg"
+  printf "[package]\nname = \"pkg\"\nreadme = '''README.md''''\n" > "$c9ng/pkg/Cargo.toml"
+  printf '# Real\n\ntext\n' > "$c9ng/pkg/README.md'"
+  printf '# Decoy\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ng/pkg/README.md"
+  git -C "$c9ng" add -A && git -C "$c9ng" commit -qm quotes-before-terminator
+  check "quotes before a multi-line terminator belong to the value" fail "$c9ng"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
