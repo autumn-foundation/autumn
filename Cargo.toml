@@ -125,6 +125,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 syn = { version = "2", features = ["full", "visit", "visit-mut"] }
 quote = "1"
 proc-macro2 = "1"
+# Resolves a dependency's actual (possibly `package = "..."`-renamed) crate
+# name from the invoking crate's Cargo.toml — used by autumn-macros to emit
+# `::autumn_web` paths that still resolve after a downstream rename (#1828).
+proc-macro-crate = "3.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

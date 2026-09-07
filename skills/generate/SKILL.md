@@ -49,6 +49,18 @@ created (`autumn destroy scaffold Post title:String`, `--dry-run` supported).
 It never touches a database — only generated files/migrations. On the
 published 0.5.0 CLI, revert by hand (git) instead.
 
+`destroy` refuses to delete a file you edited. `generate` records a digest of
+every file it owns in `.autumn/generated.toml` (commit it), and `destroy`
+deletes a file whose content matches that digest or the current templates.
+A CLI upgrade that changed a template therefore no longer forces `--force`.
+The entry records the command's arguments, a fingerprint of the
+`autumn.generate.toml` they resolve from, and the resolved database backend, so
+the digest counts only when all three match.
+Two cases still need it: a project generated before the manifest existed, and
+a file you edited and want deleted anyway. Re-running the original generator
+command with `--force` re-records the digest and is the better fix for the
+first.
+
 ## Field type reference
 
 Use the exact tokens below — the DSL parser is case-sensitive and does not
@@ -98,7 +110,11 @@ mailer --list-unsubscribe` are backend-aware too (#1927): on a SQLite app they
 scaffold SQLite-dialect migrations (`INTEGER PRIMARY KEY AUTOINCREMENT`,
 `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of being rejected,
 and the generated auth session store is typed against
-`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908).
+`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). That
+store's query functions also bind `::autumn_web::RuntimeBackend` rather than
+`diesel::pg::Pg` (#1908), so the tracked-sessions store compiles and runs on the
+SQLite connection; the scaffolded session-management and OAuth guides emit their
+operator SQL in the app's dialect too.
 **Every** field kind now has a working diesel SQLite conversion (#1924): a
 SQLite app's `Cargo.toml` gets the SQLite dependency set (diesel on `sqlite`,
 bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated

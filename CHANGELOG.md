@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file
+  whose generator template changed since the project was generated (issue
+  #1835). `generate` now records a digest of every file it owns in
+  `.autumn/generated.toml`, and `destroy` accepts a file matching either that
+  digest or the current render. A real edit matches neither and is still
+  refused without `--force`, and the applied-migration guard is unchanged.
+  Commit the manifest — it is the baseline a later checkout compares against.
+  A project generated before the manifest existed keeps the previous
+  behaviour: compare against the current render only, `--force` to override.
+  Each entry also records the inputs that produced it — the command's
+  arguments, a fingerprint of the `autumn.generate.toml` they resolve from, and
+  the resolved database backend — so the digest counts only when all three
+  match. `autumn destroy model Post` after `autumn generate model Post
+  title:String` is still refused; editing the recipe, or moving the project
+  between SQLite and Postgres, drops the baseline rather than trusting it; and
+  files written by `autumn new --starter`, which uses the same machinery, are
+  never a generator's to delete.
+  A side effect of the digest being taken over LF-normalised text: a CRLF
+  checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
+  whether or not a manifest entry backs it.
+
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
   a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
@@ -30,6 +51,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature, which `STABILITY.md` places outside SemVer.
 
 ### Added
+
+- **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
+  (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
+  its query functions by `diesel::pg::Pg`, which rejects the SQLite
+  `RuntimeConnection`, so the store did not compile on a SQLite app. Every such
+  bound in the generated auth surface (the four session revoke/list functions and
+  the seven remember-me chain functions) is now
+  `::autumn_web::RuntimeBackend` — the alias that resolves to `diesel::pg::Pg` by
+  default and `diesel::sqlite::Sqlite` under the `sqlite` feature — so the
+  scaffolded store compiles and runs on whichever backend the app selected.
+  Postgres behaviour is unchanged; the alias resolves to the same backend it
+  already used. The scaffolded `docs/guide/session-management.md` also emits its
+  operator SQL in the app's own dialect: the stale-row sweep is
+  `datetime('now', '-90 days')` on SQLite (was Postgres-only `NOW() - INTERVAL`),
+  and its retrofit `CREATE TABLE` is now rendered from the same helper as the
+  migration, so the two cannot drift. The scaffolded `docs/guide/oauth.md`
+  documents its `oauth_identities` schema in the app's dialect for the same
+  reason. A new `sqlite_tracked_sessions` test runs the generated store's shape
+  against a real, file-backed SQLite database over a multi-connection pool —
+  login tracking, the revocation gate (including a revoke committed on another
+  connection), the `UNIQUE` digest guard, `last_seen_at` refresh, rotation
+  rebinding, the three revoke paths, the documented retention sweep across both
+  timestamp encodings, and `ON DELETE CASCADE` on account deletion. A
+  `sqlite_test_targets_are_ci_named` hygiene test now fails the build if any
+  `sqlite`-gated `[[test]]` target is missing from the CI job that names them,
+  so a future target cannot ship dark. Guide:
+  `docs/guide/sqlite-in-production.md`.
+- **cli:** dependency advisories and policy reach the dev loop (issue #1633).
+  `autumn doctor` gains a `dependencies` check that grades the app's lockfile
+  against its own `deny.toml` — the same policy file, waiver store, check list
+  and auditor that #1600's CI gate runs, so a local verdict predicts the CI
+  verdict. Two differences remain and are reported rather than hidden: CI pins
+  cargo-deny 0.20.2 while a local run uses whatever is installed, and CI
+  fetches the advisory database every run while doctor reads local data and
+  names its age. Each finding reports its advisory or violation id, severity,
+  crate and title; a waived finding shows as waived and never fails, and a
+  tree with nothing live is exactly one line. Severity is consequence: what the
+  policy denies grades high or critical (CVSS v3 separates the two), what it
+  warns about grades low or medium. `autumn dev` reports only findings the
+  policy **denies** — the ones that turn CI red — so a clean tree, a fully
+  waived tree and a tree with only warn-level findings all add nothing to its
+  output; a critical advisory gets a startup banner. The audit is read after
+  the initial build, so a cold start never waits on it. Neither command
+  fetches: both run `cargo deny --offline`, doctor warns once when the advisory
+  data is over 7 days old, and a missing auditor or database is a **pass** that
+  reads `not evaluated` — never a silent pass, and never a warning that would
+  make `autumn doctor --strict` red on every machine that has not installed an
+  optional tool. `autumn new` now scaffolds `[licenses]`, `[bans]` and
+  `[sources]` into `deny.toml` as commented, quiet defaults, and the generated
+  CI workflow derives its check list from the sections that file declares — in
+  every TOML spelling, by the same rule doctor uses — so uncommenting one
+  widens the local check and the CI gate together. See
+  docs/guide/supply-chain.md.
+- **autumn-macros:** every macro's generated code now resolves the
+  `autumn-web` crate path via [`proc-macro-crate`](https://docs.rs/proc-macro-crate)
+  instead of a hardcoded `::autumn_web` (issue #1828), so a downstream crate
+  that depends on `autumn-web` under a renamed Cargo key (`web = { package =
+  "autumn-web" }`) can use `#[get]`, `#[model]`, `#[repository]` and every
+  other Autumn macro with no changes. For the rarer case of hosting two
+  differently-keyed `autumn-web` versions in one crate at once (e.g.
+  mid-upgrade), where automatic detection is ambiguous, every attribute macro
+  additionally accepts an explicit `crate = "..."` override, e.g.
+  `#[get("/x", crate = "autumn_web_05")]`.
 
 - **sqlite:** `Uuid`, `decimal{p,s}` and `enum{…}` model fields now work on a
   SQLite app — the last three field kinds `autumn generate` refused (#1924).
@@ -96,6 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `generate auth` already emits. The same type on Postgres, so behaviour is
   unchanged — but the emitted bytes of `src/policies/<model>.rs` differ, and a
   SQLite app needs it to compile at all (#1924).
+
+### Added
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
@@ -1704,6 +1790,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spawn site queries fleet-distribution through a named
   `SchedulerCoordinator`/`SchedulerBackend` predicate instead of matching the
   scheduler config enum inline.
+- **ci:** the test suite is now **sharded across runners** instead of running as
+  one job per OS [no-plugin] — CI scheduling only; it adds no framework surface
+  an agent could reach for, and the notes for humans editing tests live in
+  CLAUDE.md rather than the plugin. On the 2026-08-26 trunk run
+  `Test (windows-latest)` alone was 128 minutes and *was* the critical path of a
+  2h27m run. Two things dominated, both measured from that run's logs. First,
+  `compile_fail::` (trybuild) was 37.1 of the 46.8 minutes the consolidated
+  `integration_tests` binary spent running on Windows, and it was the *tail* —
+  the binary finished 0.2s after trybuild did, on every OS. Each case shells out
+  a nested `cargo` build and trybuild serialises them behind a project-dir lock,
+  so only more runners make it faster. Second, the eight non-default feature
+  lanes ran in sequence in that same job, ~44 minutes of pure recompilation on
+  Windows despite being independent builds.
+
+  `test` is now four job families running side by side — `test` (the workspace
+  suite), `trybuild` (four shards), `test-features` (one job per feature set)
+  and `test-docker` — behind one aggregate `Test suite` gate. First fully-green
+  sharded run: **2h27m → 1h57m**. `trybuild`, `test-features` and `coverage`
+  were then narrowed further: the first two to Linux only (a trybuild golden is
+  pinned to the rustc version, not the OS; a feature lane asks about a feature,
+  not a platform), and `coverage` — by then a co-equal 55-minute tail — split
+  into four lanes by feature set, each uploading under its own Codecov flag.
+  That took the workflow from 47 expanded jobs to 32. Those three changes land
+  after the 1h57m measurement, so the new total is not yet measured.
+
+  Test-layout consequences, all of which keep every test running and
+  merge-blocking: `compile_pass_tests` split into `_a`/`_b` (a disjoint split of
+  the same fixture list, no fixture added or removed); the `sim_*` determinism
+  modules got a single-threaded second step, because removing trybuild freed the
+  libtest thread pool and the remaining ~1880 tests went from trickling through
+  trybuild's gaps (863s) to full parallelism (61s), enough to flip them on a
+  4-vCPU runner; and `capsule_cache_effect` moved to its own binary, because it
+  installs a process-global cache that any concurrent `TestApp::build` clears.
+  Every shard runs `cargo test --workspace` deliberately — the trybuild fixture
+  list is `#[cfg(feature = ...)]`-gated, so narrowing a shard would silently
+  compile fewer fixtures and still report green — and each asserts a non-zero
+  pass count, because `cargo test` exits 0 when a filter matches nothing.
+  **Branch protection must be repointed** from the per-OS `Test (…)` checks to
+  `Test suite` (`test-gate`), the one name that stays stable as shards come and
+  go.
 - **plugin-conformance:** **Breaking:** `plugin_conformance::ConformanceConfig`
   gains a `contract` field and is now `#[non_exhaustive]`, so it can no longer
   be built with a struct literal — use `ConformanceConfig::new(name)` and the
@@ -1984,8 +2110,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failing after upgrade — this is the intended effect of closing the gap. See
   `docs/security/2026-09-03-webhook-ssrf/`.
 
+### Performance
+
+- **`MemorySearchBackend::keyword_search` no longer re-tokenizes every
+  document's fields on every query:** `score` (in `autumn-search/src/memory.rs`)
+  called `tokenize` — which allocates a `String` per token via
+  `str::to_lowercase` — on every indexed field of every document, on every
+  single `keyword_search` call. Profiling a realistic 5,000-document,
+  two-field (~206 words/document) corpus with `valgrind --tool=callgrind`
+  found this re-tokenization (the scan loop itself plus `str::to_lowercase`)
+  accounted for ~66% of the call's instructions. A document's tokens don't
+  change between searches, only between writes, so `MemorySearchBackend` now
+  tokenizes each document's fields once, when it is written (`StoredDocument`
+  in `memory.rs`), and every later `keyword_search`/`score` call reuses the
+  cached tokens instead of recomputing them. Purely an internal
+  representation change to the in-memory reference/dev backend — no public
+  API moved and ranking behavior is unchanged (same 128 `autumn-search` tests
+  pass unmodified in assertions). New harness:
+  `autumn-search/benches/keyword_search.rs`. Measured on the same machine, one
+  session: instructions (callgrind, 5 queries over the corpus) 12,029,984,210
+  → 1,820,921,069 (**-84.9%**); marginal allocation blocks/query (dhat)
+  1,038,586 → 8,586 (**-99.2%**); marginal allocation bytes/query (dhat)
+  6,563,220 → 530,398 (**-91.9%**).
+
 ### Fixed
 
+- **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
+  post's slug and make its permalink silently serve a different post (issue
+  #2544):** `unique_slug()`/`unique_slug_excluding()` proved uniqueness with a
+  `SELECT COUNT` before the `INSERT`/`UPDATE` that relied on it — a
+  check-then-act race two concurrent submits (a double-click, or a
+  flaky-network auto-retry) could both win, landing two posts on the same
+  `(subreddit_id, slug)`. Nothing at the database level backed that
+  invariant (`posts.slug` had only a plain, non-unique index, unlike
+  `subreddits.slug`/`users.username`), so once duplicated, `show()`'s
+  unordered `.filter(slug...).filter(subreddit_id...).first()` returned an
+  arbitrary one of the two forever — the other post's own permalink now
+  silently served someone else's title, body, and comments with a `200` and
+  no error. Fixed with a composite `UNIQUE (subreddit_id, slug)` constraint
+  (migration `20260906163932_posts_slug_unique_per_subreddit`) plus a retry
+  loop in `submit`/`update`: the existing `SELECT`-based guess stays as a
+  fast path, but a losing insert/update now comes back as a unique-violation
+  on that named constraint, which the loser catches and retries with the
+  next candidate slug instead of colliding with the winner. Regression-tested
+  by driving the real compiled binary with 10 fully concurrent, identical
+  `/submit` requests and asserting no duplicate `(subreddit_id, slug)` pair
+  survives (`tests/post_slug_race_e2e.rs`).
+
+- **`#[query_budget]` silently missed queries issued through a handle bound
+  via an async/fallible accessor (e.g. `let mut conn = self.conn().await?;`),
+  a real shape in `PostgresSearchStore::write_documents`:** neither
+  `Analyzer::expr_is_handle` nor `chain_root_is_handle` peeled
+  `Expr::Await`/`Expr::Try` before checking whether a call was one of the
+  recognized handle accessors (`db`, `repo`, `repository`, `pool`, `conn`,
+  `connection`), so `conn` never entered the tracked-handle set and every
+  later query issued through it (e.g. a diesel-async
+  `query.execute(&mut conn)` inside a loop) went uncounted with **no
+  diagnostic at all** — worse than the analysis's own "never assume
+  query-free" contract, which is meant to *report* what it cannot prove, not
+  silently drop it. `expr_is_handle` now recognizes `self.conn().await?`
+  through a new, deliberately narrower `awaited_expr_is_fresh_handle` helper
+  that only fires on the `?`-unwrapped shape — a bare `self.conn().await`
+  (no `?`) still yields the `Result` itself, not the handle, and is not
+  promoted, so a later `result.is_err()`/`.unwrap()` is not miscounted as a
+  query. [no-plugin] — analysis-only fix inside `autumn-macros`; no API
+  change.
 - **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
   attribute broke instead of composing (issue #2516):** #1668 moved each of
   these three body guards' checks out of the handler body and into a
@@ -2267,7 +2456,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[public]` to all three handlers, matching the pattern documented right
   above them in the template. [no-plugin] — restores previously-documented
   behavior; no new or changed API.
-
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
@@ -2355,7 +2543,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern doesn't, plus the mirror-image ordering where a lock that
   genuinely wins the race correctly rejects the concurrent login instead of
   silently granting a session.
-
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
@@ -3588,6 +3775,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **new `throttle_check` profiling harness; findings, no fix:** added
+  `autumn/benches/throttle_check.rs`, driving real traffic through a
+  `#[throttle]`-guarded route and an identical unthrottled route at
+  equal-length paths with an identical response body (issue #1350's
+  per-route rate limiter had no committed benchmark before this). Several
+  review rounds fixed real measurement bugs before these numbers were final:
+  `key = "token"` with an identical `Authorization: Bearer` header sent to
+  BOTH routes (not `key = "ip"` — `TestApp` requests carry no `ConnectInfo`,
+  which would make `extract_throttle_key` return `None` and profile
+  `__check_throttle`'s no-client bypass instead of the real
+  `limiter.decide()` path; and not an asymmetric header, which would fold
+  its own construction cost into the measurement); equal-length routes/body
+  (`/route-a`/`/route-b`, both `"ok"`), since differently-sized paths and
+  response bodies also leaked into the byte delta; a `THROTTLE_LIMIT` guard
+  plus an assertion on every measured response, so a large `--iterations`
+  can never silently drain the bucket and profile denials instead of the
+  documented warm `Decision::Allowed` path; asserting (not just
+  `black_box`ing) the measured status on BOTH routes, since an earlier
+  version asserted only the throttled side, putting that assertion's own
+  comparison/branch instructions asymmetrically into the callgrind delta;
+  and widening the frame-level DHAT attribution beyond `rate_limit::`-named
+  frames to also catch `#[throttle]`'s generated `FromRequestParts` gate
+  cloning `parts.headers` *before* ever calling into the `rate_limit` module
+  (`autumn-macros/src/throttle.rs`), which the first attribution pass missed
+  entirely; and base-subtracting the callgrind instruction counts (an
+  `--iterations 0` run per route, matching the DHAT methodology) rather than
+  dividing raw process totals by request count, which had been diluting both
+  routes' per-request figures with shared process-startup/router-construction
+  cost. Full, corrected `#[throttle]` overhead against the
+  ~140-151-block/~27.3-28.7KB per-request baseline `config_alloc_gate`
+  already gates (#2232): ~10 blocks / ~885 bytes per request (~6.6%/~3.1%,
+  under the 10%-of-allocations floor) and ~5.3% more instructions than an
+  unthrottled route on the marginal, base-subtracted count (callgrind,
+  `--route throttled` vs. `--route plain`) — which, read as "would a fix
+  removing this entire overhead clear the 5%-of-instructions floor,"
+  technically says yes, though only just. But no *safe, autonomous,
+  smallest-fix* candidate gets there: the only narrowly-scoped,
+  mechanistically-clear piece —
+  two redundant `format!` calls building an almost-always-cache-hit
+  `HashMap` key (`resolve_throttle_params`'s `registry_key`,
+  `__check_throttle`'s `cache_key`) — accounts for only ~6 of those ~10
+  blocks and isn't separately visible above a 1%-of-instructions self-cost
+  threshold on its own. The rest (two `HeaderMap` clones, one in the
+  generated gate and one in `extract_throttle_key`, plus the LRU-backed
+  `MemoryStore::decide` bucket lookup) is load-bearing rate-limiting state
+  tracking, not an obvious redundancy, and this bench's minimal 1-2-header
+  requests likely *understate* the gate's `parts.headers.clone()` cost for
+  a real multi-header production request. Fixing the aggregate would mean
+  restructuring the limiter's per-request key derivation and bucket-lookup
+  path together — a maintainer decision on a security-relevant surface, not
+  an unreviewed autonomous change. Recorded as a findings issue rather than
+  shipped; the harness itself is the lasting artifact, giving `#[throttle]`
+  its first profiling coverage.
 - **new `repository_crud` profiling harness; findings, no fix (#2486):** added
   `autumn/benches/repository_crud.rs`, driving real `save`/`find_by_id`/`page`
   calls through a `#[repository]`-generated repository against a live
@@ -3709,6 +3949,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as "applied"). Measured against a 50,000-row fixture with a 2,050-id bulk
   action: revoke statement calls 2,050 → 1. See
   `docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`.
+
+- **`FeatureFlagAdminModel`'s admin panel bulk "delete" action now issues
+  one `DELETE` CTE instead of one per selected flag:** it never overrode
+  `AdminModel::execute_action`'s trait default, so it inherited the same
+  per-id loop the `TokenAdminModel` fix above closed — a full connection
+  checkout plus a single-row `DELETE ... WHERE id = $1 RETURNING key`
+  (feeding the `feature_flag_changes` audit insert) per id. It now
+  overrides `execute_action` for `"delete"` to batch every id into one
+  `WHERE id = ANY($1)` round trip; the returned count, final row state,
+  and audit trail are unchanged (an already-deleted or nonexistent id is
+  still a silent no-op, still counted as "applied"). Measured against a
+  4,000-row fixture with an 820-id bulk action: delete-CTE statement
+  calls 820 → 1, buffers 9,639 → 6,977 (-27.6%). See
+  `docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`.
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,

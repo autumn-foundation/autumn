@@ -4448,15 +4448,21 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
         }
         _ => return None,
     };
+    // `deserialize_with`'s value is a string serde parses into a path itself
+    // (it never passes through this crate's own generic `::autumn_web`
+    // token rewrite — see `crate_path`'s module doc, #1828), so it must be
+    // built from the actively resolved crate name directly.
+    let crate_root =
+        crate::crate_path::escaped_target_path_segment(&crate::crate_path::current_target());
     if nullable {
         // `deserialize_with` disables serde's implicit missing-`Option`-field
         // -is-`None` handling; `default` restores it so a JSON body may still
         // omit the nullable column. (The `_option` helper itself maps a
         // present-but-empty form value to `None`.)
-        let path = format!("::autumn_web::form::{base}_option");
+        let path = format!("::{crate_root}::form::{base}_option");
         Some(quote! { #[serde(default, deserialize_with = #path)] })
     } else {
-        let path = format!("::autumn_web::form::{base}");
+        let path = format!("::{crate_root}::form::{base}");
         Some(quote! { #[serde(deserialize_with = #path)] })
     }
 }

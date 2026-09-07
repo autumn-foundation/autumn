@@ -1274,6 +1274,20 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                     if rel.contains("master.key") || rel.contains("credentials.enc") {
                         continue;
                     }
+                    // `.autumn/generated.toml` records the digest of each file
+                    // AND the command that wrote it (issue #1835). The two runs
+                    // type different commands by construction — that is the
+                    // flag under test — so the recorded command differs while
+                    // the digests, which describe the output this gate is
+                    // about, must not. Compare the digests, drop the command.
+                    let body = if rel.ends_with(".autumn/generated.toml") {
+                        body.lines()
+                            .filter(|line| !line.starts_with("invocation = "))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        body
+                    };
                     out.push((rel, body));
                 }
             }

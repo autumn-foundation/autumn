@@ -1129,8 +1129,8 @@ fn plan_scaffold_with_options_impl(
     // (`crate::routes::<parent>::paths`, `schema::<parents>`) and leaves their
     // nested routes mounted — an uncompilable project. The default destroy
     // already stops, but only by accident: the injected section reads as
-    // "diverged from generated content", whose message says nothing about
-    // children and which `--force` waves straight through. Refuse explicitly
+    // diverged content, whose message says nothing about children and which
+    // `--force` waves straight through. Refuse explicitly
     // instead, naming them, so `--force` cannot turn a deliberate override of
     // one check into silent breakage of another.
     if for_revert && !options_with_key.api {

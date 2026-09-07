@@ -139,7 +139,7 @@ buckets on SQLite:
 | Embedded migrations + `autumn migrate` up/down | ✅ | ✅ | **Startup** migrations apply on **file-backed** SQLite through diesel's `MigrationHarness` (unlocked); an **in-memory** target with registered migrations is refused at boot (the migrated schema is lost before the runtime pool anchors it). The `autumn migrate` CLI up/down still routes through the Postgres advisory-lock path (`hold_migration_lock` → `PgConnection`), so it is not available for a `sqlite://` URL yet. (The separate **declarative** `autumn schema migrate` verb — see [Declarative schema](./declarative-schema.md) — *does* apply pending migrations on SQLite, unlocked, **but only when the CLI was built with the non-default `sqlite` cargo feature** — the default/published `autumn` binary is Postgres-only and stops with a "rebuild with `--features sqlite`" error.) | ⚠️ **Partial** — startup migrations apply on file-backed SQLite (MigrationHarness; in-memory + migrations boot-refused); the classic `autumn migrate` CLI up/down is Postgres-only (planned) |
 | `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Offline SQL-file safety linter (reads no DB URL, so it does not fail on a `sqlite://` target); its safety rules target Postgres migration semantics — there is no SQLite-specific classification yet. | ⚠️ **Partial** — the linter runs (no DB connection), but its rules are Postgres-oriented; no SQLite-specific classification |
 | Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation on the migration path. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. (Note: application **write-RMW** sites *do* issue `BEGIN IMMEDIATE` since #1996 — this row is only about the migration path.) | ⚠️ **Not serialized** — no advisory lock / no migration-path `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
-| Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. | ⛔ **Planned — #1908** |
+| Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. The `generate auth` tracked-sessions store binds `RuntimeBackend` rather than `diesel::pg::Pg`, so it compiles and runs on either backend, and its migration DDL and scaffolded guide are emitted in the app's own dialect (#1908 / #1927). Its `schema.rs` block is backend-independent (every column kind the table uses maps to the same diesel sql-type on both backends), not dialect-forked. The cookie-session backends (`[session] backend = "memory" | "redis"`) are backend-independent and unchanged. **Still Postgres-only, and out of this row's scope:** the framework `DbApiTokenStore` (`api_tokens` — machine tokens, not login sessions) is typed `Pool<AsyncPgConnection>` with Postgres-only DDL, and the `--starter saas` scaffold pins `AsyncPgConnection` throughout. | ✅ **Available now** (#1908, behind the `sqlite` feature) |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
 | Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
@@ -197,6 +197,13 @@ published support contract**. Available **today**:
   AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of
   being refused, and the generated auth session store is typed against
   `::autumn_web::RuntimeConnection` so it compiles on either backend.
+- **DB-backed sessions store on SQLite (#1908)** — the `generate auth`
+  tracked-sessions store bounds its query functions by
+  `::autumn_web::RuntimeBackend` instead of a hard-coded `diesel::pg::Pg`, so the
+  scaffolded store compiles and runs against the SQLite `RuntimeConnection`. The
+  scaffolded `docs/guide/session-management.md` now hands the operator SQL in the
+  app's own dialect (`datetime('now', '-90 days')`, SQLite retrofit DDL) instead
+  of Postgres-only `NOW() - INTERVAL` / `BIGSERIAL`.
 - **`autumn doctor` SQLite awareness** — a SQLite app is no longer nagged about a
   missing `pg_dump` or a non-`postgres://` URL.
 
@@ -208,7 +215,7 @@ SQLite-dialect smoke SQL against, so the generated smoke test remains
 Postgres-shaped. Tracked under the runtime slice #1905.
 
 The support-matrix rows still marked **Planned** name follow-on subsystem slices
-whose SQLite support has not landed yet (sessions/auth #1908, durable jobs and
+whose SQLite support has not landed yet (durable jobs and
 `#[scheduled]` tasks #1907, backup/restore/scrub/retention/deploy persistence
 #1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
 boots and serves; those subsystems are simply not wired for SQLite until their
@@ -581,7 +588,9 @@ Additional generator shapes are refused on SQLite:
 > --list-unsubscribe` suppression table). The generated auth **DB-backed session
 > store** is typed against `::autumn_web::RuntimeConnection` (which resolves to the
 > Postgres connection by default and the SQLite connection under the `sqlite`
-> feature), so it compiles on whichever backend the app selected.
+> feature), so it compiles on whichever backend the app selected. Its query
+> functions bind `::autumn_web::RuntimeBackend` for the same reason (#1908), and
+> the scaffolded session-management guide emits its SQL in the app's dialect.
 
 > **Full-text search now generates on SQLite (#2047).** The `--searchable` /
 > `#[searchable]` scaffold — historically rejected at generate time on SQLite —

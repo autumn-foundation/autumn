@@ -11,6 +11,22 @@
 //!
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
+//!
+//! # Renamed or multi-versioned `autumn-web` dependencies (#1828)
+//!
+//! Every macro generates code that ultimately refers back to types in
+//! `autumn-web` via absolute (`::`-rooted) paths like `::autumn_web::Route`.
+//! By default that name is resolved automatically — via
+//! [`proc-macro-crate`](https://docs.rs/proc-macro-crate) — from the
+//! invoking crate's own `Cargo.toml`, so renaming the dependency (`web = {
+//! package = "autumn-web" }`) just works with no macro changes.
+//!
+//! A crate that must depend on **two** differently-keyed copies of
+//! `autumn-web` at once (e.g. mid-upgrade) is inherently ambiguous for that
+//! automatic detection. Every attribute macro (`#[get]`, `#[model]`,
+//! `#[repository]`, …) therefore also accepts an explicit `crate = "..."`
+//! argument naming the extern-prelude identifier to use instead, e.g.
+//! `#[get("/x", crate = "autumn_web_05")]`.
 
 mod agent_authority;
 mod api_doc;
@@ -19,6 +35,7 @@ mod cached;
 mod collect;
 #[cfg(feature = "db")]
 mod commentable;
+mod crate_path;
 mod edge;
 mod edge_routes_macro;
 mod event;
@@ -121,7 +138,12 @@ use proc_macro::TokenStream;
 /// declares.
 #[proc_macro_attribute]
 pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
-    route::route_macro("GET", "get", attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(route::route_macro("GET", "get", attr, item.into())).into()
 }
 
 /// Annotate an async function as a POST route handler.
@@ -144,7 +166,12 @@ pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
-    route::route_macro("POST", "post", attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(route::route_macro("POST", "post", attr, item.into())).into()
 }
 
 /// Annotate an async function as a PUT route handler.
@@ -167,7 +194,12 @@ pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
-    route::route_macro("PUT", "put", attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(route::route_macro("PUT", "put", attr, item.into())).into()
 }
 
 /// Annotate an async function as a PATCH route handler.
@@ -187,7 +219,12 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
-    route::route_macro("PATCH", "patch", attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(route::route_macro("PATCH", "patch", attr, item.into())).into()
 }
 
 /// Annotate an async function as a DELETE route handler.
@@ -210,7 +247,12 @@ pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
-    route::route_macro("DELETE", "delete", attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(route::route_macro("DELETE", "delete", attr, item.into())).into()
 }
 
 /// Annotate an OAuth2/OIDC callback handler.
@@ -219,7 +261,12 @@ pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// callback endpoints such as `/auth/github/callback`.
 #[proc_macro_attribute]
 pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
-    oauth2_callback::oauth2_callback_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(oauth2_callback::oauth2_callback_macro(attr, item.into())).into()
 }
 
 /// Collect annotated route handlers into a `Vec<Route>`.
@@ -243,7 +290,8 @@ pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn routes(input: TokenStream) -> TokenStream {
-    routes_macro::routes_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(routes_macro::routes_macro(input.into())).into()
 }
 
 /// Emit a `pub mod paths { … }` that re-exports each handler's typed path helper.
@@ -266,7 +314,8 @@ pub fn routes(input: TokenStream) -> TokenStream {
 /// then `paths::show_post(id)`.
 #[proc_macro]
 pub fn paths(input: TokenStream) -> TokenStream {
-    paths_macro::paths_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(paths_macro::paths_macro(input.into())).into()
 }
 
 /// Set up the async runtime for an Autumn application.
@@ -318,7 +367,12 @@ pub fn paths(input: TokenStream) -> TokenStream {
 /// not name.
 #[proc_macro_attribute]
 pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
-    main_macro::main_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(main_macro::main_macro(attr, item.into())).into()
 }
 
 /// Annotate an async function as a deterministic simulation test (S-1797, W1).
@@ -345,7 +399,12 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
-    sim_test::sim_test_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(sim_test::sim_test_macro(attr, item.into())).into()
 }
 
 /// Annotate an async inbound mail handler function.
@@ -376,25 +435,41 @@ pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn inbound_mail(attr: TokenStream, item: TokenStream) -> TokenStream {
-    inbound_mail::inbound_mail_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(inbound_mail::inbound_mail_macro(attr, item.into())).into()
 }
 
 /// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.
 #[proc_macro_attribute]
 pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
-    mailer::mailer_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(mailer::mailer_macro(attr, item.into())).into()
 }
 
 /// Register zero-argument mail preview methods for the dev mail preview UI.
 #[proc_macro_attribute]
 pub fn mailer_preview(attr: TokenStream, item: TokenStream) -> TokenStream {
-    mailer_preview::mailer_preview_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(mailer_preview::mailer_preview_macro(attr, item.into())).into()
 }
 
 /// Collect `#[mailer_preview]` impl blocks into runtime preview registrations.
 #[proc_macro]
 pub fn mail_previews(input: TokenStream) -> TokenStream {
-    mail_previews_macro::mail_previews_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(mail_previews_macro::mail_previews_macro(input.into())).into()
 }
 
 /// Define a widget story for the `/_stories` gallery:
@@ -408,7 +483,8 @@ pub fn mail_previews(input: TokenStream) -> TokenStream {
 /// surrounding environment is a compile error.
 #[proc_macro]
 pub fn story(input: TokenStream) -> TokenStream {
-    story_macro::story_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(story_macro::story_macro(input.into())).into()
 }
 
 /// Attribute macro for Autumn database models.
@@ -686,7 +762,12 @@ pub fn story(input: TokenStream) -> TokenStream {
 #[cfg(feature = "db")]
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
-    model::model_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(model::model_macro(attr, item.into())).into()
 }
 
 /// Derive a field-accurate `OpenApiSchema` impl for a plain struct with named
@@ -718,7 +799,8 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_derive(OpenApiSchema)]
 pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
-    openapi_schema::derive_openapi_schema(input)
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(openapi_schema::derive_openapi_schema(input).into()).into()
 }
 
 /// Derive a repository with CRUD operations and derived queries.
@@ -775,7 +857,12 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
 #[cfg(feature = "db")]
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
-    repository::repository_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(repository::repository_macro(attr, item.into())).into()
 }
 
 /// Declare a scheduled background task.
@@ -791,7 +878,12 @@ pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
-    scheduled::scheduled_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(scheduled::scheduled_macro(attr, item.into())).into()
 }
 
 /// Declare an on-demand background job.
@@ -831,7 +923,12 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
-    job::job_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(job::job_macro(attr, item.into())).into()
 }
 
 /// Declare a typed domain event.
@@ -846,7 +943,12 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
-    event::event_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(event::event_macro(attr, item.into())).into()
 }
 
 /// Declare an event listener that reacts to a typed `#[event]`.
@@ -860,19 +962,30 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn listener(attr: TokenStream, item: TokenStream) -> TokenStream {
-    listener::listener_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(listener::listener_macro(attr, item.into())).into()
 }
 
 /// Collect `#[listener]` handlers into a `Vec<ListenerInfo>`.
 #[proc_macro]
 pub fn listeners(input: TokenStream) -> TokenStream {
-    listeners_macro::listeners_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(listeners_macro::listeners_macro(input.into())).into()
 }
 
 /// Declare a one-off operational task runnable with `autumn task <name>`.
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
-    one_off_task::task_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(one_off_task::task_macro(attr, item.into())).into()
 }
 
 /// Annotate an async function as a statically pre-rendered GET route.
@@ -910,7 +1023,12 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
-    static_route::static_get_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(static_route::static_get_macro(attr, item.into())).into()
 }
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
@@ -920,19 +1038,22 @@ pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn tasks(input: TokenStream) -> TokenStream {
-    tasks_macro::tasks_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(tasks_macro::tasks_macro(input.into())).into()
 }
 
 /// Collect `#[job]` handlers into a `Vec<JobInfo>`.
 #[proc_macro]
 pub fn jobs(input: TokenStream) -> TokenStream {
-    jobs_macro::jobs_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(jobs_macro::jobs_macro(input.into())).into()
 }
 
 /// Collect `#[task]` handlers into a `Vec<OneOffTaskInfo>`.
 #[proc_macro]
 pub fn one_off_tasks(input: TokenStream) -> TokenStream {
-    one_off_tasks_macro::one_off_tasks_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(one_off_tasks_macro::one_off_tasks_macro(input.into())).into()
 }
 
 /// Secure a route handler with authentication and optional role checks.
@@ -964,7 +1085,12 @@ pub fn one_off_tasks(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
-    secured::secured_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(secured::secured_macro(attr, item.into())).into()
 }
 
 /// Declare a route handler as deliberately public (unauthenticated).
@@ -987,7 +1113,12 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
-    public::public_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(public::public_macro(attr, item.into())).into()
 }
 
 /// Declare a read-path route as eligible to run in the edge capsule (#1790).
@@ -1039,7 +1170,12 @@ pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn edge(attr: TokenStream, item: TokenStream) -> TokenStream {
-    edge::edge_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(edge::edge_macro(attr, item.into())).into()
 }
 
 /// Collect `#[edge]` handlers into a `Vec<EdgeRoute>` (#1790).
@@ -1062,7 +1198,8 @@ pub fn edge(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn edge_routes(input: TokenStream) -> TokenStream {
-    edge_routes_macro::edge_routes_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(edge_routes_macro::edge_routes_macro(input.into())).into()
 }
 
 /// Require fresh ("step-up") authentication before a route handler runs.
@@ -1106,7 +1243,12 @@ pub fn edge_routes(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
-    step_up::step_up_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(step_up::step_up_macro(attr, item.into())).into()
 }
 
 /// Apply a per-route rate limit to a handler.
@@ -1159,7 +1301,12 @@ pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// inference does not depend on expansion order (#1677).
 #[proc_macro_attribute]
 pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
-    throttle::throttle_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(throttle::throttle_macro(attr, item.into())).into()
 }
 
 /// Bound the number of database queries a handler can issue — at compile time.
@@ -1212,7 +1359,12 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// rustc. See `docs/guide/query-budgets.md` for the full guide.
 #[proc_macro_attribute]
 pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
-    query_budget::query_budget_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(query_budget::query_budget_macro(attr, item.into())).into()
 }
 
 /// Declare a handler agent-operable, under a named authority grant.
@@ -1295,7 +1447,12 @@ pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// See `docs/guide/agent-authority.md` for the full guide.
 #[proc_macro_attribute]
 pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
-    agent_authority::agent_operable_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(agent_authority::agent_operable_macro(attr, item.into())).into()
 }
 
 /// Gate a route handler on a named feature flag.
@@ -1327,7 +1484,12 @@ pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 #[proc_macro_attribute]
 pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
-    feature_flag::feature_flag_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(feature_flag::feature_flag_macro(attr, item.into())).into()
 }
 
 /// Enforce a record-level authorization policy on a route handler.
@@ -1353,7 +1515,12 @@ pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
-    authorize::authorize_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(authorize::authorize_macro(attr, item.into())).into()
 }
 
 /// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.
@@ -1368,7 +1535,8 @@ pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro]
 pub fn static_routes(input: TokenStream) -> TokenStream {
-    static_routes_macro::static_routes_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(static_routes_macro::static_routes_macro(input.into())).into()
 }
 
 /// Define a service for cross-model orchestration and non-DB side effects.
@@ -1410,7 +1578,12 @@ pub fn static_routes(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
-    service::service_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(service::service_macro(attr, item.into())).into()
 }
 
 /// Cache the return value of a function based on its arguments.
@@ -1469,7 +1642,12 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
-    cached::cached_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(cached::cached_macro(attr, item.into())).into()
 }
 
 /// Enrich a route handler's auto-generated `OpenAPI` documentation.
@@ -1535,7 +1713,23 @@ pub fn api_doc(attr: TokenStream, item: TokenStream) -> TokenStream {
     // we re-attach `#[api_doc(...)]` to the function body. Rust then
     // expands the route macro next, which finds and consumes the
     // preserved `#[api_doc]` via the usual attribute-list walk.
-    api_doc_standalone(attr, item)
+    //
+    // `#[api_doc(...)]` never itself emits an `::autumn_web` path — it only
+    // reorders attributes for the paired route macro to expand next, and
+    // that route macro's own `crate = "..."` (see `get`, `post`, etc.) is
+    // what actually governs the combined expansion. Still strip a `crate =
+    // "..."` given here (rather than leaving it for the reordering below to
+    // re-embed and only later fail with a confusing raw parse error out of
+    // `api_doc::extract`), so every attribute macro accepts and validates
+    // the argument uniformly even though this one has nothing to apply it
+    // to.
+    let (_crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let out: proc_macro2::TokenStream = api_doc_standalone(attr.into(), item).into();
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(out).into()
 }
 
 const ROUTE_ATTR_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "static_get", "ws"];
@@ -1623,7 +1817,12 @@ fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
-    ws::ws_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(ws::ws_macro(attr, item.into())).into()
 }
 
 /// Translate an i18n key, with **compile-time validation** that the key
@@ -1656,7 +1855,8 @@ pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// produce the visible `{$key}` marker on miss.
 #[proc_macro]
 pub fn t(input: TokenStream) -> TokenStream {
-    i18n::t_macro(input.into()).into()
+    let _guard = crate_path::set_target(None);
+    crate_path::finalize(i18n::t_macro(input.into())).into()
 }
 
 /// Turn a plain state enum into a statically-verified lifecycle.
@@ -1696,5 +1896,10 @@ pub fn t(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
-    lifecycle::lifecycle_macro(attr.into(), item.into()).into()
+    let (crate_override, attr) = match crate_path::extract_crate_override(attr.into()) {
+        Ok(pair) => pair,
+        Err(err) => return err.into(),
+    };
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(lifecycle::lifecycle_macro(attr, item.into())).into()
 }

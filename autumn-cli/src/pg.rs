@@ -1555,12 +1555,27 @@ mod tests {
         // `require` — `prefer` (and `allow`) never auto-upgrade even with a
         // CA file present, so this combination must still just drop the
         // unsupported `sslrootcert` param rather than erroring.
-        let sanitized =
-            sanitize_db_url("postgres://host/db?sslmode=prefer&sslrootcert=/etc/ca.pem").unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(
-            config.get_ssl_mode(),
-            tokio_postgres::config::SslMode::Prefer
+        //
+        // Scopes away PGSSLCERT/PGSSLKEY so an ambient/racing value can't trip
+        // the sslcert/sslkey rejection — see the comment on
+        // `sanitize_rejects_require_with_sslrootcert_in_url_form`. Without it
+        // `sanitize_rejects_pgsslcert_env_var_in_url_form` and
+        // `sanitize_does_not_override_explicit_sslcert_rejection_message_source`,
+        // which set PGSSLCERT to a value, make this `unwrap()` panic with
+        // "sslcert/sslkey (client-certificate authentication) is not
+        // supported" whenever they overlap it.
+        temp_env::with_vars(
+            [("PGSSLCERT", None::<&str>), ("PGSSLKEY", None::<&str>)],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://host/db?sslmode=prefer&sslrootcert=/etc/ca.pem")
+                        .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Prefer
+                );
+            },
         );
     }
 

@@ -113,6 +113,13 @@ after checking this table and `docs/guide/`.
 The name `autumn` is the CLI binary, not the framework crate. In code, import
 from `autumn_web::prelude::*`.
 
+Renaming the `autumn-web` dependency in `Cargo.toml` (`web = { package =
+"autumn-web" }`) — e.g. mid-upgrade, to depend on two versions in one crate —
+just works: every macro resolves the real crate name automatically. For the
+rare case where a crate hosts two differently-keyed copies at once (automatic
+detection is then ambiguous), pass an explicit override to any attribute
+macro: `#[get("/x", crate = "autumn_web_05")]`.
+
 ## Project shape
 
 ```text

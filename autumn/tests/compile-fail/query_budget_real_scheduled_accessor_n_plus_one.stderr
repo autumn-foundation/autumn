@@ -1,0 +1,7 @@
+error: `#[query_budget(1)]` cannot be proven: a database query (`find_recipient`) runs inside a loop, so this handler's query count grows with the size of the collection — the classic N+1.
+
+       Batch the per-row lookup into one query with `preload(...)`, put `#[query_cost(N)]` on the loop statement when the iteration count is bounded by something the analysis cannot see, or opt the handler out with `#[query_budget(unbounded, reason = ...)]`. See docs/guide/query-budgets.md.
+  --> tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs:30:5
+   |
+30 |     for id in ids {
+   |     ^^^

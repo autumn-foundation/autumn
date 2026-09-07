@@ -832,7 +832,10 @@ fn active_vendor_dirs(sources: &Sources) -> Vec<PathBuf> {
 ///
 /// The last level of the hierarchy, and the one with no `.cargo` component:
 /// the file is `$CARGO_HOME/config.toml`, not `$CARGO_HOME/.cargo/config.toml`.
-fn cargo_home() -> Option<PathBuf> {
+///
+/// `BaseDirs` rather than `$HOME`: on Windows Cargo derives its home from the
+/// user profile, and `$HOME` is normally unset there.
+pub fn cargo_home() -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os("CARGO_HOME") {
         let path = PathBuf::from(configured);
         if !path.as_os_str().is_empty() {

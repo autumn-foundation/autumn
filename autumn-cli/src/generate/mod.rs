@@ -30,6 +30,7 @@ mod nested;
 pub mod notifications;
 pub mod plugin;
 pub mod policy;
+pub mod provenance;
 pub mod pwa;
 pub mod scaffold;
 mod scaffold_i18n;
@@ -76,11 +77,14 @@ pub enum GenerateError {
     #[error("{0}")]
     Config(String),
 
-    /// `autumn destroy` refuses to remove file(s) whose content has diverged
-    /// from what the matching `generate` invocation would have produced
-    /// (issue #1048) — pass `--force` to override.
+    /// `autumn destroy` refuses to remove file(s) whose content matches
+    /// neither what the matching `generate` invocation produces now nor the
+    /// digest `generate` recorded when it wrote them (issues #1048, #1835) —
+    /// pass `--force` to override.
     #[error(
-        "refusing to destroy — file(s) diverged from generated content, pass --force to override:\n{}",
+        "refusing to destroy — file(s) match neither the current generator output nor the \
+         digest recorded in {}; edit them back, or pass --force to delete them anyway:\n{}",
+        crate::generate::provenance::MANIFEST_PATH,
         format_collisions(.0)
     )]
     Diverged(Vec<PathBuf>),

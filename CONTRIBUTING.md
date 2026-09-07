@@ -44,6 +44,16 @@ Chromium `system-tests` lanes (those run in dedicated CI jobs); `cargo test -p
 <pkg>` remains fine for iterating on a single crate — just run
 `./scripts/pre-push-check.sh` before you push.
 
+In CI that blocking gate is **sharded across runners**, so a red PR points at
+one of several jobs rather than a single `Test (<os>)`: `test` runs the
+workspace suite, `trybuild` runs `compile_fail::` in four shards,
+`test-features` runs one job per non-default feature set, and `test-docker`
+runs the Linux testcontainer sweep. `Test suite` (`test-gate`) is the
+aggregate check that must be green. Nothing about how you *write* a test
+changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
+(renaming a `compile_fail.rs` test function, and what branch protection should
+require).
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
