@@ -97,6 +97,28 @@
 # the built binary's `--help` usage strings across all 173 command paths: exact
 # agreement, no mismatch in either direction.
 #
+# The OPTION model was validated the same way, by running the built binary and
+# reading its exit code rather than reasoning about clap's parser. Every row
+# below was measured, and the gate agrees with all of them:
+#
+#   exit 0  autumn --version · replay --help · db --help · deploy --help · db -h
+#           replay -h · replay -hpapi · replay -hx · routes /admin --help posture
+#   exit 2  migrate --version · --version=foo · replay --help=foo
+#           test --reset=true · routes --user-only=yes · routes /admin --methd POST
+#           config set retries 3 --actorr · replay -xh · replay -zz
+#   accepted (exit 1, parsed then failed for want of a project/database)
+#           test --nocapture · test --package blog · test --reset · test --nope
+#           config set retries -1 · routes /admin --method POST
+#
+# Run those from an EMPTY directory: a line clap accepts then fails at runtime
+# exits 1, so exit 2 cleanly means "the parser rejected it". Do not run them in
+# a real project — `autumn test --reset` drops the test database, and
+# `config set` writes to a live one.
+#
+# Nothing here adds a build dependency: the gate still parses the derive input
+# and runs in seconds with no toolchain. The binary is how the MODEL is checked
+# when a question turns on clap's behaviour rather than on the source.
+#
 # TRUTH SET: parsed from the clap derive input in `autumn-cli/src/**/*.rs`, not
 # from a checked-in snapshot. A snapshot is one forgotten regeneration away
 # from gating the docs against a CLI that no longer exists, which is the very
@@ -3103,16 +3125,20 @@ def _short_cluster(tok, options):
     what is unknown there, and guessing is how a gate invents a defect on a
     correct page.
     """
-    terminal = False
     for pos, ch in enumerate(tok[1:], start=1):
         name = '-' + ch
+        # A terminal letter ends the parse where it stands. clap prints help and
+        # exits at `-h` WITHOUT looking at the rest of the group, so a later
+        # undeclared letter is never reached and cannot make the line a defect:
+        # `autumn replay -hx` exits 0 (measured). Checked before the
+        # unknown-letter bail below, which would otherwise reject the token.
+        if name in TERMINAL_OPTIONS and name in options:
+            return 1, True
         if name not in options:
             return None
-        if name in TERMINAL_OPTIONS:
-            terminal = True
         if options[name]:                       # this letter takes a value
-            return (1 if pos < len(tok) - 1 else 2), terminal
-    return 1, terminal
+            return (1 if pos < len(tok) - 1 else 2), False
+    return 1, False
 
 
 # A token that starts with `-` is judged as a flag unless it carries a character
@@ -3974,6 +4000,15 @@ def self_test():
     # Collapsing it to an ordinary group reported that correct line incomplete.
     expect(_classify_option('-hpapi', surface['replay']) == ('terminal', 0),
            'a cluster containing -h is terminal, not an ordinary group')
+    # …and a letter AFTER the terminal one is never parsed by clap, so it cannot
+    # turn a successful help invocation into a defect. `autumn replay -hx`
+    # exits 0 (measured against the built binary).
+    expect(_classify_option('-hx', surface['replay']) == ('terminal', 0),
+           'an undeclared letter after -h does not reject the group')
+    expect(resolve(tk('replay -hx'), surface, runnable=True) is None,
+           '…and the line is complete, not missing <CAPSULE>')
+    expect(opts_of('replay -xh') == [('replay', '-xh')],
+           'but an undeclared letter BEFORE -h is reached, so it still reports')
     expect(resolve(tk('replay -hpapi'), surface, runnable=True) is None,
            '…so <CAPSULE> is not reported missing')
     expect(resolve(tk('replay -papi'), surface, runnable=True) == 'autumn replay',
