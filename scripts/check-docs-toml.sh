@@ -694,7 +694,16 @@ def classify(body, lead_in, known_roots, schema=None):
     # `storage`) are plausible crate names, so today's clean result there is luck
     # rather than design. A dotted key has no such collision: it is a table
     # declaration, not a name.
-    if any(seg in known_roots for seg in DOTTED_ROOT.findall(body)):
+    # `profile` joins the known roots here for the same reason it does in the
+    # bracketed test above: it is `#[serde(skip)]` and so absent from the schema,
+    # but `profile.prod.server.prot = 9000` is an autumn.toml overlay written
+    # dotted, and TOML treats it as identical to `[profile.prod.server] prot`.
+    # Leaving it out made the two spellings disagree — the bracketed one read,
+    # the dotted one skipped — which is the asymmetry this rule exists to close.
+    # The Cargo-profile disambiguation is unaffected: it runs later, in
+    # `check_fence`, on the PARSED table, so an unmarked `profile.dev.debug = 1`
+    # still resolves to `is_cargo_profile("dev", {"debug": 1})` and stays exempt.
+    if any(seg in (known_roots | {"profile"}) for seg in DOTTED_ROOT.findall(body)):
         return None
     if not headers:
         return "no-section-header"
@@ -1291,6 +1300,10 @@ def self_test():
         ("dotted root is read", "server.port = 9000\n", None),
         ("dotted root, indented", "  database.pool_size = 10\n", None),
         ("dotted non-root is not read", "widget.colour = 1\n", "no-section-header"),
+        # A dotted PROFILE overlay is autumn.toml written the other way round;
+        # the bracketed spelling was read and this one was not.
+        ("dotted profile overlay is read", "profile.prod.server.port = 9000\n", None),
+        ("dotted profile overlay, typo'd leaf", "profile.prod.server.prot = 9000\n", None),
         # ...but a bare key or an inline table whose NAME collides with a root is
         # not enough: a headerless Cargo dependency list carries `http` and could
         # carry `cache`/`mail`/`storage`, and admitting it would report every
@@ -1366,6 +1379,13 @@ def self_test():
     # A profile name whose value is not a table is reported, as the runtime does.
     for label, body, expected in (
         ("scalar profile entry", '[profile]\nprod = "x"\n', ["profile.prod"]),
+        # The dotted spelling of an overlay reaches the same walk as the
+        # bracketed one, and reports the same key.
+        ("dotted overlay typo is reported", "profile.prod.server.prot = 9000\n", ["server.prot"]),
+        ("dotted overlay, valid", "profile.prod.server.port = 9000\n", []),
+        # ...and the Cargo-profile exemption still applies to the dotted form on
+        # an UNMARKED fence, since it is decided later on the parsed table.
+        ("dotted cargo profile stays exempt", "profile.dev.debug = 1\n", []),
         ("array-of-scalars profile entry", '[profile]\nprod = ["x"]\n', ["profile.prod"]),
         # `[[profile.prod]]` is a LIST, which the runtime reports rather than
         # walks: at path ["profile"] it descends only Value::Table.
