@@ -52,6 +52,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **tls:** tenants can connect their own domains, each with its own
+  automatically issued and renewed certificate (issue #1635). Enable
+  `[server.tls.acme.custom_domains]` with an ingress hostname (and addresses,
+  for apex domains) and the whole journey ships: the app registers a hostname
+  for a tenant, autumn renders the exact CNAME or A/AAAA records to show that
+  tenant, and the domain moves through queryable `pending_dns` → `verified` →
+  `issuing` → `active` states carrying the reason whenever it is stuck. No
+  ACME order is created until autumn independently confirms the hostname
+  resolves to this deployment; once active, requests on that `Host` resolve to
+  the owning tenant and are served that domain's certificate by SNI. An SNI
+  hostname nobody registered is refused at the handshake without contacting the
+  CA, and issuance is capped per domain and deployment-wide with exponential
+  backoff on repeated failure. Renewal is per domain and isolated: a failure
+  names the domain and tenant in `/actuator/health` and raises the
+  `scheduled_task_failure` alert while every other domain keeps serving and
+  renewing. Certificates load incrementally through a bounded cache, so a
+  1,000-domain deployment does not need them all resident. Offboarding stops
+  routing, serving and renewal and deletes the stored certificate; the new
+  `custom_domains` retention dataset prunes abandoned registrations and
+  orphaned certificates. `autumn doctor` grades the section and, with
+  `--online`, flags registered domains whose DNS no longer points here. See
+  `docs/guide/tls.md`.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite

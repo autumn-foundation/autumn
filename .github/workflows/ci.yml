@@ -774,6 +774,12 @@ jobs:
           cargo test -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
+          # The custom-domain SNI resolver + certificate cache (#1635) need
+          # `tls` to compile at all, so the default `test` lane runs only the
+          # feature-free half of `custom_domains`. Run the whole module here.
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests custom_domains:: | tee "${RUNNER_TEMP}/custom-domains.log"
+          assert_ran "${RUNNER_TEMP}/custom-domains.log" "custom_domains"
       - name: Run ACME-gated tests (certificate provisioning + renewal)
         if: matrix.lane == 'acme'
         # `acme` is not a default feature either, so the `test` job's workspace
@@ -807,6 +813,12 @@ jobs:
           cargo test -p autumn-web --features acme \
             --test integration_tests acme_end_to_end:: | tee "${RUNNER_TEMP}/acme-e2e.log"
           assert_ran "${RUNNER_TEMP}/acme-e2e.log" "acme_end_to_end"
+          # Per-tenant custom-domain issuance, renewal, offboarding and the
+          # retention prune (#1635) — `acme`-gated, so nothing else compiles it.
+          cargo test -p autumn-web --features "acme,test-support" \
+            --test integration_tests custom_domain_issuance:: \
+            | tee "${RUNNER_TEMP}/custom-domain-issuance.log"
+          assert_ran "${RUNNER_TEMP}/custom-domain-issuance.log" "custom_domain_issuance"
       - name: Run real-ACME (Pebble) end-to-end test
         # Issue #1863, deferred from #1608/PR #1858: every ACME test above
         # drives `instant-acme` against `acme_fake_ca`, an in-process stand-in

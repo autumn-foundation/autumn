@@ -459,6 +459,23 @@ pub fn build_server_config(
     provider: Arc<CryptoProvider>,
     resolver: Arc<ReloadableCertResolver>,
 ) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    build_server_config_with_resolver(provider, resolver)
+}
+
+/// [`build_server_config`], for any [`ResolvesServerCert`].
+///
+/// The custom-domain path (#1635) serves a per-SNI resolver rather than the
+/// single swappable certificate, so the listener takes the resolver as a trait
+/// object; everything else about the config is identical.
+///
+/// # Errors
+///
+/// Returns [`TlsError::BuildConfig`] if rustls rejects the chosen protocol
+/// versions for the provider.
+pub fn build_server_config_with_resolver(
+    provider: Arc<CryptoProvider>,
+    resolver: Arc<dyn ResolvesServerCert>,
+) -> Result<Arc<rustls::ServerConfig>, TlsError> {
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|source| TlsError::BuildConfig { source })?

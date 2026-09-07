@@ -1580,6 +1580,198 @@ pub fn probe_port(domain: &str, port: u16) -> PortReachability {
     }
 }
 
+/// What `autumn doctor` found about one registered tenant custom domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomainProbe {
+    /// The registered hostname.
+    pub hostname: String,
+    /// The tenant it routes to.
+    pub tenant: String,
+    /// Its lifecycle state, as the registry recorded it.
+    pub status: String,
+    /// Where DNS says it points now.
+    pub dns: DnsPointsHere,
+}
+
+/// Grade the `[server.tls.acme.custom_domains]` section (offline, pure).
+///
+/// Returns `None` when the section is absent — custom domains are off and
+/// there is nothing to say.
+#[must_use]
+pub fn check_custom_domains_config_impl(
+    custom_domains: Option<&autumn_web::config::CustomDomainsConfig>,
+    error: Option<&str>,
+    registered: usize,
+) -> Option<CheckResult> {
+    if let Some(error) = error {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme.custom_domains] does not load: {error}"
+            )),
+            hint: Some(
+                "Fix the section (an unknown key is rejected outright) — the server will not \
+                 boot with it as written",
+            ),
+        });
+    }
+    let cd = custom_domains?;
+    if !cd.enabled {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "[server.tls.acme.custom_domains] enabled = false: no tenant hostname is \
+                 registrable"
+                    .to_owned(),
+            ),
+            hint: None,
+        });
+    }
+    if let Err(message) = cd.validate() {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Fail,
+            detail: Some(message),
+            hint: Some("Fix [server.tls.acme.custom_domains]; the server exits at boot on this"),
+        });
+    }
+    if registered > cd.max_domains {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{registered} domains are registered but max_domains is {}; the ones already \
+                 stored still load and serve, but no new domain can be connected",
+                cd.max_domains
+            )),
+            hint: Some("Raise [server.tls.acme.custom_domains] max_domains"),
+        });
+    }
+    Some(CheckResult {
+        name: "custom_domains",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "custom domains are enabled; {registered} registered, cap {}",
+            cd.max_domains
+        )),
+        hint: None,
+    })
+}
+
+/// Grade one registered custom domain's live DNS (pure; injectable).
+///
+/// A domain that reached `verified` or `active` and whose DNS has since moved
+/// away is a **Fail**: it is serving a certificate for a hostname that no
+/// longer reaches this deployment, and its next HTTP-01 renewal will fail. A
+/// domain still `pending_dns` is expected not to point here yet, so it is
+/// reported without failing the run.
+#[must_use]
+pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
+    let CustomDomainProbe {
+        hostname,
+        tenant,
+        status,
+        dns,
+    } = probe;
+    let settled = status == "active" || status == "verified";
+    match dns {
+        DnsPointsHere::Matches => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Pass,
+            detail: Some(format!("{hostname} (tenant {tenant}) resolves to this host")),
+            hint: None,
+        },
+        DnsPointsHere::LocalIpsUnknown => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "cannot tell where {hostname} (tenant {tenant}) points: this host has no \
+                 discoverable public address, which is normal behind NAT or in a container"
+            )),
+            hint: Some("Check the domain from outside the deployment"),
+        },
+        DnsPointsHere::Unresolved if settled => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is {status} but no longer resolves at all; it is \
+                 serving a certificate nobody can reach, and its renewal will fail"
+            )),
+            hint: Some(
+                "Ask the tenant to restore the record, or offboard the domain so renewals stop",
+            ),
+        },
+        DnsPointsHere::Unresolved => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is {status} and does not resolve yet"
+            )),
+            hint: Some("The tenant has not published the DNS record yet"),
+        },
+        DnsPointsHere::PartialMatch { unmatched: seen }
+        | DnsPointsHere::ResolvesElsewhere { resolved: seen } => CheckResult {
+            name: "custom_domain_dns",
+            status: if settled {
+                CheckStatus::Fail
+            } else {
+                CheckStatus::Warn
+            },
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is {status} but resolves to {}, which {} not this \
+                 host",
+                seen.join(", "),
+                if seen.len() == 1 { "is" } else { "are" }
+            )),
+            hint: Some(
+                "Point the record back at this deployment's ingress, or offboard the domain",
+            ),
+        },
+    }
+}
+
+/// Read the custom-domain registry off disk, where the runtime store writes it.
+///
+/// Returns `(hostname, tenant, status)` per record, sorted. A file that will
+/// not parse is skipped — the same treatment the runtime store gives it — so
+/// one corrupt record does not blind the check to the rest.
+#[must_use]
+pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> Vec<(String, String, String)> {
+    let Ok(entries) = std::fs::read_dir(store_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Ok(domain) =
+            serde_json::from_slice::<autumn_web::custom_domain::CustomDomain>(&bytes)
+        {
+            out.push((
+                domain.hostname,
+                domain.tenant,
+                domain.status.as_str().to_owned(),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Most custom domains one `doctor --online` run probes.
+///
+/// A deployment can hold a thousand, and a DNS lookup each would turn a
+/// diagnostic into a several-minute stall. The bound is stated in the check's
+/// detail so an operator knows the run was partial.
+pub const MAX_CUSTOM_DOMAIN_PROBES: usize = 25;
+
 /// Thin bounded I/O wrapper: resolve `domain` and compare its addresses to this
 /// host's local IPs via the pure [`grade_dns_points_here`] grader.
 #[must_use]
@@ -6100,6 +6292,16 @@ pub struct AcmeDoctorConfig {
     /// config the server refuses to boot on. `None` when the section is valid or
     /// absent.
     pub dns_error: Option<String>,
+    /// The `[server.tls.acme.custom_domains]` section (issue #1635), when
+    /// configured, as the runtime's typed `CustomDomainsConfig` sees it.
+    /// `None` when the section is absent or does not deserialize — see
+    /// [`custom_domains_error`](Self::custom_domains_error).
+    pub custom_domains: Option<autumn_web::config::CustomDomainsConfig>,
+    /// The rendered deserialization error for a PRESENT but malformed
+    /// `[server.tls.acme.custom_domains]` section. Recorded so the grader FAILs
+    /// rather than reporting "custom domains are off" for a config the server
+    /// refuses to boot on. `None` when the section is valid or absent.
+    pub custom_domains_error: Option<String>,
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -6302,6 +6504,19 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
             Err(e) => (None, Some(e.to_string())),
         });
 
+    // Deserialize `[server.tls.acme.custom_domains]` the same way (#1635). Its
+    // `deny_unknown_fields` catches a mistyped key that would otherwise sit in
+    // the file doing nothing while every tenant domain stayed pending.
+    let (custom_domains, custom_domains_error) = acme
+        .get("custom_domains")
+        .map_or((None, None), |value| match value
+            .clone()
+            .try_into::<autumn_web::config::CustomDomainsConfig>(
+        ) {
+            Ok(cd) => (Some(cd), None),
+            Err(e) => (None, Some(e.to_string())),
+        });
+
     Some(AcmeDoctorConfig {
         domains,
         contact_email,
@@ -6317,6 +6532,8 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         renew_before_days_error,
         dns,
         dns_error,
+        custom_domains,
+        custom_domains_error,
     })
 }
 
@@ -8608,6 +8825,69 @@ pub fn run(opts: DoctorOptions) {
             tasks.push(Box::new(move || {
                 check_acme_tenancy_domain_impl(tenancy_base.as_deref(), &tenancy_domains, covers)
             }));
+
+            // Tenant custom domains (#1635). Offline: the section itself, read
+            // alongside the registry on disk so the cap can be compared
+            // against what is actually registered.
+            let cd_cfg = acme.custom_domains.clone();
+            let cd_error = acme.custom_domains_error.clone();
+            let registered = cd_cfg
+                .as_ref()
+                .filter(|cd| cd.enabled)
+                .map(|cd| read_custom_domain_registry(&cd.store_dir))
+                .unwrap_or_default();
+            let registered_count = registered.len();
+            tasks.push(Box::new(move || {
+                check_custom_domains_config_impl(
+                    cd_cfg.as_ref(),
+                    cd_error.as_deref(),
+                    registered_count,
+                )
+                .unwrap_or(CheckResult {
+                    name: "custom_domains",
+                    status: CheckStatus::Pass,
+                    detail: Some(
+                        "no [server.tls.acme.custom_domains] section: tenants cannot connect                          their own domains"
+                            .to_owned(),
+                    ),
+                    hint: None,
+                })
+            }));
+
+            // Online: does each registered domain still point here? A domain
+            // that reached `active` and has since moved away is serving a
+            // certificate nobody can reach and will fail its next renewal —
+            // AC8's "flag registered domains whose DNS no longer points at the
+            // deployment". Bounded, and the bound is reported.
+            if opts.online {
+                let total = registered.len();
+                for (index, (hostname, tenant, status)) in registered
+                    .into_iter()
+                    .take(MAX_CUSTOM_DOMAIN_PROBES)
+                    .enumerate()
+                {
+                    tasks.push(Box::new(move || {
+                        let dns = resolve_dns_points_here(&hostname);
+                        let mut result = check_custom_domain_dns_impl(&CustomDomainProbe {
+                            hostname,
+                            tenant,
+                            status,
+                            dns,
+                        });
+                        // Say once, on the last probe, that the sweep was
+                        // partial — silently checking 25 of 1,000 would read as
+                        // a clean bill of health for 975 unprobed domains.
+                        if index + 1 == MAX_CUSTOM_DOMAIN_PROBES && total > MAX_CUSTOM_DOMAIN_PROBES
+                        {
+                            let detail = result.detail.take().unwrap_or_default();
+                            result.detail = Some(format!(
+                                "{detail} (probed the first {MAX_CUSTOM_DOMAIN_PROBES} of {total}                                  registered domains)"
+                            ));
+                        }
+                        result
+                    }));
+                }
+            }
 
             // Probe EVERY configured domain: issuance orders authorizations for
             // all `config.domains`, so a probe of only the first name can pass
@@ -11987,6 +12267,8 @@ pub struct Vault {
             renew_before_days_error: None,
             dns: None,
             dns_error: None,
+            custom_domains: None,
+            custom_domains_error: None,
         }
     }
 
@@ -11997,6 +12279,161 @@ pub struct Vault {
     ) -> autumn_web::config::AcmeDnsConfig {
         toml::from_str(&format!("provider = \"{}\"\n", provider.as_str()))
             .expect("the minimal DNS section parses")
+    }
+
+    // ── Tenant custom domains (#1635) ───────────────────────────────────
+
+    fn custom_domains_config(enabled: bool) -> autumn_web::config::CustomDomainsConfig {
+        autumn_web::config::CustomDomainsConfig {
+            enabled,
+            ingress_hostname: Some("ingress.myapp.com".to_owned()),
+            ..autumn_web::config::CustomDomainsConfig::default()
+        }
+    }
+
+    #[test]
+    fn custom_domains_config_check_grades_the_section() {
+        // Absent section: nothing to say.
+        assert!(check_custom_domains_config_impl(None, None, 0).is_none());
+
+        // Disabled: a Pass that says so, not silence.
+        let off = check_custom_domains_config_impl(Some(&custom_domains_config(false)), None, 0)
+            .expect("a present section is always graded");
+        assert_eq!(off.status, CheckStatus::Pass);
+        assert!(off.detail.unwrap().contains("enabled = false"));
+
+        // Enabled with an ingress: Pass, naming the count and the cap.
+        let on = check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, 3)
+            .unwrap();
+        assert_eq!(on.status, CheckStatus::Pass);
+        assert!(on.detail.unwrap().contains('3'));
+
+        // Enabled with nowhere for tenants to point: the same Fail the runtime
+        // exits on at boot.
+        let no_ingress = autumn_web::config::CustomDomainsConfig {
+            enabled: true,
+            ingress_hostname: None,
+            ..autumn_web::config::CustomDomainsConfig::default()
+        };
+        assert_eq!(
+            check_custom_domains_config_impl(Some(&no_ingress), None, 0)
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
+
+        // A malformed section fails rather than reading as "off".
+        assert_eq!(
+            check_custom_domains_config_impl(None, Some("unknown field `ingres_hostname`"), 0)
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
+
+        // More registered than the cap allows: a Warn, since the stored domains
+        // still serve.
+        let mut capped = custom_domains_config(true);
+        capped.max_domains = 2;
+        assert_eq!(
+            check_custom_domains_config_impl(Some(&capped), None, 5)
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+    }
+
+    fn probe(status: &str, dns: DnsPointsHere) -> CustomDomainProbe {
+        CustomDomainProbe {
+            hostname: "app.clientco.com".to_owned(),
+            tenant: "tenant-a".to_owned(),
+            status: status.to_owned(),
+            dns,
+        }
+    }
+
+    #[test]
+    fn a_live_custom_domain_whose_dns_moved_away_fails() {
+        let moved = probe(
+            "active",
+            DnsPointsHere::ResolvesElsewhere {
+                resolved: vec!["198.51.100.7".to_owned()],
+            },
+        );
+        let result = check_custom_domain_dns_impl(&moved);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("app.clientco.com"), "{detail}");
+        assert!(detail.contains("tenant-a"), "{detail}");
+        assert!(detail.contains("198.51.100.7"), "{detail}");
+
+        // Gone entirely is just as bad.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("active", DnsPointsHere::Unresolved)).status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn a_pending_custom_domain_that_does_not_point_here_yet_is_only_a_warning() {
+        // Not yet published is the ordinary state right after registration.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("pending_dns", DnsPointsHere::Unresolved)).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe(
+                "pending_dns",
+                DnsPointsHere::ResolvesElsewhere {
+                    resolved: vec!["198.51.100.7".to_owned()],
+                }
+            ))
+            .status,
+            CheckStatus::Warn
+        );
+        // Pointing here is a Pass whatever the state.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("active", DnsPointsHere::Matches)).status,
+            CheckStatus::Pass
+        );
+        // Unknowable from inside a NAT is never a hard failure.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("active", DnsPointsHere::LocalIpsUnknown)).status,
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn the_registry_reader_skips_unreadable_records_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        // A missing directory is empty, not an error: nothing has registered yet.
+        assert!(read_custom_domain_registry(&dir.path().join("absent")).is_empty());
+
+        for (file, host) in [("b.json", "b.clientco.com"), ("a.json", "a.clientco.com")] {
+            std::fs::write(
+                dir.path().join(file),
+                serde_json::json!({
+                    "hostname": host,
+                    "tenant": "tenant-a",
+                    "status": "active",
+                    "failure_reason": null,
+                    "registered_at_unix": 1,
+                    "verified_at_unix": 1,
+                    "activated_at_unix": 1,
+                    "cert_not_after_unix": 2,
+                    "consecutive_failures": 0,
+                    "next_attempt_unix": null
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("corrupt.json"), "{not json").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "irrelevant").unwrap();
+
+        let records = read_custom_domain_registry(dir.path());
+        assert_eq!(records.len(), 2, "the corrupt record must not blind the rest");
+        assert_eq!(records[0].0, "a.clientco.com");
+        assert_eq!(records[1].0, "b.clientco.com");
     }
 
     #[test]
@@ -12721,6 +13158,10 @@ contact_email = \"ops@example.com\"
                     renew_before_days: *renew_before_days,
                     ca_root_path: None,
                     dns: dns.clone(),
+                    // Tenant custom domains are graded by their own
+                    // `custom_domains` check, not by `acme_config`, so this
+                    // parity case holds them absent on both sides.
+                    custom_domains: None,
                 };
 
                 assert_eq!(
@@ -12767,6 +13208,10 @@ contact_email = \"ops@example.com\"
                     renew_before_days: 30,
                     ca_root_path: None,
                     dns: dns.clone(),
+                    // Tenant custom domains are graded by their own
+                    // `custom_domains` check, not by `acme_config`, so this
+                    // parity case holds them absent on both sides.
+                    custom_domains: None,
                 };
                 assert_eq!(
                     check_acme_config_impl(&doctor_cfg).is_some(),

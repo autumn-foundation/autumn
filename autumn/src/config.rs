@@ -135,6 +135,7 @@
 //! | `AUTUMN_RETENTION__WEBHOOK_REPLAY` | `retention.webhook_replay` | duration `String` |
 //! | `AUTUMN_RETENTION__SESSIONS` | `retention.sessions` | duration `String` |
 //! | `AUTUMN_RETENTION__AUDIT_ARCHIVES` | `retention.audit_archives` | duration `String` |
+//! | `AUTUMN_RETENTION__CUSTOM_DOMAINS` | `retention.custom_domains` | duration `String` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
 //! | `AUTUMN_SCHEDULER__KEY_PREFIX` | `scheduler.key_prefix` | `String` |
@@ -2927,6 +2928,7 @@ pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str
 /// webhook_replay         = "3d"    # inbound webhook replay markers
 /// sessions               = "30d"   # server-side session records
 /// audit_archives         = "400d"  # JSONL audit archive entries
+/// custom_domains         = "30d"   # tenant domains never verified since
 /// ```
 ///
 /// Durations use the same syntax as `#[scheduled(every = ...)]`: `s`/`m`/`h`/
@@ -3009,6 +3011,17 @@ pub struct RetentionConfig {
     /// [`crate::audit::JsonlFileAuditSink`].
     #[serde(default)]
     pub audit_archives: Option<String>,
+
+    /// Tenant custom-domain registrations that never reached DNS
+    /// verification, measured from registration. Unset (default): a pending
+    /// registration is kept until the app offboards it.
+    ///
+    /// Never touches a domain that verified: an active domain is live
+    /// configuration, not aged data. Orphaned certificates — a stored pair for
+    /// a hostname no longer registered — are pruned by the same sweep
+    /// regardless of this window, since there is no record left to age.
+    #[serde(default)]
+    pub custom_domains: Option<String>,
 }
 
 impl Default for RetentionConfig {
@@ -3023,6 +3036,7 @@ impl Default for RetentionConfig {
             webhook_replay: None,
             sessions: None,
             audit_archives: None,
+            custom_domains: None,
         }
     }
 }
@@ -3039,7 +3053,7 @@ impl RetentionConfig {
     /// table from drifting apart: adding a field here without adding the
     /// matching dataset fails a test in `crate::data_retention`.
     #[must_use]
-    pub fn windows(&self) -> [(&'static str, Option<&str>); 8] {
+    pub fn windows(&self) -> [(&'static str, Option<&str>); 9] {
         [
             ("job_history", self.job_history.as_deref()),
             ("commit_hooks", self.commit_hooks.as_deref()),
@@ -3052,6 +3066,7 @@ impl RetentionConfig {
             ("webhook_replay", self.webhook_replay.as_deref()),
             ("sessions", self.sessions.as_deref()),
             ("audit_archives", self.audit_archives.as_deref()),
+            ("custom_domains", self.custom_domains.as_deref()),
         ]
     }
 
@@ -5047,6 +5062,7 @@ impl AutumnConfig {
     /// - `AUTUMN_RETENTION__WEBHOOK_REPLAY` → `retention.webhook_replay` (duration `String`)
     /// - `AUTUMN_RETENTION__SESSIONS` → `retention.sessions` (duration `String`)
     /// - `AUTUMN_RETENTION__AUDIT_ARCHIVES` → `retention.audit_archives` (duration `String`)
+    /// - `AUTUMN_RETENTION__CUSTOM_DOMAINS` → `retention.custom_domains` (duration `String`)
     ///
     /// # Signed webhooks
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)

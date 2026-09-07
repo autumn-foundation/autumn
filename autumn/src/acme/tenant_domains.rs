@@ -45,6 +45,10 @@ use rustls::crypto::CryptoProvider;
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Callback that clears an outstanding custom-domain alert once every domain
+/// is healthy again.
+pub type RecoveryFn = Arc<dyn Fn() + Send + Sync>;
+
 /// The [`CertId`] a tenant hostname's certificate is stored under.
 ///
 /// One hostname per certificate, so offboarding one tenant deletes exactly one
@@ -156,6 +160,16 @@ pub struct CustomDomainTask {
     pub renew_before_days: u32,
     /// Where a failure is reported (#1610's failed-scheduled-operation alert).
     pub reporter: ReporterFn,
+    /// Invoked once no domain carries a failure any more, so the operator
+    /// alert the reporter raised is cleared rather than left standing.
+    pub recovery: Option<RecoveryFn>,
+    /// The certificate store as a filesystem store, when it is one, so the
+    /// retention prune can enumerate stored pairs. `None` disables orphan
+    /// pruning rather than guessing at another store's layout.
+    pub cert_store_paths: Option<Arc<crate::acme::store::FsAcmeStore>>,
+    /// Certificate ids the prune must never delete — the deployment's own
+    /// certificate, which shares this store but has no registry record.
+    pub retained_cert_ids: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for CustomDomainTask {
@@ -173,7 +187,7 @@ impl CustomDomainTask {
     /// The loop never returns an error: a tick that fails leaves the affected
     /// domain's reason recorded and every other domain serving.
     pub async fn run(
-        self,
+        &self,
         interval: std::time::Duration,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
@@ -282,6 +296,14 @@ impl CustomDomainTask {
             .await
             .map_err(|e| format!("failed to persist the active state for {hostname}: {e}"))?;
         tracing::info!(hostname, not_after, "custom domain is active");
+        // Clear the operator alert only once NOTHING is failing: with a
+        // thousand domains, recovering one while another is still broken must
+        // not retract an alert that is still true.
+        if let Some(recovery) = &self.recovery
+            && self.registry.health_report(now_unix).is_empty()
+        {
+            recovery();
+        }
         Ok(())
     }
 
@@ -387,6 +409,76 @@ impl CustomDomainTask {
         for domain in active.into_iter().take(self.cache.capacity()) {
             self.warm(&domain.hostname).await;
         }
+    }
+}
+
+impl crate::custom_domain::CustomDomainPruner for CustomDomainTask {
+    fn prune<'a>(
+        &'a self,
+        cutoff_unix: i64,
+        dry_run: bool,
+    ) -> futures::future::BoxFuture<'a, Result<u64, String>> {
+        Box::pin(async move {
+            let mut removed = 0_u64;
+            // Abandoned connections: a tenant was handed DNS instructions and
+            // never published the record. Nothing else ever deletes these.
+            for domain in self.registry.list() {
+                if domain.status == crate::custom_domain::DomainStatus::PendingDns
+                    && domain.registered_at_unix < cutoff_unix
+                {
+                    removed += 1;
+                    if !dry_run {
+                        self.offboard(&domain.hostname)
+                            .await
+                            .map_err(|e| format!("failed to offboard {}: {e}", domain.hostname))?;
+                    }
+                }
+            }
+            // Orphaned certificates: a pair whose hostname is no longer
+            // registered at all. Pruned regardless of the cutoff — there is no
+            // record left to age.
+            removed += self.prune_orphan_certs(dry_run)?;
+            Ok(removed)
+        })
+    }
+}
+
+impl CustomDomainTask {
+    /// Delete stored certificate pairs no registered hostname maps to.
+    ///
+    /// Only certificates whose [`CertId`] matches some *removed* custom domain
+    /// can be identified: an id is a hash, so the deployment's own certificate
+    /// (and any other) is left alone by construction — we delete only ids that
+    /// no longer appear in the registry AND are not the configured cert.
+    fn prune_orphan_certs(&self, dry_run: bool) -> Result<u64, String> {
+        let Some(fs) = self.cert_store_paths.as_ref() else {
+            // A non-filesystem store cannot be enumerated through this seam.
+            return Ok(0);
+        };
+        let live: std::collections::HashSet<String> = self
+            .registry
+            .list()
+            .into_iter()
+            .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
+            .collect();
+        let stored = fs
+            .list_certs()
+            .map_err(|e| format!("failed to enumerate stored certificates: {e}"))?;
+        let mut removed = 0;
+        for (id, chain, key) in stored {
+            if live.contains(id.as_str()) || self.retained_cert_ids.contains(id.as_str()) {
+                continue;
+            }
+            removed += 1;
+            if !dry_run {
+                for path in [&chain, &key] {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
+                    }
+                }
+            }
+        }
+        Ok(removed)
     }
 }
 

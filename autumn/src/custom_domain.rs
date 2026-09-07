@@ -1302,6 +1302,119 @@ impl DomainVerifier for SystemDomainVerifier {
     }
 }
 
+// ── Health ───────────────────────────────────────────────────────────────
+
+/// The `custom_domains` health indicator (AC5).
+///
+/// `Down` when any domain's certificate has actually expired — that domain is
+/// no longer servable. A domain merely carrying a `failure_reason` (a retry is
+/// pending, its certificate still valid) is `Up` with the detail attached: one
+/// tenant's failed renewal is not a deployment outage, and grading it as one
+/// would make the signal useless at a thousand domains.
+///
+/// Every unhealthy domain is named with its tenant, so an operator reading
+/// `/actuator/health` can act without a registry lookup.
+#[derive(Debug)]
+pub struct CustomDomainHealthIndicator {
+    registry: Arc<CustomDomainRegistry>,
+    now_unix: fn() -> i64,
+}
+
+impl CustomDomainHealthIndicator {
+    /// An indicator over `registry`.
+    #[must_use]
+    pub fn new(registry: Arc<CustomDomainRegistry>) -> Self {
+        Self {
+            registry,
+            now_unix: default_now_unix,
+        }
+    }
+
+    /// Grade the registry at `now_unix` (pure; used by `check` and tests).
+    #[must_use]
+    pub fn grade(&self, now_unix: i64) -> crate::actuator::HealthCheckOutput {
+        use crate::actuator::{HealthCheckOutput, HealthStatus};
+        let mut details = std::collections::HashMap::new();
+        let all = self.registry.list();
+        let active = all.iter().filter(|d| d.is_servable()).count();
+        details.insert("registered".to_owned(), serde_json::json!(all.len()));
+        details.insert("active".to_owned(), serde_json::json!(active));
+
+        let expired: Vec<String> = all
+            .iter()
+            .filter(|d| d.cert_not_after_unix.is_some_and(|na| na <= now_unix))
+            .map(|d| format!("{} (tenant {})", d.hostname, d.tenant))
+            .collect();
+        let failing: Vec<String> = all
+            .iter()
+            .filter(|d| d.failure_reason.is_some())
+            .map(|d| {
+                format!(
+                    "{} (tenant {}): {}",
+                    d.hostname,
+                    d.tenant,
+                    d.failure_reason.as_deref().unwrap_or_default()
+                )
+            })
+            .collect();
+        if !failing.is_empty() {
+            details.insert("failing".to_owned(), serde_json::json!(failing));
+        }
+        if !expired.is_empty() {
+            details.insert("expired".to_owned(), serde_json::json!(expired));
+        }
+
+        HealthCheckOutput {
+            status: if expired.is_empty() {
+                HealthStatus::Up
+            } else {
+                HealthStatus::Down
+            },
+            details,
+        }
+    }
+}
+
+impl crate::actuator::HealthIndicator for CustomDomainHealthIndicator {
+    fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
+        let now = (self.now_unix)();
+        Box::pin(async move { self.grade(now) })
+    }
+
+    fn group(&self) -> crate::actuator::IndicatorGroup {
+        crate::actuator::IndicatorGroup::HealthOnly
+    }
+}
+
+/// Wall-clock seconds since the epoch.
+fn default_now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+// ── Retention ────────────────────────────────────────────────────────────
+
+/// Prunes the custom-domain datasets the framework owns (#1605 / #1635 AC7).
+///
+/// The seam lives here, in the core module, so the retention engine can drive
+/// it without the `acme` feature; the implementation that actually knows about
+/// certificates is [`crate::acme::tenant_domains::CustomDomainTask`].
+pub trait CustomDomainPruner: Send + Sync {
+    /// Delete what the retention policy no longer keeps and return how many
+    /// records went (or would go, when `dry_run`).
+    ///
+    /// Two things are pruned: registry records still awaiting DNS since before
+    /// `cutoff_unix` — a tenant who was handed instructions and never followed
+    /// them — and stored certificates for hostnames no longer registered,
+    /// which nothing would otherwise ever delete.
+    fn prune<'a>(
+        &'a self,
+        cutoff_unix: i64,
+        dry_run: bool,
+    ) -> futures::future::BoxFuture<'a, Result<u64, String>>;
+}
+
 // ── SNI certificate selection ────────────────────────────────────────────
 
 #[cfg(feature = "tls")]

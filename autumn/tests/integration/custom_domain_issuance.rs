@@ -6,11 +6,11 @@
 //! and without wall-clock waits. The ACME wire protocol is covered by
 //! `acme_end_to_end.rs`; what a real order does is not re-tested here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use autumn_web::acme::store::{AcmeStore as _, CertId, FsAcmeStore};
+use autumn_web::acme::store::{CertId, FsAcmeStore};
 
 use autumn_web::acme::tenant_domains::CustomDomainTask;
 use autumn_web::custom_domain::{
@@ -53,18 +53,28 @@ impl DomainVerifier for TableVerifier {
 
 /// An issuer that records every hostname it was asked about and fails for the
 /// hostnames named in `failing`.
+///
+/// With `heal_after` set, a named hostname fails only its first `heal_after`
+/// attempts and succeeds afterwards — enough to drive a failure-then-recovery
+/// sequence without a second issuer.
 #[derive(Debug)]
 struct ScriptedIssuer {
     calls: Mutex<Vec<String>>,
     failing: Vec<String>,
+    heal_after: usize,
     count: AtomicUsize,
 }
 
 impl ScriptedIssuer {
     fn new(failing: &[&str]) -> Arc<Self> {
+        Self::healing(failing, usize::MAX)
+    }
+
+    fn healing(failing: &[&str], heal_after: usize) -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
             failing: failing.iter().map(|h| (*h).to_owned()).collect(),
+            heal_after,
             count: AtomicUsize::new(0),
         })
     }
@@ -81,9 +91,13 @@ impl ScriptedIssuer {
 impl DomainIssuer for ScriptedIssuer {
     fn issue<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
         Box::pin(async move {
-            self.calls.lock().unwrap().push(hostname.to_owned());
+            let attempts = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(hostname.to_owned());
+                calls.iter().filter(|h| *h == hostname).count()
+            };
             self.count.fetch_add(1, Ordering::SeqCst);
-            if self.failing.iter().any(|h| h == hostname) {
+            if self.failing.iter().any(|h| h == hostname) && attempts <= self.heal_after {
                 return Err("the CA rejected the order".to_owned());
             }
             Ok(IssuedCertificate {
@@ -101,6 +115,7 @@ struct Harness {
     registry: Arc<CustomDomainRegistry>,
     cache: Arc<CustomDomainCertCache>,
     alerts: Arc<Mutex<Vec<String>>>,
+    recovered: Arc<Mutex<Vec<String>>>,
     _dir: tempfile::TempDir,
 }
 
@@ -114,6 +129,7 @@ fn harness_with_limiter(
     limiter: IssuanceLimiter,
 ) -> Harness {
     let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
     let registry = Arc::new(CustomDomainRegistry::new(
         Arc::new(MemoryCustomDomainStore::new()),
         100,
@@ -121,10 +137,12 @@ fn harness_with_limiter(
     let cache = Arc::new(CustomDomainCertCache::new(8));
     let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&alerts);
+    let recovered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recovered_out = Arc::clone(&recovered);
     let task = CustomDomainTask {
         registry: Arc::clone(&registry),
         cache: Arc::clone(&cache),
-        certs: Arc::new(FsAcmeStore::new(dir.path(), "staging")),
+        certs: Arc::clone(&store) as Arc<dyn autumn_web::acme::store::AcmeStore>,
         provider: autumn_web::tls::crypto_provider(),
         verifier,
         issuer,
@@ -136,12 +154,19 @@ fn harness_with_limiter(
         },
         renew_before_days: 30,
         reporter: Arc::new(move |message: String| sink.lock().unwrap().push(message)),
+        recovery: Some(Arc::new({
+            let sink = Arc::clone(&recovered);
+            move || sink.lock().unwrap().push("recovered".to_owned())
+        })),
+        cert_store_paths: Some(store),
+        retained_cert_ids: HashSet::new(),
     };
     Harness {
         task,
         registry,
         cache,
         alerts,
+        recovered: recovered_out,
         _dir: dir,
     }
 }
@@ -435,4 +460,151 @@ async fn a_cold_domain_is_reloaded_from_the_store_rather_than_reordered() {
     );
     assert!(h.cache.get("app.clientco.com").is_some());
     assert_eq!(issuer.count(), 1, "warming must not place a new order");
+}
+
+// ── AC5: the alert clears only when nothing is failing ───────────────────
+
+#[tokio::test]
+async fn recovery_fires_only_once_every_domain_is_healthy() {
+    // Both domains fail their first order, then heal. Two successes land in
+    // one tick, and only the second — after which nothing is failing — may
+    // clear the operator alert.
+    let issuer = ScriptedIssuer::healing(&["a.clientco.com", "b.clientco.com"], 1);
+    let h = harness(
+        TableVerifier::new(&[
+            ("a.clientco.com", points_here()),
+            ("b.clientco.com", points_here()),
+        ]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("a.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .register("b.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert!(
+        h.recovered.lock().unwrap().is_empty(),
+        "nothing has recovered while both domains are failing"
+    );
+
+    h.task.tick(NOW + 301).await;
+    assert_eq!(
+        h.registry.get("a.clientco.com").unwrap().status,
+        DomainStatus::Active
+    );
+    assert_eq!(
+        h.registry.get("b.clientco.com").unwrap().status,
+        DomainStatus::Active
+    );
+    assert_eq!(
+        h.recovered.lock().unwrap().len(),
+        1,
+        "the alert clears exactly once, when the LAST failing domain recovers"
+    );
+}
+
+// ── AC7: retention prunes abandoned records and orphaned certificates ────
+
+#[tokio::test]
+async fn retention_prunes_abandoned_registrations_and_orphaned_certificates() {
+    use autumn_web::custom_domain::CustomDomainPruner as _;
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[("live.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("live.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    // Never published DNS.
+    h.registry
+        .register("abandoned.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+    // A certificate whose registry record is already gone.
+    h.task
+        .certs
+        .save_cert(
+            &CertId::from_domains(&["orphan.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let cutoff = NOW + 86_400;
+    // A dry run reports without deleting.
+    assert_eq!(h.task.prune(cutoff, true).await.unwrap(), 2);
+    assert!(h.registry.get("abandoned.clientco.com").is_some());
+
+    assert_eq!(h.task.prune(cutoff, false).await.unwrap(), 2);
+    assert!(h.registry.get("abandoned.clientco.com").is_none());
+    assert!(
+        h.task
+            .certs
+            .load_cert(&CertId::from_domains(&["orphan.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The live domain and its certificate are untouched.
+    assert!(h.registry.get("live.clientco.com").is_some());
+    assert!(
+        h.task
+            .certs
+            .load_cert(&CertId::from_domains(&["live.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+// ── AC5: health names the domain and the tenant ──────────────────────────
+
+#[tokio::test]
+async fn health_is_up_while_a_failing_domain_still_serves_and_down_once_it_expires() {
+    use autumn_web::actuator::HealthStatus;
+    use autumn_web::custom_domain::CustomDomainHealthIndicator;
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .record_active("app.clientco.com", NOW, NOW + 86_400)
+        .await
+        .unwrap();
+    h.registry
+        .record_failure("app.clientco.com", NOW, "the CA rejected the order", 300)
+        .await
+        .unwrap();
+
+    let indicator = CustomDomainHealthIndicator::new(Arc::clone(&h.registry));
+    let graded = indicator.grade(NOW);
+    assert_eq!(
+        graded.status,
+        HealthStatus::Up,
+        "a failed renewal on a still-valid certificate is not an outage"
+    );
+    let failing = serde_json::to_string(&graded.details["failing"]).unwrap();
+    assert!(failing.contains("app.clientco.com"), "{failing}");
+    assert!(failing.contains("tenant-a"), "{failing}");
+
+    // Once the certificate is actually dead the deployment is Down.
+    assert_eq!(indicator.grade(NOW + 86_401).status, HealthStatus::Down);
 }
