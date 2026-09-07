@@ -379,19 +379,28 @@ def _find_key(table, path):
     keys, which is the other half of keeping those lines in the table at all:
     a `description = \"\"\"` block containing a line `publish = false` must not
     make the package unpublishable.
+
+    Nesting is tracked for the same reason one level in. A value may itself run
+    over lines — `metadata = {` and then `readme = "PRIVATE.md"` — and that
+    readme belongs to metadata, not the package: Cargo reports the package's
+    own `readme = false`. Reading the nested line as a package key seeded a
+    file no registry publishes, which is the direction that hides an orphan.
     """
     pos = 0
     ml = None
+    depth = 0
     for line in table.split('\n'):
         if ml is not None:
             if _ml_close(line, ml) >= 0:
                 ml = None
             pos += len(line) + 1
             continue
-        k = _line_key(line)
-        if k is not None and k[0] == path:
-            return table[pos + len(line) - len(k[1]):]
-        _at, ml = _scan_toml_line(line)
+        if depth <= 0:
+            k = _line_key(line)
+            if k is not None and k[0] == path:
+                return table[pos + len(line) - len(k[1]):]
+        _at, ml, delta = _scan_toml_line(line)
+        depth += delta
         pos += len(line) + 1
     return None
 
@@ -488,6 +497,7 @@ def _inline_table(value):
     quote = None
     esc = False
     closed = False
+    comment = False
     for ch in s[1:]:
         if quote is not None:
             cur += ch
@@ -503,7 +513,19 @@ def _inline_table(value):
             elif ch == quote:
                 quote = None
             continue
-        if ch in '"\'':
+        if comment:
+            # A `}` inside a COMMENT is not the end of the table. Cargo accepts
+            # `# note } here` between entries and still reports the keys after
+            # it; closing there dropped them and read the package as
+            # publishable. The comment runs to the newline, which exists here
+            # because a multi-line inline table is joined line by line.
+            if ch == '\n':
+                comment = False
+                cur += ch
+            continue
+        if ch == '#':
+            comment = True
+        elif ch in '"\'':
             quote = ch
             cur += ch
         elif ch in '[{':
@@ -593,7 +615,51 @@ _AUTO_README = ('README.md', 'README.txt', 'README')
 # package's README as a reader root — silent, the direction that hides an
 # orphan. Every approximation below is therefore measured against a scanner
 # that lacks it, not reasoned about.
-_TOML_HEADER = re.compile(r'^[ \t]*\[\[?[ \t]*([^\[\]]*?)[ \t]*\]\]?[ \t]*(?:#.*)?$')
+def _header_name(line):
+    """The inner text of a table header line, else None.
+
+    Scanned rather than matched, because a QUOTED segment may contain the
+    delimiter: `[package.metadata."x]"]` keeps the `]` inside the name, and
+    Cargo scopes the keys under it to that metadata table. A `[^\\[\\]]*`
+    pattern rejected the whole line, so the scope stayed `[package]` and a
+    `publish = false` meant for metadata was read as the package's own —
+    dropping a publishable crate's README from the roots.
+    """
+    s = line.lstrip()
+    if not s.startswith('['):
+        return None
+    i = 2 if s.startswith('[[') else 1
+    j = i
+    n = len(s)
+    quote = None
+    esc = False
+    end = None
+    while j < n:
+        c = s[j]
+        if quote is not None:
+            if esc:
+                esc = False
+            elif quote == '"' and c == '\\':
+                esc = True
+            elif c == quote:
+                quote = None
+        elif c in '"\'':
+            quote = c
+        elif c == ']':
+            end = j
+            break
+        j += 1
+    if end is None:
+        return None
+    rest = s[end + 1:]
+    if i == 2:
+        if not rest.startswith(']'):
+            return None
+        rest = rest[1:]
+    rest = rest.strip()
+    if rest and not rest.startswith('#'):
+        return None
+    return s[i:end]
 
 
 def _toml_key_path(text):
@@ -680,12 +746,19 @@ def _ml_close(text, tok, start=0):
 
 
 def _scan_toml_line(line):
-    """`(comment_start, open_delimiter)` for one line of TOML.
+    """`(comment_start, open_delimiter, depth_delta)` for one line of TOML.
 
     `comment_start` is where an unquoted `#` begins a comment, or None.
     `open_delimiter` is a multi-line delimiter left open at end of line, or
-    None. One scanner answers both because they are the same question — what on
-    this line is quoted and what is not — and both mis-answers hide orphans
+    None. `depth_delta` is the net `{`/`[` nesting the line leaves open, so a
+    caller can tell a package key from one nested inside a value: with
+    `metadata = {` on one line and `readme = "PRIVATE.md"` on the next, that
+    readme is metadata's, not the package's, and Cargo reports the package's
+    own `readme = false` instead. Reading the nested line as a package key
+    seeded a file no registry publishes.
+
+    One scanner answers all three because they are the same question — what on
+    this line is quoted and what is not — and the mis-answers hide orphans
     rather than report false ones:
 
       - a `\"\"\"` inside a comment (`# see \"\"\" this`) read as an opener swallows
@@ -699,6 +772,7 @@ def _scan_toml_line(line):
     """
     i = 0
     n = len(line)
+    depth = 0
     while i < n:
         # A triple delimiter has to be tested before the single quote that
         # starts it, or every one of them opens a single-line string instead.
@@ -706,10 +780,10 @@ def _scan_toml_line(line):
             tok = line[i:i + 3]
             close = _ml_close(line, tok, i + 3)
             if close < 0:
-                return None, tok
+                return None, tok, depth
             i = close + 3
         elif line[i] == '#':
-            return i, None                   # comment runs to end of line
+            return i, None, depth            # comment runs to end of line
         elif line[i] == '"':
             i += 1
             while i < n and line[i] != '"':  # basic strings take escapes
@@ -719,8 +793,12 @@ def _scan_toml_line(line):
             close = line.find("'", i + 1)    # literal strings do not
             i = n if close < 0 else close + 1
         else:
+            if line[i] in '{[':
+                depth += 1
+            elif line[i] in '}]':
+                depth -= 1
             i += 1
-    return None, None
+    return None, None, depth
 
 
 def _strip_toml_comments(text):
@@ -751,10 +829,10 @@ def _strip_toml_comments(text):
             out.append(line[:close + 3])
             line = line[close + 3:]
             ml = None
-            at, ml = _scan_toml_line(line)
+            at, ml, _d = _scan_toml_line(line)
             out[-1] += line if at is None else line[:at]
             continue
-        at, ml = _scan_toml_line(line)
+        at, ml, _d = _scan_toml_line(line)
         out.append(line if at is None else line[:at])
     return '\n'.join(out)
 
@@ -793,20 +871,20 @@ def _toml_lines(manifest):
             # The remainder of the closing line is live TOML again.
             rest = line[close + 3:]
             ml = None
-            m = _TOML_HEADER.match(rest)
-            if m is not None:
-                table = _toml_key_path(m.group(1))
+            name = _header_name(rest)
+            if name is not None:
+                table = _toml_key_path(name)
                 yield table, '', True
                 continue
-            _at, ml = _scan_toml_line(rest)
+            _at, ml, _d = _scan_toml_line(rest)
             yield table, line, False
             continue
-        m = _TOML_HEADER.match(line)
-        if m is not None:
-            table = _toml_key_path(m.group(1))
+        name = _header_name(line)
+        if name is not None:
+            table = _toml_key_path(name)
             yield table, '', True
             continue
-        _at, ml = _scan_toml_line(line)
+        _at, ml, _d = _scan_toml_line(line)
         yield table, line, True
 
 
@@ -7985,6 +8063,39 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n7/pkg/README.md"
   git -C "$c9n7" add -A && git -C "$c9n7" commit -qm literal-triple-no-escape
   check "a literal triple quote closes despite a backslash" fail "$c9n7"
+
+  # A QUOTED header segment may contain the delimiter: `[package.metadata."x]"]`
+  # keeps the `]` in the name, so the `publish = false` under it is metadata's.
+  # Rejecting the line left the scope at `[package]` and read that key as the
+  # package's own, dropping a publishable crate's README.
+  local c9n8="$tmp/c9n8"; make_corpus "$c9n8"
+  mkdir -p "$c9n8/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\n\n[package.metadata."x]"]\npublish = false\n' \
+    > "$c9n8/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n8/pkg/README.md"
+  git -C "$c9n8" add -A && git -C "$c9n8" commit -qm bracket-in-quoted-header
+  check "a bracket inside a quoted header segment stays in the name" pass "$c9n8"
+
+  # A key NESTED in a multi-line inline value is not a package key: this
+  # `readme` belongs to `metadata`, and Cargo reports the package's own
+  # `readme = false` — no README at all.
+  local c9n9="$tmp/c9n9"; make_corpus "$c9n9"
+  mkdir -p "$c9n9/pkg"
+  printf '[package]\nname = "pkg"\nmetadata = {\nreadme = "PRIVATE.md"\n}\nreadme = false\n' \
+    > "$c9n9/pkg/Cargo.toml"
+  printf '# Private\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n9/pkg/PRIVATE.md"
+  git -C "$c9n9" add -A && git -C "$c9n9" commit -qm nested-inline-key
+  check "a key nested in an inline value is not the package's" fail "$c9n9"
+
+  # A `}` inside a COMMENT does not end an inline table, so the keys after it
+  # are still read: Cargo reports `publish: []` for this manifest.
+  local c9na="$tmp/c9na"; make_corpus "$c9na"
+  mkdir -p "$c9na/pkg"
+  printf 'package = {\nname = "pkg",\n# note } here\npublish = false,\nreadme = "README.md" }\n' \
+    > "$c9na/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9na/pkg/README.md"
+  git -C "$c9na" add -A && git -C "$c9na" commit -qm comment-brace-inline
+  check "a brace in a comment does not close an inline table" fail "$c9na"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
