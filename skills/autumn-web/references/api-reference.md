@@ -1269,6 +1269,21 @@ time = { version = ">=0.3, <0.4" }
 
 JSON clients receive `application/problem+json`.
 
+Read accessors, for a caller with no HTTP response to parse (a GraphQL
+resolver, a `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl):
+
+- `status() -> StatusCode`
+- `details() -> Option<&HashMap<String, Vec<String>>>` - per-field validation
+  messages, `None` when the error did not come from validation
+- `code() -> &'static str` - the same stable code the `problem+json` body
+  carries (`autumn.validation_failed`, `autumn.not_found`, ...)
+- `source_chain() -> Vec<String>`
+- `downcast_ref::<T>()` / `downcast_chain_ref::<T>()`
+
+`Display` on a validation error appends the failing fields in sorted order:
+`Validation failed: email: Must be a valid email address`. The `problem+json`
+`detail` is unchanged - it stays the bare title, with the fields in `errors`.
+
 ## Signed webhook API
 
 Provider presets:
