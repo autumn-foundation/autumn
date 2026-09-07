@@ -304,12 +304,91 @@ _PUBLISH_INHERITS = re.compile(
     r'|^[ \t]*publish[ \t]*=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
     re.M)
 
+# Every pattern above reads a key Cargo reads from ONE table, so they have to be
+# applied to that table rather than to the whole document. `[package.metadata.*]`
+# is arbitrary third-party data Cargo itself ignores — cargo-deb, cargo-dist and
+# friends all keep their settings there — and a `publish = false` sitting in one
+# of those was being read as the package's own, dropping a publishable crate's
+# README from the roots. That is the LOUD direction (a page reported orphaned
+# that is not one), unlike the last two findings here, but it still blocks a
+# valid docs change on a manifest Cargo accepts.
+_TOML_HEADER = re.compile(r'^[ \t]*\[\[?[ \t]*([^\[\]]*?)[ \t]*\]\]?[ \t]*(?:#.*)?$')
+_TOML_ML = re.compile(r'"""|\'\'\'')
+_DOTTED_CACHE = {}
+
+
+def _toml_lines(manifest):
+    """Yield `(table, line)` for each line of TOML outside a multi-line string.
+
+    `table` is the enclosing header's name, or None before the first header.
+
+    Line-scanned, like every other pattern in this file. The one construct that
+    has to be tracked is the multi-line string, because a `\"\"\"` block whose
+    CONTENT contains a line reading `[package]` would otherwise re-scope every
+    key after it. The toggle is approximate — it misreads a `\"\"\"` that appears
+    inside a single-line string or a comment — and that residue can only
+    mis-scope a key, which reports a false orphan rather than hiding a real one.
+    """
+    table = None
+    ml = None
+    for line in manifest.split('\n'):
+        if ml is not None:
+            if ml not in line:
+                continue
+            # The remainder of the closing line is live TOML again.
+            line = line.split(ml, 1)[1]
+            ml = None
+        m = _TOML_HEADER.match(line)
+        if m is not None:
+            table = m.group(1)
+            continue
+        rest = line
+        while True:
+            d = _TOML_ML.search(rest)
+            if d is None:
+                break
+            after = rest[d.end():]
+            close = after.find(d.group(0))
+            if close < 0:
+                ml = d.group(0)
+                break
+            rest = after[close + len(d.group(0)):]
+        yield table, line
+
+
+def _toml_table(manifest, name):
+    """The body of top-level TOML table `name`, as text.
+
+    Root-level dotted keys are folded in with their prefix stripped: written
+    before any header, `package.publish = false` IS `[package]`'s `publish`,
+    and Cargo honours it — `cargo metadata` reports `publish: []`, the same
+    thing it reports for the plain spelling. TOML permits whitespace around the
+    dot, so the prefix is matched rather than compared.
+    """
+    dotted = _DOTTED_CACHE.get(name)
+    if dotted is None:
+        dotted = re.compile(
+            r'^[ \t]*' + r'[ \t]*\.[ \t]*'.join(
+                re.escape(p) for p in name.split('.')) + r'[ \t]*\.[ \t]*')
+        _DOTTED_CACHE[name] = dotted
+    out = []
+    for table, line in _toml_lines(manifest):
+        if table == name:
+            out.append(line)
+        elif table is None:
+            m = dotted.match(line)
+            if m is not None:
+                out.append(line[m.end():])
+    return '\n'.join(out)
+
 
 def _publishable(manifest):
     """Whether a package manifest allows publishing at all."""
+    manifest = _toml_table(manifest, 'package')
     m = _PUBLISH_DECL.search(manifest)
     if m is None and _PUBLISH_INHERITS.search(manifest):
-        m = _PUBLISH_DECL.search(read('Cargo.toml'))
+        m = _PUBLISH_DECL.search(
+            _toml_table(read('Cargo.toml'), 'workspace.package'))
     if m is None:
         return True
     value = m.group(1)
@@ -327,13 +406,14 @@ def _readme_path(manifest, pkg):
 
     `pkg` is the manifest's directory; the returned path is repo-relative.
     """
+    manifest = _toml_table(manifest, 'package')
     if _README_INHERITS.search(manifest):
         # Inherited values resolve against the workspace root, so both the
         # manifest to read the key from AND the directory it is relative to
         # move up. A root manifest with no `[workspace.package] readme` is a
         # manifest Cargo rejects; auto-detecting the root README there is
         # harmless, since that file is already a root on its own account.
-        manifest = read('Cargo.toml')
+        manifest = _toml_table(read('Cargo.toml'), 'workspace.package')
         pkg = ''
     m = _README_STRING.search(manifest)
     if m is not None:
@@ -6952,6 +7032,54 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m2/pkg/README.md"
   git -C "$c9m2" add -A && git -C "$c9m2" commit -qm inherited-readme
   check "an inherited readme is the workspace root's, not the member's" fail "$c9m2"
+
+  # `[package.metadata.*]` is arbitrary third-party data Cargo ignores, so a
+  # `publish` key there is not `package.publish`. `cargo metadata` reports this
+  # package as publishable with `readme = README.md`; reading the key
+  # document-wide dropped its README from the roots and reported a page nobody
+  # had orphaned.
+  local c9m3="$tmp/c9m3"; make_corpus "$c9m3"
+  mkdir -p "$c9m3/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\n\n[package.metadata.example]\npublish = false\n' \
+    > "$c9m3/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m3/pkg/README.md"
+  git -C "$c9m3" add -A && git -C "$c9m3" commit -qm metadata-publish
+  check "publish in a metadata table is not the package's" pass "$c9m3"
+
+  # ...and the same for `readme`: a metadata table's key must not be mistaken
+  # for the one Cargo publishes, in EITHER direction. Here the real package has
+  # opted out, so the stray key must not resurrect it as an entry surface.
+  local c9m4="$tmp/c9m4"; make_corpus "$c9m4"
+  mkdir -p "$c9m4/pkg"
+  printf '[package]\nname = "pkg"\nreadme = false\n\n[package.metadata.tool]\nreadme = "README.md"\n' \
+    > "$c9m4/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m4/pkg/README.md"
+  git -C "$c9m4" add -A && git -C "$c9m4" commit -qm metadata-readme
+  check "readme in a metadata table is not the package's" fail "$c9m4"
+
+  # A root-level DOTTED key names the same table and Cargo honours it: written
+  # before any header, `package.publish = false` comes back out of `cargo
+  # metadata` as `publish: []`, exactly as the plain spelling does. Scoping to
+  # the `[package]` header alone would read this manifest as having no key.
+  local c9m5="$tmp/c9m5"; make_corpus "$c9m5"
+  mkdir -p "$c9m5/pkg"
+  printf 'package.name = "pkg"\npackage.publish = false\npackage.readme = "README.md"\n' \
+    > "$c9m5/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m5/pkg/README.md"
+  git -C "$c9m5" add -A && git -C "$c9m5" commit -qm dotted-publish
+  check "a root-level dotted publish key is the package's" fail "$c9m5"
+
+  # A multi-line string whose CONTENT looks like a section header must not
+  # re-scope the keys after it. Without the string tracking, the `[package]`
+  # inside this description captures the `publish = false` on the next line and
+  # strands a README Cargo does publish.
+  local c9m6="$tmp/c9m6"; make_corpus "$c9m6"
+  mkdir -p "$c9m6/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\ndescription = """\n[package]\npublish = false\n"""\n' \
+    > "$c9m6/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m6/pkg/README.md"
+  git -C "$c9m6" add -A && git -C "$c9m6" commit -qm multiline-header
+  check "a header inside a multi-line string is not a header" pass "$c9m6"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
