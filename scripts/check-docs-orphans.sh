@@ -564,12 +564,49 @@ def _toml_table(manifest, name):
     return '\n'.join(out) if seen else None
 
 
-def _publishable(manifest):
+_WORKSPACE_KEY = re.compile(
+    _key('workspace') + r'=[ \t]*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\')', re.M)
+
+
+def _owning_workspace(package, pkg):
+    """The manifest this member inherits `[workspace.package]` from.
+
+    Hard-coding the repository root was wrong for a NESTED workspace. A member
+    of `nested/` inherits from `nested/Cargo.toml`, and reading the repo root
+    instead found no key at all — so an inherited `publish = false` read as
+    publishable and seeded that member's README. Silent direction, verified
+    against `cargo metadata` reporting `publish: []` for exactly that layout.
+
+    Cargo resolves the owner by an explicit `workspace = "path"` under
+    `[package]` if present, else by walking up to the nearest ancestor manifest
+    that declares a `[workspace]` table.
+    """
+    m = _WORKSPACE_KEY.search(package)
+    if m is not None:
+        named = (_decode_basic(m.group(1)) if m.group(1) is not None
+                 else m.group(2))
+        base = posixpath.normpath(posixpath.join(pkg, named) if pkg else named)
+        cand = 'Cargo.toml' if base in ('', '.') else base + '/Cargo.toml'
+        if cand in tracked_set:
+            return cand
+    d = pkg
+    while True:
+        d = posixpath.dirname(d)
+        cand = (d + '/Cargo.toml') if d else 'Cargo.toml'
+        if cand in tracked_set and _toml_table(read(cand),
+                                               'workspace') is not None:
+            return cand
+        if not d:
+            return 'Cargo.toml'
+
+
+def _publishable(manifest, pkg):
     """Whether a package's `[package]` table allows publishing at all."""
     m = _PUBLISH_DECL.search(manifest)
     if m is None and _PUBLISH_INHERITS.search(manifest):
         m = _PUBLISH_DECL.search(
-            _toml_table(read('Cargo.toml'), 'workspace.package') or '')
+            _toml_table(read(_owning_workspace(manifest, pkg)),
+                        'workspace.package') or '')
     if m is None:
         return True
     value = m.group(1)
@@ -598,13 +635,16 @@ def _readme_paths(manifest, pkg):
     have won — and an untracked file carries no edges here anyway.
     """
     if _README_INHERITS.search(manifest):
-        # Inherited values resolve against the workspace root, so both the
+        # Inherited values resolve against the OWNING workspace, so both the
         # manifest to read the key from AND the directory it is relative to
-        # move up. A root manifest with no `[workspace.package] readme` is a
-        # manifest Cargo rejects; auto-detecting the root README there is
-        # harmless, since that file is already a root on its own account.
-        manifest = _toml_table(read('Cargo.toml'), 'workspace.package') or ''
-        pkg = ''
+        # move there — which is not the repository root when the workspace is
+        # nested: `cargo metadata` reports `../README.md` for a member of
+        # `nested/`, i.e. `nested/README.md`. A workspace manifest with no
+        # `[workspace.package] readme` is one Cargo rejects; auto-detecting
+        # beside it is harmless.
+        owner = _owning_workspace(manifest, pkg)
+        manifest = _toml_table(read(owner), 'workspace.package') or ''
+        pkg = posixpath.dirname(owner)
     m = _README_STRING.search(manifest)
     if m is not None:
         # Only the BASIC form carries escapes; a literal string is its own
@@ -625,11 +665,21 @@ def _readme_paths(manifest, pkg):
         # `posixpath.normpath`, not this file's `normalize`, which is defined
         # far below — and stdlib is the right tool anyway: this resolves a
         # manifest path, not a Markdown destination.
-        cand = posixpath.normpath(posixpath.join(pkg, name) if pkg else name)
-        # Outside its own package directory it is some other file's job.
-        if pkg and not cand.startswith(pkg + '/'):
-            continue
-        out.append(cand)
+        # Climbing out of the package directory is ordinary and published:
+        # `cargo package --list` on a crate with `readme = "../CRATE.md"`
+        # ships `CRATE.md` inside the crate, so that file IS the registry
+        # landing page. An earlier guard dropped every such path on the
+        # reasoning that it "names the workspace root README, already a root on
+        # its own account" — true of the `../README.md` three packages here
+        # use, and false in general.
+        #
+        # Nothing guards climbing out of the REPOSITORY either, deliberately.
+        # `../outside.md` cannot be in `tracked_set` — no tracked path begins
+        # with `..` — so a containment check is a branch that never decides
+        # anything. One was written, along with a test, and both were removed
+        # when the test passed against a build with the check deleted.
+        out.append(posixpath.normpath(
+            posixpath.join(pkg, name) if pkg else name))
     return out
 
 
@@ -639,12 +689,13 @@ def _crate_readme_roots():
         if posixpath.basename(f) != 'Cargo.toml':
             continue
         package = _toml_table(read(f), 'package')
+        pkg = posixpath.dirname(f)
         # No `[package]` table at all is a VIRTUAL manifest — a `Cargo.toml`
         # carrying only `[workspace]`. It declares no crate, so no registry
         # renders a landing page and the README beside it is a plain waypoint.
-        if package is None or not _publishable(package):
+        if package is None or not _publishable(package, pkg):
             continue
-        for cand in _readme_paths(package, posixpath.dirname(f)):
+        for cand in _readme_paths(package, pkg):
             # First tracked candidate wins, which is Cargo's own "first that
             # exists" over the files this corpus can actually carry edges from.
             if cand in tracked_set:
@@ -7423,6 +7474,52 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mm/pkg/README.txt"
   git -C "$c9mm" add -A && git -C "$c9mm" commit -qm autodetect-order
   check "auto-detection stops at the first match" fail "$c9mm"
+
+  # A README ABOVE its package is still that crate's landing page: `cargo
+  # package --list` on this manifest ships `CRATE.md` inside the crate. The
+  # guard that dropped every out-of-package path was justified for the
+  # `../README.md` this repo uses — already a root on its own account — and
+  # wrong in general.
+  local c9mn="$tmp/c9mn"; make_corpus "$c9mn"
+  mkdir -p "$c9mn/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "../CRATE.md"\n' > "$c9mn/pkg/Cargo.toml"
+  printf '# Crate\n\n- [Mail](docs/guide/mail.md)\n' > "$c9mn/CRATE.md"
+  git -C "$c9mn" add -A && git -C "$c9mn" commit -qm readme-above-package
+  check "a README above its package is still an entry surface" pass "$c9mn"
+
+  # There is deliberately NO companion test for a path climbing out of the
+  # REPOSITORY. One was written and deleted with the check it guarded: it
+  # passed against a build with the check removed, because `../outside.md`
+  # cannot be in `tracked_set` in the first place. See `_readme_paths`.
+
+  # A member of a NESTED workspace inherits from that workspace, not from the
+  # repository root — `cargo metadata` reports `publish: []` for this layout.
+  # Reading the root manifest found no key and read the member as publishable.
+  local c9mp="$tmp/c9mp"; make_corpus "$c9mp"
+  mkdir -p "$c9mp/nested/pkg"
+  printf '[workspace]\nmembers = []\nexclude = ["nested"]\n' > "$c9mp/Cargo.toml"
+  printf '[workspace]\nmembers = ["pkg"]\n\n[workspace.package]\npublish = false\n' \
+    > "$c9mp/nested/Cargo.toml"
+  printf '[package]\nname = "pkg"\npublish.workspace = true\nreadme = "README.md"\n' \
+    > "$c9mp/nested/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../../docs/guide/mail.md)\n' \
+    > "$c9mp/nested/pkg/README.md"
+  git -C "$c9mp" add -A && git -C "$c9mp" commit -qm nested-workspace-inherit
+  check "a nested member inherits from its own workspace" fail "$c9mp"
+
+  # ...and an inherited README resolves against that same nested workspace:
+  # `cargo metadata` reports `../README.md` for the member, i.e. the file
+  # beside the NESTED manifest, not the one at the repository root.
+  local c9mq="$tmp/c9mq"; make_corpus "$c9mq"
+  mkdir -p "$c9mq/nested/pkg"
+  printf '[workspace]\nmembers = []\nexclude = ["nested"]\n' > "$c9mq/Cargo.toml"
+  printf '[workspace]\nmembers = ["pkg"]\n\n[workspace.package]\nreadme = "README.md"\n' \
+    > "$c9mq/nested/Cargo.toml"
+  printf '[package]\nname = "pkg"\nreadme.workspace = true\n' \
+    > "$c9mq/nested/pkg/Cargo.toml"
+  printf '# Nested\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mq/nested/README.md"
+  git -C "$c9mq" add -A && git -C "$c9mq" commit -qm nested-inherited-readme
+  check "an inherited readme resolves against the nested workspace" pass "$c9mq"
 
   # There is deliberately NO test here for a `#` inside a quoted registry name
   # (`publish = ["reg#1"]`). One was written and deleted: it passed against a
