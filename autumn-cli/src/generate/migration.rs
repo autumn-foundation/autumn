@@ -406,6 +406,7 @@ mod tests {
     use crate::generate::Flags;
     use crate::generate::emit::Action;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn project() -> TempDir {
@@ -1192,6 +1193,37 @@ pub struct Post {
 
     // ── `plan_migration_destroy_fallback` (issue #1048 PR review) ───────────
 
+    /// A project holding a `#[searchable]` `Post` model and the
+    /// `AddSearchToPosts` migration generated from it, returned with the
+    /// migration's directory. Shared by the three `destroy` fallback tests.
+    fn searchable_post_with_migration() -> (TempDir, PathBuf) {
+        let tmp = project();
+        let models_dir = tmp.path().join("src/models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("post.rs"),
+            r#"
+#[autumn_web::model(table = "posts")]
+#[searchable(language = "english")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[searchable(weight = "A")]
+    pub title: String,
+}
+"#,
+        )
+        .unwrap();
+
+        let plan = plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let dir = tmp
+            .path()
+            .join("migrations/20260427000000_add_search_to_posts");
+        assert!(dir.exists());
+        (tmp, dir)
+    }
+
     #[test]
     fn destroy_add_search_migration_after_model_already_destroyed_still_removes_it() {
         // A common cleanup order — destroying the model before destroying
@@ -1205,31 +1237,9 @@ pub struct Post {
                 ("DATABASE_URL", None::<&str>),
             ],
             || {
-                let tmp = project();
-                let models_dir = tmp.path().join("src/models");
-                fs::create_dir_all(&models_dir).unwrap();
-                let model_src = r#"
-#[autumn_web::model(table = "posts")]
-#[searchable(language = "english")]
-pub struct Post {
-    #[id]
-    pub id: i64,
-    #[searchable(weight = "A")]
-    pub title: String,
-}
-"#;
-                fs::write(models_dir.join("post.rs"), model_src).unwrap();
-
-                let plan =
-                    plan_migration(tmp.path(), "AddSearchToPosts", &[], "20260427000000").unwrap();
-                plan.execute(Flags::default()).unwrap();
-                let dir = tmp
-                    .path()
-                    .join("migrations/20260427000000_add_search_to_posts");
-                assert!(dir.exists());
-
+                let (tmp, dir) = searchable_post_with_migration();
                 // Simulate `autumn destroy model Post` having already run.
-                fs::remove_file(models_dir.join("post.rs")).unwrap();
+                fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
                 assert!(
                     plan_migration(tmp.path(), "AddSearchToPosts", &[], "99999999999999").is_err()
                 );
@@ -1240,25 +1250,76 @@ pub struct Post {
                     "99999999999999",
                 )
                 .unwrap();
-                // Without --force: content is unverifiable (the search
-                // config is gone), so it's treated as diverged and left in
-                // place.
-                let err = fallback_plan
-                    .revert(Flags {
-                        dry_run: false,
-                        force: false,
-                    })
-                    .unwrap_err();
-                assert!(matches!(err, GenerateError::Diverged(_)));
-                assert!(dir.exists());
+                // The fallback plan cannot reproduce the SQL — the search
+                // config is gone — but the digest `generate` recorded still
+                // proves the files are its own untouched output, so no
+                // --force is needed (issue #1835).
+                fallback_plan.revert(Flags::default()).unwrap();
+                assert!(!dir.exists());
+            },
+        );
+    }
 
-                let fallback_plan = plan_migration_destroy_fallback(
+    #[test]
+    fn destroy_add_search_migration_still_refuses_hand_edited_sql() {
+        // The #1048 guard under the #1835 code path: the recorded digest makes
+        // the fallback plan usable, and an edit still has to break it.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let (tmp, dir) = searchable_post_with_migration();
+                fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+                fs::write(dir.join("up.sql"), "-- my own SQL\n").unwrap();
+
+                let err = plan_migration_destroy_fallback(
                     tmp.path(),
                     "AddSearchToPosts",
                     "99999999999999",
                 )
-                .unwrap();
-                fallback_plan
+                .unwrap()
+                .revert(Flags::default())
+                .unwrap_err();
+
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(dir.exists());
+            },
+        );
+    }
+
+    #[test]
+    fn destroy_add_search_migration_without_provenance_still_needs_force() {
+        // The pre-#1835 path, still taken by a project generated before the
+        // manifest existed: nothing was recorded and the search config is
+        // gone, so the SQL is unverifiable and the directory is left alone.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let (tmp, dir) = searchable_post_with_migration();
+                fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+                fs::remove_file(tmp.path().join(crate::generate::provenance::MANIFEST_PATH))
+                    .unwrap();
+
+                let err = plan_migration_destroy_fallback(
+                    tmp.path(),
+                    "AddSearchToPosts",
+                    "99999999999999",
+                )
+                .unwrap()
+                .revert(Flags::default())
+                .unwrap_err();
+                assert!(matches!(err, GenerateError::Diverged(_)));
+                assert!(dir.exists());
+
+                plan_migration_destroy_fallback(tmp.path(), "AddSearchToPosts", "99999999999999")
+                    .unwrap()
                     .revert(Flags {
                         dry_run: false,
                         force: true,

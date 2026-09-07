@@ -38,6 +38,16 @@
 //! interleave their executions and destroy the ordinal determinism these tests
 //! exist to prove. For the same reason ordinal determinism is only claimed
 //! under the sim's paused, single-threaded runtime with one worker.
+//!
+//! The lock is actually broader than "drives jobs": `sim.build`/`TestApp::build`
+//! always runs `initialize_job_runtime`, which unconditionally clears the
+//! process-global job client before deciding whether this app has any jobs to
+//! (re)install. So even a job-less test's `sim.build` clears state a
+//! concurrently-running, job-driving test depends on — `a_stalled_user_reporter_
+//! does_not_starve_the_fault_projection` builds no jobs but still takes the lock
+//! for exactly this reason (a gap here surfaced as a spurious "job runtime is
+//! not initialized" failure in whichever job-driving test happened to be
+//! mid-flight).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -1061,6 +1071,17 @@ async fn boom() -> AutumnResult<&'static str> {
 #[cfg(feature = "reporting")]
 #[sim_test]
 async fn a_stalled_user_reporter_does_not_starve_the_fault_projection(mut sim: Sim) {
+    // This app builds no jobs, but `sim.build` still runs the shared
+    // `initialize_job_runtime` boot path, which unconditionally clears the
+    // process-global job client before checking whether there's anything to
+    // (re)install (`autumn::app::initialize_job_runtime`). Without the same
+    // lock every other test in this module holds, that clear can land inside
+    // another, job-driving test's window between building its app and
+    // enqueueing against it, surfacing as a spurious "job runtime is not
+    // initialized" failure there instead of here (observed on CI as
+    // `fault_plan_composes_with_a_user_job_interceptor` failing under
+    // parallel test execution).
+    let _guard = job::global_job_runtime_test_lock().lock().await;
     sim.build(
         TestApp::new()
             .routes(routes![boom])

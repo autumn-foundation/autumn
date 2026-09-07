@@ -84,6 +84,27 @@ If `autumn-admin-plugin` is installed:
 If the `mail` feature is enabled:
 | `http://localhost:3000/_autumn/mail` | Mailer preview (dev profile only) |
 
+## Dependency findings on startup (unreleased — trunk-dev, issue #1633)
+
+`autumn dev` reports dependency-policy findings once per run, and only the ones
+that turn CI red — findings the app's `deny.toml` **denies**:
+
+```
+  ⚠️  1 blocking dependency finding (worst: high) — run `autumn doctor` for detail.
+```
+
+A critical advisory gets a startup banner naming the ids instead. Everything
+else is silent by design: a clean tree, a fully waived tree, a tree with only
+warn-level findings (duplicate or yanked crates), and every state where the
+policy could not be evaluated (no cargo-deny, no advisory database, no
+`deny.toml`) all print nothing. `autumn doctor` is where those are reported.
+
+Do not read silence as "no audit ran". The audit starts after the initial
+build — running it alongside makes its `cargo metadata` contend with Cargo's
+package-cache lock — and the watch loop polls for the result without ever
+blocking, so nothing here delays startup or a rebuild. The line can therefore
+appear a second or two after the server does.
+
 ## Hot reload behavior
 
 `autumn dev` watches `src/`, `templates/`, and `static/` for changes and

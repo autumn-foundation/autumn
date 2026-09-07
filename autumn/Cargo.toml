@@ -540,6 +540,16 @@ required-features = ["db"]
 name = "csrf_verify"
 harness = false
 
+# Per-route `#[throttle]` rate-limiter workload for profilers (issue #1350):
+# drives real GET traffic through a `#[throttle]`-guarded handler and an
+# identical unthrottled handler, interleaved, so a profiler can attribute the
+# limiter's own per-request cost against the same ingress stack
+# `request_pipeline.rs` already measures. Asserts nothing beyond "not denied"
+# — see the file header for the exact commands.
+[[bench]]
+name = "throttle_check"
+harness = false
+
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
 # guard, since a `[[bin]]` target — unlike a `[[test]]` — is simply skipped by
@@ -904,6 +914,19 @@ path = "tests/sqlite_dependent_destroy.rs"
 name = "sqlite_read_only_tx"
 path = "tests/sqlite_read_only_tx.rs"
 
+# DB-backed sessions store on SQLite (issue #1908): the `generate auth` tracked-
+# sessions store binds `::autumn_web::RuntimeBackend` instead of `diesel::pg::Pg`,
+# so it accepts the SQLite `RuntimeConnection`. Mirrors the generated DDL, schema
+# block and store functions and runs them against a real SQLite database — login
+# tracking, the revocation gate, `last_seen_at` refresh, rotation rebinding, and
+# the three revoke paths. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_tracked_sessions`.
+[[test]]
+name = "sqlite_tracked_sessions"
+path = "tests/sqlite_tracked_sessions.rs"
+
 # Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
 # `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-
 # transactional) SQLite pool from the recorded URL instead of dropping it and
@@ -1102,6 +1125,12 @@ path = "tests/cache_global_integration.rs"
 [[test]]
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
+
+# Isolated: installs a process-global cache backend and depends on it surviving
+# across two requests, which any concurrent `TestApp::build` would clear.
+[[test]]
+name = "capsule_cache_effect"
+path = "tests/capsule_cache_effect.rs"
 
 # Isolated: loom model-checking binary. Empty under a normal build
 # (`#![cfg(loom_models)]`); only compiles/runs under

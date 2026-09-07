@@ -172,6 +172,11 @@ release's scaffold produced the framework-owned files above, so a later
 [`autumn upgrade`](upgrading.md#scaffold-files) can tell a template that moved
 from a file you edited, and never overwrite your work.
 
+A sibling file, `.autumn/generated.toml`, appears after your first `autumn
+generate`. Commit it too: it does the same job for generated code, so
+[`autumn destroy`](generators.md#undoing-a-generator-autumn-destroy) can tell
+its own output from your edits.
+
 The files that matter right now:
 
 | Path                       | Purpose                                          |

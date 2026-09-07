@@ -2471,24 +2471,10 @@ pub struct Account {
         assert!(plan_admin(tmp.path(), "Post", &["title:String".into()]).is_err());
 
         let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
-        // Without --force: content is unverifiable (the model is gone), so
-        // it's treated as diverged and left in place rather than guessed at.
-        let err = fallback_plan
-            .revert(Flags {
-                dry_run: false,
-                force: false,
-            })
-            .unwrap_err();
-        assert!(matches!(err, GenerateError::Diverged(_)));
-        assert!(tmp.path().join("src/admin/post.rs").exists());
-
-        let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
-        fallback_plan
-            .revert(Flags {
-                dry_run: false,
-                force: true,
-            })
-            .unwrap();
+        // The fallback plan cannot reproduce the content — it never read the
+        // model — but the digest `generate` recorded still proves these files
+        // are its own untouched output, so no --force is needed (issue #1835).
+        fallback_plan.revert(Flags::default()).unwrap();
         assert!(!tmp.path().join("src/admin/post.rs").exists());
         assert!(!tmp.path().join("tests/post_admin.rs").exists());
         assert!(
@@ -2497,6 +2483,54 @@ pub struct Account {
                 .contains("post"),
             "the mod declaration removal doesn't depend on the model and must succeed too"
         );
+    }
+
+    #[test]
+    fn destroy_admin_fallback_still_refuses_a_hand_edited_file() {
+        // The #1048 guard under the #1835 code path: the recorded digest makes
+        // the fallback plan usable, and an edit still has to break it.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        fs::write(tmp.path().join("src/admin/post.rs"), "// my own code\n").unwrap();
+
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+    }
+
+    #[test]
+    fn destroy_admin_fallback_without_provenance_still_needs_force() {
+        // The pre-#1835 path, still taken by a project generated before the
+        // manifest existed: content is unverifiable (the model is gone and
+        // nothing was recorded), so it is treated as diverged and left alone.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        fs::remove_file(tmp.path().join(crate::generate::provenance::MANIFEST_PATH)).unwrap();
+
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+
+        plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags {
+                dry_run: false,
+                force: true,
+            })
+            .unwrap();
+        assert!(!tmp.path().join("src/admin/post.rs").exists());
+        assert!(!tmp.path().join("tests/post_admin.rs").exists());
     }
 
     #[test]

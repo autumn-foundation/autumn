@@ -138,6 +138,7 @@ mod htmx_serving;
 mod i18n_integration;
 mod idempotency_middleware;
 mod idempotency_tenant_scope;
+mod idempotency_token_principal;
 mod impersonation;
 #[cfg(feature = "db")]
 mod impersonation_versioned_db;
@@ -380,6 +381,8 @@ mod validate_merged_model;
 mod validate_on_update_blind;
 mod validate_patch_option_ip;
 mod webhook_outbound;
+#[cfg(feature = "db")]
+mod webhook_outbound_dispatch_fanout_profile;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
 #[cfg(feature = "maud")]

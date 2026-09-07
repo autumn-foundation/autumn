@@ -761,9 +761,6 @@ pub async fn submit(
         .await
         .map_err(|_| AutumnError::not_found_msg("Subreddit not found"))?;
 
-    // Ensure unique slug within this subreddit by appending a suffix
-    let slug = unique_slug(&base_slug, subreddit_id, &mut db).await?;
-
     // NOT trimmed, unlike the title. The body is Markdown source, and leading
     // whitespace is syntax: four spaces make a CommonMark code block, and
     // trailing spaces make a hard line break. Trimming it silently reformats
@@ -772,61 +769,79 @@ pub async fn submit(
     let body = valid.body.clone();
     let subreddit_slug = sub.slug.clone();
 
-    let new_post = crate::models::NewPost {
-        title: title.clone(),
-        slug: slug.clone(),
-        body: body.clone(),
-        url,
-        author_id: user_id,
-        subreddit_id,
-    };
-
+    // Ensure a unique slug within this subreddit, retrying with the next
+    // candidate whenever a concurrent submit wins the one just proposed
+    // (#2544) — see `unique_slug` and `is_post_slug_conflict`.
+    let mut slug = unique_slug(&base_slug, subreddit_id, &mut db).await?;
     let subreddit_slug_for_job = subreddit_slug.clone();
     let author_username_for_job = author_username.clone();
-    let post: Post = db
-        .tx(move |conn| {
-            let new_post = new_post.clone();
-            let subreddit_slug = subreddit_slug_for_job.clone();
-            let author_username = author_username_for_job.clone();
-            async move {
-                let post: Post = diesel::insert_into(posts::table)
-                    .values(&new_post)
-                    .get_result(conn)
-                    .await?;
+    let mut attempt = 0u32;
+    let post: Post = loop {
+        let new_post = crate::models::NewPost {
+            title: title.clone(),
+            slug: slug.clone(),
+            body: body.clone(),
+            url: url.clone(),
+            author_id: user_id,
+            subreddit_id,
+        };
+        let subreddit_slug = subreddit_slug_for_job.clone();
+        let author_username = author_username_for_job.clone();
+        let attempt_result = db
+            .tx(move |conn| {
+                let new_post = new_post.clone();
+                let subreddit_slug = subreddit_slug.clone();
+                let author_username = author_username.clone();
+                async move {
+                    let post: Post = diesel::insert_into(posts::table)
+                        .values(&new_post)
+                        .get_result(conn)
+                        .await?;
 
-                let post_id = post.id;
-                diesel::insert_into(crate::schema::votes::table)
-                    .values((
-                        crate::schema::votes::user_id.eq(user_id),
-                        crate::schema::votes::post_id.eq(post_id),
-                        crate::schema::votes::value.eq(1_i16),
+                    let post_id = post.id;
+                    diesel::insert_into(crate::schema::votes::table)
+                        .values((
+                            crate::schema::votes::user_id.eq(user_id),
+                            crate::schema::votes::post_id.eq(post_id),
+                            crate::schema::votes::value.eq(1_i16),
+                        ))
+                        .execute(conn)
+                        .await?;
+
+                    diesel::update(posts::table.find(post_id))
+                        .set(posts::score.eq(1_i64))
+                        .execute(conn)
+                        .await?;
+
+                    let post: Post = posts::table.find(post_id).first(conn).await?;
+
+                    // Enqueue the publication job inside the transaction
+                    let payload = serde_json::to_value(PostPublicationArgs::new(
+                        post.id,
+                        &post.title,
+                        &post.slug,
+                        &subreddit_slug,
+                        &author_username,
                     ))
-                    .execute(conn)
-                    .await?;
+                    .unwrap();
+                    autumn_web::job::enqueue_on_conn(PostPublicationJob::NAME, &payload, conn)
+                        .await?;
 
-                diesel::update(posts::table.find(post_id))
-                    .set(posts::score.eq(1_i64))
-                    .execute(conn)
-                    .await?;
+                    Ok::<_, AutumnError>(post)
+                }
+                .scope_boxed()
+            })
+            .await;
 
-                let post: Post = posts::table.find(post_id).first(conn).await?;
-
-                // Enqueue the publication job inside the transaction
-                let payload = serde_json::to_value(PostPublicationArgs::new(
-                    post.id,
-                    &post.title,
-                    &post.slug,
-                    &subreddit_slug,
-                    &author_username,
-                ))
-                .unwrap();
-                autumn_web::job::enqueue_on_conn(PostPublicationJob::NAME, &payload, conn).await?;
-
-                Ok::<_, AutumnError>(post)
+        match attempt_result {
+            Ok(post) => break post,
+            Err(err) if is_post_slug_conflict(&err) && attempt < MAX_SLUG_CONFLICT_RETRIES => {
+                attempt += 1;
+                slug = unique_slug(&base_slug, subreddit_id, &mut db).await?;
             }
-            .scope_boxed()
-        })
-        .await?;
+            Err(err) => return Err(err),
+        }
+    };
 
     let lookup = crate::repositories::PostRelationsLookup {
         author_name: author_username.clone(),
@@ -1352,17 +1367,6 @@ pub async fn update(
 
     let title = valid.title.trim().to_string();
     let base_slug = slugify(&title);
-    // Ensure unique slug within subreddit, excluding the current post
-    let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
-
-    let changes = crate::models::UpdatePost {
-        title: Patch::Set(title),
-        slug: Patch::Set(new_slug.clone()),
-        // Not trimmed, for the same reason as the create path: this is
-        // Markdown source, where leading and trailing whitespace carry meaning.
-        body: Patch::Set(valid.body.clone()),
-        ..Default::default()
-    };
     let sub: Subreddit = subreddits::table
         .find(post.subreddit_id)
         .first(&mut *db)
@@ -1373,15 +1377,41 @@ pub async fn update(
         .first(&mut *db)
         .await?;
 
-    let lookup = crate::repositories::PostRelationsLookup {
-        author_name: author.username,
-        sub_name: sub.name.clone(),
-        sub_slug: sub.slug.clone(),
-    };
+    // Ensure a unique slug within the subreddit, excluding the current post,
+    // retrying with the next candidate whenever a concurrent write wins the
+    // one just proposed (#2544) — same race, same fix as `submit`.
+    let mut new_slug =
+        unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
+    let mut attempt = 0u32;
+    loop {
+        let changes = crate::models::UpdatePost {
+            title: Patch::Set(title.clone()),
+            slug: Patch::Set(new_slug.clone()),
+            // Not trimmed, for the same reason as the create path: this is
+            // Markdown source, where leading and trailing whitespace carry meaning.
+            body: Patch::Set(valid.body.clone()),
+            ..Default::default()
+        };
+        let lookup = crate::repositories::PostRelationsLookup {
+            author_name: author.username.clone(),
+            sub_name: sub.name.clone(),
+            sub_slug: sub.slug.clone(),
+        };
 
-    crate::repositories::CURRENT_POST_RELATIONS
-        .scope(lookup, async move { repo.update(post.id, &changes).await })
-        .await?;
+        let attempt_result = crate::repositories::CURRENT_POST_RELATIONS
+            .scope(lookup, async { repo.update(post.id, &changes).await })
+            .await;
+
+        match attempt_result {
+            Ok(_) => break,
+            Err(err) if is_post_slug_conflict(&err) && attempt < MAX_SLUG_CONFLICT_RETRIES => {
+                attempt += 1;
+                new_slug =
+                    unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
     flash.success("Post updated.").await;
     Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)).into_response())
@@ -1611,7 +1641,42 @@ pub async fn delete_post(
 
 // ── Helpers ────────────────────────────────────────────────────
 
-/// Generate a unique slug within a subreddit by appending `-2`, `-3`, etc.
+/// The database-level backstop for post-slug uniqueness (migration
+/// `20260906163932_posts_slug_unique_per_subreddit`), named so a violation of
+/// it can be told apart from any other unique constraint on this connection.
+const POSTS_SLUG_UNIQUE_CONSTRAINT: &str = "posts_subreddit_id_slug_key";
+
+/// How many times `submit`/`update` will recompute a candidate slug and
+/// retry after the database rejects one as a duplicate (#2544). Each retry
+/// is one cheap `COUNT` plus one insert/update attempt, and the number of
+/// genuine racers on one exact title is bounded by how many clients can
+/// double-click or auto-retry at once — comfortably under this budget even
+/// under the 10-way concurrent repro that motivated the fix. Exhausting it
+/// returns the underlying database error rather than looping forever.
+const MAX_SLUG_CONFLICT_RETRIES: u32 = 20;
+
+/// Whether `err` is a unique-constraint violation on
+/// [`POSTS_SLUG_UNIQUE_CONSTRAINT`] specifically — the signal that another
+/// request just won the slug `unique_slug`/`unique_slug_excluding` proposed,
+/// as opposed to some unrelated database error that must propagate as-is.
+fn is_post_slug_conflict(err: &AutumnError) -> bool {
+    matches!(
+        err.downcast_ref::<diesel::result::Error>(),
+        Some(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            info,
+        )) if info.constraint_name() == Some(POSTS_SLUG_UNIQUE_CONSTRAINT)
+    )
+}
+
+/// Propose a slug unique within a subreddit by appending `-2`, `-3`, etc.
+///
+/// This SELECT is only a snapshot, not a guarantee (#2544): two concurrent
+/// callers can both read "not taken" for the same base slug before either
+/// commits. It exists to make the common (non-racing) case return the
+/// obvious slug in one query, not to enforce uniqueness by itself — that is
+/// [`POSTS_SLUG_UNIQUE_CONSTRAINT`]'s job, with the caller retrying this
+/// function (via [`is_post_slug_conflict`]) when the database disagrees.
 async fn unique_slug(
     base: &str,
     subreddit_id: i64,
@@ -1634,7 +1699,8 @@ async fn unique_slug(
     }
 }
 
-/// Like `unique_slug`, but excludes a specific post ID (for updates).
+/// Like `unique_slug`, but excludes a specific post ID (for updates). Carries
+/// the same snapshot-only caveat — see `unique_slug`.
 async fn unique_slug_excluding(
     base: &str,
     subreddit_id: i64,
@@ -2180,5 +2246,77 @@ mod tests {
         assert!(!rendered.contains("<script"), "rendered: {rendered}");
         assert!(!rendered.contains("<img"), "rendered: {rendered}");
         assert!(!rendered.contains("javascript:"), "rendered: {rendered}");
+    }
+
+    // ── #2544: telling a slug conflict apart from any other DB error ────
+
+    /// Mirrors `autumn::error::unique_violation_field_tests`' own fake, at the
+    /// same trait boundary diesel gives every backend-reported constraint
+    /// name through — no real database needed to prove `is_post_slug_conflict`
+    /// matches on the exact constraint name and nothing else.
+    #[derive(Debug)]
+    struct FakeDbErrorInfo {
+        constraint: Option<&'static str>,
+    }
+
+    impl diesel::result::DatabaseErrorInformation for FakeDbErrorInfo {
+        fn message(&self) -> &'static str {
+            "duplicate key value violates unique constraint"
+        }
+        fn details(&self) -> Option<&str> {
+            None
+        }
+        fn hint(&self) -> Option<&str> {
+            None
+        }
+        fn table_name(&self) -> Option<&str> {
+            None
+        }
+        fn column_name(&self) -> Option<&str> {
+            None
+        }
+        fn constraint_name(&self) -> Option<&str> {
+            self.constraint
+        }
+        fn statement_position(&self) -> Option<i32> {
+            None
+        }
+    }
+
+    fn unique_violation(constraint: Option<&'static str>) -> AutumnError {
+        AutumnError::internal_server_error(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            Box::new(FakeDbErrorInfo { constraint }),
+        ))
+    }
+
+    #[test]
+    fn recognizes_a_violation_of_the_posts_slug_constraint() {
+        assert!(is_post_slug_conflict(&unique_violation(Some(
+            POSTS_SLUG_UNIQUE_CONSTRAINT
+        ))));
+    }
+
+    #[test]
+    fn ignores_a_unique_violation_on_a_different_constraint() {
+        // A retry that fired on ANY unique violation — e.g. `votes_unique_post`
+        // from the same transaction's vote insert — would mask a real bug by
+        // silently retrying an error that has nothing to do with the slug and
+        // will never resolve.
+        assert!(!is_post_slug_conflict(&unique_violation(Some(
+            "votes_unique_post"
+        ))));
+    }
+
+    #[test]
+    fn ignores_a_unique_violation_with_no_constraint_name() {
+        assert!(!is_post_slug_conflict(&unique_violation(None)));
+    }
+
+    #[test]
+    fn ignores_a_non_conflict_error_entirely() {
+        assert!(!is_post_slug_conflict(
+            &AutumnError::internal_server_error_msg("connection reset")
+        ));
     }
 }

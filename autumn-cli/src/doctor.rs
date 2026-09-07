@@ -7,6 +7,7 @@
 use autumn_web::config::{DeployConfig, ProcessRole};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 
 // ── Signing secret validation constants (mirrored from autumn-web) ────────────
 
@@ -237,6 +238,219 @@ pub fn check_plugin_residue_impl(wirings: &[PluginWiring]) -> CheckResult {
             "`autumn plugin list` shows what is installable; `autumn plugin remove <name>` unwires a plugin cleanly",
         ),
     }
+}
+
+/// How many findings the dependency check names before it counts the rest.
+const DEPENDENCY_DETAIL_LIMIT: usize = 10;
+
+/// How many waived ids the single-line clean state names.
+const DEPENDENCY_WAIVER_NAME_LIMIT: usize = 3;
+
+/// Grade the app's dependency policy evaluation (issue #1633).
+///
+/// Pure and injectable, like every other `_impl` check here. The verdict is
+/// the CI gate's verdict: a denied finding fails, a warned finding warns, and a
+/// waived finding is neither.
+///
+/// The states where the policy could not be evaluated split. A missing auditor
+/// or an unfetched database is the stock state of a machine that has not opted
+/// in, so those PASS and say so in their detail — `exit_code` promotes any
+/// warning to exit 1, and warning there would make `autumn doctor --strict`
+/// red for everyone (the rule the `platform_support` check follows). A missing
+/// policy file or an audit that produced no verdict is a repository or run
+/// problem, and warns.
+pub fn check_dependencies_impl(eval: &crate::deps::Evaluation) -> CheckResult {
+    use crate::deps::{Evaluation, STALE_AFTER_DAYS};
+
+    let (status, detail, hint) = match eval {
+        Evaluation::AuditorMissing { checks } => (
+            CheckStatus::Pass,
+            format!(
+                "not evaluated — cargo-deny is not installed (`cargo install --locked cargo-deny`); {}",
+                dependency_checks_phrase(checks)
+            ),
+            None,
+        ),
+        Evaluation::DatabaseMissing { checks } => (
+            CheckStatus::Pass,
+            format!(
+                "not evaluated — no local advisory database (`cargo deny fetch db`); {}",
+                dependency_checks_phrase(checks)
+            ),
+            None,
+        ),
+        Evaluation::NoPolicy => (
+            CheckStatus::Warn,
+            format!(
+                "no {} — the app has no dependency policy, and its CI gate needs one",
+                crate::deps::POLICY_FILE
+            ),
+            Some(
+                "copy the `deny.toml` that `autumn new` generates; docs/guide/supply-chain.md explains it",
+            ),
+        ),
+        Evaluation::Unavailable { reason, .. } => (
+            CheckStatus::Warn,
+            format!("the dependency audit produced no verdict: {reason}"),
+            Some(
+                "`deny.toml` is the policy both `autumn doctor` and the CI gate read; `cargo deny check` shows the auditor's own error",
+            ),
+        ),
+        Evaluation::Audited {
+            findings,
+            checks,
+            db_age_days,
+            auditor,
+        } => {
+            return grade_dependency_findings(
+                findings,
+                checks,
+                *db_age_days,
+                auditor,
+                STALE_AFTER_DAYS,
+            );
+        }
+    };
+    CheckResult {
+        name: "dependencies",
+        status,
+        detail: Some(detail),
+        hint,
+    }
+}
+
+/// The checks a policy activates.
+///
+/// Spelled the same way in every state, evaluated or not: this is the fragment
+/// a reader — and the scaffold's parity test — compares against the check list
+/// the generated CI workflow derives.
+fn dependency_checks_phrase(checks: &[String]) -> String {
+    if checks.is_empty() {
+        return "checks: none".to_owned();
+    }
+    format!("checks: {}", checks.join(", "))
+}
+
+/// Grade a completed audit.
+fn grade_dependency_findings(
+    findings: &[crate::deps::Finding],
+    checks: &[String],
+    db_age_days: Option<u64>,
+    auditor: &str,
+    stale_after_days: u64,
+) -> CheckResult {
+    let stale = db_age_days.is_some_and(|age| age > stale_after_days);
+    let live: Vec<&crate::deps::Finding> =
+        findings.iter().filter(|finding| !finding.waived).collect();
+    let blocking = live.iter().filter(|finding| finding.blocking).count();
+
+    let status = if blocking > 0 {
+        CheckStatus::Fail
+    } else if !live.is_empty() || stale {
+        CheckStatus::Warn
+    } else {
+        CheckStatus::Pass
+    };
+
+    // Context every reader needs to map this verdict onto the CI gate: the
+    // auditor, the checks the policy activates, and how old the data is.
+    let mut context = format!("{auditor}; {}", dependency_checks_phrase(checks));
+    if let Some(age) = db_age_days {
+        let plural = if age == 1 { "" } else { "s" };
+        let _ = write!(context, "; advisory data {age} day{plural} old");
+        if stale {
+            context.push_str(" (stale)");
+        }
+    }
+    let stale_hint = "`cargo deny fetch db` refreshes the advisory database; the verdict above is only as fresh as that data";
+    let finding_hint = "`deny.toml` holds the policy and the waivers; docs/guide/supply-chain.md explains how to fix or waive a finding";
+
+    // Nothing live: one line, whatever the waivers hold. An app scaffolded by
+    // `autumn new` always carries a waiver, so listing waivers here would make
+    // the single-line clean state unreachable for every generated app.
+    if live.is_empty() {
+        let waived: Vec<&str> = findings.iter().map(|finding| finding.id.as_str()).collect();
+        let summary = if waived.is_empty() {
+            "no advisories or policy violations".to_owned()
+        } else {
+            format!(
+                "no live findings; {} waived ({})",
+                waived.len(),
+                crate::deps::name_some(&waived, DEPENDENCY_WAIVER_NAME_LIMIT)
+            )
+        };
+        return CheckResult {
+            name: "dependencies",
+            status,
+            detail: Some(crate::deps::one_line(&format!("{summary} — {context}"))),
+            hint: stale.then_some(stale_hint),
+        };
+    }
+
+    // Blocking findings first, then warnings, then waivers: the reader acts on
+    // what fails CI, and still sees everything else.
+    let mut ordered: Vec<&crate::deps::Finding> = live.clone();
+    ordered.sort_by_key(|finding| !finding.blocking);
+    ordered.extend(findings.iter().filter(|finding| finding.waived));
+
+    let waived = findings.len() - live.len();
+    let plural = if findings.len() == 1 { "" } else { "s" };
+    let mut counts = format!("{} finding{plural}", findings.len());
+    if blocking > 0 {
+        let _ = write!(counts, ", {blocking} blocking");
+    }
+    if waived > 0 {
+        let _ = write!(counts, ", {waived} waived");
+    }
+
+    // The summary shares the check's own line; every finding below it is
+    // indented to the same column as doctor's `hint:`.
+    let mut lines = vec![format!("{counts} — {context}")];
+    lines.extend(
+        ordered
+            .iter()
+            .take(DEPENDENCY_DETAIL_LIMIT)
+            .map(|finding| format!("   {}", format_dependency_finding(finding))),
+    );
+    if ordered.len() > DEPENDENCY_DETAIL_LIMIT {
+        lines.push(format!(
+            "   …and {} more",
+            ordered.len() - DEPENDENCY_DETAIL_LIMIT
+        ));
+    }
+
+    CheckResult {
+        name: "dependencies",
+        status,
+        detail: Some(lines.join("\n")),
+        // Stale data explains a verdict the reader may not otherwise trust, so
+        // it outranks the fix-or-waive pointer.
+        hint: Some(if stale { stale_hint } else { finding_hint }),
+    }
+}
+
+/// One finding, as exactly one line of doctor detail.
+///
+/// Collapsed here as well as in the parser: the cap above counts findings, so
+/// a finding that renders as four lines would defeat it.
+fn format_dependency_finding(finding: &crate::deps::Finding) -> String {
+    // A policy violation's id is its code; naming both reads "duplicate low
+    // duplicate aes 0.8.4".
+    let identity = if finding.id == finding.code {
+        finding.code.clone()
+    } else {
+        format!("{} {}", finding.id, finding.code)
+    };
+    let mut line = crate::deps::one_line(&format!(
+        "{identity} ({}) {} — {}",
+        finding.severity.label(),
+        finding.package,
+        finding.title
+    ));
+    if finding.waived {
+        line.push_str(" (waived)");
+    }
+    line
 }
 
 /// Every migration version the `diesel migration list` output records as
@@ -2677,7 +2891,6 @@ pub const fn exit_code(summary: &Summary, strict: bool) -> i32 {
 }
 
 pub fn format_check_line(result: &CheckResult) -> String {
-    use std::fmt::Write as _;
     let g = glyph(&result.status);
     let mut line = format!("{g} {}", result.name);
     if let Some(ref detail) = result.detail {
@@ -5989,7 +6202,6 @@ fn acme_short_hash(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
     let mut out = String::with_capacity(16);
     for byte in &digest[..8] {
-        use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
     out
@@ -6507,7 +6719,6 @@ fn acme_cert_id(domains: &[String]) -> String {
     let digest = hasher.finalize();
     let mut out = String::with_capacity(32);
     for byte in &digest[..16] {
-        use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
     out
@@ -8703,6 +8914,20 @@ pub fn run(opts: DoctorOptions) {
                 .map_or_else(Vec::new, applied_migration_versions)
         });
         check_plugin_residue_impl(&wirings)
+    }));
+
+    // 19. Dependency advisories and policy (issue #1633): the app's lockfile
+    //     graded against its own `deny.toml` — the same policy file, waiver
+    //     store and auditor that #1600's CI gate runs, so this verdict predicts
+    //     that gate. Always offline — the advisory database is never fetched
+    //     here — and bounded, so a `cargo metadata` waiting on Cargo's
+    //     package-cache lock reports no verdict rather than hanging doctor.
+    //     See `crate::deps` for what parity does and does not cover.
+    tasks.push(Box::new(|| {
+        check_dependencies_impl(&crate::deps::evaluate_within(
+            std::path::Path::new("."),
+            crate::deps::DOCTOR_BUDGET,
+        ))
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -18863,5 +19088,389 @@ redirect_uri = "http://localhost/callback"
         let output = "Migrations:\n  [X] 20260101000000_create_users\n  [ ] 20260202000000_pending\n  [X] 20260720000000_media_rooms\n";
         let versions = parse_applied_migration_versions(output);
         assert_eq!(versions, vec!["20260101000000", "20260720000000"]);
+    }
+
+    // ── #1633: dependency advisories and policy in the dev loop ──────────────
+
+    mod dependencies {
+        use super::super::*;
+        use crate::deps::{Evaluation, Finding, Severity};
+
+        fn finding(
+            id: &str,
+            code: &str,
+            severity: Severity,
+            waived: bool,
+            blocking: bool,
+        ) -> Finding {
+            Finding {
+                id: id.to_owned(),
+                code: code.to_owned(),
+                package: "badcrate 1.2.3".to_owned(),
+                title: "boom".to_owned(),
+                severity,
+                waived,
+                blocking,
+            }
+        }
+
+        fn audited(findings: Vec<Finding>, db_age_days: Option<u64>) -> Evaluation {
+            Evaluation::Audited {
+                findings,
+                checks: vec!["advisories".to_owned()],
+                db_age_days,
+                auditor: "cargo-deny 0.20.2".to_owned(),
+            }
+        }
+
+        #[test]
+        fn a_clean_tree_is_exactly_one_passing_line() {
+            // Noise discipline is falsifiable: a clean tree costs one line.
+            let result = check_dependencies_impl(&audited(Vec::new(), Some(2)));
+            assert_eq!(result.name, "dependencies");
+            assert_eq!(result.status, CheckStatus::Pass);
+            let line = format_check_line(&result);
+            assert_eq!(line.lines().count(), 1, "{line}");
+            assert!(line.contains("dependencies"), "{line}");
+        }
+
+        #[test]
+        fn a_blocking_finding_fails_and_names_its_id_and_severity() {
+            let result = check_dependencies_impl(&audited(
+                vec![finding(
+                    "RUSTSEC-2099-0001",
+                    "vulnerability",
+                    Severity::Critical,
+                    false,
+                    true,
+                )],
+                Some(1),
+            ));
+            assert_eq!(result.status, CheckStatus::Fail);
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("RUSTSEC-2099-0001"), "{detail}");
+            assert!(detail.contains("critical"), "{detail}");
+            assert!(detail.contains("badcrate 1.2.3"), "{detail}");
+        }
+
+        #[test]
+        fn a_policy_violation_fails_and_names_its_violation_id() {
+            let result = check_dependencies_impl(&audited(
+                vec![finding("banned", "banned", Severity::High, false, true)],
+                Some(1),
+            ));
+            assert_eq!(result.status, CheckStatus::Fail);
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("banned"), "{detail}");
+            assert!(detail.contains("high"), "{detail}");
+        }
+
+        #[test]
+        fn findings_the_policy_only_warns_about_warn() {
+            let result = check_dependencies_impl(&audited(
+                vec![finding("yanked", "yanked", Severity::Low, false, false)],
+                Some(1),
+            ));
+            assert_eq!(result.status, CheckStatus::Warn);
+        }
+
+        #[test]
+        fn a_waived_finding_displays_as_waived_and_never_fails() {
+            let result = check_dependencies_impl(&audited(
+                vec![finding(
+                    "RUSTSEC-2023-0071",
+                    "vulnerability",
+                    Severity::Critical,
+                    true,
+                    false,
+                )],
+                Some(1),
+            ));
+            assert_eq!(
+                result.status,
+                CheckStatus::Pass,
+                "a waived finding is not a failure"
+            );
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("waived"), "{detail}");
+            assert!(detail.contains("RUSTSEC-2023-0071"), "{detail}");
+        }
+
+        #[test]
+        fn a_waived_finding_alongside_a_live_one_still_fails_on_the_live_one() {
+            let result = check_dependencies_impl(&audited(
+                vec![
+                    finding(
+                        "RUSTSEC-2023-0071",
+                        "vulnerability",
+                        Severity::Low,
+                        true,
+                        false,
+                    ),
+                    finding(
+                        "RUSTSEC-2099-0001",
+                        "vulnerability",
+                        Severity::High,
+                        false,
+                        true,
+                    ),
+                ],
+                Some(1),
+            ));
+            assert_eq!(result.status, CheckStatus::Fail);
+            let detail = result.detail.expect("detail");
+            // The live finding is listed first: it is the one to act on.
+            let live = detail
+                .find("RUSTSEC-2099-0001")
+                .expect("live finding listed");
+            let waived = detail
+                .find("RUSTSEC-2023-0071")
+                .expect("waived finding listed");
+            assert!(live < waived, "{detail}");
+        }
+
+        #[test]
+        fn a_missing_policy_file_warns_and_says_ci_needs_one() {
+            let result = check_dependencies_impl(&Evaluation::NoPolicy);
+            assert_eq!(result.status, CheckStatus::Warn);
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("deny.toml"), "{detail}");
+        }
+
+        #[test]
+        fn a_machine_without_the_auditor_does_not_fail_doctor_strict() {
+            // `exit_code` treats any warning as a failure under `--strict`, and
+            // cargo-deny is not installed by any Autumn install path. Warning
+            // here would make `autumn doctor --strict` — a Tier 1 command —
+            // exit 1 on every machine that has not opted in.
+            let result = check_dependencies_impl(&Evaluation::AuditorMissing {
+                checks: vec!["advisories".to_owned()],
+            });
+            assert_eq!(result.status, CheckStatus::Pass);
+            let summary = compute_summary(std::slice::from_ref(&result));
+            assert_eq!(exit_code(&summary, true), 0);
+            let detail = result.detail.expect("detail");
+            assert!(
+                detail.contains("not evaluated"),
+                "a pass must not read as a verdict: {detail}"
+            );
+            assert!(
+                detail.contains("cargo install"),
+                "the detail must say how to enable it: {detail}"
+            );
+        }
+
+        #[test]
+        fn an_unfetched_database_does_not_fail_doctor_strict_either() {
+            // Same reasoning: the database is only populated by an explicit
+            // `cargo deny fetch db`.
+            let result = check_dependencies_impl(&Evaluation::DatabaseMissing {
+                checks: vec!["advisories".to_owned()],
+            });
+            assert_eq!(result.status, CheckStatus::Pass);
+            let summary = compute_summary(std::slice::from_ref(&result));
+            assert_eq!(exit_code(&summary, true), 0);
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("not evaluated"), "{detail}");
+            assert!(
+                detail.contains("cargo deny fetch db"),
+                "the detail must say how to fetch it: {detail}"
+            );
+        }
+
+        #[test]
+        fn an_unevaluated_policy_still_names_the_checks_it_would_run() {
+            // The derived check list is what a reader compares against CI, so
+            // it must survive a state where nothing could be audited.
+            let result = check_dependencies_impl(&Evaluation::AuditorMissing {
+                checks: vec!["advisories".to_owned(), "licenses".to_owned()],
+            });
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("advisories"), "{detail}");
+            assert!(detail.contains("licenses"), "{detail}");
+        }
+
+        #[test]
+        fn a_stale_database_warns_once_and_reports_the_data_age() {
+            // Offline behavior: one warning with the data age, never a failure
+            // and never a hang.
+            let age = crate::deps::STALE_AFTER_DAYS + 5;
+            let result = check_dependencies_impl(&audited(Vec::new(), Some(age)));
+            assert_eq!(result.status, CheckStatus::Warn);
+            let detail = result.detail.clone().expect("detail");
+            assert!(
+                detail.contains(&age.to_string()),
+                "the age must appear: {detail}"
+            );
+            assert_eq!(
+                format_check_line(&result).lines().count(),
+                2,
+                "one warning line plus its hint"
+            );
+        }
+
+        #[test]
+        fn fresh_data_reports_its_age_without_warning() {
+            let result = check_dependencies_impl(&audited(Vec::new(), Some(3)));
+            assert_eq!(result.status, CheckStatus::Pass);
+            assert!(result.detail.expect("detail").contains('3'));
+        }
+
+        #[test]
+        fn an_auditor_that_produced_no_verdict_warns_with_the_reason() {
+            let result = check_dependencies_impl(&Evaluation::Unavailable {
+                reason: "cargo metadata failed".to_owned(),
+                checks: Vec::new(),
+            });
+            assert_eq!(result.status, CheckStatus::Warn);
+            assert!(
+                result
+                    .detail
+                    .expect("detail")
+                    .contains("cargo metadata failed"),
+                "the reason must be surfaced"
+            );
+        }
+
+        #[test]
+        fn a_long_finding_list_is_capped() {
+            // 731 `source-not-allowed` findings is a real cargo-deny output.
+            // Doctor names a bounded few and counts the rest.
+            let findings: Vec<Finding> = (0..40)
+                .map(|n| {
+                    finding(
+                        &format!("RUSTSEC-2099-{n:04}"),
+                        "vulnerability",
+                        Severity::High,
+                        false,
+                        true,
+                    )
+                })
+                .collect();
+            let result = check_dependencies_impl(&audited(findings, Some(1)));
+            let detail = result.detail.expect("detail");
+            assert!(
+                detail.lines().count() <= 12,
+                "detail must stay bounded, got {} lines",
+                detail.lines().count()
+            );
+            assert!(
+                detail.contains("40"),
+                "the total must still be reported: {detail}"
+            );
+            assert!(detail.contains("more"), "{detail}");
+        }
+
+        #[test]
+        fn a_multi_line_title_cannot_break_the_cap() {
+            // Defence in depth: the parser normalizes titles, and the renderer
+            // must not depend on that having happened.
+            let findings: Vec<Finding> = (0..40)
+                .map(|n| {
+                    let mut f = finding(
+                        &format!("RUSTSEC-2099-{n:04}"),
+                        "duplicate",
+                        Severity::Low,
+                        false,
+                        false,
+                    );
+                    f.title = "lock entries:\nfirst\nsecond\nthird".to_owned();
+                    f
+                })
+                .collect();
+            let result = check_dependencies_impl(&audited(findings, Some(1)));
+            let detail = result.detail.expect("detail");
+            assert!(
+                detail.lines().count() <= 12,
+                "one line per finding, got {} lines",
+                detail.lines().count()
+            );
+        }
+
+        #[test]
+        fn a_finding_line_never_repeats_its_own_identifier() {
+            // A policy violation's id *is* its code, so naming both reads
+            // "duplicate low duplicate aes 0.8.4".
+            let result = check_dependencies_impl(&audited(
+                vec![finding(
+                    "duplicate",
+                    "duplicate",
+                    Severity::Low,
+                    false,
+                    false,
+                )],
+                Some(1),
+            ));
+            let detail = result.detail.expect("detail");
+            assert_eq!(
+                detail.matches("duplicate").count(),
+                1,
+                "the identifier is named once: {detail}"
+            );
+        }
+
+        #[test]
+        fn finding_lines_are_indented_under_the_check() {
+            let result = check_dependencies_impl(&audited(
+                vec![finding(
+                    "RUSTSEC-2099-0001",
+                    "vulnerability",
+                    Severity::High,
+                    false,
+                    true,
+                )],
+                Some(1),
+            ));
+            let detail = result.detail.expect("detail");
+            let mut lines = detail.lines();
+            assert!(
+                !lines.next().expect("summary").starts_with(' '),
+                "the summary shares the check's own line"
+            );
+            for line in lines {
+                assert!(line.starts_with("   "), "unindented finding line: {line:?}");
+            }
+        }
+
+        #[test]
+        fn the_check_survives_the_json_contract() {
+            let result = check_dependencies_impl(&audited(
+                vec![finding(
+                    "RUSTSEC-2099-0001",
+                    "vulnerability",
+                    Severity::Critical,
+                    false,
+                    true,
+                )],
+                Some(1),
+            ));
+            let summary = compute_summary(std::slice::from_ref(&result));
+            let json = to_json_output(std::slice::from_ref(&result), &summary);
+            let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            let check = &parsed["checks"][0];
+            assert_eq!(check["name"], "dependencies");
+            assert_eq!(check["status"], "fail");
+            assert!(
+                check["detail"]
+                    .as_str()
+                    .expect("detail")
+                    .contains("RUSTSEC-2099-0001"),
+                "--json must carry the advisory id"
+            );
+        }
+
+        #[test]
+        fn the_checks_the_policy_activates_are_reported() {
+            // The reader has to be able to tell which CI gate this predicts.
+            let result = check_dependencies_impl(&Evaluation::Audited {
+                findings: Vec::new(),
+                checks: vec!["advisories".to_owned(), "licenses".to_owned()],
+                db_age_days: Some(1),
+                auditor: "cargo-deny 0.20.2".to_owned(),
+            });
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("advisories"), "{detail}");
+            assert!(detail.contains("licenses"), "{detail}");
+        }
     }
 }
