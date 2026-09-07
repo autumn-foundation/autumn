@@ -5700,6 +5700,29 @@ pub fn try_build_router_with_static_inner(
     // holds without changing anything about how these layers wrap the
     // live-serving router below (🛡 Warden,
     // docs/security/2026-09-07-mcp-custom-layer-static-mode/).
+    //
+    // Known limitation: this calls `Layer::layer()` on the registered
+    // layer(s) a *second* time (once here for the dispatch clone, once below
+    // for the live-serving router) — unlike every other mode/path, which
+    // calls it exactly once and shares the resulting *service* by cloning
+    // the already-built router. A layer that allocates its enforcement state
+    // inside `layer()` itself, rather than constructing it once and sharing
+    // it via `Arc` — e.g. `tower::limit::ConcurrencyLimitLayer`, which Tower
+    // documents as a *per-service* limit for exactly this reason, contrasted
+    // with `GlobalConcurrencyLimitLayer`'s shared `Arc<Semaphore>` — gets two
+    // independent instances of that state, so direct and MCP traffic are
+    // capped separately instead of against one shared app-wide budget.
+    // Unavoidable without either of two worse regressions: taking dispatch
+    // from a service that already carries this application would need it
+    // downstream of the static-first middleware (whose whole point is
+    // deciding whether the real handler runs at all — a `tools/call` must
+    // never be answered from a stale cached page), or applying custom_layers
+    // before that middleware would stop them from processing cached-page
+    // responses, the reason they sit outside it in the first place. Use a
+    // layer that owns its shared state behind an `Arc` (constructed once,
+    // cloned into the `Layer` value) rather than allocating inside
+    // `Layer::layer()`, and this is a non-issue — the same discipline the
+    // framework's own mirrored layers on `mcp_router` below already follow.
     #[cfg(feature = "mcp")]
     let mcp_dispatch_extra_layers = custom_layers.clone();
     #[cfg(not(feature = "mcp"))]

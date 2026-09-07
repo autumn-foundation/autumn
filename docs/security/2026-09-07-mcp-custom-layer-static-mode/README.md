@@ -208,6 +208,50 @@ doesn't intend to forward — not something to change opportunistically inside
 an unrelated authn-bypass fix. Filed as a follow-up rather than folded into
 this PR; replied on the review thread with this reasoning.
 
+## 🔁 Review round 3 (Codex, PR #2608, commit `8b0df1a`)
+
+**P2 — "Share state between both custom-layer applications" (verified real,
+documented as a known limitation rather than restructured).** Accurate: the
+round-2 fix calls `Layer::layer()` on the registered custom layer(s) *twice*
+in static/ISR mode — once for the dispatch clone (`mcp_dispatch_extra_layers`)
+and once for the live-serving router — whereas every other mode/path calls it
+exactly once and shares the resulting *service* by cloning the already-built
+router. Confirmed against a real Tower type, not a hypothetical: Tower's own
+`tower::limit::ConcurrencyLimitLayer` allocates a fresh `Arc<Semaphore>`
+*inside* `Layer::layer()`, which is why Tower ships a second type,
+`GlobalConcurrencyLimitLayer`, specifically to share one semaphore across
+multiple `.layer()` calls — Tower's own docs call the first one a
+*per-service* limit for exactly this reason. An app using bare
+`ConcurrencyLimitLayer` (rather than the `Global` variant) as an
+`AppBuilder::layer()` app-wide cap, in SSG/ISR mode, with the capped route
+MCP-exposed, would get two independent semaphores — one for direct HTTP, one
+for `tools/call` replay — instead of one shared budget.
+
+Why this isn't restructured away: dispatch must never be wrapped by the
+static-first middleware (a `tools/call` replay has to run the live handler,
+never be answered from a stale cached page — this is true in every mode,
+not new here), and `custom_layers` must wrap *outside* the static-first
+middleware for the live path (so a registered layer can still process/
+compress a cached-page response — see `RouterContext::custom_layers`'s doc).
+Those two requirements can't be satisfied by one shared post-`.layer()`
+service: taking dispatch from a service downstream of static-first
+middleware breaks the first; applying `custom_layers` upstream of it (so
+dispatch and the live path could share one application) breaks the second.
+Both alternatives are worse than the current gap, which never reopens the
+authn bypass this PR closes (both paths still enforce *something* — the
+failure mode is two independent budgets, not zero).
+
+Documented in `autumn/src/router.rs` at the `mcp_dispatch_extra_layers`
+clone site, alongside the existing "Known limitation" comments this function
+already carries for the `AuthenticatedPrincipal`/rate-limit and
+per-route-timeout cases (same class of static/ISR-vs-MCP trade-off, same
+precedent for documenting rather than deep-restructuring). The fix: use a
+layer that owns its shared state behind an `Arc` constructed once (like
+`GlobalConcurrencyLimitLayer`, or any custom layer following that pattern)
+rather than allocating inside `Layer::layer()` — which is the discipline the
+framework's own mirrored layers on `mcp_router` (rate-limit, load-shed,
+timeout) already follow, per the pre-existing comments beside them.
+
 ## ✅ Verification
 
 - Repro test red on trunk (`trunk-failure.txt`), green after the fix
