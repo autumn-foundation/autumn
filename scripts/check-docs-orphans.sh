@@ -398,7 +398,6 @@ def _find_key(table, path):
 # The value half. Anchored at the text `_find_key` hands back, so each asks
 # only "what is this value", never "which key was it".
 _VAL_BOOL = re.compile(r'[ \t]*(false|true)\b')
-_VAL_LIST = re.compile(r'[ \t]*(\[[^\]]*\])')
 # The MULTI-LINE forms have to come first, or `"""docs/intro.md"""` matches as
 # the empty basic string `""` and the path resolves to the package directory —
 # which is not a tracked file, so the crate contributes no entry surface at all.
@@ -464,6 +463,34 @@ def _decode_basic(text):
     return _TOML_ESCAPE.sub(one, text)
 
 
+def _delimited(value, opener):
+    """The interior of a bracketed value, or None if it is unterminated.
+
+    `opener` is `{` or `[`; the matching closer is the one at nesting depth
+    zero that is outside strings and comments. Both callers used to find their
+    own — `_inline_table` by scanning, the publish allowlist by a `\\[[^\\]]*\\]`
+    pattern — and the pattern stopped at a `]` written inside a comment, which
+    emptied a populated allowlist and dropped a published crate's README.
+    """
+    closer = '}' if opener == '{' else ']'
+    s = value.lstrip()
+    if not s.startswith(opener):
+        return None
+    live, _at, _ml = _toml_live(s)
+    depth = 0
+    for i in range(1, len(s)):
+        if i not in live:
+            continue
+        c = s[i]
+        if c in '[{':
+            depth += 1
+        elif c in ']}':
+            if depth == 0:
+                return s[1:i] if c == closer else None
+            depth -= 1
+    return None
+
+
 def _inline_table(value):
     """A COMPLETE inline table's entries as `key = value` strings, else None.
 
@@ -478,38 +505,26 @@ def _inline_table(value):
     measured, not assumed. Returning the entries found so far would have marked
     the package table seen and silently dropped every later key.
     """
-    s = value.lstrip()
-    if not s.startswith('{'):
-        return None
-    # A multi-line inline table is joined line by line, so a comment inside it
-    # ends at the newline rather than at the end of the whole text. Each line
-    # is classified on its own for that reason, and the offsets re-based.
-    live = set()
-    base = 0
-    for chunk in s.split('\n'):
-        chunk_live, _at, _ml = _toml_live(chunk)
-        live |= {base + j for j in chunk_live}
-        base += len(chunk) + 1
-    depth = 0
-    start = 1
+    inner = _delimited(value, '{')
+    if inner is None:
+        return None                          # unterminated: read on
+    live, _at, _ml = _toml_live(inner)
     entries = []
-    for i in range(1, len(s)):
+    depth = 0
+    start = 0
+    for i in range(len(inner)):
         if i not in live:
             continue
-        c = s[i]
+        c = inner[i]
         if c in '[{':
             depth += 1
-        elif c == ']':
-            depth -= 1
-        elif c == '}':
-            if depth == 0:
-                entries.append(s[start:i])
-                return [e.strip() for e in entries if e.strip()]
+        elif c in ']}':
             depth -= 1
         elif c == ',' and depth == 0:
-            entries.append(s[start:i])
+            entries.append(inner[start:i])
             start = i + 1
-    return None                              # unterminated: read on
+    entries.append(inner[start:])
+    return [e.strip() for e in entries if e.strip()]
 
 
 def _inherits(value):
@@ -689,10 +704,14 @@ def _ml_close(text, tok, start=0):
 
 
 def _toml_live(text):
-    """`(live, comment_at, open_ml)` — which characters of `text` are TOML.
+    """`(live, comments, open_ml)` — which characters of `text` are TOML.
 
     `live` is the set of indices outside every string form and outside a
-    comment; `comment_at` is where an unquoted `#` starts one, or None;
+    comment. `comments` is the set of indices INSIDE one, which is a different
+    question and has a caller of its own: whether a `publish` allowlist holds
+    an entry asks "is there anything here that is not a comment", and a
+    populated list's content sits entirely inside strings — so `live` is empty
+    for it and answering from `live` calls every populated list empty.
     `open_ml` is a multi-line delimiter left unterminated, or None.
 
     ONE walker, because three separate ones is what this rule kept being wrong
@@ -704,7 +723,7 @@ def _toml_live(text):
     fixing them one at a time is what made the next one predictable.
     """
     live = set()
-    comment_at = None
+    comments = set()
     open_ml = None
     i = 0
     n = len(text)
@@ -720,8 +739,15 @@ def _toml_live(text):
                 break
             i = close + 3
         elif c == '#':
-            comment_at = i
-            break
+            # A comment ends at the NEWLINE, not at the end of the text, so
+            # this works on a whole multi-line value as well as on one line.
+            # `_inline_table` used to chunk by line to get that, which lost a
+            # multi-line string's state between chunks and let a `}` inside one
+            # close the table early.
+            nl = text.find('\n', i)
+            end = n if nl < 0 else nl
+            comments |= set(range(i, end))
+            i = end
         elif c == '"':
             i += 1
             while i < n and text[i] != '"':
@@ -733,7 +759,7 @@ def _toml_live(text):
         else:
             live.add(i)
             i += 1
-    return live, comment_at, open_ml
+    return live, comments, open_ml
 
 
 def _scan_toml_line(line):
@@ -761,7 +787,8 @@ def _scan_toml_line(line):
     So both are measured, not argued: self-tests pin the comment and
     single-line-string cases and fail against a scanner lacking this.
     """
-    live, comment_at, open_ml = _toml_live(line)
+    live, comments, open_ml = _toml_live(line)
+    comment_at = min(comments) if comments else None
     depth = 0
     for i in live:
         if line[i] in '{[':
@@ -769,42 +796,6 @@ def _scan_toml_line(line):
         elif line[i] in '}]':
             depth -= 1
     return comment_at, open_ml, depth
-
-
-def _strip_toml_comments(text):
-    """`text` with TOML comments removed, quoting respected.
-
-    Needed because a value can be spread over lines with a comment inside it:
-    `publish = [\\n  # intentionally private\\n]` is an EMPTY allowlist to Cargo
-    — it reports `publish: []` — but its captured interior is not empty text,
-    so a bare emptiness test read the package as publishable.
-
-    The quoting-awareness is NOT observable through the only caller today, and
-    saying so is more useful than a test that pretends otherwise. `_publishable`
-    asks one question of the result — is it blank — and a populated list always
-    retains its first entry's opening quote, which a greedy `#`-to-end-of-line
-    strip cannot remove unless a `#` precedes it, in which case the quote is
-    inside a comment and the list really is empty. So both readings agree on
-    every input. This shares `_scan_toml_line` anyway, because one notion of
-    "what is quoted" is simpler to keep right than two.
-    """
-    out = []
-    ml = None
-    for line in text.split('\n'):
-        if ml is not None:
-            close = _ml_close(line, ml)
-            if close < 0:
-                out.append(line)
-                continue
-            out.append(line[:close + 3])
-            line = line[close + 3:]
-            ml = None
-            at, ml, _d = _scan_toml_line(line)
-            out[-1] += line if at is None else line[:at]
-            continue
-        at, ml, _d = _scan_toml_line(line)
-        out.append(line if at is None else line[:at])
-    return '\n'.join(out)
 
 
 def _toml_rows(text):
@@ -990,15 +981,17 @@ def _publishable(manifest, pkg):
     b = _VAL_BOOL.match(value)
     if b is not None:
         return b.group(1) == 'true'
-    lst = _VAL_LIST.match(value)
-    if lst is not None:
-        value = lst.group(1)
+    inner = _delimited(value, '[')
+    if inner is not None:
         # An empty allowlist publishes nowhere; a populated one publishes
-        # somewhere, and that registry renders the README. Comments are
-        # stripped first because a list spread over lines can carry one —
-        # `publish = [\n  # intentionally private\n]` is EMPTY to Cargo, which
-        # reports `publish: []`, but its interior is not empty text.
-        return _strip_toml_comments(value[1:-1]).strip() != ''
+        # somewhere, and that registry renders the README. Emptiness is asked
+        # of the LIVE characters, so a list spread over lines with a comment in
+        # it — `publish = [\n  # intentionally private\n]`, EMPTY to Cargo,
+        # which reports `publish: []` — reads as empty, and a comment that
+        # happens to contain `]` does not truncate a populated one.
+        _live, comments, _ml = _toml_live(inner)
+        return any(i not in comments and not inner[i].isspace()
+                   for i in range(len(inner)))
     return True
 
 
@@ -8113,6 +8106,29 @@ self_test() {
   git -C "$c9nc" add -A && git -C "$c9nc" commit -qm closing-line-remainder
   check "text after a multi-line string closes is live again" fail "$c9nc"
 
+  # A multi-line string INSIDE an inline table keeps its state across lines,
+  # so the `}` written inside this description does not close the table and
+  # the `publish = false` below it is read. Cargo reports `publish: []`.
+  local c9ne="$tmp/c9ne"; make_corpus "$c9ne"
+  mkdir -p "$c9ne/pkg"
+  printf 'package = {\nname = "pkg",\ndescription = """a\n} still string\n""",\npublish = false,\nreadme = "README.md" }\n' \
+    > "$c9ne/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ne/pkg/README.md"
+  git -C "$c9ne" add -A && git -C "$c9ne" commit -qm ml-string-in-inline-table
+  check "a multi-line string spans lines inside an inline table" fail "$c9ne"
+
+  # A `]` inside a COMMENT does not close a publish list, so this allowlist is
+  # populated and the crate IS published — `cargo metadata` reports
+  # `publish: ['internal']`. Stopping at that bracket emptied the list and
+  # dropped a published crate's README from the roots.
+  local c9nf="$tmp/c9nf"; make_corpus "$c9nf"
+  mkdir -p "$c9nf/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\npublish = [ # closes with ] below\n  "internal"\n]\n' \
+    > "$c9nf/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9nf/pkg/README.md"
+  git -C "$c9nf" add -A && git -C "$c9nf" commit -qm bracket-in-list-comment
+  check "a bracket in a comment does not close a publish list" pass "$c9nf"
+
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
   # passed against a build with the check removed, because `../outside.md`
@@ -8147,10 +8163,18 @@ self_test() {
   git -C "$c9mq" add -A && git -C "$c9mq" commit -qm nested-inherited-readme
   check "an inherited readme resolves against the nested workspace" pass "$c9mq"
 
-  # There is deliberately NO test here for a `#` inside a quoted registry name
-  # (`publish = ["reg#1"]`). One was written and deleted: it passed against a
-  # greedy `#`-to-end-of-line strip as well as the quoting-aware one, because
-  # the two cannot disagree here. See `_strip_toml_comments`.
+  # A `#` inside a quoted registry name is not a comment, and the allowlist is
+  # populated. This case was once a deleted test — it could not fail while
+  # emptiness was decided by stripping comments from text, because a populated
+  # list always kept its first entry's opening quote. Deciding emptiness from
+  # the LIVE characters instead made it discriminating, so it is back.
+  local c9nd="$tmp/c9nd"; make_corpus "$c9nd"
+  mkdir -p "$c9nd/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\npublish = ["reg#1"]\n' \
+    > "$c9nd/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9nd/pkg/README.md"
+  git -C "$c9nd" add -A && git -C "$c9nd" commit -qm hash-in-registry-name
+  check "a hash inside a quoted registry name is not a comment" pass "$c9nd"
 
   # A VIRTUAL manifest — only `[workspace]`, no `[package]` — declares no
   # crate, so nothing renders a registry landing page for it and the README
