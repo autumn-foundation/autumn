@@ -3116,22 +3116,37 @@ def _reportable_flag(name):
             and not _PROSE_IN_FLAG.search(name))
 
 
-def _scan_options_only(tokens, i, node, path, flags):
-    """Judge the OPTIONS in `tokens[i:]`, resolving no further commands.
+def _scan_options_only(tokens, i, node, path, flags, surface):
+    """Judge the OPTIONS in `tokens[i:]`, resolving no NEW command defects.
 
     Reached once a positional has been met on a node that also has subcommands,
     where a bare token can no longer be told from a subcommand name. Options
     still can be, so they are still checked; everything else is stepped over.
 
+    A subcommand IS still followed once the node's declared positional slots are
+    full, because at that point a token matching a child name can only be that
+    child. `routes` takes one `PREFIX` then an optional subcommand, so `autumn
+    routes /admin audit --strict` is correct and `--strict` belongs to `audit`;
+    judging it against `routes` forever reported that correct line. The slot
+    count comes from `hyphen_slots`, which carries one entry per positional.
+
     Always returns None: a command defect cannot be proven from here, and
     guessing one is how a gate reports a page that is correct.
     """
+    filled = 0
+    slots = len(node['hyphen_slots'])
     while i < len(tokens):
         tok = tokens[i]
         if tok == '--':                         # end of options; only operands left
             return None
         if not (tok.startswith('-') and len(tok) > 1):
-            i += 1                              # a value, or another positional
+            if filled >= slots and tok in node['children']:
+                path = path + ' ' + tok         # the subcommand after the values
+                node = surface[path]
+                filled, slots = 0, len(node['hyphen_slots'])
+            else:
+                filled += 1                     # a value, or another positional
+            i += 1
             continue
         if node['trailing']:
             # Everything from the first positional onward belongs to the
@@ -3278,6 +3293,16 @@ def resolve(tokens, surface, runnable=False, flags=None):
                     if node['trailing'] and supplied:
                         return None
                     o = t2.split('=', 1)[0]
+                    if o not in node['options'] and '=' not in t2:
+                        # A compact short group: `-papi` is `--package api`, and
+                        # `autumn replay <capsule> -papi` is a correct line. The
+                        # outer walk has always resolved these; this loop did
+                        # not, so once a leaf had begun taking positionals every
+                        # bundled short read as an undeclared flag.
+                        eaten = _short_cluster(t2, node['options'])
+                        if eaten is not None:
+                            i += eaten
+                            continue
                     if (o not in node['options']
                             and supplied < len(hyphen_slots)
                             and hyphen_slots[supplied]):
@@ -3334,7 +3359,7 @@ def resolve(tokens, surface, runnable=False, flags=None):
             # Only option-shaped tokens are judged from here. Anything else may
             # be another positional value, or the value of an option, and no
             # further subcommand resolution is attempted.
-            return _scan_options_only(tokens, i, node, path, flags)
+            return _scan_options_only(tokens, i, node, path, flags, surface)
         if not TOKEN.match(tok):
             return None
         return 'autumn ' + path + ' ' + tok
@@ -3743,6 +3768,24 @@ def self_test():
            'a subcommand reached before a positional keeps its own options')
     expect(opts_of('routes audit --nope') == [('routes audit', '--nope')],
            "…and reports against the SUBCOMMAND's path, not the parent's")
+    # …and a subcommand written AFTER the positional is followed too, once the
+    # declared slots are full. Judging every later option against the parent
+    # forever reported `autumn routes /admin audit --strict`, which is correct.
+    expect(opts_of('routes /admin audit --strict') == [],
+           'a subcommand after a filled positional slot takes its own options')
+    expect(opts_of('routes /admin audit --nope') == [('routes audit', '--nope')],
+           'a bad option there reports against the CHILD, not the parent')
+    expect(opts_of('routes /admin --methd POST') == [('routes', '--methd')],
+           'a bad option before any subcommand still reports against the parent')
+
+    # A compact short group is one option and its value: `-papi` is
+    # `--package api`. The outer walk always resolved these; the leaf loop did
+    # not, so once a leaf had begun taking positionals every bundled short read
+    # as an undeclared flag — a correct line reported.
+    expect(opts_of('replay capsule.json -papi') == [],
+           'a compact short after a leaf positional is not drift')
+    expect(opts_of('replay capsule.json -zz') == [('replay', '-zz')],
+           '…but an unresolvable one still is')
 
     # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
     # used to read these stopped at the list's first `]`, so the field vanished
