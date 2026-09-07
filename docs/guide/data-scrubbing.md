@@ -372,6 +372,17 @@ where the server never revisits the rows that predate it. Afterwards each
 subsetted table is rewritten with `VACUUM (FULL, ANALYZE)` — deleting rows on its
 own frees no disk, and the point of a sample is the disk.
 
+`--dry-run` prints that whole sequence as SQL you can actually run, so the walk
+prints as the loop it is — a `DO` block that repeats the pass and stops on one
+that selects nothing — rather than as a single pass with a comment saying to
+repeat it. The difference is not cosmetic: within a pass the statements run in
+list order, and that order comes from the catalog, so one pass reaches only as
+deep as the order happens to favour and everything below it is deleted. Nothing
+would catch that — dropping a descendant leaves every foreign key satisfied, so
+the integrity assertions still pass and the script commits a copy quietly
+missing rows. The compaction is the only thing printed outside the transaction,
+because `VACUUM (FULL)` cannot run inside one.
+
 With `--output`, the artifact is captured **before** the compaction, not after.
 Every lock is released when the scrub commits, so the gap between committing and
 dumping is a gap in which a concurrent write could land unscrubbed rows in the

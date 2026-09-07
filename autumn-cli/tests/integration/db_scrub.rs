@@ -1618,6 +1618,164 @@ async fn sampling_refuses_legacy_table_inheritance() {
     );
 }
 
+/// The printed dry run has to be the loop, not the statements plus a comment.
+///
+/// `walk_statements` is one pass; `apply` repeats it to a fixpoint. Within a
+/// pass the statements run in list order, and that order comes from the
+/// catalog — so a chain deeper than the order happens to favour is only partly
+/// selected, and everything below is deleted. Nothing catches it: dropping a
+/// descendant leaves every foreign key satisfied, so all three integrity
+/// assertions still pass and the script commits a copy that is quietly missing
+/// rows the real command keeps.
+///
+/// This fixture is that unfavourable order on purpose — the constraints are
+/// added deepest-first, so `tag_votes -> note_tags` is walked before the edge
+/// that seeds `notes`. The assertion is the invariant that matters: running the
+/// advertised SQL leaves the same database the command does.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_printed_dry_run_walks_to_the_same_fixpoint_the_command_does() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+
+    let mut clients = Vec::new();
+    for name in ["deep_real", "deep_printed"] {
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let client = connect(&format!("{base}/{name}")).await;
+        client.batch_execute(DEEP_CHAIN_SCHEMA).await.unwrap();
+        clients.push(client);
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("src").join("models")).unwrap();
+    std::fs::write(
+        dir.join("src").join("models").join("user.rs"),
+        "pub struct User { pub id: i32, pub email: String }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("scrub.toml"), DEEP_CHAIN_SCRUB_TOML).unwrap();
+
+    // The real command, on the first database.
+    let real_url = format!("{base}/deep_real");
+    let (_o, real_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=2", "--seed", "7"],
+        &[("AUTUMN_DATABASE__URL", real_url.as_str())],
+    );
+
+    // The dry run, on the second — then the SQL it printed, run verbatim.
+    let printed_url = format!("{base}/deep_printed");
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &[
+            "db",
+            "scrub",
+            "--dry-run",
+            "--sample",
+            "users=2",
+            "--seed",
+            "7",
+        ],
+        &[("AUTUMN_DATABASE__URL", printed_url.as_str())],
+    );
+    assert!(
+        dry_err.contains("EXIT WHEN total = 0;"),
+        "the walk must print as a loop, not as statements plus a comment saying \
+         to repeat them: {dry_err}"
+    );
+    let script = printed_transaction(&dry_err);
+    clients[1]
+        .batch_execute(&script)
+        .await
+        .unwrap_or_else(|e| panic!("the printed SQL must run as printed: {e}\n{script}"));
+
+    // The fixture has to actually need more than one pass, or this proves
+    // nothing: `settled in N pass(es)` is the command's own report of that.
+    assert!(
+        !real_err.contains("settled in 1 pass"),
+        "the fixture must exercise a multi-pass closure: {real_err}"
+    );
+    for table in ["users", "notes", "note_tags", "tag_votes"] {
+        let sql = format!("SELECT count(*) FROM {table}");
+        let real = count(&clients[0], &sql).await;
+        let printed = count(&clients[1], &sql).await;
+        assert_eq!(
+            printed, real,
+            "{table}: the printed SQL kept {printed} row(s), the command kept {real}"
+        );
+        assert!(
+            real > 0,
+            "{table} must survive the sample, or the comparison is vacuous"
+        );
+    }
+}
+
+/// The `BEGIN;` \u{2026} `COMMIT;` the dry run printed, unindented.
+///
+/// The compaction after it is deliberately left out: `VACUUM (FULL)` cannot run
+/// inside a transaction, and a batch send is one.
+fn printed_transaction(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim() == "BEGIN;")
+        .expect("the dry run must print the transaction it opens");
+    let end = lines
+        .iter()
+        .position(|l| l.trim() == "COMMIT;")
+        .expect("the dry run must print the commit");
+    lines[start..=end]
+        .iter()
+        .map(|l| l.strip_prefix("  ").unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A root and three levels below it, with the foreign keys added deepest-first
+/// so the catalog reports them in the order that needs the most passes.
+const DEEP_CHAIN_SCHEMA: &str = "\
+    CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL); \
+    CREATE TABLE notes (id int PRIMARY KEY, user_id int NOT NULL, body text NOT NULL); \
+    CREATE TABLE note_tags (id int PRIMARY KEY, note_id int NOT NULL, label text NOT NULL); \
+    CREATE TABLE tag_votes (id int PRIMARY KEY, note_tag_id int NOT NULL, voter text NOT NULL); \
+    ALTER TABLE tag_votes ADD CONSTRAINT tag_votes_note_tag_fk \
+        FOREIGN KEY (note_tag_id) REFERENCES note_tags(id); \
+    ALTER TABLE note_tags ADD CONSTRAINT note_tags_note_fk \
+        FOREIGN KEY (note_id) REFERENCES notes(id); \
+    ALTER TABLE notes ADD CONSTRAINT notes_user_fk \
+        FOREIGN KEY (user_id) REFERENCES users(id); \
+    INSERT INTO users SELECT g, 'user' || g || '@example.com' FROM generate_series(1, 4) g; \
+    INSERT INTO notes SELECT g, g, 'note ' || g FROM generate_series(1, 4) g; \
+    INSERT INTO note_tags SELECT g, g, 'tag ' || g FROM generate_series(1, 4) g; \
+    INSERT INTO tag_votes SELECT g, g, 'voter' || g FROM generate_series(1, 4) g;";
+
+const DEEP_CHAIN_SCRUB_TOML: &str = r#"
+[defaults]
+safe_columns = ["id"]
+
+[tables.users]
+safe = []
+
+[tables.users.pii]
+email = "email"
+
+[tables.users.encrypted]
+
+[tables.notes]
+safe = ["user_id", "body"]
+
+[tables.note_tags]
+safe = ["note_id", "label"]
+
+[tables.tag_votes]
+safe = ["note_tag_id", "voter"]
+"#;
+
 /// The same leak, through a `never_include` table rather than a purged one.
 ///
 /// `never_include` promises the table ends up empty. The sample empties it, but

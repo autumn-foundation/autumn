@@ -1223,6 +1223,24 @@ fn key_expr(alias: &str, key: &[String]) -> String {
 /// literal: `*/` inside it would close the comment and let whatever follows
 /// run as part of the statement. It is a label, so anything outside a plain
 /// identifier alphabet becomes `_`.
+/// What the emitted walk loop raises if it somehow fails to settle.
+const ITERATION_LIMIT_MESSAGE: &str = "the sample selection did not settle; the closure walk did \
+                                       not reach a fixpoint";
+
+/// A dollar-quote tag that cannot terminate `body` early.
+///
+/// Dollar quoting is lexical: a `$tag$` sequence ends the literal wherever it
+/// appears, including inside a block comment or a quoted identifier — and a
+/// Postgres identifier may legally contain `$`. Rather than assume the source
+/// has no such name, widen the tag until the body cannot contain it.
+fn dollar_tag(body: &str) -> String {
+    let mut tag = String::from("$autumn_walk$");
+    while body.contains(&tag) {
+        tag.insert(tag.len() - 1, '_');
+    }
+    tag
+}
+
 fn comment_safe(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -1410,6 +1428,55 @@ impl SamplePlan {
             }
         }
         out
+    }
+
+    /// The closure walk as one executable statement: the fixpoint loop itself.
+    ///
+    /// [`Self::walk_statements`] is **one pass**. [`apply`] repeats it until a
+    /// pass selects nothing, and a printed script that runs each statement once
+    /// is a different command: within a pass the statements run in list order,
+    /// so a chain deeper than the order happens to favour is only partly
+    /// selected, and the edge order comes from the catalog rather than from
+    /// anything this module chooses. The rows below the point it reached are
+    /// then deleted — silently, because deleting a descendant breaks no foreign
+    /// key and every integrity assertion still passes.
+    ///
+    /// So the dry run emits this instead of the bare statements: the same
+    /// walk, the same per-pass `ANALYZE`, and the same `MAX_PASSES` ceiling,
+    /// wrapped in the loop that makes them a fixpoint.
+    #[must_use]
+    pub fn walk_loop_statement(&self) -> String {
+        let mut body = vec![
+            "DECLARE".to_owned(),
+            "  moved bigint;".to_owned(),
+            "  total bigint;".to_owned(),
+            "  passes integer := 0;".to_owned(),
+            "BEGIN".to_owned(),
+            "  LOOP".to_owned(),
+            "    total := 0;".to_owned(),
+        ];
+        for statement in self.walk_statements() {
+            body.push(format!("    {statement};"));
+            // Immediately, before the next statement overwrites it.
+            body.push("    GET DIAGNOSTICS moved = ROW_COUNT;".to_owned());
+            body.push("    total := total + moved;".to_owned());
+        }
+        for statement in self.analyze_statements() {
+            body.push(format!("    {statement};"));
+        }
+        body.push("    passes := passes + 1;".to_owned());
+        body.push("    EXIT WHEN total = 0;".to_owned());
+        body.push(format!("    IF passes >= {MAX_PASSES} THEN"));
+        body.push(format!(
+            "      RAISE EXCEPTION {};",
+            quote_literal(ITERATION_LIMIT_MESSAGE),
+        ));
+        body.push("    END IF;".to_owned());
+        body.push("  END LOOP;".to_owned());
+        body.push("END".to_owned());
+        let body = body.join("\n");
+        let tag = dollar_tag(&body);
+        format!("DO {tag}\n{body}\n{tag}")
     }
 
     /// The row-removing `DELETE`s, children before parents.
@@ -2862,6 +2929,81 @@ mod tests {
                 "every reference to {name} must be public-qualified: {all}"
             );
         }
+    }
+
+    #[test]
+    fn the_printed_walk_is_a_loop_that_repeats_every_statement() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let walk = plan.walk_statements();
+        let analyze = plan.analyze_statements();
+        let loop_sql = plan.walk_loop_statement();
+
+        // Every statement of a pass is inside the loop, not merely described by
+        // it: a printed walk that runs each statement once selects only as deep
+        // as the catalog's edge order reaches, and the rows below that are then
+        // deleted without breaking any foreign key the assertions check.
+        assert!(
+            !walk.is_empty(),
+            "the fixture must have a walk to loop over"
+        );
+        for statement in &walk {
+            assert!(
+                loop_sql.contains(statement),
+                "the loop must carry {statement}:\n{loop_sql}"
+            );
+        }
+        for statement in &analyze {
+            assert!(
+                loop_sql.contains(statement),
+                "the loop must re-analyze per pass, like `apply`: {statement}"
+            );
+        }
+        // One row count per walk statement, taken immediately after it — a
+        // single `GET DIAGNOSTICS` at the end of the pass would read only the
+        // last statement and stop the loop while rows were still being found.
+        assert_eq!(
+            loop_sql
+                .matches("GET DIAGNOSTICS moved = ROW_COUNT;")
+                .count(),
+            walk.len(),
+            "each statement's own row count must be captured:\n{loop_sql}"
+        );
+        assert!(
+            loop_sql.contains("EXIT WHEN total = 0;"),
+            "the loop must end on a pass that selects nothing:\n{loop_sql}"
+        );
+        assert!(
+            loop_sql.contains(&format!("IF passes >= {MAX_PASSES} THEN")),
+            "the printed loop must carry the same ceiling `apply` does:\n{loop_sql}"
+        );
+    }
+
+    #[test]
+    fn the_walk_loop_is_dollar_quoted_past_any_identifier() {
+        // Dollar quoting is lexical, so a `$autumn_walk$` inside the body would
+        // end the block early and leave the rest as raw SQL. Postgres lets an
+        // identifier contain `$`, so the tag has to widen rather than assume.
+        assert_eq!(dollar_tag("INSERT INTO x"), "$autumn_walk$");
+        assert_eq!(
+            dollar_tag(r#"INSERT INTO "a$autumn_walk$b""#),
+            "$autumn_walk_$"
+        );
+        assert_eq!(
+            dollar_tag(r#""a$autumn_walk$b" "c$autumn_walk_$d""#),
+            "$autumn_walk__$"
+        );
+        let body = r#"x "a$autumn_walk$b""#;
+        assert!(
+            !body.contains(&dollar_tag(body)),
+            "the chosen tag must not appear in the body it quotes"
+        );
     }
 
     #[test]

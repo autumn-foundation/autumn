@@ -2689,10 +2689,13 @@ fn report_sample_sql(url: &str, label: &str, plan: &sample::SamplePlan) -> Resul
     for statement in plan.index_statements() {
         eprintln!("  {statement};");
     }
-    eprintln!("  -- then, repeated until no new related rows are found:");
-    for statement in plan.walk_statements() {
-        eprintln!("  {statement};");
-    }
+    // The walk as the loop it really is, not the statements plus a comment
+    // saying to repeat them. Within a pass the statements run in list order, so
+    // running them once selects only as deep as the catalog's edge order
+    // happens to reach; the rows below that survive the walk but not the
+    // DELETEs, and nothing catches it, because dropping a descendant leaves
+    // every foreign key satisfied and every assertion below still passes.
+    eprintln!("  {};", plan.walk_loop_statement().replace('\n', "\n  "));
     for statement in plan.delete_statements() {
         eprintln!("  {statement};");
     }
