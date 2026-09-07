@@ -144,33 +144,109 @@ not reach the handler: {"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"","
 already covered by its own tests in both modes, and the docs already tell
 users to authenticate MCP tools with route-level guards instead of it.
 
+## 🔁 Review round 2 (Codex, PR #2608)
+
+Two automated findings landed on the first push. Both verified against the
+running code before deciding what to do with them.
+
+**P2 — "Avoid applying custom layers twice to each tool call" (confirmed,
+fixed).** The first version of this fix merged `mcp_router` inside
+`build_router_pre_state` exactly as before, with only the new
+`mcp_dispatch_extra_layers` added on top for the dispatch clone. In SSG/ISR
+mode that meant `/mcp` was still nested inside the router the caller's own
+`custom_layers` reapplication wraps (`try_build_router_with_static_inner`,
+"Custom (outside static middleware)") — so a single `tools/call` ran every
+custom layer **twice**: once for the live `/mcp` POST (the envelope), once
+for the dispatch replay. Verified empirically with a probe test (a
+`from_fn` layer incrementing an `Arc<AtomicUsize>` counter): one `tools/call`
+produced a count of `2` before the fix below, `1` after. Harmless for an
+idempotent layer (security headers), but a real bug for a stateful one — a
+rate limiter or quota counter would be charged twice per call, halving its
+effective MCP throughput relative to direct HTTP; a one-time-use nonce/token
+layer could reject the replay outright.
+
+Fix: `build_router_pre_state` no longer merges `mcp_router` internally when
+`defer_security_headers` is true (SSG/ISR mode) — it hands the router back
+to the caller instead (return type becomes `(Router<AppState>,
+Option<Router<AppState>>)`), and `try_build_router_with_static_inner` merges
+it in *after* its `custom_layers` reapplication. The live `/mcp` envelope
+now never traverses `custom_layers` at all in either mode — matching the
+fully-dynamic path, where it structurally never did (see
+`docs/guide/mcp.md`'s "why `/mcp` sits outside the global middleware
+stack"). `mcp_router` is unaffected otherwise: it already carries its own
+dedicated copies of security headers, rate-limit, timeout, CORS, etc.
+(mirroring `apply_middleware`, per the existing comments in
+`build_router_pre_state`), so where exactly it merges relative to
+compression/shadow-mirroring/`static_gate`/security-headers doesn't matter —
+only staying outside `custom_layers` does. Locked in by a new committed
+regression test,
+`custom_layer_runs_exactly_once_per_tools_call_in_static_mode`, asserting
+the counter is exactly `1`.
+
+**P1 — "Preserve custom authentication headers in the replay" (verified,
+declined as out of scope).** Accurate: `mcp::build_request`'s
+`FORWARDED_HEADERS` allowlist (`authorization`, `cookie`,
+`idempotency-key`, `host`, `forwarded`, the `x-forwarded-*` family,
+`x-real-ip`, `accept-language`) does not include arbitrary custom headers
+like `x-api-key`, so a custom layer that authenticates on a header outside
+that curated list will reject a `tools/call` replay even when the *live*
+`/mcp` request carried a valid credential on that header — this PR's own
+test only exercises the "no credential" side of that, so it doesn't
+demonstrate the false-positive case Codex describes, but the mechanism is
+real. It is **not**, however, a regression this PR introduces: `build_request`
+is shared, unconditional code that already behaves identically for the
+fully-dynamic path today, on trunk, with no relation to `dist` manifests or
+`custom_layers`. It also fails in the safe direction — a legitimate call is
+over-rejected, not an illegitimate one let through — so it does not reopen
+the bypass this PR closes. Expanding `FORWARDED_HEADERS` is a deliberate,
+curated security decision (see the header-by-header reasoning already in
+that list and in `docs/guide/failure-capsules.md`'s "names are matched
+exactly" precedent for the *same* kind of curation problem in capsule
+redaction) that trades off forwarding more of a client's headers into an
+internal replay against the risk of leaking or misusing ones the framework
+doesn't intend to forward — not something to change opportunistically inside
+an unrelated authn-bypass fix. Filed as a follow-up rather than folded into
+this PR; replied on the review thread with this reasoning.
+
 ## ✅ Verification
 
 - Repro test red on trunk (`trunk-failure.txt`), green after the fix
   (`after.txt`).
 - `cargo test -p autumn-web --lib --features mcp,openapi,maud
-  router::trusted_host_tests::` — 44 passed, including every `static_gate`
+  router::trusted_host_tests::` — 178 passed, including every `static_gate`
   test (`static_gate_runs_before_cached_static_page`,
   `static_gate_runs_in_dynamic_mode`,
   `static_gate_redirect_carries_security_headers_ssg`,
   `static_gate_redirect_carries_security_headers_dynamic`,
   `static_gate_layer_requires_fail_closed_idempotency`) unchanged.
 - `cargo test -p autumn-web --lib --features mcp,openapi,maud,test-support`
-  (full crate unit suite) — 5761 passed, 0 failed, 21 ignored.
+  (full crate unit suite) — 5762 passed, 0 failed, 21 ignored.
 - `cargo test -p autumn-web --test integration_tests --features
   test-support,mcp,openapi,maud mcp` — 84 passed, 0 failed (every MCP
   integration test: envelope auth, streaming, plugin exposure, schema
   derivation, structured query args, including
   `tools_call_enforces_bearer_token_via_real_pipeline` and
   `static_gate_is_excluded_from_mcp_dispatch_in_dynamic_mode`).
+- `cargo check -p autumn-web --features sqlite` and `cargo clippy -p
+  autumn-web --features sqlite --lib -- -D warnings` — clean. CI's
+  `sqlite-runtime` job caught a real `clippy::needless_pass_by_value` on
+  `mcp_dispatch_extra_layers` in the non-`mcp` build (the parameter is
+  genuinely unused when the feature is off) — the per-parameter
+  `#[cfg_attr(..., allow(unused_variables))]` pattern already used for `ctx`
+  in this function does not extend to this lint (it reasons about the whole
+  function body, not one binding), so the allow moved to the function
+  itself, `#[cfg_attr(not(feature = "mcp"),
+  allow(clippy::needless_pass_by_value))]`.
 - `cargo check --workspace` — clean.
 - `cargo fmt --all` — clean.
 - `cargo clippy -p autumn-web --all-targets --features
-  mcp,openapi,maud,test-support -- -D warnings` — clean (the one
-  `too_many_lines` hit was on the new test itself; resolved with
+  mcp,openapi,maud,test-support -- -D warnings` — clean. Two real hits along
+  the way, both fixed: `too_many_lines` on the first new test (resolved with
   `#[allow(clippy::too_many_lines)]`, matching `build_router_pre_state`'s own
-  existing allow for the same lint). The `autumn-macros` `unknown_lints`
-  warning present in this run's log is pre-existing on trunk
+  existing allow for the same lint), and `items_after_statements` on the
+  second new test (an `async fn` item declared after a `let` — moved the
+  `fn` to the top of the test body). The `autumn-macros` `unknown_lints`
+  warning present in these runs' logs is pre-existing on trunk
   (`clippy::unused_async_trait_impl` is not a real lint name on this
   toolchain) and unrelated to this change — confirmed by running the same
   clippy invocation against trunk via `git stash`.
