@@ -11360,11 +11360,25 @@ mod tests {
 
         let cargo_toml = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
 
+        // Check the `autumn-web` dependency line specifically, not just for the
+        // substring `sqlite` anywhere in the file: a fix that added `diesel = {
+        // features = ["sqlite", ...] }` (Diesel's own per-backend feature, not
+        // autumn-web's backend-flip feature) would satisfy a bare
+        // `cargo_toml.contains("sqlite")` while leaving `RuntimeBackend` on
+        // Postgres and the boot failure this test exists to catch fully intact
+        // (caught in review on #2604).
+        let autumn_web_line = cargo_toml
+            .lines()
+            .find(|line| line.trim_start().starts_with("autumn-web"))
+            .unwrap_or_else(|| {
+                panic!("Cargo.toml must declare an `autumn-web` dependency: {cargo_toml}")
+            });
         assert!(
-            cargo_toml.contains("sqlite"),
+            autumn_web_line.contains("\"sqlite\""),
             "a SQLite-targeted app must come out of `generate auth` with \
-             autumn-web's `sqlite` feature enabled, the same way `mail` is \
-             auto-wired by `ensure_autumn_web_mail_feature`: {cargo_toml}"
+             autumn-web's own `sqlite` feature enabled on its dependency line, \
+             the same way `mail` is auto-wired by \
+             `ensure_autumn_web_mail_feature`: {autumn_web_line}"
         );
         assert!(
             !cargo_toml.contains("pq-sys"),
