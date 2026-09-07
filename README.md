@@ -235,6 +235,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/teams`](examples/teams) | Organization membership, roles, and email invitations: multi-org `Membership`, a `require_role` guard, `#[mailer]` invite emails, idempotent accept, and role-gated member management |
 | [`examples/media-room`](examples/media-room) | Live-media plugin: installs `autumn-media-plugin` with the rooms primitive and creates/lists mesh-call rooms through the mounted `RoomService` (see the [media guide](docs/guide/media.md)) |
 | [`examples/invoice`](examples/invoice) | Renders one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` (see the [PDF downloads guide](docs/guide/pdf-downloads.md)) |
+| [`examples/react-graphql`](examples/react-graphql) | TypeScript React SPA on an Autumn backend, talking GraphQL through a generic `GraphqlPlugin`: resolvers built on a `#[model]` + `#[repository]` with `#[normalize]`, `#[validate]` and `MutationHooks`, generated REST CRUD over the same rows, `Plugin` + `nest` + `declare_plugin_routes`, `PluginContract`, and a committed Vite bundle served under the default CSP |
 
 ## Documentation
 
