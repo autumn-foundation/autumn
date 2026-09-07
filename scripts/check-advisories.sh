@@ -207,10 +207,12 @@ run_gate() {
 #   2. the same tree to PASS once — and only once — that id is waived,
 #      which is the waiver mechanism the docs describe.
 #
-# Both policies are covered on purpose. The workspace `deny.toml` is what gates
-# this repo; the scaffold's `deny.toml.tmpl` is what gates every generated app,
-# and it is otherwise only ever exercised against trees that happen to be
-# clean — so nothing would notice if it stopped blocking.
+# All four policies are covered on purpose. The workspace `deny.toml` is what
+# gates this repo; the scaffold's `deny.toml.tmpl` is what gates every
+# generated app; `fuzz/deny.toml` and `examples/island-flock/deny.toml` gate
+# the two satellite graphs (`audit_satellite_graphs`). Every one of them is
+# otherwise only ever exercised against trees that happen to be clean — so
+# nothing would notice if any single one of them stopped blocking.
 
 # Write the throwaway crate carrying the injected vulnerable dependency.
 write_fixture_crate() {
@@ -329,8 +331,11 @@ self_test() {
 
   prove_policy_blocks "the workspace policy (deny.toml)" deny.toml
   prove_policy_blocks "the scaffold policy (${SCAFFOLD_POLICY})" "${SCAFFOLD_POLICY}"
+  for dir in ${SATELLITE_GRAPHS}; do
+    prove_policy_blocks "the satellite policy (${dir}/deny.toml)" "${dir}/deny.toml"
+  done
 
-  log "advisory gate self-test OK (${VULNERABLE_ADVISORY} blocked, then waived, under both policies)"
+  log "advisory gate self-test OK (${VULNERABLE_ADVISORY} blocked, then waived, under every policy)"
 }
 
 case "${1:-}" in

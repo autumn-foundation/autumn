@@ -218,7 +218,7 @@ outside this pass's authority to decide unilaterally.
 | `fuzz` rehearsal | — | `RUSTFLAGS="--cfg fuzzing" cargo +nightly check --workspace` from `fuzz/`: clean |
 | `island-flock` rehearsal | — | `cargo check --target wasm32-unknown-unknown` from `examples/island-flock/`: clean |
 | Full gate | `./scripts/check-advisories.sh`: OK (3 graphs) | `./scripts/check-advisories.sh`: OK (5 graphs) |
-| Self-test | `./scripts/check-advisories.sh --self-test`: OK | unchanged, still OK (root + scaffold policies; not extended to the two new satellite configs this pass) |
+| Self-test | `./scripts/check-advisories.sh --self-test`: OK (root + scaffold policies only) | OK, extended to all 4 policies (root, scaffold, `fuzz/deny.toml`, `examples/island-flock/deny.toml` — Codex review caught that the satellite policies shipped with no negative proof) |
 
 ## 🔬 Reproduce
 
