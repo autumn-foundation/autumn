@@ -76,7 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the option map, and the walk silently stopped at each of them. A token that
   merely starts with `-` is judged only when spelled like a flag, so prose
   arrows and slash-joined shorthand are not reported. Corpus-wide noise: zero.
-  `--list-options` prints the parsed option surface.
+  `--list-options` prints the parsed option surface. [no-plugin] — a CI gate
+  over this repo's own docs, with no surface an agent reaches for. The plugin
+  needed no correction either: it names none of the five dead flags, and its one
+  `build --release` is a genuine `cargo build --release` in the image builder.
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
