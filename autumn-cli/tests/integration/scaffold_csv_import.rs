@@ -1205,6 +1205,72 @@ fn normalized_relative_path(path: &Path, root: &Path) -> String {
     parts.join("/")
 }
 
+/// `.autumn/generated.toml` keys every entry by the file's path, so a migration
+/// directory's second-resolution timestamp is embedded in the manifest BODY as
+/// well as in the manifest's own path (issue #1835). [`normalized_relative_path`]
+/// rewrites the path only, so a second-boundary straddle still failed the
+/// byte-comparison on the manifest itself — the same failure that motivated the
+/// path normalization, one layer in. Rewrite the stamp in the key too.
+fn normalized_manifest_line(line: &str) -> String {
+    let Some(rest) = line.strip_prefix("[files.\"migrations/") else {
+        return line.to_owned();
+    };
+    let Some((dir, tail)) = rest.split_once('/') else {
+        return line.to_owned();
+    };
+    let Some((stamp, name)) = dir.split_once('_') else {
+        return line.to_owned();
+    };
+    if stamp.len() != 14 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return line.to_owned();
+    }
+    format!("[files.\"migrations/<timestamp>_{name}/{tail}")
+}
+
+#[test]
+fn normalized_manifest_line_rewrites_only_a_migration_stamp() {
+    assert_eq!(
+        normalized_manifest_line("[files.\"migrations/20260907041023_create_posts/up.sql\"]"),
+        "[files.\"migrations/<timestamp>_create_posts/up.sql\"]"
+    );
+    // Not a migration key.
+    assert_eq!(
+        normalized_manifest_line("[files.\"src/models/post.rs\"]"),
+        "[files.\"src/models/post.rs\"]"
+    );
+    // Not a 14-digit stamp.
+    assert_eq!(
+        normalized_manifest_line("[files.\"migrations/readme_notes/up.sql\"]"),
+        "[files.\"migrations/readme_notes/up.sql\"]"
+    );
+    // A digest line is left exactly alone.
+    assert_eq!(
+        normalized_manifest_line("digest = \"abc\""),
+        "digest = \"abc\""
+    );
+
+    // The exact shape a Windows CI run failed on: two manifests identical but
+    // for the second the two scaffolds landed in. They must normalize equal.
+    let manifest = |stamp: &str| {
+        format!(
+            "[files.\"migrations/{stamp}_create_posts/down.sql\"]\ndigest = \"fb5c66\"\n\n\
+             [files.\"migrations/{stamp}_create_posts/up.sql\"]\ndigest = \"59cc3a\"\n\n\
+             [files.\"src/models/post.rs\"]\ndigest = \"50b7f4\""
+        )
+    };
+    let normalize = |body: String| {
+        body.lines()
+            .map(normalized_manifest_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        normalize(manifest("20260907041023")),
+        normalize(manifest("20260907041024")),
+        "a one-second straddle must not make two identical scaffolds differ"
+    );
+}
+
 /// The normalization above is what a Windows CI run caught: it used to strip a
 /// literal `"migrations/"` prefix, which never matched a `\`-separated path, so
 /// the timestamp survived and a second-boundary straddle became a hard failure
@@ -1283,6 +1349,7 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                     let body = if rel.ends_with(".autumn/generated.toml") {
                         body.lines()
                             .filter(|line| !line.starts_with("invocation = "))
+                            .map(normalized_manifest_line)
                             .collect::<Vec<_>>()
                             .join("\n")
                     } else {
