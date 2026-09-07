@@ -14,12 +14,14 @@ help: the trait `JsonSink` is not implemented for `Customer`
    = note: an autumn `#[model]` with `#[classified]` columns has no `Serialize` impl: the classification is carried by the type, so the whole record cannot reach a sink
    = note: release each classified column at a declared boundary and respond with the released view, e.g. `Json(SupportView::from_released(customer.email.declassify(&YOUR_BOUNDARY)))`
    = note: declare the boundary with `autumn_web::declassify!`; see docs/guide/data-classification.md
-help: the trait `IntoResponse` is implemented for `autumn_web::Json<T>`
+help: the trait `IntoResponse` is conditionally implemented for `autumn_web::Json<T>`
   --> src/extract.rs
    |
    | / impl<T> IntoResponse for Json<T>
    | | where
    | |     T: crate::classify::JsonSink,
-   | |_________________________________^
+   | |________-------------------------^
+   |          |
+   |          unsatisfied requirement introduced here: `Customer: JsonSink`
    = note: required for `autumn_web::Json<Customer>` to implement `IntoResponse`
    = note: this error originates in the attribute macro `autumn_web::model` (in Nightly builds, run with -Z macro-backtrace for more info)
