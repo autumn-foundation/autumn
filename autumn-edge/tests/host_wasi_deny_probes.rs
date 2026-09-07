@@ -50,11 +50,31 @@ fn filesystem_import_is_refused_at_load() {
 "#));
 }
 
-/// R2 (real function, never implemented): a guest that imports a real WASI
-/// socket call must fail to link — the shim's closed world excludes the
-/// network the same way it excludes the filesystem.
+/// R2 (real function, never implemented): a guest that imports the exact
+/// socket call the pre-registration names (`sock_connect`) must fail to
+/// link — the shim's closed world excludes the network the same way it
+/// excludes the filesystem. A Codex review on this PR correctly flagged
+/// that an earlier version of this probe imported `sock_send` instead,
+/// which never exercised the pre-registered `sock_connect` criterion at
+/// all: had the host implemented one but not the other, this suite would
+/// have stayed green while still claiming the `sock_connect` line was
+/// checked. Both are now probed independently.
 #[test]
-fn network_import_is_refused_at_load() {
+fn socket_connect_import_is_refused_at_load() {
+    assert_denied_at_load(&run(r#"(module
+  (import "wasi_snapshot_preview1" "sock_connect"
+    (func $sock_connect (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "_start")))
+"#));
+}
+
+/// R2 (real function, never implemented), second representative: the same
+/// closed-world claim for `sock_send`, kept as an independent probe rather
+/// than folded into the one above so a failure names the specific import
+/// that regressed.
+#[test]
+fn socket_send_import_is_refused_at_load() {
     assert_denied_at_load(&run(r#"(module
   (import "wasi_snapshot_preview1" "sock_send"
     (func $sock_send (param i32 i32 i32 i32 i32) (result i32)))
@@ -77,23 +97,43 @@ fn invented_namespace_import_is_refused_at_load() {
 }
 
 /// R3 (environment): the module doc says `environ_get`/`environ_sizes_get`
-/// "answer empty," which is a documentation claim about a function
-/// (`write_two_zeroes`) that could regress silently — a wrong-but-plausible
-/// implementation still links and still answers *something*. This guest
-/// traps deliberately if either returned size is non-zero, so "the capsule
-/// exited without answering" (clean fallthrough, no trap) is the only way to
-/// pass, and a real leak would show up as a distinctly different, trapped
+/// "answer empty," which is a documentation claim about two independently
+/// registered functions (`write_two_zeroes` for the sizes call, a separate
+/// closure for `environ_get` itself) that could regress silently — a
+/// wrong-but-plausible implementation still links and still answers
+/// *something*. A Codex review on this PR correctly flagged that an earlier
+/// version of this probe only called `environ_sizes_get`, leaving
+/// `environ_get` itself uncovered: a regression that writes real data
+/// through `environ_get` while the sizes call still reports zero would have
+/// passed unnoticed. This guest sentinel-fills both the pointer-array and
+/// string-buffer regions before calling `environ_get`, and traps if either
+/// the reported sizes or either buffer changed. "The capsule exited without
+/// answering" (clean fallthrough, no trap) is the only way to pass; a real
+/// leak in either function shows up as a distinctly different, trapped
 /// detail instead.
 #[test]
 fn environ_is_actually_empty_not_just_documented() {
     let outcome = run(r#"(module
   (import "wasi_snapshot_preview1" "environ_sizes_get"
     (func $environ_sizes_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "environ_get"
+    (func $environ_get (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")
+    ;; Sentinel-fill the pointer-array region (100..108) and the string
+    ;; buffer region (200..208) before handing them to environ_get.
+    (i32.store (i32.const 100) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 104) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 200) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 204) (i32.const 0xdeadbeef))
     (drop (call $environ_sizes_get (i32.const 0) (i32.const 4)))
     (if (i32.ne (i32.load (i32.const 0)) (i32.const 0)) (then (unreachable)))
-    (if (i32.ne (i32.load (i32.const 4)) (i32.const 0)) (then (unreachable)))))
+    (if (i32.ne (i32.load (i32.const 4)) (i32.const 0)) (then (unreachable)))
+    (drop (call $environ_get (i32.const 100) (i32.const 200)))
+    (if (i32.ne (i32.load (i32.const 100)) (i32.const 0xdeadbeef)) (then (unreachable)))
+    (if (i32.ne (i32.load (i32.const 104)) (i32.const 0xdeadbeef)) (then (unreachable)))
+    (if (i32.ne (i32.load (i32.const 200)) (i32.const 0xdeadbeef)) (then (unreachable)))
+    (if (i32.ne (i32.load (i32.const 204)) (i32.const 0xdeadbeef)) (then (unreachable)))))
 "#);
     let EdgeOutcome::Fallthrough { reason, detail } = &outcome else {
         panic!("expected a fallthrough, the guest was served: {outcome:?}");
@@ -101,22 +141,35 @@ fn environ_is_actually_empty_not_just_documented() {
     assert_eq!(*reason, FallthroughReason::CapsuleError);
     assert_eq!(
         detail, "the capsule exited without answering",
-        "a trapped detail here means environ_sizes_get returned a non-zero \
-         count -- a real leak, not the documented empty environment: {detail}"
+        "a trapped detail here means environ_sizes_get reported a non-zero \
+         count, or environ_get wrote through the sentinel buffers -- a real \
+         leak, not the documented empty environment: {detail}"
     );
 }
 
-/// R3 (arguments): the same probe for `args_sizes_get`.
+/// R3 (arguments): the same probe for `args_sizes_get`/`args_get`, same
+/// Codex-review gap closed the same way.
 #[test]
 fn args_are_actually_empty_not_just_documented() {
     let outcome = run(r#"(module
   (import "wasi_snapshot_preview1" "args_sizes_get"
     (func $args_sizes_get (param i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "args_get"
+    (func $args_get (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")
+    (i32.store (i32.const 100) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 104) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 200) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 204) (i32.const 0xdeadbeef))
     (drop (call $args_sizes_get (i32.const 0) (i32.const 4)))
     (if (i32.ne (i32.load (i32.const 0)) (i32.const 0)) (then (unreachable)))
-    (if (i32.ne (i32.load (i32.const 4)) (i32.const 0)) (then (unreachable)))))
+    (if (i32.ne (i32.load (i32.const 4)) (i32.const 0)) (then (unreachable)))
+    (drop (call $args_get (i32.const 100) (i32.const 200)))
+    (if (i32.ne (i32.load (i32.const 100)) (i32.const 0xdeadbeef)) (then (unreachable)))
+    (if (i32.ne (i32.load (i32.const 104)) (i32.const 0xdeadbeef)) (then (unreachable)))
+    (if (i32.ne (i32.load (i32.const 200)) (i32.const 0xdeadbeef)) (then (unreachable)))
+    (if (i32.ne (i32.load (i32.const 204)) (i32.const 0xdeadbeef)) (then (unreachable)))))
 "#);
     let EdgeOutcome::Fallthrough { reason, detail } = &outcome else {
         panic!("expected a fallthrough, the guest was served: {outcome:?}");
@@ -124,7 +177,8 @@ fn args_are_actually_empty_not_just_documented() {
     assert_eq!(*reason, FallthroughReason::CapsuleError);
     assert_eq!(
         detail, "the capsule exited without answering",
-        "a trapped detail here means args_sizes_get returned a non-zero \
-         count -- a real leak, not the documented empty argv: {detail}"
+        "a trapped detail here means args_sizes_get reported a non-zero \
+         count, or args_get wrote through the sentinel buffers -- a real \
+         leak, not the documented empty argv: {detail}"
     );
 }

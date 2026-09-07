@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does `autumn-edge`'s host still deny the WASI escapes its own module doc claims? (pursue: 5/5 probes held vs. 5/5 pre-set line)
+# ⛏️ Prospect: does `autumn-edge`'s host still deny the WASI escapes its own module doc claims? (pursue: 6/6 probes held vs. pre-set line)
 
 ## 🎯 Question
 
@@ -108,8 +108,8 @@ Pre-registration commit: the commit that added this file to
 
 ## 🧪 Apparatus
 
-`autumn-edge/tests/host_wasi_deny_probes.rs` — five new integration tests,
-gated behind the existing non-default `host` feature, plus one new
+`autumn-edge/tests/host_wasi_deny_probes.rs` — six integration tests, gated
+behind the existing non-default `host` feature, plus one new
 `[dev-dependencies]` line (`wat = "1"`, matching the sibling `autumn` crate's
 identical use for its own escape suite). Each probe is a hand-written WAT
 module driven entirely through `autumn-edge`'s public API
@@ -127,37 +127,59 @@ named in the pre-registration.
   probe that needs to observe a *returned value* (not just "trap vs. no
   trap") would need to either emit a minimal valid response frame or extend
   this harness with a stderr-reporting convention; neither was needed for
-  the five properties tested here.
-- Only 5 of the plan doc's 17 named threats (R1–R17) are covered:
-  filesystem (R1), one representative unimplemented real WASI function
-  standing in for "closed world" (R2, via `sock_send`), one invented-namespace
-  host escape (also R2-shaped, mirroring `plugin_sandbox`'s `HOST_COMMAND`),
-  and environment/argv leakage (R3). R11–R17 (header/cookie stripping,
-  manifest/artifact integrity, consent surfacing) are **plugin_sandbox-only
-  concepts** — `autumn-edge` has no manifest, no declared-capability grant
-  surface, and strips credential headers before the frame is built (i.e.
-  before the guest ever runs), so those threats don't have an edge-host
-  analogue to probe in the first place. R4/R6–R9 were in the plan doc's own
-  gaps (its table skips R4 and jumps R3→R5); this assay did not chase them
-  down since they're not part of Keystone's memo either. This is a
-  targeted subset chosen for "cheapest apparatus that can falsify the
-  specific baseline Keystone's memo questioned," not a full port of the
-  17-item table.
-- **Negative control, run and reverted, not merged**: to prove the two
+  the six properties tested here.
+- 6 of the plan doc's 17 named threats (R1–R17) are covered: filesystem
+  (R1), two independent real-function representatives of "closed world"
+  (R2, via `sock_connect` and `sock_send`), one invented-namespace host
+  escape (also R2-shaped, mirroring `plugin_sandbox`'s `HOST_COMMAND`), and
+  environment/argv leakage (R3, both the size call and the value call for
+  each). R11–R17 (header/cookie stripping, manifest/artifact integrity,
+  consent surfacing) are **plugin_sandbox-only concepts** — `autumn-edge`
+  has no manifest, no declared-capability grant surface, and strips
+  credential headers before the frame is built (i.e. before the guest ever
+  runs), so those threats don't have an edge-host analogue to probe in the
+  first place. R4/R6–R9 were in the plan doc's own gaps (its table skips R4
+  and jumps R3→R5); this assay did not chase them down since they're not
+  part of Keystone's memo either. This is a targeted subset chosen for
+  "cheapest apparatus that can falsify the specific baseline Keystone's
+  memo questioned," not a full port of the 17-item table.
+- **Negative controls, run and reverted, not merged**: to prove the
   "answers empty" probes actually falsify (rather than passing vacuously),
-  `environ_sizes_get`'s registration was temporarily edited to write a
-  non-zero count (3, 40) instead of calling `write_two_zeroes`, the
-  `environ_is_actually_empty_not_just_documented` test was rerun, and it
-  failed exactly as expected — `left: "the capsule trapped: wasm
-  \`unreachable\` instruction executed"` vs. `right: "the capsule exited
-  without answering"`. The edit was then reverted; `git diff --stat
-  autumn-edge/src/host.rs` shows zero net change to that file in this PR.
-  No such control was run for the three link-time-refusal probes — an
-  unresolved import failing to link is `wasmi`'s own behavior, not
-  `autumn-edge` code this assay could plausibly edit to fake a pass, so the
-  cheaper substitute is confidence from reading `define_wasi_shim`'s full
-  body (grepped and read in the Prior Art check) rather than a second
+  two separate registrations were each temporarily edited to leak, the
+  corresponding test rerun to confirm it failed, then reverted:
+  `environ_sizes_get` was made to write a non-zero count (3, 40) instead of
+  calling `write_two_zeroes` — `environ_is_actually_empty_not_just_documented`
+  failed with `left: "the capsule trapped: wasm \`unreachable\` instruction
+  executed"` vs. `right: "the capsule exited without answering"`; separately,
+  `environ_get` was made to write a real value through its pointer-array
+  argument — the same test failed the same way. Both edits were reverted;
+  `git diff --stat autumn-edge/src/host.rs` shows zero net change to that
+  file in this PR. No such control was run for the four link-time-refusal
+  probes — an unresolved import failing to link is `wasmi`'s own behavior,
+  not `autumn-edge` code this assay could plausibly edit to fake a pass, so
+  the cheaper substitute is confidence from reading `define_wasi_shim`'s
+  full body (grepped and read in the Prior Art check) rather than a second
   synthetic regression.
+- **Update (Codex review round)** — two real gaps found and fixed, both
+  confirmed by re-reading before changing anything:
+  1. The pre-registration named `sock_connect` as the representative
+     unimplemented real WASI function, but the first version of this probe
+     imported `sock_send` instead — a real discrepancy between the
+     committed criterion and what was actually exercised. Had the host
+     implemented one but not the other, the suite would have stayed green
+     while the report still claimed the `sock_connect` line was checked.
+     Fixed by testing both independently
+     (`socket_connect_import_is_refused_at_load`,
+     `socket_send_import_is_refused_at_load`) rather than silently
+     substituting one for the other in the write-up.
+  2. The environ/args probes only ever called the `_sizes_get` functions,
+     never `environ_get`/`args_get` themselves — both are registered
+     independently in `define_wasi_shim`, so a regression that leaked real
+     data through the value-returning call while the size call still
+     reported zero would have passed unnoticed. Fixed by sentinel-filling
+     the pointer-array and buffer regions before calling `environ_get`/
+     `args_get` and trapping if either changed; confirmed to actually catch
+     a leak with the second negative control described above.
 
 ## 📊 Assay
 
@@ -168,12 +190,13 @@ cargo test -p autumn-edge --features host --test host_wasi_deny_probes
 | Probe | Threat class | Expected | Result |
 |---|---|---|---|
 | `filesystem_import_is_refused_at_load` | R1 — ambient filesystem | refused at instantiation | **refused** (`"...could not be instantiated..."`) |
-| `network_import_is_refused_at_load` | R2 — closed world, real fn | refused at instantiation | **refused** |
+| `socket_connect_import_is_refused_at_load` | R2 — closed world, real fn (`sock_connect`) | refused at instantiation | **refused** |
+| `socket_send_import_is_refused_at_load` | R2 — closed world, real fn (`sock_send`) | refused at instantiation | **refused** |
 | `invented_namespace_import_is_refused_at_load` | R2 — closed world, invented namespace | refused at instantiation | **refused** |
-| `environ_is_actually_empty_not_just_documented` | R3 — environment | clean exit, no trap | **clean exit** (`"the capsule exited without answering"`) |
-| `args_are_actually_empty_not_just_documented` | R3 — argv | clean exit, no trap | **clean exit** |
+| `environ_is_actually_empty_not_just_documented` | R3 — environment (size + value calls) | clean exit, no trap | **clean exit** (`"the capsule exited without answering"`) |
+| `args_are_actually_empty_not_just_documented` | R3 — argv (size + value calls) | clean exit, no trap | **clean exit** |
 
-5/5 against the pre-set pursue line. Full crate suite re-run clean alongside
+6/6 against the pre-set pursue line. Full crate suite re-run clean alongside
 the new tests (`cargo test -p autumn-edge --features host`: 22 existing
 `#[cfg(test)]`/integration tests + 2 doctests, all passing, confirming the
 new dev-dependency and feature-gated test file didn't disturb anything
@@ -183,20 +206,21 @@ unrelated `unknown_lints` warning from a stale `clippy::unused_async_trait_impl`
 name in workspace lint config, reproducible on `trunk-dev` before this PR,
 not introduced by it).
 
-Worst-case probing: the negative control (see stubs list) is the worst case
-this assay could cheaply manufacture — an actual leak, caught. No attempt
-was made to fuzz WAT shapes beyond the five hand-written probes; each targets
+Worst-case probing: the two negative controls (see stubs list) are the worst
+case this assay could cheaply manufacture — an actual leak, caught, in both
+the size-reporting and value-returning halves of the R3 contract. No attempt
+was made to fuzz WAT shapes beyond the six hand-written probes; each targets
 one specific, named claim from the module doc rather than searching for
 unknown ones.
 
 ## 🏁 Verdict: **pursue** (the baseline holds) — with a real, separate structural finding
 
-**5/5 probes confirm `autumn-edge`'s host still holds every WASI-deny
+**6/6 probes confirm `autumn-edge`'s host still holds every WASI-deny
 property this assay could cheaply check, unmodified, despite the zero-commit
 gap Keystone's memo flagged.** Against the pre-set line, this is not a
 security emergency: the "do nothing yet" default in Keystone's memo (or
 either of its other two options) is not being chosen blind to an active
-hole, at least not one of these five shapes.
+hole, at least not one of these six shapes.
 
 That is not the same finding as "the two hosts are equivalently robust,"
 and this assay does not claim it. What it adds to Keystone's memo, precisely:
@@ -213,7 +237,7 @@ and this assay does not claim it. What it adds to Keystone's memo, precisely:
   `CapsuleError` fallthrough (`"the capsule could not be instantiated:
   {err}"`) — no `DeniedCapability`, no operation name, nothing a caller could
   alert on differently from an ordinary buggy capsule. Both fail closed
-  *today*, because `path_open`/`sock_send`/arbitrary namespaces are simply
+  *today*, because `path_open`/`sock_connect`/`sock_send`/arbitrary namespaces are simply
   never defined — but that is an accident of what's implemented, not a
   designed, inspectable contract the way `plugin_sandbox`'s allowlist scan
   is. If `autumn-edge` ever needs to run a **less-trusted** artifact (its own
@@ -231,7 +255,7 @@ and this assay does not claim it. What it adds to Keystone's memo, precisely:
   today" as a real gap rather than an accepted one. That weighing is still
   the human decision Keystone's memo correctly declined to make — this
   assay only replaces "we assume it still holds" with "it does hold, checked
-  five ways, and here specifically is the one place the two hosts' *designs*
+  six ways, and here specifically is the one place the two hosts' *designs*
   — not just their WASI surfaces — actually diverge."
 
 ## 💰 Cost to productionize
@@ -241,7 +265,7 @@ health on the baseline, not a build recommendation. For whoever picks up
 Keystone's memo next, this assay changes the cost estimate for option 1 only
 by naming one more piece already worth converging (the import-allowlist
 check itself, not just the WASI plumbing Keystone's memo already named) and
-by leaving five now-permanent regression tests in place that option 1's own
+by leaving six now-permanent regression tests in place that option 1's own
 "run the existing suite against both hosts" goal partially satisfies for
 `autumn-edge`'s side today, without waiting on the broader convergence
 decision.
@@ -254,16 +278,20 @@ cargo test -p autumn-edge --features host
 cargo clippy -p autumn-edge --features host --all-targets -- -D warnings
 ```
 
-Negative control (do not merge — for reproducing the falsifiability check
-only): in `autumn-edge/src/host.rs`, replace the
-`.func_wrap(WASI, "environ_sizes_get", write_two_zeroes)` registration with a
-closure that writes a non-zero count, rerun
-`environ_is_actually_empty_not_just_documented`, observe the trap, then
-revert.
+Negative controls (do not merge — for reproducing the falsifiability checks
+only): in `autumn-edge/src/host.rs`,
+1. replace the `.func_wrap(WASI, "environ_sizes_get", write_two_zeroes)`
+   registration with a closure that writes a non-zero count, rerun
+   `environ_is_actually_empty_not_just_documented`, observe the trap, then
+   revert; and, separately,
+2. replace the `"environ_get"` registration's closure body (currently
+   `|_caller, _environ, _buffer| errno::SUCCESS`) with one that writes a
+   real value through the `environ` pointer argument, rerun the same test,
+   observe the trap, then revert.
 
 ## 🗄️ Dismantle
 
-The five probe tests are kept, not dismantled — like the query-budget
+The six probe tests are kept, not dismantled — like the query-budget
 generalization assay's fixtures, they are cheap, real regression coverage
 for a security property that had zero adversarial coverage before this PR,
 and they cost nothing to leave in `autumn-edge`'s own test suite behind its
