@@ -11311,6 +11311,68 @@ mod tests {
         }
     }
 
+    /// 🪝 Snag finding (exploratory QA, not yet filed as a numbered issue):
+    /// `generate auth` is backend-aware for its migration DDL (see
+    /// `plan_auth_emits_sqlite_ddl_including_sessions` above and issue #1927),
+    /// but its Cargo.toml dependency wiring is not. It unconditionally splices
+    /// in `super::model::MODEL_DEPS`, which hard-codes
+    /// `diesel = { features = ["postgres", ...] }`, `diesel-async = { features
+    /// = ["postgres"] }`, and `pq-sys` regardless of the target backend, and it
+    /// never enables `autumn-web`'s `sqlite` feature the way
+    /// `ensure_autumn_web_mail_feature` auto-wires `mail`.
+    ///
+    /// Verified end-to-end against a real generated app (not just this plan):
+    /// following the documented workflow — set `[database] primary_url =
+    /// "sqlite://..."` in `autumn.toml`, then run `autumn generate auth` — and
+    /// nothing else, produces an app that compiles (silently defaulting to the
+    /// Postgres `RuntimeBackend`, since `sqlite` was never enabled) but fails
+    /// at boot against its own configured database with: "Failed to create
+    /// database pool: `SQLite` is a recognized database backend but its runtime
+    /// pool is only available in a build of autumn-web compiled with
+    /// `--features sqlite`; this is a default (Postgres) build". Manually
+    /// adding `features = ["sqlite"]` avoids that crash but still leaves an
+    /// unnecessary `pq-sys` (bundled libpq, requiring a C toolchain) in a
+    /// project that can never reach a Postgres server — the opposite of the
+    /// "zero-ops... no database server to install" pitch in
+    /// `docs/guide/sqlite-in-production.md`, whose support matrix explicitly
+    /// claims `generate auth` "compiles and runs on either backend" / "on
+    /// whichever backend the app selected".
+    ///
+    /// Quarantined until `MODEL_DEPS` (shared with `generate model` /
+    /// `generate scaffold`) is made backend-aware the same way DDL rendering
+    /// already is — a design decision (e.g. a backend-conditional dep list, or
+    /// an `ensure_autumn_web_sqlite_feature` mirroring the mail/oauth2/webauthn
+    /// helpers) out of scope for a QA session to make unilaterally.
+    #[test]
+    #[ignore = "known gap: generate auth's Cargo.toml deps are not backend-aware (Snag finding, not yet a numbered issue)"]
+    fn plan_auth_on_sqlite_app_wires_sqlite_feature_and_skips_postgres_only_deps() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+
+        plan_auth(tmp.path(), "User", "20260908000000")
+            .expect("generate auth must scaffold on a SQLite app")
+            .execute(Flags::default())
+            .unwrap();
+
+        let cargo_toml = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+
+        assert!(
+            cargo_toml.contains("sqlite"),
+            "a SQLite-targeted app must come out of `generate auth` with \
+             autumn-web's `sqlite` feature enabled, the same way `mail` is \
+             auto-wired by `ensure_autumn_web_mail_feature`: {cargo_toml}"
+        );
+        assert!(
+            !cargo_toml.contains("pq-sys"),
+            "a SQLite-only app should never need `pq-sys` (bundled libpq) — it \
+             can never reach a Postgres server: {cargo_toml}"
+        );
+    }
+
     /// Collect every generated `.rs` file under `root`, recursively.
     fn generated_rust_files(root: &Path) -> Vec<(std::path::PathBuf, String)> {
         let mut out = Vec::new();
