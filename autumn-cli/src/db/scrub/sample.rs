@@ -1233,7 +1233,7 @@ const ITERATION_LIMIT_MESSAGE: &str = "the sample selection did not settle; the 
 /// appears, including inside a block comment or a quoted identifier — and a
 /// Postgres identifier may legally contain `$`. Rather than assume the source
 /// has no such name, widen the tag until the body cannot contain it.
-fn dollar_tag(body: &str) -> String {
+pub fn dollar_tag(body: &str) -> String {
     let mut tag = String::from("$autumn_walk$");
     while body.contains(&tag) {
         tag.insert(tag.len() - 1, '_');
@@ -1241,7 +1241,7 @@ fn dollar_tag(body: &str) -> String {
     tag
 }
 
-fn comment_safe(name: &str) -> String {
+pub fn comment_safe(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ') {
@@ -1586,9 +1586,16 @@ impl SamplePlan {
                     None
                 };
                 (
+                    // Sanitized here rather than at the point of use: this label
+                    // is printed into a `--` comment in the dry run, where a
+                    // newline inside a quoted identifier would end the comment
+                    // and leave the rest of the name as executable SQL in a
+                    // sequence advertised as paste-ready.
                     format!(
                         "{} ({} -> {})",
-                        edge.name, edge.child_table, edge.parent_table
+                        comment_safe(&edge.name),
+                        comment_safe(&edge.child_table),
+                        comment_safe(&edge.parent_table),
                     ),
                     format!(
                         "SELECT count(*) AS n FROM {} AS c \
@@ -2951,6 +2958,48 @@ mod tests {
                 "every reference to {name} must be public-qualified: {all}"
             );
         }
+    }
+
+    #[test]
+    fn an_integrity_label_cannot_break_out_of_a_sql_comment() {
+        // The label is printed after `-- verifies` in the dry run. A newline
+        // inside a quoted identifier — which Postgres permits — would end that
+        // comment and leave the rest of the name as executable SQL in a
+        // sequence the operator was told to paste verbatim. A `COMMIT;` there
+        // lands between the sample's deletes and the column rewrites, so the
+        // paste commits a sampled but UNSCRUBBED database.
+        let (tables, _) = schema();
+        let hostile = "comments_user_fk\nCOMMIT; SELECT 'INJECTED'; --";
+        let keys = vec![
+            fk(hostile, "comments", "user_id", "users", "id"),
+            fk("users_country_fk", "users", "country_id", "countries", "id"),
+        ];
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let labels: Vec<String> = plan
+            .integrity_statements()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert!(
+            !labels.is_empty(),
+            "the fixture must produce a label to sanitize"
+        );
+        for label in &labels {
+            assert!(
+                !label.contains('\n') && !label.contains('\r'),
+                "a label reaching a `--` comment must stay on one line: {label:?}"
+            );
+        }
+        assert!(
+            labels.iter().any(|l| l.starts_with("comments_user_fk")),
+            "and must still identify the constraint: {labels:?}"
+        );
     }
 
     #[test]

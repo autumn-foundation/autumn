@@ -2484,8 +2484,8 @@ fn classify_and_apply(
                 for rewrite in &table.encrypted {
                     eprintln!(
                         "  -- {}.{}: re-encrypted per row under the target's key ({} mode)",
-                        table.table,
-                        rewrite.column,
+                        sample::comment_safe(&table.table),
+                        sample::comment_safe(&rewrite.column),
                         if rewrite.deterministic {
                             "deterministic"
                         } else {
@@ -3601,11 +3601,18 @@ fn lock_statements(
 /// because a bare `SELECT count(*)` in a pasted sequence returns a number and
 /// then commits anyway — exactly the run the command refuses.
 fn integrity_assertion(check: &str) -> String {
-    format!(
-        "DO $$ BEGIN IF ({check}) > 0 THEN \
+    // The tag is chosen from the finished body, never fixed: `check` carries
+    // quoted identifiers, a Postgres identifier may legally contain `$`, and
+    // dollar quoting is lexical — a `$$` inside a column name would close this
+    // block mid-statement and turn the rest into a syntax error in the one
+    // sequence the operator was told to paste.
+    let body = format!(
+        "BEGIN IF ({check}) > 0 THEN \
          RAISE EXCEPTION 'a foreign key this run checked does not resolve'; \
-         END IF; END $$"
-    )
+         END IF; END"
+    );
+    let tag = sample::dollar_tag(&body);
+    format!("DO {tag} {body} {tag}")
 }
 
 /// The SQL that asserts a promised-empty table really is empty.
@@ -3617,12 +3624,16 @@ fn integrity_assertion(check: &str) -> String {
 /// returning a row. The table name appears only as an identifier — already
 /// quoted — so nothing has to be escaped into a string literal.
 fn emptiness_assertion(table: &str) -> String {
-    format!(
-        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM {}) THEN \
+    // Same reason as `integrity_assertion`: the table name is an identifier and
+    // may legally contain `$`, so the delimiter comes from the body.
+    let body = format!(
+        "BEGIN IF EXISTS (SELECT 1 FROM {}) THEN \
          RAISE EXCEPTION 'a table this run promised would be empty still holds rows'; \
-         END IF; END $$",
+         END IF; END",
         qualified_ident(table)
-    )
+    );
+    let tag = sample::dollar_tag(&body);
+    format!("DO {tag} {body} {tag}")
 }
 
 /// The emptying passes `emptying_phases` returns, as `(table, statement)`.
@@ -3904,6 +3915,49 @@ fn execute(
 
 #[cfg(test)]
 mod tests {
+    use super::{emptiness_assertion, integrity_assertion};
+
+    // ── Printed assertions survive hostile identifiers ──────────────────────
+
+    #[test]
+    fn an_assertion_delimiter_cannot_be_closed_by_an_identifier() {
+        // Postgres permits `$` in a quoted identifier, and dollar quoting is
+        // lexical — a fixed `DO $$ ... $$` around a query naming `"us$$ers"`
+        // closes mid-statement, so the sequence the operator was told to paste
+        // is a syntax error rather than the check it advertises.
+        let check = r#"SELECT count(*) FROM "public"."us$$ers""#;
+        let sql = integrity_assertion(check);
+        assert!(
+            !sql.starts_with("DO $$ "),
+            "the delimiter must come from the body, not a constant: {sql}"
+        );
+        assert!(sql.contains(check), "the check itself must survive: {sql}");
+        let tag = sql
+            .split_whitespace()
+            .nth(1)
+            .expect("the block must open with `DO <tag>`");
+        assert_eq!(
+            sql.matches(tag).count(),
+            2,
+            "the tag must appear exactly twice — opening and closing: {sql}"
+        );
+        assert!(sql.ends_with(tag), "and must close the block: {sql}");
+    }
+
+    #[test]
+    fn an_emptiness_assertion_delimiter_widens_the_same_way() {
+        let sql = emptiness_assertion("jobs$autumn_walk$queue");
+        let tag = sql
+            .split_whitespace()
+            .nth(1)
+            .expect("the block must open with `DO <tag>`");
+        assert_ne!(
+            tag, "$autumn_walk$",
+            "a table name carrying the default tag must push it wider: {sql}"
+        );
+        assert_eq!(sql.matches(tag).count(), 2, "opened and closed once: {sql}");
+    }
+
     use std::collections::{BTreeMap, BTreeSet};
 
     use autumn_schema_core::{Backend, Column, ColumnType, ForeignKey, Index, Table};
