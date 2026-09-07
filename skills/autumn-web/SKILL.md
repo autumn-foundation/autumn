@@ -1247,10 +1247,11 @@ Two things to get right when generating this code:
 
 - **There is no default store.** `OutboundWebhookPlugin::new(store)` takes one as
   a required argument. `InMemoryOutboundWebhookHandler` ships with the framework
-  but is process-local — subscriptions and delivery logs vanish on restart and
-  are not shared across replicas — so it is for tests, development and
-  single-process apps. Anything multi-replica needs a durable shared
-  implementation of the trait. (`OutboundWebhookStore` /
+  but is process-local AND unbounded — subscriptions and delivery logs vanish
+  on restart, are not shared across replicas, and are held in plain hash maps
+  with no cap or eviction, so `log_delivery` retains every attempt for the
+  lifetime of the process — so it is for tests and local development. Any
+  long-running app needs a durable shared implementation of the trait. (`OutboundWebhookStore` /
   `InMemoryOutboundWebhookStore` are compatibility aliases; prefer the
   `…Handler` names in new code.)
 - **`dispatch()` is not transactional.** It writes a delivery-log row per
