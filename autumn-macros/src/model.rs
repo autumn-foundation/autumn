@@ -1713,7 +1713,7 @@ fn lower_filter_comparison(
     let Some(sql_op) = sql_comparison_op(&binary.op) else {
         // Spanned on the operator, not the whole expression: the operator is
         // the part to change.
-        return Err(filter_grammar_error(&binary.op));
+        return Err(filter_grammar_error(binary.op));
     };
     let (ident, field) = filter_field(&binary.left, model_ident, fields)?;
     let literal = filter_literal(&binary.right)?;

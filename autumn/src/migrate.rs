@@ -2701,7 +2701,7 @@ fn run_pending_locked_inner(
 /// [`pending_shard_framework_migrations`] (the status path) cannot disagree about
 /// what a shard needs. Adding a shard-required set means adding it here.
 #[cfg(feature = "db")]
-fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
+const fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
     [
         &crate::version_history::VERSION_HISTORY_MIGRATIONS,
         &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,

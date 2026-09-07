@@ -1247,6 +1247,8 @@ async fn ac5_only_the_changed_derivation_is_enqueued() {
 /// finishes the job without repairing anything twice.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+// One linear sweep, asserted at each step; splitting it would hide the sequence.
+#[allow(clippy::too_many_lines)]
 async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
     let (_guard, _pg, pool) = setup().await;
     let mut conn = pool.get().await.expect("conn");

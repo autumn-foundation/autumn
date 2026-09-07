@@ -10386,12 +10386,16 @@ async fn setup_database(
     // registry collision stops the boot; a database failure only logs, because
     // a derivation whose backfill has not run is stale rather than broken and
     // `/actuator/derivations` reports exactly that.
-    if runtime_boot && crate::derivation::has_derivation_descriptors() {
-        if let Err(e) = start_derivation_backfill(topology.as_ref(), shards.as_ref()).await {
-            #[cfg(feature = "managed-pg")]
-            crate::managed_pg::emergency_stop_async().await;
-            return Err(e);
-        }
+    // Needs an explicit `if let` rather than `?`, so the managed-pg child is
+    // stopped before unwinding. `?` would skip the cfg-gated stop call.
+    #[allow(clippy::question_mark)]
+    if runtime_boot
+        && crate::derivation::has_derivation_descriptors()
+        && let Err(e) = start_derivation_backfill(topology.as_ref(), shards.as_ref()).await
+    {
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        return Err(e);
     }
 
     let (replica_readiness, replica_migration_check) = if topology
