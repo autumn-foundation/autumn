@@ -2067,6 +2067,10 @@ STYLE_ATTR_OPEN = re.compile(
 # The property boundary matters on its own: `--display:none` is a custom
 # PROPERTY and changes nothing, so an unbounded match rejected a live link.
 _DISPLAY_DECL = re.compile(r'\s*display' + _TWS + r'*:([^;]*)', re.I)
+# `visibility` hides differently and has to be asked separately: the element
+# keeps its BOX — a hidden anchor is still 30x17 — but paints nothing and
+# hit-tests through to whatever is behind it, so it is not a route.
+_VISIBILITY_DECL = re.compile(r'\s*visibility' + _TWS + r'*:([^;]*)', re.I)
 _IMPORTANT = re.compile(r'!' + _TWS + r'*important' + _TWS + r'*$', re.I)
 _CSS_COMMENT = re.compile(r'/\*.*?\*/|/\*.*', re.S)
 
@@ -2148,10 +2152,26 @@ def _display_none(style):
     # rejected it. An unterminated `/*` runs to the end of the attribute, so
     # both forms are blanked — space for space, since nothing here depends on
     # the length but the habit is what keeps offsets safe elsewhere.
+    return _effective(style, _DISPLAY_DECL) == 'none'
+
+
+def _effective(style, decl):
+    """The winning value of one property in an inline style, lowercased.
+
+    The cascade, shared rather than written once per property — `display` and
+    `visibility` differ only in which declaration they look for, and this file
+    has learned what happens when a rule lives in one place and not its
+    sibling.
+    """
+    # CSS comments are not declarations. `color:red; /* display:none; */`
+    # renders a visible 30px link, but reading the comment as a declaration
+    # rejected it. An unterminated `/*` runs to the end of the attribute, so
+    # both forms are blanked — space for space, since nothing here depends on
+    # the length but the habit is what keeps offsets safe elsewhere.
     style = _CSS_COMMENT.sub(lambda c: ' ' * len(c.group(0)), style)
     winner, winner_important = None, False
-    for decl in _declarations(style):
-        m = _DISPLAY_DECL.match(decl)
+    for piece in _declarations(style):
+        m = decl.match(piece)
         if not m:
             continue
         value = m.group(1).strip()
@@ -2162,7 +2182,48 @@ def _display_none(style):
         # and this one is not.
         if important or not winner_important:
             winner, winner_important = value, important
-    return winner is not None and winner.lower() == 'none'
+    return winner.lower() if winner is not None else None
+
+
+def _visibility_hidden(style):
+    """Whether an inline style makes an element paint nothing.
+
+    `hidden` and `collapse` both do — measured in Chromium: the anchor keeps a
+    30x17 box, but a hit test at its centre lands on the BODY behind it, so
+    there is nothing to click.
+    """
+    return _effective(style, _VISIBILITY_DECL) in ('hidden', 'collapse')
+
+
+def _invisible_anchor(tag_src, content_src):
+    """Whether an anchor paints nothing because of `visibility`.
+
+    UNLIKE `display:none`, this one has an escape, and the escape is why it
+    cannot just be added to the hidden-tag machinery: `visibility` INHERITS,
+    and a descendant may set it back. Measured in Chromium —
+    `<a style="visibility:hidden"><span style="visibility:visible">Mail</span></a>`
+    paints `Mail` and a hit test on it lands inside the anchor, so it IS a
+    route, while the same anchor without that span hit-tests through to the
+    BODY behind it and is not.
+
+    So: hidden by the anchor's own style, and no tag inside its content
+    setting a visible `visibility`. The content is read from RAW, like the
+    anchor's own style, because values are blanked upstream.
+    """
+    if not _visibility_hidden(_style_value_str(tag_src)):
+        return False
+    for m in STYLE_ATTR_OPEN.finditer(content_src):
+        value = _style_value(m)
+        if value and _effective(value, _VISIBILITY_DECL) not in (
+                None, 'hidden', 'collapse'):
+            return False
+    return True
+
+
+def _style_value_str(tag_src):
+    """The inline style of a single tag, or `''` if it has none."""
+    m = STYLE_ATTR_OPEN.fullmatch(tag_src)
+    return (_style_value(m) or '') if m else ''
 
 
 def _style_value(m):
@@ -2958,6 +3019,12 @@ def edges_from(f):
         if not has_content(img_view[tag.end():stop], txt[tag.end():stop],
                            raw[tag.end():stop]):
             continue
+        # `visibility:hidden` is checked LAST, and separately from the hidden
+        # machinery above, because it is the one form of hiding a descendant
+        # can undo — so the answer needs the anchor's content, which the
+        # checks above do not have.
+        if _invisible_anchor(raw[tag.start():tag.end()], raw[tag.end():stop]):
+            continue
         add_relative(next(g for g in m.groups() if g is not None),
                      markdown=False)
 
@@ -3081,7 +3148,12 @@ def edges_from(f):
 # Breadth-first from every root. Only roots and guide pages carry edges: that
 # restriction is what keeps a security report or a `///` citation from standing
 # in for a route a reader can walk.
-seen = set()
+# Seeded with the roots, not left empty: an instruction file may sit INSIDE
+# the guide tree — `docs/guide/topic/AGENTS.md` is both an entry surface and a
+# node — and processing a frontier item never adds that item itself. Such a
+# root reported ITSELF as unreachable, which is the gate contradicting its own
+# root list.
+seen = set(roots)
 frontier = list(roots)
 while frontier:
     cur = frontier.pop()
@@ -6168,6 +6240,45 @@ self_test() {
   printf '# A\n\n- [Mail](docs/guide/mail.md)\n' > "$c9ky/skills/x/AGENT.md"
   git -C "$c9ky" add -A && git -C "$c9ky" commit -qm agent-md-is-not-a-skill-root
   check "an AGENT.md beside a skill is not a root" fail "$c9ky"
+
+  # `visibility:hidden` keeps the BOX — the anchor is still 30x17 — but paints
+  # nothing and hit-tests through to the body behind it, so there is nothing
+  # to click. Only `display:none` was recognised, and this let an orphan pass.
+  local c9kz="$tmp/c9kz"; make_corpus "$c9kz"
+  printf '# Jobs\n\n<a style="visibility:hidden" href="mail.md">Mail</a>\n' \
+    > "$c9kz/docs/guide/jobs.md"
+  git -C "$c9kz" add -A && git -C "$c9kz" commit -qm visibility-hidden-anchor
+  check "a visibility:hidden anchor is not a route" fail "$c9kz"
+
+  # ...and `collapse` hides the same way outside a table.
+  local c9la="$tmp/c9la"; make_corpus "$c9la"
+  printf '# Jobs\n\n<a style="visibility:collapse" href="mail.md">Mail</a>\n' \
+    > "$c9la/docs/guide/jobs.md"
+  git -C "$c9la" add -A && git -C "$c9la" commit -qm visibility-collapse-anchor
+  check "a visibility:collapse anchor is not a route" fail "$c9la"
+
+  # ...but UNLIKE `display:none` this one has an escape, which is why it is not
+  # simply another hidden tag: `visibility` inherits, and a descendant can set
+  # it back. This span paints and hit-tests INSIDE the anchor, so it is a
+  # route, and rejecting the anchor on its own style alone strands the page.
+  local c9lb="$tmp/c9lb"; make_corpus "$c9lb"
+  printf '# Jobs\n\n<a style="visibility:hidden" href="mail.md"><span style="visibility:visible">Mail</span></a>\n' \
+    > "$c9lb/docs/guide/jobs.md"
+  git -C "$c9lb" add -A && git -C "$c9lb" commit -qm visibility-descendant-override
+  check "a visible descendant restores the route" pass "$c9lb"
+
+  # A root may sit INSIDE the guide tree, and is then both an entry surface and
+  # a node. Processing a frontier item never adds that item itself, so such a
+  # root reported ITSELF as unreachable — the gate contradicting its own root
+  # list. Both pages here are reachable: one as a root, one through it.
+  local c9lc="$tmp/c9lc"; make_corpus "$c9lc"
+  mkdir -p "$c9lc/docs/guide/topic"
+  printf '# T\n\ntext\n' > "$c9lc/docs/guide/topic/other.md"
+  printf '# A\n\n- [Mail](../mail.md)\n' > "$c9lc/docs/guide/topic/AGENTS.md"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n- [Other](docs/guide/topic/other.md)\n' \
+    > "$c9lc/README.md"
+  git -C "$c9lc" add -A && git -C "$c9lc" commit -qm root-inside-the-guide-tree
+  check "a root inside the guide tree is reachable" pass "$c9lc"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
