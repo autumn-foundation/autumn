@@ -56,12 +56,20 @@ const GUARD_RESPONSE_PATH: [&str; 5] = ["autumn_web", "reexports", "axum", "resp
 /// `#[ws]` handler could otherwise return an unrelated user type merely
 /// named `Response` (fourth Codex review pass on #2513).
 fn is_guard_response_path(path: &syn::Path) -> bool {
+    // `GUARD_RESPONSE_PATH[0]` is the literal `"autumn_web"` crate root, but
+    // the guard macro's already-finalized output this recognizes may carry a
+    // renamed or overridden root instead (#1828) — compare it against the
+    // actively resolved name, or a genuine match is missed.
     path.segments.len() == GUARD_RESPONSE_PATH.len()
+        && path.segments.first().is_some_and(|segment| {
+            segment.ident == crate::crate_path::current_target_path_segment()
+        })
         && path
             .segments
             .iter()
-            .zip(GUARD_RESPONSE_PATH.iter())
-            .all(|(segment, expected)| segment.ident == expected)
+            .skip(1)
+            .zip(&GUARD_RESPONSE_PATH[1..])
+            .all(|(segment, expected)| segment.ident == *expected)
 }
 
 fn is_app_state_type(ty: &syn::Type) -> bool {

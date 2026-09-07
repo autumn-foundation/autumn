@@ -44,6 +44,13 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tracing-subscriber = "0.3"
 example-e2e = { path = "../../example-e2e" }
+# Plain HTTP client for `tests/post_slug_race_e2e.rs` (#2544) — no cookie/CSRF
+# helper exists in `example-e2e` (only Chromium + Postgres provisioning), and
+# a `cookie_store(true)` client is exactly what the issue's own `curl -c/-b`
+# repro needs: one shared session across every concurrent `/submit`.
+# `rustls-tls`, not the default TLS backend, to match `example-e2e`'s own
+# choice and avoid pulling in a second, openssl-backed stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies"] }
 
 [lints.rust]
 unsafe_code = "forbid"

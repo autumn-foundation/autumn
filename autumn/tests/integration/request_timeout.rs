@@ -218,8 +218,17 @@ async fn fast_route_not_timed_out_when_deadline_enabled() {
 // A handler that hangs well past the deadline, used to prove that a request
 // which times out *while the server is draining* returns a single clean 503
 // (freeing its worker) — no double cancellation, no hang.
+//
+// Notifies `HANG_ENTERED` on entry so the test can wait for the request to
+// actually be in-flight (accepted and dispatched) instead of guessing with a
+// sleep: a fixed-delay guess can fire before the connection is even
+// accepted, which races the graceful-shutdown listener teardown and resets
+// the client's not-yet-accepted socket instead of exercising the deadline.
+static HANG_ENTERED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 #[get("/hang")]
 async fn hang() -> &'static str {
+    HANG_ENTERED.notify_one();
     tokio::time::sleep(Duration::from_secs(30)).await;
     "never"
 }
@@ -252,8 +261,6 @@ async fn timeout_fires_cleanly_during_graceful_drain() {
             .ok();
     });
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     // Begin a request that will hang past the deadline.
     let client = tokio::spawn(async move {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -267,8 +274,8 @@ async fn timeout_fires_cleanly_during_graceful_drain() {
     });
 
     // Simulate SIGTERM mid-request: flip to draining and cancel the listener
-    // while the hang handler is still in-flight.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    // once the hang handler is confirmed in-flight (not on a timing guess).
+    HANG_ENTERED.notified().await;
     probes.begin_draining();
     shutdown_clone.cancel();
 

@@ -1352,7 +1352,7 @@ mod tests {
     #[test]
     fn app_state_debug_with_pool() {
         let config = config::DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(crate::test_urls::primary("test")),
             pool_size: 5,
             ..Default::default()
         };
@@ -1366,12 +1366,12 @@ mod tests {
     #[test]
     fn database_topology_state_exposes_replica_as_read_pool() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1398,12 +1398,12 @@ mod tests {
     #[test]
     fn read_pool_uses_primary_when_replica_is_unready_and_policy_allows_fallback() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1434,12 +1434,12 @@ mod tests {
     #[test]
     fn read_pool_does_not_route_to_unready_replica_when_policy_fails_readiness() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };
@@ -1463,12 +1463,12 @@ mod tests {
     #[tokio::test]
     async fn readiness_fails_when_app_state_replica_is_unready_and_policy_is_fail_readiness() {
         let primary_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/primary".into()),
+            url: Some(crate::test_urls::primary("primary")),
             pool_size: 5,
             ..Default::default()
         };
         let replica_config = config::DatabaseConfig {
-            url: Some("postgres://localhost/replica".into()),
+            url: Some(crate::test_urls::replica("primary", "replica")),
             pool_size: 2,
             ..Default::default()
         };

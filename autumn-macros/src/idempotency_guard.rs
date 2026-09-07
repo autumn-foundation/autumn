@@ -783,12 +783,33 @@ fn path_expr_matches(expr: &Expr, expected: &[&str]) -> bool {
 }
 
 fn path_matches(path: &syn::Path, expected: &[&str]) -> bool {
-    path.segments.len() == expected.len()
+    if path.segments.len() != expected.len() {
+        return false;
+    }
+    // Only an `expected` path actually rooted at the framework crate (some
+    // call sites match a `core::...`/`std::...` path instead, e.g. the
+    // `Option`/`Result` patterns above) needs its leading segment compared
+    // against the actively resolved name rather than the literal
+    // `"autumn_web"` — once a rename or `crate = "..."` override (#1828) is
+    // in effect, that's what an earlier-expanded stacked macro's own
+    // (already-finalized) output is rooted at instead (Codex review, #2552).
+    let root_matches = if expected.first() == Some(&"autumn_web") {
+        path.segments.first().is_some_and(|segment| {
+            segment.ident == crate::crate_path::current_target_path_segment()
+        })
+    } else {
+        path.segments
+            .first()
+            .zip(expected.first())
+            .is_some_and(|(segment, expected)| segment.ident == *expected)
+    };
+    root_matches
         && path
             .segments
             .iter()
-            .zip(expected)
-            .all(|(segment, expected)| segment.ident == expected)
+            .skip(1)
+            .zip(&expected[1..])
+            .all(|(segment, expected)| segment.ident == *expected)
 }
 
 fn path_ends_with(path: &syn::Path, expected: &str) -> bool {

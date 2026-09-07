@@ -2042,6 +2042,60 @@ Every generator accepts:
   collision. `mod.rs` and `schema.rs` are always treated as modify-in-place
   edits and don't trigger collisions.
 
+## Undoing a generator: `autumn destroy`
+
+`autumn destroy <thing> <the same arguments>` reverses a matching `generate`.
+It removes the files that invocation owns. It also takes that invocation's
+edits back out of the files it shares with other resources.
+
+`destroy` refuses to delete a file you have edited. To tell your edits from its
+own output, `generate` records a digest of every file it **owns** in
+`.autumn/generated.toml` — the files it creates, not the shared files it edits
+in place. `destroy` deletes an owned file when the content matches that digest,
+or matches what the current templates render. It reports `Diverged` and stops
+when the content matches neither.
+
+Each entry also records the inputs that produced it — the command's arguments,
+a fingerprint of the `autumn.generate.toml` they resolve from, and the resolved
+database backend — so the digest only counts when all three match. That is what
+`destroy` asks for anyway. Changing the recipe, or moving the project between
+SQLite and Postgres, drops the baseline for every resource, back to comparing
+against the current templates: a stale baseline is worse than no baseline.
+`autumn destroy model Post` after `autumn generate model Post title:String`
+renders a different model and is refused, rather than deleting the file while
+the `schema.rs` and `Cargo.toml` reverts, which are derived from those fields,
+quietly do nothing. It also keeps one command from claiming another's files:
+`autumn new --starter` writes through the same machinery, and no generator
+owns what it wrote.
+
+Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
+against. Without it, `destroy` can only compare against the current templates —
+so a CLI upgrade that changed a template makes every untouched file that
+generator wrote look edited.
+
+Two cases need `--force`:
+
+- The project has no manifest entry for the file — it was generated before
+  Autumn wrote the manifest — **and** the template has changed since. Prefer
+  re-running the original generator command with `--force` first (for example
+  `autumn generate model Post title:String --force`): that rewrites the file
+  and records its digest, and the destroy then works without `--force`.
+- You edited the file, and you want it deleted anyway.
+
+`--force` skips the content check. It does not skip the applied-migration
+guard: `destroy` never removes migration files that a configured database
+records as applied.
+
+A file that several resources share (a mailer's `_layout.html`, say) is
+never a hard error and is never force-deleted. `destroy` removes it only
+when it is provably this generator's own output and no sibling resource is
+left in its directory; otherwise it warns and leaves it in place.
+
+`destroy` also removes each entry it acted on from the manifest, and deletes
+the manifest once it holds nothing. Deleting or hand-editing the manifest
+loses the baseline for the entries you removed — nothing fails, but those
+files fall back to comparing against the current templates only.
+
 ## `autumn db pull` — scaffold models from an existing database
 
 The generators above are greenfield: you describe a table with the `name:Type`
