@@ -11367,12 +11367,23 @@ mod tests {
         // `cargo_toml.contains("sqlite")` while leaving `RuntimeBackend` on
         // Postgres and the boot failure this test exists to catch fully intact
         // (caught in review on #2604).
-        let autumn_web_line = cargo_toml
-            .lines()
-            .find(|line| line.trim_start().starts_with("autumn-web"))
-            .unwrap_or_else(|| {
-                panic!("Cargo.toml must declare an `autumn-web` dependency: {cargo_toml}")
-            });
+        // Finds the line declaring dependency `name` specifically (the first
+        // non-whitespace character after `name` must be `=`), so `"diesel"`
+        // does not also match `diesel-async` or `diesel_migrations`.
+        let dep_line = |name: &str| -> &str {
+            cargo_toml
+                .lines()
+                .find(|line| {
+                    line.trim_start()
+                        .strip_prefix(name)
+                        .is_some_and(|rest| rest.trim_start().starts_with('='))
+                })
+                .unwrap_or_else(|| {
+                    panic!("Cargo.toml must declare a `{name}` dependency: {cargo_toml}")
+                })
+        };
+
+        let autumn_web_line = dep_line("autumn-web");
         assert!(
             autumn_web_line.contains("\"sqlite\""),
             "a SQLite-targeted app must come out of `generate auth` with \
@@ -11380,6 +11391,28 @@ mod tests {
              the same way `mail` is auto-wired by \
              `ensure_autumn_web_mail_feature`: {autumn_web_line}"
         );
+
+        // Diesel's own per-backend feature must follow the app's chosen
+        // backend too: leaving `diesel`/`diesel-async` pinned to
+        // `features = ["postgres", ...]` compiles in (and, for `diesel`,
+        // transitively re-pulls `pq-sys` for) a Postgres client the app can
+        // never reach, even after `pq-sys`'s own direct dependency line is
+        // removed and autumn-web's `sqlite` feature is enabled (caught in
+        // review on #2604 — a fix that stopped there would still leave this
+        // regression uncaught).
+        let diesel_line = dep_line("diesel");
+        let diesel_async_line = dep_line("diesel-async");
+        assert!(
+            !diesel_line.contains("\"postgres\""),
+            "a SQLite-only app should not compile in Diesel's Postgres \
+             backend, which transitively re-pulls `pq-sys`: {diesel_line}"
+        );
+        assert!(
+            !diesel_async_line.contains("\"postgres\""),
+            "a SQLite-only app should not compile in diesel-async's Postgres \
+             backend: {diesel_async_line}"
+        );
+
         assert!(
             !cargo_toml.contains("pq-sys"),
             "a SQLite-only app should never need `pq-sys` (bundled libpq) — it \
