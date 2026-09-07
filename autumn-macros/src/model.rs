@@ -7606,15 +7606,28 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // The predicate is `datetime_local_serde_attr` itself, not a re-derivation of
     // "is this a datetime": the schema must describe exactly the fields that
     // actually receive the adapter, or the two drift.
-    let datetime_local_property_names: Vec<String> = fields_for_new
+    //
+    // Nullability is carried alongside the name and re-applied below.
+    // `datetime_local_serde_attr` accepts `Option<DateTime<..>>` too (it unwraps
+    // the `Option` before matching), so this widening reaches optional datetime
+    // columns as well — and replacing the property wholesale would DISCARD the
+    // `oneOf [.., null]` branch the emitter put there, while the generated
+    // deserializer still accepts an explicit `null`. A string-only schema would
+    // then reject a valid create payload.
+    let datetime_local_properties: Vec<(String, bool)> = fields_for_new
         .iter()
         .filter(|f| datetime_local_serde_attr(&f.ty).is_some())
         .filter_map(|f| {
             // `raw_field_names: true` above, so the property is the bare ident.
             let raw = f.ident.as_ref()?.to_string();
-            Some(raw.strip_prefix("r#").unwrap_or(&raw).to_owned())
+            let name = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
+            Some((name, is_option_type(&f.ty)))
         })
         .collect();
+    let datetime_local_property_names: Vec<&String> =
+        datetime_local_properties.iter().map(|(n, _)| n).collect();
+    let datetime_local_property_nullable: Vec<bool> =
+        datetime_local_properties.iter().map(|(_, n)| *n).collect();
     let new_struct_schema_body = if datetime_local_property_names.is_empty() {
         new_struct_schema_body
     } else {
@@ -7624,14 +7637,26 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .get_mut("properties")
                 .and_then(|__p| __p.as_object_mut())
             {
-                for __autumn_name in [#(#datetime_local_property_names),*] {
+                for (__autumn_name, __autumn_nullable) in [
+                    #((#datetime_local_property_names, #datetime_local_property_nullable)),*
+                ] {
                     if let Some(__autumn_prop) = __autumn_props.get_mut(__autumn_name) {
-                        *__autumn_prop = ::autumn_web::reexports::serde_json::json!({
+                        let __autumn_widened = ::autumn_web::reexports::serde_json::json!({
                             "type": "string",
                             "description": "RFC 3339, or an offsetless local datetime \
                                             (YYYY-MM-DDTHH:MM[:SS[.f]]) as posted by an \
                                             HTML `datetime-local` control.",
                         });
+                        // An optional column keeps its null branch: the adapter
+                        // unwraps the `Option` but the deserializer still takes
+                        // an explicit `null`.
+                        *__autumn_prop = if __autumn_nullable {
+                            ::autumn_web::reexports::serde_json::json!({
+                                "oneOf": [__autumn_widened, { "type": "null" }]
+                            })
+                        } else {
+                            __autumn_widened
+                        };
                     }
                 }
             }

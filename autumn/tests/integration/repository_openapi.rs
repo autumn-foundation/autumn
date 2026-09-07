@@ -467,6 +467,7 @@ mod schema_datetime {
             id -> Int8,
             title -> Text,
             occurred_at -> Timestamptz,
+            maybe_occurred_at -> Nullable<Timestamptz>,
         }
     }
 }
@@ -479,6 +480,7 @@ pub struct DatedRow {
     pub id: i64,
     pub title: String,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub maybe_occurred_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `#[model]` injects its own datetime-local-tolerant deserializer on every
@@ -514,6 +516,33 @@ fn the_new_schema_admits_the_offsetless_datetime_its_deserializer_takes() {
     assert!(
         schema["properties"]["title"].get("description").is_none(),
         "the widening must not leak onto neighbouring properties"
+    );
+}
+
+/// `datetime_local_serde_attr` unwraps the `Option`, so an OPTIONAL datetime
+/// column receives the adapter too — and the widening must keep the null branch
+/// the emitter put there. Replacing the property wholesale with a string-only
+/// schema would reject an explicit `null` that the generated deserializer
+/// accepts.
+#[test]
+fn the_widening_keeps_the_null_branch_of_an_optional_datetime() {
+    let schema =
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<NewDatedRow>())
+            .expect("the create companion registers its schema");
+    let prop = &schema["properties"]["maybe_occurred_at"];
+
+    let branches = prop["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an optional datetime keeps its oneOf: {prop}"));
+    assert!(
+        branches.iter().any(|b| b["type"] == "null"),
+        "the null branch must survive the widening: {prop}"
+    );
+    assert!(
+        branches
+            .iter()
+            .any(|b| b["type"] == "string" && b.get("format").is_none()),
+        "and the string branch must carry the widened, format-free shape: {prop}"
     );
 }
 
