@@ -15,10 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #2587). Exact `Display` output is outside the SemVer surface (see
   `STABILITY.md`), and the `application/problem+json` body is unaffected: it
   renders the wrapped error, so `detail` still reads `Validation failed` with
-  the fields in `errors`. Job and scheduled-task failure strings are
-  unaffected too — the failure capsule, the `last_error` column, alerts and
-  the `sys:tasks` broadcast now record `message()`, so a capsule recorded
-  before this change still replays as a match. Keep untrusted text out of
+  the fields in `errors`. Persisted failure strings are unaffected too — the
+  job failure capsule, the job and scheduled-task `last_error` columns, the
+  repository commit-hook `last_error`, alerts and the `sys:tasks` broadcast
+  now record `message()`, so a capsule recorded before this change still
+  replays as a match. Keep untrusted text out of
   `#[validate(message = "...")]`: `Display` output reaches your logs.
 
 - **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file

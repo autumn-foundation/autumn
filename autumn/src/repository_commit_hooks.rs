@@ -1464,7 +1464,10 @@ async fn run_repository_commit_hook_row_value(
 
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
+        // `message`, not `Display`: both nack paths persist this in
+        // `last_error`, so it must not move when `Display` gains the field
+        // list of a hook that returned a validation error.
+        Ok(Err(error)) => Err(error.message()),
         Err(panic) => Err(format_repository_commit_hook_panic(&*panic)),
     }
 }
