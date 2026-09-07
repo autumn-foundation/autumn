@@ -291,6 +291,19 @@ def read(f):
 # decoded), or literal-quoted, in any dotted combination — and only the VALUE
 # half stays a regex. Ten findings on this rule were spellings of a key; this is
 # the one place they can all be answered at once.
+#
+# WHY NOT `tomllib`, the obvious question about the hand-written scanning below:
+# it would be WRONG here, not merely unavailable. `tomllib` implements TOML 1.0,
+# and Cargo's parser does not. A `package = {` spread over several lines is
+# invalid TOML 1.0 — `tomllib.loads` raises `Invalid initial character for a key
+# part` — while `cargo metadata` accepts the same manifest and reports the
+# package normally. A gate built on the stricter parser would reject manifests
+# Cargo builds, which is this rule's recurring error with a standards document
+# standing in for "the spellings this repository happens to use". The oracle has
+# to be Cargo, because Cargo is what publishes the crate whose README is being
+# decided about. (`tomllib` is also 3.11+, which this file has already declined
+# to require once — see the atomic-group note far below — but that is the weaker
+# reason and would stop applying if the floor ever rose.)
 _BARE_KEY = re.compile(r'[A-Za-z0-9_-]+')
 
 
