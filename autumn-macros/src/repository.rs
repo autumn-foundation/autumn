@@ -2223,6 +2223,32 @@ fn ledger_append_ts(
     }
 }
 
+/// `#[validate(...)]` on the repository insert path (#2586).
+///
+/// `payload` is a `&New*` expression. Expands to a no-op for a payload type
+/// that does not implement `validator::Validate` — a model with no
+/// `#[validate]` columns, or a hand-written insert struct — so no repository
+/// needs migrating.
+///
+/// Pass the borrow the caller already holds rather than adding one: `validator`
+/// supplies a blanket `impl<T: Validate> Validate for &T`, so an extra `&` does
+/// still validate, but only through that impl. The direct form does not depend
+/// on it.
+fn maybe_validate_insert(payload: &TokenStream) -> TokenStream {
+    quote! {
+        {
+            // Both traits must be in scope for autoref resolution to choose
+            // between them; exactly one applies to any concrete payload type,
+            // so the other is (correctly) unused.
+            #[allow(unused_imports)]
+            use ::autumn_web::validation::{
+                MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+            };
+            (&::autumn_web::validation::MaybeValidate(#payload)).autumn_maybe_validate()
+        }
+    }
+}
+
 /// Generate the `move_to`/`move_before`/`move_after`/`move_up`/`move_down`
 /// inherent methods for a `position(...)`-declaring repository (issue #1358).
 /// Empty `TokenStream` when `config.position` is `None`, so every existing
@@ -4833,6 +4859,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             let __autumn_read_route =
                 ::autumn_web::repository::ReadRoute::from_state(state);
+        }
+    };
+
+    // #2586: `docs/guide/forms.md` promises the model's `#[validate]` rules
+    // hold on every write path — a form, an API endpoint, a seed, a job, a CSV
+    // import. Only the generated REST handlers ran them, so a caller reaching
+    // the repository directly bypassed the model entirely. These fragments put
+    // them on the insert path itself, after `#[normalize]` canonicalizes the
+    // payload and before the `before_create` hook, exactly as the guide states.
+    //
+    // Update paths are deliberately untouched: they keep the documented
+    // hooked / `validate_on_update = fetch` / blind table.
+    let validate_insert_new = {
+        let call = maybe_validate_insert(&quote! { new });
+        quote! { #call?; }
+    };
+    let validate_row_result = maybe_validate_insert(&quote! { __autumn_row });
+    let validate_item_result = maybe_validate_insert(&quote! { &item });
+    let validate_insert_each_row = {
+        let call = maybe_validate_insert(&quote! { __autumn_row });
+        quote! {
+            // Every row is checked before any row is written, so a rejected
+            // batch leaves nothing behind.
+            for __autumn_row in new {
+                #call?;
+            }
         }
     };
 
@@ -7747,10 +7799,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut successes = Vec::new();
                 let mut failures = Vec::new();
 
-                // 1. Run before_create hooks sequentially
+                // 1. Run the model's `#[validate]` rules, then before_create,
+                //    sequentially. A row either side rejects is reported by
+                //    index and skipped — the method's partial-success contract.
                 let mut valid_items = Vec::new();
                 for (idx, original_item) in new.iter().enumerate() {
                     let mut item = original_item.clone();
+                    // #2586: model rules first, so a hook never sees a row the
+                    // model would refuse.
+                    if let ::core::result::Result::Err(err) = #validate_item_result {
+                        failures.push((idx, err));
+                        continue;
+                    }
                     let mut ctx = MutationContext::new(MutationOp::Create);
                     #idempotency_setup
                     match self.hooks.before_create(&mut ctx, &mut item).await {
@@ -10099,6 +10159,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut successes = Vec::new();
                 let mut failures = Vec::new();
 
+                // #2586: run the model's `#[validate]` rules first and report a
+                // rejected row by index, keeping the partial-success contract.
+                // Only the surviving indices are recorded here; the rows are
+                // re-collected below solely when something was dropped, so a
+                // model with no rules still writes from the caller's slice with
+                // no extra clone.
+                let mut __autumn_kept: ::std::vec::Vec<usize> =
+                    ::std::vec::Vec::with_capacity(new.len());
+                for (idx, __autumn_row) in new.iter().enumerate() {
+                    match #validate_row_result {
+                        ::core::result::Result::Ok(()) => __autumn_kept.push(idx),
+                        ::core::result::Result::Err(err) => failures.push((idx, err)),
+                    }
+                }
+                let __autumn_retained: ::std::vec::Vec<#new_name>;
+                let new: &[#new_name] = if __autumn_kept.len() == new.len() {
+                    new
+                } else {
+                    __autumn_retained =
+                        __autumn_kept.iter().map(|&i| new[i].clone()).collect();
+                    &__autumn_retained
+                };
+                if new.is_empty() {
+                    return Ok((successes, failures));
+                }
+
                 let mut offset = 0;
                 let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                 let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
@@ -10145,9 +10231,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 return ::core::result::Result::Err(batch_err);
                             }
 
-                            // Fallback to row-by-row insertion for this chunk
+                            // Fallback to row-by-row insertion for this chunk.
+                            // #2586: chunks index into the retained rows, so map
+                            // back to the caller's index before reporting.
                             for (idx, item) in chunk.iter().enumerate() {
-                                let global_idx = offset + idx;
+                                let global_idx = __autumn_kept[offset + idx];
                                 let res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                     async move {
                                         let model = (#row_insert_expr_conn)
@@ -11634,20 +11722,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     ) = if config.sharded && config.tenant_scoped {
         let write_guard = &cross_shard_write_guard;
         (
-            quote! { #write_guard #save_body },
+            quote! { #write_guard #validate_insert_new #save_body },
             quote! { #write_guard #update_body },
             quote! { #write_guard #delete_body },
-            quote! { #write_guard #save_many_body },
+            quote! { #write_guard #validate_insert_each_row #save_many_body },
             quote! { #write_guard #save_many_skip_invalid_body },
             quote! { #write_guard #update_many_body },
             quote! { #write_guard #delete_many_body },
         )
     } else {
         (
-            save_body,
+            quote! { #validate_insert_new #save_body },
             update_body,
             delete_body,
-            save_many_body,
+            quote! { #validate_insert_each_row #save_many_body },
             save_many_skip_invalid_body,
             update_many_body,
             delete_many_body,
@@ -14223,9 +14311,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let fname = name.to_string();
                 if spec.string_fields.contains(&fname) {
                     let enc_ident = format_ident!("__autumn_foc_{name}");
+                    let norm_ident = format_ident!("__autumn_focn_{name}");
+                    // #2586: canonicalize the lookup argument on a `#[normalize]`
+                    // column, the same probe the derived `find_by_*` finders use.
+                    // The insert normalizes its payload, so a raw lookup would
+                    // miss the row it just wrote: the next identical call would
+                    // conflict on insert and then miss the re-lookup too, which
+                    // surfaces as the "no matching row on re-lookup" 500 rather
+                    // than the existing row. Runs before the encrypted-column
+                    // encoder, matching the finder order.
                     encode_lets.push(quote! {
+                        let #norm_ident = {
+                            #[allow(unused_imports)]
+                            use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                            ::autumn_web::normalize::SpezLookup::<#model_name>(
+                                ::core::marker::PhantomData, #fname, &#name,
+                            )
+                            .spez_lookup()
+                        };
                         let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                            #table_name_str, #fname, &#name,
+                            #table_name_str, #fname, &#norm_ident,
                         )
                         .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                             __e.to_string(),
@@ -14263,6 +14368,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let step1_lookup = make_lookup(quote! { &mut __rconn });
             let relookup = make_lookup(quote! { &mut conn });
+            // #2586: the create half runs the model's `#[validate]` rules, but a
+            // refusal must not overtake the found path. Step 1 is
+            // replica-eligible, so it can miss a row the primary already has
+            // (and a concurrent caller can insert one after it ran); this call
+            // would then insert nothing, which is exactly the case the rules do
+            // not govern. Confirm on the primary before refusing, so the answer
+            // does not depend on replication lag.
+            let validate_or_found = {
+                let primary_lookup = make_lookup(quote! { &mut __autumn_vconn });
+                let call = maybe_validate_insert(&quote! { new });
+                quote! {
+                    if let ::core::result::Result::Err(__autumn_invalid) = #call {
+                        let mut __autumn_vconn = self.__autumn_acquire_conn().await?;
+                        let __autumn_existing: ::core::option::Option<#model_name> =
+                            #primary_lookup;
+                        if let ::core::option::Option::Some(__autumn_row) = __autumn_existing {
+                            return ::core::result::Result::Ok((__autumn_row, false));
+                        }
+                        return ::core::result::Result::Err(__autumn_invalid);
+                    }
+                }
+            };
             let none_branch_msg = if config.soft_delete {
                 "find_or_create_by: the insert hit a unique conflict but no matching \
                  row was found on re-lookup. Two causes are possible: (1) the lookup \
@@ -14471,6 +14598,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             return ::core::result::Result::Ok((__row, false));
                         }
                     }
+                    // #2586: the row is about to be created, so normalize and
+                    // then run the model's `#[validate]` rules — the same
+                    // insert-path contract `save` has. Deliberately after the
+                    // lookup: a found row is returned unchanged, because this
+                    // call inserts nothing.
+                    #[allow(unused_imports)]
+                    use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                    #[allow(unused_imports)]
+                    use ::std::borrow::Borrow as _;
+                    let __autumn_normalized =
+                        ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                    let new: &#new_name = __autumn_normalized.borrow();
+                    #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
                     #step2
                 }
@@ -19576,6 +19716,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
+                // #2586: normalize before the per-row `#[validate]` pass inside
+                // the body, so a skip-invalid import judges — and stores — the
+                // same canonical value `save_many` does. Same zero-clone probe.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_skip_invalid_body
             }
 
@@ -21346,6 +21495,243 @@ mod tests {
         assert!(
             generated.contains("\"page\"") && generated.contains("\"size\""),
             "the query schema must document page and size params"
+        );
+    }
+
+    /// Slice `generated` from `start` up to `end` (or the end of the string).
+    fn section_between<'a>(generated: &'a str, start: &str, end: &str) -> &'a str {
+        let from = generated
+            .find(start)
+            .unwrap_or_else(|| panic!("missing `{start}` in generated code"));
+        let rest = &generated[from..];
+        let to = rest.find(end).unwrap_or(rest.len());
+        &rest[..to]
+    }
+
+    #[test]
+    fn repository_macro_save_validates_after_normalize_before_insert() {
+        // #2586: `save` runs the model's `#[validate]` rules on every caller —
+        // a job, a seed, a resolver — not only the generated REST handlers.
+        // Order: normalize, then validate, then insert.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(&generated, "async fn save (", "async fn update (");
+
+        let normalize_at = section
+            .find("spez_normalize ()")
+            .expect("save must normalize the payload");
+        // Pinned to the exact emitted form: `new` is already a `&New*`, so an
+        // extra borrow would validate only via `validator`'s blanket
+        // `impl Validate for &T`. Assert the shape that does not rely on it.
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("save must validate the payload");
+        let insert_at = section.find("insert_into").expect("save must insert");
+        assert!(
+            normalize_at < validate_at && validate_at < insert_at,
+            "save must normalize, then validate, then insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_validates_on_every_config_branch() {
+        // #2586 names four `save` bodies — blind, hooked, tenant-scoped and
+        // versioned. The splice sits at the one point they are composed, so
+        // prove that rather than trusting it.
+        for attr in [
+            quote! { Post },
+            quote! { Post, hooks = PostHooks },
+            quote! { Post, tenant_scoped },
+            quote! { Post, versioned = true },
+            quote! { Post, tenant_scoped, sharded },
+        ] {
+            let label = attr.to_string();
+            let generated =
+                repository_macro(attr, quote! { pub trait PostRepository {} }).to_string();
+            let section = section_between(&generated, "async fn save (", "async fn update (");
+            assert!(
+                section.contains("MaybeValidate (new)"),
+                "`{label}` must validate on the insert path: {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_hooked_save_validates_before_before_create() {
+        // #2586: on a hooked repository the rules run before `before_create`,
+        // as `docs/guide/forms.md` states.
+        let generated = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = section_between(&generated, "async fn save (", "async fn update (");
+
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("hooked save must validate the payload");
+        let hook_at = section
+            .find("before_create")
+            .expect("hooked save must run before_create");
+        assert!(
+            validate_at < hook_at,
+            "validation must run before the before_create hook: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_many_validates_each_row_before_insert() {
+        // #2586: the bulk insert path validates every row before writing any.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many (",
+            "async fn save_many_skip_invalid (",
+        );
+
+        let validate_at = section
+            .find("MaybeValidate (__autumn_row)")
+            .expect("save_many must validate each row");
+        let insert_at = section.find("insert_into").expect("save_many must insert");
+        assert!(
+            validate_at < insert_at,
+            "every row must be validated before the batch insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_many_skip_invalid_normalizes_and_reports_rows() {
+        // #2586: skip-invalid keeps its partial-success contract — a row the
+        // model rejects is reported by index, not raised. It also normalizes
+        // first, so validators see the same canonical value `save` gives them.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many_skip_invalid (",
+            "async fn update_many (",
+        );
+
+        let normalize_at = section
+            .find("spez_normalize_many ()")
+            .expect("skip-invalid must normalize rows");
+        let validate_at = section
+            .find("MaybeValidate (__autumn_row)")
+            .expect("skip-invalid must validate rows");
+        assert!(
+            normalize_at < validate_at,
+            "rows must be normalized before validation: {section}"
+        );
+        // Reported, not raised: the rejected index is pushed onto `failures`
+        // rather than `?`-propagated. `failures . push` alone would pass on the
+        // unchanged code (hook and constraint failures already use it), so pin
+        // the arm the validation pass writes.
+        assert!(
+            section.contains("::core::result::Result::Err (err) => failures . push ((idx , err))")
+                || section.contains(
+                    ":: core :: result :: Result :: Err (err) => failures . push ((idx , err))"
+                ),
+            "an invalid row must be reported by index, not raised: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_hooked_save_many_skip_invalid_validates_before_hook() {
+        // #2586: same contract on the hooked skip-invalid path.
+        let generated = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many_skip_invalid (",
+            "async fn update_many (",
+        );
+
+        let validate_at = section
+            .find("MaybeValidate (& item)")
+            .expect("hooked skip-invalid must validate rows");
+        let hook_at = section
+            .find("before_create")
+            .expect("hooked skip-invalid must run before_create");
+        assert!(
+            validate_at < hook_at,
+            "validation must run before before_create: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_find_or_create_by_validates_before_insert() {
+        // #2586: the get-or-insert path validates only when it is about to
+        // insert, so an existing row is still returned for a payload the model
+        // would reject.
+        let generated = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_slug(&self, slug: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        // Bound on the next generated item. `HasTenantIdColumn` is emitted only
+        // for a tenant_scoped repository, so it would never match here and the
+        // "section" would run to the end of the output.
+        let section = section_between(
+            &generated,
+            "pub async fn find_or_create_by_slug",
+            "pub async fn preload",
+        );
+
+        let lookup_at = section
+            .find("__autumn_acquire_read_conn")
+            .expect("get-or-insert must look up first");
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("get-or-insert must validate the payload");
+        let insert_at = section
+            .find("insert_into")
+            .expect("get-or-insert must insert");
+        assert!(
+            lookup_at < validate_at && validate_at < insert_at,
+            "validation must sit between the lookup and the insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_upsert_many_stays_unvalidated() {
+        // #2586 guard rail: `upsert_many` takes whole models and Postgres
+        // decides per row whether the statement inserts or updates, so there is
+        // no insert to hang the rule on. `docs/guide/forms.md` documents the
+        // carve-out; pin it so it cannot drift silently.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        // Bounded on the inherent impl that follows the trait impl. Note
+        // `impl PostRepository for PgPostRepository` does not match this needle.
+        let section = section_between(
+            &generated,
+            "async fn upsert_many (",
+            "impl PgPostRepository",
+        );
+        assert!(
+            !section.contains("MaybeValidate"),
+            "upsert_many is a documented carve-out: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_blind_update_still_validates_nothing() {
+        // #2586 guard rail: the fix is insert-only. A no-hooks, no-knob
+        // repository keeps the documented blind update path.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(&generated, "async fn update (", "async fn delete_by_id (");
+
+        assert!(
+            !section.contains("MaybeValidate"),
+            "the blind update path must stay unvalidated: {section}"
         );
     }
 

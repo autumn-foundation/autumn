@@ -295,7 +295,10 @@ through the repository's `save_many_skip_invalid`, so a row the database rejects
 is isolated and reported against its own CSV line instead of aborting the batch.
 Each row is re-encoded and handed to the module's own `decode_form`, so it is
 validated by exactly the `#[validate(...)]` rules a browser submission goes
-through. The planner auto-enables autumn-web's `multipart` feature (`csv` comes
+through. The repository then re-checks the model's rules on the **normalized**
+row (#2586), so on a `#[normalize]` column the two passes can disagree: such a
+row is reported against its CSV line as a write failure rather than as a field
+error, and nothing is written for it. The planner auto-enables autumn-web's `multipart` feature (`csv` comes
 from the export). **Insert-only** — no row is matched against an existing
 record, so re-uploading an exported file duplicates it; use
 `ImportMode::Upsert { by }` by hand for update-in-place. Bounded by

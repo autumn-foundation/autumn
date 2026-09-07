@@ -494,6 +494,37 @@ mod tests {
 
     #[test]
     #[allow(clippy::needless_borrow, unused_imports)]
+    fn maybe_validate_survives_an_extra_borrow() {
+        // #2586: the repository insert path holds its payload as `&New*`. An
+        // extra borrow makes `T` a reference type, which reaches the validating
+        // arm only through `validator`'s blanket `impl<T: Validate> Validate
+        // for &T`. Both forms must validate — if that blanket impl ever goes,
+        // the wrapped-reference form silently starts accepting everything, and
+        // this is what catches it.
+        use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
+
+        #[derive(validator::Validate)]
+        struct HasRules {
+            #[validate(length(min = 5))]
+            name: String,
+        }
+
+        let owned = HasRules {
+            name: "ab".to_string(),
+        };
+        let payload: &HasRules = &owned;
+        assert!(
+            (&MaybeValidate(payload)).autumn_maybe_validate().is_err(),
+            "the emitted form must reach the validating branch"
+        );
+        assert!(
+            (&MaybeValidate(&payload)).autumn_maybe_validate().is_err(),
+            "a wrapped `&&New*` must not fall through to the no-op arm"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrow, unused_imports)]
     fn maybe_validate_is_noop_for_non_validate_types() {
         // Autoref specialization: a type that does NOT implement `Validate`
         // falls through to the no-op branch and compiles + always succeeds.

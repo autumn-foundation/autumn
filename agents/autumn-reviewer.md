@@ -68,6 +68,11 @@ Check every file you review against these items. Report only items that fail.
   no `ChangesetForm`, no manual `.validate()` call, and no body-level error
   checks. Do NOT flag `Form<T>` that is followed by explicit validation logic
   or uses a `Changeset`/`ChangesetForm` helper; those are supported patterns.
+  Since #2586, also do NOT flag one that reaches a **generated** repository's
+  `save`/`save_many`/`save_many_skip_invalid`/`find_or_create_by_*` on a model
+  carrying `#[validate]` — the repository enforces those rules. That exemption
+  does not extend to a hand-written repository, raw `diesel::insert_into`,
+  `upsert_many`, or any update path.
 - **Route-level authorization missing**: Check that record-level operations
   (edit, delete, update) have `#[authorize("action", resource = Model)]` or
   explicit ownership checks in the handler body.

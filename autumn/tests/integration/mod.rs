@@ -378,6 +378,8 @@ mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;
 #[cfg(feature = "db")]
+mod validate_on_insert;
+#[cfg(feature = "db")]
 mod validate_on_update_blind;
 mod validate_patch_option_ip;
 mod webhook_outbound;

@@ -1205,6 +1205,39 @@ fn normalized_relative_path(path: &Path, root: &Path) -> String {
     parts.join("/")
 }
 
+/// Apply the same timestamp rule to `.autumn/generated.toml`'s body.
+///
+/// The manifest keys every file by its real relative path, so a migration
+/// directory's 14-digit stamp appears again *inside* this one file — where
+/// normalizing the file's own path cannot reach it. Two scaffolds one second
+/// apart then differ on the key alone, with every digest identical. Also drops
+/// the recorded `invocation`, which differs by construction: the two runs type
+/// different commands, and that is the flag under test.
+fn normalized_manifest_body(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line.starts_with("invocation = "))
+        .map(normalized_manifest_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rewrite `migrations/<14 digits>_` to `migrations/<timestamp>_` in one line.
+/// Anything else — a shorter run, a non-digit, a different parent — is left
+/// alone, mirroring `normalized_relative_path`.
+fn normalized_manifest_line(line: &str) -> String {
+    let Some((head, rest)) = line.split_once("migrations/") else {
+        return line.to_owned();
+    };
+    let Some((stamp, tail)) = rest.split_once('_') else {
+        return line.to_owned();
+    };
+    if stamp.len() == 14 && stamp.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{head}migrations/<timestamp>_{tail}")
+    } else {
+        line.to_owned()
+    }
+}
+
 /// The normalization above is what a Windows CI run caught: it used to strip a
 /// literal `"migrations/"` prefix, which never matched a `\`-separated path, so
 /// the timestamp survived and a second-boundary straddle became a hard failure
@@ -1241,6 +1274,41 @@ fn normalized_relative_path_is_separator_agnostic() {
         normalized_relative_path(&elsewhere, &root),
         "data/20260827030722_export.csv"
     );
+}
+
+/// The path rule above cannot reach the stamp recorded *inside* the manifest.
+/// A Windows run caught that gap the same way it caught the first one: two
+/// scaffolds a second apart, identical digests, keys one second off.
+#[test]
+fn normalized_manifest_body_rewrites_the_stamp_in_its_keys() {
+    let body = "\
+[files.\"migrations/20260907025351_create_posts/up.sql\"]
+digest = \"abc\"
+invocation = \"autumn generate scaffold post --import\"
+
+[files.\"src/models/post.rs\"]
+digest = \"def\"";
+    assert_eq!(
+        normalized_manifest_body(body),
+        "\
+[files.\"migrations/<timestamp>_create_posts/up.sql\"]
+digest = \"abc\"
+
+[files.\"src/models/post.rs\"]
+digest = \"def\""
+    );
+
+    // Two runs a second apart must normalize to the same text.
+    let earlier = "[files.\"migrations/20260907025351_create_posts/up.sql\"]";
+    let later = "[files.\"migrations/20260907025352_create_posts/up.sql\"]";
+    assert_eq!(
+        normalized_manifest_body(earlier),
+        normalized_manifest_body(later)
+    );
+
+    // A digest that merely looks stamp-like is untouched.
+    let digest = "digest = \"20260907025351_not_a_path\"";
+    assert_eq!(normalized_manifest_body(digest), digest);
 }
 
 fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
@@ -1280,11 +1348,10 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                     // flag under test — so the recorded command differs while
                     // the digests, which describe the output this gate is
                     // about, must not. Compare the digests, drop the command.
+                    // Its keys carry the migration timestamp too, which the
+                    // path normalization above cannot reach.
                     let body = if rel.ends_with(".autumn/generated.toml") {
-                        body.lines()
-                            .filter(|line| !line.starts_with("invocation = "))
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        normalized_manifest_body(&body)
                     } else {
                         body
                     };
