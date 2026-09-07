@@ -253,6 +253,30 @@ let row: Validated<ImportRow> = raw_row.validate()?;
 the framework, it derefs to `T` for reading, and it deliberately does **not**
 implement `DerefMut`, so it cannot be mutated back into an invalid state.
 
+#### Reading the failure back
+
+Off the HTTP path nothing renders the 422 for you, so read the field map off
+the error instead of re-running `validator` yourself:
+
+```rust,ignore
+match raw_row.validate() {
+    Ok(row) => import(row),
+    Err(err) => {
+        // "Validation failed: email: Must be a valid email address"
+        tracing::warn!("row {index} rejected: {err}");
+        for (field, messages) in err.details().into_iter().flatten() {
+            reject_field(field, messages);
+        }
+    }
+}
+```
+
+`AutumnError::details()` is `Some` for a validation failure and `None`
+otherwise, `AutumnError::code()` returns the same stable code the
+`problem+json` body carries (`autumn.validation_failed`, …), and `Display`
+appends the failing fields in sorted order. The HTTP response is unchanged:
+its `detail` still reads `Validation failed`, with the fields in `errors`.
+
 ### Which one?
 
 | The caller is… | Use | Failure looks like |

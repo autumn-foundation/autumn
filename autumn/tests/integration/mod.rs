@@ -84,6 +84,7 @@ mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
 mod error_reporting;
+mod error_validation_details;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;

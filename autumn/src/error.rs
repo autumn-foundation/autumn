@@ -603,7 +603,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::CONFLICT,
             details: None,
-            problem_type: Some("https://autumn.dev/problems/conflict"),
+            problem_type: Some(PROBLEM_TYPE_CONFLICT),
             cache_idempotency_response: false,
             #[cfg(debug_assertions)]
             backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
@@ -641,7 +641,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::GONE,
             details: None,
-            problem_type: Some("https://autumn.dev/problems/gone"),
+            problem_type: Some(PROBLEM_TYPE_GONE),
             cache_idempotency_response: false,
             #[cfg(debug_assertions)]
             backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
@@ -684,7 +684,7 @@ impl AutumnError {
             inner: Box::new(StringError(msg.into())),
             status: StatusCode::SERVICE_UNAVAILABLE,
             details: None,
-            problem_type: Some("https://autumn.dev/problems/query-timeout"),
+            problem_type: Some(PROBLEM_TYPE_QUERY_TIMEOUT),
             cache_idempotency_response: false,
             #[cfg(debug_assertions)]
             backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
@@ -705,6 +705,79 @@ impl AutumnError {
     #[must_use]
     pub const fn status(&self) -> StatusCode {
         self.status
+    }
+
+    /// Per-field validation messages, when this error came from validation.
+    ///
+    /// `Some` for [`AutumnError::validation`] and for a failed
+    /// [`ValidateExt::validate`](crate::ValidateExt::validate), `None`
+    /// otherwise. Read it where there is no HTTP response to parse: a GraphQL
+    /// resolver, a `#[task]`, a CLI command, an MCP tool, a mutation hook.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut errors = HashMap::new();
+    /// errors.insert("email".to_string(), vec!["Invalid".to_string()]);
+    ///
+    /// let err = AutumnError::validation(errors);
+    /// assert_eq!(err.details().unwrap()["email"], ["Invalid".to_string()]);
+    /// ```
+    #[must_use]
+    pub const fn details(&self) -> Option<&std::collections::HashMap<String, Vec<String>>> {
+        self.details.as_ref()
+    }
+
+    /// The stable problem code the rendered response carries.
+    ///
+    /// Same value as the `code` member of the `application/problem+json`
+    /// body, so a non-HTTP caller can branch on it without building a
+    /// response.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    ///
+    /// assert_eq!(AutumnError::not_found_msg("no such user").code(), "autumn.not_found");
+    /// assert_eq!(AutumnError::gone_msg("sunsetted").code(), "autumn.gone");
+    /// ```
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        let (status, problem_type) = self.rendered_problem(&self.inner.to_string());
+        problem_type
+            .and_then(problem_code_for_type)
+            .unwrap_or_else(|| problem_code_for(status, self.has_field_errors()))
+    }
+
+    /// Whether this error carries at least one field message.
+    fn has_field_errors(&self) -> bool {
+        self.details.as_ref().is_some_and(|map| !map.is_empty())
+    }
+
+    /// Status and problem type the rendered response uses.
+    ///
+    /// A cancelled database statement arrives as a plain `500`; the response
+    /// demotes it to a `503` query timeout, so [`code`](Self::code) reads the
+    /// same classification the body shows. `message` is the wrapped error's
+    /// `Display`, passed in because the caller already has it.
+    fn rendered_problem(&self, message: &str) -> (StatusCode, Option<&'static str>) {
+        let lowered = message.to_lowercase();
+        if lowered.contains("57014")
+            || lowered.contains("query_canceled")
+            || lowered.contains("canceling statement due to statement timeout")
+            || lowered.contains("statement timeout")
+            || lowered.contains("query canceled")
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(PROBLEM_TYPE_QUERY_TIMEOUT),
+            );
+        }
+        (self.status, self.problem_type)
     }
 
     #[doc(hidden)]
@@ -938,7 +1011,31 @@ fn pg_message_is_nul_rejection(message: &str) -> bool {
 
 impl std::fmt::Display for AutumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.inner)
+        write!(f, "{}", self.inner)?;
+
+        // Fold the field map in, so `err.to_string()` says which field failed
+        // off the HTTP path. Sorted, so the rendering is stable across runs.
+        // The problem+json `detail` renders the wrapped error alone and is
+        // unaffected.
+        let mut fields: Vec<_> = self
+            .details
+            .iter()
+            .flatten()
+            .filter(|(_, messages)| !messages.is_empty())
+            .collect();
+        fields.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (index, (field, messages)) in fields.into_iter().enumerate() {
+            f.write_str(if index == 0 { ": " } else { "; " })?;
+            write!(f, "{field}: ")?;
+            for (position, message) in messages.iter().enumerate() {
+                if position > 0 {
+                    f.write_str(", ")?;
+                }
+                f.write_str(message)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -988,17 +1085,13 @@ pub(crate) fn problem_details(
         detail
     };
 
-    // When an explicit problem type URI is provided, derive the machine-readable
-    // code from its path segment (last path component, hyphens → underscores,
-    // prefixed with "autumn."). This avoids having to enumerate every error type
-    // in a separate match table.
-    //
-    // Example: "https://autumn.dev/problems/query-timeout" → "autumn.query_timeout"
+    // An explicit problem type names the code: take the static one when the
+    // type is a known Autumn type, otherwise derive it from the URI so a new
+    // type still gets a code without an entry in the table.
     let code = explicit_type.map_or_else(
         || problem_code_for(status, has_validation_errors).to_owned(),
         |etype| {
-            let slug = etype.rsplit('/').next().unwrap_or(etype);
-            format!("autumn.{}", slug.replace('-', "_"))
+            problem_code_for_type(etype).map_or_else(|| derive_problem_code(etype), str::to_owned)
         },
     );
 
@@ -1061,6 +1154,36 @@ fn validation_errors(
         .collect();
     errors.sort_by(|left, right| left.field.cmp(&right.field));
     errors
+}
+
+/// Problem-type URIs Autumn attaches explicitly, overriding the one the
+/// status alone would select.
+const PROBLEM_TYPE_CONFLICT: &str = "https://autumn.dev/problems/conflict";
+const PROBLEM_TYPE_GONE: &str = "https://autumn.dev/problems/gone";
+const PROBLEM_TYPE_QUERY_TIMEOUT: &str = "https://autumn.dev/problems/query-timeout";
+
+/// Derive a code from a problem-type URI: last path segment, hyphens to
+/// underscores, `autumn.` prefix.
+///
+/// `"https://autumn.dev/problems/query-timeout"` → `"autumn.query_timeout"`.
+fn derive_problem_code(type_uri: &str) -> String {
+    let slug = type_uri.rsplit('/').next().unwrap_or(type_uri);
+    format!("autumn.{}", slug.replace('-', "_"))
+}
+
+/// Code for an explicitly attached problem type.
+///
+/// Same value [`derive_problem_code`] produces, held as a `&'static str` so
+/// [`AutumnError::code`] can return one. Add an entry alongside every new
+/// explicit type; `explicit_problem_codes_match_derivation` guards the two
+/// against drift.
+fn problem_code_for_type(type_uri: &str) -> Option<&'static str> {
+    match type_uri {
+        PROBLEM_TYPE_CONFLICT => Some("autumn.conflict"),
+        PROBLEM_TYPE_GONE => Some("autumn.gone"),
+        PROBLEM_TYPE_QUERY_TIMEOUT => Some("autumn.query_timeout"),
+        _ => None,
+    }
 }
 
 const fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
@@ -1138,21 +1261,8 @@ fn server_error_detail(status: StatusCode) -> String {
 
 impl IntoResponse for AutumnError {
     fn into_response(self) -> Response {
-        let mut status = self.status;
         let message = self.inner.to_string();
-        let mut problem_type = self.problem_type;
-
-        // Automatically map database query cancellation (statement timeout) to 503 Service Unavailable
-        let err_str = message.to_lowercase();
-        if err_str.contains("57014")
-            || err_str.contains("query_canceled")
-            || err_str.contains("canceling statement due to statement timeout")
-            || err_str.contains("statement timeout")
-            || err_str.contains("query canceled")
-        {
-            status = StatusCode::SERVICE_UNAVAILABLE;
-            problem_type = Some("https://autumn.dev/problems/query-timeout");
-        }
+        let (status, problem_type) = self.rendered_problem(&message);
 
         let details = self.details.clone();
         let cache_idempotency_response = self.cache_idempotency_response;
@@ -1748,6 +1858,204 @@ mod tests {
             assert_eq!(
                 unique_violation_field(&err, MAPPING),
                 Some(("email", "has already been taken"))
+            );
+        }
+    }
+
+    // ── #2587: read accessors for validation details and problem code ──
+
+    fn details_map(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(field, messages)| {
+                (
+                    (*field).to_owned(),
+                    messages.iter().map(|m| (*m).to_owned()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn details_reads_back_the_validation_map() {
+        let err = AutumnError::validation(details_map(&[("title", &["must be 1-120 characters"])]));
+        let details = err.details().expect("validation error carries details");
+        assert_eq!(
+            details.get("title").map(Vec::as_slice),
+            Some(["must be 1-120 characters".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn details_is_none_for_non_validation_errors() {
+        assert!(
+            AutumnError::not_found_msg("no such user")
+                .details()
+                .is_none()
+        );
+        assert!(
+            AutumnError::conflict_msg("stale version")
+                .details()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn code_matches_the_rendered_problem_code() {
+        let cases: Vec<(AutumnError, &str)> = vec![
+            (
+                AutumnError::validation(details_map(&[("title", &["too short"])])),
+                "autumn.validation_failed",
+            ),
+            (AutumnError::not_found_msg("gone"), "autumn.not_found"),
+            (AutumnError::bad_request_msg("bad"), "autumn.bad_request"),
+            (AutumnError::conflict_msg("stale"), "autumn.conflict"),
+            (AutumnError::gone_msg("sunset"), "autumn.gone"),
+            (
+                AutumnError::query_timeout("statement_timeout"),
+                "autumn.query_timeout",
+            ),
+            (
+                AutumnError::internal_server_error_msg("boom"),
+                "autumn.internal_server_error",
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(err.code(), expected, "code() for {err:?}");
+        }
+    }
+
+    #[test]
+    fn code_follows_the_statement_timeout_reclassification() {
+        // `into_response` demotes a 500 whose message names a cancelled
+        // statement to a 503 `autumn.query_timeout`; `code()` says the same.
+        let err =
+            AutumnError::internal_server_error_msg("canceling statement due to statement timeout");
+        assert_eq!(err.code(), "autumn.query_timeout");
+    }
+
+    #[test]
+    fn display_lists_the_failing_fields() {
+        let err = AutumnError::validation(details_map(&[
+            ("title", &["must be 1-120 characters"]),
+            ("email", &["invalid"]),
+        ]));
+        // Fields are sorted, so the rendering is stable across runs.
+        assert_eq!(
+            err.to_string(),
+            "Validation failed: email: invalid; title: must be 1-120 characters"
+        );
+    }
+
+    #[test]
+    fn display_joins_multiple_messages_for_one_field() {
+        let err = AutumnError::validation(details_map(&[(
+            "password",
+            &["too short", "needs a digit"],
+        )]));
+        assert_eq!(
+            err.to_string(),
+            "Validation failed: password: too short, needs a digit"
+        );
+    }
+
+    #[test]
+    fn display_falls_back_to_the_title_without_field_messages() {
+        assert_eq!(
+            AutumnError::validation(details_map(&[])).to_string(),
+            "Validation failed"
+        );
+        assert_eq!(
+            AutumnError::validation(details_map(&[("title", &[])])).to_string(),
+            "Validation failed"
+        );
+    }
+
+    #[test]
+    fn display_is_unchanged_for_non_validation_errors() {
+        assert_eq!(
+            AutumnError::not_found_msg("no such user").to_string(),
+            "no such user"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_equals_the_code_in_the_rendered_body() -> Result<(), axum::Error> {
+        let builders: Vec<fn() -> AutumnError> = vec![
+            || AutumnError::validation(details_map(&[("title", &["too short"])])),
+            || AutumnError::not_found_msg("gone"),
+            || AutumnError::conflict_msg("stale"),
+            || AutumnError::gone_msg("sunset"),
+            || AutumnError::query_timeout("statement_timeout"),
+            || AutumnError::internal_server_error_msg("boom"),
+            || AutumnError::internal_server_error_msg("ERROR: 57014 query canceled"),
+        ];
+
+        for build in builders {
+            let expected = build().code();
+            let body =
+                axum::body::to_bytes(build().into_response().into_body(), usize::MAX).await?;
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+            assert_eq!(json["code"], expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_problem_codes_match_derivation() {
+        for type_uri in [
+            PROBLEM_TYPE_CONFLICT,
+            PROBLEM_TYPE_GONE,
+            PROBLEM_TYPE_QUERY_TIMEOUT,
+        ] {
+            assert_eq!(
+                problem_code_for_type(type_uri).map(str::to_owned),
+                Some(derive_problem_code(type_uri)),
+                "table and derivation disagree for {type_uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_explicit_problem_type_is_in_the_code_table() {
+        // A constructor attaching a problem type that the table does not
+        // carry would fall back to the status-derived code and disagree with
+        // the rendered body.
+        let known = [
+            "PROBLEM_TYPE_CONFLICT",
+            "PROBLEM_TYPE_GONE",
+            "PROBLEM_TYPE_QUERY_TIMEOUT",
+        ];
+        let uris = [
+            PROBLEM_TYPE_CONFLICT,
+            PROBLEM_TYPE_GONE,
+            PROBLEM_TYPE_QUERY_TIMEOUT,
+        ];
+
+        // Split so the needles do not match this test's own source.
+        let needles = [
+            ["problem_type", ": Some("].concat(),
+            ["problem_type", " = Some("].concat(),
+        ];
+
+        for line in include_str!("error.rs").lines() {
+            for prefix in &needles {
+                let Some(rest) = line.split(prefix.as_str()).nth(1) else {
+                    continue;
+                };
+                let name = rest.split(')').next().unwrap_or(rest);
+                assert!(
+                    known.contains(&name),
+                    "{name} is attached to an AutumnError but is not a known problem type"
+                );
+            }
+        }
+
+        for uri in uris {
+            assert!(
+                problem_code_for_type(uri).is_some(),
+                "{uri} has no entry in problem_code_for_type"
             );
         }
     }

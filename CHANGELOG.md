@@ -52,6 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **web:** `AutumnError` now reads back its own validation details (issue
+  #2587). `details()` returns the per-field message map for a validation
+  failure and `None` for anything else, `code()` returns the stable problem
+  code the `application/problem+json` body carries
+  (`autumn.validation_failed`, `autumn.not_found`, …), and `Display` appends
+  the failing fields in sorted order — `Validation failed: email: Must be a
+  valid email address`. A consumer with no HTTP response to parse (a GraphQL
+  resolver, a `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl) no longer
+  has to re-run `validator` to say which field failed. Purely additive; the
+  problem-details body is byte-identical, including its bare `Validation
+  failed` `detail`.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite
