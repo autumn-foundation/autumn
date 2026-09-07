@@ -15,8 +15,9 @@ runnable as written.
 > **Scope.** This is about *what is inside* an artifact and *where it came
 > from*. Whether any of it is **known-vulnerable** is the advisory gate, which
 > your scaffolded app runs on every push — jump to
-> [Part 3a](#part-3a--the-advisory-gate-known-vulnerable-dependencies). Runtime
-> build-info reporting lives on `/actuator/info`.
+> [Part 3a](#part-3a--the-advisory-gate-known-vulnerable-dependencies), or to
+> [Part 3b](#part-3b--the-dev-loop) for the same policy in `autumn doctor` and
+> `autumn dev`. Runtime build-info reporting lives on `/actuator/info`.
 
 ---
 
@@ -340,7 +341,7 @@ Every app `autumn new` generates ships two halves of one gate:
 
 | File | Role |
 |---|---|
-| `.github/workflows/ci.yml` | Runs `cargo deny check advisories` on every push and pull request. |
+| `.github/workflows/ci.yml` | Runs `cargo deny check` on every push and pull request, over the checks `deny.toml` declares. |
 | `deny.toml` | The policy it reads: what counts as a failure, and which advisories you have explicitly accepted. |
 
 The check resolves your **whole** dependency graph — transitive crates
@@ -350,12 +351,25 @@ included, not just what your `Cargo.toml` names — and matches it against the
 `unmaintained` and `unsound` advisories fail too (narrow those in `deny.toml`
 if you would rather triage them separately), and a yanked crate warns.
 
-Run exactly what CI runs, locally:
+Run it locally. CI derives its check list from the sections `deny.toml`
+declares, so the exact command depends on your policy — `autumn doctor` does
+that derivation for you and reports the same verdict:
 
 ```bash
 cargo install --locked cargo-deny   # once
+autumn doctor                       # derives the checks, as CI does
+```
+
+To drive cargo-deny yourself, pass the sections your policy declares. For the
+shipped policy, which declares only `[advisories]`, that is:
+
+```bash
 cargo deny check advisories
 ```
+
+Uncomment `[licenses]` and the CI command becomes `cargo deny check advisories
+licenses`; a bare `cargo deny check advisories` would then pass locally on a
+tree CI rejects.
 
 ### Reading a failure
 
@@ -484,6 +498,188 @@ watched fail is indistinguishable from a gate that no longer runs.
 
 ---
 
+## Part 3b — the dev loop
+
+CI is the enforcement point. It is a poor *first* contact with a vulnerable
+dependency: by the time the job is red, the change is pushed and the team is
+blocked. `autumn doctor` and `autumn dev` move that contact left, without
+becoming the kind of audit output developers learn to scroll past.
+
+### One policy file, one waiver store, one auditor
+
+`deny.toml` at the app root is the whole policy surface. It carries the
+advisory rules and their waivers, and — commented out in a fresh scaffold —
+`[licenses]`, `[bans]` and `[sources]`. `autumn doctor` runs the same auditor
+against the same file, with the same waivers and the same check list your CI
+job uses. Nothing here is a second implementation, and there is no second
+waiver format: a waiver is an `[advisories] ignore` entry, read by doctor, dev
+and CI alike.
+
+Two differences remain, and doctor reports both on its own line so you can
+judge them:
+
+- **The auditor version.** The generated workflow pins `cargo-deny@0.20.2`; a
+  local run uses whatever `cargo deny` is on your PATH. Doctor names the
+  version it used. Install the pinned one to remove the difference:
+  `cargo install --locked cargo-deny@0.20.2`.
+- **The advisory data.** CI fetches the RustSec database immediately before it
+  audits, so it always grades against today's advisories. Doctor never fetches
+  (see *Offline and air-gapped* below) and names its data age. An advisory
+  published since your last fetch is red in CI and silent locally — run
+  `cargo deny fetch db` to close the gap.
+
+Uncommenting a section widens both sides at once. The generated workflow
+derives its check list from the file:
+
+```bash
+checks="advisories"
+for section in bans licenses sources; do
+  if grep -qE "^[[:space:]]*(\[\[?[[:space:]]*)?[\"']?$section[\"']?[[:space:]]*[].=]" deny.toml; then
+    checks="$checks $section"
+  fi
+done
+cargo deny --offline check $checks
+```
+
+`autumn doctor` reaches the same answer by parsing the file as TOML, which is
+exact where grep can only approximate: `[bans]`, `[ bans ]`, `["bans"]`,
+`[bans.build]`, `[[bans.deny]]`, `bans.deny = …` and `bans = { … }` all declare
+the same table. The two are held together by a test —
+`doctor_and_the_generated_workflow_derive_the_same_checks` runs *this shell* and
+`autumn doctor` over every one of those spellings and requires the same answer —
+so a rule that drifts fails the build rather than silently un-enforcing your
+policy.
+
+### `autumn doctor` — the dependency check
+
+One check, `dependencies`, reporting each finding with its advisory or
+violation id, its severity, the crate, and the title:
+
+```text
+❌ dependencies — 2 findings, 1 blocking, 1 waived — cargo-deny 0.20.2; checks: advisories; advisory data 3 days old
+   RUSTSEC-2099-0001 vulnerability (critical) badcrate 1.2.3 — remote code execution
+   RUSTSEC-2023-0071 vulnerability (medium) rsa 0.9.10 — Marvin Attack: potential key recovery through timing sidechannels (waived)
+   hint: `deny.toml` holds the policy and the waivers; docs/guide/supply-chain.md explains how to fix or waive a finding
+```
+
+Blocking findings are listed first. A waived finding is shown as waived and
+never fails the check. When nothing is live, the whole check is one line —
+including for a freshly scaffolded app, which ships one pre-triaged waiver:
+
+```text
+✅ dependencies — no live findings; 1 waived (RUSTSEC-2023-0071) — cargo-deny 0.20.2; checks: advisories; advisory data 0 days old
+```
+
+The line follows doctor's ordinary conventions, so
+`--json` carries the same detail string, capped at the first ten findings; run
+`cargo deny check` itself when you need every one. `--strict` promotes the
+check's warnings to exit 1 — stricter than the CI gate, where a cargo-deny
+warning is not a failure — so keep `--strict` runs quiet by writing a policy
+whose warnings you mean. The scaffold's only warn-level rule is
+`yanked = "warn"`; its commented `[bans]` default sets
+`multiple-versions = "allow"` for the same reason.
+
+### Severity defaults
+
+Severity is *consequence*, not taxonomy. What your policy denies is graded
+high or critical; what it only warns about is graded low or medium:
+
+| Finding | Grade | Doctor |
+|---|---|---|
+| Vulnerability, CVSS ≥ 9.0 | critical | fail |
+| Vulnerability, any lower or absent CVSS | high | fail |
+| Unmaintained / unsound (denied by the shipped policy) | high | fail |
+| License, ban or source violation | high | fail |
+| Yanked crate (`yanked = "warn"`), duplicate crate | low | warn |
+| Waived by `[advisories] ignore` | its own CVSS band | pass |
+
+A vulnerability always fails, whatever it scores: cargo-deny denies every
+vulnerability and that is not configurable, so grading a CVSS 2.6 vulnerability
+"low" would say pass where CI says fail. CVSS is used only to separate critical
+from high, which is what the `autumn dev` banner keys on. A **waived** finding
+is the one row graded on its own merits rather than on consequence — it has no
+consequence left — so the same advisory can read `(medium)` waived and `(high)`
+live. The number describes the advisory; the verdict describes the gate.
+
+Critical and high are exactly the findings cargo-deny grades as errors, which
+is exactly what makes the CI job red. Reading a doctor failure therefore tells
+you which CI failure you are about to get. CVSS v3 base scores come from the
+advisory's own vector, computed under the minor version that vector declares —
+v3.1 revised the changed-scope impact equation, so the same metrics can score
+7.0 under `CVSS:3.0/` and 6.9 under `CVSS:3.1/`, which is a band apart. A
+vulnerability with no published score — or one published as a CVSS v4.0 vector,
+which is not scored here — is treated as high rather than assumed harmless. Such a finding still fails; it just does not earn the
+`autumn dev` banner.
+
+### `autumn dev` — quiet by default
+
+`autumn dev` never blocks startup and never interrupts the rebuild loop over a
+dependency finding. Output is rationed:
+
+- **Clean or fully waived tree** — nothing. Zero dependency lines.
+- **Findings the policy only warns about** — nothing. A duplicate crate or a
+  yanked crate leaves CI green, so it is doctor's to report, not dev's.
+- **Findings the policy denies, below critical** — one line: the count and the
+  worst severity.
+- **A critical advisory** — a startup banner, in the style of the
+  maintenance-mode warning, naming the ids.
+- **Policy not evaluated** — nothing. Silence is dev's answer to a missing
+  auditor, a missing database, or a missing policy file; `autumn doctor` is
+  where those are reported.
+
+Nothing waits on the audit. It starts *after* the initial `cargo build` — run
+beside the build, its `cargo metadata` contends with Cargo's package-cache lock
+and slows the build itself — and the watch loop then polls for the result
+without blocking, printing it the moment it lands. A verdict that has not
+arrived within thirty seconds is dropped. So the audit costs the dev loop no
+latency at all, on a cold start or a rebuild; the trade is that the line can
+appear a second or two after the server does.
+
+### Offline and air-gapped
+
+Neither command ever fetches. Both run `cargo deny --offline` against whatever
+RustSec data is already on disk, so neither can hang on the network and neither
+depends on it.
+
+- **Database never fetched** — `autumn doctor` **passes**, with a detail that
+  reads `not evaluated` and hints `cargo deny fetch db`. Same reasoning as a
+  missing auditor below: no Autumn install path fetches the database, so
+  warning here would make `autumn doctor --strict` red on every machine that
+  has not opted in. It never reports a clean tree it could not verify — but do
+  not rely on `--strict` to notice an unevaluated tree; read the detail.
+- **Database present** — doctor reports its age (`advisory data 3 days old`),
+  measured from the last fetch. Data older than 7 days is marked **stale** and
+  warns, even on a tree with no findings: CI audits against a database it
+  fetches every run, so a verdict is only as fresh as the data behind it.
+- **cargo-deny not installed** — doctor **passes**, and its detail reads
+  `not evaluated`, with the install command and the checks it would have run.
+  It is not a warning: `--strict` turns warnings into exit 1, and cargo-deny is
+  not installed by any Autumn install path, so warning here would make
+  `autumn doctor --strict` red on every machine that has not opted in. A pass
+  that says "not evaluated" is never a silent pass.
+- **The audit produced no verdict** — a warning naming the reason. This covers
+  a `deny.toml` that is not valid TOML (cargo-deny loads the policy before it
+  audits, so the CI gate fails outright on one), a section written in a
+  spelling only one of the two derivations can see, and cargo-deny rejecting
+  the tree for a reason the diagnostic parse could not account for. All three
+  are reported *before* the missing-tool checks above: those pass, and a pass
+  on a repository CI rejects is the one outcome this check exists to prevent.
+- **`autumn dev`** — silent in every one of those states.
+
+Refresh the data with one command, network permitting:
+
+```bash
+cargo deny fetch db
+```
+
+On an air-gapped machine, set `[advisories] db-path` in `deny.toml` to a
+directory *holding* database checkouts — the same shape as
+`~/.cargo/advisory-dbs`, not a checkout itself — and mirror the RustSec
+repository into it. `~` and `$CARGO_HOME` are expanded, as cargo-deny expands
+them. Doctor reads that path and ages it the same way.
+
+---
+
 ## Command reference
 
 | Command | Answers |
@@ -497,6 +693,9 @@ watched fail is indistinguishable from a gate that no longer runs.
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
 | `autumn sbom --features F` | …resolving the features the build used. |
 | `autumn sbom --filter-platform T` | …restricted to one target triple. |
+| `autumn doctor` | Does this app's lockfile pass its own dependency policy? |
+| `autumn doctor --json` | …as machine-readable output, ids and severities included. |
+| `cargo deny fetch db` | Refresh the RustSec advisory database doctor reads. |
 | `cargo deny check advisories` | Is anything in this tree known-vulnerable? (reads `deny.toml`) |
 | `./scripts/check-advisories.sh` | …for Autumn's own graphs, and for the app scaffold's. |
 | `./scripts/check-advisories.sh --self-test` | Can that gate still reject a known CVE? |

@@ -96,11 +96,13 @@ offline-sync = ["db", "http-client"]
 # must use an explicit `--features` list that EXCLUDES `sqlite` (see
 # `.github/workflows/ci.yml`).
 #
-# PR1 is a no-op refactor: enabling it switches the connection *type alias* but
-# the SQLite pool CONSTRUCTION stays refused at runtime
-# (`PoolError::UnsupportedBackend`); a working pool is PR2. Needs no extra deps
-# — diesel's sqlite backend and diesel-async's sync-connection-wrapper are
-# already in the graph.
+# The runtime is wired (#1905): enabling this feature switches the connection
+# type alias AND builds a deadpool pool over
+# `SyncConnectionWrapper<SqliteConnection>`, so an app boots, migrates and
+# serves against a `sqlite://` target. Needs no extra deps — diesel's sqlite
+# backend and diesel-async's sync-connection-wrapper are already in the graph.
+# What this build REFUSES is a Postgres target (`PoolError::UnsupportedBackend`),
+# the mirror of the default build's refusal of a SQLite one.
 # `sqlite` pulls in `db` so it is genuinely self-sufficient: `db` owns the
 # shared, backend-neutral migration/pool plumbing this feature builds on — the
 # `crate::migrate` module (itself `#[cfg(feature = "db")]`), `deadpool`, and
@@ -913,6 +915,19 @@ path = "tests/sqlite_dependent_destroy.rs"
 [[test]]
 name = "sqlite_read_only_tx"
 path = "tests/sqlite_read_only_tx.rs"
+
+# DB-backed sessions store on SQLite (issue #1908): the `generate auth` tracked-
+# sessions store binds `::autumn_web::RuntimeBackend` instead of `diesel::pg::Pg`,
+# so it accepts the SQLite `RuntimeConnection`. Mirrors the generated DDL, schema
+# block and store functions and runs them against a real SQLite database — login
+# tracking, the revocation gate, `last_seen_at` refresh, rotation rebinding, and
+# the three revoke paths. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_tracked_sessions`.
+[[test]]
+name = "sqlite_tracked_sessions"
+path = "tests/sqlite_tracked_sessions.rs"
 
 # Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
 # `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-

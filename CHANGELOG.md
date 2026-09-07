@@ -9,6 +9,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SQLite runtime honesty (issues #1905 / #2539).** The runtime landed in
+  #2537; three things still behaved or read as though it had not.
+
+  **Its own unit tests now run.** `cargo test -p autumn-web --features sqlite
+  --lib` failed 52 tests, so the CI lane ran a module filter rather than a bare
+  `--lib` — which meant a newly added module could rot the same way the pool
+  tests already had, silently, because nothing ran it. Fixtures spelled
+  `postgres://` inline, which `build_sqlite_pool` correctly refuses, so they
+  panicked at construction. They now spell their target through a shared
+  `crate::test_urls` helper that picks one per backend, and the tests whose
+  SUBJECT is refused on SQLite (a distinct `replica_url`, the Postgres job
+  backend) are `#[cfg(not(feature = "sqlite"))]` with a SQLite counterpart
+  where one exists. The lane runs a bare `--lib`: 5607 tests under `sqlite`,
+  5648 under the default.
+
+  **Boot errors no longer echo credentials.** `DatabaseConfig::validate`
+  printed the offending URL raw, and it is the refusal an ordinary
+  `autumn.toml` misconfiguration actually hits — reaching `tracing::error!` one
+  line after the startup summary masked the same URL. The tree's three
+  redactors are consolidated into one (`db_url`), closing two holes on the way:
+  the message redactor recognized `postgres://` tokens only, so a
+  `mysql://user:pw@host` in a driver error went out whole; and the target
+  redactor returned any `sqlite://` target verbatim, including
+  `sqlite://user:hunter2@host/app.db`, since backend detection classifies by
+  scheme alone.
+
+  Redaction is now by allowlist per recognized backend rather than wholesale,
+  so the boot summary keeps what operators read it for: a Postgres target keeps
+  `sslmode`, `application_name`, `connect_timeout` and the other policy
+  parameters (`sslpassword` and anything unlisted go), a SQLite target keeps
+  its filename plus `mode`, `cache`, `immutable`, `vfs`, `nolock`, and a target
+  whose backend is unrecognized still loses its whole query string, because its
+  key names cannot be enumerated.
+
+  **The Postgres-only stores refuse a SQLite target.** `PgFlagStore`,
+  `PgExperimentStore` and `PgConfigStore` open a `diesel::PgConnection` and
+  issue `pg_notify` / `pg_advisory_xact_lock` / `jsonb` SQL.
+  `from_database_config` accepted a `sqlite://` URL and built a store that
+  failed on first use with a driver error naming a backend the operator never
+  chose; it now screens through the new
+  `DatabaseConfig::effective_primary_postgres_url` and returns `None`. **Note
+  the timing change:** an app that writes
+  `.with_flag_store(PgFlagStore::from_database_config(&cfg)?.expect(…))` and is
+  pointed at a SQLite target now fails at boot rather than at the first flag
+  read. Autumn never selects a store for you — pick the in-memory store on that
+  arm (`docs/guide/feature-flags.md` shows the shape).
+  `docs/guide/sqlite-in-production.md` gains a matrix row per affected
+  subsystem.
+
+- **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file
+  whose generator template changed since the project was generated (issue
+  #1835). `generate` now records a digest of every file it owns in
+  `.autumn/generated.toml`, and `destroy` accepts a file matching either that
+  digest or the current render. A real edit matches neither and is still
+  refused without `--force`, and the applied-migration guard is unchanged.
+  Commit the manifest — it is the baseline a later checkout compares against.
+  A project generated before the manifest existed keeps the previous
+  behaviour: compare against the current render only, `--force` to override.
+  Each entry also records the inputs that produced it — the command's
+  arguments, a fingerprint of the `autumn.generate.toml` they resolve from, and
+  the resolved database backend — so the digest counts only when all three
+  match. `autumn destroy model Post` after `autumn generate model Post
+  title:String` is still refused; editing the recipe, or moving the project
+  between SQLite and Postgres, drops the baseline rather than trusting it; and
+  files written by `autumn new --starter`, which uses the same machinery, are
+  never a generator's to delete.
+  A side effect of the digest being taken over LF-normalised text: a CRLF
+  checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
+  whether or not a manifest entry backs it.
+
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
   a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
@@ -30,6 +100,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature, which `STABILITY.md` places outside SemVer.
 
 ### Added
+
+- **`scripts/check-sqlite-unification.sh`** — the `sqlite` feature is a backend
+  flip, so one dependency edge enabling it (`autumn-web = { …, features =
+  ["sqlite"] }`, or a feature forwarding `autumn-web/sqlite` under another
+  name) swaps `db::RuntimeConnection` for every consumer in the graph and
+  breaks the Postgres default. That invariant was prose, a `sqlite`-excluding
+  feature list in CI, and review; nothing read the manifests. The gate scans
+  every `Cargo.toml` in the tree, allows autumn-cli's own same-named opt-in
+  feature, and is self-testing with no toolchain. Wired into CI's `lint` job
+  and `scripts/pre-push-check.sh`, which skips the sqlite lane entirely.
+  [no-plugin] — a repo gate, no agent-facing surface.
+- **examples:** `examples/react-graphql`, a TypeScript React single-page app
+  on an Autumn backend that talks GraphQL through a plugin, against a real
+  Postgres `#[model]`. Two files carry the point. `src/graphql_plugin.rs` is a
+  generic `GraphqlPlugin<Q, M, S>` that adapts any `async-graphql` schema onto
+  an app — `AppBuilder::nest` for the raw router (with the schema as
+  router-local `Extension` state, so two schemas can share root types at two
+  paths), `declare_plugin_routes` so `autumn routes` and the audit gate see it,
+  per-execution injection of `AppState` into the GraphQL context, a
+  `PluginContract`, and a `GET` transport that refuses non-query operations
+  with `405`. `src/notes.rs` shows what that buys: every resolver builds the
+  generated `PgNoteRepository` from the pool on `AppState`
+  (`with_pool_untracked`, the constructor for code with no request), so
+  `#[normalize(trim)]`, the model's `#[validate]` rules, and the repository's
+  `MutationHooks` (`before_create` validation, a `before_delete` rule refusing
+  to delete a pinned note) apply identically to a GraphQL mutation and
+  the generated `api = "/api/notes"` REST handlers mounted beside it (the
+  `on_startup` seed runs once across instances, on one connection under a
+  transaction-scoped advisory lock). `AutumnError`s become GraphQL field errors carrying the
+  HTTP status in `extensions.status`. The plugin serves `POST /graphql`, the
+  GraphQL-over-HTTP `GET` form, and `GET /graphql/sdl`, whose output is
+  drift-tested against a committed `schema.graphql` the TypeScript types are
+  written against. The Vite/React 19 bundle is committed under `static/app/`
+  (fixed file names, no hash) and served by the standard `/static` mount under
+  the default `script-src 'self'` CSP, so `cargo run` needs no Node toolchain;
+  `autumn build --embed` bakes it into the binary (`embed_static!` +
+  `.embedded_static`, behind the crate's `embed-assets` feature); `npm run dev`
+  proxies `/graphql` to the Rust server for hot-reload work. Tested in two
+  tiers plus a smoke: `TestApp` tests with no Docker (shell, SDL drift,
+  `plugin_conformance::run_conformance`, error mapping, the `GET` guard,
+  two plugins at two paths), `TestDb` testcontainer tests that apply the
+  example's real embedded migration (rows, hooks, normalisation, validation,
+  REST/GraphQL parity), and a Chromium smoke that drives the real binary
+  against a testcontainer Postgres through a query and a form mutation.
+  Cataloged as a supported example.
+
+- **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
+  (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
+  its query functions by `diesel::pg::Pg`, which rejects the SQLite
+  `RuntimeConnection`, so the store did not compile on a SQLite app. Every such
+  bound in the generated auth surface (the four session revoke/list functions and
+  the seven remember-me chain functions) is now
+  `::autumn_web::RuntimeBackend` — the alias that resolves to `diesel::pg::Pg` by
+  default and `diesel::sqlite::Sqlite` under the `sqlite` feature — so the
+  scaffolded store compiles and runs on whichever backend the app selected.
+  Postgres behaviour is unchanged; the alias resolves to the same backend it
+  already used. The scaffolded `docs/guide/session-management.md` also emits its
+  operator SQL in the app's own dialect: the stale-row sweep is
+  `datetime('now', '-90 days')` on SQLite (was Postgres-only `NOW() - INTERVAL`),
+  and its retrofit `CREATE TABLE` is now rendered from the same helper as the
+  migration, so the two cannot drift. The scaffolded `docs/guide/oauth.md`
+  documents its `oauth_identities` schema in the app's dialect for the same
+  reason. A new `sqlite_tracked_sessions` test runs the generated store's shape
+  against a real, file-backed SQLite database over a multi-connection pool —
+  login tracking, the revocation gate (including a revoke committed on another
+  connection), the `UNIQUE` digest guard, `last_seen_at` refresh, rotation
+  rebinding, the three revoke paths, the documented retention sweep across both
+  timestamp encodings, and `ON DELETE CASCADE` on account deletion. A
+  `sqlite_test_targets_are_ci_named` hygiene test now fails the build if any
+  `sqlite`-gated `[[test]]` target is missing from the CI job that names them,
+  so a future target cannot ship dark. Guide:
+  `docs/guide/sqlite-in-production.md`.
+- **cli:** dependency advisories and policy reach the dev loop (issue #1633).
+  `autumn doctor` gains a `dependencies` check that grades the app's lockfile
+  against its own `deny.toml` — the same policy file, waiver store, check list
+  and auditor that #1600's CI gate runs, so a local verdict predicts the CI
+  verdict. Two differences remain and are reported rather than hidden: CI pins
+  cargo-deny 0.20.2 while a local run uses whatever is installed, and CI
+  fetches the advisory database every run while doctor reads local data and
+  names its age. Each finding reports its advisory or violation id, severity,
+  crate and title; a waived finding shows as waived and never fails, and a
+  tree with nothing live is exactly one line. Severity is consequence: what the
+  policy denies grades high or critical (CVSS v3 separates the two), what it
+  warns about grades low or medium. `autumn dev` reports only findings the
+  policy **denies** — the ones that turn CI red — so a clean tree, a fully
+  waived tree and a tree with only warn-level findings all add nothing to its
+  output; a critical advisory gets a startup banner. The audit is read after
+  the initial build, so a cold start never waits on it. Neither command
+  fetches: both run `cargo deny --offline`, doctor warns once when the advisory
+  data is over 7 days old, and a missing auditor or database is a **pass** that
+  reads `not evaluated` — never a silent pass, and never a warning that would
+  make `autumn doctor --strict` red on every machine that has not installed an
+  optional tool. `autumn new` now scaffolds `[licenses]`, `[bans]` and
+  `[sources]` into `deny.toml` as commented, quiet defaults, and the generated
+  CI workflow derives its check list from the sections that file declares — in
+  every TOML spelling, by the same rule doctor uses — so uncommenting one
+  widens the local check and the CI gate together. See
+  docs/guide/supply-chain.md.
+- **autumn-macros:** every macro's generated code now resolves the
+  `autumn-web` crate path via [`proc-macro-crate`](https://docs.rs/proc-macro-crate)
+  instead of a hardcoded `::autumn_web` (issue #1828), so a downstream crate
+  that depends on `autumn-web` under a renamed Cargo key (`web = { package =
+  "autumn-web" }`) can use `#[get]`, `#[model]`, `#[repository]` and every
+  other Autumn macro with no changes. For the rarer case of hosting two
+  differently-keyed `autumn-web` versions in one crate at once (e.g.
+  mid-upgrade), where automatic detection is ambiguous, every attribute macro
+  additionally accepts an explicit `crate = "..."` override, e.g.
+  `#[get("/x", crate = "autumn_web_05")]`.
+- **docs:** three guide pages a reader could not reach are now indexed in the
+  root `README.md`, and `scripts/check-docs-orphans.sh` keeps every guide page
+  reachable. The corpus already gated the three things a reader copies off a
+  page — the link they click (`check-docs-links.sh`), the command they run
+  (`check-docs-cli.sh`) and the `AUTUMN_*` variable they set
+  (`check-docs-config.sh`) — but all three check a page the reader already
+  reached. Nothing checked whether a page could be reached at all, and that
+  failure is the quietest of the four: no 404, no exit code, no ignored
+  override, just a reader concluding the feature does not exist. `docs/guide/`
+  has no index page of its own, so its 155 pages are found through the
+  hand-maintained `## Documentation` list and the skill indexes, and nothing
+  noticed when a page was left off both. The baseline run found
+  `time-zones.md`, `active-search-and-autocomplete.md` and
+  `outbound-webhooks.md` unreachable from every reader entry point. Making
+  `outbound-webhooks.md` reachable then surfaced eight wrong claims about
+  delivery semantics in it, corrected here — every symbol it named resolved in
+  the current source the whole time, which is what a structural gate can check
+  and is not the same as being right.
+  `outbound-webhooks.md` is the sharpest: the README indexed
+  `signed-webhooks.md` (webhooks coming *in*), so a reader searching it for
+  "webhook" concluded that was all there was and never found the page on
+  sending signed webhooks *out* to endpoints their own customers register — a
+  surface with a filed SSRF report against it, whose only two mentions anywhere
+  were that report and a `///` comment, neither of them clickable. The gate
+  walks the graph a reader can click rather than counting inbound mentions,
+  because the weaker question misses exactly that case; the new index entries
+  are written in the words a reader searches for ("time zone", "timezone",
+  "autocomplete", "typeahead", "as you type", "outbound webhooks"), none of
+  which appeared anywhere in the README before. Wired into the docs-only CI
+  job; no toolchain needed.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
@@ -1617,6 +1825,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **admin-plugin:** `ListParams` gains `sql_offset_limit()`, converting a
+  page/per-page request into ready-to-bind `(offset, limit)` — `per_page == 0`
+  means unlimited, offset 0. `ExperimentAdminModel`, `TokenAdminModel`, and
+  `FeatureFlagAdminModel::list()` each reimplemented this identically; history
+  shows the "`per_page == 0`" special case was fixed in two of the three in
+  one commit and copy-pasted into the third when it was added later. A custom
+  `AdminModel::list()` implementation can now reuse the same helper instead of
+  re-deriving it. `[no-plugin]`: internal dedup, no new agent-facing surface.
 - **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
   instead of the last step of `Test (ubuntu-latest)`:** as step 16 of that job
   it inherited a disk already filled by the whole workspace build plus eight
@@ -2011,6 +2227,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   6,563,220 → 530,398 (**-91.9%**).
 
 ### Fixed
+
+- **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
+  post's slug and make its permalink silently serve a different post (issue
+  #2544):** `unique_slug()`/`unique_slug_excluding()` proved uniqueness with a
+  `SELECT COUNT` before the `INSERT`/`UPDATE` that relied on it — a
+  check-then-act race two concurrent submits (a double-click, or a
+  flaky-network auto-retry) could both win, landing two posts on the same
+  `(subreddit_id, slug)`. Nothing at the database level backed that
+  invariant (`posts.slug` had only a plain, non-unique index, unlike
+  `subreddits.slug`/`users.username`), so once duplicated, `show()`'s
+  unordered `.filter(slug...).filter(subreddit_id...).first()` returned an
+  arbitrary one of the two forever — the other post's own permalink now
+  silently served someone else's title, body, and comments with a `200` and
+  no error. Fixed with a composite `UNIQUE (subreddit_id, slug)` constraint
+  (migration `20260906163932_posts_slug_unique_per_subreddit`) plus a retry
+  loop in `submit`/`update`: the existing `SELECT`-based guess stays as a
+  fast path, but a losing insert/update now comes back as a unique-violation
+  on that named constraint, which the loser catches and retries with the
+  next candidate slug instead of colliding with the winner. Regression-tested
+  by driving the real compiled binary with 10 fully concurrent, identical
+  `/submit` requests and asserting no duplicate `(subreddit_id, slug)` pair
+  survives (`tests/post_slug_race_e2e.rs`).
 
 - **`#[query_budget]` silently missed queries issued through a handle bound
   via an async/fallible accessor (e.g. `let mut conn = self.conn().await?;`),
@@ -3805,6 +4043,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   action: revoke statement calls 2,050 → 1. See
   `docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`.
 
+- **`FeatureFlagAdminModel`'s admin panel bulk "delete" action now issues
+  one `DELETE` CTE instead of one per selected flag:** it never overrode
+  `AdminModel::execute_action`'s trait default, so it inherited the same
+  per-id loop the `TokenAdminModel` fix above closed — a full connection
+  checkout plus a single-row `DELETE ... WHERE id = $1 RETURNING key`
+  (feeding the `feature_flag_changes` audit insert) per id. It now
+  overrides `execute_action` for `"delete"` to batch every id into one
+  `WHERE id = ANY($1)` round trip; the returned count, final row state,
+  and audit trail are unchanged (an already-deleted or nonexistent id is
+  still a silent no-op, still counted as "applied"). Measured against a
+  4,000-row fixture with an 820-id bulk action: delete-CTE statement
+  calls 820 → 1, buffers 9,639 → 6,977 (-27.6%). See
+  `docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`.
+
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
   `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
@@ -4074,6 +4326,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they exercise) and end to end: `cargo test -p autumn-macros --lib` (1073
   passed), `cargo fmt --all -- --check`, `cargo clippy -p autumn-macros
   --all-targets -- -D warnings` all clean.
+- **`MemorySearchBackend::keyword_search` no longer compares every field
+  token against every query token:** `score` (in `autumn-search/src/memory.rs`)
+  looped over each field's tokens and, for every one, scanned the *entire*
+  query-token list looking for a match — `field_tokens.len() × tokens.len()`
+  `String` equality checks per field, most of which fall through to a real
+  `memcmp` because the corpus draws from a shared vocabulary with plenty of
+  same-length words. Profiling the committed `autumn-search/benches/keyword_search.rs`
+  harness (5,000-document, two-field corpus, ~206 words/document) with
+  `valgrind --tool=callgrind` found this comparison work — the scan loop plus
+  `memcmp` — at over 85% of the call's instructions. A query has far fewer
+  tokens than a field has words (2 vs. ~206 in the bench), so `StoredDocument`
+  now stores each field's tokens as occurrence counts
+  (`HashMap<String, u32>`, built once at write time, same as the prior
+  tokenize-at-write change) instead of a flat `Vec<String>`, and `score` looks
+  up each query token once instead of scanning every field token. Purely an
+  internal representation change to the in-memory reference/dev backend — no
+  public API moved and ranking behavior is unchanged (same 128 `autumn-search`
+  lib tests and 109 integration tests pass with unmodified assertions).
+  Measured on the same machine, one session: instructions (callgrind, 2,000
+  queries over the corpus) 77,559,837,270 → 23,238,817,778 (**-70.0%**);
+  marginal allocation blocks/query and bytes/query (dhat) are unchanged
+  (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
+  allocation-bound, so only the instruction floor is claimed.
 
 ## [0.7.0] - 2026-08-23
 
