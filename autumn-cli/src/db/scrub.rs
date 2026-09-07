@@ -3713,26 +3713,57 @@ fn psql_connect(url: &str) -> String {
     )
 }
 
-/// `url` with any password removed, or `None` if that cannot be guaranteed.
+/// Connection-string keywords whose value is a credential.
+///
+/// A URI carries these two ways — `postgres://user:secret@host/db` and
+/// `postgres://host/db?password=secret` — and the query form wins where both
+/// appear, which `pg::sanitize_prefers_query_user_password_dbname_over_url_structure`
+/// pins. Clearing only the userinfo therefore prints the effective password.
+const SECRET_KEYWORDS: [&str; 2] = ["password", "sslpassword"];
+
+/// `url` with every password removed, or `None` if that cannot be guaranteed.
 fn password_free_conninfo(url: &str) -> Option<String> {
     if let Ok(mut parsed) = url::Url::parse(url) {
         // `set_password` returns Err only for a URL that cannot have one
         // (`mailto:` and friends), which a connection string is not.
-        return parsed.set_password(None).ok().map(|()| parsed.into());
+        parsed.set_password(None).ok()?;
+        let kept: Vec<(String, String)> = parsed
+            .query_pairs()
+            .filter(|(key, _)| !is_secret_keyword(key))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        if kept.is_empty() {
+            parsed.set_query(None);
+        } else {
+            parsed.query_pairs_mut().clear().extend_pairs(kept);
+        }
+        return Some(parsed.into());
     }
-    // Keyword form: `host=... dbname=... password=...`. Dropping a bare
-    // `password=` token is only sound while no value is quoted or escaped,
-    // because a quoted value may itself contain whitespace — so anything
-    // carrying a quote or a backslash is refused rather than guessed at.
+    // Keyword form: `host=... dbname=... password=...`. Dropping a secret token
+    // is only sound while no value is quoted or escaped, because a quoted value
+    // may itself contain whitespace — so anything carrying a quote or a
+    // backslash is refused rather than guessed at.
     if url.contains('\'') || url.contains('"') || url.contains('\\') {
         return None;
     }
     Some(
         url.split_whitespace()
-            .filter(|token| !token.starts_with("password="))
+            .filter(|token| {
+                token
+                    .split_once('=')
+                    .is_none_or(|(key, _)| !is_secret_keyword(key))
+            })
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+/// Whether a connection-string keyword carries a credential. Compared without
+/// case, because a URI query key is not normalised for us.
+fn is_secret_keyword(key: &str) -> bool {
+    SECRET_KEYWORDS
+        .iter()
+        .any(|secret| key.eq_ignore_ascii_case(secret))
 }
 
 /// One `psql` meta-command argument, double-quoted with backslash escapes —
@@ -4179,6 +4210,31 @@ mod tests {
         assert!(
             keyword.contains("db2.internal") && !keyword.contains("hunter2"),
             "keyword form must survive without its password: {keyword}"
+        );
+
+        // A URI carries the password two ways, and the query form is the
+        // EFFECTIVE one where both appear — so clearing the userinfo alone
+        // prints the credential that actually authenticates.
+        let in_query = super::psql_connect("postgres://bob@db/app?password=secret2");
+        assert!(
+            !in_query.contains("secret2"),
+            "a query-string password must be stripped too: {in_query}"
+        );
+        let both = super::psql_connect(
+            "postgres://alice:secret1@db/app?password=secret2&sslpassword=k3y&application_name=x",
+        );
+        assert!(
+            !both.contains("secret1") && !both.contains("secret2") && !both.contains("k3y"),
+            "every credential form must go: {both}"
+        );
+        assert!(
+            both.contains("application_name=x"),
+            "and every non-secret parameter must stay: {both}"
+        );
+        let keyword_ssl = super::psql_connect("host=db sslpassword=k3y dbname=app");
+        assert!(
+            !keyword_ssl.contains("k3y") && keyword_ssl.contains("dbname=app"),
+            "keyword form carries the same secrets: {keyword_ssl}"
         );
 
         // A quoted keyword value cannot be split on whitespace with certainty,
