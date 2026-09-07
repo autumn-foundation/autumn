@@ -494,6 +494,31 @@ mod tests {
 
     #[test]
     #[allow(clippy::needless_borrow, unused_imports)]
+    fn maybe_validate_fires_through_a_reference_binding() {
+        // #2586: the repository insert path holds its payload as `&New*` and
+        // passes that binding straight in. Wrapping `&payload` there would make
+        // `T` a reference type, which takes the no-op arm and validates
+        // nothing — a silent bypass. Pin the shape the macro emits.
+        use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
+
+        #[derive(validator::Validate)]
+        struct HasRules {
+            #[validate(length(min = 5))]
+            name: String,
+        }
+
+        let owned = HasRules {
+            name: "ab".to_string(),
+        };
+        let payload: &HasRules = &owned;
+        assert!(
+            (&MaybeValidate(payload)).autumn_maybe_validate().is_err(),
+            "a `&New*` binding must reach the validating branch"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrow, unused_imports)]
     fn maybe_validate_is_noop_for_non_validate_types() {
         // Autoref specialization: a type that does NOT implement `Validate`
         // falls through to the no-op branch and compiles + always succeeds.

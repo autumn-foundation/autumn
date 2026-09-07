@@ -635,10 +635,12 @@ for (index, error) in &errors {
 }
 ```
 
-`before_create` hook failures are filtered out immediately. If the resulting
-batch insert fails due to a database constraint (e.g. a unique violation),
-Autumn falls back to row-by-row insertion for that chunk so that individual
-constraint failures are isolated rather than aborting all remaining valid rows.
+Rows are normalized, then checked against the model's `#[validate]` rules, then
+passed to `before_create`; a failure at any of those steps is filtered out and
+reported against the caller's own index. If the resulting batch insert fails due
+to a database constraint (e.g. a unique violation), Autumn falls back to
+row-by-row insertion for that chunk so that individual constraint failures are
+isolated rather than aborting all remaining valid rows.
 
 ### `upsert_many` and hooks — a compile-time guard
 

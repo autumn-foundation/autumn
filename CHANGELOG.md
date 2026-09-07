@@ -2067,6 +2067,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`#[validate]` on a `#[model]` was ignored by every repository write that did
+  not go through a generated REST handler (issue #2586):** `docs/guide/forms.md`
+  promises a rule put on the model covers every write path — a form, an API
+  endpoint, a seed, a job, a CSV import — but `#[repository]` spliced the check
+  into the `api = "..."` `create`/`update` handlers only. A GraphQL resolver, a
+  `#[task]`, a seed or an admin action calling `save` wrote a row the model
+  forbids, and `#[normalize]` running on that same path made the gap easy to
+  miss: a `#[normalize(trim)] #[validate(length(min = 1))]` title submitted as
+  `"   "` was trimmed to `""` and then inserted.
+  The rules now run on every generated insert path — `save`, `save_many`,
+  `save_many_skip_invalid`, and the create half of `find_or_create_by_*` — after
+  normalization and before the `before_create` hook, exactly where the guide
+  says they run. `save` and `save_many` raise a 422 with the per-field map and
+  write nothing; `save_many_skip_invalid` keeps its partial-success contract and
+  reports a rejected row as `(index, error)` against the caller's own index; and
+  `find_or_create_by_*` validates only when it is about to insert, so a row that
+  already exists is still returned. `save_many_skip_invalid` also normalizes its
+  rows now, which it did not before, so it judges and stores the same canonical
+  value `save_many` does.
+  A payload type without `#[validate]` columns still compiles to a no-op, so no
+  repository needs migrating — but a caller that has been writing rows its own
+  model forbids will now get a 422 where it used to get a row. Update paths are
+  unchanged: they keep the documented hooked / `validate_on_update = fetch` /
+  blind table.
+
 - **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
   post's slug and make its permalink silently serve a different post (issue
   #2544):** `unique_slug()`/`unique_slug_excluding()` proved uniqueness with a

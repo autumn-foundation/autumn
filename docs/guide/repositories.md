@@ -66,7 +66,8 @@ If hooks are enabled on your repository, `save_many` guarantees full transaction
 
 When bulk importing dirty external data (e.g., from CSVs or public API hooks), some rows might violate business rules or database constraints. `save_many_skip_invalid` enables maximum throughput without losing valid rows.
 
-- It runs `before_create` hooks on each row and filters out custom validation failures.
+- It runs the model's `#[validate]` rules on each row first, then the `before_create` hooks, and filters out the failures of either.
+- A rejected row is reported against **the caller's own index**, so a `(index, error)` pair still points at the CSV line it came from.
 - It attempts a high-speed batch insert of all successful records in a transaction.
 - **Constraint Fallback**: If the batch insert fails due to a database constraint (e.g., `UniqueViolation`), it automatically falls back to row-by-row insertion for that chunk, isolating individual DB constraint failures.
 - Returns a tuple of `(successful_models, list_of_errors_with_indices)`.

@@ -280,8 +280,35 @@ pub struct User {
 }
 ```
 
-The generated repository runs these rules on **insert**, before the
-`before_create` hook, always.
+The generated repository runs these rules on **insert**, after `#[normalize]`
+canonicalizes the payload and before the `before_create` hook. Every generated
+insert path applies them — `save`, `save_many`, `save_many_skip_invalid`, and
+the create half of `find_or_create_by_*` — so a GraphQL resolver, a `#[task]`,
+a seed or an admin action gets the same answer a generated `--api` handler
+does.
+
+Each path keeps its own failure shape:
+
+| Insert path | An invalid row |
+|---|---|
+| `save` | 422 with the field map; nothing is written |
+| `save_many` | 422 on the first offender, before any row is written |
+| `save_many_skip_invalid` | reported as `(index, error)` against the caller's own index; the valid rows still land |
+| `find_or_create_by_*` | 422 only when the row is about to be created — a row that already exists is returned unchanged |
+
+`upsert_many` is not on that list. It takes whole models rather than a `New*`,
+and Postgres decides per row whether the statement inserts or updates — so there
+is no insert to hang the rule on. Validate before you call it.
+
+A payload type with no `#[validate]` columns costs nothing: the check compiles
+away.
+
+A generated `--api` handler still checks the decoded payload itself, before it
+reaches the repository, so it can answer 422 without a database round trip. That
+check sees the payload **as submitted**; the repository's sees it normalized. A
+value only normalization would make valid — `"  ab  "` against
+`#[normalize(trim)] #[validate(length(max = 3))]` — is therefore refused at the
+endpoint, though `repo.save` would accept it.
 
 **On update, merged-model validation is opt-in.** A repository with hooks, or
 one declared `#[repository(Post, validate_on_update = fetch)]`, loads the
@@ -362,9 +389,10 @@ on lookups and still agree.
 
 ### Where it runs
 
-Normalization happens at the head of the repository save flow: `save` /
-`save_many` normalize the `New*` insert struct, **before** validation and
-before the `before_create` hook, so:
+Normalization happens at the head of the repository insert flow: `save`,
+`save_many`, `save_many_skip_invalid` and `find_or_create_by_*` normalize the
+`New*` insert struct, **before** validation and before the `before_create`
+hook, so:
 
 ```text
 submitted value
