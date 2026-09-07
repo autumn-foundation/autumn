@@ -381,7 +381,36 @@ def _opens_label(txt, i):
     return not (i and txt[i - 1] in '\\!')
 
 
-def inline_links(txt):
+def _openers(txt):
+    """Every `[` that could open a label, in order, skipping what cannot.
+
+    A backslash escapes the bracket after it, and a CODE SPAN is stepped over
+    whole — `[outer `[x](other.md)`](mail.md)` is one link to `mail.md` whose
+    label happens to display a second link as code. Hunting with `find('[')`
+    saw the sample as a real inner link, and (once inner links deactivate the
+    opener above them) that stranded the outer link's page.
+
+    Yielding positions rather than driving the loop means a caller cannot
+    advance past a span it already consumed; that is deliberate. The scanners
+    below re-derive their own end from `_label_end`, and overlapping openers
+    are exactly what the nesting cases need.
+    """
+    i, n = 0, len(txt)
+    while i < n:
+        c = txt[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == '`':
+            span = CODE_SPAN.match(txt, i)
+            i = span.end() if span else i + 1
+            continue
+        if c == '[':
+            yield i
+        i += 1
+
+
+def inline_links(txt, resolved=None):
     """Every inline `[label](dest)`, with the label balanced to ANY depth.
 
     A regular expression cannot count, so the nesting pattern was bounded —
@@ -394,27 +423,91 @@ def inline_links(txt):
     character, a BLANK LINE ends the paragraph and with it the label, and a
     code span is skipped whole.
 
+    A LINK MAY NOT CONTAIN A LINK. When the label holds one, CommonMark
+    deactivates the OUTER opener and the inner link is what renders, so
+    `[outer [Mail](mail.md)](https://example.test)` gives the reader a route
+    to `mail.md` and none to `example.test`. Balancing straight through the
+    label yielded the outer destination and skipped past the inner one —
+    exactly backwards, and it reported a page the reader can click as an
+    orphan. `resolved` is the set of defined reference labels; without it
+    only an inner INLINE link deactivates, since that is the one shape that
+    resolves unconditionally.
+
+    The rule is narrower than "a bracket pair inside the label", and every
+    boundary here was measured rather than reasoned:
+
+    - An inner IMAGE does not deactivate: `[outer ![m](m.png)](x)` is a link
+      wrapping an image. Images may contain links, too, so an outer `!`
+      opener is never deactivated by anything.
+    - An UNRESOLVED reference does not deactivate — it is not a link, just
+      literal brackets — which is why `resolved` has to be threaded in.
+    - A link inside a CODE SPAN does not deactivate, and `_label_end` already
+      steps over those, so the inner scan must use it rather than a bare
+      bracket search.
+    - An inner AUTOLINK or RAW ANCHOR does not deactivate. cmark-gfm emits
+      nested `<a>` there; invalid HTML, but not this gate's business.
+
     Yields `(label_start, label_end, angle_dest, bare_dest)`, matching what
     the patterns' groups 1, 2 and 3 gave the caller.
     """
-    i, n = 0, len(txt)
-    while True:
-        i = txt.find('[', i)
-        if i == -1:
-            return
+    for i in _openers(txt):
         # `\[` is an escaped bracket and `![` opens an image; neither starts a
         # link label. Same guard as the patterns' lookbehind.
         if not _opens_label(txt, i):
-            i += 1
             continue
         j = _label_end(txt, i)
-        if j is not None:
-            m = DEST_RE.match(txt, j + 1)
-            if m:
-                yield i + 1, j, m.group(1), m.group(2)
-                i = m.end()
-                continue
-        i += 1
+        if j is None:
+            continue
+        m = DEST_RE.match(txt, j + 1)
+        if m and not contains_link(txt[i + 1:j], resolved):
+            yield i + 1, j, m.group(1), m.group(2), m.start(), m.end()
+
+
+def inline_images(txt):
+    """Every inline `![alt](dest)` span, with the alt text balanced to ANY depth.
+
+    Yields `(start, end)` over the whole span, `!` included.
+
+    An image's alt text is a link label and nests like one, so the bounded
+    pattern this replaces missed `![outer [middle [alt]]](x.md)` and left the
+    destination for the bare-path scan to pick up as if it were prose. An
+    image destination is a resource the page loads, never text on screen, so
+    that made a genuinely orphaned page reachable.
+
+    No deactivation rule here, and that asymmetry is measured, not assumed: a
+    link may not contain a link, but an IMAGE may — `![outer [Mail](m.md)](x)`
+    renders as one image whose alt text reads `outer Mail`.
+    """
+    for i in _openers(txt):
+        if not (i and txt[i - 1] == '!'):
+            continue
+        j = _label_end(txt, i)
+        if j is None:
+            continue
+        m = DEST_RE.match(txt, j + 1)
+        if m:
+            yield i - 1, m.end()
+
+
+def contains_link(label, resolved=None):
+    """Whether a link label holds a link, which deactivates the opener above it.
+
+    Recursion is over a strictly shorter string every time — the label sits
+    inside the brackets it is cut from — so it terminates, and `LABEL_MAX`
+    bounds how deep it can go.
+    """
+    for _ in inline_links(label, resolved):
+        return True
+    if not resolved:
+        return False
+    for _s, _e, lstart, lend, ref in full_references(label):
+        # `[text][]` is collapsed: the label IS the reference.
+        if ref_label(ref or label[lstart:lend]) in resolved:
+            return True
+    for m in REF_USE_SHORTCUT.finditer(label):
+        if ref_label(m.group(1)) in resolved:
+            return True
+    return False
 # Markdown drops the backslash from an escaped ASCII punctuation character, so
 # `guide\(v2\).md` addresses the file `guide(v2).md` — same rule as the sibling.
 UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
@@ -577,8 +670,11 @@ def full_references(txt, images=False):
 # copy admitted one, so `![alt` / blank / `docs/guide/mail.md](x.png)` — which
 # renders as a broken image and then the PATH as visible text — was masked
 # whole before the bare-path scan, hiding a route the reader can read.
-IMAGE_LABEL = r'!\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\]'
-IMAGE_INLINE = re.compile(IMAGE_LABEL + DEST)
+# The inline spelling is scanned by `inline_images`, not matched: its own
+# bounded pattern admitted one nested bracket pair, so
+# `![outer [middle [alt]]](docs/guide/mail.md)` was left unmasked and its
+# destination — a resource, never text on screen — reached the bare-path scan
+# as if a reader could read it there.
 # The label is captured twice because an image reference names its
 # definition in one of three places: `![alt][ref]` (the second), `![ref][]`
 # and `![ref]` (the first). Which one is used decides whether this is an
@@ -1066,16 +1162,19 @@ ATTR_VALUE_ANY = re.compile(r'\b' + ATTR_ASSIGNED, re.I)
 # rule-applied-to-one-sibling mistake this file keeps making.
 ANCHOR_TAG = re.compile(
     r'<a(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
-# The destination of a rendered link, blanked before the bare-path scan —
-# matched with the LABEL in front of it, because `](docs/guide/mail.md)`
-# with no opening bracket renders literally and its path is visible text.
-# `\]` alone blanked that away and reported the page it names as an orphan.
+# The destination of a rendered link is blanked before the bare-path scan by
+# `blank_link_dests`, which walks `inline_links` rather than matching a
+# pattern. Two bounded patterns stood here and were deleted: they required the
+# LABEL in front of the destination, because `](docs/guide/mail.md)` with no
+# opening bracket renders literally and its path is visible text — but they
+# admitted only ONE level of nesting, so
+# `[outer [middle [label]]](https://example.test/?q=docs/guide/mail.md)` went
+# unblanked and the bare scan read a repository path out of an EXTERNAL URL.
+# The scanner also knows what a pattern cannot: an outer opener deactivated by
+# an inner link is not a link, so its `](…)` is visible text and must survive.
 # Only the destination is blanked, never the label: the label IS on screen,
 # so `[see docs/guide/mail.md](https://example.com)` names a route in words
 # the reader can read.
-LINK_DEST = re.compile(r'(?<![\\!])\[' + FLAT + r'*\](' + DEST + r')')
-LINK_DEST_NESTED = re.compile(
-    r'(?<![\\!])\[(?:' + FLAT + r'|\[' + FLAT + r'*\])*\](' + DEST + r')')
 # A whole raw tag, used to bound where `src=` may be masked. Unscoped, that
 # pattern also eats the query of `[Mail](mail.md?src=guide)`, which is an
 # ordinary Markdown link the sibling gate resolves.
@@ -1452,7 +1551,7 @@ def _blank_href(m):
     return whole
 
 
-def blank_link_dests(txt):
+def blank_link_dests(txt, resolved=None):
     """Blank the DESTINATION of every rendered link, leaving its label alone.
 
     `sub_in_prose` cannot do this: it blanks whole matches, and the label of a
@@ -1467,11 +1566,10 @@ def blank_link_dests(txt):
             continue
         protected = [(m.start(), m.end()) for m in CODE_SPAN.finditer(seg)]
         spans = []
-        for pat in (LINK_DEST, LINK_DEST_NESTED):
-            for m in pat.finditer(seg):
-                if any(a <= m.start() < b for a, b in protected):
-                    continue
-                spans.append(m.span(1))
+        for lstart, _le, _a, _b, ds, de in inline_links(seg, resolved):
+            if any(a <= lstart - 1 < b for a, b in protected):
+                continue
+            spans.append((ds, de))
         for a, b in spans:
             seg = seg[:a] + ' ' * (b - a) + seg[b:]
         out.append(seg)
@@ -2296,7 +2394,12 @@ def mask_invisible(txt, keep_images=False):
         if keep_images:
             out.append(seg)
             continue
-        blank(IMAGE_INLINE)
+        # `protected` is the same guard `blank()` applies: an image SAMPLE
+        # inside a code span keeps its visible destination, so the scan must
+        # skip one exactly as the pattern did.
+        for a, b in [s for s in inline_images(seg)
+                     if not any(p <= s[0] < q for p, q in protected)]:
+            seg = seg[:a] + ' ' * (b - a) + seg[b:]
         # An image REFERENCE is an image only if its label resolves. The
         # definition set is read from the whole text rather than the resolved
         # one computed later in `edges_from`, which is not available this
@@ -2422,7 +2525,7 @@ def edges_from(f):
     # feed the bare-path scan a path out of its query string; that destination
     # is `inline_links`' to resolve, and it resolves to an external URL. Prose
     # only: the same text in a fence shows the path and still counts.
-    scan = blank_link_dests(txt)
+    scan = blank_link_dests(txt, definition_labels(txt))
     # An `href` value is not visible text either. It is spared from masking
     # so the anchor extractor can read it — and that extractor now REJECTS
     # an anchor with no content, which left `<a href="docs/guide/mail.md">`
@@ -2460,7 +2563,11 @@ def edges_from(f):
     md_txt = sub_in_prose(RAW_BLOCK, md_txt)
     md_txt = sub_in_prose(RAW_BLOCK_TYPE7, md_txt, only_at_block_start=True)
 
-    for lstart, lend, angle, bare in inline_links(md_txt):
+    # The definition set decides whether an inner REFERENCE is a link — and so
+    # whether it deactivates the opener around it. Definitions are
+    # document-scoped, so this is read from the whole view.
+    _md_defined = definition_labels(md_txt)
+    for lstart, lend, angle, bare, _ds, _de in inline_links(md_txt, _md_defined):
         # Offsets line up across both views because every masker replaces
         # space for space.
         if not has_content(img_view[lstart:lend], md_txt[lstart:lend],
@@ -5389,6 +5496,68 @@ self_test() {
     > "$c9jl/docs/guide/jobs.md"
   git -C "$c9jl" add -A && git -C "$c9jl" commit -qm backticks-across-blank-line
   check "backticks either side of a blank line are not a span" pass "$c9jl"
+
+  # A LINK MAY NOT CONTAIN A LINK: the inner one renders and the outer opener
+  # is deactivated, so the reader's route is `mail.md` and not the outer
+  # destination. Balancing straight through the label yielded the outer and
+  # skipped the inner — the page the reader can click, reported an orphan.
+  local c9jm="$tmp/c9jm"; make_corpus "$c9jm"
+  printf '# Jobs\n\n[outer [Mail](mail.md)](https://example.test)\n' \
+    > "$c9jm/docs/guide/jobs.md"
+  git -C "$c9jm" add -A && git -C "$c9jm" commit -qm inner-link-wins
+  check "an inner link deactivates the opener above it" pass "$c9jm"
+
+  # ...and the deactivated outer `](…)` is then LITERAL TEXT, so a path in it
+  # is on screen and is a route by this gate's own rule. Blanking it as though
+  # it were still a link destination stranded the page it names.
+  local c9jn="$tmp/c9jn"; make_corpus "$c9jn"
+  printf '# O\n\ntext\n' > "$c9jn/docs/guide/other.md"
+  printf '# Jobs\n\n[outer [Mail](mail.md)](docs/guide/other.md)\n' \
+    > "$c9jn/docs/guide/jobs.md"
+  git -C "$c9jn" add -A && git -C "$c9jn" commit -qm deactivated-dest-visible
+  check "a deactivated destination is visible text" pass "$c9jn"
+
+  # An UNRESOLVED reference is not a link and deactivates nothing, so the outer
+  # link still renders and its destination is still the reader's route. Reading
+  # every bracket pair as an inner link would have stranded this page.
+  local c9jo="$tmp/c9jo"; make_corpus "$c9jo"
+  printf '# Jobs\n\n[outer [nosuch]](mail.md)\n' > "$c9jo/docs/guide/jobs.md"
+  git -C "$c9jo" add -A && git -C "$c9jo" commit -qm undefined-ref-inside-label
+  check "an undefined reference deactivates nothing" pass "$c9jo"
+
+  # (An inner IMAGE deactivates nothing either — a link may not contain a link,
+  # but it may contain an image — and that case was written here and removed.
+  # It cannot fail: deactivating the outer opener turns its `](…)` into visible
+  # text, and a destination named in visible text is a route by this gate's own
+  # rule, so the page is reachable under either reading. Measured with the
+  # destination bare and angle-wrapped alike. The asymmetry is real and stays
+  # pinned where it is derived, in `inline_links`.)
+
+  # A link inside a CODE SPAN deactivates nothing, since it renders as code.
+  local c9jq="$tmp/c9jq"; make_corpus "$c9jq"
+  printf '# Jobs\n\n[outer `[x](other.md)`](mail.md)\n' \
+    > "$c9jq/docs/guide/jobs.md"
+  git -C "$c9jq" add -A && git -C "$c9jq" commit -qm link-sample-inside-label
+  check "a link sample in a code span deactivates nothing" pass "$c9jq"
+
+  # An image's alt text is a link label and nests like one. The bounded pattern
+  # took one level, so a deeper alt left the image unmasked and its destination
+  # — a resource the page loads, never text on screen — reached the bare-path
+  # scan as if the reader could read it there.
+  local c9jr="$tmp/c9jr"; make_corpus "$c9jr"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n![outer [middle [alt]]](docs/guide/mail.md)\n' \
+    > "$c9jr/README.md"
+  git -C "$c9jr" add -A && git -C "$c9jr" commit -qm deep-nested-image-alt
+  check "a deeply nested image alt still masks its destination" fail "$c9jr"
+
+  # The same bound on the link-destination pattern let a repository path be
+  # read out of an EXTERNAL URL's query string: unblanked, `scan` still held
+  # `docs/guide/mail.md`, and clicking the link leaves the repository entirely.
+  local c9js="$tmp/c9js"; make_corpus "$c9js"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n[outer [middle [label]]](https://example.test/?q=docs/guide/mail.md)\n' \
+    > "$c9js/README.md"
+  git -C "$c9js" add -A && git -C "$c9js" commit -qm deep-nested-external-dest
+  check "a deeply nested label still blanks its destination" fail "$c9js"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
