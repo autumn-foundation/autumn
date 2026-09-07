@@ -1029,11 +1029,7 @@ impl CustomDomainRegistry {
     }
 
     /// Apply `f` to a record and persist it. A missing hostname is a no-op.
-    async fn mutate(
-        &self,
-        hostname: &str,
-        f: impl FnOnce(&mut CustomDomain),
-    ) -> io::Result<()> {
+    async fn mutate(&self, hostname: &str, f: impl FnOnce(&mut CustomDomain)) -> io::Result<()> {
         let Ok(host) = normalize_hostname(hostname) else {
             return Ok(());
         };
@@ -1606,12 +1602,14 @@ mod sni {
         /// Does the operator's own certificate cover `name`?
         fn base_covers(&self, name: &str) -> bool {
             self.base_names.iter().any(|pattern| {
-                pattern.strip_prefix("*.").map_or(pattern == name, |suffix| {
-                    // A wildcard matches exactly one label, per RFC 6125.
-                    name.strip_suffix(suffix)
-                        .and_then(|prefix| prefix.strip_suffix('.'))
-                        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
-                })
+                pattern
+                    .strip_prefix("*.")
+                    .map_or(pattern == name, |suffix| {
+                        // A wildcard matches exactly one label, per RFC 6125.
+                        name.strip_suffix(suffix)
+                            .and_then(|prefix| prefix.strip_suffix('.'))
+                            .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+                    })
             })
         }
     }
@@ -1640,7 +1638,8 @@ pub use sni::{CustomDomainCertCache, SniCertResolver, SniCertSource};
 /// replacement), so refusing to serve every tenant afterwards would be a
 /// worse outcome than continuing.
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Write a lock, recovering from poisoning. See [`read_lock`].
@@ -1676,7 +1675,10 @@ mod tests {
             ..ExpectedIngress::default()
         };
         assert_eq!(
-            grade_dns_verification(&ObservedTarget::Cname("ingress.myapp.com.".to_owned()), &expected),
+            grade_dns_verification(
+                &ObservedTarget::Cname("ingress.myapp.com.".to_owned()),
+                &expected
+            ),
             VerificationOutcome::PointsHere
         );
     }
@@ -1738,12 +1740,18 @@ mod tests {
     #[tokio::test]
     async fn re_registering_the_same_pair_is_idempotent() {
         let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
-        registry.register("app.clientco.com", "t1", 100).await.unwrap();
+        registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .unwrap();
         registry
             .record_active("app.clientco.com", 100, 200)
             .await
             .unwrap();
-        let again = registry.register("app.clientco.com", "t1", 500).await.unwrap();
+        let again = registry
+            .register("app.clientco.com", "t1", 500)
+            .await
+            .unwrap();
         assert_eq!(
             again.status,
             DomainStatus::Active,
@@ -1754,9 +1762,18 @@ mod tests {
     #[tokio::test]
     async fn a_failed_order_returns_to_verified_not_pending() {
         let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
-        registry.register("app.clientco.com", "t1", 100).await.unwrap();
-        registry.record_verified("app.clientco.com", 100).await.unwrap();
-        registry.record_issuing("app.clientco.com", 100).await.unwrap();
+        registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .unwrap();
+        registry
+            .record_verified("app.clientco.com", 100)
+            .await
+            .unwrap();
+        registry
+            .record_issuing("app.clientco.com", 100)
+            .await
+            .unwrap();
         registry
             .record_failure("app.clientco.com", 100, "CA said no", 300)
             .await

@@ -39,10 +39,14 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
             .ok_or_else(|| {
                 crate::AutumnError::service_unavailable_msg("Config is not available")
             })?;
-        let domains = state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
-        let tenant_id =
-            extract_tenant_from_parts_with_domains(parts, &config, domains.as_deref().map(AsRef::as_ref))
-                .await?;
+        let domains =
+            state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
+        let tenant_id = extract_tenant_from_parts_with_domains(
+            parts,
+            &config,
+            domains.as_deref().map(AsRef::as_ref),
+        )
+        .await?;
         Ok(Self(tenant_id))
     }
 }

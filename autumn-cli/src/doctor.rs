@@ -1680,7 +1680,9 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
         DnsPointsHere::Matches => CheckResult {
             name: "custom_domain_dns",
             status: CheckStatus::Pass,
-            detail: Some(format!("{hostname} (tenant {tenant}) resolves to this host")),
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) resolves to this host"
+            )),
             hint: None,
         },
         DnsPointsHere::LocalIpsUnknown => CheckResult {
@@ -6507,14 +6509,15 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     // Deserialize `[server.tls.acme.custom_domains]` the same way (#1635). Its
     // `deny_unknown_fields` catches a mistyped key that would otherwise sit in
     // the file doing nothing while every tenant domain stayed pending.
-    let (custom_domains, custom_domains_error) = acme
-        .get("custom_domains")
-        .map_or((None, None), |value| match value
-            .clone()
-            .try_into::<autumn_web::config::CustomDomainsConfig>(
-        ) {
-            Ok(cd) => (Some(cd), None),
-            Err(e) => (None, Some(e.to_string())),
+    let (custom_domains, custom_domains_error) =
+        acme.get("custom_domains").map_or((None, None), |value| {
+            match value
+                .clone()
+                .try_into::<autumn_web::config::CustomDomainsConfig>()
+            {
+                Ok(cd) => (Some(cd), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
         });
 
     Some(AcmeDoctorConfig {
@@ -12303,8 +12306,8 @@ pub struct Vault {
         assert!(off.detail.unwrap().contains("enabled = false"));
 
         // Enabled with an ingress: Pass, naming the count and the cap.
-        let on = check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, 3)
-            .unwrap();
+        let on =
+            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, 3).unwrap();
         assert_eq!(on.status, CheckStatus::Pass);
         assert!(on.detail.unwrap().contains('3'));
 
@@ -12431,7 +12434,11 @@ pub struct Vault {
         std::fs::write(dir.path().join("ignored.txt"), "irrelevant").unwrap();
 
         let records = read_custom_domain_registry(dir.path());
-        assert_eq!(records.len(), 2, "the corrupt record must not blind the rest");
+        assert_eq!(
+            records.len(),
+            2,
+            "the corrupt record must not blind the rest"
+        );
         assert_eq!(records[0].0, "a.clientco.com");
         assert_eq!(records[1].0, "b.clientco.com");
     }

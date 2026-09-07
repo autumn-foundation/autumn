@@ -91,7 +91,13 @@ pub trait AcmeStore: Send + Sync {
     ///
     /// Offboarding a tenant custom domain (#1635) deletes its certificate here
     /// rather than leaving it on disk forever.
-    fn delete_cert<'a>(&'a self, id: &'a CertId) -> StoreFuture<'a, io::Result<()>>;
+    ///
+    /// Defaulted to a no-op so an existing store keeps compiling. A store that
+    /// does not override it retains offboarded certificates; override it if
+    /// that matters for your deployment.
+    fn delete_cert<'a>(&'a self, _id: &'a CertId) -> StoreFuture<'a, io::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Filesystem-backed [`AcmeStore`] rooted at a cache directory.

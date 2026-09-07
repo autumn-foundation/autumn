@@ -178,9 +178,7 @@ impl RetentionDataset {
             Self::WebhookReplay => "Inbound webhook replay markers",
             Self::Sessions => "Server-side session records",
             Self::AuditArchives => "Entries in the JSONL audit archive",
-            Self::CustomDomains => {
-                "Tenant custom-domain registry records and their certificates"
-            }
+            Self::CustomDomains => "Tenant custom-domain registry records and their certificates",
         }
     }
 

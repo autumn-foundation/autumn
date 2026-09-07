@@ -241,7 +241,11 @@ async fn a_domain_pointing_elsewhere_is_never_ordered() {
             .contains("198.51.100.7"),
         "the status must explain why: {record:?}"
     );
-    assert_eq!(issuer.count(), 0, "zero ACME orders for an unverified domain");
+    assert_eq!(
+        issuer.count(),
+        0,
+        "zero ACME orders for an unverified domain"
+    );
 }
 
 #[tokio::test]
@@ -259,7 +263,13 @@ async fn an_unresolved_domain_says_so_without_ordering() {
 
     let record = h.registry.get("app.clientco.com").unwrap();
     assert_eq!(record.status, DomainStatus::PendingDns);
-    assert!(record.failure_reason.as_deref().unwrap().contains("resolve"));
+    assert!(
+        record
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("resolve")
+    );
     assert_eq!(issuer.count(), 0);
 }
 
@@ -311,7 +321,11 @@ async fn a_failing_domain_backs_off_and_leaves_its_neighbours_alone() {
     // Inside its backoff the failed domain is not retried.
     let before = issuer.count();
     h.task.tick(NOW + 2).await;
-    assert_eq!(issuer.count(), before, "a backed-off domain must not re-order");
+    assert_eq!(
+        issuer.count(),
+        before,
+        "a backed-off domain must not re-order"
+    );
 
     // Past the backoff it is.
     h.task.tick(NOW + 301).await;
@@ -435,7 +449,11 @@ async fn an_offboarded_domain_stops_being_served_and_renewed() {
 
     let before = issuer.count();
     h.task.tick(NOW + 100_000).await;
-    assert_eq!(issuer.count(), before, "an offboarded domain must not renew");
+    assert_eq!(
+        issuer.count(),
+        before,
+        "an offboarded domain must not renew"
+    );
 }
 
 // ── AC6: incremental certificate loading ─────────────────────────────────
@@ -746,7 +764,10 @@ async fn a_handshake_for_a_domain_past_the_cache_loads_its_certificate_from_disk
         resolver.certificate_for("app.clientco.com").is_some(),
         "a cold domain must load its certificate on the handshake path"
     );
-    assert!(cache.get("app.clientco.com").is_some(), "and be cached after");
+    assert!(
+        cache.get("app.clientco.com").is_some(),
+        "and be cached after"
+    );
     // An unregistered hostname is still refused without ever touching disk.
     assert!(resolver.certificate_for("attacker.example.net").is_none());
 }

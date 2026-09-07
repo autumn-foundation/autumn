@@ -9102,7 +9102,10 @@ async fn build_acme_tls_listener(
 
     let cert_resolver: std::sync::Arc<dyn rustls::server::ResolvesServerCert> =
         custom_domains.as_ref().map_or_else(
-            || std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
+            || {
+                std::sync::Arc::clone(&resolver)
+                    as std::sync::Arc<dyn rustls::server::ResolvesServerCert>
+            },
             |cd| {
                 std::sync::Arc::new(
                     crate::custom_domain::SniCertResolver::new(
@@ -9124,9 +9127,11 @@ async fn build_acme_tls_listener(
                 )
             },
         );
-    let server_config =
-        crate::tls::build_server_config_with_resolver(std::sync::Arc::clone(&provider), cert_resolver)
-            .map_err(|e| e.to_string())?;
+    let server_config = crate::tls::build_server_config_with_resolver(
+        std::sync::Arc::clone(&provider),
+        cert_resolver,
+    )
+    .map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
 
@@ -9387,9 +9392,8 @@ fn spawn_custom_domain_task(
         .collect(),
     });
 
-    state.insert_extension(
-        std::sync::Arc::clone(&task) as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>
-    );
+    state.insert_extension(std::sync::Arc::clone(&task)
+        as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
 
     let interval = std::time::Duration::from_secs(config.poll_interval_secs.max(1));
     tokio::spawn(async move {
@@ -9402,11 +9406,7 @@ fn spawn_custom_domain_task(
 fn make_custom_domain_reporter(state: &AppState) -> crate::acme::tenant_domains::ReporterFn {
     let state = state.clone();
     std::sync::Arc::new(move |message: String| {
-        crate::alerts::notify_scheduled_task_failure(
-            &state,
-            CUSTOM_DOMAIN_TASK_NAME,
-            &message,
-        );
+        crate::alerts::notify_scheduled_task_failure(&state, CUSTOM_DOMAIN_TASK_NAME, &message);
     })
 }
 

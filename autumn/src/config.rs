@@ -7362,7 +7362,10 @@ impl CustomDomainsConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.ingress_hostname.as_ref().is_none_or(|h| h.trim().is_empty())
+        if self
+            .ingress_hostname
+            .as_ref()
+            .is_none_or(|h| h.trim().is_empty())
             && self.ingress_ipv4.is_empty()
             && self.ingress_ipv6.is_empty()
         {

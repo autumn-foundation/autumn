@@ -75,7 +75,10 @@ fn hostnames_are_normalised_and_validated() {
         "app.clientco.com"
     );
     // A port is not part of a hostname the CA can be asked about.
-    assert_eq!(normalize_hostname("app.clientco.com:443").unwrap(), "app.clientco.com");
+    assert_eq!(
+        normalize_hostname("app.clientco.com:443").unwrap(),
+        "app.clientco.com"
+    );
 
     for bad in [
         "",
@@ -249,17 +252,33 @@ async fn a_domain_pointing_elsewhere_never_reaches_the_acme_provider() {
     let outcome = VerificationOutcome::PointsElsewhere {
         detail: "resolves to 198.51.100.7".to_owned(),
     };
-    autumn_web::custom_domain::apply_verification(&registry, "app.clientco.com", &outcome, NOW, 300)
-        .await
-        .unwrap();
+    autumn_web::custom_domain::apply_verification(
+        &registry,
+        "app.clientco.com",
+        &outcome,
+        NOW,
+        300,
+    )
+    .await
+    .unwrap();
 
     let after = registry.get("app.clientco.com").unwrap();
     assert_eq!(after.status, DomainStatus::PendingDns);
-    assert!(after.failure_reason.as_deref().unwrap().contains("198.51.100.7"));
+    assert!(
+        after
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("198.51.100.7")
+    );
 
     // Nothing is due for issuance, so the issuer is never called.
     assert!(registry.due_for_issuance(NOW + 1).is_empty());
-    assert_eq!(issuer.count(), 0, "an unverified domain must place no ACME order");
+    assert_eq!(
+        issuer.count(),
+        0,
+        "an unverified domain must place no ACME order"
+    );
 }
 
 // ── AC3: request routing for a registered domain ─────────────────────────
@@ -361,10 +380,7 @@ fn repeated_failures_back_off_exponentially_and_cap() {
     let limiter = IssuanceLimiter::new(100, 100, 300, 3600);
     assert_eq!(limiter.check("a.test", NOW), IssuanceDecision::Allow);
     assert_eq!(limiter.backoff_for(2), 600);
-    assert_eq!(
-        autumn_web::custom_domain::backoff_secs(1, 300, 3600),
-        300
-    );
+    assert_eq!(autumn_web::custom_domain::backoff_secs(1, 300, 3600), 300);
     assert_eq!(autumn_web::custom_domain::backoff_secs(2, 300, 3600), 600);
     assert_eq!(autumn_web::custom_domain::backoff_secs(3, 300, 3600), 1200);
     // Capped, and never overflows for an absurd failure count.
@@ -399,12 +415,20 @@ async fn a_thousand_domains_register_and_resolve_without_per_domain_config() {
     ));
     for i in 0..1000 {
         let host = format!("tenant{i}.clientco.com");
-        registry.register(&host, &format!("tenant-{i}"), NOW).await.unwrap();
-        registry.record_active(&host, NOW, NOW + 86_400).await.unwrap();
+        registry
+            .register(&host, &format!("tenant-{i}"), NOW)
+            .await
+            .unwrap();
+        registry
+            .record_active(&host, NOW, NOW + 86_400)
+            .await
+            .unwrap();
     }
     assert_eq!(registry.len(), 1000);
     assert_eq!(
-        registry.tenant_for_host("tenant999.clientco.com").as_deref(),
+        registry
+            .tenant_for_host("tenant999.clientco.com")
+            .as_deref(),
         Some("tenant-999")
     );
 
@@ -436,7 +460,10 @@ async fn removing_a_domain_stops_routing_serving_and_renewal() {
     assert!(!registry.is_servable("app.clientco.com"));
     assert!(registry.tenant_for_host("app.clientco.com").is_none());
     assert!(registry.due_for_renewal(NOW + 86_400, 30).is_empty());
-    assert!(store.load_all_blocking().is_empty(), "the record must be deleted, not orphaned");
+    assert!(
+        store.load_all_blocking().is_empty(),
+        "the record must be deleted, not orphaned"
+    );
 
     // Removing twice is not an error.
     assert!(!registry.remove("app.clientco.com").await.unwrap());
@@ -448,7 +475,10 @@ async fn offboarding_a_tenant_removes_every_domain_it_owns() {
     for host in ["a.clientco.com", "b.clientco.com"] {
         registry.register(host, "tenant-a", NOW).await.unwrap();
     }
-    registry.register("c.other.com", "tenant-b", NOW).await.unwrap();
+    registry
+        .register("c.other.com", "tenant-b", NOW)
+        .await
+        .unwrap();
 
     assert_eq!(registry.remove_tenant("tenant-a").await.unwrap(), 2);
     assert!(registry.list_for_tenant("tenant-a").is_empty());
@@ -460,12 +490,18 @@ async fn offboarding_a_tenant_removes_every_domain_it_owns() {
 #[tokio::test]
 async fn renewal_is_due_per_domain_and_one_failure_leaves_the_others_alone() {
     let registry = registry();
-    registry.register("soon.clientco.com", "tenant-a", NOW).await.unwrap();
+    registry
+        .register("soon.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
     registry
         .record_active("soon.clientco.com", NOW, NOW + 10 * 86_400)
         .await
         .unwrap();
-    registry.register("later.clientco.com", "tenant-b", NOW).await.unwrap();
+    registry
+        .register("later.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
     registry
         .record_active("later.clientco.com", NOW, NOW + 80 * 86_400)
         .await
@@ -483,7 +519,11 @@ async fn renewal_is_due_per_domain_and_one_failure_leaves_the_others_alone() {
     // The failed domain keeps serving its still-valid certificate, and the
     // healthy domain is untouched.
     let failed = registry.get("soon.clientco.com").unwrap();
-    assert_eq!(failed.status, DomainStatus::Active, "a renewal failure must not stop serving");
+    assert_eq!(
+        failed.status,
+        DomainStatus::Active,
+        "a renewal failure must not stop serving"
+    );
     assert!(failed.failure_reason.is_some());
     let healthy = registry.get("later.clientco.com").unwrap();
     assert_eq!(healthy.status, DomainStatus::Active);
@@ -499,8 +539,8 @@ async fn renewal_is_due_per_domain_and_one_failure_leaves_the_others_alone() {
 
 #[cfg(feature = "tls")]
 mod sni {
-    use super::{CustomDomainRegistry, MemoryCustomDomainStore, NOW};
     use super::super::tls_support::{CERT_PEM, KEY_PEM, RENEWED_CERT_PEM, RENEWED_KEY_PEM};
+    use super::{CustomDomainRegistry, MemoryCustomDomainStore, NOW};
     use autumn_web::custom_domain::{CustomDomainCertCache, SniCertResolver};
     use std::sync::Arc;
 
@@ -576,7 +616,10 @@ mod sni {
             cache.insert(host, key(CERT_PEM, KEY_PEM));
         }
         assert_eq!(cache.len(), 2);
-        assert!(cache.get("a.test").is_none(), "oldest entry must be evicted");
+        assert!(
+            cache.get("a.test").is_none(),
+            "oldest entry must be evicted"
+        );
         assert!(cache.get("c.test").is_some());
 
         cache.remove("c.test");

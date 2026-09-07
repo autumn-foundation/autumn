@@ -1128,12 +1128,13 @@ pub(crate) fn generate_csr(domains: &[String]) -> Result<(Vec<u8>, String), Stri
 /// host does not know, so `ca_root_path` replaces the trust anchors with that
 /// root; without it the client cannot complete the TLS handshake and every
 /// order fails.
-pub(crate) fn account_builder(
-    config: &AcmeConfig,
-) -> Result<instant_acme::AccountBuilder, String> {
+pub(crate) fn account_builder(config: &AcmeConfig) -> Result<instant_acme::AccountBuilder, String> {
     ensure_default_crypto_provider();
     config.ca_root_path.as_ref().map_or_else(
-        || instant_acme::Account::builder().map_err(|e| format!("failed to build ACME client: {e}")),
+        || {
+            instant_acme::Account::builder()
+                .map_err(|e| format!("failed to build ACME client: {e}"))
+        },
         |path| {
             instant_acme::Account::builder_with_root(path).map_err(|e| {
                 format!(

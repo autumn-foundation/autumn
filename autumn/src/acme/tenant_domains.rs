@@ -88,11 +88,9 @@ impl AcmeDomainIssuer {
     async fn order(&self, hostname: &str) -> Result<IssuedCertificate, String> {
         use instant_acme::{Identifier, NewOrder};
 
-        let account = crate::acme::renewal::load_or_register_account(
-            self.store.as_ref(),
-            &self.config,
-        )
-        .await?;
+        let account =
+            crate::acme::renewal::load_or_register_account(self.store.as_ref(), &self.config)
+                .await?;
         let identifiers = [Identifier::Dns(hostname.to_owned())];
         let mut order = account
             .new_order(&NewOrder::new(&identifiers))
@@ -209,10 +207,15 @@ impl CustomDomainTask {
             self.verify_one(&domain.hostname, now_unix).await;
         }
         for domain in self.registry.due_for_issuance(now_unix) {
-            self.issue_one(&domain.hostname, &domain.tenant, now_unix).await;
+            self.issue_one(&domain.hostname, &domain.tenant, now_unix)
+                .await;
         }
-        for domain in self.registry.due_for_renewal(now_unix, self.renew_before_days) {
-            self.issue_one(&domain.hostname, &domain.tenant, now_unix).await;
+        for domain in self
+            .registry
+            .due_for_renewal(now_unix, self.renew_before_days)
+        {
+            self.issue_one(&domain.hostname, &domain.tenant, now_unix)
+                .await;
         }
     }
 
@@ -224,11 +227,15 @@ impl CustomDomainTask {
             .registry
             .get(hostname)
             .map_or(0, |d| d.consecutive_failures);
-        let backoff = i64::try_from(self.limiter.backoff_for(failures.saturating_add(1)))
-            .unwrap_or(i64::MAX);
-        if let Err(e) = apply_verification(&self.registry, hostname, &outcome, now_unix, backoff).await
+        let backoff =
+            i64::try_from(self.limiter.backoff_for(failures.saturating_add(1))).unwrap_or(i64::MAX);
+        if let Err(e) =
+            apply_verification(&self.registry, hostname, &outcome, now_unix, backoff).await
         {
-            tracing::warn!(hostname, "failed to persist custom-domain verification: {e}");
+            tracing::warn!(
+                hostname,
+                "failed to persist custom-domain verification: {e}"
+            );
         }
     }
 
@@ -279,7 +286,10 @@ impl CustomDomainTask {
         }
 
         if let Err(e) = self.registry.record_issuing(hostname, now_unix).await {
-            tracing::warn!(hostname, "failed to persist custom-domain issuing state: {e}");
+            tracing::warn!(
+                hostname,
+                "failed to persist custom-domain issuing state: {e}"
+            );
         }
         self.limiter.record_attempt(hostname, now_unix);
 
@@ -413,7 +423,10 @@ impl CustomDomainTask {
                     true
                 }
                 Err(e) => {
-                    tracing::warn!(hostname, "stored custom-domain certificate is unusable: {e}");
+                    tracing::warn!(
+                        hostname,
+                        "stored custom-domain certificate is unusable: {e}"
+                    );
                     false
                 }
             },
@@ -540,15 +553,16 @@ impl FsSniCertSource {
 
 impl crate::custom_domain::SniCertSource for FsSniCertSource {
     fn load(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let (chain_path, key_path) = self
-            .store
-            .find_cert_for_domains(&[hostname.to_owned()])?;
+        let (chain_path, key_path) = self.store.find_cert_for_domains(&[hostname.to_owned()])?;
         let chain = std::fs::read(&chain_path).ok()?;
         let key = std::fs::read(&key_path).ok()?;
         match crate::tls::certified_key_from_pem(&chain, &key, &self.provider) {
             Ok(certified) => Some(certified),
             Err(e) => {
-                tracing::warn!(hostname, "stored custom-domain certificate is unusable: {e}");
+                tracing::warn!(
+                    hostname,
+                    "stored custom-domain certificate is unusable: {e}"
+                );
                 None
             }
         }
