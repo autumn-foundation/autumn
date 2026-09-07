@@ -104,7 +104,9 @@ fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
             assert_eq!(name, "app.clientco.com");
             assert_eq!(value, "ingress.myapp.com");
         }
-        other => panic!("expected a CNAME instruction, got {other:?}"),
+        other @ DnsInstructions::Address { .. } => {
+            panic!("expected a CNAME instruction, got {other:?}")
+        }
     }
     assert!(sub.render().contains("CNAME"));
 
@@ -116,7 +118,9 @@ fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
             assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
             assert!(ipv6.is_empty());
         }
-        other => panic!("expected address records, got {other:?}"),
+        other @ DnsInstructions::Cname { .. } => {
+            panic!("expected address records, got {other:?}")
+        }
     }
     assert!(apex.render().contains('A'));
 }

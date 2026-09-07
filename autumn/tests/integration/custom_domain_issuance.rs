@@ -1125,7 +1125,7 @@ async fn a_thousand_domains_serve_the_right_certificate_through_a_cache_of_two_h
         };
         certs
             .save_cert(
-                &CertId::from_domains(&[host.clone()]),
+                &CertId::from_domains(std::slice::from_ref(&host)),
                 &autumn_web::acme::store::StoredCert {
                     chain_pem: chain.to_owned(),
                     key_pem: key.to_owned(),
