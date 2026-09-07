@@ -850,6 +850,20 @@ fn classify_edges(
                     .or_default()
                     .push(describe(edge));
             }
+            // The mirror of the retained-child case below: an outside child —
+            // framework-owned, and NOT purged, so it keeps its rows — pointing
+            // at a sampled parent that keeps every row of its own (a full-copy
+            // table, or an exact-100% root). The two arms above already took
+            // every subsetted parent, so the sample cannot break this reference:
+            // the parent loses nothing. The re-count still wants it, for the one
+            // reason the re-count exists — a constraint a migration left
+            // `NOT VALID` over a pre-existing orphan is never revalidated by
+            // Postgres, and keeping both sides whole does not repair it. A
+            // purged child is exempt: the run empties it, and an absent row
+            // cannot dangle.
+            (None, Some(_)) if !inputs.purged.contains(&edge.child_table) => {
+                verify_only.push(edge.clone());
+            }
             // The mirror image: a table the sample removes rows from points INTO
             // a purged framework table. Purges run before the sample so the case
             // above holds, which would empty the parent while these rows still
@@ -3264,6 +3278,77 @@ mod tests {
         assert!(
             plan.walk_edges.iter().all(|e| e.name != "countries_job_fk"),
             "but it must not enter the walk"
+        );
+    }
+
+    #[test]
+    fn an_outside_child_of_a_full_copy_parent_is_still_verified() {
+        // The mirror of the case above, on the other side of the edge: a
+        // framework-owned table nothing empties pointing INTO a full-copy table.
+        // Neither side loses a row, so the sample cannot break the reference —
+        // which is exactly why it fell through every arm and was dropped. A
+        // `NOT VALID` constraint over a pre-existing orphan is never revalidated
+        // by Postgres, so the run would report every checked reference resolving
+        // while one does not.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "job_country_fk",
+            "autumn_jobs",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges.iter().any(|e| e.name == "job_country_fk"),
+            "an outside child of a full-copy parent must be re-counted: {:?}",
+            plan.verify_edges
+                .iter()
+                .map(|e| &e.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "job_country_fk"),
+            "but it must not enter the walk — nothing outside the universe is sampled"
+        );
+    }
+
+    #[test]
+    fn a_purged_child_of_a_full_copy_parent_needs_no_verification() {
+        // The exemption on this side: the run empties the child, so nothing of
+        // it survives to dangle.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "job_country_fk",
+            "autumn_jobs",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges.iter().all(|e| e.name != "job_country_fk"),
+            "a purged child's references need no re-count"
         );
     }
 

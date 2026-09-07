@@ -1652,6 +1652,75 @@ async fn disabling_the_delete_trigger_lifts_the_refusal() {
     );
 }
 
+/// The re-count reaches an outside child of a table the sample keeps whole.
+///
+/// Neither side of that edge loses a row — a framework-owned table nothing
+/// empties, pointing at an `always_include` table — so the sample cannot break
+/// the reference, which is why the edge used to be dropped from the plan
+/// entirely. That is exactly backwards for the one job this re-count has:
+/// Postgres never revalidates a `NOT VALID` constraint against rows that
+/// predate it, so an orphan there survives while the run reports that every
+/// checked reference resolves.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_recount_covers_an_outside_child_of_a_full_copy_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "outside_child_recount").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                country_id BIGINT NOT NULL, \
+                args TEXT NOT NULL \
+            ); \
+            INSERT INTO autumn_jobs (country_id, args) VALUES (999999, 'orphaned'); \
+            ALTER TABLE autumn_jobs ADD CONSTRAINT autumn_jobs_country_fk \
+                FOREIGN KEY (country_id) REFERENCES countries (id) NOT VALID;",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/outside_child_recount");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        stderr.contains("autumn_jobs_country_fk"),
+        "the re-count must name the edge it found unresolved: {stderr}"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
+        )
+        .await,
+        200,
+        "and the run must roll back rather than commit over it"
+    );
+
+    // The legitimate case still passes: repair the orphan and the same run
+    // completes, with the edge counted rather than skipped.
+    client
+        .batch_execute("UPDATE autumn_jobs SET country_id = (SELECT min(id) FROM countries)")
+        .await
+        .unwrap();
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "the repaired run must scrub as usual"
+    );
+}
+
 /// A `DELETE` trigger on a table the run empties is refused before any write.
 ///
 /// The emptying pass has to run LAST — that is what makes "this table ends up
