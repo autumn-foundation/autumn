@@ -67,7 +67,7 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 // not demand them is not misled, while a request client is no
                 // longer forced to send what the handler does not need.
                 let container_default = crate::schema::has_serde_default(&input.attrs);
-                crate::schema::emit_schema_fn_body_full(
+                let body = crate::schema::emit_schema_fn_body_full(
                     &field_ref_refs,
                     container_default,
                     &[],
@@ -77,7 +77,33 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                     // true of both directions — no conflict, unlike the
                     // directional attributes refused above.
                     &|f: &syn::Field| crate::schema::has_serde_default(&f.attrs),
-                )
+                );
+                // `#[serde(deny_unknown_fields)]` makes deserialization REJECT
+                // any key not listed above. Without `additionalProperties:
+                // false` the schema invites a client to send extras that the
+                // handler then 400s on. Describable rather than refusable —
+                // JSON Schema says exactly this — so it is emitted, not
+                // rejected.
+                //
+                // Sound in both directions: the attribute constrains input, and
+                // a response built from this struct never carries a key outside
+                // the listed set either, so the closed object is true of the
+                // serialize side as well.
+                if crate::schema::serde_bare_word(&input.attrs, &["deny_unknown_fields"]).is_some()
+                {
+                    quote! {{
+                        let mut __autumn_closed = { #body };
+                        if let Some(__autumn_obj) = __autumn_closed.as_object_mut() {
+                            __autumn_obj.insert(
+                                "additionalProperties".to_owned(),
+                                ::autumn_web::reexports::serde_json::json!(false),
+                            );
+                        }
+                        __autumn_closed
+                    }}
+                } else {
+                    body
+                }
             }
             _ => {
                 return syn::Error::new_spanned(

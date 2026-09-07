@@ -462,3 +462,41 @@ fn datetime_and_uuid_fields_are_inline_scalars_not_dangling_refs() {
         );
     }
 }
+
+// ── `deny_unknown_fields` is a closed object (issue #802) ──────────────
+
+/// A struct whose deserialization rejects unknown keys.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClosedQuery {
+    pub q: String,
+}
+
+/// Without the derive saying so, an `OpenAPI` validator lets a client send extra
+/// keys that serde then rejects with a 400 — the schema invites a request the
+/// handler refuses.
+#[test]
+fn deny_unknown_fields_closes_the_object() {
+    let schema = <ClosedQuery as autumn_web::openapi::OpenApiSchema>::schema();
+    assert_eq!(
+        schema["additionalProperties"],
+        serde_json::json!(false),
+        "`#[serde(deny_unknown_fields)]` must publish a closed object: {schema}"
+    );
+}
+
+/// The ordinary struct stays open — absence of the attribute must not silently
+/// start forbidding extras, which would break every client sending a superset.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+pub struct OpenQuery {
+    pub q: String,
+}
+
+#[test]
+fn a_struct_without_the_attribute_stays_open() {
+    let schema = <OpenQuery as autumn_web::openapi::OpenApiSchema>::schema();
+    assert!(
+        schema.get("additionalProperties").is_none(),
+        "an ordinary struct must not be closed: {schema}"
+    );
+}
