@@ -336,8 +336,18 @@ fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Resu
 /// so a sibling list-valued attribute — `#[serde(bound(deserialize = "…"),
 /// alias = "legacy")]` — cannot abort the walk before `alias` is reached.
 pub fn variant_has_serde_alias(variant: &syn::Variant) -> bool {
+    has_serde_alias(&variant.attrs)
+}
+
+/// Does this attribute list carry `#[serde(alias = "…")]`?
+///
+/// serde accepts `alias` on a FIELD and on a VARIANT, and it means the same
+/// deserialize-only widening in both places. One predicate serves both, so the
+/// two callers cannot drift the way the audit and the emitter drifted over
+/// `default` (issue #802).
+pub fn has_serde_alias(attrs: &[syn::Attribute]) -> bool {
     let mut found = false;
-    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("alias") {
                 // Consume the value so the walk continues cleanly.

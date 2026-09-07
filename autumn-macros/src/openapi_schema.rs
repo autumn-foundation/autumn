@@ -332,6 +332,24 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
                  `OpenApiConfig::register_schema`.",
             ));
         }
+        // Same deserialize-only widening as on a variant, one level down.
+        // serde accepts an object carrying ONLY the alias, while the emitted
+        // schema names the canonical property and marks it `required` — so a
+        // validator rejects input the handler takes. `#[serde(deny_unknown_fields)]`
+        // sharpens it into a contradiction: the alias key is then forbidden as
+        // an additional property AND the canonical one demanded, so no request
+        // satisfies the schema and the handler at once.
+        if crate::schema::has_serde_alias(&field.attrs) {
+            return Err(syn::Error::new_spanned(
+                field,
+                "#[derive(OpenApiSchema)] cannot describe a field with `#[serde(alias = \"…\")]`: \
+                 the alias is accepted when deserializing but never written when serializing, so \
+                 one property name cannot be right for both requests and responses — a validator \
+                 would reject a request the handler accepts. Use `#[serde(rename = \"…\")]` if the \
+                 wire name should change in both directions, or write the `OpenApiSchema` impl by \
+                 hand and register it with `OpenApiConfig::register_schema`.",
+            ));
+        }
         if let Some(key) = crate::schema::serde_split_rename(&field.attrs, "rename") {
             return Err(syn::Error::new_spanned(field, split_rename_message(key)));
         }
@@ -659,6 +677,47 @@ mod tests {
             }
         })
         .expect("a container default makes every field omissible on input");
+    }
+
+    /// A FIELD alias is the same deserialize-only widening as a variant alias.
+    /// Missing this while catching the variant form was the fourth instance on
+    /// this branch of a rule applied at one level of the syntax tree and not
+    /// the other, so both now share one predicate.
+    #[test]
+    fn a_field_alias_is_refused() {
+        let err = audit(&parse_quote! {
+            struct Row {
+                #[serde(alias = "legacy_name")]
+                name: String,
+            }
+        })
+        .expect_err("an aliased field must be refused");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// Same parser-robustness guarantee the variant scan has.
+    #[test]
+    fn a_field_alias_after_a_list_valued_attribute_is_still_seen() {
+        let err = audit(&parse_quote! {
+            struct Row {
+                #[serde(bound(deserialize = "T: Clone"), alias = "legacy_name")]
+                name: String,
+            }
+        })
+        .expect_err("a field alias behind a list-valued sibling must still be found");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// A symmetric `rename` on a field must still be describable.
+    #[test]
+    fn a_renamed_field_is_still_describable() {
+        audit(&parse_quote! {
+            struct Row {
+                #[serde(rename = "displayName")]
+                name: String,
+            }
+        })
+        .expect("a symmetric field rename must stay describable");
     }
 
     fn audit_enum(input: &DeriveInput) -> Result<(), String> {
