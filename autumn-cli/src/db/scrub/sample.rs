@@ -1550,9 +1550,28 @@ impl SamplePlan {
     /// duration so a row inserted mid-run cannot escape the subset — a
     /// full-copy table included, because the walk reads it to decide which
     /// parents to keep.
+    ///
+    /// The foreign key re-count's own endpoints count as reads, which is why
+    /// they are here even when the sample never touches their rows. Two things
+    /// follow from a table being in this list, and the re-count needs both: the
+    /// scrub refuses to run when it has row-level security (a policy would hide
+    /// the very orphan the count exists to find, and it would report success),
+    /// and the rows cannot change under the count before the commit.
     #[must_use]
     pub fn locked_tables(&self) -> Vec<&str> {
-        self.tables.iter().map(|t| t.table.as_str()).collect()
+        let mut tables: Vec<&str> = self
+            .tables
+            .iter()
+            .map(|t| t.table.as_str())
+            .chain(
+                self.verify_edges
+                    .iter()
+                    .flat_map(|edge| [edge.child_table.as_str(), edge.parent_table.as_str()]),
+            )
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+        tables
     }
 
     /// One orphan-counting query per foreign key, as `(label, sql)`.
@@ -3321,6 +3340,52 @@ mod tests {
             plan.walk_edges.iter().all(|e| e.name != "job_country_fk"),
             "but it must not enter the walk — nothing outside the universe is sampled"
         );
+    }
+
+    #[test]
+    fn the_recounts_own_endpoints_are_locked_and_rls_checked() {
+        // `locked_tables` is what the scrub's RLS refusal and its `LOCK TABLE`
+        // set are both built from. An outside child reached only by the
+        // re-count is in neither the plan's tables nor the purge list, so
+        // without this it is read by a check whose answer nothing protects: a
+        // policy hiding the orphan turns "every reference resolves" into a false
+        // clean bill of health.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "job_country_fk",
+            "autumn_jobs",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        let locked = plan.locked_tables();
+        assert!(
+            locked.contains(&"autumn_jobs"),
+            "an outside endpoint of the re-count must be locked and RLS-checked: {locked:?}"
+        );
+        // And every table the plan owns is still there.
+        for table in &plan.tables {
+            assert!(
+                locked.contains(&table.table.as_str()),
+                "{} must stay locked: {locked:?}",
+                table.table
+            );
+        }
+        let mut sorted = locked.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, locked, "the list must be sorted and deduplicated");
     }
 
     #[test]

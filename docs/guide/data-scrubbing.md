@@ -527,10 +527,19 @@ apply-time error.
   column too — and refuses on any difference, so a privilege gap can never look
   like a clean bill of health. Foreign tables count as part of that universe: one
   left pointing at production would otherwise be classified by nothing.
-- **Row-level security is refused**, for the tables the scrub rewrites *and* the
-  ones `[framework] purge` empties. A role that does not bypass RLS would touch
-  only the rows its policies expose and report success — a silent partial scrub.
-  Connect as the table owner or a `BYPASSRLS` role.
+- **Row-level security is refused** on every table the run reads or writes: the
+  ones it rewrites, the ones `[framework] purge` and `never_include` empty, the
+  ones the sample reads to decide what to keep, and both endpoints of every
+  foreign key the run re-counts. A role that does not bypass RLS sees only the
+  rows its policies expose, and each phase then reports a success it cannot
+  stand behind — a partial rewrite, a table reported emptied that is not, or a
+  re-count that misses the orphan it exists to find. Connect as the table owner
+  or a `BYPASSRLS` role.
+
+  The re-count's endpoints matter more than they look: a framework-owned table
+  the run never writes still gets checked, because a constraint a migration left
+  `NOT VALID` is never revalidated by Postgres, and a policy hiding the orphan
+  would turn that check into a false clean bill of health.
 - **Triggers are warned about, not disabled.** An audit or history trigger can
   copy the pre-scrub row into another table as the rewrite runs. The scrub names
   the tables carrying user triggers; check or disable them on the copy.

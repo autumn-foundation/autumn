@@ -256,7 +256,9 @@ pub enum ScrubError {
         /// The table names, sorted.
         tables: Vec<String>,
     },
-    /// The target has row-level security on a table the scrub would rewrite.
+    /// The target has row-level security on a table this run reads or writes —
+    /// a rewrite, an emptying `DELETE`, the sample's own reads, or an endpoint
+    /// of the foreign key re-count.
     RowLevelSecurity {
         /// The table names, sorted.
         tables: Vec<String>,
@@ -515,9 +517,11 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::RowLevelSecurity { tables } => write!(
                 f,
-                "{} table(s) the scrub would rewrite have row-level security enabled:\n{}\n  \
-                 A role that does not bypass RLS updates only the rows its policies expose and \
-                 reports success, leaving the rest of the PII in place — a silent partial scrub. \
+                "{} table(s) this run reads or writes have row-level security enabled:\n{}\n  \
+                 A role that does not bypass RLS sees only the rows its policies expose, and \
+                 every phase then reports a success it cannot stand behind: an `UPDATE` \
+                 rewrites part of the PII, a `DELETE` reports a table emptied that is not, and \
+                 the foreign key re-count misses the very orphan it exists to find. \
                  Connect as the table owner or a BYPASSRLS role.",
                 tables.len(),
                 bullet_list(tables),
