@@ -235,7 +235,11 @@ pub fn database_file(url: &str) -> Option<PathBuf> {
         .next()
         .unwrap_or_default()
         .to_vec();
-    if decoded.is_empty() {
+    // Re-check for the in-memory token AFTER decoding: the checks above see the
+    // raw target, so `file:%3Amemory%3A` and `file::memory:#fragment` both reach
+    // here as `:memory:`. Returning that as a path would have the deploy link a
+    // persistence file the app never opens.
+    if decoded.is_empty() || decoded == b":memory:" {
         return None;
     }
     decoded_path(decoded)
@@ -279,9 +283,10 @@ fn uri_asks_for_memory(target: &str) -> bool {
     let Some((_, query)) = uri.split_once('?') else {
         return false;
     };
-    query
-        .split(['&', ';'])
-        .any(|parameter| parameter == "mode=memory")
+    // `&` only: SQLite does not treat `;` as a separator, so in
+    // `file:app.db?x=1;mode=memory` the semicolon is part of `x`'s value and the
+    // target is the durable `app.db`.
+    query.split('&').any(|parameter| parameter == "mode=memory")
 }
 
 /// The string to hand `sqlite3_open` for an already-resolved database FILE.
@@ -683,8 +688,22 @@ mod tests {
         }
         // A name that is nothing but a NUL names no file at all.
         assert_eq!(database_file("file:%00"), None);
+        // The in-memory token can hide behind percent-encoding or a fragment; a
+        // raw-text check runs before decoding, so re-check after it.
+        for memory in [
+            "file:%3Amemory%3A",
+            "file::memory:#fragment",
+            "file:%3amemory%3a",
+        ] {
+            assert_eq!(database_file(memory), None, "{memory} is in-memory");
+        }
         // A parameter that merely starts with it is a different parameter.
         assert!(database_file("file:app?mode=memoryx").is_some());
+        // `&` is SQLite's only query separator, so a `;` stays part of a value.
+        assert!(
+            database_file("file:app.db?x=1;mode=memory").is_some(),
+            "a semicolon does not separate parameters, so this names the durable app.db"
+        );
     }
 
     /// diesel opens with `SQLITE_OPEN_URI`, so a filename that itself begins with
