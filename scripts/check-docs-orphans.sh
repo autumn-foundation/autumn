@@ -458,10 +458,20 @@ def _inline_table(value):
     cur = ''
     depth = 0
     quote = None
+    esc = False
     for ch in s[1:]:
         if quote is not None:
             cur += ch
-            if ch == quote:
+            # A BASIC string takes escapes, so `"not \", publish = true"` is
+            # one value and not a string followed by an entry. Missing that
+            # read the text inside a description as a real `publish` key —
+            # silent, and a scanner written beside `_scan_toml_line` rather
+            # than sharing its rules, which is how the two came to disagree.
+            if esc:
+                esc = False
+            elif quote == '"' and ch == '\\':
+                esc = True
+            elif ch == quote:
                 quote = None
             continue
         if ch in '"\'':
@@ -555,18 +565,20 @@ _TOML_HEADER = re.compile(r'^[ \t]*\[\[?[ \t]*([^\[\]]*?)[ \t]*\]\]?[ \t]*(?:#.*
 
 
 def _toml_key_path(text):
-    """A header's dotted name with quoting resolved: `["package"]` -> `package`.
+    """A header's name as decoded SEGMENTS: `["package"]` -> `('package',)`.
 
     A quoted table header is valid TOML and Cargo treats it as the same table —
     `["package"] … publish = false` still reports `publish: []`. Comparing the
     raw text meant `"package"` never matched `package`, so the manifest read as
-    virtual and its README stopped being an entry surface. That direction is
-    loud (a page reported orphaned that is not one), but the same normalization
-    is what lets the quoted spellings of the keys inside it be found at all.
+    virtual and its README stopped being an entry surface.
 
-    Dots inside a quoted segment are part of the name, not separators — though
-    a segment that itself contains a dot then renders indistinguishable from
-    two segments, which is irrelevant for the two names this asks about.
+    Segments, not a dotted string. An earlier version joined them back with `.`
+    and this docstring claimed a segment containing a dot was "irrelevant for
+    the two names this asks about" — which was wrong, and wrong silently. The
+    ONE-segment header `["workspace.package"]` flattened to the same text as
+    the TWO-segment `[workspace.package]`, so a `publish = true` under the
+    former was read as the latter's, and a member inheriting `publish = false`
+    came out publishable. Cargo keeps them distinct; so does this now.
     """
     parts = []
     cur = ''
@@ -574,7 +586,19 @@ def _toml_key_path(text):
     n = len(text)
     while i < n:
         c = text[i]
-        if c in '"\'':
+        if c == '"':
+            j = i + 1
+            buf = ''
+            while j < n and text[j] != '"':
+                if text[j] == '\\':
+                    buf += text[j:j + 2]
+                    j += 2
+                else:
+                    buf += text[j]
+                    j += 1
+            cur += _decode_basic(buf)
+            i = j + 1
+        elif c == "'":
             close = text.find(c, i + 1)
             if close < 0:
                 cur += text[i + 1:]
@@ -589,7 +613,7 @@ def _toml_key_path(text):
             cur += c
             i += 1
     parts.append(cur.strip())
-    return '.'.join(parts)
+    return tuple(parts)
 
 
 def _scan_toml_line(line):
@@ -745,7 +769,7 @@ def _toml_table(manifest, name):
     out = []
     seen = False
     for table, line, live in _toml_lines(manifest):
-        if table == name:
+        if table == want:
             seen = True
             out.append(line)
             continue
@@ -7804,6 +7828,32 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n0/pkg/README.md"
   git -C "$c9n0" add -A && git -C "$c9n0" commit -qm closing-line-not-a-key
   check "a multi-line closing line is not a key" pass "$c9n0"
+
+  # A ONE-segment quoted header is NOT the two-segment table of the same text:
+  # `["workspace.package"]` and `[workspace.package]` are different tables to
+  # Cargo, which reports this member as `publish: []`. Flattening the header to
+  # a dotted string made the first one's `publish = true` answer for the
+  # second's `publish = false`.
+  local c9n1="$tmp/c9n1"; make_corpus "$c9n1"
+  mkdir -p "$c9n1/pkg"
+  printf '[workspace]\nmembers = ["pkg"]\n\n["workspace.package"]\npublish = true\n\n[workspace.package]\npublish = false\n' \
+    > "$c9n1/Cargo.toml"
+  printf '[package]\nname = "pkg"\npublish.workspace = true\nreadme = "README.md"\n' \
+    > "$c9n1/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n1/pkg/README.md"
+  git -C "$c9n1" add -A && git -C "$c9n1" commit -qm quoted-header-segments
+  check "a quoted one-segment header is its own table" fail "$c9n1"
+
+  # An ESCAPED quote inside an inline table's string does not end it, so the
+  # `publish = true` written inside this description is text and the real key
+  # is `publish = false`. Cargo reports `publish: []`.
+  local c9n2="$tmp/c9n2"; make_corpus "$c9n2"
+  mkdir -p "$c9n2/pkg"
+  printf '%s\n' 'package = { name = "pkg", description = "not \", publish = true", publish = false, readme = "README.md" }' \
+    > "$c9n2/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n2/pkg/README.md"
+  git -C "$c9n2" add -A && git -C "$c9n2" commit -qm inline-escaped-quote
+  check "an escaped quote does not end an inline table string" fail "$c9n2"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
