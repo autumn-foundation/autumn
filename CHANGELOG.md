@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.**
+- **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.** [no-plugin]
   `TokenAdminModel` and `FeatureFlagAdminModel` each override
   `AdminModel::execute_action` to batch their `"delete"` bulk action into one
   query, and both carried an unchanged copy of the trait default's
