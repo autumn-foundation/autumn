@@ -409,11 +409,32 @@ and this assay does not claim it. What it adds to Keystone's memo, precisely:
   stated: not "no operation name," but "no structured, typed value — a
   caller has to string-match against an upstream dependency's Debug/Display
   output, which carries no stability contract, instead of matching on an
-  enum this crate owns." Both fail closed *today*, because
-  `path_open`/`sock_connect`/`sock_send`/arbitrary namespaces are simply
-  never defined — but that is an accident of what's implemented, not a
-  designed, type-safe contract the way `plugin_sandbox`'s allowlist scan
-  is. If `autumn-edge` ever needs to run a **less-trusted** artifact (its own
+  enum this crate owns." Both fail closed *today* for `autumn-edge`'s four
+  probed cases, because `path_open`/`sock_connect`/`sock_send`/arbitrary
+  namespaces are simply never defined there — but that is an accident of
+  what's implemented, not a designed, type-safe contract.
+  **Correction (ninth Codex review round):** an earlier version of this
+  paragraph implied `plugin_sandbox` denies all four the same accidental
+  way, contrasting only its *pre-instantiation scan mechanism* against
+  `autumn-edge`'s lack of one. Checked directly: `plugin_sandbox` actually
+  uses **both** of its own two mechanisms, split by import —
+  `path_open`/`sock_send` are explicitly **defined** as deny-stubs
+  (`autumn/src/plugin_sandbox/host.rs`'s `SERVED_IMPORTS`-style table pairs
+  each with a `DeniedCapability` and a logged detail message, around
+  lines 3555-3597), while `sock_connect` and an arbitrary namespace are
+  genuinely undefined and caught by `forbidden_imports`'s pre-instantiation
+  scan (`SandboxLoadError::ForbiddenImports`, around lines 1298-1300) —
+  matching its own `UNDEFINED_WASI`/`HOST_COMMAND` test guests exactly.
+  So the "accidental, only-fails-closed-because-it's-unimplemented" state
+  is real for `autumn-edge` across all four cases, but for `plugin_sandbox`
+  it is real for only two of its analogous cases (`sock_connect`, invented
+  namespaces) — the other two (`path_open`, `sock_send`) are a *designed*
+  denial there, active and logged, not an absence. This does not change the
+  Keystone-relevant conclusion (`autumn-edge` still lacks any equivalent
+  typed contract for *any* of its four cases), but the contrast is with
+  `plugin_sandbox`'s two *different*, both-deliberate mechanisms, not one
+  uniform accident on its side too.
+  If `autumn-edge` ever needs to run a **less-trusted** artifact (its own
   module doc's stated purpose is proving native/edge parity for the app's
   *own* build, i.e. first-party) this gap between "happens to fail closed
   with a parseable-but-unstable message" and "fails closed by a checked,
