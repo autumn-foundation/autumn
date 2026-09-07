@@ -217,6 +217,8 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(feature = "openapi")]
+mod openapi_export;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;

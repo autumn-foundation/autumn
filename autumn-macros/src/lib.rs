@@ -771,20 +771,26 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Derive a field-accurate `OpenApiSchema` impl for a plain struct with named
-/// fields (issue #1972).
+/// fields, or a unit-variant enum (issue #1972).
 ///
-/// Use it on a handler-arg struct — a `Query<T>` param struct or a
-/// non-`#[model]` `Json<T>` request body — so its `OpenAPI` component schema and
-/// MCP tool `inputSchema` describe the real fields instead of degrading to a
-/// generic `{"type":"object"}` placeholder, without a hand-written impl or an
-/// `OpenApiConfig::register_schema` call.
+/// Use it on a handler-arg type — a `Query<T>` param struct, a non-`#[model]`
+/// `Json<T>` request body, or an enum appearing in either — so its `OpenAPI`
+/// component schema and MCP tool `inputSchema` describe the real contract
+/// instead of degrading to a generic `{"type":"object"}` placeholder, without a
+/// hand-written impl or an `OpenApiConfig::register_schema` call.
 ///
-/// Each field becomes a JSON-schema property (nullable `Option<T>`, `Vec<T>`
-/// arrays, inline primitives, `$ref`s for other named types) and every
+/// **Structs**: each field becomes a JSON-schema property (nullable `Option<T>`,
+/// `Vec<T>` arrays, inline primitives, `$ref`s for other named types) and every
 /// non-`Option` field is `required` — mirroring the schema `#[model]` already
-/// generates. The derive also registers the schema in the compile-time
-/// inventory the spec/MCP back-fill consults, so the referencing route resolves
-/// it automatically.
+/// generates.
+///
+/// **Enums**: all-unit-variant enums become the closed string set
+/// `{"type":"string","enum":[…]}` that serde puts on the wire, honoring
+/// `#[serde(rename)]` / `#[serde(rename_all)]` / `#[serde(skip)]`. A
+/// data-carrying variant is a compile error rather than a guess: serde's
+/// representation for those depends on `#[serde(tag/content/untagged)]`, so an
+/// inferred shape could confidently advertise a contract the handler does not
+/// accept. Write the impl by hand and register it for that case.
 ///
 /// # Examples
 ///
@@ -795,6 +801,14 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// struct SearchParams {
 ///     q: String,
 ///     limit: Option<i32>,
+///     status: Option<Status>,
+/// }
+///
+/// #[derive(serde::Deserialize, OpenApiSchema)]
+/// #[serde(rename_all = "snake_case")]
+/// enum Status {
+///     Open,
+///     InProgress,
 /// }
 /// ```
 #[proc_macro_derive(OpenApiSchema)]

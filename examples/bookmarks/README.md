@@ -26,6 +26,7 @@ tasks, embedded migrations, htmx, and actuator endpoints.
 | **Scheduled tasks** | `src/tasks.rs` | `#[scheduled(every = "1h")]` link health checker |
 | **Embedded migrations** | `src/main.rs` | Runs Diesel migrations at startup |
 | **Actuator** | Nav bar links | `/actuator/health`, `/actuator/info` auto-mounted |
+| **OpenAPI export** | `src/main.rs` | `.openapi(..)` serves `/openapi.json`; `autumn openapi export` writes the same document without booting the app, ready for a client generator |
 | **App metrics facade** | `src/metrics.rs`, `src/routes/bookmarks.rs` | One domain counter and one timer recorded at the call site with `autumn_web::metrics` — no type to define, nothing registered with `AppBuilder` — landing on the same `/actuator/prometheus` scrape as the built-in `autumn_http_*` families |
 
 ## Prerequisites
@@ -191,3 +192,36 @@ curl -X PUT http://localhost:3000/api/bookmarks/1 \
   -H 'Content-Type: application/json' \
   -d '{"title":"Rust Lang","tag":"rust","alive":true}'
 ```
+
+## Generate a typed client from the spec
+
+The app configures `.openapi(OpenApiConfig::new("Bookmarks API", "1.0.0"))`, so
+the whole `/api/bookmarks` surface above is described by a machine-readable
+contract. Get it out without starting the server:
+
+```bash
+cargo run -p autumn-cli -- openapi export -p bookmarks --out openapi.json
+```
+
+That compiles the app and runs it in a dump mode — no port bound, no database
+touched — emitting the same document `/openapi.json` serves. Because `Bookmark`,
+`NewBookmark` and `UpdateBookmark` are `#[model]` types, they register their own
+schemas, so the export carries real fields rather than opaque objects. Confirm
+that with:
+
+```bash
+cargo run -p autumn-cli -- openapi export -p bookmarks --strict >/dev/null
+```
+
+`--strict` fails if any type on the API boundary would reach a generated client
+as an untyped blob.
+
+Then hand the document to whichever generator you prefer:
+
+```bash
+npx openapi-typescript openapi.json -o src/api.d.ts   # TypeScript
+cargo progenitor -i openapi.json -o ./client -n bookmarks-client   # Rust
+```
+
+In CI, `autumn openapi export --check openapi.json --strict` fails when the
+committed contract no longer matches the handlers.

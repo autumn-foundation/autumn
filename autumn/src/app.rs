@@ -3306,6 +3306,30 @@ impl AppBuilder {
             return;
         }
 
+        // ── OpenAPI spec dump mode ─────────────────────────────────────
+        // When AUTUMN_DUMP_OPENAPI=1, print the generated OpenAPI document
+        // and exit. Triggered by `autumn openapi export`, which needs the
+        // contract without booting the server or connecting to a database.
+        // The guard is deliberately outside the feature gate: a binary built
+        // without `openapi` must report that on the dump protocol rather than
+        // ignore the request and start serving.
+        if is_dump_openapi_mode() {
+            #[cfg(feature = "openapi")]
+            {
+                self.run_dump_openapi_mode().await;
+                return;
+            }
+            #[cfg(not(feature = "openapi"))]
+            {
+                eprintln!(
+                    "{marker}{reason}",
+                    marker = crate::openapi::OPENAPI_UNAVAILABLE_MARKER,
+                    reason = crate::openapi::OPENAPI_UNAVAILABLE_FEATURE,
+                );
+                std::process::exit(2);
+            }
+        }
+
         // ── Cache-coherence manifest dump mode ─────────────────────────
         // When AUTUMN_DUMP_CACHE_COHERENCE=1, print the cache-coherence
         // manifest (#1716) and exit. Triggered by `autumn cache audit`, which
@@ -6313,6 +6337,70 @@ impl AppBuilder {
         std::process::exit(0);
     }
 
+    /// Dump the generated `OpenAPI` document as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_OPENAPI=1` is set (by
+    /// `autumn openapi export`). Does not connect to a database or bind a TCP
+    /// port.
+    ///
+    /// The document is built through the exact same pair the `/openapi.json`
+    /// route uses — [`crate::router::collect_openapi_docs`] then the spec
+    /// generator — so an exported spec and a served one cannot drift. Config is
+    /// loaded the same way a normal boot loads it, because the session cookie
+    /// name feeds the `SessionAuth` security scheme.
+    ///
+    /// Like the served route this evaluates deprecation/sunset state against
+    /// the current instant ([`crate::openapi::generate_spec`] passes
+    /// `Utc::now()`), so an export is reproducible except across a declared
+    /// deprecation or sunset date — which is a real contract change a `--check`
+    /// diff should surface, not noise to suppress.
+    ///
+    /// Exits 0 on success, 1 on serialization failure, and 2 when the app has
+    /// no spec to emit (reported on the
+    /// [`OPENAPI_UNAVAILABLE_MARKER`](crate::openapi::OPENAPI_UNAVAILABLE_MARKER)
+    /// protocol).
+    #[cfg(feature = "openapi")]
+    async fn run_dump_openapi_mode(self) {
+        let Self {
+            routes,
+            scoped_groups,
+            api_versions,
+            openapi,
+            config_loader_factory,
+            plugin_config_roots,
+            ..
+        } = self;
+
+        let Some(openapi_config) = openapi else {
+            eprintln!(
+                "{marker}{reason}",
+                marker = crate::openapi::OPENAPI_UNAVAILABLE_MARKER,
+                reason = crate::openapi::OPENAPI_UNAVAILABLE_UNCONFIGURED,
+            );
+            std::process::exit(2);
+        };
+
+        // Config only: `TelemetryProvider::init` can reach a collector or read
+        // production credentials, and telemetry cannot affect the document, so
+        // an export advertised as touching nothing must not run it.
+        let config = load_config_only(config_loader_factory, plugin_config_roots).await;
+
+        let mut openapi_config = openapi_config;
+        openapi_config.api_versions = api_versions;
+        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name);
+
+        let docs = crate::router::collect_openapi_docs(&routes, &scoped_groups);
+        let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
+        let spec = crate::openapi::generate_spec(&openapi_config, &refs);
+
+        let json = serde_json::to_string_pretty(&spec).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize OpenAPI spec: {e}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
+
     /// Dump the effective drained-queue manifest as TOML and exit.
     ///
     /// Triggered when `AUTUMN_DUMP_JOBS=1` is set (by `autumn jobs manifest`).
@@ -7570,6 +7658,15 @@ fn exit_stop_managed_pg() {
 
 pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+/// Whether the process should dump the generated `OpenAPI` document and exit.
+///
+/// Set by `autumn openapi export`. Unlike the routes dump this is checked even
+/// when the `openapi` feature is off, so the CLI gets an explicit "no spec here"
+/// answer instead of a booted server.
+pub(crate) fn is_dump_openapi_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_OPENAPI").as_deref() == Ok("1")
 }
 
 /// Whether the dump should also emit the declared plugin contracts
@@ -9834,6 +9931,38 @@ async fn load_config_and_telemetry(
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
     plugin_config_roots: BTreeSet<String>,
 ) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    let config = load_config_only(config_loader, plugin_config_roots).await;
+
+    // 2. Initialize logging/telemetry via the installed provider, falling
+    //    back to the default `tracing-subscriber + OTLP` initializer.
+    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
+        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
+    let telemetry_guard = provider
+        .init(&config.log, &config.telemetry, config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize telemetry: {error}");
+            std::process::exit(1);
+        });
+
+    (config, telemetry_guard)
+}
+
+/// Resolve the effective configuration WITHOUT initializing telemetry.
+///
+/// Split out of [`load_config_and_telemetry`] for the one-shot dump modes that
+/// need config but must not touch the outside world. A custom
+/// `TelemetryProvider::init` may open a collector connection, read credentials
+/// or otherwise reach production resources, and telemetry cannot influence what
+/// those modes emit — so `autumn openapi export`, advertised as binding no port
+/// and opening no database, must not trigger it either (issue #802).
+///
+/// Everything up to and including [`AutumnConfig::apply_retention_caps`] is
+/// shared with the telemetry-initializing path, so the config the two resolve is
+/// identical.
+async fn load_config_only(
+    config_loader: Option<ConfigLoaderFactory>,
+    plugin_config_roots: BTreeSet<String>,
+) -> AutumnConfig {
     // 1. Load configuration via the installed loader, falling back to the
     //    five-layer TOML + env default.
     //
@@ -9878,18 +10007,7 @@ async fn load_config_and_telemetry(
     // `[retention]` section is untouched.
     config.apply_retention_caps();
 
-    // 2. Initialize logging/telemetry via the installed provider, falling
-    //    back to the default `tracing-subscriber + OTLP` initializer.
-    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
-        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
-    let telemetry_guard = provider
-        .init(&config.log, &config.telemetry, config.profile.as_deref())
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize telemetry: {error}");
-            std::process::exit(1);
-        });
-
-    (config, telemetry_guard)
+    config
 }
 
 /// Register the embedded `static/` tree (if any) as the process-wide asset

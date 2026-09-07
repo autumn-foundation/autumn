@@ -603,17 +603,6 @@ fn resolve_local_ref<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
     node
 }
 
-/// True when `schema` is the opaque object placeholder the spec generator emits
-/// for a type with no real `OpenApiSchema` (`{"type":"object","title":…}` with
-/// no `properties`). A derived/registered object always carries a `properties`
-/// key (even if empty), so a legitimately field-less struct is not flagged.
-fn is_opaque_object(schema: &Value) -> bool {
-    schema.get("type").and_then(Value::as_str) == Some("object")
-        && schema
-            .as_object()
-            .is_none_or(|map| !map.contains_key("properties"))
-}
-
 /// Inspect a built `inputSchema` for the degradations in [`SchemaDegradation`].
 ///
 /// Pure and self-contained (no logging) so it is unit-testable; [`derive_tools`]
@@ -628,7 +617,7 @@ fn detect_schema_degradations(
 
     if has_body
         && let Some(body) = props.and_then(|p| p.get("body"))
-        && is_opaque_object(resolve_local_ref(input_schema, body))
+        && crate::openapi::is_opaque_object_schema(resolve_local_ref(input_schema, body))
     {
         out.push(SchemaDegradation::OpaqueBody);
     }
@@ -638,7 +627,7 @@ fn detect_schema_degradations(
     // advertised structure round-trips. Only a missing field-level schema is.
     if has_query
         && let Some(query) = props.and_then(|p| p.get("query"))
-        && is_opaque_object(resolve_local_ref(input_schema, query))
+        && crate::openapi::is_opaque_object_schema(resolve_local_ref(input_schema, query))
     {
         out.push(SchemaDegradation::OpaqueQuery);
     }

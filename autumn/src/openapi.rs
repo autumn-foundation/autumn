@@ -69,6 +69,31 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 // ──────────────────────────────────────────────────────────────────
+// `autumn openapi export` dump protocol
+// ──────────────────────────────────────────────────────────────────
+
+/// Machine-readable stderr marker saying this binary cannot produce a spec.
+///
+/// Emitted by the `AUTUMN_DUMP_OPENAPI` dump instead of a spec document, with a
+/// human-readable reason following on the same line. `autumn openapi export`
+/// scans stderr for it so it can turn "this app has no OpenAPI surface" into an
+/// actionable message rather than a JSON parse failure on empty stdout.
+///
+/// Two things produce it: the binary was built without the `openapi` feature,
+/// or it was built with the feature but never called
+/// [`AppBuilder::openapi`](crate::app::AppBuilder::openapi).
+pub const OPENAPI_UNAVAILABLE_MARKER: &str = "[autumn:openapi-unavailable] ";
+
+/// Reason text following [`OPENAPI_UNAVAILABLE_MARKER`] when the binary was
+/// compiled without the `openapi` feature.
+pub const OPENAPI_UNAVAILABLE_FEATURE: &str = "this binary was built without the `openapi` feature";
+
+/// Reason text following [`OPENAPI_UNAVAILABLE_MARKER`] when the app never
+/// configured a spec.
+pub const OPENAPI_UNAVAILABLE_UNCONFIGURED: &str =
+    "this app never called `.openapi(OpenApiConfig::new(..))`";
+
+// ──────────────────────────────────────────────────────────────────
 // Public metadata attached to each Route
 // ──────────────────────────────────────────────────────────────────
 
@@ -1626,6 +1651,162 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Opaque-schema (placeholder) detection
+// ──────────────────────────────────────────────────────────────────
+
+/// Keys the generated placeholder may carry. Anything else means the schema
+/// says something real about its instances, so it is not a placeholder.
+#[cfg(feature = "openapi")]
+const PLACEHOLDER_KEYS: [&str; 3] = ["type", "title", "description"];
+
+/// True when `schema` is exactly the opaque object placeholder
+/// [`generate_spec`] emits for a referenced type that has no `OpenApiSchema`:
+/// `{"type":"object","title":…}` and nothing else.
+///
+/// Matched by *shape*, not by the absence of `properties` alone. An object can
+/// describe its instances without that key — `additionalProperties` (a map),
+/// `oneOf`/`allOf`/`anyOf`, `patternProperties`, a bare `$ref` — and a schema
+/// somebody registered deliberately through
+/// [`OpenApiConfig::register_schema`] in one of those forms is a real contract
+/// a client generator can render. Flagging it would make
+/// `autumn openapi export --strict` fail CI over a fully typed map. So a
+/// placeholder is recognised as an object carrying no key beyond `title` /
+/// `description`, which is precisely what the back-fill emits.
+///
+/// This is the single canonical predicate: the MCP tool-catalog builder
+/// ([`crate::mcp`]) applies it to a tool's `inputSchema`, and
+/// [`opaque_component_schemas`] applies it to a built spec's components.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn is_opaque_object_schema(schema: &serde_json::Value) -> bool {
+    if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return false;
+    }
+    schema.as_object().is_none_or(|map| {
+        map.keys()
+            .all(|key| PLACEHOLDER_KEYS.contains(&key.as_str()))
+    })
+}
+
+/// One component schema that degraded to the opaque object placeholder, with
+/// the operations that reference it.
+///
+/// Produced by [`opaque_component_schemas`]. A consumer of the spec (a client
+/// generator, Swagger UI, the MCP projection) can only render such a schema as
+/// an untyped blob — `unknown` in TypeScript, `serde_json::Value` in Rust — so
+/// `autumn openapi export` reports these rather than letting the contract
+/// degrade silently.
+#[cfg(feature = "openapi")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueSchema {
+    /// Component key under `#/components/schemas/`.
+    pub schema: String,
+    /// `"METHOD /path"` for every operation referencing it, sorted and deduped.
+    /// Empty when the component is registered but unreferenced.
+    pub referenced_by: Vec<String>,
+}
+
+/// Report every component schema in `spec` that degraded to the opaque
+/// placeholder, sorted by component name.
+///
+/// The fix for each entry is to add `#[derive(OpenApiSchema)]` to the offending
+/// type (or register a hand-written schema via
+/// [`OpenApiConfig::register_schema`]), which makes the back-fill resolve the
+/// real field-accurate schema instead of the placeholder.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn opaque_component_schemas(spec: &OpenApiSpec) -> Vec<OpaqueSchema> {
+    let Some(components) = spec.components.as_ref() else {
+        return Vec::new();
+    };
+
+    let opaque: std::collections::BTreeSet<&str> = components
+        .schemas
+        .iter()
+        .filter(|(_, schema)| is_opaque_object_schema(schema))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if opaque.is_empty() {
+        return Vec::new();
+    }
+
+    // Pre-compute each component's own outgoing refs, so attribution can follow
+    // the component graph rather than stopping at an operation's direct refs.
+    // An operation usually reaches an opaque type *indirectly* — `POST /orders`
+    // takes a derived `Order` whose `address` field `$ref`s an underived
+    // `Address` — and reporting `Address` with an empty `referenced_by` would
+    // hide the very operation whose contract is degraded.
+    let component_refs: BTreeMap<&str, Vec<String>> = components
+        .schemas
+        .iter()
+        .map(|(name, schema)| {
+            let mut out = Vec::new();
+            collect_body_ref_identities(schema, &mut out);
+            (name.as_str(), out)
+        })
+        .collect();
+
+    // Map each opaque component to the operations that reach it. A reference
+    // can sit anywhere in an operation (body, response, parameter schema, or
+    // nested inside an array/nullable wrapper), so walk the serialized
+    // operation wholesale rather than probing known slots, then close over the
+    // component graph from whatever that turns up.
+    let mut refs: BTreeMap<&str, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for (path, item) in &spec.paths {
+        for (method, operation) in path_item_operations(item) {
+            let Ok(value) = serde_json::to_value(operation) else {
+                continue;
+            };
+            let mut frontier = Vec::new();
+            collect_body_ref_identities(&value, &mut frontier);
+
+            // Breadth-first over components, `seen` guarding the cycles a
+            // self- or mutually-recursive schema creates.
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            while let Some(identity) = frontier.pop() {
+                if !seen.insert(identity.clone()) {
+                    continue;
+                }
+                if let Some(name) = opaque.get(identity.as_str()) {
+                    refs.entry(name)
+                        .or_default()
+                        .insert(format!("{method} {path}"));
+                }
+                if let Some(nested) = component_refs.get(identity.as_str()) {
+                    frontier.extend(nested.iter().cloned());
+                }
+            }
+        }
+    }
+
+    opaque
+        .into_iter()
+        .map(|schema| OpaqueSchema {
+            schema: schema.to_owned(),
+            referenced_by: refs
+                .get(schema)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Yield each `(METHOD, operation)` pair present on a [`PathItem`].
+#[cfg(feature = "openapi")]
+fn path_item_operations(item: &PathItem) -> Vec<(&'static str, &Operation)> {
+    [
+        ("GET", item.get.as_ref()),
+        ("POST", item.post.as_ref()),
+        ("PUT", item.put.as_ref()),
+        ("PATCH", item.patch.as_ref()),
+        ("DELETE", item.delete.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(method, op)| op.map(|op| (method, op)))
+    .collect()
 }
 
 // ──────────────────────────────────────────────────────────────────

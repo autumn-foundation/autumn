@@ -2717,7 +2717,19 @@ autumn graph touches posts       # which routes and jobs reach a model, table, o
 autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
+autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
+autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
+autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
 ```
+
+`autumn openapi export` is the way to get the contract out of an app — prefer
+it to booting the server and curling `/openapi.json`, and to `autumn build`
+(which writes `dist/openapi.json` only as a side effect of static generation,
+and bails out entirely on an app with no `#[static_get]` routes). Every run also
+reports the component schemas that degraded to the opaque placeholder, naming
+the operations reaching them; those are the types a generated client can only
+see as `unknown` / `serde_json::Value`. Fix each with
+`#[derive(OpenApiSchema)]` on the type. See `docs/guide/openapi.md`.
 
 Reach for `autumn graph` before reading a codebase to answer a structural
 question. It is derived from the macros at compile time and embedded in the

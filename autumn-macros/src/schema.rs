@@ -54,9 +54,8 @@ pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<Strin
                         Ok(())
                     });
                 }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });
@@ -91,9 +90,8 @@ pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
                         Ok(())
                     });
                 }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });
@@ -134,6 +132,322 @@ pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
         "SCREAMING-KEBAB-CASE" => Some(field.to_ascii_uppercase().replace('_', "-")),
         _ => None,
     }
+}
+
+/// Whether a `#[serde(...)]` attribute list carries a bare word from `words`.
+///
+/// For the marker attributes that take no value — `transparent`, `flatten`,
+/// `skip`, `skip_serializing`, `skip_deserializing`, `untagged`, `default` in
+/// its bare form. Returns the first match, so callers can name it in a
+/// diagnostic.
+pub fn serde_bare_word(attrs: &[syn::Attribute], words: &[&'static str]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(word) = words.iter().find(|w| meta.path.is_ident(w)) {
+                found = Some(*word);
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a `#[serde(...)]` attribute list carries `key = "..."` for any key in
+/// `keys`, returning the first match.
+///
+/// For the value-taking attributes that change the wire shape: `into`, `from`,
+/// `try_from`, `tag`, `content`, and the field-level `default = "path"`.
+pub fn serde_valued_key(attrs: &[syn::Attribute], keys: &[&'static str]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(key) = keys.iter().find(|k| meta.path.is_ident(k)) {
+                found = Some(*key);
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a field carries `#[serde(skip_serializing_if = "...")]`, so a
+/// response omits it whenever the predicate matches.
+///
+/// Distinct from an unconditional `skip` / `skip_serializing`: the field DOES
+/// appear in some responses, so its property belongs in the schema — it simply
+/// cannot be `required`, because a legitimate response may leave it out.
+pub fn field_has_skip_serializing_if(field: &syn::Field) -> bool {
+    let mut conditional = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing_if") {
+                conditional = true;
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    conditional
+}
+
+/// Apply an enum-level `#[serde(rename_all = "...")]` casing rule to a
+/// (`PascalCase`) variant identifier, mirroring `serde_derive`'s
+/// `RenameRule::apply_to_variant`.
+///
+/// Deliberately NOT routed through [`apply_serde_rename_all_rule`]: that helper
+/// takes an already-`snake_case` *field* name, so its `lowercase`/`snake_case`
+/// arms are identity. A variant arrives in `PascalCase`, so each rule needs the
+/// serde variant algorithm instead — `InProgress` must become `in_progress`
+/// under `snake_case` and `inprogress` (not `in_progress`) under `lowercase`.
+///
+/// Returns `None` for a rule string serde itself would reject; the `Serialize`
+/// derive on the same enum then reports the error, so this does not duplicate it.
+pub fn apply_serde_rename_all_rule_to_variant(rule: &str, variant: &str) -> Option<String> {
+    // serde's own variant→snake_case: insert `_` before every uppercase char
+    // after the first, then lowercase. (`XMLHttpRequest` → `x_m_l_http_request`,
+    // matching serde exactly rather than guessing at acronym runs.)
+    fn snake(variant: &str) -> String {
+        let mut out = String::with_capacity(variant.len() + 4);
+        for (i, ch) in variant.char_indices() {
+            if i > 0 && ch.is_uppercase() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        }
+        out
+    }
+    match rule {
+        "lowercase" => Some(variant.to_ascii_lowercase()),
+        "UPPERCASE" => Some(variant.to_ascii_uppercase()),
+        "PascalCase" => Some(variant.to_owned()),
+        "camelCase" => {
+            let mut chars = variant.chars();
+            chars
+                .next()
+                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
+        }
+        "snake_case" => Some(snake(variant)),
+        "SCREAMING_SNAKE_CASE" => Some(snake(variant).to_ascii_uppercase()),
+        "kebab-case" => Some(snake(variant).replace('_', "-")),
+        "SCREAMING-KEBAB-CASE" => Some(snake(variant).to_ascii_uppercase().replace('_', "-")),
+        _ => None,
+    }
+}
+
+/// A container-level `#[serde(...)]` enum representation other than serde's
+/// default (externally tagged), as the attribute word that selected it.
+///
+/// Each of these changes what a *unit* variant serializes to, so a schema
+/// generator that ignores them advertises the wrong wire shape:
+///
+/// | Attribute | A unit variant serializes as |
+/// |---|---|
+/// | *(default, externally tagged)* | `"Variant"` — a JSON string |
+/// | `#[serde(tag = "t")]` | `{"t": "Variant"}` — an object |
+/// | `#[serde(tag = "t", content = "c")]` | `{"t": "Variant"}` — an object |
+/// | `#[serde(untagged)]` | `null` |
+/// | `#[serde(into = "u8")]` / `from` / `try_from` | whatever the conversion type serializes as |
+///
+/// The conversion attributes belong here for the same reason: serde routes the
+/// value through another type entirely, so the variant names never reach the
+/// wire and a string-enum schema would describe a payload the handler does not
+/// accept.
+///
+/// Returns `None` for the default representation.
+pub fn serde_enum_representation(attrs: &[syn::Attribute]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            // `tag` wins the report when both `tag` and `content` are present:
+            // it is the one that changes a unit variant's shape, and naming it
+            // keeps the diagnostic pointing at the cause.
+            if meta.path.is_ident("tag") {
+                found = Some("tag");
+            } else if meta.path.is_ident("untagged") {
+                found = Some("untagged");
+            } else if meta.path.is_ident("into") {
+                found = Some("into");
+            } else if meta.path.is_ident("from") {
+                found = Some("from");
+            } else if meta.path.is_ident("try_from") {
+                found = Some("try_from");
+            } else if meta.path.is_ident("content") && found.is_none() {
+                found = Some("content");
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Consume whatever follows an unrecognized `#[serde(...)]` key so
+/// `parse_nested_meta` can reach the keys that come after it.
+///
+/// Two shapes have to be swallowed, not one. `key = "value"` is the obvious
+/// case. The other is a **list**, `key(a = "x", b = "y")` — and missing it is
+/// not cosmetic: `meta.value()` fails on a list (there is no `=`), so the
+/// parenthesized group stays unread, `parse_nested_meta` aborts on it, and
+/// every later key goes unvisited. A caller that swallows the resulting error
+/// then sees a clean "nothing found".
+///
+/// That is exactly how `#[serde(rename_all(serialize = "snake_case"), tag =
+/// "kind")]` slipped past [`serde_enum_representation`]: `tag` was never
+/// reached, so an internally tagged enum was advertised as a plain string enum.
+/// Anything that gates on absence must therefore consume both shapes.
+fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    if let Ok(value) = meta.value() {
+        let _: syn::Result<syn::Lit> = value.parse();
+    } else if meta.input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in meta.input);
+        let _: proc_macro2::TokenStream = content.parse()?;
+    }
+    Ok(())
+}
+
+/// The serde attributes on an enum variant, read for `rename` / `skip`.
+///
+/// Mirrors [`field_serde_serialize_rename`] but over a
+/// [`syn::Variant`](syn::Variant)'s attribute list.
+pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> {
+    let mut renamed = None;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Ok(value) = meta.value() {
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        renamed = Some(s.value());
+                    }
+                } else {
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            renamed = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    renamed
+}
+
+/// Whether a `#[serde(...)]` attribute list carries a **split** `rename_all` or
+/// `rename` — the `name(serialize = "...", deserialize = "...")` form — where
+/// the two sides disagree.
+///
+/// A symmetric `rename_all = "snake_case"` applies to both directions and is
+/// exact. The split form is not: the schema can only advertise one string, so a
+/// generated client sends the serialize spelling while the handler's
+/// `Deserialize` accepts the other. Same asymmetry as a directional skip, same
+/// answer — refuse rather than publish a value that only works one way.
+///
+/// Returns the attribute word (`rename_all` / `rename`) when the two sides are
+/// present and differ.
+pub fn serde_split_rename(attrs: &[syn::Attribute], key: &'static str) -> Option<&'static str> {
+    let mut split = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident(key)
+                && meta.value().is_err()
+                && meta.input.peek(syn::token::Paren)
+            {
+                let (mut ser, mut de) = (None::<String>, None::<String>);
+                meta.parse_nested_meta(|inner| {
+                    if let Ok(value) = inner.value()
+                        && let Ok(syn::Lit::Str(lit)) = value.parse::<syn::Lit>()
+                    {
+                        if inner.path.is_ident("serialize") {
+                            ser = Some(lit.value());
+                        } else if inner.path.is_ident("deserialize") {
+                            de = Some(lit.value());
+                        }
+                    }
+                    Ok(())
+                })?;
+                // Asymmetric in either shape. Both sides present and
+                // disagreeing is the obvious one. ONE side present is equally
+                // asymmetric and easier to miss: `rename_all(serialize =
+                // "snake_case")` renames only the output, so serde still
+                // DESERIALIZES the original spelling — advertising the
+                // serialize side would have a client send a value the handler
+                // rejects. Only a split whose two sides are spelled the same
+                // round-trips, and that is the sole accepted case.
+                match (ser, de) {
+                    (Some(ser), Some(de)) if ser == de => {}
+                    (None, None) => {}
+                    _ => split = Some(key),
+                }
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    split
+}
+
+/// A **directional** skip on a variant — `skip_serializing` or
+/// `skip_deserializing` — returned as the attribute word.
+///
+/// One schema describes both directions, so a variant present in only one of
+/// them has no correct rendering. `skip_deserializing` is the dangerous
+/// direction: the variant IS serialized, so a serialize-side schema advertises
+/// it, and a client that sends it back gets an unknown-variant error from
+/// serde. `skip_serializing` is the mirror — dropping it would deny an input
+/// the handler accepts. Neither can be inferred away, so the derive refuses the
+/// enum instead of publishing a half-true set. Plain `#[serde(skip)]` is
+/// unambiguous (gone from both directions) and stays supported.
+pub fn variant_directional_skip(variant: &syn::Variant) -> Option<&'static str> {
+    let mut found = None;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing") {
+                found = Some("skip_serializing");
+            } else if meta.path.is_ident("skip_deserializing") {
+                found = Some("skip_deserializing");
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// The field-level twin of [`variant_directional_skip`], with the same reasoning:
+/// a field present in only one serde direction has no correct rendering in a
+/// schema that describes both.
+pub fn variant_directional_skip_on_field(field: &syn::Field) -> Option<&'static str> {
+    serde_bare_word(&field.attrs, &["skip_serializing", "skip_deserializing"])
+}
+
+/// Whether a variant carries `#[serde(skip)]`, in which case it never appears
+/// on the wire in either direction and must not be advertised.
+pub fn variant_is_serde_skipped(variant: &syn::Variant) -> bool {
+    let mut skipped = false;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip") {
+                skipped = true;
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    skipped
 }
 
 /// The JSON-schema property name a field serializes to, honoring serde attrs.
@@ -231,6 +545,47 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     }
 
     let name = type_name_str(ty);
+
+    // Types that serialize as a JSON scalar despite not being Rust primitives.
+    // Without this they fall through to the `$ref` branch below and the spec
+    // carries a dangling component nothing registers — which the back-fill then
+    // resolves to the opaque object placeholder. `created_at` / `updated_at`
+    // columns make `NaiveDateTime` near-universal across `#[model]` types, so
+    // this was one untyped field on almost every model on an API boundary
+    // (issue #802). Each maps to the standard OpenAPI `format` for what serde
+    // actually writes.
+    if let Some((json_type, format, description)) = scalar_json_schema(&name) {
+        let format_insert = format.map(|f| {
+            quote! { __scalar.insert("format".to_owned(), #f.into()); }
+        });
+        let description_insert = description.map(|d| {
+            quote! { __scalar.insert("description".to_owned(), #d.into()); }
+        });
+        // Matching is on the type's LAST PATH SEGMENT, because a proc macro sees
+        // only the tokens as written and `use chrono::NaiveDateTime;` is the
+        // normal spelling. An application type that happens to share one of
+        // these names would otherwise be described as the external scalar, so
+        // check the derived-schema inventory FIRST at runtime: a colliding type
+        // carrying `#[derive(OpenApiSchema)]` resolves to its own real schema,
+        // and only a type nothing registered falls through to the scalar. (The
+        // same last-segment limitation already governs `primitive_json_type`
+        // for `String`, `bool` and the numerics.)
+        return quote! {{
+            match ::autumn_web::openapi::registered_derived_schema(
+                ::core::any::type_name::<#ty>()
+            ) {
+                ::core::option::Option::Some(__derived) => __derived,
+                ::core::option::Option::None => {
+                    let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
+                    __scalar.insert("type".to_owned(), #json_type.into());
+                    #format_insert
+                    #description_insert
+                    ::autumn_web::reexports::serde_json::Value::Object(__scalar)
+                }
+            }
+        }};
+    }
+
     crate::api_doc::primitive_json_type(&name).map_or_else(
         || {
             // Emit the `$ref` against the field type's FULL `type_name` identity
@@ -252,24 +607,101 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     )
 }
 
-/// Emit the body of `OpenApiSchema::schema()` for a list of fields.
+/// JSON-Schema `type`, optional `format`, and optional `description` for a
+/// non-primitive type that nevertheless serializes as a single scalar.
 ///
-/// `all_optional` is `true` for `UpdateX` structs where every field is
-/// conceptually optional (backed by `Patch<T>`).
-pub fn emit_schema_fn_body(
-    fields: &[&&Field],
-    all_optional: bool,
-    rename_all_rule: Option<&str>,
-) -> TokenStream {
-    emit_schema_fn_body_ext(fields, all_optional, &[], rename_all_rule)
+/// Deliberately narrow: only types whose serde output is unambiguous.
+/// Numeric-adjacent wrappers (`Decimal`, `BigDecimal`) are left out on purpose —
+/// whether they serialize as a JSON number or a string depends on which serde
+/// feature the app enabled, and an opaque placeholder beats a confidently wrong
+/// scalar.
+///
+/// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
+/// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
+/// but `NaiveDateTime` / `NaiveTime` serialize without one
+/// (`2026-09-06T18:00:00`). Claiming the standard format would make a strict
+/// validator reject the server's real payload, and lead a generator to emit a
+/// timezone-aware client type that cannot parse it. A bare `string` plus a
+/// description is less specific but true. `NaiveDate` keeps `date`, whose RFC
+/// 3339 production (`full-date`) has no offset to begin with, and `DateTime<Tz>`
+/// keeps `date-time` because chrono does write an offset for it.
+fn scalar_json_schema(
+    name: &str,
+) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
+    Some(match name {
+        // `DateTime<Utc>` reaches here as its last path segment, `DateTime`.
+        "DateTime" => ("string", Some("date-time"), None),
+        "NaiveDate" => ("string", Some("date"), None),
+        "NaiveDateTime" => (
+            "string",
+            None,
+            Some("ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00"),
+        ),
+        "NaiveTime" => (
+            "string",
+            None,
+            Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
+        ),
+        "Uuid" => ("string", Some("uuid"), None),
+        _ => return None,
+    })
 }
 
-pub fn emit_schema_fn_body_ext(
+/// Emit the body of `OpenApiSchema::schema()` for a list of fields.
+///
+/// `all_optional` is `true` for `Update*` structs where every field is
+/// conceptually optional (backed by `Patch<T>`); `extra_required` names fields
+/// to force into the `required` set; and `treat_as_optional` names fields that
+/// must NOT be `required` even though their type is not `Option<T>`.
+///
+/// Requiredness has to follow what the generated `Deserialize` accepts, not what
+/// the Rust type looks like. `#[model]` puts `#[serde(default)]` on a
+/// non-`Option` `bool` in the `New*` struct, so a POST body may omit it and get
+/// `false` — advertising it as required would force a generated client to send a
+/// value the server does not need (issue #802).
+pub fn emit_schema_fn_body_full(
     fields: &[&&Field],
     all_optional: bool,
     extra_required: &[&&Field],
     rename_all_rule: Option<&str>,
+    treat_as_optional: &dyn Fn(&Field) -> bool,
 ) -> TokenStream {
+    emit_schema_fn_body_named(
+        fields,
+        all_optional,
+        extra_required,
+        rename_all_rule,
+        treat_as_optional,
+        false,
+    )
+}
+
+/// As [`emit_schema_fn_body_full`], plus `raw_field_names`: advertise each
+/// property under its bare Rust identifier, ignoring every serde rename.
+///
+/// Needed for the `New*` / `Update*` companions. Those structs deliberately do
+/// NOT inherit the model's `#[serde(rename_all)]` or field-level
+/// `#[serde(rename)]` — a behaviour pinned by
+/// `autumn/tests/integration/form_for_derive.rs` — so a schema built with the
+/// model's rename metadata would advertise `authorName` for a body serde only
+/// accepts as `author_name`, and every generated client's POST would fail with
+/// a missing-field error (issue #802).
+pub fn emit_schema_fn_body_named(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+    rename_all_rule: Option<&str>,
+    treat_as_optional: &dyn Fn(&Field) -> bool,
+    raw_field_names: bool,
+) -> TokenStream {
+    let resolve_name = |f: &Field| -> Option<String> {
+        if raw_field_names {
+            let raw = f.ident.as_ref()?.to_string();
+            Some(raw.strip_prefix("r#").unwrap_or(&raw).to_owned())
+        } else {
+            schema_property_name(f, rename_all_rule)
+        }
+    };
     // Resolve each field's advertised property name once — through the shared
     // serde helpers so the schema honors `#[serde(rename)]` /
     // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
@@ -279,8 +711,8 @@ pub fn emit_schema_fn_body_ext(
         .iter()
         .chain(extra_required.iter())
         .map(|f| {
-            let field_name = schema_property_name(f, rename_all_rule)
-                .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
+            let field_name =
+                resolve_name(f).unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
             let schema_expr = emit_json_schema_tokens_for_field(f);
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
@@ -293,12 +725,12 @@ pub fn emit_schema_fn_body_ext(
     } else {
         fields
             .iter()
-            .filter(|f| !is_option_type(&f.ty))
-            .filter_map(|f| schema_property_name(f, rename_all_rule))
+            .filter(|f| !is_option_type(&f.ty) && !treat_as_optional(f))
+            .filter_map(|f| resolve_name(f))
             .collect()
     };
     for f in extra_required {
-        if let Some(name) = schema_property_name(f, rename_all_rule) {
+        if let Some(name) = resolve_name(f) {
             required_names.push(name);
         }
     }

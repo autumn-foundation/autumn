@@ -19,9 +19,9 @@ use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
 use crate::schema::{
-    apply_serde_rename_all_rule, emit_schema_fn_body, emit_schema_fn_body_ext,
-    field_is_translatable, field_serde_serialize_rename, has_attr, is_option_type,
-    serde_rename_all_serialize_rule, type_name_str,
+    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
+    field_has_skip_serializing_if, field_is_translatable, field_serde_serialize_rename, has_attr,
+    is_option_type, serde_rename_all_serialize_rule, type_name_str,
 };
 
 /// Parsed `#[model(...)]` attribute arguments.
@@ -7455,7 +7455,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     // Compute schema bodies for OpenApiSchema impls.
-    // all_fields is Vec<&Field>; emit_schema_fn_body expects &[&&Field].
+    // all_fields is Vec<&Field>; the schema emitters expect &[&&Field].
     // Thread the container `#[serde(rename_all)]` rule so the advertised schema
     // property names match the wire names the (de)serialized struct uses.
     let schema_rename_all_rule = serde_rename_all_serialize_rule(outer_attrs);
@@ -7464,18 +7464,68 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // #1654: a classified column has no `Serialize` impl, so it can never appear
     // in a JSON body. Advertising it in the read schema would document a property
     // no response can carry. The write schemas keep it: a client still *sets* it.
+    //
+    // #802: the same is true of a field hidden from JSON — `#[private]`, or
+    // `#[encrypted]` without `admin_visible`. Those get `skip_serializing`
+    // injected below, so a response never carries them either. This filter did
+    // not matter while the read schema went unregistered and every model
+    // resolved to an opaque placeholder; now that `#[model]` advertises itself,
+    // omitting it would mark always-absent fields `required` (a strict client
+    // fails to deserialize every response) and publish the names of private and
+    // encrypted columns in the contract. Write schemas keep them: they are only
+    // skipped on the way OUT, and a client still sets them.
+    // An explicit `#[serde(skip)]` / `#[serde(skip_serializing)]` the author
+    // wrote is exactly as absent from a response as the two cases above, and
+    // `field_already_skips_serialization` is the predicate that already knows
+    // it — consult it rather than re-deriving the answer.
     let serializable_field_refs: Vec<&&Field> = all_field_refs
         .iter()
-        .filter(|f| !field_is_classified(f))
+        .filter(|f| {
+            !field_is_classified(f)
+                && !field_hidden_from_json(f)
+                && !field_already_skips_serialization(f)
+        })
         .copied()
         .collect();
-    let query_struct_schema_body =
-        emit_schema_fn_body(&serializable_field_refs, false, schema_rename_all_rule);
-    let new_struct_schema_body =
-        emit_schema_fn_body(&fields_for_new, false, schema_rename_all_rule);
+    // `skip_serializing_if` is the third member of the omission family, after
+    // the unconditional `skip` / `skip_serializing` filtered above. It differs
+    // in kind: the field DOES appear in some responses, so the property stays —
+    // it just cannot be `required`, because a response that trips the predicate
+    // omits it and a strict client would reject that response.
+    //
+    // Sound HERE and only here, because this schema describes a RESPONSE: the
+    // generated repository API takes `New*` / `Update*` as its request bodies,
+    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
+    // — the same type may be a `Json<T>` request — so it refuses the shape
+    // instead, since `skip_serializing_if` governs serialization alone and
+    // serde still rejects a request that omits the field.
+    let query_struct_schema_body = emit_schema_fn_body_full(
+        &serializable_field_refs,
+        false,
+        &[],
+        schema_rename_all_rule,
+        &|f: &Field| field_has_skip_serializing_if(f),
+    );
+    // `NewModel` carries `#[serde(default)]` on every non-`Option` `bool` (see
+    // the `bool_default` wiring in the struct emitter), so a POST body may omit
+    // one and get `false`. Requiredness has to follow that, not the Rust type,
+    // or a generated client is forced to send a value the server does not need.
+    // RAW identifiers, not the model's serde names. The `New*` / `Update*`
+    // structs deliberately do not inherit `#[serde(rename_all)]` or a field
+    // `#[serde(rename)]` — pinned by `form_for_derive.rs` — so a body is decoded
+    // under the bare Rust identifiers. Advertising the model's renamed keys
+    // would make every generated POST/PUT fail with a missing-field error.
+    let new_struct_schema_body = emit_schema_fn_body_named(
+        &fields_for_new,
+        false,
+        &[],
+        None,
+        &|f: &Field| !is_option_type(&f.ty) && type_name_str(&f.ty) == "bool",
+        true,
+    );
     let update_struct_schema_body = {
         let extra: &[&&Field] = lock_version_field.as_slice();
-        emit_schema_fn_body_ext(&fields_for_new, true, extra, schema_rename_all_rule)
+        emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true)
     };
     let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
         .iter()
@@ -8494,6 +8544,38 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn schema_name() -> &'static str { stringify!(#update_name) }
             fn schema() -> ::serde_json::Value {
                 #update_struct_schema_body
+            }
+        }
+
+        // Advertise all three schemas by identity in the compile-time inventory
+        // the OpenAPI/MCP back-fill consults (issue #802). Without this the
+        // `impl`s above exist but nothing can FIND them: the back-fill resolves
+        // a referenced type through `DerivedSchemaDescriptor`, so a
+        // `#[repository(api = "..")]` endpoint's own model exported as the
+        // generic `{"type":"object","title":"X"}` placeholder — an untyped blob
+        // in every generated client — even though the real schema was compiled
+        // in all along.
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#name),
+                identity: ::autumn_web::openapi::type_name_of::<#name>,
+                schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#new_name),
+                identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                schema: <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#update_name),
+                identity: ::autumn_web::openapi::type_name_of::<#update_name>,
+                schema: <#update_name as ::autumn_web::openapi::OpenApiSchema>::schema,
             }
         }
 

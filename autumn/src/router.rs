@@ -6306,7 +6306,7 @@ pub async fn htmx_sse_handler() -> axum::response::Response {
 }
 
 #[cfg(feature = "openapi")]
-fn collect_openapi_docs(
+pub fn collect_openapi_docs(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
 ) -> Vec<crate::openapi::ApiDoc> {
