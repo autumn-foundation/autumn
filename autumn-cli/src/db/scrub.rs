@@ -2959,6 +2959,46 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
 /// says nothing about row-level security, triggers, partitions, materialized
 /// views, or schemas outside `public`. Every one of those decides whether an
 /// `UPDATE` this command emits succeeds, silently under-applies, or leaks — so
+/// Tables a statement naming them can fire a user-defined trigger on.
+///
+/// Two catalog rules decide this, and both have bitten this command:
+///
+/// - **`tgenabled`.** A trigger disabled with `ALTER TABLE ... DISABLE TRIGGER`
+///   stays in the catalog and cannot fire — and disabling it is exactly what the
+///   trigger warning and the emptying refusal tell operators to do, so counting
+///   it would make the documented remedy do nothing. `O` fires for an ordinary
+///   session and `A` fires always; `D` never fires, and `R` only under
+///   `session_replication_role = replica`, which a scrub does not set.
+///
+/// - **Row versus statement level, walking up `pg_inherits`.** A statement
+///   naming a partitioned parent (or a legacy `INHERITS` parent) fires
+///   **row-level** triggers declared on the children, so a row trigger anywhere
+///   below a table has to mark that table. It does **not** fire their
+///   statement-level triggers — measured on `PostgreSQL` 16, for both inheritance
+///   flavours — so those mark only the table they are declared on. Propagating
+///   them would refuse a run over a trigger that cannot execute.
+///
+/// Descendants need no walk: a trigger on a partitioned parent is cloned onto
+/// its partitions, and the parent is already named.
+///
+/// `extra` is an additional `pg_trigger` predicate, e.g. restricting the event.
+fn triggers_reaching(extra: &str) -> String {
+    format!(
+        "WITH RECURSIVE fires AS ( \
+           SELECT t.tgrelid AS oid, (t.tgtype & 1) <> 0 AS by_row FROM pg_trigger t \
+           WHERE NOT t.tgisinternal AND t.tgenabled IN ('O', 'A') {extra}\
+         ), ancestry AS ( \
+           SELECT oid, by_row FROM fires \
+           UNION \
+           SELECT i.inhparent, true FROM pg_inherits i \
+           JOIN ancestry a ON a.oid = i.inhrelid AND a.by_row \
+         ) \
+         SELECT DISTINCT rel.relname AS name FROM ancestry a \
+         JOIN pg_class rel ON rel.oid = a.oid \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public'"
+    )
+}
+
 /// they are probed here rather than assumed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DatabaseFacts {
@@ -3390,50 +3430,19 @@ fn probe_database_facts(
     .into_iter()
     .collect();
 
-    // `tgenabled` matters as much as `tgisinternal`: a trigger disabled with
-    // `ALTER TABLE ... DISABLE TRIGGER` stays in the catalog but cannot fire, and
-    // disabling it is exactly what this warning (and the refusal below) tells
-    // operators to do. `O` fires for an ordinary session and `A` fires always;
-    // `D` never fires and `R` only under `session_replication_role = replica`,
-    // which a scrub does not set.
-    let triggered_tables = names(
-        "SELECT DISTINCT rel.relname AS name FROM pg_trigger t \
-         JOIN pg_class rel ON rel.oid = t.tgrelid \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE NOT t.tgisinternal AND t.tgenabled IN ('O', 'A')",
-        &mut conn,
-    )?
-    .into_iter()
-    .collect();
-
-    // The `DELETE`-firing subset, separately: `tgtype` bit 3 is the DELETE
-    // event. These are the ones that matter for the run's last write, so the
-    // refusal can name exactly the tables that carry one rather than every
-    // table carrying any trigger at all.
-    //
-    // Walked UP `pg_inherits`, because the emptying statement names the parent:
-    // `DELETE FROM parent` fires a row-level trigger declared directly on a leaf
-    // partition (or on a legacy `INHERITS` child), so a trigger anywhere below a
-    // table has to mark that table. Descendants need no walk of their own — a
-    // trigger on a partitioned parent is cloned onto its partitions, and the
-    // parent is already named here.
-    let delete_triggered_tables = names(
-        "WITH RECURSIVE fires AS ( \
-           SELECT t.tgrelid AS oid FROM pg_trigger t \
-           WHERE NOT t.tgisinternal AND (t.tgtype & 8) <> 0 \
-           AND t.tgenabled IN ('O', 'A') \
-         ), ancestry AS ( \
-           SELECT oid FROM fires \
-           UNION \
-           SELECT i.inhparent FROM pg_inherits i JOIN ancestry a ON a.oid = i.inhrelid \
-         ) \
-         SELECT DISTINCT rel.relname AS name FROM ancestry a \
-         JOIN pg_class rel ON rel.oid = a.oid \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public'",
-        &mut conn,
-    )?
-    .into_iter()
-    .collect();
+    // Two questions, one shape: which tables carry a user-defined trigger at
+    // all (the warning), and which carry one that fires on `DELETE` (the
+    // refusal). `triggers_reaching` builds both, so they cannot drift on the
+    // catalog rules they share.
+    let triggered_tables = names(&triggers_reaching(""), &mut conn)?
+        .into_iter()
+        .collect();
+    // `tgtype` bit 3 is the DELETE event. These are the ones that matter for
+    // the run's last write, so the refusal can name exactly the tables that
+    // carry one rather than every table carrying any trigger at all.
+    let delete_triggered_tables = names(&triggers_reaching("AND (t.tgtype & 8) <> 0 "), &mut conn)?
+        .into_iter()
+        .collect();
 
     // `m` (materialized views) belongs here as much as the table relkinds do: a
     // schema holding only `analytics.user_emails AS SELECT … FROM public.users`
@@ -4012,7 +4021,41 @@ fn execute(
 
 #[cfg(test)]
 mod tests {
-    use super::{emptiness_assertion, integrity_assertion};
+    use super::{emptiness_assertion, integrity_assertion, triggers_reaching};
+
+    // ── Which triggers a statement can actually fire ────────────────────────
+
+    #[test]
+    fn only_row_triggers_propagate_up_the_inheritance_tree() {
+        let sql = triggers_reaching("AND (t.tgtype & 8) <> 0 ");
+        // Measured on PostgreSQL 16, both inheritance flavours: `DELETE FROM
+        // parent` fires a child's ROW trigger and not its STATEMENT trigger. A
+        // statement trigger must therefore mark only the table it is on, or the
+        // run refuses over a trigger that cannot execute.
+        assert!(
+            sql.contains("(t.tgtype & 1) <> 0 AS by_row"),
+            "the seed must record whether each trigger is row-level: {sql}"
+        );
+        assert!(
+            sql.contains("JOIN ancestry a ON a.oid = i.inhrelid AND a.by_row"),
+            "and only row-level ones may propagate to an ancestor: {sql}"
+        );
+        // A disabled trigger cannot fire, and disabling one is the remedy both
+        // the warning and the refusal recommend.
+        assert!(
+            sql.contains("t.tgenabled IN ('O', 'A')"),
+            "a disabled trigger must not count: {sql}"
+        );
+        assert!(
+            sql.contains("AND (t.tgtype & 8) <> 0"),
+            "the caller's event filter must reach the seed: {sql}"
+        );
+        // The warning asks the same question without an event filter.
+        assert!(
+            !triggers_reaching("").contains("tgtype & 8"),
+            "and an empty filter must not smuggle one in"
+        );
+    }
 
     // ── Printed assertions survive hostile identifiers ──────────────────────
 

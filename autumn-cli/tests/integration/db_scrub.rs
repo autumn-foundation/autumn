@@ -1587,6 +1587,68 @@ async fn a_delete_trigger_on_a_leaf_partition_of_an_emptied_table_is_refused() {
     );
 }
 
+/// A statement-level trigger on a leaf must not refuse the run.
+///
+/// `DELETE FROM parent` fires a child's **row**-level triggers and not its
+/// statement-level ones — measured on `PostgreSQL` 16, for declarative partitions
+/// and legacy `INHERITS` alike. Propagating every `DELETE` trigger up the tree
+/// therefore refuses runs over a trigger that cannot execute, which is worse
+/// than a false warning: the remedy on offer is to drop a trigger that was
+/// never a hazard.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_statement_level_leaf_trigger_does_not_refuse_the_run() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "leaf_statement_trigger").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL NOT NULL, \
+                shard INT NOT NULL, \
+                args TEXT NOT NULL \
+            ) PARTITION BY RANGE (shard); \
+            CREATE TABLE autumn_jobs_p0 PARTITION OF autumn_jobs \
+                FOR VALUES FROM (0) TO (10); \
+            INSERT INTO autumn_jobs (shard, args) VALUES (1, 'payload'); \
+            CREATE FUNCTION noop_stmt() RETURNS TRIGGER AS $$ \
+            BEGIN RETURN NULL; END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER leaf_stmt AFTER DELETE ON autumn_jobs_p0 \
+                FOR EACH STATEMENT EXECUTE FUNCTION noop_stmt();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/leaf_statement_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the purge must still empty the partitioned table"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "and the scrub must still run"
+    );
+}
+
 /// Disabling the trigger has to actually work — the refusal says to do it.
 ///
 /// `ALTER TABLE ... DISABLE TRIGGER` leaves the row in `pg_trigger` with
