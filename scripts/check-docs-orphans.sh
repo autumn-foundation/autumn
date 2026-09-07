@@ -129,12 +129,21 @@ import html, os, posixpath, re, subprocess, sys, urllib.parse
 root = sys.argv[1]
 
 GUIDE = 'docs/guide/'
-ROOT_FILES = ('README.md', 'AGENTS.md', 'EXAMPLES.md', 'CONTRIBUTING.md',
-              'STABILITY.md', 'docs/plugins.md')
-# `AGENTS.md` is the workspace instruction file agent tooling loads by name on
-# entering the repository — no link leads to it, which is exactly what makes it
-# an entry surface rather than a waypoint. Same argument as `SKILL.md`, and it
-# was the one such file this list still omitted.
+ROOT_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
+              'docs/plugins.md')
+# INSTRUCTION FILES are entry surfaces wherever they sit. Agent tooling loads
+# them by NAME on entering a directory, so no link leads to one — which is
+# exactly what makes it a root rather than a waypoint. As a waypoint an
+# instruction file is inert, and a guide indexed only from it was an orphan.
+#
+# By basename at any depth, not as two root-only entries: both conventions are
+# per-DIRECTORY — tooling reads the one beside the code it is working on — so a
+# nested `subproject/CLAUDE.md` is loaded exactly as the top-level one is. This
+# repository has only the two at the root, so the rule changes nothing about
+# the current graph and everything about the next file someone adds. Listing
+# `AGENTS.md` alone and leaving `CLAUDE.md` out was the same omit-one-of-a-
+# family mistake this file keeps making, caught one round later.
+INSTRUCTION_FILES = ('AGENTS.md', 'CLAUDE.md')
 # `.claude/skills/` too: the agent machinery loads a `SKILL.md` there by name
 # exactly as it does one under `skills/`, so it is a surface an agent ENTERS
 # through, not one it is routed to. It was being treated as a waypoint, which
@@ -211,6 +220,7 @@ def is_root(f):
     if f in HISTORY or f.startswith(HISTORY):
         return False
     return (f in ROOT_FILES
+            or posixpath.basename(f) in INSTRUCTION_FILES
             or _is_agent_entry(f)
             # `examples/<app>/README.md` only. A deeper one
             # (`examples/reddit-clone/capsules/README.md`) is a supporting page
@@ -507,6 +517,34 @@ def inline_links(txt, resolved=None):
             yield i + 1, j, m.group(1), m.group(2), m.start(), m.end()
 
 
+def reference_images(txt, defined):
+    """Every `![alt][ref]`, `![ref][]` and `![ref]` whose label RESOLVES.
+
+    Yields `(start, end)` over the whole span, `!` included.
+
+    Balanced like every other label here — the bounded pattern this replaces
+    took one nested pair, so a deeper alt left the image unmasked and the
+    bare-path scan read a path out of it.
+
+    An UNRESOLVED reference is not an image at all: it renders as literal
+    text, so `![alt][nosuch]` puts its label on screen and masking it would
+    invent an orphan. That is why `defined` is required rather than optional.
+    """
+    for i in _openers(txt):
+        if not (i and txt[i - 1] == '!'):
+            continue
+        j = _label_end(txt, i)
+        if j is None:
+            continue
+        first = txt[i + 1:j]
+        m = REF_TAIL.match(txt, j + 1)
+        end = m.end() if m else j + 1
+        second = m.group(1) if m else None
+        label = second if second is not None and second.strip() else first
+        if ref_label(label) in defined:
+            yield i - 1, end
+
+
 def inline_images(txt):
     """Every inline `![alt](dest)` span, with the alt text balanced to ANY depth.
 
@@ -732,9 +770,10 @@ def full_references(txt, images=False):
 # image at all — an UNRESOLVED reference renders as literal text, so
 # `![alt][docs/guide/mail.md]` with no such definition puts that path on
 # screen, and masking it unconditionally reported the page as an orphan.
-IMAGE_REF = re.compile(
-    r'!\[((?:' + FLAT + r'|\[' + FLAT + r'*\])*)\]'
-    r'(?:\[(' + FLAT + r'*)\])?')
+# The REFERENCE spellings are scanned by `reference_images`, for the reason the
+# inline one is: this pattern admitted a single nested bracket pair, so
+# `![outer [middle [docs/guide/mail.md]]][logo]` went unmasked and the bare-path
+# scan read a path out of an image's alt text.
 # Any inline link span, image or not. Blanked before the shortcut scan: links
 # cannot nest, so in `[outer [mail]](https://example.com)` only the OUTER link
 # renders and the inner `[mail]` is ordinary label text — not a shortcut
@@ -2451,13 +2490,6 @@ def has_content(image_span, masked_span, raw_span=None):
                 or ANY_IMAGE.search(image_span))
 
 
-def _image_resolves(m, defined):
-    """Whether an image reference names a definition that exists."""
-    first, second = m.group(1), m.group(2)
-    label = second if second is not None and second.strip() else first
-    return ref_label(label) in defined
-
-
 def mask_invisible(txt, keep_images=False):
     """Blank everything a reader cannot see — in PROSE, and not inside a code
     span. This is the ONE place that decides what is invisible, because scoping
@@ -2538,7 +2570,9 @@ def mask_invisible(txt, keep_images=False):
         # early; it over-accepts only a definition that a block-start check
         # would reject, and that is the direction that keeps a real image
         # masked.
-        blank(IMAGE_REF, when=lambda m: _image_resolves(m, defined))
+        for a, b in [sp for sp in reference_images(seg, defined)
+                     if not any(p <= sp[0] < q for p, q in protected)]:
+            seg = seg[:a] + ' ' * (b - a) + seg[b:]
         out.append(seg)
     return ''.join(out)
 
@@ -5835,6 +5869,41 @@ self_test() {
     > "$c9kf/docs/guide/jobs.md"
   git -C "$c9kf" add -A && git -C "$c9kf" commit -qm decl-after-url-semicolon
   check "a semicolon inside url() ends no declaration" fail "$c9kf"
+
+  # `CLAUDE.md` is an instruction file loaded by name, exactly as `AGENTS.md`
+  # is. Adding one of the pair and not the other is the omit-one-of-a-family
+  # mistake, so both are matched by basename.
+  local c9kg="$tmp/c9kg"; make_corpus "$c9kg"
+  printf '# C\n\n- [Mail](docs/guide/mail.md)\n' > "$c9kg/CLAUDE.md"
+  git -C "$c9kg" add -A && git -C "$c9kg" commit -qm claude-md-is-a-root
+  check "the root CLAUDE.md is an entry surface" pass "$c9kg"
+
+  # ...at ANY depth, because the convention is per-directory: tooling reads the
+  # instruction file beside the code it is working on, so a nested one is
+  # loaded exactly as the top-level one is and nothing links either.
+  local c9kh="$tmp/c9kh"; make_corpus "$c9kh"
+  mkdir -p "$c9kh/sub"
+  printf '# C\n\n- [Mail](docs/guide/mail.md)\n' > "$c9kh/sub/CLAUDE.md"
+  git -C "$c9kh" add -A && git -C "$c9kh" commit -qm nested-claude-md-is-a-root
+  check "a nested instruction file is an entry surface" pass "$c9kh"
+
+  # A reference image's alt text nests like any other label. The bounded
+  # pattern took one level, so a deeper alt left the image unmasked and the
+  # bare-path scan read a path out of alt text the reader never sees.
+  local c9ki="$tmp/c9ki"; make_corpus "$c9ki"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n![outer [middle [docs/guide/mail.md]]][logo]\n\n[logo]: image.png\n' \
+    > "$c9ki/README.md"
+  git -C "$c9ki" add -A && git -C "$c9ki" commit -qm deep-nested-image-reference
+  check "a deeply nested image reference is masked" fail "$c9ki"
+
+  # ...but only when it RESOLVES. An unresolved reference is not an image at
+  # all — it renders as literal text, so its label IS on screen, and masking it
+  # would invent an orphan out of a path the reader can read.
+  local c9kj="$tmp/c9kj"; make_corpus "$c9kj"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n![outer [middle [docs/guide/mail.md]]][nosuch]\n' \
+    > "$c9kj/README.md"
+  git -C "$c9kj" add -A && git -C "$c9kj" commit -qm unresolved-image-reference
+  check "an unresolved image reference is visible text" pass "$c9kj"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
