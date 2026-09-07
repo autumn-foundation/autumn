@@ -842,7 +842,9 @@ fn patch_generated_cargo_toml(project_dir: &Path) {
 ///
 /// Scaffolds, migrates, seeds, scrubs, re-checks migrations and then compiles
 /// and boots the app, so it needs the `diesel` CLI on `PATH` in addition to
-/// Docker — it runs in the generator-conformance Postgres gate.
+/// Docker — it runs in the generator-conformance Postgres gate. It then repeats
+/// the last two steps with `--sample` (issue #1636), which is the same
+/// criterion for a SAMPLED database and reuses the one expensive compile.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: compiles and boots a generated app; needs Docker + diesel CLI"]
 #[allow(clippy::too_many_lines)]
@@ -910,9 +912,48 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
     );
 
     // ── The app boots against it and answers GET /health ────────────────────
+    assert_app_serves_health(&project, &url).await;
+
+    // ── #1636: the same drill, now with a sample ────────────────────────────
+    //
+    // Re-scrubbing the (already scrubbed) database with `--sample` is the one
+    // AC the Docker sweep cannot cover either: a SAMPLED database must also
+    // migrate clean and boot. The app is already compiled by this point, so
+    // this second leg costs a boot rather than a build.
+    run_autumn_ok(&project, &["db", "scrub", "--sample", "users=50%"], &envs);
+    let sampled_users: i64 = client
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(sampled_users, 1, "50% of two users is one row");
+    let orphans: i64 = client
+        .query_one(
+            "SELECT count(*) FROM comments c \
+             LEFT JOIN users u ON u.id = c.user_id WHERE u.id IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(orphans, 0, "every foreign key must resolve in the subset");
+
+    let (_o, sampled_migrate) = run_autumn_ok(&project, &["migrate"], &envs);
+    assert!(
+        sampled_migrate.contains("Migrations are already up to date.")
+            || sampled_migrate.contains("Migrations applied successfully."),
+        "migrations must report a clean status against the sampled database: \
+         {sampled_migrate}"
+    );
+    assert_app_serves_health(&project, &url).await;
+}
+
+/// Boot the generated app in `project` against `url` and require `GET /health`
+/// to answer 200, killing the server on the way out.
+async fn assert_app_serves_health(project: &Path, url: &str) {
     let build = Command::new("cargo")
         .args(["build"])
-        .current_dir(&project)
+        .current_dir(project)
         .output()
         .expect("cargo build");
     assert!(
@@ -926,13 +967,13 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         listener.local_addr().unwrap().port()
     };
-    let stdout_path = project.join("app-stdout.log");
-    let stderr_path = project.join("app-stderr.log");
+    let stdout_path = project.join(format!("app-stdout-{app_port}.log"));
+    let stderr_path = project.join(format!("app-stderr-{app_port}.log"));
     let child = Command::new("cargo")
         .args(["run"])
-        .current_dir(&project)
+        .current_dir(project)
         .env("AUTUMN_SERVER__PORT", app_port.to_string())
-        .env("AUTUMN_DATABASE__URL", &url)
+        .env("AUTUMN_DATABASE__URL", url)
         .stdout(Stdio::from(
             std::fs::File::create(&stdout_path).expect("create the app stdout log"),
         ))
@@ -969,5 +1010,401 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
         Some(200),
         "the app must boot against the scrubbed database and answer GET /health \
          with 200\n{output}"
+    );
+}
+
+// ─── `--sample`: laptop-sized, referentially-intact subsets (issue #1636) ────
+
+/// The sampling fixture: a `countries` lookup every user points at, a
+/// `comments` child hanging off `users`, and an `audit_logs` table connected to
+/// nothing. Together they exercise all four sample roles — root, related,
+/// always-include and never-include — in one schema.
+const SAMPLE_SCHEMA: &str = "\
+    CREATE TABLE countries ( \
+        id BIGSERIAL PRIMARY KEY, \
+        code TEXT NOT NULL UNIQUE, \
+        name TEXT NOT NULL \
+    ); \
+    CREATE TABLE users ( \
+        id BIGSERIAL PRIMARY KEY, \
+        country_id BIGINT NOT NULL REFERENCES countries (id), \
+        email TEXT NOT NULL UNIQUE, \
+        full_name TEXT NOT NULL, \
+        created_at TIMESTAMP NOT NULL DEFAULT NOW() \
+    ); \
+    CREATE TABLE comments ( \
+        id BIGSERIAL PRIMARY KEY, \
+        user_id BIGINT NOT NULL REFERENCES users (id), \
+        body TEXT NOT NULL, \
+        created_at TIMESTAMP NOT NULL DEFAULT NOW() \
+    ); \
+    CREATE TABLE audit_logs ( \
+        id BIGSERIAL PRIMARY KEY, \
+        actor_email TEXT NOT NULL, \
+        action TEXT NOT NULL \
+    );";
+
+/// 3 countries, 200 users, 400 comments, 500 audit rows — enough volume that a
+/// 1% sample is a real subset rather than a rounding artefact. Generated from
+/// `generate_series`, so two databases seeded this way hold identical ids and a
+/// same-seed comparison is exact.
+const SAMPLE_ROWS: &str = "\
+    INSERT INTO countries (code, name) \
+        SELECT 'C' || i, 'Country ' || i FROM generate_series(1, 3) AS i; \
+    INSERT INTO users (country_id, email, full_name) \
+        SELECT 1 + (i % 3), 'user' || i || '@real-corp.example', 'Real Person ' || i \
+        FROM generate_series(1, 200) AS i; \
+    INSERT INTO comments (user_id, body) \
+        SELECT id, 'secret note ' || id FROM users \
+        UNION ALL SELECT id, 'second secret note ' || id FROM users; \
+    INSERT INTO audit_logs (actor_email, action) \
+        SELECT 'admin' || i || '@real-corp.example', 'login' \
+        FROM generate_series(1, 500) AS i;";
+
+/// The sampling fixture's declaration. `comments` is absent on purpose: it is
+/// registered with the GDPR anonymize strategy by `write_project_sources`, so
+/// the scrub classifies it with no declaration at all.
+const SAMPLE_SCRUB_TOML: &str = r#"
+[defaults]
+safe_columns = ["id", "created_at"]
+
+[tables.countries]
+safe = ["code", "name"]
+
+[tables.users]
+safe = ["country_id"]
+
+[tables.users.pii]
+email = "email"
+full_name = "name"
+
+[tables.audit_logs]
+safe = ["action"]
+
+[tables.audit_logs.pii]
+actor_email = "email"
+
+# Reference data is copied whole; the audit trail is not copied at all.
+[sample]
+always_include = ["countries"]
+never_include = ["audit_logs"]
+"#;
+
+/// Create `name`, seed the sampling fixture into it and return a client.
+async fn seed_sample_fixture(admin: &Client, base: &str, name: &str) -> Client {
+    admin
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+    let client = connect(&format!("{base}/{name}")).await;
+    client.batch_execute(SAMPLE_SCHEMA).await.unwrap();
+    client.batch_execute(SAMPLE_ROWS).await.unwrap();
+    client
+}
+
+/// A project directory wired for the sampling fixture.
+fn sample_project(dir: &Path) {
+    write_project_sources(dir);
+    std::fs::write(dir.join("scrub.toml"), SAMPLE_SCRUB_TOML).unwrap();
+}
+
+async fn count(client: &Client, sql: &str) -> i64 {
+    client
+        .query_one(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .get(0)
+}
+
+/// The ids the sample kept, ascending — the exact row set a seed selects.
+async fn kept_user_ids(client: &Client) -> Vec<i64> {
+    client
+        .query("SELECT id FROM users ORDER BY id", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// AC #1/#2/#3/#6/#8: one pass produces a scrubbed **and** sampled database
+/// that is smaller than the source, keeps every foreign key resolvable, honours
+/// the per-table rules, and carries none of the original values.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[allow(clippy::too_many_lines)]
+async fn sampled_scrub_is_smaller_referentially_intact_and_pii_free() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_target").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_target");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("Scrub complete"),
+        "the sampled scrub should complete: {stderr}"
+    );
+
+    // ── AC #2: the root is sized as asked, related rows follow ──────────────
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        2,
+        "1% of 200 users is 2 rows"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM comments").await,
+        4,
+        "each kept user brings its two comments and nothing else"
+    );
+
+    // ── AC #3: per-table rules ──────────────────────────────────────────────
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM countries").await,
+        3,
+        "an always-include lookup table is copied whole"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "a never-include table is excluded entirely"
+    );
+
+    // ── AC #2/#6: every foreign key still resolves ──────────────────────────
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM comments c \
+             LEFT JOIN users u ON u.id = c.user_id WHERE u.id IS NULL"
+        )
+        .await,
+        0,
+        "no comment may point at a user the sample dropped"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users u \
+             LEFT JOIN countries c ON c.id = u.country_id WHERE c.id IS NULL"
+        )
+        .await,
+        0,
+        "no user may point at a country the sample dropped"
+    );
+
+    // ── AC #1/#8: sampled AND scrubbed, in one pass ─────────────────────────
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@real-corp.example' \
+             OR full_name LIKE 'Real Person%'"
+        )
+        .await,
+        0,
+        "the rows the sample kept must still be scrubbed"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM comments WHERE body LIKE '%secret note%'"
+        )
+        .await,
+        0,
+        "a kept comment must be scrubbed too"
+    );
+
+    // ── AC #6: the run reports what it produced ─────────────────────────────
+    assert!(
+        stderr.contains("users: 200 \u{2192} 2 row(s)"),
+        "the report must give per-table row counts: {stderr}"
+    );
+    assert!(
+        stderr.contains("Total: ") && stderr.contains("of the source"),
+        "the report must compare the subset to the source: {stderr}"
+    );
+    assert!(
+        stderr.contains("foreign key(s) re-verified"),
+        "the run must verify referential integrity itself: {stderr}"
+    );
+    assert!(
+        stderr.contains("Table size: "),
+        "the report must give the size versus the source: {stderr}"
+    );
+    assert!(
+        !stderr.contains("postgres://"),
+        "no message may print the connection URL: {stderr}"
+    );
+}
+
+/// AC #4: the same seed selects the identical row set, and a different one does
+/// not — the property that lets a teammate reproduce the exact subset that
+/// exhibits a bug.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_same_seed_selects_the_identical_row_set() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    let mut selections = Vec::new();
+    for (name, seed) in [("seed_a", "99"), ("seed_b", "99"), ("seed_c", "100")] {
+        let client = seed_sample_fixture(&admin, &base, name).await;
+        let url = format!("{base}/{name}");
+        run_autumn_ok(
+            dir,
+            &["db", "scrub", "--sample", "users=10", "--seed", seed],
+            &[("AUTUMN_DATABASE__URL", url.as_str())],
+        );
+        let ids = kept_user_ids(&client).await;
+        assert_eq!(ids.len(), 10, "{name} should keep exactly 10 users");
+        selections.push(ids);
+    }
+
+    assert_eq!(
+        selections[0], selections[1],
+        "the same seed against the same source data must select the identical rows"
+    );
+    assert_ne!(
+        selections[0], selections[2],
+        "a different seed must select a different subset"
+    );
+}
+
+/// AC #5: a table the walk cannot reach aborts with a non-zero exit that names
+/// it — sampling never empties a table without saying so.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_a_table_no_root_can_reach() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_gap").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // Drop the rule that accounted for `audit_logs`: nothing references it, so
+    // the walk can no longer reach it.
+    std::fs::write(
+        dir.join("scrub.toml"),
+        SAMPLE_SCRUB_TOML.replace("never_include = [\"audit_logs\"]", "never_include = []"),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_gap");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("audit_logs"),
+        "the refusal must name the uncovered table: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be reached"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused sample must not have deleted anything"
+    );
+
+    // The same gap is caught by `--check`, which is the CI gate.
+    let (_o, check_err) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--check", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        check_err.contains("audit_logs"),
+        "--check must catch the gap before any restore: {check_err}"
+    );
+}
+
+/// AC #1: there is no path that emits sampled-but-unscrubbed rows. A
+/// classification failure refuses before the sample deletes a single row,
+/// because both are phases of one transaction.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unclassified_column_refuses_before_the_sample_deletes_anything() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_unclassified").await;
+    client
+        .batch_execute("ALTER TABLE users ADD COLUMN ssn TEXT;")
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_unclassified");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("users.ssn"),
+        "the undeclared column must still be refused: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "no row may be sampled away by a run that refuses to scrub"
+    );
+}
+
+/// `--check` and `--dry-run` write nothing, sample included.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sample_check_and_dry_run_write_nothing() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_no_write").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_no_write");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, check_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--check", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        check_err.contains("Every table is covered by the sample"),
+        "--check must confirm the sample plan is complete: {check_err}"
+    );
+
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        dry_err.contains("DELETE FROM \"public\".\"audit_logs\""),
+        "the dry run must print the sample's own statements: {dry_err}"
+    );
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "neither mode may write"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        500,
+        "neither mode may empty an excluded table"
     );
 }

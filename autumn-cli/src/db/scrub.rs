@@ -65,6 +65,12 @@ use serde::Deserialize;
 use crate::migrate;
 use crate::schema::introspect;
 
+/// Referentially-intact row subsetting (issue #1636). A submodule of the scrub
+/// rather than a sibling: a sample is a phase of one scrub transaction, never a
+/// command of its own, so no flag combination can emit sampled-but-unscrubbed
+/// rows.
+pub mod sample;
+
 use super::{quote_ident, quote_literal};
 
 /// The per-app PII declaration file, read from the project root unless
@@ -119,6 +125,12 @@ pub struct ScrubArgs {
     /// Bypass the separate guard that refuses to write over the database an
     /// artifact's own non-dev/test profile config declares.
     pub allow_source_overwrite: bool,
+    /// Root entities to sample, each `<table>=<count|percent%>` (issue #1636).
+    /// Empty means no sampling: the whole scrubbed copy is kept.
+    pub sample: Vec<String>,
+    /// The seed the sample's row selection is derived from, so the same seed
+    /// against the same source data reproduces the identical subset.
+    pub seed: u64,
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -308,6 +320,8 @@ pub enum ScrubError {
     },
     /// A backup/restore step (artifact restore, `--output` re-dump) failed.
     Backup(Box<super::backup::BackupError>),
+    /// The `--sample` subset could not be resolved or verified (issue #1636).
+    Sample(Box<sample::SampleError>),
 }
 
 impl std::fmt::Display for ScrubError {
@@ -538,7 +552,14 @@ impl std::fmt::Display for ScrubError {
                  subsequent write. Add {missing:?} to `purge`, or remove {listed:?}."
             ),
             Self::Backup(e) => write!(f, "{e}"),
+            Self::Sample(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl From<sample::SampleError> for ScrubError {
+    fn from(e: sample::SampleError) -> Self {
+        Self::Sample(Box::new(e))
     }
 }
 
@@ -711,6 +732,9 @@ pub struct ScrubConfig {
     /// Framework-owned table handling.
     #[serde(default)]
     pub framework: FrameworkRule,
+    /// Per-table subsetting rules for `--sample` (issue #1636).
+    #[serde(default)]
+    pub sample: sample::SampleRules,
 }
 
 /// Framework-owned tables whose rows carry **app-supplied** payloads, and can
@@ -2190,6 +2214,8 @@ struct SourceClassification {
     config: ScrubConfig,
     encrypted: BTreeMap<String, BTreeMap<String, bool>>,
     anonymize: BTreeSet<String>,
+    /// Parsed `--sample` roots. Empty means the whole copy is kept.
+    roots: Vec<sample::SampleSpec>,
 }
 
 /// Read and validate every file-based classification source, reporting what each
@@ -2241,11 +2267,32 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
         anonymize.len()
     );
 
+    // Parsed here rather than at the call site so a mistyped `--sample` fails
+    // alongside every other file-based refusal: BEFORE an `--artifact` restore
+    // writes real data into the target.
+    let roots = args
+        .sample
+        .iter()
+        .map(|spec| sample::parse_spec(spec))
+        .collect::<Result<Vec<_>, _>>()?;
+    if roots.is_empty() && sources_declare_sampling(&config) {
+        eprintln!(
+            "  \u{2139} scrub.toml declares [sample] rules, but no --sample root was \
+             given \u{2014} the whole copy is kept."
+        );
+    }
+
     Ok(SourceClassification {
         config,
         encrypted,
         anonymize,
+        roots,
     })
+}
+
+/// Whether `scrub.toml` carries any `[sample]` rule at all.
+const fn sources_declare_sampling(config: &ScrubConfig) -> bool {
+    !config.sample.always_include.is_empty() || !config.sample.never_include.is_empty()
 }
 
 /// Classify every target, then — only once every target has classified cleanly —
@@ -2323,17 +2370,38 @@ fn classify_and_apply(
         report_plan(label, &plan);
         report_framework_tables(&facts.framework_tables, &sources.config);
         report_triggers(&plan, &facts);
-        plans.push((label, url, plan, facts));
+
+        // Resolved in the same pass as the classification, and before ANY
+        // target is written, so a graph gap on one shard cannot leave the rest
+        // of the topology sampled.
+        let sampling = if sources.roots.is_empty() {
+            None
+        } else {
+            Some(build_sample_plan_for(args, sources, &tables, &facts)?)
+        };
+        if let Some(sampling) = &sampling {
+            report_sample_plan(label, sampling);
+        }
+        plans.push((label, url, plan, facts, sampling));
     }
 
     if args.check {
         eprintln!(
             "\n\u{2713} Every column in `public` is classified \u{2014} no unclassified data can leak."
         );
+        if !sources.roots.is_empty() {
+            eprintln!(
+                "\u{2713} Every table is covered by the sample \u{2014} no table would be \
+                 emptied unannounced, and every foreign key resolves."
+            );
+        }
         return Ok(());
     }
     if args.dry_run {
-        for (_, _, plan, facts) in &plans {
+        for (label, url, plan, facts, sampling) in &plans {
+            if let Some(sampling) = sampling {
+                report_sample_sql(url, label, sampling)?;
+            }
             for table in &plan.tables {
                 if let Some(sql) = &table.sql {
                     eprintln!("  {sql};");
@@ -2354,6 +2422,12 @@ fn classify_and_apply(
             for (_, statement) in purge_statements(&facts.framework_tables, &sources.config) {
                 eprintln!("  {statement};");
             }
+            if sampling.is_some() {
+                eprintln!(
+                    "  -- then VACUUM (FULL, ANALYZE) on every subsetted table, so the files \
+                     shrink to the sample"
+                );
+            }
         }
         eprintln!("\n\u{2713} Dry run only \u{2014} nothing was written.");
         return Ok(());
@@ -2363,7 +2437,7 @@ fn classify_and_apply(
     // so a missing key is a refusal rather than a half-scrubbed database.
     if plans
         .iter()
-        .any(|(_, _, plan, _)| plan.tables.iter().any(|t| !t.encrypted.is_empty()))
+        .any(|(_, _, plan, _, _)| plan.tables.iter().any(|t| !t.encrypted.is_empty()))
     {
         let ring = resolve_key_ring(profile, Path::new("."))?;
         autumn_web::encryption::install_key_ring(ring);
@@ -2371,21 +2445,38 @@ fn classify_and_apply(
 
     // ── Pass 2: apply ───────────────────────────────────────────────────────
     let mut committed: Vec<&str> = Vec::new();
-    for (label, url, plan, facts) in &plans {
+    for (label, url, plan, facts, sampling) in &plans {
         let purges = purge_statements(&facts.framework_tables, &sources.config);
-        let applied =
-            execute(url, plan, &purges, &facts.materialized_views, label).inspect_err(|_| {
-                if !committed.is_empty() {
-                    eprintln!(
-                        "\n\u{26A0}\u{FE0F}  Already committed before this failure: {}. \
+        let (applied, sampled) = execute(
+            url,
+            plan,
+            &purges,
+            &facts.materialized_views,
+            sampling.as_ref(),
+            label,
+        )
+        .inspect_err(|_| {
+            if !committed.is_empty() {
+                eprintln!(
+                    "\n\u{26A0}\u{FE0F}  Already committed before this failure: {}. \
                      Those databases ARE scrubbed; every later target is untouched and still \
                      holds real data.",
-                        committed.join(", ")
-                    );
-                }
-            })?;
+                    committed.join(", ")
+                );
+            }
+        })?;
         for (table, rows) in applied {
             eprintln!("  \u{2713} {table}: {rows} row(s) scrubbed.");
+        }
+        if let (Some(sampling), Some(sampled)) = (sampling.as_ref(), sampled) {
+            report_sample_outcome(label, &sampled);
+            // Deleting rows leaves the table files exactly as large as they
+            // were, so a sample that is not compacted still needs the source's
+            // disk and still dumps slowly. This is the step that makes the
+            // subset actually laptop-sized, and it can only run after the
+            // commit: VACUUM FULL rewrites each table and cannot join a
+            // transaction.
+            report_reclaimed_size(url, label, sampling, sampled.size_before)?;
         }
         committed.push(label);
     }
@@ -2404,6 +2495,172 @@ fn classify_and_apply(
 
     eprintln!("\n\u{2713} Scrub complete.");
     Ok(())
+}
+
+/// Resolve the `--sample` subset for one target from the same schema snapshot
+/// the column classification used.
+fn build_sample_plan_for(
+    args: &ScrubArgs,
+    sources: &SourceClassification,
+    tables: &[Table],
+    facts: &DatabaseFacts,
+) -> Result<sample::SamplePlan, ScrubError> {
+    // A partition's rows belong to its parent, which is what the walk and the
+    // deletes address — planning it separately would count and remove them
+    // twice, exactly as `build_plan` skips it for the rewrites.
+    let universe: Vec<(String, Vec<String>)> = tables
+        .iter()
+        .filter(|t| !facts.partitions.contains(&t.name))
+        .map(|t| (t.name.clone(), t.primary_key.clone()))
+        .collect();
+    let framework: BTreeSet<String> = facts.framework_tables.iter().cloned().collect();
+    let purged: BTreeSet<String> = purge_statements(&facts.framework_tables, &sources.config)
+        .into_iter()
+        .map(|(table, _)| table)
+        .collect();
+    Ok(sample::build_sample_plan(&sample::SampleInputs {
+        roots: &sources.roots,
+        seed: args.seed,
+        rules: &sources.config.sample,
+        tables: &universe,
+        foreign_keys: &facts.foreign_keys,
+        framework_tables: &framework,
+        purged: &purged,
+        partitions: &facts.partitions,
+    })?)
+}
+
+/// Print what the sample will select, before anything is written.
+fn report_sample_plan(label: &str, plan: &sample::SamplePlan) {
+    let roots: Vec<String> = plan
+        .tables
+        .iter()
+        .filter_map(|t| match t.role {
+            sample::SampleRole::Root(amount) => Some(match amount {
+                sample::SampleAmount::Percent(pct) => format!("{} {pct}%", t.table),
+                sample::SampleAmount::Count(n) => format!("{} {n} row(s)", t.table),
+            }),
+            _ => None,
+        })
+        .collect();
+    eprintln!(
+        "  \u{2139} Sampling {label} from {}, seed {} \u{2014} the same seed against the same \
+         source selects the identical rows.",
+        roots.join(", "),
+        plan.seed,
+    );
+}
+
+/// Print the statements a sample would run, for `--dry-run`.
+///
+/// The selection walk repeats until it stops finding related rows, so its
+/// statements are shown once with that noted rather than unrolled: how many
+/// passes a schema needs is a property of the data, not of the plan.
+fn report_sample_sql(url: &str, label: &str, plan: &sample::SamplePlan) -> Result<(), ScrubError> {
+    // Read the live row counts rather than printing a placeholder: `--dry-run`
+    // promises the EXACT statements, and a root's `LIMIT` is the one number a
+    // reader checks.
+    let mut conn = probe_connection(url, label, "size the sample")?;
+    let counts =
+        sample::source_counts(&mut conn, plan).map_err(|e| ScrubError::Sql(e.to_string()))?;
+    for statement in plan.setup_statements() {
+        eprintln!("  {statement};");
+    }
+    for statement in plan.seed_statements(&counts) {
+        eprintln!("  {statement};");
+    }
+    eprintln!("  -- then, repeated until no new related rows are found:");
+    for statement in plan.walk_statements() {
+        eprintln!("  {statement};");
+    }
+    for statement in plan.delete_statements() {
+        eprintln!("  {statement};");
+    }
+    for (constraint, statement) in plan.integrity_statements() {
+        eprintln!("  {statement}; -- verifies {constraint}");
+    }
+    Ok(())
+}
+
+/// Report what the sample kept, per table and in total (AC #6).
+fn report_sample_outcome(label: &str, outcome: &sample::SampleOutcome) {
+    eprintln!("  \u{2500}\u{2500} {label}: sampled rows \u{2500}\u{2500}");
+    for count in &outcome.counts {
+        eprintln!(
+            "    {}: {} \u{2192} {} row(s) ({}, {})",
+            count.table,
+            count.before,
+            count.after,
+            percent_of(count.after, count.before),
+            count.role,
+        );
+    }
+    let before: i64 = outcome.counts.iter().map(|c| c.before).sum();
+    let after: i64 = outcome.counts.iter().map(|c| c.after).sum();
+    eprintln!(
+        "    Total: {before} \u{2192} {after} row(s) ({} of the source), settled in {} pass(es).",
+        percent_of(after, before),
+        outcome.passes,
+    );
+    eprintln!(
+        "  \u{2713} {} foreign key(s) re-verified \u{2014} every reference in the subset resolves.",
+        outcome.verified,
+    );
+}
+
+/// Rewrite every subsetted table so the freed space is really freed, then
+/// report the size the sample actually costs.
+fn report_reclaimed_size(
+    url: &str,
+    label: &str,
+    plan: &sample::SamplePlan,
+    before: i64,
+) -> Result<(), ScrubError> {
+    let mut conn = probe_connection(url, label, "compact the sampled tables")?;
+    // Exactly the tables `data_size` measures, so the reported before/after
+    // describes the same set of files this rewrites.
+    for table in plan.subsetted_tables() {
+        // Not in a transaction, and deliberately: VACUUM FULL takes an
+        // exclusive lock and rewrites the table, neither of which a transaction
+        // block permits.
+        sql_query(format!("VACUUM (FULL, ANALYZE) {}", qualified_ident(table)))
+            .execute(&mut conn)
+            .map_err(|e| ScrubError::Sql(e.to_string()))?;
+    }
+    let after = sample::data_size(&mut conn, plan).map_err(|e| ScrubError::Sql(e.to_string()))?;
+    eprintln!(
+        "    Table size: {} \u{2192} {} ({} of the source).",
+        human_bytes(before),
+        human_bytes(after),
+        percent_of(after, before),
+    );
+    Ok(())
+}
+
+/// `part` as a percentage of `whole`, one decimal place.
+#[allow(clippy::cast_precision_loss)]
+fn percent_of(part: i64, whole: i64) -> String {
+    if whole <= 0 {
+        return "n/a".to_owned();
+    }
+    format!("{:.1}%", part as f64 * 100.0 / whole as f64)
+}
+
+/// Bytes at human scale, so "128.0 MB → 3.0 MB" reads at a glance.
+#[allow(clippy::cast_precision_loss)]
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let mut value = bytes.max(0) as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Warn when a table the scrub rewrites carries user-defined triggers.
@@ -2517,6 +2774,10 @@ pub struct DatabaseFacts {
     /// and be reported clean. `pg_class` shows them all, and the difference is
     /// a refusal.
     pub public_base_tables: BTreeSet<String>,
+    /// Every foreign key in `public`, whole constraints rather than the loose
+    /// columns above: `--sample` walks this graph to decide which rows a subset
+    /// must carry for every reference to resolve.
+    pub foreign_keys: Vec<sample::ForeignKeyRef>,
 }
 
 /// A single `name` column.
@@ -2534,6 +2795,27 @@ struct PairRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     col: String,
 }
+
+/// One whole foreign key constraint, both key lists rendered as unit-separated
+/// column names (a separator no identifier can contain).
+#[derive(diesel::QueryableByName)]
+struct ConstraintRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    child: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    child_cols: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    parent: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    parent_cols: String,
+}
+
+/// The column-name separator the constraint probe aggregates on. Postgres
+/// identifiers can contain a comma, so a printable separator would be
+/// ambiguous; `US` (unit separator) cannot appear in one.
+const KEY_SEPARATOR: char = '\u{1f}';
 
 fn pair_set(rows: Vec<PairRow>) -> BTreeSet<(String, String)> {
     rows.into_iter().map(|r| (r.tbl, r.col)).collect()
@@ -2608,6 +2890,49 @@ fn probe_database_facts(
         .load(&mut conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
+
+    // ── Foreign keys as whole constraints ───────────────────────────────────
+    // The set above answers "may this column be rewritten"; `--sample` asks a
+    // different question — "which rows must travel together" — and that needs
+    // the constraint, in key order, both sides paired.
+    let sep = KEY_SEPARATOR;
+    let constraint_rows: Vec<ConstraintRow> = sql_query(format!(
+        "SELECT c.conname AS name, rel.relname AS child, frel.relname AS parent, \
+         (SELECT string_agg(att.attname, '{sep}' ORDER BY k.ord) \
+          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+          JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = k.attnum) \
+         AS child_cols, \
+         (SELECT string_agg(att.attname, '{sep}' ORDER BY k.ord) \
+          FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) \
+          JOIN pg_attribute att ON att.attrelid = c.confrelid AND att.attnum = k.attnum) \
+         AS parent_cols \
+         FROM pg_constraint c \
+         JOIN pg_class rel ON rel.oid = c.conrelid \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         JOIN pg_class frel ON frel.oid = c.confrelid \
+         JOIN pg_namespace fns ON fns.oid = frel.relnamespace AND fns.nspname = 'public' \
+         WHERE c.contype = 'f'"
+    ))
+    .load(&mut conn)
+    .map_err(|e| ScrubError::Sql(e.to_string()))?;
+    let foreign_keys: Vec<sample::ForeignKeyRef> = constraint_rows
+        .into_iter()
+        .map(|row| sample::ForeignKeyRef {
+            name: row.name,
+            child_table: row.child,
+            child_columns: row
+                .child_cols
+                .split(KEY_SEPARATOR)
+                .map(str::to_owned)
+                .collect(),
+            parent_table: row.parent,
+            parent_columns: row
+                .parent_cols
+                .split(KEY_SEPARATOR)
+                .map(str::to_owned)
+                .collect(),
+        })
+        .collect();
 
     // ── CHECK-constrained columns ───────────────────────────────────────────
     let checked_columns = pair_set(
@@ -2873,6 +3198,7 @@ fn probe_database_facts(
         framework_tables,
         public_columns,
         public_base_tables,
+        foreign_keys,
     })
 }
 
@@ -3043,18 +3369,32 @@ fn rewrite_encrypted_column(
 
 /// Run every statement for one database inside a single transaction, so a
 /// failure can never leave a half-scrubbed database behind.
+/// What one database's scrub wrote: `(table, rows)` per rewrite, plus the
+/// sample's own outcome when `--sample` was given.
+type Applied = (Vec<(String, usize)>, Option<sample::SampleOutcome>);
+
 fn execute(
     url: &str,
     plan: &ScrubPlan,
     purges: &[(String, String)],
     materialized_views: &[String],
+    sampling: Option<&sample::SamplePlan>,
     label: &str,
-) -> Result<Vec<(String, usize)>, ScrubError> {
-    if plan.tables.is_empty() && purges.is_empty() && materialized_views.is_empty() {
-        return Ok(Vec::new());
+) -> Result<Applied, ScrubError> {
+    if plan.tables.is_empty()
+        && purges.is_empty()
+        && materialized_views.is_empty()
+        && sampling.is_none()
+    {
+        return Ok((Vec::new(), None));
     }
     let mut conn = probe_connection(url, label, "apply the scrub")?;
     let mut counts = Vec::with_capacity(plan.tables.len());
+    let mut outcome = None;
+    // A sample refusal has to abort the transaction, and the only error a
+    // transaction closure can carry is diesel's — so the reason travels beside
+    // it and is re-raised once the rollback has happened.
+    let mut refusal: Option<sample::SampleError> = None;
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
         // Pin the resolution of every unqualified name and the meaning of every
         // string literal for the whole transaction, so a role- or
@@ -3077,13 +3417,36 @@ fn execute(
             .tables
             .iter()
             .map(|t| t.table.as_str())
-            .chain(purges.iter().map(|(table, _)| table.as_str()));
+            .chain(purges.iter().map(|(table, _)| table.as_str()))
+            // Every table the sample reads or empties, too: a row inserted into
+            // one after the walk selected from it would survive a run that
+            // reports the table subsetted.
+            .chain(
+                sampling
+                    .into_iter()
+                    .flat_map(sample::SamplePlan::locked_tables),
+            );
+        let mut locked: Vec<&str> = locked.collect();
+        locked.sort_unstable();
+        locked.dedup();
         for table in locked {
             sql_query(format!(
                 "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
                 qualified_ident(table)
             ))
             .execute(conn)?;
+        }
+        // Purges run FIRST so a framework-owned table that references a
+        // sampled one is already empty when the sample removes its parents.
+        for (table, statement) in purges {
+            let rows = sql_query(statement).execute(conn)?;
+            counts.push((format!("{table} (emptied)"), rows));
+        }
+        // Then the subset, so the rewrites below touch only the rows that
+        // survive it — and so no combination of flags can commit a row that was
+        // sampled but not scrubbed: both happen in this one transaction.
+        if let Some(sampling) = sampling {
+            outcome = Some(sample::apply(conn, sampling, &mut refusal)?);
         }
         for table in &plan.tables {
             if let Some(sql) = &table.sql {
@@ -3094,10 +3457,6 @@ fn execute(
                 let rows = rewrite_encrypted_column(conn, &table.table, &table.row_key, rewrite)?;
                 counts.push((format!("{}.{}", table.table, rewrite.column), rows));
             }
-        }
-        for (table, statement) in purges {
-            let rows = sql_query(statement).execute(conn)?;
-            counts.push((format!("{table} (emptied)"), rows));
         }
         // Inside the transaction, so a refresh the role is not allowed to run
         // rolls the rewrites back rather than committing base tables that a
@@ -3112,8 +3471,12 @@ fn execute(
         }
         Ok(())
     })
-    .map_err(|e| ScrubError::Sql(e.to_string()))?;
-    Ok(counts)
+    .map_err(|e| {
+        refusal
+            .take()
+            .map_or_else(|| ScrubError::Sql(e.to_string()), ScrubError::from)
+    })?;
+    Ok((counts, outcome))
 }
 
 #[cfg(test)]

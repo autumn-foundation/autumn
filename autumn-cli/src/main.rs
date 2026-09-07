@@ -2459,6 +2459,19 @@ enum DbCommands {
         /// staging drill always passes.
         #[arg(long)]
         allow_source_overwrite: bool,
+        /// Emit a referentially-intact SUBSET instead of the whole copy, rooted
+        /// on this many rows of TABLE: `--sample users=1%` or
+        /// `--sample users=500`. Repeatable. Every row the selected roots
+        /// relate to is carried along, so every foreign key still resolves; the
+        /// subset is scrubbed in the same pass. Per-table `always_include` /
+        /// `never_include` rules live in `[sample]` in `scrub.toml`.
+        #[arg(long, value_name = "TABLE=COUNT|PERCENT%")]
+        sample: Vec<String>,
+        /// The seed `--sample` derives its row selection from. The same seed
+        /// against the same source data reproduces the identical subset, so a
+        /// teammate can rebuild the exact rows that exhibit a bug.
+        #[arg(long, value_name = "N", default_value_t = 0, requires = "sample")]
+        seed: u64,
     },
     /// Report, dry-run, or enforce the retention policy for framework-owned data.
     ///
@@ -4465,6 +4478,8 @@ fn run_command(command: Commands) {
                 dry_run,
                 force,
                 allow_source_overwrite,
+                sample,
+                seed,
             } => db::scrub::run(&db::scrub::ScrubArgs {
                 profile,
                 artifact,
@@ -4474,6 +4489,8 @@ fn run_command(command: Commands) {
                 dry_run,
                 force,
                 allow_source_overwrite,
+                sample,
+                seed,
             }),
             DbCommands::Retention {
                 package,
@@ -7891,6 +7908,8 @@ mod tests {
             dry_run,
             force,
             allow_source_overwrite,
+            sample,
+            seed,
         }) = cli.command
         else {
             panic!("expected db scrub");
@@ -7903,6 +7922,8 @@ mod tests {
         assert!(!check);
         assert!(!dry_run);
         assert!(!force);
+        assert!(sample.is_empty(), "sampling is opt-in");
+        assert_eq!(seed, 0);
     }
 
     #[test]
@@ -7931,6 +7952,8 @@ mod tests {
             dry_run,
             force,
             allow_source_overwrite,
+            sample: _,
+            seed: _,
         }) = cli.command
         else {
             panic!("expected db scrub");
@@ -7949,6 +7972,52 @@ mod tests {
         assert!(!check);
         assert!(!dry_run);
         assert!(force);
+    }
+
+    // ── autumn db scrub --sample tests (issue #1636) ───────────────────────
+
+    #[test]
+    fn parse_db_scrub_with_repeated_sample_roots_and_a_seed() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--sample",
+            "users=1%",
+            "--sample",
+            "orders=500",
+            "--seed",
+            "42",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub { sample, seed, .. }) = cli.command else {
+            panic!("expected db scrub");
+        };
+        assert_eq!(sample, vec!["users=1%".to_owned(), "orders=500".to_owned()]);
+        assert_eq!(seed, 42);
+    }
+
+    #[test]
+    fn parse_db_scrub_seed_requires_sample() {
+        // A seed with nothing to seed is a mistyped command, not a no-op: it
+        // reads as "this run is reproducible" when nothing was subsetted.
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--seed", "42"]).is_err(),
+            "--seed only means something alongside --sample"
+        );
+    }
+
+    #[test]
+    fn parse_db_scrub_sample_works_with_check_and_dry_run() {
+        // Both write nothing, and both must still be able to prove the sample
+        // plan is complete — that is the CI gate for a graph gap.
+        for mode in ["--check", "--dry-run"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "db", "scrub", "--sample", "users=1%", mode])
+                    .is_ok(),
+                "--sample must be inspectable with {mode}"
+            );
+        }
     }
 
     #[test]
