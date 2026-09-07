@@ -4124,6 +4124,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function that quietly delegated to its borrowed twin would fail even though
   its output is correct.
 
+- **`MemorySearchBackend::keyword_search` no longer compares every field
+  token against every query token:** `score` (in `autumn-search/src/memory.rs`)
+  looped over each field's tokens and, for every one, scanned the *entire*
+  query-token list looking for a match — `field_tokens.len() × tokens.len()`
+  `String` equality checks per field, most of which fall through to a real
+  `memcmp` because the corpus draws from a shared vocabulary with plenty of
+  same-length words. Profiling the committed `autumn-search/benches/keyword_search.rs`
+  harness (5,000-document, two-field corpus, ~206 words/document) with
+  `valgrind --tool=callgrind` found this comparison work — the scan loop plus
+  `memcmp` — at over 85% of the call's instructions. A query has far fewer
+  tokens than a field has words (2 vs. ~206 in the bench), so `StoredDocument`
+  now stores each field's tokens as occurrence counts
+  (`HashMap<String, u32>`, built once at write time, same as the prior
+  tokenize-at-write change) instead of a flat `Vec<String>`, and `score` looks
+  up each query token once instead of scanning every field token. Purely an
+  internal representation change to the in-memory reference/dev backend — no
+  public API moved and ranking behavior is unchanged (same 128 `autumn-search`
+  lib tests and 109 integration tests pass with unmodified assertions).
+  Measured on the same machine, one session: instructions (callgrind, 2,000
+  queries over the corpus) 77,559,837,270 → 23,238,817,778 (**-70.0%**);
+  marginal allocation blocks/query and bytes/query (dhat) are unchanged
+  (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
+  allocation-bound, so only the instruction floor is claimed.
+
 ## [0.7.0] - 2026-08-23
 
 For a narrative tour of this release, see the
