@@ -2775,7 +2775,10 @@ pub fn pending_shard_framework_migrations(
     {
         let mut pending: Vec<String> = Vec::new();
         for set in shard_framework_migration_sets() {
-            pending.extend(pending_migrations(database_url, EmbeddedMigrationsRef(set))?);
+            pending.extend(pending_migrations(
+                database_url,
+                EmbeddedMigrationsRef(set),
+            )?);
         }
         Ok(pending)
     }

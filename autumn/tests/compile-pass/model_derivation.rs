@@ -7,9 +7,9 @@
 //!   first, unfiltered, and the derivations follow in declaration order.
 //! * `Membership` declares an unfiltered `count` with no `#[belongs_to]` at
 //!   all, so the foreign key resolves by the `{snake(Parent)}_id` convention.
-//! * `Reaction` covers the `fk`, `name` and `tenant` overrides: two
-//!   `#[belongs_to]` legs to one parent leave the default foreign key
-//!   ambiguous, so each derivation names its own.
+//! * `Reaction` covers the `fk`, `name` and `tenant` overrides, and an `i64`
+//!   sum, with no `#[belongs_to]` leg at all: `fk` names a column the
+//!   `{snake(Parent)}_id` convention would not have picked.
 //! * `Bookmark` covers `parent_table`, for a parent whose table name does not
 //!   follow the convention.
 //! * `Plain` declares neither, proving a model without them still resolves to
@@ -36,6 +36,7 @@ diesel::table! {
 diesel::table! {
     teams (id) {
         id -> BigInt,
+        name -> Text,
         member_count -> BigInt,
     }
 }
@@ -62,8 +63,7 @@ diesel::table! {
 diesel::table! {
     reactions (id) {
         id -> BigInt,
-        post_id -> BigInt,
-        origin_id -> BigInt,
+        article_id -> BigInt,
         tenant_id -> BigInt,
         weight -> BigInt,
     }
@@ -72,6 +72,7 @@ diesel::table! {
 diesel::table! {
     archive_posts (id) {
         id -> BigInt,
+        title -> Text,
         bookmark_count -> BigInt,
     }
 }
@@ -119,6 +120,7 @@ pub struct Post {
 pub struct Team {
     #[id]
     pub id: i64,
+    pub name: String,
     #[default]
     pub member_count: i64,
 }
@@ -151,21 +153,18 @@ pub struct Membership {
 }
 
 #[model]
-#[belongs_to(Post, fk = post_id, name = post)]
-#[belongs_to(Post, fk = origin_id, name = origin)]
-#[derivation(Post, column = "reaction_count", fk = post_id, tenant = "tenant_id")]
+#[derivation(Post, column = "reaction_count", fk = article_id, tenant = "tenant_id")]
 #[derivation(
     Post,
     column = "origin_weight",
-    fk = origin_id,
+    fk = article_id,
     name = "posts.origin_weight_total",
     transform = sum(weight)
 )]
 pub struct Reaction {
     #[id]
     pub id: i64,
-    pub post_id: i64,
-    pub origin_id: i64,
+    pub article_id: i64,
     pub tenant_id: i64,
     pub weight: i64,
 }
@@ -176,6 +175,7 @@ pub struct Reaction {
 pub struct Archive {
     #[id]
     pub id: i64,
+    pub title: String,
     #[default]
     pub bookmark_count: i64,
 }
@@ -307,18 +307,17 @@ fn main() {
     // the default foreign key ambiguous, so each derivation names its own.
     let reaction = Reaction {
         id: 1,
-        post_id: 9,
-        origin_id: 11,
+        article_id: 9,
         tenant_id: 3,
         weight: 4,
     };
     let specs = Reaction::counter_caches();
     assert_eq!(specs.len(), 2);
 
-    // `fk` and `tenant`: the tenant column reaches the spec and the
-    // definition, and an i64 sum is read without widening.
+    // `fk` and `tenant`: the override names a column the convention would not
+    // have picked, and the tenant column reaches the spec and the definition.
     let reactions = &specs[0];
-    assert_eq!(reactions.fk_column, "post_id");
+    assert_eq!(reactions.fk_column, "article_id");
     assert_eq!(reactions.tenant_column, Some("tenant_id"));
     assert_eq!(reactions.contrib_sql, "1");
     assert_eq!((reactions.contrib_of)(&reaction), 1);
@@ -326,8 +325,9 @@ fn main() {
     assert_eq!(def.name, "posts.reaction_count");
     assert_eq!(def.tenant_column, Some("tenant_id"));
 
+    // An `i64` sum contributes the field itself, with no widening.
     let origins = &specs[1];
-    assert_eq!(origins.fk_column, "origin_id");
+    assert_eq!(origins.fk_column, "article_id");
     assert_eq!(origins.contrib_sql, "{c}.\"weight\"");
     assert_eq!((origins.contrib_of)(&reaction), 4);
     assert_eq!(

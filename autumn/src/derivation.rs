@@ -1094,9 +1094,7 @@ mod tests {
     fn drift_is_one_aggregate_over_the_parent_table() {
         let sql = crate::counter_cache::drift_sql(&sum_def().sql_view(), DRIFT_SCAN_LIMIT);
         assert!(
-            sql.starts_with(
-                "SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"dv_posts\""
-            ),
+            sql.starts_with("SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"dv_posts\""),
             "{sql}"
         );
         assert!(

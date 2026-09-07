@@ -2193,9 +2193,7 @@ mod tests {
     fn drift_is_one_aggregate_over_the_parent_table() {
         let sql = drift_sql(&view(&sum_spec()), 10_000);
         assert!(
-            sql.starts_with(
-                "SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"posts\""
-            ),
+            sql.starts_with("SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"posts\""),
             "{sql}"
         );
         assert!(sql.contains(IS_DISTINCT_FROM), "{sql}");

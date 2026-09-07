@@ -596,9 +596,14 @@ fn derivation_defs_are_generated_from_the_declarations() {
     assert!(def("dv_pages.live_revision_count").child_soft_delete);
 
     let hash = registered.definition_hash();
-    assert_eq!(hash.len(), 64, "sha256 renders as 64 hex characters: {hash}");
+    assert_eq!(
+        hash.len(),
+        64,
+        "sha256 renders as 64 hex characters: {hash}"
+    );
     assert!(
-        hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        hash.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "the definition hash is a lowercase hex content address: {hash}"
     );
     assert_ne!(
@@ -1304,7 +1309,9 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
 
     // The same three facts through the reported surface, which is what an
     // operator watching a rolling deploy actually reads.
-    let mid = derivation_status(&mut conn).await.expect("status mid-sweep");
+    let mid = derivation_status(&mut conn)
+        .await
+        .expect("status mid-sweep");
     let reported = mid
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)

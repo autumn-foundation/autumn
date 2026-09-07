@@ -10387,9 +10387,7 @@ async fn setup_database(
     // a derivation whose backfill has not run is stale rather than broken and
     // `/actuator/derivations` reports exactly that.
     if runtime_boot && crate::derivation::has_derivation_descriptors() {
-        if let Err(e) =
-            start_derivation_backfill(topology.as_ref(), shards.as_ref()).await
-        {
+        if let Err(e) = start_derivation_backfill(topology.as_ref(), shards.as_ref()).await {
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             return Err(e);
@@ -10558,10 +10556,7 @@ async fn start_derivation_backfill(
 /// cooperate: each batch locks the derivation's state row, so they take turns on
 /// one sweep instead of racing.
 #[cfg(feature = "db")]
-fn spawn_derivation_backfill(
-    label: String,
-    pool: crate::db::Pool<crate::db::RuntimeConnection>,
-) {
+fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::RuntimeConnection>) {
     tokio::spawn(async move {
         let options = crate::derivation::BackfillOptions {
             max_batches: Some(BOOT_BACKFILL_BATCHES),
