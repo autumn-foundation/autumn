@@ -2212,6 +2212,59 @@ def _visibility_hidden(style):
     return _effective(style, _VISIBILITY_DECL) in ('hidden', 'collapse')
 
 
+def mask_invisible_subtrees(view, src):
+    """Blank every `visibility:hidden` subtree, MINUS what re-shows inside it.
+
+    Kept apart from `mask_hidden_subtrees` for the one reason that makes
+    `visibility` different from `display` and the `hidden` attribute: it
+    INHERITS, and a descendant can set it back, so a subtree is not simply
+    gone. `<span style="visibility:hidden"><span style="visibility:visible">
+    Mail</span></span>` paints `Mail` and hit-tests inside it.
+
+    Blanked space for space, like every other masker here, so the offsets the
+    callers share stay valid. `src` carries the same span with attribute
+    values intact, since the view has already had them blanked.
+    """
+    at = 0
+    while True:
+        m = style_hidden_search(src, at, _VISIBILITY_DECL, _VISIBILITY_HIDDEN)
+        if not m:
+            return view
+        # The same guard `hidden_open` applies: a tag the view has already
+        # blanked — inside a comment or a script — hides nothing.
+        if not (m.start() < len(view) and view[m.start()] == '<'):
+            at = m.start() + 1
+            continue
+        end = element_end(view, m, m.group(1))
+        keep = _shown_spans(view, src, m.end(), end)
+        blanked = list(view[m.start():end])
+        for a, b in keep:
+            for i in range(a - m.start(), b - m.start()):
+                blanked[i] = view[m.start() + i]
+        for i in range(len(blanked)):
+            off = m.start() + i
+            if not any(a <= off < b for a, b in keep):
+                blanked[i] = ' '
+        view = view[:m.start()] + ''.join(blanked) + view[end:]
+        at = end
+
+
+def _shown_spans(view, src, start, end):
+    """Subtrees inside `[start, end)` that set `visibility` back to visible."""
+    spans, at = [], start
+    while at < end:
+        m = style_hidden_search(src, at, _VISIBILITY_DECL, _VISIBILITY_SHOWN)
+        if not m or m.start() >= end:
+            return spans
+        if not (m.start() < len(view) and view[m.start()] == '<'):
+            at = m.start() + 1
+            continue
+        stop = min(element_end(view, m, m.group(1)), end)
+        spans.append((m.start(), stop))
+        at = stop
+    return spans
+
+
 def _invisible_anchor(tag_src, content_src):
     """Whether an anchor paints nothing because of `visibility`.
 
@@ -2277,14 +2330,27 @@ def _style_value(m):
     return decode_attribute(raw) if raw else raw
 
 
-def style_hidden_search(txt, at):
-    """Next opening tag whose inline style computes to `display:none`."""
+_VISIBILITY_HIDDEN = ('hidden', 'collapse')
+
+
+def style_hidden_search(txt, at, decl=None, wanted=None):
+    """Next opening tag whose inline style computes to a given value.
+
+    Defaults to `display:none`, which is every caller but the visibility
+    passes; they ask for `_VISIBILITY_DECL` with the value set they care
+    about, since that property is asked in both directions — which subtrees
+    are hidden, and which ones inside them are shown again.
+    """
     pos = at
     while True:
         m = STYLE_ATTR_OPEN.search(txt, pos)
         if not m:
             return None
-        if _display_none(_style_value(m) or ''):
+        value = _style_value(m) or ''
+        if decl is None:
+            if _display_none(value):
+                return m
+        elif _effective(value, decl) in wanted:
             return m
         pos = m.start() + 1
 
@@ -2670,6 +2736,16 @@ def has_content(image_span, masked_span, raw_span=None):
     # views themselves are what get blanked.
     image_span = mask_hidden_subtrees(image_span, raw_span)
     masked_span = mask_hidden_subtrees(masked_span, raw_span)
+    # `visibility` is masked separately and AFTER, because it is the one form
+    # of hiding a descendant can undo, so the subtree is not simply gone.
+    # `<a href=…><span style="visibility:hidden">Mail</span></a>` paints
+    # nothing a reader can see — the anchor keeps a 30x17 box and is even
+    # hit-testable, but there is no ink in it — and counting that text as a
+    # label recorded a route nobody can find. Visible-vs-invisible is the rule
+    # this gate runs on, and it decides this one.
+    if raw_span is not None and len(raw_span) == len(image_span):
+        image_span = mask_invisible_subtrees(image_span, raw_span)
+        masked_span = mask_invisible_subtrees(masked_span, raw_span)
     # `&#32;` is a space on screen, so `[&#32;](mail.md)` is an anchor with
     # nothing in it — the same nothing as `[ ](mail.md)`, which was already
     # rejected. Testing the undecoded source saw four non-blank characters and
@@ -6323,6 +6399,31 @@ self_test() {
     > "$c9lf/docs/guide/jobs.md"
   git -C "$c9lf" add -A && git -C "$c9lf" commit -qm visibility-initial-descendant
   check "an initial visibility restores the route" pass "$c9lf"
+
+  # The mirror of the hidden ANCHOR: a visible anchor whose only content is
+  # hidden. The anchor keeps a 30x17 box and is even hit-testable, but there
+  # is no ink in it, and visible-vs-invisible is the rule this gate runs on.
+  local c9lg="$tmp/c9lg"; make_corpus "$c9lg"
+  printf '# Jobs\n\n<a href="mail.md"><span style="visibility:hidden">Mail</span></a>\n' \
+    > "$c9lg/docs/guide/jobs.md"
+  git -C "$c9lg" add -A && git -C "$c9lg" commit -qm hidden-descendant-only-content
+  check "an anchor whose only content is hidden is not a route" fail "$c9lg"
+
+  # ...but the mask stops at that element. Text beside it is still on screen.
+  local c9lh="$tmp/c9lh"; make_corpus "$c9lh"
+  printf '# Jobs\n\n<a href="mail.md"><span style="visibility:hidden">H</span>Vis</a>\n' \
+    > "$c9lh/docs/guide/jobs.md"
+  git -C "$c9lh" add -A && git -C "$c9lh" commit -qm hidden-descendant-plus-text
+  check "visible text beside a hidden span is a label" pass "$c9lh"
+
+  # ...and a nested `visibility:visible` re-shows its subtree, which is the one
+  # thing that makes this different from `display:none` and why it cannot join
+  # the blanket subtree masking.
+  local c9li="$tmp/c9li"; make_corpus "$c9li"
+  printf '# Jobs\n\n<a href="mail.md"><span style="visibility:hidden"><span style="visibility:visible">Mail</span></span></a>\n' \
+    > "$c9li/docs/guide/jobs.md"
+  git -C "$c9li" add -A && git -C "$c9li" commit -qm hidden-subtree-with-visible-inner
+  check "a visible subtree inside a hidden one still shows" pass "$c9li"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
