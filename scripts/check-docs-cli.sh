@@ -3257,8 +3257,21 @@ def _classify_option(tok, node):
       'unknown'   not declared; `eaten` is 1 when the value is attached
                   (so the name alone was wrong) and 0 when its arity is a guess
     """
-    name = tok.split('=', 1)[0]
-    attached = '=' in tok
+    # `=` is the LONG-option separator ONLY. A short token carries its value in
+    # its SUFFIX, `=` and all, so `autumn sbom -oartifact=prod.json` passes
+    # `artifact=prod.json` to `-o` (measured: the parser accepts it, and
+    # `autumn data export -ofoo=bar.json` fails only for a missing `--url`).
+    # Splitting unconditionally made the name `-oartifact` — and because
+    # `attached` was then true, the compact-short branch below was skipped too,
+    # so such a token could only ever come back `unknown`.
+    #
+    # The two spellings genuinely disagree here, which is why this is a split
+    # and not a shared rule: `--help=foo` is exit 2, while `-h=foo` prints help
+    # and exits 0, because clap short-circuits on the action at the letter.
+    # Handing the whole token to `_short_cluster` reproduces both.
+    long = tok.startswith('--')
+    name = tok.split('=', 1)[0] if long else tok
+    attached = ('=' in tok) if long else False
     if name in node['options']:
         # ARITY FIRST, before anything else a declared name might mean. A
         # valueless flag given a value is rejected whatever else it is: clap's
@@ -3274,7 +3287,7 @@ def _classify_option(tok, node):
         if attached:                            # `--name=value`, self-contained
             return 'known', 1
         return 'known', 2 if node['options'][name] else 1
-    if not attached:
+    if not long:
         cluster = _short_cluster(tok, node['options'])
         if cluster is not None:
             eaten, terminal = cluster
@@ -4267,6 +4280,27 @@ def self_test():
            'an unknown short group still stops the walk rather than guessing')
     expect(resolve(tk('migrate -vZ nope'), surface) is None,
            'one unknown letter makes the whole group unknown')
+
+    # --- an `=` INSIDE a short group is part of the value, not a separator.
+    # Eighteenth round: the name was split off before the group was ever read,
+    # so `-pa=b` became the name `-pa` and, being "attached", never reached
+    # `_short_cluster` at all. Measured against the built CLI:
+    #   autumn sbom -oartifact=prod.json      accepted (exit 1, no manifest)
+    #   autumn data export -ofoo=bar.json     accepted (exit 2 wants --url)
+    #   autumn replay -h=foo                  exit 0, prints help
+    # while the long spelling really does separate on `=`.
+    expect(_classify_option('-pa=b', surface['migrate']) == ('cluster', 1),
+           'an `=` inside a short group belongs to the value')
+    expect(_classify_option('-p=b', surface['migrate']) == ('cluster', 1),
+           '…including immediately after the letter')
+    expect(_classify_option('--shard=a=b', surface['migrate']) == ('known', 1),
+           'the long form still separates on the FIRST `=`, value and all')
+    expect(resolve(tk('migrate -pa=b nope'), surface) == 'autumn migrate nope',
+           'so the drift behind such a token is still reached')
+    expect(resolve(tk('migrate -Za=b nope'), surface) is None,
+           'an unknown short group carrying `=` is still unknown, not a name')
+    expect(_classify_option('-h=foo', surface['migrate']) == ('terminal', 0),
+           'a short group short-circuits on help even with an `=` after it')
 
     # --- quoting. These are what shell-aware tokenization buys: splitting on
     # whitespace consumed `"eu` as the option value and then stopped at `west"`,
