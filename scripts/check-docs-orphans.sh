@@ -314,13 +314,40 @@ LABEL_MAX_OPT = '{0,999}'
 
 DEST_RE = re.compile(DEST)
 _BLANK_NEXT = re.compile(r'[ \t]*\n')
+# A blank line ends the paragraph, and with it whatever the paragraph was in
+# the middle of — a link label, an inline HTML comment, a code span. This is
+# `.*?` with that one exclusion, shared by all three. It lives HERE, above
+# `_label_end`, because a pattern placed above the fragment it is built from
+# has raised a NameError and failed every test at once three times in this
+# file; `HTML_COMMENT_INLINE` reads it from far below.
+_CBODY = r'(?:[^\n]|\n(?![ \t]*\n))*?'
+# A code span is a run of backticks closed by an equal-length run; both
+# delimiters must be complete runs. The body was `.*?` under `re.S`, which
+# matched across a blank line — but `x \`a` / blank / `b\` y` is two
+# paragraphs of literal backticks and no code span at all, measured against
+# cmark-gfm and markdown-it-py alike. Blanking that "span" erased real text.
+CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(' + _CBODY + r')(?<!`)\1(?!`)')
 
 
 def _label_end(txt, i):
     """Index of the `]` matching the `[` at `i`, or None.
 
-    `FLAT` semantics, which is what the patterns used: a backslash escapes the
-    next character, and a BLANK LINE ends the paragraph and with it the label.
+    A backslash escapes the next character, and a BLANK LINE ends the
+    paragraph and with it the label.
+
+    A CODE SPAN is skipped whole, because it binds tighter than the link
+    brackets: `[foo `]` Mail](mail.md)` is a link whose text is
+    `foo <code>]</code> Mail`, in both cmark-gfm and markdown-it-py. Counting
+    that `]` ended the label early, and the damage ran in both directions — a
+    sibling-relative `[a `](x.md)` b](mail.md)` handed the scanner
+    `x.md` as the destination, so the page the reader actually reaches was
+    reported an orphan while the one they cannot reach was marked live. The
+    escape check comes first: `\\`` is a literal backtick that opens
+    nothing, so `[foo \\`]\\` Mail](mail.md)` really is not a link.
+
+    This was recorded here as a deliberate non-goal for most of this PR, on
+    the grounds that the bracket-counting rewrite was a separate question.
+    It was a false positive the whole time.
     """
     depth, j, n = 1, i + 1, len(txt)
     while j < n:
@@ -328,6 +355,11 @@ def _label_end(txt, i):
         if c == '\\':
             j += 2
             continue
+        if c == '`':
+            span = CODE_SPAN.match(txt, j)
+            if span:
+                j = span.end()
+                continue
         if c == '\n' and _BLANK_NEXT.match(txt, j + 1):
             return None
         if c == '[':
@@ -358,11 +390,9 @@ def inline_links(txt):
     nests a THOUSAND deep, measured, so it has no limit of its own to match.
     Counting is the only fix that ends the sequence.
 
-    Label semantics are `FLAT`'s, which is what the patterns used and what the
-    self-tests pin: a backslash escapes the next character, and a BLANK LINE
-    ends the paragraph and with it the label. Code spans are deliberately not
-    special here either — a `]` inside backticks closed the label before this
-    too, and changing that is a separate question from counting brackets.
+    Label semantics are `_label_end`'s: a backslash escapes the next
+    character, a BLANK LINE ends the paragraph and with it the label, and a
+    code span is skipped whole.
 
     Yields `(label_start, label_end, angle_dest, bare_dest)`, matching what
     the patterns' groups 1, 2 and 3 gave the caller.
@@ -654,7 +684,7 @@ HTML_COMMENT_CLOSED = re.compile(r'<!--.*?-->', re.S)
 # no comment at all (cmark-gfm escapes both). The line-initial form is
 # unaffected: a type-2 block runs THROUGH blank lines to its first `-->`,
 # which is why only this pattern carries the bound. Same idiom as `FLAT`.
-_CBODY = r'(?:[^\n]|\n(?![ \t]*\n))*?'
+# `_CBODY` itself is defined above `_label_end`, which needs it first.
 HTML_COMMENT_INLINE = re.compile(
     r'<!--->|<!-->|<!--(?!>|->)' + _CBODY + r'-->')
 UNCLOSED = '<!--'
@@ -663,9 +693,6 @@ BLANK_LINE = re.compile(r'\n[ \t]*\n')
 # A fence opener/closer: ``` or ~~~ , up to three spaces of indent, plus the
 # rest of the line — which decides whether the line is a fence at all.
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})(.*)$', re.M)
-# A code span is a run of backticks closed by an equal-length run; both
-# delimiters must be complete runs. Same shape as the sibling gate's.
-CODE_SPAN = re.compile(r'(?<!`)(`+)(?!`)(.*?)(?<!`)\1(?!`)', re.S)
 
 
 # THE TAG VOCABULARY. Everything that walks an HTML tag reads from here, and
@@ -5310,6 +5337,58 @@ self_test() {
     > "$c9iz/docs/guide/jobs.md"
   git -C "$c9iz" add -A && git -C "$c9iz" commit -qm href-path-named-hidden
   check "a path named hidden is still a route" pass "$c9iz"
+
+  # A code span binds tighter than the link brackets, so a `]` inside one is
+  # code-span content and the label runs past it. Counting that bracket ended
+  # the label early; with a SIBLING-relative destination the bare-path fallback
+  # has nothing to recover, so the page the reader can click was an orphan.
+  local c9jg="$tmp/c9jg"; make_corpus "$c9jg"
+  printf '# Jobs\n\n[foo `]` Mail](mail.md)\n' > "$c9jg/docs/guide/jobs.md"
+  git -C "$c9jg" add -A && git -C "$c9jg" commit -qm bracket-in-code-span
+  check "a bracket inside a code span does not end a label" pass "$c9jg"
+
+  # ...and the harm ran the OTHER way too, which is the direction that let an
+  # orphan through. Ending the label early hands the destination scanner the
+  # parenthesis INSIDE the span, so `mail.md` was recorded as an edge even
+  # though the reader sees it as code. The real destination here is `other.md`,
+  # which no guide page is, so the corrected reading yields no edge at all and
+  # mail.md is the orphan it always was.
+  local c9jh="$tmp/c9jh"; make_corpus "$c9jh"
+  printf '# Jobs\n\n[a `](mail.md)` b](other.md)\n' > "$c9jh/docs/guide/jobs.md"
+  git -C "$c9jh" add -A && git -C "$c9jh" commit -qm span-swallows-destination
+  check "a destination inside a code span is not an edge" fail "$c9jh"
+
+  # The backtick must open a REAL span. `\`` is an escaped literal backtick and
+  # opens nothing, so the `]` after it does end the label and this renders as
+  # plain text — measured in cmark-gfm and markdown-it-py alike. This is the
+  # case that catches the tempting fix below: blanking code spans first eats
+  # the escaped backticks AND the `]` between them, inventing a link.
+  local c9ji="$tmp/c9ji"; make_corpus "$c9ji"
+  printf '# Jobs\n\n[foo \\`]\\` Mail](mail.md)\n' > "$c9ji/docs/guide/jobs.md"
+  git -C "$c9ji" add -A && git -C "$c9ji" commit -qm escaped-backticks-in-label
+  check "an escaped backtick opens no span" fail "$c9ji"
+
+  # (An UNCLOSED run — `[foo `] Mail](mail.md)` — was written as a case here
+  # and removed: the page holds one `]` and one destination, so EVERY reading,
+  # right or wrong, reports the orphan. It verified nothing.)
+
+  # A label that is ONLY a code span is visible content, not an empty link.
+  # The tempting fix — blank code spans before scanning, as the reference pass
+  # does — would strand this page, since the label would read as whitespace.
+  local c9jk="$tmp/c9jk"; make_corpus "$c9jk"
+  printf '# Jobs\n\n[`Mail`](mail.md)\n' > "$c9jk/docs/guide/jobs.md"
+  git -C "$c9jk" add -A && git -C "$c9jk" commit -qm code-span-only-label
+  check "a label that is only a code span is content" pass "$c9jk"
+
+  # A code span cannot cross a blank line: the blank ends the paragraph, so
+  # these are two literal backticks in two paragraphs, not a span over the
+  # reference between them. `.*?` under `re.S` matched anyway and blanked the
+  # only route to mail.md.
+  local c9jl="$tmp/c9jl"; make_corpus "$c9jl"
+  printf '# Jobs\n\nAn opening ` backtick.\n\n[Mail][m]\n\nA closing ` backtick.\n\n[m]: mail.md\n' \
+    > "$c9jl/docs/guide/jobs.md"
+  git -C "$c9jl" add -A && git -C "$c9jl" commit -qm backticks-across-blank-line
+  check "backticks either side of a blank line are not a span" pass "$c9jl"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
