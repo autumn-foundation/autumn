@@ -7584,10 +7584,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         None,
         &|f: &Field| !is_option_type(&f.ty) && type_name_str(&f.ty) == "bool",
         true,
+        // `NewModel` fields are plain `T`, not `Patch<T>` — nothing to widen.
+        false,
     );
+    // Every mutable field of `UpdateModel` is declared `Patch<T>`, and `null`
+    // is a MEANINGFUL value on both sides of the wire for one: `Deserialize`
+    // maps `null` to `Patch::Clear` ("unset this column"), and `Serialize`
+    // writes `null` for both `Unchanged` and `Clear`. Describing the property
+    // as a plain, non-nullable `T` is therefore wrong in both directions — a
+    // validator rejects a legitimate clear request, and rejects a response that
+    // serializes an `UpdateModel` with any field left unchanged. Widen each to
+    // `oneOf [T, null]`, the same shape `Option<T>` already emits.
+    //
+    // The lock-version column passed as `extra` is NOT a `Patch<T>` (see the
+    // `update_fields` construction above) and stays required and non-nullable.
     let update_struct_schema_body = {
         let extra: &[&&Field] = lock_version_field.as_slice();
-        emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true)
+        emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true, true)
     };
     let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
         .iter()

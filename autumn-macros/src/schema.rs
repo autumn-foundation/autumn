@@ -314,6 +314,35 @@ fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Resu
 ///
 /// Mirrors [`field_serde_serialize_rename`] but over a
 /// [`syn::Variant`](syn::Variant)'s attribute list.
+/// Does this variant carry a `#[serde(alias = "…")]`?
+///
+/// `alias` is deserialize-only: it adds an accepted input spelling without
+/// changing what serialization writes. That asymmetry has no correct rendering
+/// in a single schema serving both directions, so the derive refuses it
+/// (issue #802).
+///
+/// Routed through [`consume_unrecognized_meta`] like every other scanner here,
+/// so a sibling list-valued attribute — `#[serde(bound(deserialize = "…"),
+/// alias = "legacy")]` — cannot abort the walk before `alias` is reached.
+pub fn variant_has_serde_alias(variant: &syn::Variant) -> bool {
+    let mut found = false;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("alias") {
+                // Consume the value so the walk continues cleanly.
+                if let Ok(value) = meta.value() {
+                    let _ = value.parse::<syn::Lit>();
+                }
+                found = true;
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
 pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> {
     let mut renamed = None;
     for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -673,6 +702,7 @@ pub fn emit_schema_fn_body_full(
         rename_all_rule,
         treat_as_optional,
         false,
+        false,
     )
 }
 
@@ -693,6 +723,7 @@ pub fn emit_schema_fn_body_named(
     rename_all_rule: Option<&str>,
     treat_as_optional: &dyn Fn(&Field) -> bool,
     raw_field_names: bool,
+    patch_nullable: bool,
 ) -> TokenStream {
     let resolve_name = |f: &Field| -> Option<String> {
         if raw_field_names {
@@ -707,13 +738,29 @@ pub fn emit_schema_fn_body_named(
     // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
     // same resolved name for BOTH the property key and the `required` entry, so
     // the two can never drift.
+    // `patch_nullable` applies to `fields` ONLY, never to `extra_required`.
+    // On an `UpdateModel` every entry of `fields` is declared `Patch<T>` while
+    // the `extra_required` lock-version column stays a plain `T` (issue #802).
     let insertions: Vec<TokenStream> = fields
         .iter()
-        .chain(extra_required.iter())
-        .map(|f| {
+        .map(|f| (f, patch_nullable))
+        .chain(extra_required.iter().map(|f| (f, false)))
+        .map(|(f, nullable)| {
             let field_name =
                 resolve_name(f).unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
-            let schema_expr = emit_json_schema_tokens_for_field(f);
+            let base = emit_json_schema_tokens_for_field(f);
+            // `Option<T>` already emits `oneOf [T, null]`, so wrapping it again
+            // would only nest a second, redundant null branch.
+            let schema_expr = if nullable && !is_option_type(&f.ty) {
+                quote! {{
+                    let __inner = #base;
+                    ::autumn_web::reexports::serde_json::json!({
+                        "oneOf": [__inner, { "type": "null" }]
+                    })
+                }}
+            } else {
+                base
+            };
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
             }

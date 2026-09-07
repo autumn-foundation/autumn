@@ -330,6 +330,36 @@ fn split_rename_message(key: &str) -> String {
 /// variants with a single, symmetric spelling. Anything else is refused rather
 /// than approximated — a confidently wrong contract is worse than no derive,
 /// since a generated client acts on it.
+/// Refuse a unit variant carrying `#[serde(alias = "…")]`.
+///
+/// Split out of [`reject_undescribable_enum`] to keep that function within the
+/// crate's line budget; it is one rule, checked in one place.
+fn reject_aliased_variants(data: &syn::DataEnum) -> syn::Result<()> {
+    // `#[serde(alias = "…")]` is a DESERIALIZE-only widening: the alias is
+    // accepted on input and never written on output. A closed string set built
+    // from the canonical spellings is therefore too narrow for a request (an
+    // OpenAPI validator rejects a value the handler happily takes) and listing
+    // the aliases would make it too wide for a response (advertising values the
+    // server never emits). Same asymmetry as a directional skip, same answer.
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::variant_has_serde_alias(v))
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] cannot describe a variant with `#[serde(alias = \"…\")]`: \
+             the alias is accepted when deserializing but never written when serializing, so one \
+             string set cannot be right for both requests and responses — listing it advertises \
+             a value the server never emits, omitting it rejects one the handler accepts. Use \
+             `#[serde(rename = \"…\")]` if the wire spelling should change in both directions, \
+             or write the `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+    Ok(())
+}
+
 fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<()> {
     if let Some(variant) = data
         .variants
@@ -413,6 +443,8 @@ fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::
             ),
         ));
     }
+
+    reject_aliased_variants(data)?;
 
     // A split rename is the same asymmetry as a directional skip: one schema,
     // two disagreeing wire spellings. Advertising the serialize side would have
@@ -518,6 +550,60 @@ mod tests {
             }
         })
         .expect("a plain struct must still be describable");
+    }
+
+    fn audit_enum(input: &DeriveInput) -> Result<(), String> {
+        let Data::Enum(data) = &input.data else {
+            panic!("fixture must be an enum");
+        };
+        reject_undescribable_enum(input, data).map_err(|e| e.to_string())
+    }
+
+    /// `alias` widens what deserialization ACCEPTS without changing what
+    /// serialization writes, so no single string set is right for both
+    /// directions.
+    #[test]
+    fn a_variant_alias_is_refused() {
+        let err = audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                #[serde(alias = "legacy")]
+                Retired,
+            }
+        })
+        .expect_err("an aliased variant must be refused");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// The scan must survive a sibling list-valued attribute — the parser bug
+    /// class that has bitten this crate before, where an unconsumed `bound(..)`
+    /// aborts the walk and the attribute after it reads as absent.
+    #[test]
+    fn an_alias_after_a_list_valued_attribute_is_still_seen() {
+        let err = audit_enum(&parse_quote! {
+            #[serde(bound(deserialize = "T: Clone"))]
+            enum Status {
+                Active,
+                #[serde(bound(deserialize = "T: Clone"), alias = "legacy")]
+                Retired,
+            }
+        })
+        .expect_err("an alias behind a list-valued sibling must still be found");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// `rename` changes BOTH directions, so it stays describable — the guard
+    /// must not swallow the ordinary case.
+    #[test]
+    fn a_renamed_variant_is_still_describable() {
+        audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                #[serde(rename = "retired")]
+                Retired,
+            }
+        })
+        .expect("a symmetric rename must still be describable");
     }
 
     /// A neighbouring serde key that merely *contains* an adapter name is not

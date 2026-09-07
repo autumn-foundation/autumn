@@ -397,6 +397,39 @@ fn a_reshaped_model_does_not_register_its_field_schema() {
     );
 }
 
+// ── The Update* patch schema is nullable on both sides (issue #802) ────
+
+/// Every mutable field of an `Update*` companion is a `Patch<T>`, and `null`
+/// carries meaning in BOTH directions: `Deserialize` maps `null` to
+/// `Patch::Clear`, and `Serialize` writes `null` for `Unchanged` and `Clear`.
+///
+/// So the registered schema has to admit null. Advertising a plain, non-nullable
+/// `T` would have a validator reject a legitimate "clear this column" request
+/// AND reject any response that serializes an `Update*` with a field left
+/// unchanged — the second reachable because the descriptor now selects this
+/// schema for a route returning `Json<UpdateBookmark>`.
+#[test]
+fn the_update_schema_admits_null_for_every_patch_field() {
+    let schema = autumn_web::openapi::registered_derived_schema(std::any::type_name::<
+        UpdateConditionalRow,
+    >())
+    .expect("the update companion registers its schema");
+    let props = schema["properties"]
+        .as_object()
+        .expect("an object schema with properties");
+
+    for name in ["title", "tags"] {
+        let prop = props.get(name).unwrap_or_else(|| panic!("{name} present"));
+        let admits_null = prop["oneOf"]
+            .as_array()
+            .is_some_and(|branches| branches.iter().any(|b| b["type"] == "null"));
+        assert!(
+            admits_null,
+            "`{name}` is a Patch<T>, so the schema must admit null: {prop}"
+        );
+    }
+}
+
 // ── Field-level re-shaping on the read schema (issue #802) ─────────────
 
 mod schema_field_reshaped {
