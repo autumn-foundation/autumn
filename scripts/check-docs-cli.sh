@@ -3159,9 +3159,19 @@ def _short_cluster(tok, options):
 _PROSE_IN_FLAG = re.compile(r'''[/<>{}$`|\\"'()\[\]]''')
 
 
-def _reportable_flag(name):
-    """Is this dashed token a flag spelling a reader could copy, or prose?"""
-    return (name.startswith('-') and name not in ('-', '--')
+def _reportable_flag(name, tok=None):
+    """Is this dashed token a flag spelling a reader could copy, or prose?
+
+    `tok` is the token `name` was derived from, and the `-`/`--` exemption is
+    the TOKEN's, not the name's. Those two are the same thing right up until a
+    long option is split on `=`: `--=debug` normalizes to the name `--` and was
+    waved through as the end-of-options marker, though clap rejects it (`error:
+    unexpected argument '--' found`, exit 2) while a bare `--` it accepts.
+    Callers that hold the token pass it; the waiver validator, where the name
+    IS what was written, does not need to.
+    """
+    tok = name if tok is None else tok
+    return (name.startswith('-') and tok not in ('-', '--')
             and not _PROSE_IN_FLAG.search(name))
 
 
@@ -3348,7 +3358,7 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
             if flags is not None:
                 flags.append((path, name, kind))
             return None                         # see `_walk`'s option branch
-        if flags is not None and _reportable_flag(name):
+        if flags is not None and _reportable_flag(name, tok):
             flags.append((path, name, kind))
         if eaten:                               # attached value: arity is known
             i += eaten
@@ -3402,7 +3412,7 @@ def resolve(tokens, surface, runnable=False, flags=None):
                 flags.append(('', tokens[0].split('=', 1)[0], kind))
         elif kind == 'unknown':
             name = tokens[0].split('=', 1)[0]
-            if flags is not None and _reportable_flag(name):
+            if flags is not None and _reportable_flag(name, tokens[0]):
                 flags.append(('', name, kind))
         return None
     if not TOKEN.match(tokens[0]):
@@ -3461,7 +3471,7 @@ def _walk(tokens, i, path, surface, runnable, flags):
             # an attached value can be walked PAST (its arity is inside the
             # token) while a detached one stops the walk, since whether it eats
             # the next token is a guess and guessing invents defects.
-            if flags is not None and _reportable_flag(name):
+            if flags is not None and _reportable_flag(name, tok):
                 flags.append((path, name, kind))
             if eaten:
                 i += eaten
@@ -3522,7 +3532,7 @@ def _walk(tokens, i, path, surface, runnable, flags):
                         supplied += 1
                         i += 1
                         continue
-                    if flags is not None and _reportable_flag(o):
+                    if flags is not None and _reportable_flag(o, t2):
                         flags.append((path, o, kind))
                     if eaten:                   # attached value: arity is known
                         i += eaten
@@ -4301,6 +4311,27 @@ def self_test():
            'an unknown short group carrying `=` is still unknown, not a name')
     expect(_classify_option('-h=foo', surface['migrate']) == ('terminal', 0),
            'a short group short-circuits on help even with an `=` after it')
+
+    # --- `--=value` is not the end-of-options marker. Nineteenth round: the
+    # name normalizes to `--`, which `_reportable_flag` exempted as the bare
+    # marker, so the token went unreported though clap rejects it:
+    #   autumn build --=debug   exit 2, `unexpected argument '--' found`
+    #   autumn build --         exit 1, accepted
+    # The exemption is the TOKEN's, so it is asked of the token. Checked on all
+    # FOUR paths that report an option, since a rule reaching some of them and
+    # not the others has been this PR's most repeated defect.
+    expect(opts_of('migrate --=debug') == [('migrate', '--')],
+           'an `--=value` token is reported by the outer walk')
+    expect(opts_of('--=debug') == [('', '--')],
+           '…by the root branch')
+    expect(opts_of('migrate status --=debug') == [('migrate status', '--')],
+           '…by the leaf loop')
+    expect(opts_of('routes /admin --=debug') == [('routes', '--')],
+           '…and by the options-only scan past a positional')
+    expect(opts_of('migrate -- nope') == [],
+           'while a bare `--` stays exempt on every one of them')
+    expect(opts_of('routes /admin -- nope') == [],
+           '…including past a positional')
 
     # --- quoting. These are what shell-aware tokenization buys: splitting on
     # whitespace consumed `"eu` as the option value and then stopped at `west"`,
