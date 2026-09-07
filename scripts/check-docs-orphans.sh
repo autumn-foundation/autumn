@@ -265,7 +265,42 @@ def read(f):
 # OUTSIDE its package — `readme = "../README.md"`, which three packages here
 # use — names the workspace root README, already a root on its own account.
 _README_KEY = re.compile(r'^\s*readme\s*=\s*"([^"]*)"', re.M)
-_PUBLISH_FALSE = re.compile(r'^\s*publish\s*=\s*false\s*$', re.M)
+# Cargo has TWO spellings for "never published", and `publish = false` is only
+# one of them: an EMPTY allowlist, `publish = []`, means the same thing —
+# `cargo publish` refuses because the key must be `true` or a NON-EMPTY list.
+# Matching only the boolean seeded the README of an unpublishable package as a
+# reader root, which is the silent direction: it can hide an orphan.
+#
+# A non-empty list is the opposite — `publish = ["some-registry"]` IS
+# published, just not to crates.io, and its README is still that crate's
+# landing page there.
+_PUBLISH_DECL = re.compile(
+    r'^[ \t]*publish[ \t]*=[ \t]*(false|true|\[[^\]]*\])', re.M)
+# ...and a package may inherit the setting instead of declaring it, in either
+# spelling Cargo accepts. Neither occurs in this repository today; both are
+# handled so the first one to appear is not a fresh defect, and because the
+# error this guards is the quiet one.
+_PUBLISH_INHERITS = re.compile(
+    r'^[ \t]*publish[ \t]*\.[ \t]*workspace[ \t]*=[ \t]*true'
+    r'|^[ \t]*publish[ \t]*=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
+    re.M)
+
+
+def _publishable(manifest):
+    """Whether a package manifest allows publishing at all."""
+    m = _PUBLISH_DECL.search(manifest)
+    if m is None and _PUBLISH_INHERITS.search(manifest):
+        m = _PUBLISH_DECL.search(read('Cargo.toml'))
+    if m is None:
+        return True
+    value = m.group(1)
+    if value == 'false':
+        return False
+    if value.startswith('['):
+        # An empty allowlist publishes nowhere; a populated one publishes
+        # somewhere, and that registry renders the README.
+        return value[1:-1].strip() != ''
+    return True
 
 
 def _crate_readme_roots():
@@ -274,7 +309,7 @@ def _crate_readme_roots():
         if posixpath.basename(f) != 'Cargo.toml':
             continue
         manifest = read(f)
-        if _PUBLISH_FALSE.search(manifest):
+        if not _publishable(manifest):
             continue
         pkg = posixpath.dirname(f)
         m = _README_KEY.search(manifest)
@@ -6793,6 +6828,40 @@ self_test() {
   printf '# Fuzz\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9lv/fuzz/README.md"
   git -C "$c9lv" add -A && git -C "$c9lv" commit -qm unpublished-readme-not-a-root
   check "an unpublished crate README is not a root" fail "$c9lv"
+
+  # `publish = []` is Cargo's OTHER spelling of "never published" — the key
+  # must be `true` or a non-empty list — so that README is not a landing page
+  # either. Matching only the boolean seeded it as a root, which is the silent
+  # direction: it hides an orphan rather than reporting one.
+  local c9lw="$tmp/c9lw"; make_corpus "$c9lw"
+  mkdir -p "$c9lw/pkg"
+  printf '[package]\nname = "pkg"\npublish = []\nreadme = "README.md"\n' \
+    > "$c9lw/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9lw/pkg/README.md"
+  git -C "$c9lw" add -A && git -C "$c9lw" commit -qm empty-publish-allowlist
+  check "an empty publish allowlist is not published" fail "$c9lw"
+
+  # ...but a POPULATED allowlist is published, just not to crates.io, and that
+  # registry renders the README. Treating any list as unpublishable would
+  # strand this page.
+  local c9lx="$tmp/c9lx"; make_corpus "$c9lx"
+  mkdir -p "$c9lx/pkg"
+  printf '[package]\nname = "pkg"\npublish = ["internal"]\nreadme = "README.md"\n' \
+    > "$c9lx/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9lx/pkg/README.md"
+  git -C "$c9lx" add -A && git -C "$c9lx" commit -qm populated-publish-allowlist
+  check "a populated publish allowlist is published" pass "$c9lx"
+
+  # ...and a package may INHERIT the setting rather than declare it.
+  local c9ly="$tmp/c9ly"; make_corpus "$c9ly"
+  mkdir -p "$c9ly/pkg"
+  printf '[workspace]\nmembers = ["pkg"]\n\n[workspace.package]\npublish = false\n' \
+    > "$c9ly/Cargo.toml"
+  printf '[package]\nname = "pkg"\npublish.workspace = true\nreadme = "README.md"\n' \
+    > "$c9ly/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ly/pkg/README.md"
+  git -C "$c9ly" add -A && git -C "$c9ly" commit -qm inherited-publish-false
+  check "an inherited publish=false is not published" fail "$c9ly"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
