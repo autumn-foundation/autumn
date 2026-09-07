@@ -22,6 +22,7 @@ mod data_flow;
 mod db;
 mod db_pull;
 mod deploy;
+mod deps;
 mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;

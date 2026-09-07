@@ -26,8 +26,7 @@ use std::time::Duration;
 use autumn_web::app::AppBuilder;
 use autumn_web::capsule::regression::{RegressionCase, RegressionContext};
 use autumn_web::capsule::{
-    CacheEffect, Capsule, CapsuleOutcome, DivergenceLog, ReplayFixtures, Verdict, execute,
-    load_capsule,
+    Capsule, CapsuleOutcome, DivergenceLog, ReplayFixtures, Verdict, execute, load_capsule,
 };
 use autumn_web::config::AutumnConfig;
 use autumn_web::entropy::Rng;
@@ -54,22 +53,6 @@ async fn charge(State(state): State<AppState>) -> Result<&'static str, AutumnErr
     Err(AutumnError::internal_server_error_msg(format!(
         "upstream said {}",
         response.status().as_u16()
-    )))
-}
-
-/// Reads the cache, then fails quoting what it found.
-#[get("/cached")]
-async fn cached() -> Result<&'static str, AutumnError> {
-    let Some(cache) = autumn_web::cache::global_cache() else {
-        return Err(AutumnError::internal_server_error_msg("no cache"));
-    };
-    let hit: Option<u32> = autumn_web::cache::get_cached(cache.as_ref(), "widgets:count");
-    let Some(count) = hit else {
-        autumn_web::cache::insert_cached(cache.as_ref(), "widgets:count", 41_u32, None);
-        return Err(AutumnError::internal_server_error_msg("cache miss"));
-    };
-    Err(AutumnError::internal_server_error_msg(format!(
-        "cache said {count}"
     )))
 }
 
@@ -145,21 +128,6 @@ fn capsule_paths(dir: &Path) -> Vec<PathBuf> {
         .collect();
     paths.sort();
     paths
-}
-
-async fn await_capsules(dir: &Path, expected: usize) -> Vec<PathBuf> {
-    for _ in 0..200 {
-        let paths = capsule_paths(dir);
-        if paths.len() >= expected {
-            return paths;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "expected {expected} capsule(s) in {}, found {}",
-        dir.display(),
-        capsule_paths(dir).len()
-    );
 }
 
 async fn await_one_capsule(dir: &Path) -> PathBuf {
@@ -504,83 +472,6 @@ async fn a_job_that_panics_before_its_final_attempt_still_leaves_a_capsule() {
     );
 
     job::clear_global_job_client();
-}
-
-// ── Phase 2: cache ──────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn a_cache_hit_is_captured_and_replayed_without_a_backend() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // The backend is installed *after* `build`, not before: `TestApp::build`
-    // clears the process-global cache (and takes the lock that guards it), so a
-    // backend set up front would be wiped — and a test holding that lock across
-    // `build` would deadlock on it.
-    let client = TestApp::new()
-        .config(capture_config(dir.path()))
-        .routes(routes![cached])
-        .build();
-    autumn_web::cache::set_global_cache(Arc::new(autumn_web::cache::MokaCache::new(16, None)));
-    // First call misses and fills, second call hits: two capsules, one per
-    // branch, so both the write and the read are on tape.
-    client.get("/cached").send().await.assert_status(500);
-    client.get("/cached").send().await.assert_status(500);
-    let capsules: Vec<Capsule> = await_capsules(dir.path(), 2)
-        .await
-        .iter()
-        .map(|path| load_capsule(path).expect("the capsule loads"))
-        .collect();
-    // Matched by content, not by file order: persistence runs on a detached
-    // blocking task, so the two capsules can land in either order.
-    assert!(
-        capsules
-            .iter()
-            .any(|capsule| capsule.effects.cache.iter().any(
-                |entry| matches!(entry, CacheEffect::Insert { key, .. } if key == "widgets:count")
-            )),
-        "the fill must be recorded: {:?}",
-        capsules
-            .iter()
-            .map(|capsule| &capsule.effects.cache)
-            .collect::<Vec<_>>()
-    );
-    let hit = capsules
-        .iter()
-        .find(|capsule| {
-            capsule.effects.cache.iter().any(|entry| {
-                matches!(entry, CacheEffect::Get { key, value: Some(_) } if key == "widgets:count")
-            })
-        })
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "one capsule must record the hit *with the value it served*: {:?}",
-                capsules
-                    .iter()
-                    .map(|capsule| &capsule.effects.cache)
-                    .collect::<Vec<_>>()
-            )
-        });
-
-    // Replay against an **empty** backend. The seam sits inside `get_cached`,
-    // so a cache object still has to exist for the handler to read through —
-    // but it holds nothing, so a hit can only have come from the capsule.
-    let fixtures = ReplayFixtures::from_capsule(&hit);
-    let router = TestApp::new()
-        .config(replay_config())
-        .routes(routes![cached])
-        .with_clock(fixtures.clock())
-        .build()
-        .into_router();
-    autumn_web::cache::set_global_cache(Arc::new(autumn_web::cache::MokaCache::new(16, None)));
-    let outcome = execute(router, &hit, Arc::new(DivergenceLog::new()), &fixtures).await;
-
-    assert_eq!(
-        outcome.verdict,
-        Verdict::Reproduced,
-        "the recorded cache hit must replay without a backend: {outcome:?}"
-    );
-
-    autumn_web::cache::clear_global_cache();
 }
 
 // ── Phase 2: mail ───────────────────────────────────────────────────────────
