@@ -236,7 +236,8 @@ const ADMIN_CSS: &str = "
         transition: border-color 0.15s;
     }
     .form-input:focus {
-        outline: none;
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
         border-color: var(--primary);
         box-shadow: 0 0 0 3px var(--primary-light);
     }
@@ -270,7 +271,8 @@ const ADMIN_CSS: &str = "
         font-size: 0.875rem;
     }
     .search-bar input:focus {
-        outline: none;
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
         border-color: var(--primary);
         box-shadow: 0 0 0 3px var(--primary-light);
     }
@@ -2606,6 +2608,49 @@ mod tests {
         let (la, lb) = (relative_luminance(a), relative_luminance(b));
         let (lighter, darker) = if la >= lb { (la, lb) } else { (lb, la) };
         (lighter + 0.05) / (darker + 0.05)
+    }
+
+    // Audited 2026-09-04 (Wayfinder). The core admin CRUD loop (list → create
+    // → edit, the reason the plugin exists — every registered model routes
+    // through it) removed `:focus`'s outline on every text/select/textarea/
+    // date input and the list page's search box, replacing it with
+    // `border-color` + `box-shadow` only. `box-shadow` (and often
+    // `border-color`) is suppressed under forced-colors mode (Windows High
+    // Contrast and equivalent OS/browser settings), so a keyboard user in
+    // that mode tabbing through the create/edit form saw *no* focus
+    // indicator at all on any field — a WCAG 2.4.7 (Focus Visible) failure,
+    // and exactly the "style away focus outlines without an equal-or-better
+    // replacement" anti-pattern this persona is instructed never to ship.
+    // The framework already has a real convention for this everywhere else
+    // (`autumn/src/ui/widgets.css` uses `outline: 2px solid var(--primary);
+    // outline-offset: 2px;` on 8 separate focus states, and this same file's
+    // skip-link at line ~53 does too) — these two rules were the outliers.
+    // Fix: restore that same outline (forced-colors mode renders any
+    // non-`none` outline using the system's own focus color, so it can't be
+    // silently stripped) alongside the existing border/box-shadow, which
+    // keeps the current visual treatment in normal rendering.
+    #[test]
+    fn form_and_search_input_focus_keeps_a_visible_outline() {
+        assert!(
+            !ADMIN_CSS.contains("outline: none"),
+            "a form/search input :focus rule dropped its outline with no \
+             equal-or-better replacement — box-shadow/border-color alone are \
+             stripped under forced-colors mode, leaving keyboard users with \
+             no visible focus indicator: {ADMIN_CSS}"
+        );
+        for selector in [".form-input:focus", ".search-bar input:focus"] {
+            let start = ADMIN_CSS
+                .find(selector)
+                .unwrap_or_else(|| panic!("missing `{selector}` rule in ADMIN_CSS"));
+            let block_end = ADMIN_CSS[start..]
+                .find('}')
+                .map_or(ADMIN_CSS.len(), |i| start + i);
+            let block = &ADMIN_CSS[start..block_end];
+            assert!(
+                block.contains("outline: 2px solid var(--primary)"),
+                "`{selector}` must keep a visible outline: {block}"
+            );
+        }
     }
 
     // Audited 2026-09-02 (Wayfinder). Config page (100% of admin-plugin
