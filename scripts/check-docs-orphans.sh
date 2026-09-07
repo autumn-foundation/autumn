@@ -254,17 +254,36 @@ def read(f):
 # than waypoints. As a waypoint one is inert, so a guide indexed only from a
 # subcrate's README was an orphan.
 #
-# Cargo's own rule, both halves: an explicit `readme = "..."` naming a file in
-# the package directory, or — with no `readme` key at all — an auto-detected
-# `README.md` beside the manifest. Only the explicit half occurs in this
-# repository today; the default is here so the next package that relies on it
-# is not a fresh defect.
+# Cargo's `readme` key has FOUR states, and only one of them is a path. Read
+# off `cargo metadata`'s resolved `readme` field rather than inferred:
 #
-# `publish = false` excludes it: nothing renders the README of a package that
-# is never published, so it stays an ordinary waypoint. And a `readme` pointing
-# OUTSIDE its package — `readme = "../README.md"`, which three packages here
-# use — names the workspace root README, already a root on its own account.
-_README_KEY = re.compile(r'^\s*readme\s*=\s*"([^"]*)"', re.M)
+#   readme = "docs/intro.md"  ->  "docs/intro.md"   an explicit path
+#   readme = true             ->  "README.md"       explicit auto-detect
+#   (key omitted)             ->  "README.md"       implicit auto-detect
+#   readme = false            ->  null              published with NO readme
+#
+# Matching only the quoted form put the last of those on the auto-detect path,
+# seeding a page Cargo does not publish as a reader entry surface — the silent
+# direction, because a root can only hide an orphan, never invent one.
+#
+# A path pointing OUTSIDE its package — `readme = "../README.md"`, which three
+# packages here use — names the workspace root README, already a root on its
+# own account, so it is some other rule's job.
+_README_STRING = re.compile(r'^[ \t]*readme[ \t]*=[ \t]*"([^"]*)"', re.M)
+_README_BOOL = re.compile(r'^[ \t]*readme[ \t]*=[ \t]*(false|true)\b', re.M)
+# A fifth spelling, and the same silent failure: an INHERITED `readme` resolves
+# against the workspace root, not the member directory — `readme.workspace =
+# true` under a `[workspace.package] readme = "README.md"` comes back out of
+# `cargo metadata` as `"../README.md"`. So the member's own `README.md` is not
+# what gets published, and treating the key as absent seeded exactly that file.
+# Cargo also refuses `readme = false` in `[workspace.package]` ("was not
+# defined"), so an inherited value is always a path.
+_README_INHERITS = re.compile(
+    r'^[ \t]*readme[ \t]*\.[ \t]*workspace[ \t]*=[ \t]*true'
+    r'|^[ \t]*readme[ \t]*=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
+    re.M)
+# Publishability gates all of the above: nothing renders the README of a
+# package that is never published, so it stays an ordinary waypoint.
 # Cargo has TWO spellings for "never published", and `publish = false` is only
 # one of them: an EMPTY allowlist, `publish = []`, means the same thing —
 # `cargo publish` refuses because the key must be `true` or a NON-EMPTY list.
@@ -303,6 +322,41 @@ def _publishable(manifest):
     return True
 
 
+def _readme_path(manifest, pkg):
+    """The file Cargo publishes as this package's README, or None for no README.
+
+    `pkg` is the manifest's directory; the returned path is repo-relative.
+    """
+    if _README_INHERITS.search(manifest):
+        # Inherited values resolve against the workspace root, so both the
+        # manifest to read the key from AND the directory it is relative to
+        # move up. A root manifest with no `[workspace.package] readme` is a
+        # manifest Cargo rejects; auto-detecting the root README there is
+        # harmless, since that file is already a root on its own account.
+        manifest = read('Cargo.toml')
+        pkg = ''
+    m = _README_STRING.search(manifest)
+    if m is not None:
+        named = m.group(1)
+    else:
+        b = _README_BOOL.search(manifest)
+        if b is not None and b.group(1) == 'false':
+            # The explicit opt-out: the package is published with no README,
+            # so no registry page renders one and nothing is an entry surface.
+            return None
+        # `readme = true` and an omitted key are the same instruction:
+        # auto-detect the `README.md` beside the manifest.
+        named = 'README.md'
+    # `posixpath.normpath`, not this file's `normalize`, which is defined
+    # far below — and stdlib is the right tool anyway: this resolves a
+    # manifest path, not a Markdown destination.
+    cand = posixpath.normpath(posixpath.join(pkg, named) if pkg else named)
+    # Outside its own package directory it is some other file's job.
+    if pkg and not cand.startswith(pkg + '/'):
+        return None
+    return cand
+
+
 def _crate_readme_roots():
     out = set()
     for f in tracked:
@@ -311,17 +365,8 @@ def _crate_readme_roots():
         manifest = read(f)
         if not _publishable(manifest):
             continue
-        pkg = posixpath.dirname(f)
-        m = _README_KEY.search(manifest)
-        named = m.group(1) if m else 'README.md'
-        # `posixpath.normpath`, not this file's `normalize`, which is defined
-        # far below — and stdlib is the right tool anyway: this resolves a
-        # manifest path, not a Markdown destination.
-        cand = posixpath.normpath(posixpath.join(pkg, named) if pkg else named)
-        # Outside its own package directory it is some other file's job.
-        if pkg and not cand.startswith(pkg + '/'):
-            continue
-        if cand in tracked_set:
+        cand = _readme_path(manifest, posixpath.dirname(f))
+        if cand is not None and cand in tracked_set:
             out.add(cand)
     return out
 
@@ -6862,6 +6907,51 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ly/pkg/README.md"
   git -C "$c9ly" add -A && git -C "$c9ly" commit -qm inherited-publish-false
   check "an inherited publish=false is not published" fail "$c9ly"
+
+  # `readme = false` is Cargo's explicit opt-out — `cargo metadata` reports the
+  # package's `readme` as null — so the crate IS published but its registry
+  # page renders no README, and this file is a waypoint like any other. The key
+  # only ever matched a quoted string, so `false` landed on the auto-detect
+  # default and seeded a page Cargo never publishes.
+  local c9lz="$tmp/c9lz"; make_corpus "$c9lz"
+  mkdir -p "$c9lz/pkg"
+  printf '[package]\nname = "pkg"\nreadme = false\n' > "$c9lz/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9lz/pkg/README.md"
+  git -C "$c9lz" add -A && git -C "$c9lz" commit -qm readme-false
+  check "readme=false opts out of being an entry surface" fail "$c9lz"
+
+  # ...while `readme = true` is the SAME instruction as omitting the key —
+  # auto-detect `README.md` — so it must not be swept up with `false` by a
+  # pattern that matches the boolean without reading which one it is.
+  local c9m0="$tmp/c9m0"; make_corpus "$c9m0"
+  mkdir -p "$c9m0/pkg"
+  printf '[package]\nname = "pkg"\nreadme = true\n' > "$c9m0/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m0/pkg/README.md"
+  git -C "$c9m0" add -A && git -C "$c9m0" commit -qm readme-true
+  check "readme=true is an entry surface" pass "$c9m0"
+
+  # A quoted `"false"` is a PATH named false, not the boolean. Nothing here
+  # spells it that way, but the two regexes have to disagree in the right
+  # direction, and this is the case that says which one wins.
+  local c9m1="$tmp/c9m1"; make_corpus "$c9m1"
+  mkdir -p "$c9m1/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "false"\n' > "$c9m1/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m1/pkg/false"
+  git -C "$c9m1" add -A && git -C "$c9m1" commit -qm readme-quoted-false
+  check "a quoted readme=\"false\" is a path, not the boolean" pass "$c9m1"
+
+  # An INHERITED `readme` resolves against the workspace root: Cargo rewrites
+  # `readme.workspace = true` under `[workspace.package] readme = "README.md"`
+  # to `../README.md`. The member's own README is therefore NOT published, and
+  # reading the key as absent seeded precisely that file.
+  local c9m2="$tmp/c9m2"; make_corpus "$c9m2"
+  mkdir -p "$c9m2/pkg"
+  printf '[workspace]\nmembers = ["pkg"]\n\n[workspace.package]\nreadme = "README.md"\n' \
+    > "$c9m2/Cargo.toml"
+  printf '[package]\nname = "pkg"\nreadme.workspace = true\n' > "$c9m2/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m2/pkg/README.md"
+  git -C "$c9m2" add -A && git -C "$c9m2" commit -qm inherited-readme
+  check "an inherited readme is the workspace root's, not the member's" fail "$c9m2"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
