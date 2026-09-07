@@ -3165,6 +3165,32 @@ def _reportable_flag(name):
             and not _PROSE_IN_FLAG.search(name))
 
 
+def _missing_value(kind, eaten, i, tokens, runnable):
+    """Is this a value-taking option written with no value left to take?
+
+    `_classify_option` answers what an option IS from the node alone; whether
+    the value it needs is actually THERE depends on the token list, so it is
+    asked here. `autumn build --package` at the end of a line is "a value is
+    required for '--package <PACKAGE>' but none was supplied", exit 2
+    (measured) — the walk stepped over two tokens where only one existed and
+    ran off the end reporting nothing.
+
+    ONLY inside a fence, for the same reason `requires_sub` is: in prose a
+    command-and-flag without a value is how English names the flag. The corpus
+    does this ten times on correct pages — "`autumn plugin-check
+    --plugin-name` takes one string", "`autumn new --starter` writes through
+    the same machinery" — and reporting them would have been this gate's worst
+    regression yet, ten false positives at once. Found by running the corpus,
+    not by the injection tests, which is why the corpus run is not optional.
+
+    Shared by all three option loops rather than written in each: a rule taught
+    to one of them and not the others has been the cause of four review rounds
+    on this PR.
+    """
+    return (runnable and kind == 'known' and eaten == 2
+            and i + eaten > len(tokens))
+
+
 def _starts_trailing(node, supplied):
     """Does an UNKNOWN hyphen token here start a `trailing_var_arg` capture?
 
@@ -3273,6 +3299,10 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
         kind, eaten = _classify_option(tok, node)
         if kind == 'terminal':
             return None
+        if _missing_value(kind, eaten, i, tokens, runnable):
+            if flags is not None:
+                flags.append((path, name, 'needsvalue'))
+            return None
         if kind in ('known', 'cluster'):
             i += eaten
             continue
@@ -3370,6 +3400,10 @@ def _walk(tokens, i, path, surface, runnable, flags):
             kind, eaten = _classify_option(tok, node)
             if kind == 'terminal':
                 return None
+            if _missing_value(kind, eaten, i, tokens, runnable):
+                if flags is not None:
+                    flags.append((path, name, 'needsvalue'))
+                return None
             if kind in ('known', 'cluster'):
                 i += eaten
                 continue
@@ -3428,6 +3462,10 @@ def _walk(tokens, i, path, surface, runnable, flags):
                     o = t2.split('=', 1)[0]
                     kind, eaten = _classify_option(t2, node)
                     if kind == 'terminal':
+                        return None
+                    if _missing_value(kind, eaten, i, tokens, runnable):
+                        if flags is not None:
+                            flags.append((path, o, 'needsvalue'))
                         return None
                     if kind in ('known', 'cluster'):
                         i += eaten
@@ -4009,6 +4047,23 @@ def self_test():
            '…and the line is complete, not missing <CAPSULE>')
     expect(opts_of('replay -xh') == [('replay', '-xh')],
            'but an undeclared letter BEFORE -h is reached, so it still reports')
+
+    # --- a value-taking option written with no value. `autumn build --package`
+    # is "a value is required for '--package <PACKAGE>'", exit 2 (measured).
+    # FENCE-ONLY, like `requires_sub`: in prose a command-and-flag without a
+    # value is how English names the flag, and the corpus does that ten times
+    # on correct pages.
+    expect(raw_opts('migrate --shard', runnable=True)
+           == [('migrate', '--shard', 'needsvalue')],
+           'a value-taking option with nothing after it is reported in a fence')
+    expect(raw_opts('migrate --shard') == [],
+           '…and NOT in prose, where it is how English names the flag')
+    expect(raw_opts('migrate --shard eu', runnable=True) == [],
+           'a value that is present resolves')
+    expect(raw_opts('migrate --with-maintenance', runnable=True) == [],
+           'a BOOLEAN option needs nothing after it')
+    expect(raw_opts('migrate --shard=eu', runnable=True) == [],
+           'an attached value counts as supplied')
     expect(resolve(tk('replay -hpapi'), surface, runnable=True) is None,
            '…so <CAPSULE> is not reported missing')
     expect(resolve(tk('replay -papi'), surface, runnable=True) == 'autumn replay',
@@ -6261,8 +6316,9 @@ def main():
             # note has to match the defect: `--reset` IS declared, and telling
             # an author it does not exist would send them to fix the wrong
             # thing.
-            note = ('takes no value' if kind == 'novalue'
-                    else 'is not an option of this command')
+            note = {'novalue': 'takes no value',
+                    'needsvalue': 'requires a value'}.get(
+                        kind, 'is not an option of this command')
             print(f'{f}:{lineno}: `{("autumn " + cmd_path).strip()}`: '
                   f'`{opt}` {note}  (line: {line})')
         print()
