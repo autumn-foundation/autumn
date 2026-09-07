@@ -170,7 +170,7 @@ jobs:
         # provenance record for bytes nobody can obtain is just noise in the
         # transparency log.
         if: ${{ inputs.tag != '' }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: autumn-${{ matrix.target }}.*
 
