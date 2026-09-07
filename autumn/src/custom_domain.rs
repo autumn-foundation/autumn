@@ -1261,18 +1261,27 @@ impl IssuanceLimiter {
     /// reason reported is the most specific one.
     #[must_use]
     pub fn check(&self, hostname: &str, now_unix: i64) -> IssuanceDecision {
-        let attempts = read_lock(&self.attempts);
-        let domain_hits = attempts
-            .per_domain
-            .get(hostname)
-            .map(|hits| within(hits, now_unix, PER_DOMAIN_WINDOW_SECS))
-            .unwrap_or_default();
+        // Both windows are read under ONE guard, then the guard is released
+        // before any decision is built: a caller must not hold the lock while
+        // formatting a message, and the two counts must come from the same
+        // instant or a domain could pass its own budget against a global count
+        // taken after another thread spent it.
+        let (domain_hits, global_hits) = {
+            let attempts = read_lock(&self.attempts);
+            let domain_hits = attempts
+                .per_domain
+                .get(hostname)
+                .map(|hits| within(hits, now_unix, PER_DOMAIN_WINDOW_SECS))
+                .unwrap_or_default();
+            let global_hits = within(&attempts.global, now_unix, GLOBAL_WINDOW_SECS);
+            drop(attempts);
+            (domain_hits, global_hits)
+        };
         if domain_hits.len() >= self.per_domain_per_day as usize {
             return IssuanceDecision::PerDomainLimit {
                 retry_after_secs: retry_after(&domain_hits, now_unix, PER_DOMAIN_WINDOW_SECS),
             };
         }
-        let global_hits = within(&attempts.global, now_unix, GLOBAL_WINDOW_SECS);
         if global_hits.len() >= self.global_per_hour as usize {
             return IssuanceDecision::GlobalLimit {
                 retry_after_secs: retry_after(&global_hits, now_unix, GLOBAL_WINDOW_SECS),
