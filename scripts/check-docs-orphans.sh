@@ -2069,8 +2069,38 @@ def _display_none(style):
 
 
 def _style_value(m):
-    """The style attribute's text from a `STYLE_ATTR_OPEN` match."""
-    return m.group(2) if m.group(2) is not None else m.group(3)
+    """The style attribute's text from a `STYLE_ATTR_OPEN` match, DECODED.
+
+    The HTML tokenizer resolves character references in an attribute value
+    before CSS ever sees it, so `style="display&#58;none"` reaches the engine
+    as `display:none` and hides the element. Handing the encoded source to the
+    cascade missed the declaration and recorded the href as a live route — an
+    orphan passing.
+
+    `html.unescape`, not `decode_char_refs`: this is an HTML attribute, so the
+    tokenizer's lenient rules apply rather than CommonMark's strict ones. That
+    is the same split `add_relative` already makes between a raw href and a
+    Markdown destination, and it matters — all of these hide the anchor,
+    measured in Chromium, and only the first is a CommonMark reference:
+
+        display&#58;none      display&#58none      &#100;isplay:none
+        display&colon;none    display:&#110;one    display:none&#59;color:red
+
+    Decoding before the split, not after, so `content:&quot;a;display:block&quot;`
+    becomes a real quoted value that `_declarations` can see the string in.
+
+    Length changes here, which is safe only because nothing reads offsets
+    INSIDE the attribute: both callers mask by the whole tag's span.
+
+    KNOWN LIMIT: inside an attribute the tokenizer does NOT decode a
+    semicolonless NAMED reference followed by `=` or an alphanumeric, and
+    `html.unescape` decodes it anyway. Reaching a wrong answer through that
+    would take a style whose undecoded form is not `display:none` and whose
+    over-decoded form is, which is a contrivance; writing an attribute-aware
+    tokenizer to rule it out is not worth it here.
+    """
+    raw = m.group(2) if m.group(2) is not None else m.group(3)
+    return html.unescape(raw) if raw else raw
 
 
 def style_hidden_search(txt, at):
@@ -5904,6 +5934,33 @@ self_test() {
     > "$c9kj/README.md"
   git -C "$c9kj" add -A && git -C "$c9kj" commit -qm unresolved-image-reference
   check "an unresolved image reference is visible text" pass "$c9kj"
+
+  # The HTML tokenizer decodes character references in an attribute BEFORE CSS
+  # sees it, so this reaches the engine as `display:none` and hides the anchor.
+  # Handing the encoded source to the cascade recorded a live route.
+  local c9kk="$tmp/c9kk"; make_corpus "$c9kk"
+  printf '# Jobs\n\n<a style="display&#58;none" href="mail.md">Mail</a>\n' \
+    > "$c9kk/docs/guide/jobs.md"
+  git -C "$c9kk" add -A && git -C "$c9kk" commit -qm style-entity-colon
+  check "a character reference in a style is decoded" fail "$c9kk"
+
+  # ...by the TOKENIZER's rules, not CommonMark's: a numeric reference without
+  # its semicolon is decoded in an attribute, and this anchor is hidden too.
+  # The strict decoder used for Markdown destinations would have missed it.
+  local c9kl="$tmp/c9kl"; make_corpus "$c9kl"
+  printf '# Jobs\n\n<a style="display&#58none" href="mail.md">Mail</a>\n' \
+    > "$c9kl/docs/guide/jobs.md"
+  git -C "$c9kl" add -A && git -C "$c9kl" commit -qm style-entity-no-semicolon
+  check "a semicolonless reference in a style is decoded" fail "$c9kl"
+
+  # ...and decoding comes BEFORE the declaration split, so an encoded quote
+  # becomes a real one and the semicolon inside it ends no declaration. Decoded
+  # after the split, `display:block"` reads as a declaration and unhides this.
+  local c9km="$tmp/c9km"; make_corpus "$c9km"
+  printf '# Jobs\n\n<a style="display:none;content:&quot;a;display:block&quot;" href="mail.md">Mail</a>\n' \
+    > "$c9km/docs/guide/jobs.md"
+  git -C "$c9km" add -A && git -C "$c9km" commit -qm style-entity-quote
+  check "an encoded quote is decoded before the split" fail "$c9km"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
