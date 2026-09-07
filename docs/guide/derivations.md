@@ -92,10 +92,14 @@ to `is_some_and` rather than `!=`, which in Rust would count the NULL row SQL
 excludes.
 
 A string literal is single-quoted for SQL, and an embedded `'` is doubled. A
-literal `{` or `}` in a string is rejected, because it could forge the `{c}`
-placeholder. Ordering comparisons on a string field are rejected too: Rust
-compares bytes and SQL compares by collation, so `status > "b"` would mean two
-different things in the two lowerings. Compare a string with `==` or `!=`.
+literal `{`, `}`, `\`, NUL or other control character in a string is
+rejected: a brace could forge the `{c}` placeholder, and the others have
+backend-specific escape rules. Ordering comparisons on a string field are
+rejected too: Rust compares bytes and SQL compares by collation, so
+`status > "b"` would mean two different things in the two lowerings. Compare a
+string with `==` or `!=`, and keep the column on a deterministic, case-sensitive
+collation: on a `citext` or `NOCASE` column SQL matches `"PUB"` and Rust does
+not.
 
 Everything else is a compile error whose message lists the grammar: `||`,
 arithmetic, any method call other than the two NULL probes, float literals, a
@@ -289,6 +293,12 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
 - **A single primary key, and one database.** The child needs a scalar `#[id]`,
   and the parent `UPDATE` runs on the child's connection, so a sharded setup
   must keep parent and child on the same shard.
+- **Column names come from field names.** A filter field or summed field
+  renamed with `#[diesel(column_name = "...")]` is rejected. A foreign-key
+  field renamed that way is not detected, so keep `fk` fields unrenamed.
+- **Self-referential derivations are untested.** A child that derives onto its
+  own table (a comment's `reply_count`) takes the same lock order as any other
+  parent, but no test in this release covers it.
 - **No configuration keys.** Reconciliation and the boot backfill are automatic
   and use the default `BackfillOptions`. Call `run_backfill` to pace a large
   repair by hand.
