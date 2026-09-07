@@ -292,31 +292,42 @@ and this assay does not claim it. What it adds to Keystone's memo, precisely:
 - The **denial mechanism itself differs in a way this assay newly confirms
   empirically, not just by reading**: `plugin_sandbox` refuses an unresolved
   import **before instantiation**, by name, into a typed
-  `SandboxLoadError::ForbiddenImports` a caller can inspect and log
-  structurally. `autumn-edge` has no equivalent — `EdgeArtifact::from_bytes`
-  does no import scan at all (its own doc comment says the *conformance
-  suite* does that, as a side check on first-party artifacts, not the host);
-  an unresolved import here fails inside `wasmi`'s own `linker.instantiate`
-  call and surfaces as an untyped, un-named string inside a generic
-  `CapsuleError` fallthrough (`"the capsule could not be instantiated:
-  {err}"`) — no `DeniedCapability`, no operation name, nothing a caller could
-  alert on differently from an ordinary buggy capsule. Both fail closed
-  *today*, because `path_open`/`sock_connect`/`sock_send`/arbitrary namespaces are simply
+  `SandboxLoadError::ForbiddenImports` — a `DeniedCapability` enum plus an
+  `operation` field a caller can match on without parsing text.
+  `autumn-edge` has no equivalent — `EdgeArtifact::from_bytes` does no
+  import scan at all (its own doc comment says the *conformance suite* does
+  that, as a side check on first-party artifacts, not the host); an
+  unresolved import here fails inside `wasmi`'s own `linker.instantiate`
+  call and surfaces as a free-text string inside a generic `CapsuleError`
+  fallthrough. **Correction (Codex review):** an earlier version of this
+  bullet claimed that string was "untyped, un-named" — checked directly by
+  printing one (`"the capsule could not be instantiated: cannot find
+  definition for import wasi_snapshot_preview1::path_open with type
+  Func(...)"`), the import's module and name **are** present, just embedded
+  in `wasmi`'s own `Display` formatting of its internal error type rather
+  than exposed as a stable field. The real gap is narrower than originally
+  stated: not "no operation name," but "no structured, typed value — a
+  caller has to string-match against an upstream dependency's Debug/Display
+  output, which carries no stability contract, instead of matching on an
+  enum this crate owns." Both fail closed *today*, because
+  `path_open`/`sock_connect`/`sock_send`/arbitrary namespaces are simply
   never defined — but that is an accident of what's implemented, not a
-  designed, inspectable contract the way `plugin_sandbox`'s allowlist scan
+  designed, type-safe contract the way `plugin_sandbox`'s allowlist scan
   is. If `autumn-edge` ever needs to run a **less-trusted** artifact (its own
   module doc's stated purpose is proving native/edge parity for the app's
-  *own* build, i.e. first-party) this gap between "happens to fail closed"
-  and "fails closed by a checked, logged contract" is exactly the kind of
-  thing Keystone's option 1 (converge) would fix for free, and option 2
-  (document as deliberate) would need to write down explicitly rather than
+  *own* build, i.e. first-party) this gap between "happens to fail closed
+  with a parseable-but-unstable message" and "fails closed by a checked,
+  typed, logged contract" is exactly the kind of thing Keystone's option 1
+  (converge) would fix for free, and option 2 (document as deliberate)
+  would need to write down explicitly rather than
   leave implicit.
 - This sharpens, rather than resolves, Keystone's own three options: it is
   evidence *against* urgency (nothing is silently broken today) and
   evidence *for* option 1's stated benefit (a shared, checked allowlift
   mechanism the ecosystem doesn't currently apply to `autumn-edge`) over
-  option 3 (defer) if the deciding human weighs "no named-import diagnostic
-  today" as a real gap rather than an accepted one. That weighing is still
+  option 3 (defer) if the deciding human weighs "no *typed* named-import
+  diagnostic today, only a parseable string" as a real gap rather than an
+  accepted one. That weighing is still
   the human decision Keystone's memo correctly declined to make — this
   assay only replaces "we assume it still holds" with "it does hold, checked
   five pre-registered ways plus one supplemental, and here specifically is
