@@ -471,6 +471,17 @@ async fn experiment_admin_bulk_delete_batch_profile() {
         "cascading override delete must remove every override for a deleted experiment"
     );
 
+    // The N+1 floor claim, pinned as an assertion: one bulk action now costs
+    // exactly one delete statement, regardless of how many ids were
+    // submitted -- not `expected_ids_len` calls, one per id, the way the
+    // trait-default loop this replaces would have produced (see
+    // docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/baseline/).
+    assert_eq!(
+        delete_calls, 1,
+        "the batched execute_action must issue exactly one delete statement \
+         for the whole bulk action, not one per id"
+    );
+
     conn.transaction::<(), diesel::result::Error, _>(|conn| {
         explain(
             conn,
