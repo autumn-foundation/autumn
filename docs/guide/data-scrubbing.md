@@ -275,6 +275,14 @@ autumn db scrub --sample users=1% --seed 20260101
 
 The seed defaults to `0`, so a run is reproducible whether or not you pass one.
 
+That guarantee holds across operators, not just across repeats on one machine.
+The key is hashed from its text rendering, and several session settings change
+what that rendering is — `DateStyle` for a `date` or `timestamp` key,
+`bytea_output`, `extra_float_digits`, `IntervalStyle`, `TimeZone` — so the scrub
+pins all of them for its own transaction. Without that, the same seed over the
+same `date` primary key selects a different subset under `DateStyle = ISO, YMD`
+than under `Postgres, DMY`, and neither operator has any way to tell.
+
 ### Fail-closed, same as the classification
 
 Sampling refuses before it deletes anything when it cannot prove the result:

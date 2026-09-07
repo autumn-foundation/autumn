@@ -2523,7 +2523,7 @@ fn classify_and_apply(
             // transaction against whichever database the session happens to be
             // connected to — sampling one of them repeatedly, with row counts
             // taken from the others, and leaving the rest untouched.
-            eprintln!("  \\connect {}", quote_ident(&parsed_db_name(url)));
+            eprintln!("  {}", psql_connect(url));
             eprintln!("  BEGIN;");
             // The same session pins `execute` sets, before anything reads or
             // writes: without them a role-level `search_path` resolves the
@@ -3663,6 +3663,51 @@ fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> V
     tables
 }
 
+/// The `psql` meta-command that moves the session to one target, in full.
+///
+/// A bare `\connect dbname` reuses the host, port and user of the existing
+/// connection, so on a fleet whose shards are the same database name on
+/// different servers it silently keeps running against the first one — the
+/// boundary would look like it switched and would not have. Every component is
+/// therefore passed positionally, with `-reuse-previous=off` so nothing is
+/// inherited, and `-` for a component the URL does not carry.
+///
+/// The password is never emitted: `psql` prompts, or reads `.pgpass`.
+fn psql_connect(url: &str) -> String {
+    let parsed = url::Url::parse(url).ok();
+    let component = |value: Option<String>| {
+        value
+            .filter(|v| !v.is_empty())
+            .map_or_else(|| "-".to_owned(), |v| quote_psql_arg(&v))
+    };
+    let db = component(Some(parsed_db_name(url)).filter(|n| n != "<unknown>"));
+    let user = component(parsed.as_ref().map(|u| u.username().to_owned()));
+    let host = component(
+        parsed
+            .as_ref()
+            .and_then(|u| u.host_str().map(str::to_owned)),
+    );
+    let port = component(
+        parsed
+            .as_ref()
+            .and_then(|u| u.port().map(|p| p.to_string())),
+    );
+    format!("\\connect -reuse-previous=off {db} {user} {host} {port}")
+}
+
+/// One `psql` meta-command argument, double-quoted with backslash escapes —
+/// `psql` reads them that way inside double quotes, unlike SQL identifiers.
+fn quote_psql_arg(value: &str) -> String {
+    let escaped: String = value
+        .chars()
+        .flat_map(|c| {
+            let escape = matches!(c, '"' | '\\');
+            escape.then_some('\\').into_iter().chain(std::iter::once(c))
+        })
+        .collect();
+    format!("\"{escaped}\"")
+}
+
 /// The session settings the scrub pins for the whole transaction.
 ///
 /// A role- or database-level `search_path` (tenant schemas) would otherwise
@@ -3674,11 +3719,28 @@ fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> V
 /// Shared with the dry run: printing the statements without them advertises SQL
 /// that resolves differently from the command it claims to be, on exactly the
 /// targets whose `search_path` made the pinning necessary.
-fn session_settings() -> [String; 2] {
+fn session_settings() -> Vec<String> {
     [
-        "SET LOCAL search_path = pg_catalog, public".to_owned(),
-        "SET LOCAL standard_conforming_strings = on".to_owned(),
+        "SET LOCAL search_path = pg_catalog, public",
+        "SET LOCAL standard_conforming_strings = on",
+        // The rest pin how a value RENDERS, because the sample's row key is
+        // hashed from `key::text` and `--seed` promises the same seed against
+        // the same source selects the same rows. Measured: the same seed over a
+        // `date` primary key selects a different subset under `DateStyle = ISO,
+        // YMD` than under `Postgres, DMY`. `bytea_output` and
+        // `extra_float_digits` do the same for their types, and `IntervalStyle`
+        // for intervals. (`TimeZone` is pinned by the driver on connect, but
+        // relying on that leaves the guarantee resting on a dependency's
+        // default.)
+        "SET LOCAL DateStyle = 'ISO, YMD'",
+        "SET LOCAL IntervalStyle = 'iso_8601'",
+        "SET LOCAL TimeZone = 'UTC'",
+        "SET LOCAL bytea_output = 'hex'",
+        "SET LOCAL extra_float_digits = 3",
     ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// Every table the run locks, deduplicated and ordered, as `LOCK TABLE` SQL.
@@ -4038,6 +4100,57 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::{emptiness_assertion, integrity_assertion, triggers_reaching};
+
+    // ── The dry run's session and connection preamble ──────────────────────
+
+    #[test]
+    fn the_connect_boundary_carries_the_whole_endpoint_and_no_password() {
+        // A bare `\\connect dbname` inherits host, port and user, so a fleet whose
+        // shards share a database name on different servers would keep running
+        // against the first one while looking like it had moved.
+        let line = super::psql_connect("postgres://scrubby:hunter2@db1.internal:6543/app");
+        assert_eq!(
+            line,
+            r#"\connect -reuse-previous=off "app" "scrubby" "db1.internal" "6543""#
+        );
+        assert!(
+            !line.contains("hunter2"),
+            "the password must never reach the printed script: {line}"
+        );
+        // Components the URL does not carry become `-`, which `psql` reads as
+        // "use the default" rather than "reuse the previous connection's".
+        let sparse = super::psql_connect("postgres:///app");
+        assert_eq!(sparse, r#"\connect -reuse-previous=off "app" - - -"#);
+    }
+
+    #[test]
+    fn the_session_pins_cover_every_rendering_the_row_key_depends_on() {
+        // `--seed` promises the same seed over the same source selects the same
+        // rows, and the key is hashed from `key::text`. Measured: a `date`
+        // primary key selects a different subset under `DateStyle = ISO, YMD`
+        // than under `Postgres, DMY`.
+        let pinned = super::session_settings().join("; ");
+        for setting in [
+            "search_path",
+            "standard_conforming_strings",
+            "DateStyle",
+            "IntervalStyle",
+            "TimeZone",
+            "bytea_output",
+            "extra_float_digits",
+        ] {
+            assert!(
+                pinned.contains(setting),
+                "{setting} changes how a value renders, so it must be pinned: {pinned}"
+            );
+        }
+        assert!(
+            super::session_settings()
+                .iter()
+                .all(|s| s.starts_with("SET LOCAL ")),
+            "and every pin must be transaction-scoped: {pinned}"
+        );
+    }
 
     // ── Which triggers a statement can actually fire ────────────────────────
 

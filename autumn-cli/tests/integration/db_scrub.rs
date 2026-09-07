@@ -2139,12 +2139,14 @@ async fn the_printed_dry_run_walks_to_the_same_fixpoint_the_command_does() {
     // runs every transaction against whichever database psql is on.
     assert!(
         dry_err.contains("SET LOCAL search_path = pg_catalog, public;")
-            && dry_err.contains("SET LOCAL standard_conforming_strings = on;"),
+            && dry_err.contains("SET LOCAL standard_conforming_strings = on;")
+            && dry_err.contains("SET LOCAL DateStyle = 'ISO, YMD';"),
         "the printed transaction must pin the same session settings: {dry_err}"
     );
     assert!(
-        dry_err.contains(r#"\connect "deep_printed""#),
-        "and must say which database it is for: {dry_err}"
+        dry_err.contains(r#"\connect -reuse-previous=off "deep_printed""#),
+        "and must move the session to this target's own endpoint, inheriting \
+         nothing from the previous one: {dry_err}"
     );
     let script = printed_transaction(&dry_err);
     clients[1]
