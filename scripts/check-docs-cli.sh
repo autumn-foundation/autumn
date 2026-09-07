@@ -3167,6 +3167,7 @@ def _classify_option(tok, node):
       'terminal'  clap prints and exits 0 without checking requirements
       'known'     declared here; `eaten` tokens belong to it
       'cluster'   a compact short group; `eaten` tokens belong to it
+      'novalue'   declared, but given an attached value it does not take
       'unknown'   not declared; `eaten` is 1 when the value is attached
                   (so the name alone was wrong) and 0 when its arity is a guess
     """
@@ -3176,6 +3177,12 @@ def _classify_option(tok, node):
         if name in TERMINAL_OPTIONS:
             return 'terminal', 0
         if attached:                            # `--name=value`, self-contained
+            if not node['options'][name]:
+                # A valueless flag given a value. Clap's `bool` fields are
+                # `ArgAction::SetTrue` with `num_args(0)`, so `--reset=true` is
+                # "unexpected value 'true' for '--reset'", exit 2. The arity was
+                # already in the map; this branch simply never asked.
+                return 'novalue', 1
             return 'known', 1
         return 'known', 2 if node['options'][name] else 1
     if not attached:
@@ -3230,8 +3237,13 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
         if kind in ('known', 'cluster'):
             i += eaten
             continue
+        if kind == 'novalue':
+            if flags is not None:
+                flags.append((path, name, kind))
+            i += eaten
+            continue
         if flags is not None and _reportable_flag(name):
-            flags.append((path, name))
+            flags.append((path, name, kind))
         if eaten:                               # attached value: arity is known
             i += eaten
             continue
@@ -3277,10 +3289,15 @@ def resolve(tokens, surface, runnable=False, flags=None):
         # every root-level flag — `autumn --helpp` read exactly like the
         # `autumn --help` the guide runs. Not walked past: the root takes a
         # required subcommand, so there is nothing after it to judge.
-        name = tokens[0].split('=', 1)[0]
-        if name not in surface.get('', {'options': {}})['options']:
+        root = surface.get('', {'options': {}})
+        kind, _eaten = _classify_option(tokens[0], root)
+        if kind == 'novalue':
+            if flags is not None:
+                flags.append(('', tokens[0].split('=', 1)[0], kind))
+        elif kind == 'unknown':
+            name = tokens[0].split('=', 1)[0]
             if flags is not None and _reportable_flag(name):
-                flags.append(('', name))
+                flags.append(('', name, kind))
         return None
     if not TOKEN.match(tokens[0]):
         return None
@@ -3318,6 +3335,11 @@ def _walk(tokens, i, path, surface, runnable, flags):
             if kind in ('known', 'cluster'):
                 i += eaten
                 continue
+            if kind == 'novalue':
+                if flags is not None:
+                    flags.append((path, name, kind))
+                i += eaten                      # arity known: keep judging
+                continue
             if _starts_trailing(node, 0):
                 return None                     # forwarded verbatim, not judged
             # Not declared here. Reported when it is spelled like a flag; then
@@ -3325,7 +3347,7 @@ def _walk(tokens, i, path, surface, runnable, flags):
             # token) while a detached one stops the walk, since whether it eats
             # the next token is a guess and guessing invents defects.
             if flags is not None and _reportable_flag(name):
-                flags.append((path, name))
+                flags.append((path, name, kind))
             if eaten:
                 i += eaten
                 continue
@@ -3367,6 +3389,11 @@ def _walk(tokens, i, path, surface, runnable, flags):
                     if kind in ('known', 'cluster'):
                         i += eaten
                         continue
+                    if kind == 'novalue':
+                        if flags is not None:
+                            flags.append((path, o, kind))
+                        i += eaten              # arity known: keep judging
+                        continue
                     if _starts_trailing(node, supplied):
                         return None             # forwarded verbatim, not judged
                     if supplied < len(hyphen_slots) and hyphen_slots[supplied]:
@@ -3378,7 +3405,7 @@ def _walk(tokens, i, path, surface, runnable, flags):
                         i += 1
                         continue
                     if flags is not None and _reportable_flag(o):
-                        flags.append((path, o))
+                        flags.append((path, o, kind))
                     if eaten:                   # attached value: arity is known
                         i += eaten
                         continue
@@ -3484,7 +3511,7 @@ def scan(root, surface, files):
             hits = []
             bad = resolve(argv, surface, runnable=where == FENCED_COMMAND,
                           flags=hits)
-            for cmd_path, opt in hits:
+            for cmd_path, opt, kind in hits:
                 # Waived by the command-and-flag pair, and — exactly as for a
                 # command — never inside a fence. The reason is the same one:
                 # a fenced line is handed over to be run, so a page may NAME a
@@ -3494,7 +3521,7 @@ def scan(root, surface, files):
                 if where == PROSE_SPAN and line_block[lineno] in flag_allowed.get(key, ()):
                     waived += 1
                     continue
-                flag_defects.append((f, lineno, cmd_path, opt, display))
+                flag_defects.append((f, lineno, cmd_path, opt, display, kind))
             if bad is None:
                 continue
             command = bad[len('autumn '):]
@@ -3746,6 +3773,9 @@ def self_test():
     # #2498 it was walked away from in silence. It is collected through an
     # out-parameter so that a caller asking only about commands is unaffected.
     def opts_of(argv, runnable=False):
+        return [(p, n) for p, n, _k in raw_opts(argv, runnable)]
+
+    def raw_opts(argv, runnable=False):
         hits = []
         resolve(tk(argv), surface, runnable=runnable, flags=hits)
         return hits
@@ -3983,6 +4013,25 @@ def self_test():
            'and everything after it is forwarded too')
     expect(resolve(tk('test --nocapture'), surface, runnable=True) is None,
            'such a line is complete, not missing an argument')
+
+    # --- a valueless flag given a value. clap's `bool` fields are
+    # `ArgAction::SetTrue` with `num_args(0)`, so `--reset=true` is "unexpected
+    # value 'true' for '--reset'". The arity was already in the option map; the
+    # attached branch simply never asked, and accepted every such line.
+    expect(_classify_option('--reset=true', surface['test']) == ('novalue', 1),
+           'an attached value on a valueless flag is its own kind')
+    expect(_classify_option('--method=GET', surface['routes']) == ('known', 1),
+           '…while a value-taking option accepts the attached form')
+    expect(raw_opts('test --reset=true') == [('test', '--reset', 'novalue')],
+           'it is reported, and as novalue rather than unknown')
+    expect(raw_opts('routes --methd=GET') == [('routes', '--methd', 'unknown')],
+           'an undeclared attached option stays unknown')
+    # The distinction is the whole point of carrying the kind: `--reset` IS
+    # declared, and reporting "has no --reset" would send an author to fix the
+    # wrong thing.
+    expect(raw_opts('routes --user-only=yes --method=GET')
+           == [('routes', '--user-only', 'novalue')],
+           'the walk continues past it, so a later correct option is not reported')
 
     # Not every dashed token is a flag: the corpus writes prose arrows and
     # slash-joined shorthand in command position, and neither is copyable.
@@ -5010,7 +5059,7 @@ def self_test():
         tmp.write_text(flag_page)
         f_cmd, f_flags, f_waived = scan(tmp.parent, surface, [tmp.name])
     expect(f_waived == 1, f'the waived flag must be waived, got {f_waived}')
-    expect(sorted(l for _f, l, _c, _o, _d in f_flags) == [6, 9],
+    expect(sorted(l for _f, l, _c, _o, _d, _k in f_flags) == [6, 9],
            f'a fence and a distant paragraph must both still report: {f_flags}')
     expect(f_cmd == [],
            f'a flag waiver must not register as a COMMAND waiver: {f_cmd}')
@@ -6142,11 +6191,16 @@ def main():
           + (f' ({waived} waived)' if waived else ''))
     if flag_defects:
         print()
-        for f, lineno, cmd_path, opt, argv in flag_defects:
+        for f, lineno, cmd_path, opt, argv, kind in flag_defects:
             line = ('autumn ' + argv).strip()
-            # `cmd_path` is '' for an option passed to the root itself.
-            print(f'{f}:{lineno}: `{("autumn " + cmd_path).strip()}` has no '
-                  f'`{opt}`  (line: {line})')
+            # `cmd_path` is '' for an option passed to the root itself. The
+            # note has to match the defect: `--reset` IS declared, and telling
+            # an author it does not exist would send them to fix the wrong
+            # thing.
+            note = ('takes no value' if kind == 'novalue'
+                    else 'is not an option of this command')
+            print(f'{f}:{lineno}: `{("autumn " + cmd_path).strip()}`: '
+                  f'`{opt}` {note}  (line: {line})')
         print()
         print('Each line above tells a reader to pass an option the command '
               'does not declare; clap answers with "unexpected argument" and '
