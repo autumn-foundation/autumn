@@ -3187,7 +3187,13 @@ def _missing_value(kind, eaten, i, tokens, runnable):
     to one of them and not the others has been the cause of four review rounds
     on this PR.
     """
-    return (runnable and kind == 'known' and eaten == 2
+    # `cluster` as well as `known`: a compact group ending on a value-taking
+    # short has exactly the same arity, so `autumn build -p` is "a value is
+    # required for '--package <PACKAGE>'" (measured) just as `--package` is.
+    # Checking only `known` left the short spelling of this defect accepted —
+    # the same shape as finding 1, where `--name=value` was the unchecked
+    # spelling of an unchecked name.
+    return (runnable and kind in ('known', 'cluster') and eaten == 2
             and i + eaten > len(tokens))
 
 
@@ -4064,6 +4070,17 @@ def self_test():
            'a BOOLEAN option needs nothing after it')
     expect(raw_opts('migrate --shard=eu', runnable=True) == [],
            'an attached value counts as supplied')
+    # …and the SHORT spelling of the same defect. `_classify_option` calls a
+    # bare `-p` a cluster, so a check written for `known` alone missed it.
+    expect(raw_opts('migrate -p', runnable=True)
+           == [('migrate', '-p', 'needsvalue')],
+           'a bare value-taking short is reported too')
+    expect(raw_opts('migrate -p blog', runnable=True) == [],
+           '…and resolves when its value is there')
+    expect(raw_opts('migrate -pblog', runnable=True) == [],
+           '…or attached to the letter')
+    expect(raw_opts('migrate -p') == [],
+           'still prose-exempt, like the long spelling')
     expect(resolve(tk('replay -hpapi'), surface, runnable=True) is None,
            '…so <CAPSULE> is not reported missing')
     expect(resolve(tk('replay -papi'), surface, runnable=True) == 'autumn replay',
