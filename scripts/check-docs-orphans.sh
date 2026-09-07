@@ -1934,8 +1934,67 @@ def definition_labels(txt):
 #   measuring the bare forms of both shows why.
 ANY_IMAGE = re.compile(
     r'!\[|<(?:img|svg|video|canvas|object|embed|progress|meter'
-    r'|hr|input|select|textarea|button)\b',
+    r'|hr|select|textarea|button)\b',
     re.I)
+# `input` was in that list for one round and had to come out: it is the one
+# element here whose painting depends on an ATTRIBUTE. `<input type="hidden">`
+# is 0x0 with no clickable area, so a tag-name match called an empty anchor
+# content and let an orphan through — the very failure the `audio` note above
+# describes, which I wrote in the same commit that added `input`. The argument
+# was right and I did not apply it to the tag next to it.
+#
+# The type is read rather than the tag rejected outright, because every OTHER
+# type paints — text 185x17, checkbox 20x17, submit 57x17, image 57x17, and a
+# bare `<input>` 185x17 — so dropping the element would strand real links.
+_INPUT_TAG = re.compile(
+    r'<input\b(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
+# Measured, and none of it is guessable from the spec text alone:
+#   the value must be EXACTLY `hidden` — `type=" hidden "`, `type="hidden "`
+#   and `type="hiddenx"` all fall back to `text` and paint, so no stripping
+#   the value;
+#   matching is case-insensitive, attribute name and value both, and the value
+#   may be unquoted: `<input TYPE=HIDDEN>` is 0x0;
+#   the FIRST `type` wins when an author repeats it — `type="hidden"
+#   type="text"` is 0x0 while `type="text" type="hidden"` paints — which is why
+#   this searches for one rather than scanning them all.
+# The global `hidden` attribute needs nothing here: `<input hidden>` is already
+# blanked by the hidden-subtree pass before `has_content` sees the span,
+# verified against a corpus rather than assumed.
+_TYPE_ATTR = re.compile(
+    r'\btype' + _TWS + r'*=' + _TWS + r'*'
+    r'(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))', re.I)
+
+
+def _input_paints(tag):
+    """Whether an `<input>` renders anything the reader could click."""
+    m = _TYPE_ATTR.search(tag)
+    if not m:
+        return True
+    value = next(g for g in m.groups() if g is not None)
+    return value.lower() != 'hidden'
+
+
+def _paints_an_input(view, raw_span):
+    """Whether the span holds an `<input>` the reader can see.
+
+    The tags are FOUND in the masked view, so one inside a comment or a hidden
+    subtree is already blanked and cannot count. The type is READ from `raw`
+    at the same offsets, because attribute VALUES are blanked upstream —
+    `<input type="hidden">` arrives here as `<input type="      ">`, which
+    reads as an ordinary text input and calls an empty anchor content.
+
+    Same split, and the same reason, as the `hidden` attribute and the inline
+    `display:none` a few lines above: a bare attribute NAME survives masking
+    and a value does not. Offsets line up because every masker replaces space
+    for space.
+    """
+    for m in _INPUT_TAG.finditer(view):
+        tag = m.group(0)
+        if raw_span is not None and len(raw_span) == len(view):
+            tag = raw_span[m.start():m.end()]
+        if _input_paints(tag):
+            return True
+    return False
 # An element carrying `hidden`, and its OPENING tag only — the matching close
 # is found by a scan, because same-name nesting cannot be balanced by a regular
 # expression. `<span hidden><span></span>Mail</span>` closed at the INNER
@@ -2517,7 +2576,8 @@ def has_content(image_span, masked_span, raw_span=None):
     # not paint; these are the opposite case and must survive.
     return bool(decode_visible(ANY_TAG.sub('', masked_span))
                 .translate(_ZERO_WIDTH).strip(' \t\n\r\f\v')
-                or ANY_IMAGE.search(image_span))
+                or ANY_IMAGE.search(image_span)
+                or _paints_an_input(image_span, raw_span))
 
 
 def mask_invisible(txt, keep_images=False):
@@ -5961,6 +6021,65 @@ self_test() {
     > "$c9km/docs/guide/jobs.md"
   git -C "$c9km" add -A && git -C "$c9km" commit -qm style-entity-quote
   check "an encoded quote is decoded before the split" fail "$c9km"
+
+  # `<input type="hidden">` is 0x0 with nothing to click, so an anchor holding
+  # only one is empty. `input` was added to the painted-element list by tag
+  # NAME, which called this a route and let an orphan through.
+  local c9kn="$tmp/c9kn"; make_corpus "$c9kn"
+  printf '# Jobs\n\n<a href="mail.md"><input type="hidden"></a>\n' \
+    > "$c9kn/docs/guide/jobs.md"
+  git -C "$c9kn" add -A && git -C "$c9kn" commit -qm anchor-wrapping-hidden-input
+  check "an anchor wrapping a hidden input is not a route" fail "$c9kn"
+
+  # ...but every OTHER type paints — text 185x17, checkbox 20x17, submit
+  # 57x17, and a bare `<input>` 185x17 — so dropping the element outright
+  # strands a real link. That is the obvious over-correction to the case above.
+  local c9ko="$tmp/c9ko"; make_corpus "$c9ko"
+  printf '# Jobs\n\n<a href="mail.md"><input type="text"></a>\n' \
+    > "$c9ko/docs/guide/jobs.md"
+  git -C "$c9ko" add -A && git -C "$c9ko" commit -qm anchor-wrapping-text-input
+  check "an anchor wrapping a text input is a route" pass "$c9ko"
+
+  # The value must be EXACTLY `hidden`: `type=" hidden "` is not the hidden
+  # type at all, it falls back to `text` and paints. Stripping the value before
+  # comparing calls this empty and invents an orphan.
+  local c9kp="$tmp/c9kp"; make_corpus "$c9kp"
+  printf '# Jobs\n\n<a href="mail.md"><input type=" hidden "></a>\n' \
+    > "$c9kp/docs/guide/jobs.md"
+  git -C "$c9kp" add -A && git -C "$c9kp" commit -qm input-type-padded-hidden
+  check "a padded type value is not the hidden type" pass "$c9kp"
+
+  # ...matched case-insensitively, name and value, and the value may be
+  # unquoted.
+  local c9kq="$tmp/c9kq"; make_corpus "$c9kq"
+  printf '# Jobs\n\n<a href="mail.md"><input TYPE=HIDDEN></a>\n' \
+    > "$c9kq/docs/guide/jobs.md"
+  git -C "$c9kq" add -A && git -C "$c9kq" commit -qm input-type-unquoted-upper
+  check "an unquoted uppercase hidden type still hides" fail "$c9kq"
+
+  # ...and the FIRST `type` wins when an author repeats it, so this is hidden
+  # while the reverse order paints.
+  local c9kr="$tmp/c9kr"; make_corpus "$c9kr"
+  printf '# Jobs\n\n<a href="mail.md"><input type="hidden" type="text"></a>\n' \
+    > "$c9kr/docs/guide/jobs.md"
+  git -C "$c9kr" add -A && git -C "$c9kr" commit -qm input-duplicate-type
+  check "the first type attribute decides" fail "$c9kr"
+
+  # The type is read from RAW because values are blanked upstream — but the
+  # TAGS are found in the masked view, so one inside a comment cannot count.
+  # Scanning raw for both made this commented-out input content.
+  local c9ks="$tmp/c9ks"; make_corpus "$c9ks"
+  printf '# Jobs\n\n<a href="mail.md"><!-- <input type="text"> --></a>\n' \
+    > "$c9ks/docs/guide/jobs.md"
+  git -C "$c9ks" add -A && git -C "$c9ks" commit -qm commented-out-input
+  check "a commented-out input is not content" fail "$c9ks"
+
+  # ...and neither is one inside a hidden subtree.
+  local c9kt="$tmp/c9kt"; make_corpus "$c9kt"
+  printf '# Jobs\n\n<a href="mail.md"><span hidden><input type="text"></span></a>\n' \
+    > "$c9kt/docs/guide/jobs.md"
+  git -C "$c9kt" add -A && git -C "$c9kt" commit -qm hidden-subtree-input
+  check "an input in a hidden subtree is not content" fail "$c9kt"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
