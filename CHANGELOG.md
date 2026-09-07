@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SQLite runtime honesty (issues #1905 / #2539).** The runtime landed in
+  #2537; three things still behaved or read as though it had not.
+
+  **Its own unit tests now run.** `cargo test -p autumn-web --features sqlite
+  --lib` failed 52 tests, so the CI lane ran a module filter rather than a bare
+  `--lib` — which meant a newly added module could rot the same way the pool
+  tests already had, silently, because nothing ran it. Fixtures spelled
+  `postgres://` inline, which `build_sqlite_pool` correctly refuses, so they
+  panicked at construction. They now spell their target through a shared
+  `crate::test_urls` helper that picks one per backend, and the tests whose
+  SUBJECT is refused on SQLite (a distinct `replica_url`, the Postgres job
+  backend) are `#[cfg(not(feature = "sqlite"))]` with a SQLite counterpart
+  where one exists. The lane runs a bare `--lib`: 5607 tests under `sqlite`,
+  5648 under the default.
+
+  **Boot errors no longer echo credentials.** `DatabaseConfig::validate`
+  printed the offending URL raw, and it is the refusal an ordinary
+  `autumn.toml` misconfiguration actually hits — reaching `tracing::error!` one
+  line after the startup summary masked the same URL. The tree's three
+  redactors are consolidated into one (`db_url`), closing two holes on the way:
+  the message redactor recognized `postgres://` tokens only, so a
+  `mysql://user:pw@host` in a driver error went out whole; and the target
+  redactor returned any `sqlite://` target verbatim, including
+  `sqlite://user:hunter2@host/app.db`, since backend detection classifies by
+  scheme alone.
+
+  Redaction is now by allowlist per recognized backend rather than wholesale,
+  so the boot summary keeps what operators read it for: a Postgres target keeps
+  `sslmode`, `application_name`, `connect_timeout` and the other policy
+  parameters (`sslpassword` and anything unlisted go), a SQLite target keeps
+  its filename plus `mode`, `cache`, `immutable`, `vfs`, `nolock`, and a target
+  whose backend is unrecognized still loses its whole query string, because its
+  key names cannot be enumerated.
+
+  **The Postgres-only stores refuse a SQLite target.** `PgFlagStore`,
+  `PgExperimentStore` and `PgConfigStore` open a `diesel::PgConnection` and
+  issue `pg_notify` / `pg_advisory_xact_lock` / `jsonb` SQL.
+  `from_database_config` accepted a `sqlite://` URL and built a store that
+  failed on first use with a driver error naming a backend the operator never
+  chose; it now screens through the new
+  `DatabaseConfig::effective_primary_postgres_url` and returns `None`. **Note
+  the timing change:** an app that writes
+  `.with_flag_store(PgFlagStore::from_database_config(&cfg)?.expect(…))` and is
+  pointed at a SQLite target now fails at boot rather than at the first flag
+  read. Autumn never selects a store for you — pick the in-memory store on that
+  arm (`docs/guide/feature-flags.md` shows the shape).
+  `docs/guide/sqlite-in-production.md` gains a matrix row per affected
+  subsystem.
+
 - **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file
   whose generator template changed since the project was generated (issue
   #1835). `generate` now records a digest of every file it owns in
@@ -85,6 +134,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over this repo's own docs, with no surface an agent reaches for. The plugin
   needed no correction either: it names none of the five dead flags, and its one
   `build --release` is a genuine `cargo build --release` in the image builder.
+- **`scripts/check-sqlite-unification.sh`** — the `sqlite` feature is a backend
+  flip, so one dependency edge enabling it (`autumn-web = { …, features =
+  ["sqlite"] }`, or a feature forwarding `autumn-web/sqlite` under another
+  name) swaps `db::RuntimeConnection` for every consumer in the graph and
+  breaks the Postgres default. That invariant was prose, a `sqlite`-excluding
+  feature list in CI, and review; nothing read the manifests. The gate scans
+  every `Cargo.toml` in the tree, allows autumn-cli's own same-named opt-in
+  feature, and is self-testing with no toolchain. Wired into CI's `lint` job
+  and `scripts/pre-push-check.sh`, which skips the sqlite lane entirely.
+  [no-plugin] — a repo gate, no agent-facing surface.
+- **examples:** `examples/react-graphql`, a TypeScript React single-page app
+  on an Autumn backend that talks GraphQL through a plugin, against a real
+  Postgres `#[model]`. Two files carry the point. `src/graphql_plugin.rs` is a
+  generic `GraphqlPlugin<Q, M, S>` that adapts any `async-graphql` schema onto
+  an app — `AppBuilder::nest` for the raw router (with the schema as
+  router-local `Extension` state, so two schemas can share root types at two
+  paths), `declare_plugin_routes` so `autumn routes` and the audit gate see it,
+  per-execution injection of `AppState` into the GraphQL context, a
+  `PluginContract`, and a `GET` transport that refuses non-query operations
+  with `405`. `src/notes.rs` shows what that buys: every resolver builds the
+  generated `PgNoteRepository` from the pool on `AppState`
+  (`with_pool_untracked`, the constructor for code with no request), so
+  `#[normalize(trim)]`, the model's `#[validate]` rules, and the repository's
+  `MutationHooks` (`before_create` validation, a `before_delete` rule refusing
+  to delete a pinned note) apply identically to a GraphQL mutation and
+  the generated `api = "/api/notes"` REST handlers mounted beside it (the
+  `on_startup` seed runs once across instances, on one connection under a
+  transaction-scoped advisory lock). `AutumnError`s become GraphQL field errors carrying the
+  HTTP status in `extensions.status`. The plugin serves `POST /graphql`, the
+  GraphQL-over-HTTP `GET` form, and `GET /graphql/sdl`, whose output is
+  drift-tested against a committed `schema.graphql` the TypeScript types are
+  written against. The Vite/React 19 bundle is committed under `static/app/`
+  (fixed file names, no hash) and served by the standard `/static` mount under
+  the default `script-src 'self'` CSP, so `cargo run` needs no Node toolchain;
+  `autumn build --embed` bakes it into the binary (`embed_static!` +
+  `.embedded_static`, behind the crate's `embed-assets` feature); `npm run dev`
+  proxies `/graphql` to the Rust server for hot-reload work. Tested in two
+  tiers plus a smoke: `TestApp` tests with no Docker (shell, SDL drift,
+  `plugin_conformance::run_conformance`, error mapping, the `GET` guard,
+  two plugins at two paths), `TestDb` testcontainer tests that apply the
+  example's real embedded migration (rows, hooks, normalisation, validation,
+  REST/GraphQL parity), and a Chromium smoke that drives the real binary
+  against a testcontainer Postgres through a query and a form mutation.
+  Cataloged as a supported example.
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
@@ -148,6 +241,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-upgrade), where automatic detection is ambiguous, every attribute macro
   additionally accepts an explicit `crate = "..."` override, e.g.
   `#[get("/x", crate = "autumn_web_05")]`.
+- **docs:** three guide pages a reader could not reach are now indexed in the
+  root `README.md`, and `scripts/check-docs-orphans.sh` keeps every guide page
+  reachable. The corpus already gated the three things a reader copies off a
+  page — the link they click (`check-docs-links.sh`), the command they run
+  (`check-docs-cli.sh`) and the `AUTUMN_*` variable they set
+  (`check-docs-config.sh`) — but all three check a page the reader already
+  reached. Nothing checked whether a page could be reached at all, and that
+  failure is the quietest of the four: no 404, no exit code, no ignored
+  override, just a reader concluding the feature does not exist. `docs/guide/`
+  has no index page of its own, so its 155 pages are found through the
+  hand-maintained `## Documentation` list and the skill indexes, and nothing
+  noticed when a page was left off both. The baseline run found
+  `time-zones.md`, `active-search-and-autocomplete.md` and
+  `outbound-webhooks.md` unreachable from every reader entry point. Making
+  `outbound-webhooks.md` reachable then surfaced eight wrong claims about
+  delivery semantics in it, corrected here — every symbol it named resolved in
+  the current source the whole time, which is what a structural gate can check
+  and is not the same as being right.
+  `outbound-webhooks.md` is the sharpest: the README indexed
+  `signed-webhooks.md` (webhooks coming *in*), so a reader searching it for
+  "webhook" concluded that was all there was and never found the page on
+  sending signed webhooks *out* to endpoints their own customers register — a
+  surface with a filed SSRF report against it, whose only two mentions anywhere
+  were that report and a `///` comment, neither of them clickable. The gate
+  walks the graph a reader can click rather than counting inbound mentions,
+  because the weaker question misses exactly that case; the new index entries
+  are written in the words a reader searches for ("time zone", "timezone",
+  "autocomplete", "typeahead", "as you type", "outbound webhooks"), none of
+  which appeared anywhere in the README before. Wired into the docs-only CI
+  job; no toolchain needed.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
@@ -1735,6 +1858,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **admin-plugin:** `ListParams` gains `sql_offset_limit()`, converting a
+  page/per-page request into ready-to-bind `(offset, limit)` — `per_page == 0`
+  means unlimited, offset 0. `ExperimentAdminModel`, `TokenAdminModel`, and
+  `FeatureFlagAdminModel::list()` each reimplemented this identically; history
+  shows the "`per_page == 0`" special case was fixed in two of the three in
+  one commit and copy-pasted into the third when it was added later. A custom
+  `AdminModel::list()` implementation can now reuse the same helper instead of
+  re-deriving it. `[no-plugin]`: internal dedup, no new agent-facing surface.
 - **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job
   instead of the last step of `Test (ubuntu-latest)`:** as step 16 of that job
   it inherited a disk already filled by the whole workspace build plus eight
@@ -4157,6 +4288,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity between the input buffers and the emitted ones, so an `_owned`
   function that quietly delegated to its borrowed twin would fail even though
   its output is correct.
+
+- **`MemorySearchBackend::keyword_search` no longer compares every field
+  token against every query token:** `score` (in `autumn-search/src/memory.rs`)
+  looped over each field's tokens and, for every one, scanned the *entire*
+  query-token list looking for a match — `field_tokens.len() × tokens.len()`
+  `String` equality checks per field, most of which fall through to a real
+  `memcmp` because the corpus draws from a shared vocabulary with plenty of
+  same-length words. Profiling the committed `autumn-search/benches/keyword_search.rs`
+  harness (5,000-document, two-field corpus, ~206 words/document) with
+  `valgrind --tool=callgrind` found this comparison work — the scan loop plus
+  `memcmp` — at over 85% of the call's instructions. A query has far fewer
+  tokens than a field has words (2 vs. ~206 in the bench), so `StoredDocument`
+  now stores each field's tokens as occurrence counts
+  (`HashMap<String, u32>`, built once at write time, same as the prior
+  tokenize-at-write change) instead of a flat `Vec<String>`, and `score` looks
+  up each query token once instead of scanning every field token. Purely an
+  internal representation change to the in-memory reference/dev backend — no
+  public API moved and ranking behavior is unchanged (same 128 `autumn-search`
+  lib tests and 109 integration tests pass with unmodified assertions).
+  Measured on the same machine, one session: instructions (callgrind, 2,000
+  queries over the corpus) 77,559,837,270 → 23,238,817,778 (**-70.0%**);
+  marginal allocation blocks/query and bytes/query (dhat) are unchanged
+  (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
+  allocation-bound, so only the instruction floor is claimed.
 
 ## [0.7.0] - 2026-08-23
 

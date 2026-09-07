@@ -155,8 +155,11 @@ pub mod credentials;
 pub mod current;
 #[cfg(feature = "db")]
 pub mod db;
+pub(crate) mod db_url;
 pub mod dotenv;
 pub mod download;
+#[cfg(test)]
+pub(crate) mod test_urls;
 /// The edge capsule's read lane (issue #1790), re-exported from `autumn-edge`.
 ///
 /// [`EdgeRoute`](autumn_edge::EdgeRoute), [`EdgeCache`](autumn_edge::EdgeCache),
