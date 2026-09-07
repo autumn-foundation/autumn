@@ -466,6 +466,20 @@ def _positionals(payload):
 # so those five spellings silently switched the gate OFF for the rest of their
 # line, and (once flags are gated) each would be reported as drift against a
 # flag that is actually there. Multi-line `#[arg(…)]` forms failed identically.
+# Clap's generated help and version are TERMINAL actions: it prints and exits 0
+# without ever checking that the command's required subcommand or positionals
+# were supplied. So `autumn replay --help` succeeds — the CLI's own tests assert
+# it (`autumn-cli/tests/integration/replay.rs`) — even though `replay` requires
+# `<CAPSULE>`, and so do `autumn db --help` and `autumn deploy --help` against
+# their required subcommands.
+#
+# Recognising these as ordinary booleans (which is what putting them in the
+# option map did) made the walk consume one and then apply the end-of-input
+# requirements to a line that never reaches them. Only terminal when the node
+# actually DECLARES the flag: `autumn migrate --version` is still drift, since
+# `--version` lives on the root alone.
+TERMINAL_OPTIONS = frozenset({'--help', '-h', '--version', '-V'})
+
 # Flags clap supplies itself, on every command, taking no value.
 #
 # `--help`/`-h` ONLY. `--version` is declared once, by `#[command(version)]` on
@@ -3264,6 +3278,8 @@ def _walk(tokens, i, path, surface, runnable, flags):
                 if eaten is not None:
                     i += eaten
                     continue
+            if name in node['options'] and name in TERMINAL_OPTIONS:
+                return None                     # help/version: prints and exits 0
             if name not in node['options']:
                 # An option this command does not declare. Reported when it is
                 # spelled like a flag, and in either case the walk stops here:
@@ -3307,6 +3323,8 @@ def _walk(tokens, i, path, surface, runnable, flags):
                     if node['trailing'] and supplied:
                         return None
                     o = t2.split('=', 1)[0]
+                    if o in node['options'] and o in TERMINAL_OPTIONS:
+                        return None             # help/version: prints and exits 0
                     if o not in node['options'] and '=' not in t2:
                         # A compact short group: `-papi` is `--package api`, and
                         # `autumn replay <capsule> -papi` is a correct line. The
@@ -3821,6 +3839,26 @@ def self_test():
            'a complete command through that path resolves')
     expect(resolve(tk('routes /admin posture'), surface) is None,
            '…and in PROSE a bare group is still just its name')
+
+    # --- clap's help/version PRINT AND EXIT 0, without checking that the
+    # command's required subcommand or positionals were supplied. Treating them
+    # as ordinary booleans made the walk consume one and then apply the
+    # end-of-input requirements: `autumn replay --help` was reported as needing
+    # <CAPSULE>, though the CLI's own tests assert that line succeeds.
+    for form in ('replay --help', 'replay -h', 'db --help', 'db -h'):
+        expect(resolve(tk(form), surface, runnable=True) is None,
+               f'`autumn {form}` prints help and exits 0; it is not incomplete')
+    # …and the requirement checks still fire on the same commands without one.
+    expect(resolve(tk('replay'), surface, runnable=True) == 'autumn replay',
+           'a required positional is still required without --help')
+    expect(resolve(tk('db'), surface, runnable=True) == 'autumn db',
+           'a required subcommand is still required without --help')
+    # Terminal only where the flag is DECLARED: `--version` is the root's alone,
+    # so on a subcommand it stays drift rather than becoming a free pass.
+    expect(opts_of('migrate --version') == [('migrate', '--version')],
+           '--version on a subcommand is drift, not a terminal action')
+    expect(resolve(tk('replay --version'), surface, runnable=True) is None,
+           "…and an undeclared option still stops the walk, not reporting the args")
 
     # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
     # used to read these stopped at the list's first `]`, so the field vanished
