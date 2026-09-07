@@ -397,6 +397,81 @@ fn a_reshaped_model_does_not_register_its_field_schema() {
     );
 }
 
+// ── Field-level re-shaping on the read schema (issue #802) ─────────────
+
+mod schema_field_reshaped {
+    autumn_web::reexports::diesel::table! {
+        adapter_rows (id) {
+            id -> Int8,
+            amount -> Int8,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
+        deser_adapter_rows (id) {
+            id -> Int8,
+            amount -> Int8,
+        }
+    }
+}
+
+use schema_field_reshaped::{adapter_rows, deser_adapter_rows};
+
+/// Writes the `i64` as a JSON *string*, so the field's Rust type no longer
+/// describes what reaches the wire.
+fn amount_as_string<S>(value: &i64, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    ser.serialize_str(&value.to_string())
+}
+
+fn amount_from_anything<'de, D>(de: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de)
+}
+
+#[autumn_web::model(table = "adapter_rows")]
+pub struct AdapterRow {
+    #[id]
+    pub id: i64,
+    #[serde(serialize_with = "amount_as_string")]
+    pub amount: i64,
+}
+
+#[autumn_web::model(table = "deser_adapter_rows")]
+pub struct DeserAdapterRow {
+    #[id]
+    pub id: i64,
+    #[serde(deserialize_with = "amount_from_anything")]
+    pub amount: i64,
+}
+
+/// A serialization adapter on any field the response carries re-shapes that
+/// property, so the field-by-field schema must not be registered — the same
+/// rule the container attributes follow, asked of the fields.
+///
+/// `deserialize_with` is the control: it changes only what a request is parsed
+/// from, and this schema describes a response, so it still registers.
+#[test]
+fn a_field_serialization_adapter_blocks_registration() {
+    let registered =
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<AdapterRow>());
+    assert!(
+        registered.is_none(),
+        "`#[serde(serialize_with)]` decides what reaches the wire, so a schema built from \
+         the Rust type must not be advertised: {registered:?}"
+    );
+
+    assert!(
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<DeserAdapterRow>())
+            .is_some(),
+        "`#[serde(deserialize_with)]` leaves the response shape alone, so the read schema is \
+         still accurate and must still register"
+    );
+}
+
 // ── Conditional omission on the read schema (issue #802) ───────────────
 
 mod schema_conditional {

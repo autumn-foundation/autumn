@@ -254,6 +254,27 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
                 ),
             ));
         }
+        // A (de)serialization adapter can put ANY shape on the wire — an `i64`
+        // amount written as a string is the common one — so the field's Rust
+        // type stops describing it. All three spellings are rejected, not just
+        // the serialize half: this schema serves requests AND responses, so an
+        // adapter on either side can make it wrong for that side. `with` sets
+        // both at once.
+        if let Some(key) = crate::schema::serde_valued_key(
+            &field.attrs,
+            &["with", "serialize_with", "deserialize_with"],
+        ) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "#[derive(OpenApiSchema)] cannot describe a field with \
+                     `#[serde({key} = ...)]`: the adapter decides what actually reaches the \
+                     wire, so a schema built from the field's Rust type would advertise a \
+                     shape serde neither writes nor accepts. Write the `OpenApiSchema` impl \
+                     by hand and register it with `OpenApiConfig::register_schema`."
+                ),
+            ));
+        }
         if let Some(word) = crate::schema::variant_directional_skip_on_field(field) {
             return Err(syn::Error::new_spanned(
                 field,
@@ -419,4 +440,96 @@ fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    /// Run the struct audit over a fixture, returning the rejection message.
+    fn audit(input: &DeriveInput) -> Result<(), String> {
+        let Data::Struct(data) = &input.data else {
+            panic!("fixture must be a struct");
+        };
+        let Fields::Named(named) = &data.fields else {
+            panic!("fixture must have named fields");
+        };
+        reject_undescribable_struct(input, named).map_err(|e| e.to_string())
+    }
+
+    /// A serialization adapter decides what actually reaches the wire, so the
+    /// field's Rust type stops describing it. Rejected rather than guessed:
+    /// publishing the Rust shape would be confidently wrong.
+    #[test]
+    fn a_field_serialize_adapter_is_refused() {
+        let err = audit(&parse_quote! {
+            struct Money {
+                #[serde(serialize_with = "as_string")]
+                amount: i64,
+            }
+        })
+        .expect_err("a serialize adapter must be refused");
+        assert!(
+            err.contains("serialize_with"),
+            "the message must name the attribute it refused: {err}"
+        );
+    }
+
+    /// `with` sets both directions at once, so it is wrong for both.
+    #[test]
+    fn a_field_with_adapter_is_refused() {
+        let err = audit(&parse_quote! {
+            struct Money {
+                #[serde(with = "string_money")]
+                amount: i64,
+            }
+        })
+        .expect_err("a `with` adapter must be refused");
+        assert!(err.contains("with"), "{err}");
+    }
+
+    /// The deserialize half is refused too, and deliberately: this one schema
+    /// serves requests as well as responses, so an adapter on either side makes
+    /// it wrong for that side. (`#[model]`'s read schema, which describes only a
+    /// response, keeps `deserialize_with` for exactly that reason.)
+    #[test]
+    fn a_field_deserialize_adapter_is_refused_too() {
+        let err = audit(&parse_quote! {
+            struct Money {
+                #[serde(deserialize_with = "lenient")]
+                amount: i64,
+            }
+        })
+        .expect_err("a deserialize adapter must be refused");
+        assert!(err.contains("deserialize_with"), "{err}");
+    }
+
+    /// The guard must not fire on an ordinary struct — over-rejection would
+    /// break every existing derive.
+    #[test]
+    fn a_plain_struct_still_passes() {
+        audit(&parse_quote! {
+            struct Plain {
+                id: i64,
+                #[serde(rename = "displayName")]
+                name: String,
+                tags: Option<Vec<String>>,
+            }
+        })
+        .expect("a plain struct must still be describable");
+    }
+
+    /// A neighbouring serde key that merely *contains* an adapter name is not
+    /// one: the scan matches whole keys.
+    #[test]
+    fn a_lookalike_key_is_not_an_adapter() {
+        audit(&parse_quote! {
+            struct Plain {
+                #[serde(default = "with_default")]
+                amount: i64,
+            }
+        })
+        .expect("`default = \"with_default\"` is not an adapter");
+    }
 }

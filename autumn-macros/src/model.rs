@@ -7530,8 +7530,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // behaviour for exactly these models, which is honest rather than wrong —
     // and `autumn openapi export` names every placeholder it emits, so the
     // author is told rather than left guessing.
+    //
+    // The same question has to be asked of the FIELDS, not just the container:
+    // a field-level attribute re-shapes one property where a container one
+    // re-shapes the whole object, but either way the emitted schema stops
+    // describing the response. Only fields that actually reach the schema are
+    // consulted — `serializable_field_refs`, not every field — because an
+    // adapter on a field the response never carries cannot misdescribe it.
+    //
+    //   * `flatten`          — serde merges this field's keys into the parent
+    //                          object while the emitter publishes it as a
+    //                          nested property                        → skip
+    //   * `with = "m"`       — sets both directions; the serialize half can
+    //                          write any shape (an `i64` as a string, say),
+    //                          so the Rust type no longer describes it → skip
+    //   * `serialize_with`   — the serialize half alone, same reason    → skip
+    //   * `deserialize_with` — DESERIALIZE-side only; the response is still
+    //                          the Rust type                            → keep
+    let query_field_reshaped = serializable_field_refs.iter().any(|f| {
+        serde_bare_word(&f.attrs, &["flatten"]).is_some()
+            || serde_valued_key(&f.attrs, &["with", "serialize_with"]).is_some()
+    });
     let query_struct_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
-        || serde_valued_key(outer_attrs, &["into", "tag"]).is_some();
+        || serde_valued_key(outer_attrs, &["into", "tag"]).is_some()
+        || query_field_reshaped;
     let query_schema_descriptor = if query_struct_reshaped {
         quote! {}
     } else {
