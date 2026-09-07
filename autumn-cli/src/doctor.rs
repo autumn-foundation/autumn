@@ -15646,7 +15646,7 @@ foo = "bar"
         assert!(detail.contains("redis"), "got: {detail}");
     }
 
-    /// Issue #1907: the durable SQLite queue is a table both processes on the
+    /// Issue #1907: the durable `SQLite` queue is a table both processes on the
     /// host open, so it backs a split role.
     #[test]
     fn split_topology_passes_for_worker_role_on_sqlite_backend() {
