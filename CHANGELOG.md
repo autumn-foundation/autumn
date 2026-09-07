@@ -52,6 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ci:** the dependency-advisory gate (#1600, #2050) now also audits the two
+  satellite dependency graphs that sit **outside** the main workspace and its
+  own `Cargo.lock` — `fuzz/` (compiled and run by every `fuzz.yml` CI job) and
+  `examples/island-flock/` (never built in CI, but its compiled wasm/js
+  bundle is committed and served by the `flock` example). Each satellite now
+  carries its own narrower `deny.toml` (advisories + sources; licenses are not
+  yet gated there — see that file's header), audited by
+  `scripts/check-advisories.sh`'s new `audit_satellite_graphs` step. Neither
+  graph had ever been checked before: `fuzz/Cargo.lock` was regenerated here
+  (502 lines stale, and resolving to a yanked `chacha20 0.10.1` until this
+  fix), and `examples/island-flock/`'s graph carries two `unmaintained`
+  advisories now triaged and waived with reachability notes (RUSTSEC-2024-0370
+  confirmed unreachable — a proc-macro dependency never linked into the wasm
+  output; RUSTSEC-2025-0141 reachability undetermined, revisit at the next
+  rebuild). See `docs/reports/2026-09-07-ballast-dependency-ledger-audit.md`
+  for the full evidence trail.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite

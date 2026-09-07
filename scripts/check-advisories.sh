@@ -3,7 +3,7 @@
 #
 # Blocks a merge — and a release — when any crate in a dependency tree Autumn
 # ships carries a known RustSec advisory that no config explicitly waives.
-# Three graphs are audited, because "the dependency tree" means three different
+# Five graphs are audited, because "the dependency tree" means five different
 # things here:
 #
 #   1. deny.toml         — the workspace, default + Postgres + additive features.
@@ -15,9 +15,22 @@
 #                          shipped dependency tree, it fails here rather than in
 #                          a user's first CI run. See `audit_scaffold_graph` for
 #                          how closely that graph matches a real app's.
+#   4. fuzz/deny.toml     — the `fuzz` satellite workspace (its own Cargo.lock,
+#                          excluded from the root workspace but compiled and
+#                          run by every `fuzz.yml` CI job).
+#   5. examples/island-flock/deny.toml — the `island-flock` satellite
+#                          workspace (its own Cargo.lock, excluded from the
+#                          root workspace, never built in CI, but its
+#                          compiled wasm/js output IS committed and served by
+#                          the `flock` example). See `audit_satellite_graphs`
+#                          — added 2026-09-07 (docs/reports/2026-09-07-
+#                          ballast-dependency-ledger-audit.md) after GitHub's
+#                          own dependency graph found advisories neither of
+#                          these two satellite lockfiles had ever been
+#                          audited against.
 #
 # Usage:
-#   scripts/check-advisories.sh              # audit all three graphs
+#   scripts/check-advisories.sh              # audit all five graphs
 #   scripts/check-advisories.sh --self-test  # prove the gate still rejects a
 #                                            # known-vulnerable dependency
 #
@@ -143,13 +156,41 @@ audit_scaffold_graph() {
     check advisories
 }
 
+SATELLITE_GRAPHS="fuzz examples/island-flock"
+
+# `fuzz` and `examples/island-flock` are each their OWN workspace root (see
+# `[workspace] exclude` in the root Cargo.toml) with their own `Cargo.lock`,
+# so nothing above this function ever resolves their dependency graphs —
+# `cargo deny check` roots at whatever manifest it's pointed at, and every
+# call so far points at this repo's root manifest. Both are still real,
+# shipped surface: `fuzz` is compiled and run by every `fuzz.yml` CI job on
+# every push/PR, and `island-flock`'s compiled wasm/js bundle is committed
+# under examples/flock/static/islands/ and served by the `flock` example
+# (built and tested in the main workspace). Each carries its own narrower
+# `deny.toml` (advisories + sources only — see that file's header for why
+# licenses aren't gated here yet), picked up automatically since cargo-deny
+# reads `./deny.toml` relative to the current directory — so each check runs
+# from inside that satellite's own directory rather than via `--manifest-path`
+# (which would still resolve against the ROOT `deny.toml` unless `--config`
+# were also repeated; `cd` keeps the two in lockstep by construction).
+audit_satellite_graphs() {
+  for dir in ${SATELLITE_GRAPHS}; do
+    log "satellite advisories (${dir}/deny.toml)"
+    ( cd "${dir}" && cargo deny --offline check advisories sources )
+  done
+}
+
 run_gate() {
   require_cargo_deny
   # `--offline` below means cargo must already have every crate in the graph.
   cargo fetch --locked
+  for dir in ${SATELLITE_GRAPHS}; do
+    ( cd "${dir}" && cargo fetch --locked )
+  done
   fetch_advisory_db
   audit_workspace
   audit_scaffold_graph
+  audit_satellite_graphs
   log "advisory gate OK"
 }
 

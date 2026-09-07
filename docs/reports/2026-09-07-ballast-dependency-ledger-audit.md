@@ -1,180 +1,263 @@
 # ⚓ Ballast: first dependency ledger audit, 2026-09-07
 
-First Ballast pass in this repo (no prior run found: no `docs/reports/*ballast*`,
-no `Ballast`-grep hit in `git log --all`, no `chore(deps)`-style commit ever
-merged here). The dependency harness itself — `deny.toml`, `deny-sqlite.toml`,
-`scripts/check-advisories.sh`, the `autumn doctor` `dependencies` check from
-#1633 — already exists and is unusually mature, so this pass is the ledger
-audit the harness enables, not a harness build. It closes with a **ledger
-report**, not a PR that touches the manifest: nothing found clears the impact
-floor.
+First Ballast pass in this repo (no prior run found: no
+`docs/reports/*ballast*`, no `Ballast`-grep hit in `git log --all`, no
+`chore(deps)`-style commit ever merged here). The dependency harness itself —
+`deny.toml`, `deny-sqlite.toml`, `scripts/check-advisories.sh`, the `autumn
+doctor` `dependencies` check from #1633 — already exists and is unusually
+mature. This pass started as the ledger audit that harness enables, and found
+a real, evidenced gap in the harness's own coverage; the shipped result is a
+**Harness PR** that closes it, not a dependency bump.
 
 ## 🎯 Class
 
-Ledger report. No single target dependency — this is the full-ledger sweep
-Ballast's process document calls for before reacting to anything.
+Policy / Harness. Target: `scripts/check-advisories.sh`'s audit scope, plus
+two new satellite `deny.toml` files (`fuzz/deny.toml`,
+`examples/island-flock/deny.toml`).
 
 ## 📈 Evidence
 
-**Harness used** (installed `cargo-deny 0.20.2`, the exact version CI pins via
-`taiki-e/install-action`, fetched from its GitHub release since this sandbox
-had neither `cargo-deny` nor `cargo-audit` preinstalled):
+**How the gap was found.** `git push` to this repo's remote reported, from
+GitHub itself: *"GitHub found 15 vulnerabilities on
+autumn-foundation/autumn's default branch (2 high, 9 moderate, 4 low)."* That
+number does not square with `./scripts/check-advisories.sh` passing clean —
+GitHub's dependency graph scans **every `Cargo.lock` in the repo**, not just
+the one `cargo deny` is pointed at. `find . -name Cargo.lock -not -path
+"*/target/*"` turns up three:
 
 ```
-$ cargo fetch --locked
-$ ./scripts/check-advisories.sh          # the CI gate, run locally
-$ cargo deny check licenses sources
-$ cargo deny --config deny-sqlite.toml check licenses sources
-$ cargo deny check bans                  # multiple-versions, not CI-gated
-$ cargo deny list --format json          # license/crate census
-$ cargo update --dry-run --workspace --verbose
+./Cargo.lock                        — the root workspace, audited (deny.toml + deny-sqlite.toml)
+./fuzz/Cargo.lock                   — NOT audited anywhere
+./examples/island-flock/Cargo.lock  — NOT audited anywhere
 ```
 
-**Reachability-joined advisories — 0 unwaived, 3 waived, 0 reachable.**
-`./scripts/check-advisories.sh` passes clean on all three audited graphs
-(workspace, SQLite backend, day-one scaffold). The three existing
-`[advisories] ignore` entries in `deny.toml` were independently re-checked
-against current upstream state rather than taken on faith:
+Both are deliberately their own workspace roots — `Cargo.toml`'s
+`[workspace] exclude = ["fuzz", "examples/island-flock"]`, each with its own
+`[workspace]` table and comment explaining why (`fuzz` needs a nightly/ASAN
+build cargo-fuzz owns; `island-flock` only builds for
+`wasm32-unknown-unknown`) — so nothing in the existing `deny.toml`,
+`deny-sqlite.toml`, or the scaffold audit ever resolves their graphs. That
+exclusion is the right call for the *build*; it was never meant to exempt
+either tree from the *advisory* gate, and nothing in `scripts/
+check-advisories.sh` or `ci.yml` says so — they are just silently absent.
+Both are real, shipped surface, not dead code:
 
-| Advisory | Verdict (deny.toml's own) | Re-checked today |
-| --- | --- | --- |
-| RUSTSEC-2023-0071 (rsa Marvin Attack) | unreachable: RSA-JWT path only via `jsonwebtoken`, no network-reachable timing oracle | `rsa` max stable on crates.io is still **0.9.10** — no fixed release exists yet |
-| RUSTSEC-2024-0384 (`instant` unmaintained) | build-time only, via `managed-pg-bundled`'s embedded-Postgres stack | `instant` max stable is still **0.1.13** (unmaintained since 2024-05), no update |
-| RUSTSEC-2026-0253 (`lru::pop()` unsound) | workspace's own `lru` already fixed at 0.18.2; only the 0.16.4 copy pulled by MSRV-pinned `aws-sdk-s3 1.122` is exposed, and its one use (`S3ExpressIdentityCache`, `String` keys, `get_or_insert_mut` only) hits neither unsound precondition | `lru` max stable is now **0.18.4** (workspace copy could float higher, but that's cosmetic — the ignored copy is the transitive 0.16.4 one); `aws-sdk-s3` max stable is now **1.145.0**, still incompatible with this workspace's `rust-version = 1.88.0` floor per the existing pin comment in `autumn-storage-s3/Cargo.toml` / `autumn-media-plugin/Cargo.toml` (`>=1.122, <1.123` — "the last release compatible with this workspace's 1.88.0 MSRV") |
+- **`fuzz/`** is compiled and executed by `.github/workflows/fuzz.yml` on
+  every push/PR to `trunk`/`trunk-dev` (7 targets: idempotency, routing,
+  headers, session, body, dns, sandbox) — a production CI dependency graph
+  with zero supply-chain gating.
+- **`examples/island-flock/`** is never built in CI (`build-island.sh` is a
+  documented local/manual step), but its compiled output — 3 files,
+  `examples/flock/static/islands/{autumn_island_flock.js, ..._bg.wasm,
+  flock-boot.js}` — **is committed to the repo** and served by the `flock`
+  example, which the main workspace does build and test. Whatever advisory
+  state that manual build had at commit time is what real browsers execute
+  today.
 
-All three review-by dates are **2026-10-01**, 24 days out from this run —
-not yet due, and nothing upstream has changed that would move any of them
-early.
+**Auditing both graphs for the first time**, using the same `cargo-deny
+0.20.2` binary CI pins (installed here from its GitHub release, since neither
+`cargo-deny` nor `cargo-audit` was preinstalled in this sandbox):
 
-**Stale comment, not a ledger issue**: `deny.toml`'s advisories header claims
-`yanked = "warn"` currently flags "chacha20 0.10.1, transitive." That's no
-longer true — `Cargo.lock` now carries `chacha20 0.10.2`, and
-`cargo deny check advisories` emits no yanked warning in this run. Leaving
-this for whoever next edits that section; a comment fix alone isn't a ledger
-change worth its own PR.
+**`fuzz/`** — two real findings, both fixed in this PR:
 
-**Licenses — clean, one non-obvious pass worth recording.** `cargo deny check
-licenses` (workspace and SQLite graphs) and `cargo deny list` agree: 18 raw
-SPDX license identifiers appear somewhere in the tree, but only 17 are on
-`deny.toml`'s explicit allow-list. The 18th, `LGPL-2.1-or-later`, belongs to
-`r-efi` (2 duplicate versions, 5.3.0 and 6.0.0 — a `wasi`-target-only crate),
-whose actual license expression is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`.
-`cargo deny check` evaluates the SPDX expression and is satisfied by the
-`MIT`/`Apache-2.0` branch already on the allow-list — correct cargo-deny
-behavior, confirmed by reading `r-efi`'s own license expression, not a policy
-gap. Recorded so a future pass doesn't re-discover this as a false alarm.
+1. `fuzz/Cargo.lock` was **502 lines stale** against `fuzz/Cargo.toml`
+   (`cargo fetch --locked` refused to run: "cannot update the lock file...
+   because --locked was passed"). Last touched at commit `f29d4b4`
+   ("Run untrusted plugins in a capability-sandboxed WASM runtime", #1609) —
+   every dependency `autumn-web` gained since then (this crate pulls
+   `autumn-web` as a path dependency with `features = ["inbound-mail",
+   "multipart", "openapi", "acme", "plugin-sandbox"]`) was undeclared in the
+   lockfile. **Fixed**: regenerated via `cargo fetch` (network), then
+   rehearsed — `RUSTFLAGS="--cfg fuzzing" cargo +nightly check --workspace`
+   from `fuzz/` compiles clean (the `fuzzing` cfg is what `cargo fuzz` itself
+   sets; a plain `cargo check` doesn't, so it's needed to reach
+   `autumn::__fuzz`, the `#[cfg(fuzzing)]`-gated module the fuzz targets
+   import). The stale lockfile also carried a **yanked** `chacha20 0.10.1`
+   (via `rand 0.10.2 -> postgres-protocol -> tokio-postgres -> autumn-web`);
+   `cargo update -p chacha20` moved it to `0.10.2`, matching what the main
+   workspace already resolved to.
+2. With the refreshed lockfile, `cargo deny check advisories` finds
+   **RUSTSEC-2023-0071** (the `rsa` "Marvin Attack" timing sidechannel) —
+   same crate, same `jsonwebtoken -> autumn-web` ingress the root `deny.toml`
+   already carries a waiver for. Confirmed none of the 7 fuzz targets touch
+   JWT (`grep -ln jwt fuzz_targets/*.rs` — empty). **Waived** in the new
+   `fuzz/deny.toml` with the same reasoning as the root policy, review-by
+   2026-10-01 to match.
 
-**Sources — clean.** All crates resolve from `crates.io`; no git sources, no
-unknown registries (`cargo deny check sources`, both graphs). Direct manifest
-scan (`grep -rn 'version = "\*"'` and `git = "` across every `Cargo.toml` in
-the workspace) found zero wildcard version specifiers and zero git
-dependencies anywhere — this is worth stating explicitly because
-`[bans] wildcards = "allow"` in `deny.toml` is a permissive *setting*, and
-without checking the manifests directly that reads like an open gap rather
-than the "there's nothing here to gate" it actually is.
+**`examples/island-flock/`** — two `unmaintained` findings, both triaged
+with a real reachability call, neither with a safe upgrade available:
 
-**Duplicate versions — pervasive, already a documented, deliberate
-non-gate.** `cargo deny check bans` (not CI-gated, per `deny.toml`'s own
-note) finds **73 crate names** with duplicate versions in the audited graph —
-dominated by the RustCrypto 0.9/0.10-era split (aes, digest, ecdsa,
-elliptic-curve, hmac, p256, sec1, signature, spki, …) and the
-`windows-sys`/`windows-targets` per-target-triple shim family. This matches
-`deny.toml`'s existing rationale verbatim ("pervasive and cosmetic... RustCrypto
-old/new, windows-sys target shims"). No single collapse here clears a ≥3-node
-subtree without also picking a side in an upstream RustCrypto major-version
-split across half a dozen unrelated dependency chains — that's a forcing-fact
-question for a specific `Upgrade`-class PR later, not something a ledger sweep
-should force today.
+1. **RUSTSEC-2024-0370** (`proc-macro-error`, via `yew-macro`). `cargo tree
+   -i proc-macro-error` marks it `(proc-macro)` — it runs only on the host
+   compiler during the build and cannot be linked into the
+   `wasm32-unknown-unknown` output. **Confirmed unreachable.**
+2. **RUSTSEC-2025-0141** (`bincode` 1.3.3, "unmaintained" after a maintainer
+   harassment/doxxing incident — no CVE, the team calls 1.3.3 complete).
+   Arrives via `gloo-worker -> gloo -> prokio -> yew`, i.e. `yew`'s own
+   internal runtime plumbing, not anything `island-flock`'s source touches
+   (`grep -rn gloo_worker src/` is empty). `cargo tree -i bincode` roots at
+   `yew` itself. **Reachability left undetermined, not claimed unreachable**:
+   confirming that plumbing is dead-code-eliminated from the actual compiled
+   `.wasm` would need a symbol-table inspection of the built artifact, not
+   done this pass. Waived with that caveat stated plainly and a revisit
+   trigger tied to the crate's next rebuild, rather than a confident claim
+   this pass didn't earn.
 
-**Graph facts** (deny.toml's own audited feature graph, via
-`cargo deny list --format json`):
+Both licenses were checked too, deliberately **not gated yet**:
+`cargo deny check licenses` on `fuzz/`'s graph fails on `libfuzzer-sys`,
+which carries `(MIT OR Apache-2.0) AND NCSA` — an unconditional (not
+OR-satisfied) NCSA component, a license class not on the root allow-list and
+new to this tree. Accepting a new license class is explicitly an "ask
+before" decision, not something this pass should decide unilaterally by
+adding NCSA to an allow-list. `fuzz/deny.toml` and `examples/island-flock/
+deny.toml` therefore each gate only `advisories` and `sources` (both
+independently confirmed clean for both graphs), with the license question
+left open and stated in both files' headers and here.
 
-- 743 unique crate@version nodes, 665 unique crate names
-- 131 direct (non-workspace) dependencies declared across the 28 workspace
-  member crates (whole-workspace `cargo metadata` resolve; a slightly wider
-  scope than `deny.toml`'s curated feature list, cross-checked here rather
-  than taken as identical)
-- 73 crate names carrying duplicate versions (above)
+**The rest of the ledger** — re-verified clean, unrelated to the gap above:
 
-**Scheduled-batch check.** `cargo update --dry-run --workspace --verbose`
-locks **0 packages** — every dependency already sits at the newest version
-its current manifest constraint permits. 121 dependencies show as "behind
-latest" in the verbose diff, but every one sampled is blocked by either an
-upstream pre-release pin outside our control (e.g. `aead 0.6.0-rc.10`, held
-by `rsa`'s own manifest, not ours) or this workspace's `rust-version = 1.88.0`
-floor (e.g. `aes 0.9.3 requires Rust 1.89`). A scheduled-batch PR opened today
-would carry an **empty lockfile diff** — there is nothing to batch yet.
+- **Root workspace advisories** — 0 unwaived. The 3 existing `deny.toml`
+  ignores (`RUSTSEC-2023-0071` rsa, `RUSTSEC-2024-0384` instant,
+  `RUSTSEC-2026-0253` lru) were independently re-checked against current
+  upstream state rather than taken on faith: `rsa` max stable is still
+  0.9.10 (no fix), `instant` max stable is still 0.1.13 (unmaintained since
+  2024, no fix), and `aws-sdk-s3` max stable is now 1.145.0 but still
+  incompatible with this workspace's `rust-version = 1.88.0` floor — the
+  existing `>=1.122, <1.123` pin in `autumn-storage-s3`/`autumn-media-plugin`
+  is still the last MSRV-compatible release. All three share a 2026-10-01
+  review-by date, 24 days out — not yet due.
+- **Licenses/sources, root + SQLite graphs** — clean
+  (`cargo deny check licenses sources`, both configs). One non-obvious pass
+  worth recording: 18 raw SPDX identifiers appear in the tree via `cargo deny
+  list`, but only 17 are on the allow-list — the 18th, `LGPL-2.1-or-later`,
+  belongs solely to `r-efi`'s `MIT OR Apache-2.0 OR LGPL-2.1-or-later`
+  expression and is satisfied by the `MIT`/`Apache-2.0` branch. Correct
+  cargo-deny behavior, not a policy gap; recorded so a future pass doesn't
+  re-flag it.
+- **Wildcards / unpinned git refs** — zero, anywhere (`grep -rn 'version =
+  "\*"' --include=Cargo.toml .` and the equivalent for `git = "` both empty
+  across the whole repo, main workspace and both satellites).
+- **Duplicate versions** — 73 crate names duplicated in the root audited
+  graph (`cargo deny check bans`), dominated by a RustCrypto 0.9/0.10 split
+  and per-target `windows-sys` shims. Matches `deny.toml`'s own existing
+  rationale ("pervasive and cosmetic... RustCrypto old/new, windows-sys
+  target shims") verbatim. No collapse here clears a ≥3-node subtree without
+  picking a side in an unrelated upstream major-version split — left as-is,
+  a forcing-fact question for a future `Upgrade`-class PR.
+- **Scheduled batch** — `cargo update --dry-run --workspace --verbose` locks
+  **0 packages** in the root graph; every dependency already sits at the
+  newest version its manifest constraint permits (the ~121 "behind latest"
+  entries are each blocked by an upstream pre-release pin or this
+  workspace's own MSRV floor). A batch PR opened today would carry an empty
+  root-lockfile diff.
+- **Pain ledger** — no prior Ballast run and no prior dependency-only commit
+  exist anywhere in this repo's history.
 
-**Pain ledger.** No prior Ballast run and no prior dependency-only commit
-exist anywhere in this repo's history (`git log --all --grep=Ballast -i`,
-`git log --all --grep='chore(deps)'` both empty). The only pain-ledger record
-today is `deny.toml`'s own inline comments, which already cite their forcing
-history per ignored advisory.
+**Graph facts** (root workspace, `deny.toml`'s own audited feature graph):
+743 unique crate@version nodes, 665 unique crate names, 131 direct
+(non-workspace) dependencies across the 28 workspace members.
 
 ## 💡 Mechanism / forcing fact
 
-None found. Every one of Ballast's floor conditions was checked and none
-holds today: 0 reachable advisories to close (all 3 known ones are
-unreachable/no-fix and independently re-confirmed as such), no ≥3-node
-duplicate subtree collapsible without picking a side in an unrelated
-RustCrypto-major fight, no unused dependency or feature identified in this
-pass's scope, no measured ≥10% build-time or size win (cost attribution
-wasn't run this pass — see Follow-ups), no scheduled batch available (0
-packages movable), no supply-chain fact to fix (no wildcards, no git refs,
-sources/licenses both clean). Per the hard gate, that means: no PR, because
-manufacturing one now would be "churn with a lockfile diff" against
-Ballast's own banned-changes list, not hygiene.
+Two independent, mechanically-verified facts, both about coverage rather
+than any single dependency:
+
+1. GitHub's own dependency graph — a signal external to this repo's own
+   tooling — reported vulnerabilities this repo's advisory gate structurally
+   cannot see, because two real, CI-relevant dependency graphs live outside
+   every config path `scripts/check-advisories.sh` walks.
+2. Once audited, both graphs had real, non-trivial findings: a lockfile 502
+   lines stale carrying a yanked crate, and two `unmaintained` advisories
+   that would fail the same `unmaintained = "all"` policy the root graph
+   holds itself to.
+
+That is a forcing fact for closing the gap now, not filing it as a future
+recommendation: "the harness is the deliverable" applies exactly here, and
+per the impact floor, a **supply-chain fact fixed** (a stale/yanked lockfile
+repaired, two previously-unaudited graphs brought under the same gate the
+rest of the repo already trusts) clears it on its own.
 
 ## 🔧 Change
 
-None. This report is the deliverable.
+- `fuzz/Cargo.lock` — regenerated (502 insertions / 6 deletions), no longer
+  resolves the yanked `chacha20 0.10.1`.
+- `fuzz/deny.toml` — new. Advisories + sources only (see licenses note
+  above); one reasoned, review-dated waiver (`RUSTSEC-2023-0071`, mirroring
+  the root policy).
+- `examples/island-flock/deny.toml` — new. Advisories + sources only; two
+  reasoned, review-dated waivers (`RUSTSEC-2024-0370` unreachable,
+  `RUSTSEC-2025-0141` undetermined).
+- `scripts/check-advisories.sh` — new `audit_satellite_graphs` step (plus
+  the matching `cargo fetch --locked` for each satellite manifest before the
+  offline checks run), wired into `run_gate`; header comment updated from
+  "three graphs" to "five graphs" with the two new ones documented inline.
+  Runs automatically in CI — `ci.yml`'s `supply-chain` job already calls
+  this script with no changes needed there.
+- `deny.toml` — one-line pointer added to the header noting the two
+  satellite configs exist and where.
+- `CHANGELOG.md` — `Unreleased`/`Added` entry summarizing the gap and the fix
+  for anyone tracking CI/dev-tooling changes.
+
+Not shipped, and deliberately left for a human decision rather than decided
+here: gating **licenses** on either satellite graph, because doing so today
+would require accepting `libfuzzer-sys`'s NCSA license component into the
+tree — a new license class, which this charter's "ask before" list puts
+outside this pass's authority to decide unilaterally.
 
 ## 📊 Measurement
 
-Baseline recorded for the next pass to diff against:
-
-| Metric | Value |
-| --- | --- |
-| Workspace members | 28 |
-| Direct (non-workspace) deps | 131 |
-| Unique crate@version nodes (deny.toml graph) | 743 |
-| Unique crate names (deny.toml graph) | 665 |
-| Crate names with duplicate versions | 73 |
-| Advisories matched to graph | 3 (0 reachable, 3 unreachable/no-fix, 0 undetermined) |
-| License identifiers in tree / on allow-list | 18 / 17 explicit (+1 satisfied via OR-expression) |
-| Wildcard version specifiers | 0 |
-| Unpinned git dependencies | 0 |
-| Packages `cargo update` would move today | 0 |
-
-Not measured this pass (scope call, not an oversight — recorded so the next
-Ballast run doesn't have to rediscover the gap):
-
-- Build-time / binary-size cost attribution per dependency
-- Usage audit (which surface of each heavy dependency is actually called)
-- Unused-default-feature audit
+| Check | Before | After |
+| --- | --- | --- |
+| Graphs audited by `scripts/check-advisories.sh` | 3 | 5 |
+| `fuzz/` advisory coverage | none (no config referenced this graph) | `cargo deny check advisories sources` — clean, 1 reasoned waiver |
+| `examples/island-flock/` advisory coverage | none | clean, 2 reasoned waivers |
+| `fuzz/Cargo.lock` staleness | 502 lines behind `fuzz/Cargo.toml` | current |
+| Yanked crates in `fuzz/`'s graph | 1 (`chacha20 0.10.1`) | 0 |
+| Unmaintained/unsound advisories in `island-flock`'s graph | 2, unaudited | 2, triaged (1 confirmed unreachable, 1 undetermined) |
+| Root workspace: unwaived advisories / licenses / sources | 0 / clean / clean | unchanged (re-verified, not touched) |
+| `fuzz` rehearsal | — | `RUSTFLAGS="--cfg fuzzing" cargo +nightly check --workspace` from `fuzz/`: clean |
+| `island-flock` rehearsal | — | `cargo check --target wasm32-unknown-unknown` from `examples/island-flock/`: clean |
+| Full gate | `./scripts/check-advisories.sh`: OK (3 graphs) | `./scripts/check-advisories.sh`: OK (5 graphs) |
+| Self-test | `./scripts/check-advisories.sh --self-test`: OK | unchanged, still OK (root + scaffold policies; not extended to the two new satellite configs this pass) |
 
 ## 🔬 Reproduce
 
 ```
 cargo fetch --locked
-./scripts/check-advisories.sh                       # CI's own gate
+(cd fuzz && cargo fetch --locked)
+(cd examples/island-flock && cargo fetch --locked)
+./scripts/check-advisories.sh                 # now audits all 5 graphs
+./scripts/check-advisories.sh --self-test
+
+# per-graph, standalone
+(cd fuzz && cargo deny --offline check advisories sources)
+(cd examples/island-flock && cargo deny --offline check advisories sources)
+
+# rehearsals
+(cd fuzz && RUSTFLAGS="--cfg fuzzing" cargo +nightly check --workspace)
+(cd examples/island-flock && cargo check --target wasm32-unknown-unknown)
+
+# root-graph re-verification (unchanged by this PR)
 cargo deny check licenses sources
 cargo deny --config deny-sqlite.toml check licenses sources
-cargo deny check bans                                # duplicate-version census
-cargo deny list --format json                        # license census
-cargo update --dry-run --workspace --verbose         # scheduled-batch check
-grep -rn 'version = "\*"' --include=Cargo.toml .     # wildcard scan
-grep -rn 'git = "' --include=Cargo.toml .            # unpinned git-ref scan
+cargo deny check bans
+cargo deny list --format json
+cargo update --dry-run --workspace --verbose
 ```
 
 ## Follow-ups for the next pass
 
-1. Revisit all three `deny.toml` ignores on/after **2026-10-01** (their
-   shared review-by date) — re-check `rsa`, `instant`, and
-   `aws-sdk-s3`/`lru` upstream status then.
-2. `deny.toml`'s advisories header comment names a stale yanked version
-   (`chacha20 0.10.1`); the tree is on `0.10.2` now. Worth a one-line fix
-   whenever that section is next touched.
-3. Run cost attribution (`cargo build --timings`) and a usage audit on the
-   heaviest hires once a baseline harness for those exists — this pass only
-   covered the advisory/license/source/duplicate/pin sweep.
+1. Revisit all advisory ignores sharing the **2026-10-01** review-by date
+   (root `deny.toml`'s three, plus `fuzz/deny.toml`'s one) then; re-check
+   upstream `rsa`, `instant`, and `aws-sdk-s3`/`lru` status.
+2. `examples/island-flock/deny.toml`'s `RUSTSEC-2025-0141` waiver is honest
+   about being undetermined, not unreachable — the next time `island-flock`'s
+   wasm output is rebuilt (`build-island.sh`) is the natural point to inspect
+   the artifact's retained symbols and firm up that verdict.
+3. A human decision is needed on whether to accept NCSA (via `libfuzzer-sys`)
+   as a new allowed license class for `fuzz/`'s graph — until then, `fuzz/`
+   and `island-flock`'s `deny.toml`s stay advisories+sources only.
+4. Cost attribution (`cargo build --timings`) and a usage/unused-feature
+   audit on the root graph's heaviest hires were still not run this pass —
+   this pass's scope was the coverage-gap fix plus the advisory/license/
+   source/duplicate/pin sweep.
