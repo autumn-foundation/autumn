@@ -439,8 +439,16 @@ def _positionals(payload):
 # line, and (once flags are gated) each would be reported as drift against a
 # flag that is actually there. Multi-line `#[arg(…)]` forms failed identically.
 # Flags clap supplies itself, on every command, taking no value.
-BUILTIN_OPTIONS = {'--help': False, '-h': False,
-                   '--version': False, '-V': False}
+#
+# `--help`/`-h` ONLY. `--version` is declared once, by `#[command(version)]` on
+# the root `Cli`, and clap does not put a root version flag on subcommands
+# unless `propagate_version` is set — which this CLI does not set anywhere. So
+# `autumn migrate --version` is `error: unexpected argument '--version' found`,
+# and seeding it onto every node would make the gate accept a line the CLI
+# rejects, which is the one thing a drift gate must never do. The root's own
+# `autumn --version` never reaches this map: the walk requires a command word
+# in the first position, so a bare flag there resolves to nothing.
+BUILTIN_OPTIONS = {'--help': False, '-h': False}
 
 _ARG_OPEN = re.compile(r'#\[arg\(')
 _ARG_TAIL = re.compile(
@@ -2981,15 +2989,28 @@ def _short_cluster(tok, options):
     return 1
 
 
-# A token that starts with `-` is only judged as a flag when it is SPELLED like
-# one. The corpus writes plenty of things in a command position that begin with
-# a dash and are not options a reader can copy: `->` in a prose arrow
-# (`autumn upgrade - app-code migrations 0.5.0 -> 0.6.0`) and slash-joined
+# A token that starts with `-` is judged as a flag unless it carries a character
+# that marks it as prose rather than something a reader could type. The corpus
+# writes several such things in command position: `->` in a prose arrow
+# (`autumn upgrade - app-code migrations 0.5.0 -> 0.6.0`), slash-joined
 # shorthand naming several flags at once (`autumn token issue
-# --name/--scope/--expires-at`, `autumn seed --count/--model`). Those are not
-# drift and never were — reporting them would be reporting prose. They still
-# stop the walk, exactly as they do today, because their arity is unknown.
-_FLAG_SHAPE = re.compile(r'^(?:--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z])$')
+# --name/--scope/--expires-at`, `autumn seed --count/--model`), and
+# `--flag <PLACEHOLDER>` forms. Reporting those would be reporting prose.
+#
+# The exclusion is by prose PUNCTUATION, never by requiring the token to be
+# spelled the way this project spells its flags. Matching `--[a-z0-9-]+` was the
+# first version and it silently dropped exactly the misspellings the gate is for:
+# `autumn dev --show_config` (an underscore where the real flag has a hyphen) is
+# rejected by clap and was reported by nothing, and an unresolvable compact short
+# like `-zz` went the same way. A gate that only reports flags already spelled
+# correctly reports almost nothing.
+_PROSE_IN_FLAG = re.compile(r'''[/<>{}$`|\\"'()\[\]]''')
+
+
+def _reportable_flag(name):
+    """Is this dashed token a flag spelling a reader could copy, or prose?"""
+    return (name.startswith('-') and name not in ('-', '--')
+            and not _PROSE_IN_FLAG.search(name))
 
 
 def resolve(tokens, surface, runnable=False, flags=None):
@@ -3036,7 +3057,19 @@ def resolve(tokens, surface, runnable=False, flags=None):
             return None
         if tok.startswith('-') and len(tok) > 1:
             name = tok.split('=', 1)[0]
-            if '=' in tok:                      # --name=value, self-contained
+            # `--name=value` carries its own value, so its ARITY is known — but
+            # its NAME still has to exist. Returning here on the strength of the
+            # `=` alone let `autumn build --definitely-not-real=value` through
+            # without ever reaching the membership check below, which is the
+            # attached spelling of the very defect this gate reports.
+            attached = '=' in tok
+            if attached:
+                if name not in node['options']:
+                    if flags is not None and _reportable_flag(name):
+                        flags.append((path, name))
+                    # Unlike the detached form, this one can be walked past: the
+                    # value is inside the token, so the next token is still the
+                    # command's to judge.
                 i += 1
                 continue
             if not tok.startswith('--') and len(tok) > 2:
@@ -3054,7 +3087,7 @@ def resolve(tokens, surface, runnable=False, flags=None):
                 # spelled like a flag, and in either case the walk stops here:
                 # whether it consumes the next token is unknown, so anything
                 # after it cannot be judged without risking a false positive.
-                if flags is not None and _FLAG_SHAPE.match(name):
+                if flags is not None and _reportable_flag(name):
                     flags.append((path, name))
                 return None
             i += 2 if node['options'][name] else 1
@@ -3086,11 +3119,14 @@ def resolve(tokens, surface, runnable=False, flags=None):
                     if node['trailing'] and supplied:
                         return None
                     o = t2.split('=', 1)[0]
-                    if '=' in t2:
+                    if '=' in t2:               # value attached; name still checked
+                        if o not in node['options']:
+                            if flags is not None and _reportable_flag(o):
+                                flags.append((path, o))
                         i += 1
                         continue
                     if o not in node['options']:
-                        if flags is not None and _FLAG_SHAPE.match(o):
+                        if flags is not None and _reportable_flag(o):
                             flags.append((path, o))
                         return None             # unknown arity: cannot count on
                     i += 2 if node['options'][o] else 1
@@ -3393,6 +3429,32 @@ def self_test():
            'an undeclared option on a LEAF command must be reported too')
     expect(opts_of('migrate --help') == [] and opts_of('console -h') == [],
            "clap's own --help is on every command and is not drift")
+    # …but NOT --version. It is declared once, by `#[command(version)]` on the
+    # root, and clap propagates it to subcommands only under
+    # `propagate_version`, which this CLI does not set. Seeding it everywhere
+    # made the gate accept `autumn migrate --version`, which the CLI rejects.
+    expect(opts_of('migrate --version') == [('migrate', '--version')],
+           '--version is not propagated to subcommands and is drift on one')
+
+    # `--name=value` carries its value, so the walk may step over it — but the
+    # NAME is still checked. Skipping on the strength of the `=` alone let the
+    # attached spelling of a bad flag through in both the option walk and the
+    # leaf loop.
+    expect(opts_of('migrate --shard=eu') == [], 'a known attached option is fine')
+    expect(opts_of('migrate --nope=eu') == [('migrate', '--nope')],
+           'an UNKNOWN attached option is drift, not a token to step over')
+    expect(opts_of('console --nope=x') == [('console', '--nope')],
+           'the same, on a leaf command')
+    expect(opts_of('migrate --nope=eu status') == [('migrate', '--nope')],
+           'an attached option is walked past, so the rest of the line is judged')
+
+    # The shape filter excludes prose PUNCTUATION, never a non-canonical
+    # spelling: an underscore where the flag has a hyphen, or an unresolvable
+    # compact short, are exactly what this gate is for.
+    expect(opts_of('migrate --with_maintenance') == [('migrate', '--with_maintenance')],
+           'an underscore misspelling of a real flag must be reported')
+    expect(opts_of('migrate -zz') == [('migrate', '-zz')],
+           'an unresolvable compact short must be reported')
 
     # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
     # used to read these stopped at the list's first `]`, so the field vanished
