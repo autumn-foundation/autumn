@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **ci:** the dependency-advisory gate (#1600, #2050) now also audits the two
+- **ci:** [no-plugin] the dependency-advisory gate (#1600, #2050) now also audits the two
   satellite dependency graphs that sit **outside** the main workspace and its
   own `Cargo.lock` — `fuzz/` (compiled and run by every `fuzz.yml` CI job) and
   `examples/island-flock/` (never built in CI, but its compiled wasm/js
