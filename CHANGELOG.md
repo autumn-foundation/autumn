@@ -2015,6 +2015,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
+  post's slug and make its permalink silently serve a different post (issue
+  #2544):** `unique_slug()`/`unique_slug_excluding()` proved uniqueness with a
+  `SELECT COUNT` before the `INSERT`/`UPDATE` that relied on it — a
+  check-then-act race two concurrent submits (a double-click, or a
+  flaky-network auto-retry) could both win, landing two posts on the same
+  `(subreddit_id, slug)`. Nothing at the database level backed that
+  invariant (`posts.slug` had only a plain, non-unique index, unlike
+  `subreddits.slug`/`users.username`), so once duplicated, `show()`'s
+  unordered `.filter(slug...).filter(subreddit_id...).first()` returned an
+  arbitrary one of the two forever — the other post's own permalink now
+  silently served someone else's title, body, and comments with a `200` and
+  no error. Fixed with a composite `UNIQUE (subreddit_id, slug)` constraint
+  (migration `20260906163932_posts_slug_unique_per_subreddit`) plus a retry
+  loop in `submit`/`update`: the existing `SELECT`-based guess stays as a
+  fast path, but a losing insert/update now comes back as a unique-violation
+  on that named constraint, which the loser catches and retries with the
+  next candidate slug instead of colliding with the winner. Regression-tested
+  by driving the real compiled binary with 10 fully concurrent, identical
+  `/submit` requests and asserting no duplicate `(subreddit_id, slug)` pair
+  survives (`tests/post_slug_race_e2e.rs`).
+
 - **`#[query_budget]` silently missed queries issued through a handle bound
   via an async/fallible accessor (e.g. `let mut conn = self.conn().await?;`),
   a real shape in `PostgresSearchStore::write_documents`:** neither
