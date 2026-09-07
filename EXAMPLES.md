@@ -229,6 +229,21 @@ Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`
 
 ---
 
+### `examples/react-graphql` — React SPA + GraphQL Plugin
+
+<!-- catalog:example name=react-graphql tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer with a TypeScript/React front end who wants an Autumn backend, and wants to see how a GraphQL surface interacts with `#[model]`, `#[repository]`, hooks, and the pool |
+| **Journey** | SPA + GraphQL on a real model: Autumn renders the page shell → a committed Vite/React 19/TypeScript bundle mounts into it → the bundle queries and mutates over GraphQL served by a generic `GraphqlPlugin` → every resolver goes through the generated `PgNoteRepository`, so normalisation, validation, and hooks behave identically for GraphQL and the generated REST handlers |
+| **Key capabilities** | `#[model]` with `#[normalize(trim)]` + `#[validate]`, `MutationHooks` (`before_create` validation, `before_delete` rule), `#[repository(hooks = …, api = …)]` with a derived finder and generated REST CRUD mounted beside GraphQL, `PgNoteRepository::with_pool_untracked` from `AppState` in resolvers, an `on_startup` seed that runs once across instances under a transaction-scoped advisory lock, embedded migrations, `AutumnError` → GraphQL error with `extensions.status`, `Plugin` + `AppBuilder::nest` + `declare_plugin_routes` (audit-clean raw router), `PluginContract` + `plugin_conformance::run_conformance`, Maud shell + `asset_url` under the default `script-src 'self'` CSP, `autumn build --embed` single-binary deploy (`embed_static!` + `.embedded_static`), `GET /graphql/sdl` with a committed-SDL drift test, two-tier tests (`TestApp` without Docker; `TestDb` testcontainer with the real migration applied) |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL (`docker compose up -d` in the example directory provides one); the React bundle is committed, so Node 20.19+/22.12+ is needed only to change the frontend |
+| **Run command** | `cargo run -p react-graphql` |
+| **Success proof** | `curl -s http://127.0.0.1:3000/graphql -H 'content-type: application/json' -d '{"query":"{ notes { title } }"}'` returns `{"data":{"notes":[{"title":"Welcome to Autumn Notes"},{"title":"Try the GraphQL endpoint"}]}}` (seeded on boot); `curl -s http://127.0.0.1:3000/api/notes` returns the same rows through the generated REST handler; the browser page lists them and adds a third from its form without a reload |
+
+---
+
 ## Experimental Examples
 
 Experimental examples **are** workspace members — they compile, lint and test
@@ -323,6 +338,7 @@ can pick the closest starting point without overlap.
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf` |
+| SPA + GraphQL plugin | `react-graphql` | Autumn-rendered shell, committed Vite/React/TypeScript bundle, and a generic `GraphqlPlugin` whose resolvers go through a `#[model]`/`#[repository]` with hooks — the same rows also served by generated REST |
 
 ---
 

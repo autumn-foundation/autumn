@@ -52,6 +52,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **examples:** `examples/react-graphql`, a TypeScript React single-page app
+  on an Autumn backend that talks GraphQL through a plugin, against a real
+  Postgres `#[model]`. Two files carry the point. `src/graphql_plugin.rs` is a
+  generic `GraphqlPlugin<Q, M, S>` that adapts any `async-graphql` schema onto
+  an app — `AppBuilder::nest` for the raw router (with the schema as
+  router-local `Extension` state, so two schemas can share root types at two
+  paths), `declare_plugin_routes` so `autumn routes` and the audit gate see it,
+  per-execution injection of `AppState` into the GraphQL context, a
+  `PluginContract`, and a `GET` transport that refuses non-query operations
+  with `405`. `src/notes.rs` shows what that buys: every resolver builds the
+  generated `PgNoteRepository` from the pool on `AppState`
+  (`with_pool_untracked`, the constructor for code with no request), so
+  `#[normalize(trim)]`, the model's `#[validate]` rules, and the repository's
+  `MutationHooks` (`before_create` validation, a `before_delete` rule refusing
+  to delete a pinned note) apply identically to a GraphQL mutation and
+  the generated `api = "/api/notes"` REST handlers mounted beside it (the
+  `on_startup` seed runs once across instances, on one connection under a
+  transaction-scoped advisory lock). `AutumnError`s become GraphQL field errors carrying the
+  HTTP status in `extensions.status`. The plugin serves `POST /graphql`, the
+  GraphQL-over-HTTP `GET` form, and `GET /graphql/sdl`, whose output is
+  drift-tested against a committed `schema.graphql` the TypeScript types are
+  written against. The Vite/React 19 bundle is committed under `static/app/`
+  (fixed file names, no hash) and served by the standard `/static` mount under
+  the default `script-src 'self'` CSP, so `cargo run` needs no Node toolchain;
+  `autumn build --embed` bakes it into the binary (`embed_static!` +
+  `.embedded_static`, behind the crate's `embed-assets` feature); `npm run dev`
+  proxies `/graphql` to the Rust server for hot-reload work. Tested in two
+  tiers plus a smoke: `TestApp` tests with no Docker (shell, SDL drift,
+  `plugin_conformance::run_conformance`, error mapping, the `GET` guard,
+  two plugins at two paths), `TestDb` testcontainer tests that apply the
+  example's real embedded migration (rows, hooks, normalisation, validation,
+  REST/GraphQL parity), and a Chromium smoke that drives the real binary
+  against a testcontainer Postgres through a query and a form mutation.
+  Cataloged as a supported example.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite

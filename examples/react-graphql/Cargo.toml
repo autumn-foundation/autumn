@@ -1,0 +1,70 @@
+[package]
+name = "react-graphql"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# `src/lib.rs` carries the notes domain, the async-graphql schema, and the
+# `GraphqlPlugin` adapter so the integration tests under `tests/` can build
+# the very same app the binary runs. `src/main.rs` is only the entry point.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "react-graphql"
+path = "src/main.rs"
+
+[dependencies]
+autumn-web = { path = "../../autumn" }
+# The GraphQL executor. Default features are off: `graphiql`/`playground`
+# ship HTML that loads scripts from a CDN, which the framework's default
+# `script-src 'self'` CSP would block anyway, and `tempfile` is only for
+# multipart uploads. Everything this example needs is in the core crate.
+async-graphql = { version = "7.0", default-features = false }
+axum = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+diesel = { version = "2", features = ["postgres", "chrono"] }
+diesel-async = { version = "0.9", features = ["postgres"] }
+diesel_migrations = "2"
+maud = { version = "0.27", features = ["axum"] }
+pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
+tracing = "0.1"
+validator = { version = "0.20", features = ["derive"] }
+
+[dev-dependencies]
+autumn-web = { path = "../../autumn", features = ["test-support"] }
+example-e2e = { path = "../../example-e2e" }
+tokio = { workspace = true }
+
+[features]
+# Bake `static/` — the committed React bundle included — into the binary for a
+# single-binary deploy. Enabled by `autumn build --embed`; see `app()` in
+# src/lib.rs for the builder half of the opt-in.
+embed-assets = ["autumn-web/embed-assets"]
+# Enable the headless-browser system smoke. Requires Chromium on the host.
+#   cargo test -p react-graphql --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+[[test]]
+name = "graphql_api"
+path = "tests/graphql_api.rs"
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Determinism seam gate (autumn #1797): `clippy.toml`'s workspace-global
+# `disallowed-methods` config arms `clippy::disallowed_methods` (warn-by-default)
+# in every crate that sees it. This package is outside the gate's manifest, so
+# grandfather the lint here. Crates that set `[lints] workspace = true` get the
+# same grandfathering from `[workspace.lints.clippy]` in the root Cargo.toml.
+# A package-level table (rather than a crate-root attribute) is used so it
+# covers every target — lib, bins, tests, benches — not just one root.
+[lints.clippy]
+disallowed_methods = "allow"

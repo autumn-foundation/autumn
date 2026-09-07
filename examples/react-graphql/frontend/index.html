@@ -1,0 +1,17 @@
+<!doctype html>
+<!--
+  Dev-server-only shell. In production the shell is rendered by Autumn
+  (see `index` in ../src/main.rs); this file exists so `npm run dev` has a
+  page to mount into. Keep the two in step: same #root, same title.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Autumn Notes</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

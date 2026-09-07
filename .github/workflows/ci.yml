@@ -954,6 +954,12 @@ jobs:
           # autumn-search (#1191): the Postgres SearchBackend + DocumentSource
           # suites are testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-search -- --ignored
+          # examples/react-graphql: the Postgres tier of its GraphQL suite
+          # (rows, hooks, normalisation, validation, REST/GraphQL parity).
+          # Testcontainer-managed; serial because the tests share one
+          # migrated table. Only its Chromium smoke runs elsewhere (the
+          # publish-gate fleet e2e), so without this line the tier never runs.
+          cargo test -p react-graphql --test graphql_api -- --ignored --test-threads=1
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
