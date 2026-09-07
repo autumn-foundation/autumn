@@ -86,6 +86,10 @@ pub struct ViHookedNote {
 
 /// Counts `before_create` calls, so a test can prove the hook never saw a row
 /// the model rejects.
+///
+/// Read it back with [`hook_calls`]: a bare `calls.load(..)` resolves to
+/// `diesel_async::RunQueryDsl::load`, which is blanket-implemented for every
+/// `Sized` type and so wins method resolution over `AtomicUsize::load`.
 #[derive(Clone, Default)]
 pub struct ViHookedNoteHooks {
     before_create_calls: Arc<AtomicUsize>,
@@ -208,6 +212,11 @@ async fn setup_pool() -> (
     .expect("create vi_tenant_notes");
 
     (pool, container)
+}
+
+/// `before_create` call count, read without tripping over `RunQueryDsl::load`.
+fn hook_calls(counter: &AtomicUsize) -> usize {
+    AtomicUsize::load(counter, Ordering::SeqCst)
 }
 
 fn new_note(title: &str) -> NewViNote {
@@ -372,7 +381,7 @@ async fn hooked_save_validates_before_the_hook_runs() {
         .expect_err("the model rule must fire first");
     assert_unprocessable(&err, "title");
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        hook_calls(&calls),
         0,
         "before_create must never see a row the model forbids"
     );
@@ -404,7 +413,7 @@ async fn hooked_skip_invalid_validates_before_the_hook_runs() {
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].0, 1);
     assert_eq!(
-        calls.load(Ordering::SeqCst),
+        hook_calls(&calls),
         1,
         "the hook runs for the surviving row only"
     );
