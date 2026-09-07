@@ -25,13 +25,14 @@
 //!
 //! # Ordering (write path)
 //!
-//! `#[model]` runs normalization at the head of the repository save flow, before
-//! the hooks (where `#[validate(...)]` and other user rejection logic run) and
-//! before the row is written. Normalizers apply left-to-right in the order
-//! written in the attribute.
+//! `#[model]` runs normalization at the head of the repository insert flow,
+//! before the model's `#[validate(...)]` rules, before the hooks, and before the
+//! row is written. Normalizers apply left-to-right in the order written in the
+//! attribute.
 //!
-//! **Insert** (`save` / `save_many`) normalizes the `New*` input, so validators
-//! *and the database* observe the canonical value.
+//! **Insert** (`save`, `save_many`, `save_many_skip_invalid`, and the create
+//! half of `find_or_create_by_*`) normalizes the `New*` input, so the model's
+//! rules *and the database* observe the canonical value (#2586).
 //!
 //! **Update is not symmetric with insert, and there are three cases, not two.**
 //!
@@ -150,7 +151,8 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 /// borrow untouched — so a model with no `#[normalize]` columns (or a
 /// hand-written `New*` that doesn't implement `Normalize`) pays no clone on the
 /// save path. The generated code unifies the two arms with `Borrow` (see
-/// `#[repository]` `save`/`save_many`).
+/// `#[repository]` `save`, `save_many`, `save_many_skip_invalid` and
+/// `find_or_create_by_*`).
 #[doc(hidden)]
 pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 

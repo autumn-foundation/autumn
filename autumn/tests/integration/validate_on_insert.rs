@@ -170,6 +170,28 @@ pub trait ViShardedNoteRepository {
     fn find_or_create_by_title(title: String);
 }
 
+// ── Model with no `#[validate]` columns ──────────────────────────────────────
+//
+// The autoref probe's no-op arm. This is what "no repository needs migrating"
+// rests on, so it needs a repository-level fixture, not just a trait-level one.
+
+diesel::table! {
+    vi_lax_notes (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+#[autumn_web::model(table = "vi_lax_notes")]
+pub struct ViLaxNote {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(ViLaxNote, table = "vi_lax_notes")]
+pub trait ViLaxNoteRepository {}
+
 // ── Setup & helpers ──────────────────────────────────────────────────────────
 
 async fn setup_pool() -> (
@@ -210,6 +232,13 @@ async fn setup_pool() -> (
     .execute(&mut conn)
     .await
     .expect("create vi_tenant_notes");
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS vi_lax_notes \
+         (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("create vi_lax_notes");
 
     (pool, container)
 }
@@ -445,6 +474,50 @@ async fn find_or_create_by_validates_only_when_it_creates() {
     assert_eq!(found.id, seeded.id);
 }
 
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn find_or_create_by_matches_the_row_it_normalized() {
+    // The create half normalizes its payload, so the lookup has to look for the
+    // canonical value too. Otherwise the second identical call misses the row
+    // it just wrote, conflicts on insert, misses the re-lookup, and surfaces
+    // the "no matching row on re-lookup" 500 instead of the existing row.
+    let (pool, _container) = setup_pool().await;
+    let repo = PgViNoteRepository::with_pool_untracked(pool.clone());
+
+    let (first, created) = repo
+        .find_or_create_by_title("  spaced  ".to_string(), &new_note("  spaced  "))
+        .await
+        .expect("first call creates");
+    assert!(created);
+    assert_eq!(first.title, "spaced", "the row is stored canonical");
+
+    let (second, created_again) = repo
+        .find_or_create_by_title("  spaced  ".to_string(), &new_note("  spaced  "))
+        .await
+        .expect("the second identical call must find the row it wrote");
+    assert!(!created_again, "no second row may be created");
+    assert_eq!(second.id, first.id);
+    assert_eq!(note_count(&pool).await, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn find_or_create_by_returns_an_existing_row_over_a_rejected_payload() {
+    // The preliminary lookup is replica-eligible and a concurrent caller can
+    // insert between it and the insert, so a refusal must not overtake the
+    // found path: an existing row wins regardless of the unused payload.
+    let (pool, _container) = setup_pool().await;
+    let repo = PgViNoteRepository::with_pool_untracked(pool.clone());
+    let seeded = repo.save(&new_note("settled")).await.expect("seed");
+
+    let (found, created) = repo
+        .find_or_create_by_title("settled".to_string(), &new_note("   "))
+        .await
+        .expect("an existing row is returned even for a payload the model rejects");
+    assert!(!created);
+    assert_eq!(found.id, seeded.id);
+}
+
 // ── Tenant-scoped ────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -462,6 +535,88 @@ async fn tenant_scoped_save_validates() {
     .await
     .expect_err("tenant scoping does not exempt the model rules");
     assert_unprocessable(&err, "title");
+
+    let mut conn = pool.get().await.expect("conn");
+    let count: i64 = vi_tenant_notes::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "nothing may be written");
+}
+
+// ── Generated-surface guard (no database) ────────────────────────────────────
+
+/// Every behavioural test here needs Docker. This one does not: it proves the
+/// generated surface exists on each fixture, which keeps the compile-only
+/// repositories (sharded, tenant-scoped) from reading as dead code and catches
+/// a codegen break even where Docker cannot run.
+#[test]
+fn validate_on_insert_repository_surface_is_generated() {
+    fn assert_is_fn<T>(_: T) {}
+
+    assert_is_fn(PgViNoteRepository::find_or_create_by_title);
+    assert_is_fn(PgViShardedNoteRepository::find_or_create_by_title);
+    assert_is_fn(<PgViNoteRepository as ViNoteRepository>::save);
+    assert_is_fn(<PgViHookedNoteRepository as ViHookedNoteRepository>::save_many_skip_invalid);
+    assert_is_fn(<PgViTenantNoteRepository as ViTenantNoteRepository>::save_many);
+    // The no-`#[validate]` model still gets the same surface — the autoref
+    // probe compiled its no-op arm rather than failing to resolve.
+    assert_is_fn(<PgViLaxNoteRepository as ViLaxNoteRepository>::save);
+    assert_is_fn(<PgViLaxNoteRepository as ViLaxNoteRepository>::save_many);
+}
+
+// ── Empty and all-invalid inputs ─────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn bulk_paths_accept_an_empty_slice() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgViNoteRepository::with_pool_untracked(pool.clone());
+
+    assert!(repo.save_many(&[]).await.expect("empty batch").is_empty());
+    let (saved, failures) = repo
+        .save_many_skip_invalid(&[])
+        .await
+        .expect("empty skip-invalid batch");
+    assert!(saved.is_empty() && failures.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn skip_invalid_survives_every_row_being_rejected() {
+    // Nothing survives the filter, so the chunking pass must not run at all —
+    // it reads `new[0]` for the column count.
+    let (pool, _container) = setup_pool().await;
+    let repo = PgViNoteRepository::with_pool_untracked(pool.clone());
+
+    let (saved, failures) = repo
+        .save_many_skip_invalid(&[new_note("   "), new_note("")])
+        .await
+        .expect("an all-invalid batch reports rather than panicking");
+
+    assert!(saved.is_empty(), "nothing may be written");
+    assert_eq!(
+        failures.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec![0, 1],
+        "both rows reported against their own index"
+    );
+    assert_eq!(note_count(&pool).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_model_without_rules_still_saves() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgViLaxNoteRepository::with_pool_untracked(pool.clone());
+
+    let saved = repo
+        .save(&NewViLaxNote {
+            title: String::new(),
+        })
+        .await
+        .expect("a model with no rules accepts anything it used to");
+    assert_eq!(saved.title, "");
 }
 
 // ── Guard rail: updates are unchanged ────────────────────────────────────────

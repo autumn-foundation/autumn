@@ -2091,6 +2091,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model forbids will now get a 422 where it used to get a row. Update paths are
   unchanged: they keep the documented hooked / `validate_on_update = fetch` /
   blind table.
+  Three consequences worth knowing before you upgrade. A `#[validate]` rule on a
+  column that `before_create` **populates** now rejects every insert, because
+  the rules run first — put rules on what the caller supplies, and derive the
+  value before building the `New*`. On a `tenant_scoped` repository, `save` with
+  an invalid payload and no tenant context now returns the 422 rather than the
+  "no tenant context was established" 500; both are still errors, but the
+  precedence changed. And `Model::factory().create()` — so `autumn seed` — still
+  inserts through Diesel directly and is deliberately **not** covered, along
+  with hand-written repositories, raw `diesel::insert_into`, and `upsert_many`;
+  `docs/guide/forms.md` now says so rather than implying otherwise.
+  `find_or_create_by_*` additionally canonicalizes a `#[normalize]` lookup
+  column, the same probe the derived `find_by_*` finders already used. Without
+  it the create half would insert the canonical value while the lookup searched
+  for the raw one, so a repeated identical call would miss the row it had just
+  written and surface the "no matching row on re-lookup" 500.
 
 - **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
   post's slug and make its permalink silently serve a different post (issue

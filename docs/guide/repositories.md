@@ -55,10 +55,11 @@ For large inputs, queries are automatically chunked under the Postgres parameter
 
 ### Hook-Aware Execution
 If hooks are enabled on your repository, `save_many` guarantees full transaction integrity:
-1. Runs `before_create` hooks **sequentially** on each record.
-2. Batches the validated records and inserts them in a single database round trip inside a transaction.
-3. Runs `after_create` hooks sequentially on successfully inserted records.
-4. Stages `after_create_commit` hooks to fire only after the surrounding transaction successfully commits.
+1. Runs the model's `#[validate]` rules on every record, before any record is written — one offender aborts the batch with a 422.
+2. Runs `before_create` hooks **sequentially** on each record.
+3. Batches the validated records and inserts them in a single database round trip inside a transaction.
+4. Runs `after_create` hooks sequentially on successfully inserted records.
+5. Stages `after_create_commit` hooks to fire only after the surrounding transaction successfully commits.
 
 ---
 
@@ -181,9 +182,16 @@ concurrent caller won the insert race — you get the existing row with
 ### How it stays race-safe
 
 1. **Preliminary lookup** on the read path (replica-eligible, honoring tenant
-   scoping and soft-delete). A hit returns `(row, false)` immediately and fires
-   **no** hooks.
-2. Otherwise **insert on the primary** with `INSERT ... ON CONFLICT DO NOTHING`.
+   scoping and soft-delete). A `#[normalize]` lookup column is canonicalized
+   first, so the lookup matches the value step 2 would store. A hit returns
+   `(row, false)` immediately and fires **no** hooks.
+2. Otherwise the payload is **normalized and validated** — the create half is an
+   insert, so the model's rules apply (#2586). A refusal does not overtake the
+   found path: because step 1 is replica-eligible and a concurrent caller may
+   have inserted since, the method re-checks the primary and returns that row if
+   it exists, rather than letting replication lag decide between `(row, false)`
+   and a 422.
+3. Then **insert on the primary** with `INSERT ... ON CONFLICT DO NOTHING`.
    `ON CONFLICT DO NOTHING` is the crux: instead of raising `23505` (and
    poisoning the transaction), Postgres silently skips a conflicting insert.
    - If a row comes back, this call created it → `(row, true)`, and create/commit

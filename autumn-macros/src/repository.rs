@@ -2225,11 +2225,15 @@ fn ledger_append_ts(
 
 /// `#[validate(...)]` on the repository insert path (#2586).
 ///
-/// `payload` must already be a `&New*` expression: autoref specialization picks
-/// the validating impl from the wrapped type, so a `&&New*` would silently take
-/// the no-op arm. Expands to a no-op for a payload type that does not implement
-/// `validator::Validate` — a model with no `#[validate]` columns, or a
-/// hand-written insert struct — so no repository needs migrating.
+/// `payload` is a `&New*` expression. Expands to a no-op for a payload type
+/// that does not implement `validator::Validate` — a model with no
+/// `#[validate]` columns, or a hand-written insert struct — so no repository
+/// needs migrating.
+///
+/// Pass the borrow the caller already holds rather than adding one: `validator`
+/// supplies a blanket `impl<T: Validate> Validate for &T`, so an extra `&` does
+/// still validate, but only through that impl. The direct form does not depend
+/// on it.
 fn maybe_validate_insert(payload: &TokenStream) -> TokenStream {
     quote! {
         {
@@ -14307,9 +14311,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let fname = name.to_string();
                 if spec.string_fields.contains(&fname) {
                     let enc_ident = format_ident!("__autumn_foc_{name}");
+                    let norm_ident = format_ident!("__autumn_focn_{name}");
+                    // #2586: canonicalize the lookup argument on a `#[normalize]`
+                    // column, the same probe the derived `find_by_*` finders use.
+                    // The insert normalizes its payload, so a raw lookup would
+                    // miss the row it just wrote: the next identical call would
+                    // conflict on insert and then miss the re-lookup too, which
+                    // surfaces as the "no matching row on re-lookup" 500 rather
+                    // than the existing row. Runs before the encrypted-column
+                    // encoder, matching the finder order.
                     encode_lets.push(quote! {
+                        let #norm_ident = {
+                            #[allow(unused_imports)]
+                            use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                            ::autumn_web::normalize::SpezLookup::<#model_name>(
+                                ::core::marker::PhantomData, #fname, &#name,
+                            )
+                            .spez_lookup()
+                        };
                         let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                            #table_name_str, #fname, &#name,
+                            #table_name_str, #fname, &#norm_ident,
                         )
                         .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                             __e.to_string(),
@@ -14347,6 +14368,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let step1_lookup = make_lookup(quote! { &mut __rconn });
             let relookup = make_lookup(quote! { &mut conn });
+            // #2586: the create half runs the model's `#[validate]` rules, but a
+            // refusal must not overtake the found path. Step 1 is
+            // replica-eligible, so it can miss a row the primary already has
+            // (and a concurrent caller can insert one after it ran); this call
+            // would then insert nothing, which is exactly the case the rules do
+            // not govern. Confirm on the primary before refusing, so the answer
+            // does not depend on replication lag.
+            let validate_or_found = {
+                let primary_lookup = make_lookup(quote! { &mut __autumn_vconn });
+                let call = maybe_validate_insert(&quote! { new });
+                quote! {
+                    if let ::core::result::Result::Err(__autumn_invalid) = #call {
+                        let mut __autumn_vconn = self.__autumn_acquire_conn().await?;
+                        let __autumn_existing: ::core::option::Option<#model_name> =
+                            #primary_lookup;
+                        if let ::core::option::Option::Some(__autumn_row) = __autumn_existing {
+                            return ::core::result::Result::Ok((__autumn_row, false));
+                        }
+                        return ::core::result::Result::Err(__autumn_invalid);
+                    }
+                }
+            };
             let none_branch_msg = if config.soft_delete {
                 "find_or_create_by: the insert hit a unique conflict but no matching \
                  row was found on re-lookup. Two causes are possible: (1) the lookup \
@@ -14558,8 +14601,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // #2586: the row is about to be created, so normalize and
                     // then run the model's `#[validate]` rules — the same
                     // insert-path contract `save` has. Deliberately after the
-                    // lookup: a found row is still returned unchanged, because
-                    // this call inserts nothing.
+                    // lookup: a found row is returned unchanged, because this
+                    // call inserts nothing.
                     #[allow(unused_imports)]
                     use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
                     #[allow(unused_imports)]
@@ -14567,7 +14610,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __autumn_normalized =
                         ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
                     let new: &#new_name = __autumn_normalized.borrow();
-                    #validate_insert_new
+                    #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
                     #step2
                 }
@@ -21477,8 +21520,9 @@ mod tests {
         let normalize_at = section
             .find("spez_normalize ()")
             .expect("save must normalize the payload");
-        // Pinned to the single-ref form: `MaybeValidate (& new)` would wrap a
-        // `&&New*`, which takes the autoref no-op arm and validates nothing.
+        // Pinned to the exact emitted form: `new` is already a `&New*`, so an
+        // extra borrow would validate only via `validator`'s blanket
+        // `impl Validate for &T`. Assert the shape that does not rely on it.
         let validate_at = section
             .find("MaybeValidate (new)")
             .expect("save must validate the payload");
@@ -21573,15 +21617,22 @@ mod tests {
             .find("spez_normalize_many ()")
             .expect("skip-invalid must normalize rows");
         let validate_at = section
-            .find("MaybeValidate")
+            .find("MaybeValidate (__autumn_row)")
             .expect("skip-invalid must validate rows");
         assert!(
             normalize_at < validate_at,
             "rows must be normalized before validation: {section}"
         );
+        // Reported, not raised: the rejected index is pushed onto `failures`
+        // rather than `?`-propagated. `failures . push` alone would pass on the
+        // unchanged code (hook and constraint failures already use it), so pin
+        // the arm the validation pass writes.
         assert!(
-            section.contains("failures . push"),
-            "an invalid row must be reported, not raised: {section}"
+            section.contains("::core::result::Result::Err (err) => failures . push ((idx , err))")
+                || section.contains(
+                    ":: core :: result :: Result :: Err (err) => failures . push ((idx , err))"
+                ),
+            "an invalid row must be reported by index, not raised: {section}"
         );
     }
 
@@ -21600,7 +21651,7 @@ mod tests {
         );
 
         let validate_at = section
-            .find("MaybeValidate")
+            .find("MaybeValidate (& item)")
             .expect("hooked skip-invalid must validate rows");
         let hook_at = section
             .find("before_create")
@@ -21625,10 +21676,13 @@ mod tests {
             },
         )
         .to_string();
+        // Bound on the next generated item. `HasTenantIdColumn` is emitted only
+        // for a tenant_scoped repository, so it would never match here and the
+        // "section" would run to the end of the output.
         let section = section_between(
             &generated,
             "pub async fn find_or_create_by_slug",
-            "impl :: autumn_web :: tenancy :: HasTenantIdColumn",
+            "pub async fn preload",
         );
 
         let lookup_at = section
@@ -21643,6 +21697,27 @@ mod tests {
         assert!(
             lookup_at < validate_at && validate_at < insert_at,
             "validation must sit between the lookup and the insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_upsert_many_stays_unvalidated() {
+        // #2586 guard rail: `upsert_many` takes whole models and Postgres
+        // decides per row whether the statement inserts or updates, so there is
+        // no insert to hang the rule on. `docs/guide/forms.md` documents the
+        // carve-out; pin it so it cannot drift silently.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        // Bounded on the inherent impl that follows the trait impl. Note
+        // `impl PostRepository for PgPostRepository` does not match this needle.
+        let section = section_between(
+            &generated,
+            "async fn upsert_many (",
+            "impl PgPostRepository",
+        );
+        assert!(
+            !section.contains("MaybeValidate"),
+            "upsert_many is a documented carve-out: {section}"
         );
     }
 
