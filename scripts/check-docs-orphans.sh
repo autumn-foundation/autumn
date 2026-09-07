@@ -269,7 +269,13 @@ def read(f):
 # A path pointing OUTSIDE its package — `readme = "../README.md"`, which three
 # packages here use — names the workspace root README, already a root on its
 # own account, so it is some other rule's job.
-_README_STRING = re.compile(r'^[ \t]*readme[ \t]*=[ \t]*"([^"]*)"', re.M)
+# TOML has two single-line string forms and Cargo takes either: `readme =
+# 'docs/intro.md'` resolves to that path just as the double-quoted spelling
+# does. Matching only basic strings missed the configured path AND fell back to
+# auto-detect, so it could report a guide linked from the real README as
+# orphaned, or seed an unrelated adjacent `README.md` and hide one.
+_README_STRING = re.compile(
+    r'^[ \t]*readme[ \t]*=[ \t]*(?:"([^"]*)"|\'([^\']*)\')', re.M)
 _README_BOOL = re.compile(r'^[ \t]*readme[ \t]*=[ \t]*(false|true)\b', re.M)
 # A fifth spelling, and the same silent failure: an INHERITED `readme` resolves
 # against the workspace root, not the member directory — `readme.workspace =
@@ -507,7 +513,9 @@ def _readme_path(manifest, pkg):
         pkg = ''
     m = _README_STRING.search(manifest)
     if m is not None:
-        named = m.group(1)
+        # Whichever quote form matched; a literal string takes no escapes, so
+        # both groups are the path exactly as written.
+        named = m.group(1) if m.group(1) is not None else m.group(2)
     else:
         b = _README_BOOL.search(manifest)
         if b is not None and b.group(1) == 'false':
@@ -7210,6 +7218,28 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m9/pkg/README.md"
   git -C "$c9m9" add -A && git -C "$c9m9" commit -qm commented-empty-allowlist
   check "a commented empty allowlist is still empty" fail "$c9m9"
+
+  # Cargo takes either TOML string form, and a LITERAL one resolves to the same
+  # path: `cargo metadata` reports `docs/intro.md` for this manifest. Matching
+  # only basic strings both missed the real entry surface and fell back to
+  # auto-detect, so this page was reported orphaned though its README links it.
+  local c9md="$tmp/c9md"; make_corpus "$c9md"
+  mkdir -p "$c9md/pkg"
+  printf '[package]\nname = "pkg"\nreadme = '"'"'intro.md'"'"'\n' > "$c9md/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9md/pkg/intro.md"
+  git -C "$c9md" add -A && git -C "$c9md" commit -qm literal-readme
+  check "a literal-string readme names the entry surface" pass "$c9md"
+
+  # ...and the silent half of the same defect: falling back to auto-detect
+  # seeds an adjacent `README.md` that Cargo does NOT publish, which can hide
+  # an orphan behind a page no reader ever lands on.
+  local c9me="$tmp/c9me"; make_corpus "$c9me"
+  mkdir -p "$c9me/pkg"
+  printf '[package]\nname = "pkg"\nreadme = '"'"'intro.md'"'"'\n' > "$c9me/pkg/Cargo.toml"
+  printf '# Intro\n\ntext\n' > "$c9me/pkg/intro.md"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9me/pkg/README.md"
+  git -C "$c9me" add -A && git -C "$c9me" commit -qm literal-readme-not-adjacent
+  check "a literal-string readme is not the adjacent README" fail "$c9me"
 
   # There is deliberately NO test here for a `#` inside a quoted registry name
   # (`publish = ["reg#1"]`). One was written and deleted: it passed against a
