@@ -142,7 +142,10 @@ ROOT_FILES = ('README.md', 'AGENTS.md', 'EXAMPLES.md', 'CONTRIBUTING.md',
 # have been reported as an orphan. `.claude/agents/` is listed for the same
 # reason though the repo has none today, because the omission of one member of
 # a family is how most of this file's bugs started.
-ROOT_DIRS = ('skills/', 'agents/', '.claude/skills/', '.claude/agents/')
+# The layouts themselves live in `_is_agent_entry`, which is where the two
+# directories' differing conventions are applied. A flat tuple of prefixes
+# stood here and was crossed with a tuple of basenames, which got both
+# directions wrong at once — see that function.
 # History is a record, not a route. See the header.
 HISTORY = ('CHANGELOG.md', 'docs/releases/')
 
@@ -157,6 +160,46 @@ tracked = [
 nodes = sorted(f for f in tracked if f.startswith(GUIDE) and f.endswith('.md'))
 
 
+def _is_agent_entry(f):
+    """An entry file under `skills/` or `agents/`, in either location.
+
+    THE TWO DIRECTORIES HAVE DIFFERENT CONVENTIONS, and crossing them was
+    wrong in both directions at once:
+
+      skills/<name>/SKILL.md      the skill's entry file, loaded by name
+      agents/<name>.md            an agent definition, one file per agent
+
+    Taking the cross-product of every prefix with both basenames seeded
+    `skills/x/references/AGENT.md` — a supporting page, which as a root would
+    let a file nothing links any more still confer reachability, an orphan
+    passing — while leaving an ordinary `.claude/agents/reviewer.md` out
+    entirely, which reports a guide indexed only from there as an orphan. One
+    of those is a false negative and the other a false positive, from the same
+    two lines.
+
+    Depth is what distinguishes an entry file from a supporting one, so it is
+    checked rather than the basename alone: `references/` sits one level
+    deeper and no longer matches.
+    """
+    if not f.endswith('.md'):
+        return False
+    for prefix in ('', '.claude/'):
+        if not f.startswith(prefix):
+            continue
+        parts = f[len(prefix):].split('/')
+        if parts[0] == 'skills':
+            # `skills/<name>/SKILL.md` — the entry file, never a page beside it.
+            if len(parts) == 3 and parts[2] in ('SKILL.md', 'AGENT.md'):
+                return True
+        elif parts[0] == 'agents':
+            # `agents/<name>.md`, plus the directory spelling of the same thing.
+            if len(parts) == 2:
+                return True
+            if len(parts) == 3 and parts[2] in ('AGENT.md', 'SKILL.md'):
+                return True
+    return False
+
+
 def is_root(f):
     """A surface a reader or agent ENTERS through, rather than one they are
     routed to. A skill's entry file is `SKILL.md` — the agent machinery loads it
@@ -168,10 +211,7 @@ def is_root(f):
     if f in HISTORY or f.startswith(HISTORY):
         return False
     return (f in ROOT_FILES
-            or (f.startswith(ROOT_DIRS) and f.endswith('.md')
-                and posixpath.basename(f) in ('SKILL.md', 'AGENT.md'))
-            or (f.startswith('agents/') and f.endswith('.md')
-                and posixpath.dirname(f) == 'agents')
+            or _is_agent_entry(f)
             # `examples/<app>/README.md` only. A deeper one
             # (`examples/reddit-clone/capsules/README.md`) is a supporting page
             # its example links to, not an entry surface — same reason as a
@@ -1890,9 +1930,64 @@ STYLE_ATTR_OPEN = re.compile(
     r'(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
 # The property boundary matters on its own: `--display:none` is a custom
 # PROPERTY and changes nothing, so an unbounded match rejected a live link.
-_DISPLAY_DECL = re.compile(r'(?<![-\w])display' + _TWS + r'*:([^;]*)', re.I)
+_DISPLAY_DECL = re.compile(r'\s*display' + _TWS + r'*:([^;]*)', re.I)
 _IMPORTANT = re.compile(r'!' + _TWS + r'*important' + _TWS + r'*$', re.I)
 _CSS_COMMENT = re.compile(r'/\*.*?\*/|/\*.*', re.S)
+
+
+def _declarations(style):
+    """Split a style attribute on TOP-LEVEL semicolons.
+
+    A semicolon inside a string or a `url()` does not end a declaration, and
+    neither does the text around it start one. Scanning for the `display`
+    property anywhere in the attribute read a declaration out of another
+    declaration's VALUE, and every spelling below leaves `display: none` in
+    force — measured in Chromium, which reports `display: none` and a 0x0 box
+    for all four:
+
+        display:none; --x:"display:block;"     a quoted custom property
+        display:none; --x:display:block        an unquoted one
+        display:none; background:url("display:block;")
+        display:none; content:"display:block"
+
+    Only the first was reported; the other three are the same hole, and a
+    property-boundary lookbehind closes none of them. This is the fifth round
+    on this attribute, so it is now split before it is searched rather than
+    searched with a cleverer pattern.
+
+    A `(` opens a nesting level that `)` closes, a quote runs to its matching
+    quote, and a backslash escapes the next character inside one. Unclosed
+    runs to the end, which is what a browser does with them.
+    """
+    out, buf, depth, quote = [], [], 0, None
+    i, n = 0, len(style)
+    while i < n:
+        c = style[i]
+        if quote:
+            buf.append(c)
+            if c == '\\' and i + 1 < n:
+                buf.append(style[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in '"\'':
+            quote = c
+            buf.append(c)
+        elif c == '(':
+            depth += 1
+            buf.append(c)
+        elif c == ')':
+            depth = max(0, depth - 1)
+            buf.append(c)
+        elif c == ';' and not depth:
+            out.append(''.join(buf))
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    out.append(''.join(buf))
+    return out
 
 
 def _display_none(style):
@@ -1919,7 +2014,10 @@ def _display_none(style):
     # the length but the habit is what keeps offsets safe elsewhere.
     style = _CSS_COMMENT.sub(lambda c: ' ' * len(c.group(0)), style)
     winner, winner_important = None, False
-    for m in _DISPLAY_DECL.finditer(style):
+    for decl in _declarations(style):
+        m = _DISPLAY_DECL.match(decl)
+        if not m:
+            continue
         value = m.group(1).strip()
         important = bool(_IMPORTANT.search(value))
         if important:
@@ -5681,6 +5779,62 @@ self_test() {
   printf '# Jobs\n\n<a href="mail.md"><br></a>\n' > "$c9jz/docs/guide/jobs.md"
   git -C "$c9jz" add -A && git -C "$c9jz" commit -qm anchor-wrapping-a-break
   check "an anchor wrapping a line break is not a route" fail "$c9jz"
+
+  # `agents/<name>.md` is the agent convention, and it holds under `.claude/`
+  # too. Crossing the prefixes with the SKILL.md/AGENT.md basenames instead
+  # left an ordinary agent file out and reported its guide as an orphan.
+  local c9ka="$tmp/c9ka"; make_corpus "$c9ka"
+  mkdir -p "$c9ka/.claude/agents"
+  printf '# R\n\n- [Mail](docs/guide/mail.md)\n' > "$c9ka/.claude/agents/reviewer.md"
+  git -C "$c9ka" add -A && git -C "$c9ka" commit -qm claude-agents-entry-file
+  check "a .claude agent file is an entry surface" pass "$c9ka"
+
+  # ...and the same cross-product seeded a SUPPORTING file as a root, because
+  # the basename matched at any depth. A page nothing links any more must not
+  # confer reachability — that is an orphan passing.
+  local c9kb="$tmp/c9kb"; make_corpus "$c9kb"
+  mkdir -p "$c9kb/skills/x/references"
+  printf '# S\n\ntext\n' > "$c9kb/skills/x/SKILL.md"
+  printf '# N\n\n- [Mail](docs/guide/mail.md)\n' > "$c9kb/skills/x/references/AGENT.md"
+  git -C "$c9kb" add -A && git -C "$c9kb" commit -qm supporting-file-is-not-a-root
+  check "a supporting file below a skill is not a root" fail "$c9kb"
+
+  # ...but it is still a WAYPOINT: linked from its `SKILL.md`, it carries its
+  # edges. Dropping such files from traversal instead of demoting them would
+  # strand this guide.
+  local c9kc="$tmp/c9kc"; make_corpus "$c9kc"
+  mkdir -p "$c9kc/skills/x/references"
+  printf '# S\n\n- [Notes](references/AGENT.md)\n' > "$c9kc/skills/x/SKILL.md"
+  printf '# N\n\n- [Mail](docs/guide/mail.md)\n' > "$c9kc/skills/x/references/AGENT.md"
+  git -C "$c9kc" add -A && git -C "$c9kc" commit -qm supporting-file-is-a-waypoint
+  check "a linked supporting file still carries edges" pass "$c9kc"
+
+  # A style attribute is a list of declarations, and `display` counts only when
+  # it IS one. Searching the whole attribute read it out of another
+  # declaration's VALUE and called a hidden link visible — an orphan passing.
+  # All three spellings compute to `display: none` with a 0x0 box in Chromium.
+  local c9kd="$tmp/c9kd"; make_corpus "$c9kd"
+  printf '# Jobs\n\n<a style='"'"'display:none; --x:"display:block;"'"'"' href="mail.md">Mail</a>\n' \
+    > "$c9kd/docs/guide/jobs.md"
+  git -C "$c9kd" add -A && git -C "$c9kd" commit -qm decl-inside-custom-property
+  check "a declaration inside a custom property is not one" fail "$c9kd"
+
+  # ...and a SEMICOLON inside a string does not end a declaration, so the text
+  # after it does not start one. This is the case that needs the split to know
+  # about quotes rather than just anchoring the property name.
+  local c9ke="$tmp/c9ke"; make_corpus "$c9ke"
+  printf '# Jobs\n\n<a style='"'"'display:none; content:"a;display:block"'"'"' href="mail.md">Mail</a>\n' \
+    > "$c9ke/docs/guide/jobs.md"
+  git -C "$c9ke" add -A && git -C "$c9ke" commit -qm decl-after-string-semicolon
+  check "a semicolon inside a string ends no declaration" fail "$c9ke"
+
+  # ...nor does one inside `url()`, which is the parenthesis half of the same
+  # rule.
+  local c9kf="$tmp/c9kf"; make_corpus "$c9kf"
+  printf '# Jobs\n\n<a style='"'"'display:none; background:url(a;display:block)'"'"' href="mail.md">Mail</a>\n' \
+    > "$c9kf/docs/guide/jobs.md"
+  git -C "$c9kf" add -A && git -C "$c9kf" commit -qm decl-after-url-semicolon
+  check "a semicolon inside url() ends no declaration" fail "$c9kf"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
