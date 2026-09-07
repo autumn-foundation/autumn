@@ -758,6 +758,7 @@ fn classify_edges(
     let mut purge_after = BTreeSet::new();
     let mut purged_before: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut purged_after_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut purged_internal: Vec<(String, String, String)> = Vec::new();
     let mut internal = Vec::new();
     for edge in inputs.foreign_keys {
         // A constraint cloned from a partitioned parent was already dropped by
@@ -822,34 +823,34 @@ fn classify_edges(
                     retained_into_purged.push(describe(edge));
                 }
             }
+            // Two purged framework tables referencing each other. Neither is in
+            // the sampled universe, so nothing above decides their order — but
+            // the split below can now put them in DIFFERENT phases, which the
+            // single pre-sample pass never could. Remember the edge so the
+            // deferral can be propagated along it.
+            (None, None)
+                if inputs.purged.contains(&edge.child_table)
+                    && inputs.purged.contains(&edge.parent_table) =>
+            {
+                purged_internal.push((
+                    edge.child_table.clone(),
+                    edge.parent_table.clone(),
+                    describe(edge),
+                ));
+            }
             _ => {}
         }
     }
 
-    if !partition_local.is_empty() {
-        partition_local.sort();
-        return Err(SampleError::PartitionLocalForeignKey {
-            edges: partition_local,
-        });
-    }
-    check_purge_order(&purge_after, &purged_before, &purged_after_edges)?;
-    if !retained_into_purged.is_empty() {
-        retained_into_purged.sort();
-        return Err(SampleError::RetainedReferencesPurged {
-            edges: retained_into_purged,
-        });
-    }
+    propagate_deferrals(&purged_internal, &mut purge_after, &mut purged_after_edges);
 
-    if !outside_refs.is_empty() {
-        outside_refs.sort();
-        return Err(SampleError::OutsideTableReferencesSampled {
-            edges: outside_refs,
-        });
-    }
-    if !dangling.is_empty() {
-        dangling.sort();
-        return Err(SampleError::NeverIncludeReferenced { edges: dangling });
-    }
+    raise_edge_refusals(EdgeRefusals {
+        partition_local,
+        retained_into_purged,
+        outside_refs,
+        dangling,
+    })?;
+    check_purge_order(&purge_after, &purged_before, &purged_after_edges)?;
 
     let walk = internal
         .iter()
@@ -860,6 +861,72 @@ fn classify_edges(
         .cloned()
         .collect();
     Ok((internal, walk, purge_after))
+}
+
+/// The edge shapes the plan refuses, gathered so one pass can report them.
+struct EdgeRefusals {
+    partition_local: Vec<String>,
+    retained_into_purged: Vec<String>,
+    outside_refs: Vec<String>,
+    dangling: Vec<String>,
+}
+
+/// Raise the first non-empty refusal, most structural first: a key the plan
+/// cannot express at all, then one no delete order satisfies, then the two
+/// dangling-reference shapes.
+fn raise_edge_refusals(mut found: EdgeRefusals) -> Result<(), SampleError> {
+    for (edges, build) in [
+        (
+            &mut found.partition_local,
+            (|e| SampleError::PartitionLocalForeignKey { edges: e }) as fn(Vec<String>) -> _,
+        ),
+        (
+            &mut found.retained_into_purged,
+            (|e| SampleError::RetainedReferencesPurged { edges: e }) as fn(Vec<String>) -> _,
+        ),
+        (
+            &mut found.outside_refs,
+            (|e| SampleError::OutsideTableReferencesSampled { edges: e }) as fn(Vec<String>) -> _,
+        ),
+        (
+            &mut found.dangling,
+            (|e| SampleError::NeverIncludeReferenced { edges: e }) as fn(Vec<String>) -> _,
+        ),
+    ] {
+        if !edges.is_empty() {
+            edges.sort();
+            return Err(build(std::mem::take(edges)));
+        }
+    }
+    Ok(())
+}
+
+/// Carry a deferred purge's own references into the deferred phase with it.
+///
+/// Emptying a purged parent in the pre-sample pass would hit the rows of a
+/// purged child that is deferred, since those survive until the deferred pass.
+/// Propagating along framework-to-framework edges keeps a connected pair in one
+/// phase. It deliberately does NOT order purges *within* a phase: that is
+/// pre-existing behaviour, and the split's job is only to avoid disturbing it.
+fn propagate_deferrals(
+    edges: &[(String, String, String)],
+    purge_after: &mut BTreeSet<String>,
+    after_edges: &mut BTreeMap<String, Vec<String>>,
+) {
+    let mut settled = false;
+    while !settled {
+        settled = true;
+        for (child, parent, edge) in edges {
+            if purge_after.contains(child) && !purge_after.contains(parent) {
+                purge_after.insert(parent.clone());
+                after_edges
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(edge.clone());
+                settled = false;
+            }
+        }
+    }
 }
 
 /// Refuse a `[framework] purge` that one edge needs before the sample and
@@ -2239,6 +2306,97 @@ mod tests {
             plan.purge_after,
             BTreeSet::from(["autumn_jobs".to_owned()]),
             "the purge its emptied child references must run after the sample"
+        );
+    }
+
+    #[test]
+    fn a_deferred_purge_drags_the_purges_it_references_with_it() {
+        // autumn_jobs is deferred (audit_logs, which the sample empties, points
+        // at it) and itself references autumn_job_tracking. Purging the latter
+        // in the pre-sample pass would hit autumn_jobs's rows, which survive
+        // until the deferred pass — so it has to travel to the same phase.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        keys.push(fk(
+            "jobs_tracking_fk",
+            "autumn_jobs",
+            "tracking_id",
+            "autumn_job_tracking",
+            "id",
+        ));
+        let framework =
+            BTreeSet::from(["autumn_jobs".to_owned(), "autumn_job_tracking".to_owned()]);
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &framework,
+            purged: &framework,
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            plan.purge_after,
+            BTreeSet::from(["autumn_jobs".to_owned(), "autumn_job_tracking".to_owned()]),
+            "the referenced purge must be deferred alongside the one that needs it"
+        );
+    }
+
+    #[test]
+    fn a_propagated_deferral_that_contradicts_is_still_refused() {
+        // Same chain, but autumn_job_tracking also references the sampled
+        // `users`, which pins it BEFORE the sample. Propagation would pin it
+        // after, so the contradiction check has to see the propagated deferral,
+        // not just the directly-recorded ones.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        keys.push(fk(
+            "jobs_tracking_fk",
+            "autumn_jobs",
+            "tracking_id",
+            "autumn_job_tracking",
+            "id",
+        ));
+        keys.push(fk(
+            "tracking_user_fk",
+            "autumn_job_tracking",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let framework =
+            BTreeSet::from(["autumn_jobs".to_owned(), "autumn_job_tracking".to_owned()]);
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &framework,
+            purged: &framework,
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap_err();
+        let SampleError::PurgeOrderContradiction { tables } = err else {
+            panic!("expected a purge-order contradiction, got {err:?}");
+        };
+        assert!(
+            tables.iter().any(|t| t.starts_with("autumn_job_tracking:")),
+            "the propagated deferral must be checked too: {tables:?}"
         );
     }
 
