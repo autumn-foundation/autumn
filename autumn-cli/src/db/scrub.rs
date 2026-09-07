@@ -2507,13 +2507,17 @@ fn classify_and_apply(
                 eprintln!("  {};", emptiness_assertion(table));
             }
             eprintln!("  COMMIT;");
-            if sampling.is_some() {
-                // Deliberately outside the envelope, as in `execute`: VACUUM
-                // (FULL) cannot run inside a transaction block.
-                eprintln!(
-                    "  -- then VACUUM (FULL, ANALYZE) on every subsetted table, so the files \
-                     shrink to the sample"
-                );
+            // Deliberately outside the envelope, as in `execute`: VACUUM (FULL)
+            // cannot run inside a transaction block. Printed as the real
+            // statements rather than described: a sample that is not compacted
+            // still occupies the source's disk, so an operator running the
+            // printed sequence without them does not get the laptop-sized copy
+            // the command promises.
+            if let Some(sampling) = sampling {
+                eprintln!("  SET lock_timeout = '{COMPACT_LOCK_TIMEOUT}';");
+                for table in sampling.subsetted_tables() {
+                    eprintln!("  VACUUM (FULL, ANALYZE) {};", qualified_ident(table));
+                }
             }
         }
         eprintln!("\n\u{2713} Dry run only \u{2014} nothing was written.");
