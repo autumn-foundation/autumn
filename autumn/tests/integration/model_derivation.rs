@@ -205,6 +205,7 @@ pub trait DvRevisionRepository {}
 
 const COUNT_DERIVATION: &str = "dv_posts.published_comment_count";
 const SUM_DERIVATION: &str = "dv_posts.visible_score";
+const CAPPED_DERIVATION: &str = "dv_capped_posts.capped_count";
 
 /// The state table's own DDL, taken from the migration the framework ships, so
 /// these tests exercise the shipped statement rather than a copy of it.
@@ -1377,6 +1378,68 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
     assert!(third.completed.is_empty());
 }
 
+// ── A batch that aborts ────────────────────────────────────────────────────
+
+/// A repair that violates a constraint aborts its whole batch, so the
+/// checkpoint and the state row are left exactly as they were.
+///
+/// This is the failure mode the batch transaction exists for: the assignment,
+/// the checkpoint and the row count are one commit. A checkpoint written
+/// separately would claim a batch that never landed, and the sweep would skip
+/// those parents forever.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failing_batch_leaves_the_checkpoint_and_the_state_untouched() {
+    let (_guard, _pg, pool) = setup().await;
+    let mut conn = pool.get().await.expect("conn");
+    mark_all_complete(&mut conn).await;
+
+    // A capped parent with four published children, inserted by raw SQL so the
+    // maintained column stays 0. `CHECK (capped_count <= 3)` then rejects the
+    // repair's assignment of 4.
+    let post = seed_one_col(&mut conn, "dv_capped_posts", "label", "capped").await;
+    for _ in 0..4 {
+        diesel::sql_query("INSERT INTO dv_capped_comments (post_id, published) VALUES ($1, TRUE)")
+            .bind::<BigInt, _>(post)
+            .execute(&mut conn)
+            .await
+            .expect("legacy comment");
+    }
+
+    // Only the capped derivation is enqueued, so the sweep has exactly one
+    // batch and it is the failing one.
+    diesel::sql_query(
+        "UPDATE _autumn_derivations SET backfill_state = 'pending', checkpoint = NULL, \
+         backfilled_rows = 0 WHERE name = $1",
+    )
+    .bind::<Text, _>(CAPPED_DERIVATION)
+    .execute(&mut conn)
+    .await
+    .expect("enqueue the capped derivation");
+
+    let error = run_backfill(&mut conn, &BackfillOptions::default())
+        .await
+        .expect_err("a batch that violates a CHECK must surface the error");
+    let message = error.to_string();
+    assert!(
+        message.contains("capped_count"),
+        "the error names the constraint that rejected the repair: {message}"
+    );
+
+    let state = state_of(&mut conn, CAPPED_DERIVATION).await;
+    assert_eq!(
+        state.backfill_state, "pending",
+        "the state write shared the transaction that rolled back"
+    );
+    assert_eq!(state.checkpoint, None);
+    assert_eq!(state.backfilled_rows, 0);
+    assert_eq!(
+        derived(&mut conn, "dv_capped_posts", "capped_count", post).await,
+        0,
+        "the parent keeps the value it had"
+    );
+}
+
 // ── AC7: status and repair ─────────────────────────────────────────────────
 
 /// AC7: the status surface reports hash, state, checkpoint and drift, and a
@@ -1469,6 +1532,45 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
 
     // An unknown name is an error, not a silent no-op.
     assert!(recompute(&mut conn, "nope.nope").await.is_err());
+}
+
+/// A drift scan that cannot run is reported on its own row, and the other
+/// derivations are still measured.
+///
+/// The scan reads the derived column, so the common failure is a migration that
+/// has not been applied yet. Aborting the whole status read on it would hide
+/// every healthy derivation behind one that is merely not deployed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ac7_a_failing_drift_scan_is_reported_per_derivation() {
+    let (_guard, _pg, pool) = setup().await;
+    let mut conn = pool.get().await.expect("conn");
+    mark_all_complete(&mut conn).await;
+
+    diesel::sql_query("ALTER TABLE dv_posts DROP COLUMN visible_score")
+        .execute(&mut conn)
+        .await
+        .expect("remove the derived column the sum maintains");
+
+    let status = derivation_status(&mut conn).await.expect("status");
+    let broken = status
+        .iter()
+        .find(|entry| entry.name == SUM_DERIVATION)
+        .expect("the derivation whose column is missing is still listed");
+    assert_eq!(broken.drift, None, "nothing could be measured");
+    let detail = broken
+        .drift_error
+        .as_deref()
+        .expect("the reason is reported, not swallowed");
+    assert!(
+        detail.contains("visible_score"),
+        "the error names the missing column: {detail}"
+    );
+
+    for entry in status.iter().filter(|entry| entry.name != SUM_DERIVATION) {
+        assert_eq!(entry.drift, Some(0), "{entry:?}");
+        assert_eq!(entry.drift_error, None, "{entry:?}");
+    }
 }
 
 // ── AC8: reading a derivation is one query ─────────────────────────────────
