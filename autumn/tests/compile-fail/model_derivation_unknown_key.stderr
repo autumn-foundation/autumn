@@ -1,0 +1,5 @@
+error: expected `column = "<column>"`, `transform = count` / `transform = sum(<field>)`, `filter = <expr>`, `fk = <column>`, `tenant = "<column>"`, or `name = "<name>"` in `#[derivation(...)]`
+  --> tests/compile-fail/model_derivation_unknown_key.rs:32:56
+   |
+32 | #[derivation(Post, column = "published_comment_count", when = "published")]
+   |                                                        ^^^^

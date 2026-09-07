@@ -1,0 +1,5 @@
+error: a `#[derivation]` and another `#[derivation]` on `Comment` both maintain `posts.published_comment_count`, so every insert would count twice — give one of them a different `column = "<column>"`
+  --> tests/compile-fail/model_derivation_duplicate_column.rs:34:3
+   |
+34 | #[derivation(Post, column = "published_comment_count", filter = !published)]
+   |   ^^^^^^^^^^

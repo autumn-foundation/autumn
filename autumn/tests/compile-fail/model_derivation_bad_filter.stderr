@@ -1,0 +1,5 @@
+error: unsupported expression in `#[derivation(filter = ...)]`; the grammar accepts `field` and `!field` (bool fields), `field OP <literal>` with OP one of `==` `!=` `<` `<=` `>` `>=` and an integer, bool or string literal, `field.is_some()`, `field.is_none()`, `a && b`, and parentheses
+  --> tests/compile-fail/model_derivation_bad_filter.rs:34:65
+   |
+34 | #[derivation(Post, column = "published_comment_count", filter = published || status == "draft")]
+   |                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

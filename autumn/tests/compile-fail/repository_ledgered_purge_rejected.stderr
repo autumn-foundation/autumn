@@ -3,3 +3,9 @@ error[E0599]: no method named `purge` found for reference `&PgLedgeredPurgeNoteR
    |
 41 |     repo.purge(1).await.expect("no such method");
    |          ^^^^^ method not found in `&PgLedgeredPurgeNoteRepository`
+
+error[E0282]: type annotations needed
+  --> tests/compile-fail/repository_ledgered_purge_rejected.rs:41:5
+   |
+41 |     repo.purge(1).await.expect("no such method");
+   |     ^^^^^^^^^^^^^^^^^^^ cannot infer type

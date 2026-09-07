@@ -1,4 +1,4 @@
-error[E0599]: no associated function or constant named `start` found for struct `Machine<Paid>` in the current scope
+error[E0599]: no function or associated item named `start` found for struct `Machine<Paid>` in the current scope
   --> tests/compile-fail/lifecycle_start_only_on_initial.rs:28:56
    |
  6 | / #[lifecycle(
@@ -7,18 +7,17 @@ error[E0599]: no associated function or constant named `start` found for struct 
  9 | |     transitions(
 ...  |
 16 | | )]
-   | |__- associated function or constant `start` not found for this struct
+   | |__- function or associated item `start` not found for this struct
 ...
 28 |       let _ = order_state::Machine::<order_state::Paid>::start();
-   |                                                          ^^^^^ associated function or constant not found in `Machine<Paid>`
+   |                                                          ^^^^^ function or associated item not found in `Machine<Paid>`
    |
-   = note: the associated function or constant was found for `Machine<order_state::Pending>`
+   = note: the function or associated item was found for
+           - `Machine<order_state::Pending>`
    = help: items from traits can only be used if the trait is implemented and in scope
    = note: the following traits define an item `start`, perhaps you need to implement one of them:
            candidate #1: `cluster::transport::PeerTransport`
-           candidate #2: `opentelemetry::trace::tracer::Tracer`
-           candidate #3: `regex_syntax::ast::visitor::Visitor`
-           candidate #4: `regex_syntax::hir::visitor::Visitor`
-           candidate #5: `rustls::crypto::SupportedKxGroup`
-           candidate #6: `rustls::crypto::hash::Hash`
-           candidate #7: `testcontainers::runners::async_runner::AsyncRunner`
+           candidate #2: `regex_syntax::ast::visitor::Visitor`
+           candidate #3: `regex_syntax::hir::visitor::Visitor`
+           candidate #4: `rustls::crypto::SupportedKxGroup`
+           candidate #5: `rustls::crypto::hash::Hash`

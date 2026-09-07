@@ -1,0 +1,5 @@
+error: `approved` is not a field of model `Comment`, so it cannot appear in `#[derivation(filter = ...)]`
+  --> tests/compile-fail/model_derivation_filter_non_field.rs:33:65
+   |
+33 | #[derivation(Post, column = "published_comment_count", filter = approved)]
+   |                                                                 ^^^^^^^^
