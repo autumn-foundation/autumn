@@ -1,4 +1,4 @@
-# ⛏️ Prospect: does `autumn-edge`'s host still deny the WASI escapes its own module doc claims? (pursue: 6/6 probes held vs. pre-set line)
+# ⛏️ Prospect: does `autumn-edge`'s host still deny the WASI escapes its own module doc claims? (pursue: 5/5 pre-registered criteria held, +1 supplemental)
 
 ## 🎯 Question
 
@@ -127,13 +127,17 @@ named in the pre-registration.
   probe that needs to observe a *returned value* (not just "trap vs. no
   trap") would need to either emit a minimal valid response frame or extend
   this harness with a stderr-reporting convention; neither was needed for
-  the six properties tested here.
-- 6 of the plan doc's 17 named threats (R1–R17) are covered: filesystem
-  (R1), two independent real-function representatives of "closed world"
-  (R2, via `sock_connect` and `sock_send`), one invented-namespace host
-  escape (also R2-shaped, mirroring `plugin_sandbox`'s `HOST_COMMAND`), and
-  environment/argv leakage (R3, both the size call and the value call for
-  each). R11–R17 (header/cookie stripping, manifest/artifact integrity,
+  the six probes here.
+- 5 of the plan doc's 17 named threats (R1–R17) are pre-registered and
+  covered: filesystem (R1), one real-function representative of "closed
+  world" (R2, via `sock_connect` — the pre-registration's own named
+  example), one invented-namespace host escape (also R2-shaped, mirroring
+  `plugin_sandbox`'s `HOST_COMMAND`), and environment/argv leakage (R3,
+  both the size call and the value call for each). A sixth, supplemental
+  probe covers the same R2 threat class a second way (`sock_send`), added
+  during review — see the pre-registration-fidelity update below for why it
+  is reported separately rather than folded into the registered count.
+  R11–R17 (header/cookie stripping, manifest/artifact integrity,
   consent surfacing) are **plugin_sandbox-only concepts** — `autumn-edge`
   has no manifest, no declared-capability grant surface, and strips
   credential headers before the frame is built (i.e. before the guest ever
@@ -180,6 +184,20 @@ named in the pre-registration.
      the pointer-array and buffer regions before calling `environ_get`/
      `args_get` and trapping if either changed; confirmed to actually catch
      a leak with the second negative control described above.
+- **Update (second Codex review round) — a pre-registration-fidelity
+  correction, not a code change.** After the fix above, this report's Assay
+  and Verdict sections described the result as "6/6 against the pre-set
+  line," folding the new supplemental `sock_send` probe into the same
+  denominator as the five criteria the pre-registration actually fixed
+  (line 45 above names only `sock_connect`). A Codex review correctly
+  flagged this: scoring a probe that was added *after* the pre-registration
+  — and whose own write-up says so — as if it had been one of the
+  registered lines is exactly the kind of post-hoc criterion-widening
+  Prospect's own rules exist to prevent, independent of whether the extra
+  probe happens to pass. No apparatus or code changed for this round — the
+  `sock_send` probe stays (it is real, additional evidence, and cheap to
+  keep) but is now reported as **5/5 pre-registered, plus 1 supplemental**
+  throughout, never blended into a single inflated count.
 
 ## 📊 Assay
 
@@ -187,40 +205,54 @@ named in the pre-registration.
 cargo test -p autumn-edge --features host --test host_wasi_deny_probes
 ```
 
-| Probe | Threat class | Expected | Result |
-|---|---|---|---|
-| `filesystem_import_is_refused_at_load` | R1 — ambient filesystem | refused at instantiation | **refused** (`"...could not be instantiated..."`) |
-| `socket_connect_import_is_refused_at_load` | R2 — closed world, real fn (`sock_connect`) | refused at instantiation | **refused** |
-| `socket_send_import_is_refused_at_load` | R2 — closed world, real fn (`sock_send`) | refused at instantiation | **refused** |
-| `invented_namespace_import_is_refused_at_load` | R2 — closed world, invented namespace | refused at instantiation | **refused** |
-| `environ_is_actually_empty_not_just_documented` | R3 — environment (size + value calls) | clean exit, no trap | **clean exit** (`"the capsule exited without answering"`) |
-| `args_are_actually_empty_not_just_documented` | R3 — argv (size + value calls) | clean exit, no trap | **clean exit** |
+| Probe | Threat class | Pre-registered? | Expected | Result |
+|---|---|---|---|---|
+| `filesystem_import_is_refused_at_load` | R1 — ambient filesystem | yes | refused at instantiation | **refused** (`"...could not be instantiated..."`) |
+| `socket_connect_import_is_refused_at_load` | R2 — closed world, real fn (`sock_connect`) | yes (the pre-registration's own named example) | refused at instantiation | **refused** |
+| `invented_namespace_import_is_refused_at_load` | R2 — closed world, invented namespace | yes | refused at instantiation | **refused** |
+| `environ_is_actually_empty_not_just_documented` | R3 — environment (size + value calls) | yes | clean exit, no trap | **clean exit** (`"the capsule exited without answering"`) |
+| `args_are_actually_empty_not_just_documented` | R3 — argv (size + value calls) | yes | clean exit, no trap | **clean exit** |
+| `socket_send_import_is_refused_at_load` | R2 — closed world, real fn (`sock_send`) | **no — supplemental, added during review** | refused at instantiation | **refused** |
 
-6/6 against the pre-set pursue line. Full crate suite re-run clean alongside
-the new tests (`cargo test -p autumn-edge --features host`: 22 existing
-`#[cfg(test)]`/integration tests + 2 doctests, all passing, confirming the
-new dev-dependency and feature-gated test file didn't disturb anything
-already there). `cargo fmt -p autumn-edge` and `cargo clippy -p autumn-edge
---features host --all-targets -- -D warnings` clean (one pre-existing,
-unrelated `unknown_lints` warning from a stale `clippy::unused_async_trait_impl`
-name in workspace lint config, reproducible on `trunk-dev` before this PR,
-not introduced by it).
+**5/5 pre-registered criteria hold, against the pre-set pursue line, plus
+1/1 supplemental probe also passing.** A Codex review on this PR correctly
+flagged that an earlier version of this table folded the supplemental
+`sock_send` probe into a "6/6" headline score — since `sock_send` was never
+one of the five criteria fixed in the pre-registration (only `sock_connect`
+was named there), counting it in the denominator after the fact would be
+exactly the kind of post-hoc goalpost-widening Prospect's own rules ban,
+even though the extra probe happens to pass. The two counts are now kept
+separate: **5/5** is the number that carries the verdict against the
+pre-set line; the `sock_send` probe is additional, welcome, but
+non-registered evidence, reported alongside rather than blended in.
+
+Full crate suite re-run clean alongside the new tests (`cargo test -p
+autumn-edge --features host`: 22 existing `#[cfg(test)]`/integration tests +
+2 doctests, all passing, confirming the new dev-dependency and
+feature-gated test file didn't disturb anything already there). `cargo fmt
+-p autumn-edge` and `cargo clippy -p autumn-edge --features host
+--all-targets -- -D warnings` clean (one pre-existing, unrelated
+`unknown_lints` warning from a stale `clippy::unused_async_trait_impl` name
+in workspace lint config, reproducible on `trunk-dev` before this PR, not
+introduced by it).
 
 Worst-case probing: the two negative controls (see stubs list) are the worst
 case this assay could cheaply manufacture — an actual leak, caught, in both
 the size-reporting and value-returning halves of the R3 contract. No attempt
-was made to fuzz WAT shapes beyond the six hand-written probes; each targets
-one specific, named claim from the module doc rather than searching for
-unknown ones.
+was made to fuzz WAT shapes beyond the six hand-written probes (five
+pre-registered, one supplemental); each targets one specific, named claim
+from the module doc rather than searching for unknown ones.
 
 ## 🏁 Verdict: **pursue** (the baseline holds) — with a real, separate structural finding
 
-**6/6 probes confirm `autumn-edge`'s host still holds every WASI-deny
-property this assay could cheaply check, unmodified, despite the zero-commit
-gap Keystone's memo flagged.** Against the pre-set line, this is not a
-security emergency: the "do nothing yet" default in Keystone's memo (or
-either of its other two options) is not being chosen blind to an active
-hole, at least not one of these six shapes.
+**5/5 pre-registered probes confirm `autumn-edge`'s host still holds every
+WASI-deny property this assay could cheaply check, unmodified, despite the
+zero-commit gap Keystone's memo flagged** — plus a sixth, supplemental probe
+(`sock_send`, added during review, not part of the registered denominator)
+also passing. Against the pre-set line, this is not a security emergency:
+the "do nothing yet" default in Keystone's memo (or either of its other two
+options) is not being chosen blind to an active hole, at least not one of
+these five pre-registered shapes.
 
 That is not the same finding as "the two hosts are equivalently robust,"
 and this assay does not claim it. What it adds to Keystone's memo, precisely:
@@ -255,8 +287,9 @@ and this assay does not claim it. What it adds to Keystone's memo, precisely:
   today" as a real gap rather than an accepted one. That weighing is still
   the human decision Keystone's memo correctly declined to make — this
   assay only replaces "we assume it still holds" with "it does hold, checked
-  six ways, and here specifically is the one place the two hosts' *designs*
-  — not just their WASI surfaces — actually diverge."
+  five pre-registered ways plus one supplemental, and here specifically is
+  the one place the two hosts' *designs* — not just their WASI surfaces —
+  actually diverge."
 
 ## 💰 Cost to productionize
 
