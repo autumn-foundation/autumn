@@ -3193,8 +3193,16 @@ def _missing_value(kind, eaten, i, tokens, runnable):
     # Checking only `known` left the short spelling of this defect accepted —
     # the same shape as finding 1, where `--name=value` was the unchecked
     # spelling of an unchecked name.
-    return (runnable and kind in ('known', 'cluster') and eaten == 2
-            and i + eaten > len(tokens))
+    if not (runnable and kind in ('known', 'cluster') and eaten == 2):
+        return False
+    if i + eaten > len(tokens):
+        return True                             # nothing there at all
+    # …and a token being PRESENT is not the same as it being a value the
+    # option can take. The shell removes a redirection before the binary is
+    # launched, so `autumn build --package >/tmp/out` reaches clap as
+    # `build --package` and is "a value is required" (measured). Counting the
+    # token list alone accepted it, since `>` was sitting in the slot.
+    return bool(_redirect(tokens[i + 1]))
 
 
 def _starts_trailing(node, supplied):
@@ -4081,6 +4089,15 @@ def self_test():
            '…or attached to the letter')
     expect(raw_opts('migrate -p') == [],
            'still prose-exempt, like the long spelling')
+    # …and shell plumbing is not a value. The shell strips a redirection before
+    # the binary starts, so the option is left with nothing.
+    for form in ('migrate --shard >/tmp/out', 'migrate --shard > /tmp/out',
+                 'migrate --shard 2>/dev/null', 'migrate -p >/tmp/out'):
+        hits = raw_opts(form, runnable=True)
+        expect([k for _p, _o, k in hits] == ['needsvalue'],
+               f'a redirection cannot serve as the value in {form!r}: {hits}')
+    expect(raw_opts('migrate --shard eu >/tmp/out', runnable=True) == [],
+           'a real value followed by a redirection resolves')
     expect(resolve(tk('replay -hpapi'), surface, runnable=True) is None,
            '…so <CAPSULE> is not reported missing')
     expect(resolve(tk('replay -papi'), surface, runnable=True) == 'autumn replay',
