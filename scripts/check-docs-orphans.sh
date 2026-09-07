@@ -359,14 +359,26 @@ def _find_key(table, path):
     """Text from the value of the first line whose key is `path`, else None.
 
     The REST of the table is returned, not just that line, so a value spread
-    over following lines — an allowlist with a comment in it, say — is still
-    whole for the value patterns.
+    over following lines — an allowlist with a comment in it, or a multi-line
+    string — is still whole for the value patterns.
+
+    Multi-line strings are tracked here so their CONTENT cannot be read as
+    keys, which is the other half of keeping those lines in the table at all:
+    a `description = \"\"\"` block containing a line `publish = false` must not
+    make the package unpublishable.
     """
     pos = 0
+    ml = None
     for line in table.split('\n'):
+        if ml is not None:
+            if ml in line:
+                ml = None
+            pos += len(line) + 1
+            continue
         k = _line_key(line)
         if k is not None and k[0] == path:
             return table[pos + len(line) - len(k[1]):]
+        _at, ml = _scan_toml_line(line)
         pos += len(line) + 1
     return None
 
@@ -375,8 +387,38 @@ def _find_key(table, path):
 # only "what is this value", never "which key was it".
 _VAL_BOOL = re.compile(r'[ \t]*(false|true)\b')
 _VAL_LIST = re.compile(r'[ \t]*(\[[^\]]*\])')
+# The MULTI-LINE forms have to come first, or `"""docs/intro.md"""` matches as
+# the empty basic string `""` and the path resolves to the package directory —
+# which is not a tracked file, so the crate contributes no entry surface at all.
+# Cargo reports `docs/intro.md` for both triple-quoted spellings.
+#
+# Quoted KEYS need none of this: TOML allows basic and literal strings as keys
+# but not the multi-line forms, so `_line_key` stays as it is.
 _VAL_STRING = re.compile(
-    r'[ \t]*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\')')
+    r'[ \t]*(?:"""(.*?)"""|\'\'\'(.*?)\'\'\''
+    r'|"((?:[^"\\]|\\.)*)"|\'([^\']*)\')', re.S)
+
+
+def _trim_ml(text):
+    """TOML trims a newline immediately following a multi-line opener."""
+    if text.startswith('\r\n'):
+        return text[2:]
+    return text[1:] if text.startswith('\n') else text
+
+
+def _string_value(m):
+    """The value of whichever form `_VAL_STRING` matched.
+
+    Escapes are decoded for the two BASIC forms and left alone for the two
+    literal ones, which is the whole difference between them.
+    """
+    if m.group(1) is not None:
+        return _decode_basic(_trim_ml(m.group(1)))
+    if m.group(2) is not None:
+        return _trim_ml(m.group(2))
+    if m.group(3) is not None:
+        return _decode_basic(m.group(3))
+    return m.group(4)
 # A basic string carries ESCAPES, and Cargo decodes them before resolving the
 # path: `readme = "\\u0069ntro.md"` comes back out of `cargo metadata` as
 # `intro.md`. Returning the encoded source meant the tracked README was never
@@ -630,18 +672,28 @@ def _strip_toml_comments(text):
 
 
 def _toml_lines(manifest):
-    """Yield `(table, line)` for each line of TOML outside a multi-line string.
+    """Yield `(table, line, live)` for each line of TOML.
 
     `table` is the enclosing header's name, or None before the first header.
+    `live` is False for a line that is the CONTENT of a multi-line string.
 
     A header yields its own empty line, so a table that exists but declares no
     keys is still distinguishable from one that never appears at all — the
     difference between a manifest that defines a package and a virtual one.
 
-    Line-scanned, like every other pattern in this file. The construct that has
-    to be tracked is the multi-line string, because a `\"\"\"` block whose
-    CONTENT contains a line reading `[package]` would otherwise re-scope every
-    key after it.
+    Line-scanned, like every other pattern in this file. Multi-line strings are
+    tracked because a `\"\"\"` block whose CONTENT contains a line reading
+    `[package]` would otherwise re-scope every key after it.
+
+    The CLOSING line of such a block is yielded whole and marked not-live,
+    because dropping it destroys the thing a two-line value is made of —
+    `readme = \"\"\"` on one line and the path on the next — while its text must
+    still never be read as a key. Interior lines are dropped: they can carry
+    neither a key nor the end of a value, so keeping them decides nothing.
+
+    In-table protection does not rest on `live`; `_find_key` tracks multi-line
+    strings itself. The flag exists for root-level lines, which `_toml_table`
+    reads as dotted keys before any header has been seen.
     """
     table = None
     ml = None
@@ -650,15 +702,23 @@ def _toml_lines(manifest):
             if ml not in line:
                 continue
             # The remainder of the closing line is live TOML again.
-            line = line.split(ml, 1)[1]
+            rest = line.split(ml, 1)[1]
             ml = None
+            m = _TOML_HEADER.match(rest)
+            if m is not None:
+                table = _toml_key_path(m.group(1))
+                yield table, '', True
+                continue
+            _at, ml = _scan_toml_line(rest)
+            yield table, line, False
+            continue
         m = _TOML_HEADER.match(line)
         if m is not None:
             table = _toml_key_path(m.group(1))
-            yield table, ''
+            yield table, '', True
             continue
         _at, ml = _scan_toml_line(line)
-        yield table, line
+        yield table, line, True
 
 
 def _toml_table(manifest, name):
@@ -684,12 +744,12 @@ def _toml_table(manifest, name):
     want = tuple(name.split('.'))
     out = []
     seen = False
-    for table, line in _toml_lines(manifest):
+    for table, line, live in _toml_lines(manifest):
         if table == name:
             seen = True
             out.append(line)
             continue
-        if table is not None:
+        if table is not None or not live:
             continue
         k = _line_key(line)
         if k is None:
@@ -729,8 +789,7 @@ def _owning_workspace(package, pkg):
     if value is not None:
         m = _VAL_STRING.match(value)
         if m is not None:
-            named = (_decode_basic(m.group(1)) if m.group(1) is not None
-                     else m.group(2))
+            named = _string_value(m)
             base = posixpath.normpath(
                 posixpath.join(pkg, named) if pkg else named)
             cand = 'Cargo.toml' if base in ('', '.') else base + '/Cargo.toml'
@@ -798,10 +857,7 @@ def _readme_paths(manifest, pkg):
     value = _find_key(manifest, ('readme',))
     m = _VAL_STRING.match(value) if value is not None else None
     if m is not None:
-        # Only the BASIC form carries escapes; a literal string is its own
-        # value, which is the whole difference between the two.
-        named = ([_decode_basic(m.group(1))] if m.group(1) is not None
-                 else [m.group(2)])
+        named = [_string_value(m)]
     else:
         b = _VAL_BOOL.match(value) if value is not None else None
         if b is not None and b.group(1) == 'false':
@@ -7708,6 +7764,46 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mw/pkg/README.md"
   git -C "$c9mw" add -A && git -C "$c9mw" commit -qm inline-package-publish
   check "an inline package table's publish key is read" fail "$c9mw"
+
+  # A MULTI-LINE string is a third and fourth spelling of the same path, and
+  # the pattern order decides it: matched last, `"""docs/intro.md"""` reads as
+  # the empty basic string `""` and resolves to the package DIRECTORY, which is
+  # no tracked file, so the crate contributes nothing.
+  local c9mx="$tmp/c9mx"; make_corpus "$c9mx"
+  mkdir -p "$c9mx/pkg"
+  printf '[package]\nname = "pkg"\nreadme = """intro.md"""\n' > "$c9mx/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mx/pkg/intro.md"
+  git -C "$c9mx" add -A && git -C "$c9mx" commit -qm multiline-basic-readme
+  check "a multi-line basic readme names the same file" pass "$c9mx"
+
+  # ...and the literal triple, which takes no escapes either.
+  local c9my="$tmp/c9my"; make_corpus "$c9my"
+  mkdir -p "$c9my/pkg"
+  printf "[package]\nname = \"pkg\"\nreadme = '''intro.md'''\n" > "$c9my/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9my/pkg/intro.md"
+  git -C "$c9my" add -A && git -C "$c9my" commit -qm multiline-literal-readme
+  check "a multi-line literal readme names the same file" pass "$c9my"
+
+  # TOML trims a newline immediately after the opening delimiter, so this names
+  # `intro.md` and not `\nintro.md`.
+  local c9mz="$tmp/c9mz"; make_corpus "$c9mz"
+  mkdir -p "$c9mz/pkg"
+  printf '[package]\nname = "pkg"\nreadme = """\nintro.md"""\n' > "$c9mz/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mz/pkg/intro.md"
+  git -C "$c9mz" add -A && git -C "$c9mz" commit -qm multiline-newline-trim
+  check "a multi-line readme trims the opening newline" pass "$c9mz"
+
+  # The CLOSING line of a multi-line string is kept for its text but must not
+  # be read as a key: here it ends with `package.publish = false`, which at
+  # root level would otherwise fold in as the package's own and strand a
+  # README Cargo does publish.
+  local c9n0="$tmp/c9n0"; make_corpus "$c9n0"
+  mkdir -p "$c9n0/pkg"
+  printf 'description = """\nnote\npackage.publish = false"""\n\n[package]\nname = "pkg"\nreadme = "README.md"\n' \
+    > "$c9n0/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n0/pkg/README.md"
+  git -C "$c9n0" add -A && git -C "$c9n0" commit -qm closing-line-not-a-key
+  check "a multi-line closing line is not a key" pass "$c9n0"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
