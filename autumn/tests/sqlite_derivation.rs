@@ -542,6 +542,54 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
 }
 
 #[tokio::test]
+async fn a_state_row_with_no_derivation_is_reported_as_unregistered() {
+    let pool = boot_pool("sd_unregistered").await;
+    let mut conn = pool.get().await.expect("conn");
+    ensure_derivations(&mut conn).await.expect("enqueue");
+
+    // The row a removed or renamed derivation leaves behind. It is reported
+    // rather than deleted: only an operator can tell a removed derivation apart
+    // from a rolling deploy that has not finished.
+    diesel::sql_query(
+        "INSERT INTO _autumn_derivations \
+           (name, definition_hash, backfill_state, checkpoint, backfilled_rows) \
+         VALUES ('sd_posts.gone', 'deadbeef', 'complete', 41, 7)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a stale row");
+
+    let status = derivation_status(&mut conn).await.expect("status");
+    let names: Vec<&str> = status.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["sd_posts.gone", COUNT_DERIVATION, SUM_DERIVATION],
+        "every row is reported, sorted by name"
+    );
+
+    let stale = &status[0];
+    assert_eq!(stale.backfill_state, Some(BackfillState::Unregistered));
+    assert_eq!(
+        stale.definition_hash, None,
+        "this binary declares no derivation of that name"
+    );
+    assert_eq!(stale.stored_hash.as_deref(), Some("deadbeef"));
+    assert_eq!(stale.checkpoint, Some(41));
+    assert_eq!(stale.backfilled_rows, 7);
+    assert_eq!(
+        stale.drift, None,
+        "there is no definition left to measure drift against"
+    );
+    assert_eq!(stale.drift_error, None);
+
+    // A stale row must not hide the derivations this binary does declare.
+    for entry in &status[1..] {
+        assert!(entry.definition_hash.is_some(), "{entry:?}");
+        assert_eq!(entry.drift, Some(0), "{entry:?}");
+    }
+}
+
+#[tokio::test]
 async fn status_reports_state_and_recompute_clears_the_drift() {
     let pool = boot_pool("sd_status").await;
     let mut conn = pool.get().await.expect("conn");

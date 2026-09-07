@@ -2,9 +2,10 @@
 //! (`#[derivation]`, issue #1769).
 //!
 //! A derivation is a counter cache with a filter and a per-row contribution, so
-//! these tests are the counter-cache suite's siblings: same shape, but every
-//! assertion turns on rows the filter *rejects* being invisible to the
-//! maintained value, and on a weighted contribution rather than `±1`.
+//! these tests are the counter-cache suite's siblings. They have the same shape,
+//! but every assertion turns on two things: a row the filter rejects stays
+//! invisible to the maintained value, and the contribution is weighted rather
+//! than `+1` or `-1`.
 //!
 //! The behavioural tests need a Postgres. They prefer `AUTUMN_TEST_PG_URL` and
 //! fall back to testcontainers, so they run both in CI's ignored-test sweep and
@@ -30,11 +31,12 @@
 //! | `DvCappedComment` | `filter = published`, onto a `CHECK`ed column | `dv_capped_posts.capped_count` |
 //! | `DvRevision` | `filter = published` on a `soft_delete` repository | `dv_pages.live_revision_count` |
 //!
-//! `DvCappedComment` exists to make **same-transaction** atomicity observable:
-//! its parent's column carries `CHECK (capped_count <= 3)`, so the fourth
+//! `DvCappedComment` exists to make **same-transaction** atomicity observable.
+//! Its parent's column carries `CHECK (capped_count <= 3)`, so the fourth
 //! published insert fails on the *derivation update*. If that update ran outside
-//! the insert's transaction the child row would survive; because it is inside,
-//! the whole thing rolls back.
+//! the insert's transaction the child row would survive. Because it is inside,
+//! the whole thing rolls back. The same `CHECK` also makes a backfill batch fail
+//! on demand, which is how the abort-inside-a-batch test works.
 
 #![cfg(feature = "db")]
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
@@ -385,8 +387,32 @@ async fn post_snapshot(conn: &mut AsyncPgConnection, post_id: i64) -> SnapshotRo
     .expect("read post snapshot")
 }
 
-/// Create the fixture schema, if it is not there already.
+/// Every fixture table, child before parent.
+const FIXTURE_TABLES: &[&str] = &[
+    "dv_comments",
+    "dv_posts",
+    "dv_capped_comments",
+    "dv_capped_posts",
+    "dv_revisions",
+    "dv_pages",
+];
+
+/// Create the fixture schema.
+///
+/// On the shared-server path the tables are dropped first, following the
+/// reddit-clone precedent: a table left by an older revision of this suite would
+/// otherwise keep a column this one has since changed, and one test here drops a
+/// column on purpose. On the testcontainer path each test gets its own empty
+/// database, so the drops are no-ops.
 async fn create_schema(conn: &mut AsyncPgConnection) {
+    if std::env::var("AUTUMN_TEST_PG_URL").is_ok() {
+        for table in FIXTURE_TABLES {
+            diesel::sql_query(format!("DROP TABLE IF EXISTS {table} CASCADE"))
+                .execute(conn)
+                .await
+                .unwrap_or_else(|e| panic!("could not drop `{table}`: {e}"));
+        }
+    }
     for stmt in DDL {
         diesel::sql_query(*stmt)
             .execute(conn)
@@ -395,24 +421,46 @@ async fn create_schema(conn: &mut AsyncPgConnection) {
     }
 }
 
-/// Replace `dv_posts` with `total` rows that already carry derived values.
+/// Replace `dv_posts` with `total` parents, seeded **through the repository**.
 ///
-/// The derived columns are seeded directly: this measures the *read* cost of a
-/// maintained derivation, so how the values got there is beside the point.
-async fn reseed_posts_with_derived_values(conn: &mut AsyncPgConnection, total: usize) {
+/// Each parent gets two comments saved by `PgDvCommentRepository`: one published
+/// with score 5 and one draft with score 100. So every parent ends at
+/// `published_comment_count = 1` and `visible_score = 5`, and those values were
+/// produced by the maintenance path this suite is about. Seeding the columns
+/// directly, as this helper used to, made the read assertion unable to fail on a
+/// regression in that path.
+///
+/// Ids restart at 1, so the expected rows are `(1..=total, 1, 5)`.
+async fn reseed_posts_through_the_repository(pool: &Pool<AsyncPgConnection>, total: usize) {
+    let mut conn = pool.get().await.expect("conn");
     diesel::sql_query("TRUNCATE dv_comments, dv_posts RESTART IDENTITY CASCADE")
-        .execute(conn)
+        .execute(&mut conn)
         .await
         .expect("reset");
+    let mut posts = Vec::with_capacity(total);
     for i in 0..total {
-        diesel::sql_query(
-            "INSERT INTO dv_posts (title, published_comment_count, visible_score) \
-             VALUES ($1, 2, 5)",
-        )
-        .bind::<Text, _>(format!("p{i}"))
-        .execute(conn)
-        .await
-        .expect("seed post");
+        posts.push(seed_post(&mut conn, &format!("p{i}")).await);
+    }
+    drop(conn);
+
+    let comments = PgDvCommentRepository::with_pool_untracked(pool.clone());
+    for post in posts {
+        comments
+            .save(&NewDvComment {
+                post_id: post,
+                published: true,
+                score: 5,
+            })
+            .await
+            .expect("save the published comment");
+        comments
+            .save(&NewDvComment {
+                post_id: post,
+                published: false,
+                score: 100,
+            })
+            .await
+            .expect("save the draft");
     }
 }
 
@@ -544,9 +592,10 @@ fn derivation_defs_are_generated_from_the_declarations() {
     assert!(def("dv_pages.live_revision_count").child_soft_delete);
 
     let hash = registered.definition_hash();
+    assert_eq!(hash.len(), 64, "sha256 renders as 64 hex characters: {hash}");
     assert!(
-        (48..=64).contains(&hash.len()) && hash.chars().all(|c| c.is_ascii_hexdigit()),
-        "the definition hash is a hex content address: {hash}"
+        hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "the definition hash is a lowercase hex content address: {hash}"
     );
     assert_ne!(
         hash,
@@ -1180,10 +1229,7 @@ async fn ac5_only_the_changed_derivation_is_enqueued() {
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)
         .expect("the changed derivation is reported");
-    assert_eq!(
-        entry.stored_hash.as_deref(),
-        Some(entry.definition_hash.as_str())
-    );
+    assert_eq!(entry.stored_hash, entry.definition_hash);
 }
 
 // ── AC6: resumable backfill ────────────────────────────────────────────────
@@ -1196,8 +1242,8 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
     let (_guard, _pg, pool) = setup().await;
     let mut conn = pool.get().await.expect("conn");
 
-    // Five parents, each with one published comment nobody counted — the shape
-    // of a table adopting a derivation it did not have before.
+    // Five parents, each with one published comment nobody counted. This is the
+    // shape of a table adopting a derivation it did not have before.
     let mut posts = Vec::new();
     for i in 0..5 {
         let post = seed_post(&mut conn, &format!("p{i}")).await;
@@ -1229,7 +1275,7 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
         "every parent starts drifted"
     );
 
-    // One batch of two, then stop — the kill.
+    // One batch of two, then stop: the kill.
     let first = run_backfill(
         &mut conn,
         &BackfillOptions {
@@ -1251,6 +1297,27 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
         "the checkpoint names the last repaired parent"
     );
     assert_eq!(stopped.backfilled_rows, 2);
+
+    // The same three facts through the reported surface, which is what an
+    // operator watching a rolling deploy actually reads.
+    let mid = derivation_status(&mut conn).await.expect("status mid-sweep");
+    let reported = mid
+        .iter()
+        .find(|entry| entry.name == COUNT_DERIVATION)
+        .expect("the stopped derivation is reported");
+    assert_eq!(reported.backfill_state, Some(BackfillState::Running));
+    assert_eq!(
+        reported.checkpoint,
+        Some(posts[1]),
+        "the checkpoint names the last repaired parent"
+    );
+    assert_eq!(reported.backfilled_rows, 2);
+    assert_eq!(
+        reported.drift,
+        Some(3),
+        "the three parents past the checkpoint still disagree"
+    );
+
     assert_eq!(
         derived(&mut conn, "dv_posts", "published_comment_count", posts[0]).await,
         1
@@ -1281,7 +1348,13 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
     assert_eq!(done.backfill_state, "complete");
     assert_eq!(
         done.backfilled_rows, 5,
-        "five parents, counted once each — no double counting across the resume"
+        "five parents, visited once each, with no double counting across the resume"
+    );
+    assert_eq!(
+        done.checkpoint,
+        Some(posts[4]),
+        "the checkpoint stays populated after completion: it is the last \
+         position the sweep applied, not an in-flight cursor"
     );
     for post in &posts {
         assert_eq!(
@@ -1332,10 +1405,7 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)
         .expect("the count is reported");
-    assert_eq!(
-        count.stored_hash.as_deref(),
-        Some(count.definition_hash.as_str())
-    );
+    assert_eq!(count.stored_hash, count.definition_hash);
     assert_eq!(count.backfill_state, Some(BackfillState::Complete));
     assert_eq!(count.checkpoint, None);
     assert!(
@@ -1343,14 +1413,20 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
         "the row records when it changed"
     );
     assert_eq!(
-        count.drift, 1,
+        count.drift,
+        Some(1),
         "one parent disagrees with the source of truth"
     );
+    assert_eq!(count.drift_error, None, "the scan ran");
     let sum = drifted
         .iter()
         .find(|entry| entry.name == SUM_DERIVATION)
         .expect("the sum is reported");
-    assert_eq!(sum.drift, 1, "the sum never saw the legacy comment either");
+    assert_eq!(
+        sum.drift,
+        Some(1),
+        "the sum never saw the legacy comment either"
+    );
 
     assert_eq!(
         recompute(&mut conn, COUNT_DERIVATION)
@@ -1376,7 +1452,8 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
 
     for entry in derivation_status(&mut conn).await.expect("status") {
         assert_eq!(
-            entry.drift, 0,
+            entry.drift,
+            Some(0),
             "no derivation may drift after a recompute: {entry:?}"
         );
     }
@@ -1408,7 +1485,7 @@ mod query_count {
     use diesel_async::RunQueryDsl as _;
 
     use super::{
-        DB_LOCK, create_schema, dv_posts, reseed_posts_with_derived_values, start_postgres,
+        DB_LOCK, create_schema, dv_posts, reseed_posts_through_the_repository, start_postgres,
     };
 
     /// One `SELECT` over the parent table, derived columns included — no join
@@ -1440,14 +1517,21 @@ mod query_count {
             .build();
 
         for total in [1usize, 40usize] {
-            reseed_posts_with_derived_values(&mut pool.get().await.expect("conn"), total).await;
+            reseed_posts_through_the_repository(&pool, total).await;
 
             let resp = client.get("/dv-posts").send().await;
             resp.assert_ok();
+            // The values, not just the row count: they were maintained by the
+            // repository saves above, so a regression in the delta paths fails
+            // here rather than passing as "one query returned nonsense".
+            let expected: Vec<(i64, i64, i64)> = (1..=i64::try_from(total).expect("total fits"))
+                .map(|id| (id, 1, 5))
+                .collect();
             assert_eq!(
-                resp.json::<Vec<(i64, i64, i64)>>().len(),
-                total,
-                "every parent is listed"
+                resp.json::<Vec<(i64, i64, i64)>>(),
+                expected,
+                "one published comment of score 5 per parent, and the draft \
+                 counts for neither column"
             );
             // Counted against the fixture table, not the whole request: a
             // recycled pooled connection is validated with a `SELECT $1` ping
