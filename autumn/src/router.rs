@@ -13916,6 +13916,7 @@ mod trusted_host_tests {
     /// leave `/mcp` and public routes alone) — exactly the shape that makes
     /// the outer `/mcp` envelope request itself pass the layer while the
     /// route the layer actually protects would not.
+    #[cfg(feature = "mcp")]
     fn deny_unless_api_key_for_secret_path_registration() -> crate::app::CustomLayerRegistration {
         let gate = axum::middleware::from_fn(
             |req: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -13942,6 +13943,7 @@ mod trusted_host_tests {
     /// A `dist` dir with a valid but empty manifest: enough to route through
     /// the SSG/ISG branch of `try_build_router_with_static_inner` without any
     /// route actually being served from the static cache.
+    #[cfg(feature = "mcp")]
     fn build_empty_dist() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dist = tmp.path().join("dist");
