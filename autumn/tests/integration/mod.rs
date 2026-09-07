@@ -192,6 +192,8 @@ mod migrate_checksum_proptest;
 #[cfg(feature = "db")]
 mod model_counter_cache;
 #[cfg(feature = "db")]
+mod model_derivation;
+#[cfg(feature = "db")]
 mod model_field_attrs;
 #[cfg(feature = "db")]
 mod model_votable;

@@ -3573,6 +3573,64 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
 }
 
+/// `GET <actuator-prefix>/derivations` -- maintained derived read models
+/// (issue #1769).
+///
+/// Reports every `#[derivation]` this binary declares: its definition hash, the
+/// hash and backfill state recorded in `_autumn_derivations`, and its current
+/// drift from the source of truth. `drift: 0` on every row is the healthy
+/// answer; a nonzero one names the derivation to recompute.
+///
+/// Sensitive-gated, like `/env` and `/graph`: the document names parent tables,
+/// child tables and the columns joining them.
+///
+/// Each drift figure is one aggregate over a parent table, so this is an
+/// operator endpoint rather than a monitoring one — do not scrape it.
+///
+/// A process with no database pool answers `503` rather than `404`, so an
+/// operator can tell "this build has no such endpoint" apart from "this process
+/// has no database to report against".
+#[cfg(feature = "db")]
+pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> axum::response::Response {
+    let Some(pool) = state.pool() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no database pool is configured in this process",
+                "hint": "derivation state lives in the `_autumn_derivations` table, so \
+                         reporting it needs a database connection",
+            })),
+        )
+            .into_response();
+    };
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "could not acquire a database connection",
+                    "detail": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    match crate::derivation::derivation_status(&mut conn).await {
+        Ok(statuses) => (StatusCode::OK, Json(statuses)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "could not read derivation state",
+                "detail": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET <actuator-prefix>/graph` -- the application's architecture graph
 /// (issue #1747).
 ///
@@ -4005,6 +4063,10 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
         paths.push(actuator_route_path(prefix, "/graph"));
+        #[cfg(feature = "db")]
+        {
+            paths.push(actuator_route_path(prefix, "/derivations"));
+        }
         #[cfg(feature = "system-info")]
         {
             paths.push(actuator_route_path(prefix, "/system"));
@@ -4158,6 +4220,13 @@ pub(crate) fn actuator_router_with_prefix<
                 &actuator_route_path(prefix, "/graph"),
                 axum::routing::get(graph_endpoint),
             );
+        #[cfg(feature = "db")]
+        {
+            router = router.route(
+                &actuator_route_path(prefix, "/derivations"),
+                axum::routing::get(derivations_endpoint::<S>),
+            );
+        }
         #[cfg(feature = "http-client")]
         {
             router = router
@@ -5592,6 +5661,58 @@ mod tests {
             "the listing must match the mounts, or the startup barrier seeds a path \
              that is not served"
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn actuator_derivations_path_is_listed_only_in_sensitive_mode() {
+        // The listing seeds the startup barrier's allow-list, so a mount without
+        // a listed path is a route the barrier holds shut. The document names
+        // parent and child tables, so it is sensitive-gated like `/graph`.
+        assert!(
+            actuator_endpoint_paths("/actuator", true, true)
+                .contains(&"/actuator/derivations".to_owned())
+        );
+        assert!(
+            !actuator_endpoint_paths("/actuator", false, true)
+                .contains(&"/actuator/derivations".to_owned()),
+            "the listing must match the mounts, or the startup barrier seeds a path \
+             that is not served"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_derivations_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/derivations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_derivations_reports_no_pool_as_unavailable() {
+        // 503, not 404: an operator has to be able to tell "this build has no
+        // such endpoint" from "this process has no database to report against".
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/derivations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

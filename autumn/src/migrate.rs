@@ -729,8 +729,8 @@ pub struct AppliedUserMigration {
 }
 
 /// Versions of all embedded framework migrations: the control-plane
-/// [`FRAMEWORK_MIGRATIONS`] plus the shard-required version-history and
-/// commit-hook queue migrations.
+/// [`FRAMEWORK_MIGRATIONS`] plus the shard-required version-history,
+/// commit-hook queue and derivation-state migrations.
 ///
 /// Used to exclude framework-owned migrations from user rollback planning so
 /// the forward-only contract is preserved regardless of which migrations are
@@ -760,6 +760,7 @@ where
         MigrationSource::<DB>::migrations(
             &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
         ),
+        MigrationSource::<DB>::migrations(&crate::derivation::DERIVATION_MIGRATIONS),
     ] {
         let migrations = migrations.map_err(|e| MigrationError::Migration(e.to_string()))?;
         versions.extend(migrations.iter().map(|m| m.name().version().to_string()));

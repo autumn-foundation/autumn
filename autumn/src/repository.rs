@@ -41,6 +41,13 @@ pub use crate::counter_cache::{
     counter_cache_recompute,
 };
 
+// Derivations (#1769) are maintained through the counter-cache specs above, so
+// the hooks a generated repository calls are already in scope from that
+// re-export. What `#[model]` needs additionally is the registry it submits each
+// declared derivation into.
+#[doc(inline)]
+pub use crate::derivation::{DerivationDef, DerivationDescriptor};
+
 // ── Dependent-cascade primitives (issue #2309 follow-up) ─────────────
 //
 // `dependent(...)` (#1369) generates an `__autumn_apply_dependent_on_conn`
