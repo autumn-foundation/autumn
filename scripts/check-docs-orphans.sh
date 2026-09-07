@@ -129,8 +129,12 @@ import html, os, posixpath, re, subprocess, sys, urllib.parse
 root = sys.argv[1]
 
 GUIDE = 'docs/guide/'
-ROOT_FILES = ('README.md', 'EXAMPLES.md', 'CONTRIBUTING.md', 'STABILITY.md',
-              'docs/plugins.md')
+ROOT_FILES = ('README.md', 'AGENTS.md', 'EXAMPLES.md', 'CONTRIBUTING.md',
+              'STABILITY.md', 'docs/plugins.md')
+# `AGENTS.md` is the workspace instruction file agent tooling loads by name on
+# entering the repository — no link leads to it, which is exactly what makes it
+# an entry surface rather than a waypoint. Same argument as `SKILL.md`, and it
+# was the one such file this list still omitted.
 # `.claude/skills/` too: the agent machinery loads a `SKILL.md` there by name
 # exactly as it does one under `skills/`, so it is a surface an agent ENTERS
 # through, not one it is routed to. It was being treated as a waypoint, which
@@ -500,6 +504,13 @@ def contains_link(label, resolved=None):
         return True
     if not resolved:
         return False
+    # The reference scans are patterns, not scanners, so they cannot step over
+    # a code span the way `_openers` does — and a reference SPELLED in code is
+    # not a link. `[outer `[fake][m]`](mail.md)` with `[m]` defined kept the
+    # outer link in both renderers, while this function suppressed it and
+    # stranded the page. Blanked space for space, so the offsets the callers
+    # read stay valid.
+    label = CODE_SPAN.sub(lambda m: ' ' * len(m.group(0)), label)
     for _s, _e, lstart, lend, ref in full_references(label):
         # `[text][]` is collapsed: the label IS the reference.
         if ref_label(ref or label[lstart:lend]) in resolved:
@@ -1820,8 +1831,31 @@ def definition_labels(txt):
 # gives its anchor a 304x17 box that hit-tests inside it, exactly like the
 # elements that are listed. The conclusion held up; that half of the argument
 # for it never should have been written down unchecked.
+#
+# `hr` and the FORM CONTROLS join the list on the same evidence everything
+# else here rests on — an anchor wrapping one, measured in Chromium for its
+# box and hit-tested at its centre:
+#
+#     hr 1264x2 IN    input 185x17 IN    select 22x17 IN
+#     textarea 182x17 IN                 button 16x17 IN
+#
+# `progress` and `meter` were already listed and are the same family, so the
+# other four were the omission. `hr` is not that family: it is a block-level
+# rule that paints a line, and an anchor wrapping one is a wide, thin, wholly
+# clickable target.
+#
+# DELIBERATELY STILL OUT, each measured rather than reasoned:
+#   `br` 0x17 and `wbr` 0x17 — full line height, ZERO width, nothing to click.
+#   `output`, `datalist`, `template` — 0x0; they do not paint at all.
+#   `audio` — 0x0 BARE, and 300x17 only with `controls`. This list matches tag
+#   names and cannot read attributes, so listing it would call a silent,
+#   invisible element content and let an orphan through. `video` is listed and
+#   is not the same case: bare `<video></video>` is already 300x17. The
+#   sibling-symmetry argument for adding `audio` is wrong here, and only
+#   measuring the bare forms of both shows why.
 ANY_IMAGE = re.compile(
-    r'!\[|<(?:img|svg|video|canvas|object|embed|progress|meter)\b',
+    r'!\[|<(?:img|svg|video|canvas|object|embed|progress|meter'
+    r'|hr|input|select|textarea|button)\b',
     re.I)
 # An element carrying `hidden`, and its OPENING tag only — the matching close
 # is found by a scan, because same-name nesting cannot be balanced by a regular
@@ -5613,6 +5647,40 @@ self_test() {
     > "$c9jv/README.md"
   git -C "$c9jv" add -A && git -C "$c9jv" commit -qm markdown-dest-backslash
   check "a Markdown destination backslash is not a separator" fail "$c9jv"
+
+  # A reference SPELLED IN CODE is not a link and deactivates nothing. The
+  # inner-link rule reads the label with a scanner, which steps over code
+  # spans, but the reference scans below it are patterns and could not — so a
+  # code sample suppressed the outer link and stranded the page it names.
+  local c9jw="$tmp/c9jw"; make_corpus "$c9jw"
+  printf '# Jobs\n\n[outer `[fake][m]`](mail.md)\n\n[m]: https://example.test\n' \
+    > "$c9jw/docs/guide/jobs.md"
+  git -C "$c9jw" add -A && git -C "$c9jw" commit -qm ref-sample-inside-label
+  check "a reference spelled in code deactivates nothing" pass "$c9jw"
+
+  # `AGENTS.md` is loaded by name on entering the repository. Nothing links it,
+  # which is what makes it an entry surface rather than a waypoint — as a
+  # waypoint it is inert, and a guide indexed only from there was an orphan.
+  local c9jx="$tmp/c9jx"; make_corpus "$c9jx"
+  printf '# Agents\n\n- [Mail](docs/guide/mail.md)\n' > "$c9jx/AGENTS.md"
+  git -C "$c9jx" add -A && git -C "$c9jx" commit -qm agents-md-is-a-root
+  check "the root AGENTS.md is an entry surface" pass "$c9jx"
+
+  # An anchor wrapping only an `<hr>` is a wide, thin, wholly clickable target
+  # — 1264x2 in Chromium, hit-testing inside the anchor — so it is a route.
+  # `has_content` strips tags, so a rule with no text read as an empty link.
+  local c9jy="$tmp/c9jy"; make_corpus "$c9jy"
+  printf '# Jobs\n\n<a href="mail.md"><hr></a>\n' > "$c9jy/docs/guide/jobs.md"
+  git -C "$c9jy" add -A && git -C "$c9jy" commit -qm anchor-wrapping-a-rule
+  check "an anchor wrapping a rule is a route" pass "$c9jy"
+
+  # ...but `<br>` is NOT. It is full line height and ZERO width, so there is
+  # nothing to click; adding the whole "elements that paint" family without
+  # measuring each one would have made this empty anchor a route.
+  local c9jz="$tmp/c9jz"; make_corpus "$c9jz"
+  printf '# Jobs\n\n<a href="mail.md"><br></a>\n' > "$c9jz/docs/guide/jobs.md"
+  git -C "$c9jz" add -A && git -C "$c9jz" commit -qm anchor-wrapping-a-break
+  check "an anchor wrapping a line break is not a route" fail "$c9jz"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
