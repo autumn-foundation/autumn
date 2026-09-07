@@ -451,6 +451,13 @@ use schema_field_reshaped::{adapter_rows, deser_adapter_rows};
 
 /// Writes the `i64` as a JSON *string*, so the field's Rust type no longer
 /// describes what reaches the wire.
+///
+/// `&i64` is not a style choice: serde's `serialize_with` calls the function
+/// with a reference to the field, so taking it by value does not compile.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's serialize_with contract dictates the &T parameter"
+)]
 fn amount_as_string<S>(value: &i64, ser: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,

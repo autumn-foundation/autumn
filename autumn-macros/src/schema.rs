@@ -180,6 +180,17 @@ pub fn serde_valued_key(attrs: &[syn::Attribute], keys: &[&'static str]) -> Opti
 /// Distinct from an unconditional `skip` / `skip_serializing`: the field DOES
 /// appear in some responses, so its property belongs in the schema — it simply
 /// cannot be `required`, because a legitimate response may leave it out.
+/// Does this attribute list carry `#[serde(default)]`, bare or `= "path"`?
+///
+/// Shared by the derive's emitter (which marks a defaulted field not-`required`)
+/// and its audit (which must NOT refuse `skip_serializing_if` on a field serde
+/// can fill in). Those two have to agree on what "defaulted" means, so they ask
+/// the same function rather than each spelling the check out (issue #802).
+pub fn has_serde_default(attrs: &[syn::Attribute]) -> bool {
+    serde_bare_word(attrs, &["default"]).is_some()
+        || serde_valued_key(attrs, &["default"]).is_some()
+}
+
 pub fn field_has_skip_serializing_if(field: &syn::Field) -> bool {
     let mut conditional = false;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {

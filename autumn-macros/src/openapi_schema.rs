@@ -66,9 +66,7 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 // a response still carries every field, so a client that does
                 // not demand them is not misled, while a request client is no
                 // longer forced to send what the handler does not need.
-                let container_default = crate::schema::serde_bare_word(&input.attrs, &["default"])
-                    .is_some()
-                    || crate::schema::serde_valued_key(&input.attrs, &["default"]).is_some();
+                let container_default = crate::schema::has_serde_default(&input.attrs);
                 crate::schema::emit_schema_fn_body_full(
                     &field_ref_refs,
                     container_default,
@@ -78,10 +76,7 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                     // and is always present in a response, so "not required" is
                     // true of both directions — no conflict, unlike the
                     // directional attributes refused above.
-                    &|f: &syn::Field| {
-                        crate::schema::serde_bare_word(&f.attrs, &["default"]).is_some()
-                            || crate::schema::serde_valued_key(&f.attrs, &["default"]).is_some()
-                    },
+                    &|f: &syn::Field| crate::schema::has_serde_default(&f.attrs),
                 )
             }
             _ => {
@@ -287,10 +282,19 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
                 ),
             ));
         }
-        // Direction-dependent for the same reason, but only when the type does
-        // not already make it optional.
+        // Direction-dependent for the same reason, but only when nothing else
+        // already makes omission valid on the REQUEST side. Three things can:
+        // an `Option<T>` type, a field `#[serde(default)]`, or a container
+        // `#[serde(default)]`. With any of them the rejection's own premise --
+        // "serde still rejects a request that omits it" -- is simply false:
+        // deserialization fills the field in, serialization may omit it, and a
+        // not-`required` property describes both directions accurately. The
+        // emitter below already marks such a field optional, so refusing it here
+        // rejected a type it could in fact describe.
         if crate::schema::field_has_skip_serializing_if(field)
             && !crate::schema::is_option_type(&field.ty)
+            && !crate::schema::has_serde_default(&field.attrs)
+            && !crate::schema::has_serde_default(&input.attrs)
         {
             return Err(syn::Error::new_spanned(
                 field,
@@ -550,6 +554,58 @@ mod tests {
             }
         })
         .expect("a plain struct must still be describable");
+    }
+
+    /// `skip_serializing_if` alone IS direction-dependent: the response may
+    /// omit the field while serde still demands it on a request.
+    #[test]
+    fn skip_serializing_if_alone_is_still_refused() {
+        let err = audit(&parse_quote! {
+            struct Row {
+                #[serde(skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect_err("a bare skip_serializing_if on a non-Option field must be refused");
+        assert!(err.contains("skip_serializing_if"), "{err}");
+    }
+
+    /// Adding a field `#[serde(default)]` makes omission valid in BOTH
+    /// directions, so the type becomes describable and must not be refused.
+    #[test]
+    fn a_field_default_rescues_skip_serializing_if() {
+        audit(&parse_quote! {
+            struct Row {
+                #[serde(default, skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect("default + skip_serializing_if is describable");
+    }
+
+    /// The valued spelling counts too.
+    #[test]
+    fn a_valued_field_default_rescues_skip_serializing_if() {
+        audit(&parse_quote! {
+            struct Row {
+                #[serde(default = "empty_tags", skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect("default = \"path\" + skip_serializing_if is describable");
+    }
+
+    /// A CONTAINER default covers every field, so it rescues them too.
+    #[test]
+    fn a_container_default_rescues_skip_serializing_if() {
+        audit(&parse_quote! {
+            #[serde(default)]
+            struct Row {
+                #[serde(skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect("a container default makes every field omissible on input");
     }
 
     fn audit_enum(input: &DeriveInput) -> Result<(), String> {
