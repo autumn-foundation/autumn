@@ -2318,6 +2318,14 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
 /// enough for the containment rules — it closes the `shared/../releases` hole —
 /// and a symlink on the host that defeats it would defeat any check made here.
 ///
+/// Collapsing `..` is safe here because `SQLite` collapses it too, in its own
+/// VFS, BEFORE calling `open(2)`. The deploy therefore links only the collapsed
+/// path — `data/nested/../app.db` creates `data`, not `data/nested` — and the app
+/// still opens the file the deploy linked. Raw `open(2)` would NOT: POSIX
+/// resolution needs `data/nested` to exist. So this is load-bearing on `SQLite`'s
+/// behaviour, not the kernel's. Re-check it before supporting a VFS that does not
+/// normalize lexically.
+///
 /// Returns `None` when the path climbs above the filesystem root.
 fn lexically_normalized(path: &str) -> Option<String> {
     let absolute = path.starts_with('/');
