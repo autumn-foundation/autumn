@@ -3174,15 +3174,18 @@ def _classify_option(tok, node):
     name = tok.split('=', 1)[0]
     attached = '=' in tok
     if name in node['options']:
+        # ARITY FIRST, before anything else a declared name might mean. A
+        # valueless flag given a value is rejected whatever else it is: clap's
+        # `bool` fields are `ArgAction::SetTrue` with `num_args(0)`, so
+        # `--reset=true` is "unexpected value 'true' for '--reset'", exit 2 —
+        # and help and version are valueless too, so `autumn replay --help=foo`
+        # is the same error and not a terminal action. Ordering this check
+        # after the terminal one accepted exactly those lines.
+        if attached and not node['options'][name]:
+            return 'novalue', 1
         if name in TERMINAL_OPTIONS:
             return 'terminal', 0
         if attached:                            # `--name=value`, self-contained
-            if not node['options'][name]:
-                # A valueless flag given a value. Clap's `bool` fields are
-                # `ArgAction::SetTrue` with `num_args(0)`, so `--reset=true` is
-                # "unexpected value 'true' for '--reset'", exit 2. The arity was
-                # already in the map; this branch simply never asked.
-                return 'novalue', 1
             return 'known', 1
         return 'known', 2 if node['options'][name] else 1
     if not attached:
@@ -3240,8 +3243,7 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
         if kind == 'novalue':
             if flags is not None:
                 flags.append((path, name, kind))
-            i += eaten
-            continue
+            return None                         # see `_walk`'s option branch
         if flags is not None and _reportable_flag(name):
             flags.append((path, name, kind))
         if eaten:                               # attached value: arity is known
@@ -3338,8 +3340,13 @@ def _walk(tokens, i, path, surface, runnable, flags):
             if kind == 'novalue':
                 if flags is not None:
                     flags.append((path, name, kind))
-                i += eaten                      # arity known: keep judging
-                continue
+                # Stop, rather than walk past. The value is inside the token
+                # so the arity IS known, but clap's parse fails right here and
+                # never reaches the end-of-input requirement checks — carrying
+                # on reported `autumn replay --help=foo` as ALSO needing
+                # <CAPSULE>, a second complaint about something clap never got
+                # to evaluate. One accurate defect per line.
+                return None
             if _starts_trailing(node, 0):
                 return None                     # forwarded verbatim, not judged
             # Not declared here. Reported when it is spelled like a flag; then
@@ -3392,8 +3399,7 @@ def _walk(tokens, i, path, surface, runnable, flags):
                     if kind == 'novalue':
                         if flags is not None:
                             flags.append((path, o, kind))
-                        i += eaten              # arity known: keep judging
-                        continue
+                        return None             # see `_walk`'s option branch
                     if _starts_trailing(node, supplied):
                         return None             # forwarded verbatim, not judged
                     if supplied < len(hyphen_slots) and hyphen_slots[supplied]:
@@ -4031,7 +4037,9 @@ def self_test():
     # wrong thing.
     expect(raw_opts('routes --user-only=yes --method=GET')
            == [('routes', '--user-only', 'novalue')],
-           'the walk continues past it, so a later correct option is not reported')
+           'one defect per line: nothing further is reported after it')
+    expect(resolve(tk('replay --help=foo'), surface, runnable=True) is None,
+           'clap fails at the bad token, so <CAPSULE> is not ALSO reported missing')
 
     # Not every dashed token is a flag: the corpus writes prose arrows and
     # slash-joined shorthand in command position, and neither is copyable.
