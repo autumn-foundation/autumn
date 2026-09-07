@@ -1174,6 +1174,28 @@ always_include = ["countries"]
 never_include = ["audit_logs"]
 "#;
 
+/// The domain every address `SAMPLE_ROWS` seeds carries.
+///
+/// Assertions that look for original values surviving a run must match on THIS
+/// and not on a plausible-looking domain the fixture never writes. A predicate
+/// that cannot match counts zero whether or not anything leaked, so "nothing
+/// spilled" passes with the leak fully present — which is what nine of the
+/// assertions below were doing until CI ran them: dropping the refusal and
+/// letting the emptying pass fire put 500 rows into `comments`, and the
+/// `%@example.com` predicate they used still reported 0.
+const SEEDED_DOMAIN: &str = "@real-corp.example";
+
+/// Rows of `table` whose `column` still holds an address the fixture seeded.
+///
+/// Single-sourced so the domain cannot drift back out of step with the seed.
+async fn seeded_rows(client: &Client, table: &str, column: &str) -> i64 {
+    count(
+        client,
+        &format!("SELECT count(*) FROM {table} WHERE {column} LIKE '%{SEEDED_DOMAIN}'"),
+    )
+    .await
+}
+
 /// Create `name`, seed the sampling fixture into it and return a client.
 async fn seed_sample_fixture(admin: &Client, base: &str, name: &str) -> Client {
     admin
@@ -1183,6 +1205,14 @@ async fn seed_sample_fixture(admin: &Client, base: &str, name: &str) -> Client {
     let client = connect(&format!("{base}/{name}")).await;
     client.batch_execute(SAMPLE_SCHEMA).await.unwrap();
     client.batch_execute(SAMPLE_ROWS).await.unwrap();
+    // Prove the seed and `seeded_rows` agree, here and once, rather than
+    // trusting each call site: if the seed ever stops writing SEEDED_DOMAIN,
+    // every leak assertion in this file silently reports zero and passes.
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        200,
+        "the seed must write addresses the leak assertions can match"
+    );
     client
 }
 
@@ -1322,7 +1352,7 @@ async fn sampled_scrub_is_smaller_referentially_intact_and_pii_free() {
     // Swept across every character column of every table rather than by a
     // hand-written column list, so a value that landed somewhere unexpected is
     // caught too.
-    for secret in ["@real-corp.example", "Real Person", "secret note"] {
+    for secret in [SEEDED_DOMAIN, "Real Person", "secret note"] {
         let hits = occurrences(&client, secret).await;
         assert!(
             hits.is_empty(),
@@ -1494,11 +1524,7 @@ async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
         "the trigger's rows must be purged after the rewrites, not before them"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM autumn_jobs WHERE args LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "autumn_jobs", "args").await,
         0,
         "no original address may survive in the purged table"
     );
@@ -1568,20 +1594,12 @@ async fn a_delete_trigger_on_a_leaf_partition_of_an_emptied_table_is_refused() {
         "the refusal must name the PARENT the statement empties: {stderr}"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM comments WHERE body LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "comments", "body").await,
         0,
         "and nothing may have spilled into the classified table"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "users", "email").await,
         200,
         "a refusal before any write leaves the source untouched"
     );
@@ -1683,11 +1701,7 @@ async fn an_on_delete_rule_on_an_emptied_table_is_refused() {
         "the refusal must name the table and say a rule is why: {stderr}"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM autumn_jobs WHERE args LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "autumn_jobs", "args").await,
         0,
         "nothing may have been archived by a refused run"
     );
@@ -1762,11 +1776,7 @@ async fn a_statement_level_leaf_trigger_does_not_refuse_the_run() {
         "the purge must still empty the partitioned table"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "users", "email").await,
         0,
         "and the scrub must still run"
     );
@@ -1818,20 +1828,12 @@ async fn disabling_the_delete_trigger_lifts_the_refusal() {
         "the never_include table must still be emptied"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "users", "email").await,
         0,
         "and the PII must still be scrubbed"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM comments WHERE body LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "comments", "body").await,
         0,
         "with nothing spilled by the trigger that can no longer fire"
     );
@@ -1879,11 +1881,7 @@ async fn the_recount_covers_an_outside_child_of_a_full_copy_table() {
         "the re-count must name the edge it found unresolved: {stderr}"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "users", "email").await,
         200,
         "and the run must roll back rather than commit over it"
     );
@@ -1896,11 +1894,7 @@ async fn the_recount_covers_an_outside_child_of_a_full_copy_table() {
         .unwrap();
     run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "users", "email").await,
         0,
         "the repaired run must scrub as usual"
     );
@@ -1969,20 +1963,12 @@ async fn a_delete_trigger_on_an_emptied_table_is_refused_before_any_write() {
         "a refusal before any write must leave the source untouched"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "users", "email").await,
         200,
         "and no PII may be left half-scrubbed"
     );
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM comments WHERE body LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "comments", "body").await,
         0,
         "and nothing may have spilled into the scrubbed app table"
     );
@@ -2019,6 +2005,18 @@ async fn sampling_refuses_legacy_table_inheritance() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     sample_project(dir);
+    // The child is an ordinary relation of its own, so the classification sees
+    // it as a table like any other and refuses the unsampled leg below until it
+    // is declared. That refusal is correct and covered elsewhere; declaring the
+    // child here keeps THIS test about inheritance.
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!(
+            "{SAMPLE_SCRUB_TOML}\n[tables.archived_comments]\n\
+             safe = [\"user_id\"]\n\n[tables.archived_comments.pii]\nbody = \"redact\"\n"
+        ),
+    )
+    .unwrap();
     let url = format!("{base}/legacy_inherit");
     let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
 
@@ -2037,11 +2035,7 @@ async fn sampling_refuses_legacy_table_inheritance() {
     // that reach the child's rows correctly either way.
     run_autumn_ok(dir, &["db", "scrub"], &envs);
     assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
-        )
-        .await,
+        seeded_rows(&client, "users", "email").await,
         0,
         "the unsampled scrub must still run and scrub the PII"
     );
