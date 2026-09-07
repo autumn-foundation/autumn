@@ -563,6 +563,7 @@ dependencies = [
  "serde_json",
  "tower",
  "wasmi",
+ "wat",
 ]
 
 [[package]]
