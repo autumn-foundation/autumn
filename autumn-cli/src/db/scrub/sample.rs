@@ -224,6 +224,14 @@ pub enum SampleError {
     },
     /// The closure walk did not converge (defensive; unreachable in practice).
     IterationLimit,
+    /// A table the run promised would be empty holds rows once every write is
+    /// done. A trigger fired by one emptying statement can insert into a table
+    /// an earlier statement already emptied, so ordering the deletes cannot rule
+    /// this out — only checking the promise afterwards can.
+    NotEmptied {
+        /// `table (n row(s))` descriptions, sorted.
+        tables: Vec<String>,
+    },
     /// The post-sample foreign key verification found unresolved references.
     IntegrityViolation {
         /// `constraint: child -> parent (n row(s))` descriptions, sorted.
@@ -388,6 +396,19 @@ impl std::fmt::Display for SampleError {
                 "The sample selection did not settle after {MAX_PASSES} passes over the \
                  foreign key graph.\n  \
                  Nothing was written. Please report this with the schema that produced it."
+            ),
+            Self::NotEmptied { tables } => write!(
+                f,
+                "{} table(s) the run promised would be empty still hold rows after \
+                 every write:\n{}\n  \
+                 A trigger fired by one of the emptying statements has inserted into a \
+                 table an earlier one already emptied — an `ON DELETE` archive trigger \
+                 between two of them will do it — so the rows are back, carrying whatever \
+                 they carried before. Nothing is committed. Disable the triggers on the \
+                 copy before scrubbing, or stop promising a table is emptied when \
+                 something refills it.",
+                tables.len(),
+                bullets(tables),
             ),
             Self::IntegrityViolation { violations } => write!(
                 f,
@@ -781,6 +802,7 @@ fn classify_edges(
     let mut purged_before: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut purged_after_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut purged_internal: Vec<(String, String, String)> = Vec::new();
+    let mut verify_only: Vec<ForeignKeyConstraint> = Vec::new();
     let mut internal = Vec::new();
     for edge in inputs.foreign_keys {
         // A constraint cloned from a partitioned parent was already dropped by
@@ -845,6 +867,17 @@ fn classify_edges(
                     retained_into_purged.push(describe(edge));
                 }
             }
+            // A retained table pointing at a framework table nothing empties.
+            // The walk has no reason to follow it — the parent keeps every row,
+            // so the reference cannot be broken BY the sample — but the
+            // re-count still wants it. A constraint a migration left `NOT VALID`
+            // over an existing orphan is never revalidated by Postgres, and
+            // keeping the parent whole does not repair it, so without this the
+            // run would report that every checked reference resolves while one
+            // does not.
+            (Some(child_role), None) if child_role.is_subsetted() => {
+                verify_only.push(edge.clone());
+            }
             // Two purged framework tables referencing each other. Neither is in
             // the sampled universe, so nothing above decides their order — but
             // the split below can now put them in DIFFERENT phases, which the
@@ -882,6 +915,7 @@ fn classify_edges(
         })
         .cloned()
         .collect();
+    internal.extend(verify_only);
     Ok((internal, walk, purge_after))
 }
 

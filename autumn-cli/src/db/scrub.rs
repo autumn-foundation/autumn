@@ -2930,6 +2930,13 @@ pub struct DatabaseFacts {
     pub foreign_keys: Vec<sample::ForeignKeyConstraint>,
 }
 
+/// A single `n` count column, for the promised-empty verification.
+#[derive(diesel::QueryableByName)]
+struct RowCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
 /// A single `name` column.
 #[derive(diesel::QueryableByName)]
 struct NameRow {
@@ -3732,6 +3739,34 @@ fn execute(
         }
         for (table, rows) in purged_rows {
             counts.push((format!("{table} (emptied)"), rows));
+        }
+
+        // Prove the promise instead of ordering for it.
+        //
+        // Each statement in the pass above can fire triggers, and one of those
+        // can insert into a table an EARLIER statement already emptied — an
+        // `ON DELETE` archive trigger between two promised-empty tables does
+        // exactly that. No ordering of the deletes rules that out in general:
+        // the trigger graph decides, and it can be cyclic. So the guarantee is
+        // checked rather than arranged, in the same transaction, the same way
+        // the sample re-counts its foreign keys rather than trusting the walk.
+        let mut refilled = Vec::new();
+        for (table, _) in &phases.final_pass {
+            let row: RowCount = sql_query(format!(
+                "SELECT count(*) AS n FROM {}",
+                qualified_ident(table)
+            ))
+            .get_result(conn)?;
+            if row.n > 0 {
+                refilled.push(format!("{table} ({} row(s))", row.n));
+            }
+        }
+        if !refilled.is_empty() {
+            refilled.sort();
+            refilled.dedup();
+            return Err(sample::SampleFailure::Refused(
+                sample::SampleError::NotEmptied { tables: refilled },
+            ));
         }
         // Inside the transaction, so a refresh the role is not allowed to run
         // rolls the rewrites back rather than committing base tables that a

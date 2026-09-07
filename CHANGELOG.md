@@ -100,7 +100,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   released at commit, and running a whole-schema `VACUUM (FULL)` first would
   stretch the commit-to-dump window — during which a concurrent write could land
   unscrubbed rows in the artifact — from moments to minutes, for no benefit,
-  since `pg_dump` is logical and a compacted table dumps to the same bytes. A foreign key declared on a partition rather than
+  since `pg_dump` is logical and a compacted table dumps to the same bytes.
+  Finally, every promised-empty table is COUNTED after all writes and the run
+  aborts if any holds rows: each emptying statement fires triggers, one of which
+  can refill a table an earlier statement emptied, so the promise is verified
+  rather than ordered for. The integrity re-count also now covers a retained
+  table's foreign keys into framework tables nothing empties, which a `NOT VALID`
+  constraint over a pre-existing orphan would otherwise hide. A foreign key declared on a partition rather than
   cloned onto it from its partitioned parent is likewise refused, rather than
   dropped from the walk and the integrity re-check as if it were a clone. The
   re-check honours each constraint's own NULL rule, so a partly-NULL composite

@@ -354,6 +354,14 @@ still warns when a table it writes to carries user-defined triggers: emptying th
 destination cannot help a trigger that writes somewhere the purge list does not
 name.)
 
+After that pass, every promised-empty table is **counted**, and a run that finds
+rows in one aborts. Ordering the removals cannot rule this out: each `DELETE`
+fires triggers, and one of those can insert into a table an earlier `DELETE`
+already emptied — an `ON DELETE` archive trigger between two promised-empty
+tables does exactly that, and the trigger graph can be cyclic. So the promise is
+checked rather than arranged, the same way the foreign keys are re-counted rather
+than trusted to the walk.
+
 The foreign key re-check runs **inside** the scrub's transaction, so a violation
 rolls the whole run back rather than handing you a broken copy. It counts orphans
 per constraint under that constraint's own NULL rule: a partly-NULL composite

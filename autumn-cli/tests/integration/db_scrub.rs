@@ -1504,6 +1504,71 @@ async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
     );
 }
 
+/// A trigger chain between two promised-empty tables is caught, not committed.
+///
+/// `audit_logs` is `never_include` and `autumn_jobs` is purged, so both are
+/// promised empty. An `ON DELETE` trigger on `audit_logs` archives into
+/// `autumn_jobs`: whichever the final pass empties first, emptying the other can
+/// put rows back. Ordering cannot fix that in general — the trigger graph
+/// decides, and it can be cyclic — so the run verifies both are empty after
+/// every write and rolls back if either is not.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_trigger_chain_between_emptied_tables_rolls_the_run_back() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "empty_chain").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            CREATE FUNCTION archive_audit() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO autumn_jobs (args) VALUES (OLD.actor_email); \
+                RETURN OLD; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER audit_archive BEFORE DELETE ON audit_logs \
+                FOR EACH ROW EXECUTE FUNCTION archive_audit();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/empty_chain");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        stderr.contains("autumn_jobs") && stderr.contains("promised"),
+        "the refusal must name the table that came back: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "the whole run must roll back, leaving the source untouched"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
+        )
+        .await,
+        200,
+        "and no PII may be left half-scrubbed"
+    );
+}
+
 /// Legacy `INHERITS` is refused rather than sampled wrong.
 ///
 /// An inheritance child is an ordinary table the plan would sample separately,
