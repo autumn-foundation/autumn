@@ -1249,8 +1249,10 @@ Two things to get right when generating this code:
   a required argument. `InMemoryOutboundWebhookHandler` ships with the framework
   but is process-local AND unbounded — subscriptions and delivery logs vanish
   on restart, are not shared across replicas, and are held in plain hash maps
-  with no cap or eviction, so `log_delivery` retains every attempt for the
-  lifetime of the process — so it is for tests and local development. Any
+  with no cap or eviction. A retry replaces its log row rather than adding one
+  (same id, `attempt` advanced in place), so growth is per DISPATCH, not per
+  attempt — and nothing ever evicts, so memory grows with dispatch volume for
+  the lifetime of the process. It is for tests and local development; any
   long-running app needs a durable shared implementation of the trait. (`OutboundWebhookStore` /
   `InMemoryOutboundWebhookStore` are compatibility aliases; prefer the
   `…Handler` names in new code.)

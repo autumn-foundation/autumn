@@ -1257,6 +1257,21 @@ ATTR_VALUE_ANY = re.compile(r'\b' + ATTR_ASSIGNED, re.I)
 # fell outside the anchor bounds, was never masked, and its invisible path kept
 # an orphan alive. Fixing HTML_TAG and leaving this one is the same
 # rule-applied-to-one-sibling mistake this file keeps making.
+# `<a href>` is the only element read as a route, and one omission is known:
+# `<area href>` inside a `<map>`. It IS navigation — a clickable region of an
+# image map — so this is a real false positive if a page ever uses one, and it
+# is not the unbounded class the invisibility note above closes. It is bounded:
+# `a` and `area` are the only elements carrying a clickable navigation href.
+#
+# It is unimplemented rather than declined, for two reasons worth separating.
+# An `<area>` has no content of its own, so the visible, clickable thing is the
+# `<img usemap="#name">` that references the enclosing `<map name="name">` —
+# deciding it means resolving three elements to each other, which is the
+# parsed-tree shape already filed three times over. And no page in this corpus
+# uses one; an image map in a Markdown guide is deliberate, not the accidental
+# omission this gate exists to catch. Adding cross-element resolution with zero
+# instances to test it against is how the last several regressions here
+# happened.
 ANCHOR_TAG = re.compile(
     r'<a(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
 # The destination of a rendered link is blanked before the bare-path scan by

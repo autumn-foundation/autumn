@@ -49,7 +49,7 @@ To support diverse hosting environments, the persistence layer is abstracted beh
 
 Autumn ships `InMemoryOutboundWebhookStore`—a thread-safe, in-memory implementation—but it is not a default: `OutboundWebhookPlugin::new(store)` requires you to name a store, so choosing it is always explicit. Because it is process-local, its subscriptions and delivery logs are lost on restart and are not shared between replicas.
 
-**It is also unbounded.** Subscriptions and delivery logs are held in plain hash maps with no capacity limit and no eviction, so `log_delivery` retains every attempt for the lifetime of the process — memory grows with delivery volume and is never reclaimed. Use it for tests and local development. A long-running app of any kind needs a durable implementation of the trait, as does anything with more than one replica or that must survive a deploy.
+**It is also unbounded.** Subscriptions and delivery logs are held in plain hash maps with no capacity limit and no eviction. A retry does *not* add a row — the job reuses the original log id and `log_delivery` replaces that entry in place, advancing its `attempt` counter, so only the latest attempt of each delivery is retained and the actuator shows that rather than a per-attempt history. What does grow is dispatches: each one inserts a row per matching subscription, and nothing ever removes them. Memory therefore grows with dispatch volume for the lifetime of the process. Use it for tests and local development. A long-running app of any kind needs a durable implementation of the trait, as does anything with more than one replica or that must survive a deploy.
 
 ---
 
