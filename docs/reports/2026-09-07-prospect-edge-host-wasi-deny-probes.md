@@ -141,24 +141,57 @@ named in the pre-registration.
   reported separately rather than folded into the registered count.
   R5–R10 (a database import, resource/hang controls) and R11–R17
   (header/cookie stripping, manifest/artifact integrity, consent surfacing)
-  are not covered by this file: R6/R7/R9/R10 already have dedicated,
-  pre-existing coverage in `autumn-edge/src/host.rs`'s own `#[cfg(test)]`
-  suite (fuel exhaustion, memory limits, trap handling — not adversarial
-  WASI-escape guests, but real coverage of those specific threats by a
-  different mechanism); R5, R8, and R11–R17 are either not reachable from
-  `autumn-edge`'s API shape (no database seam, no manifest, credential
-  headers stripped before the guest ever runs) or were simply out of scope
-  for "cheapest apparatus that can falsify the specific baseline Keystone's
-  memo questioned" — this was never meant to be a full port of the 17-item
-  table, only enough of it to answer the pre-registered question.
-  **Update (fourth Codex review round)**: this correction itself was
-  prompted by a review comment pointing out that R4 is explicitly defined
-  in the plan doc (`docs/plans/2026-08-27-sandboxed-plugins-first-slice.md:45`,
-  "Network egress via `sock_*`") and that the socket probes therefore
-  exercise R4, not R2 as originally labeled here — confirmed by re-reading
-  the full R1–R17 table (`grep -n '^| R' docs/plans/...`), which shows all
-  seventeen rows present with no gaps. Reclassified accordingly; no
-  apparatus change, write-up only.
+  are not covered by this file. Checked individually, not assumed:
+  - **R6** (infinite loop) and **R7** (memory bomb) genuinely have
+    dedicated, pre-existing tests in `autumn-edge/src/host.rs`'s own
+    `#[cfg(test)]` suite (`a_runaway_loop_exhausts_its_fuel_and_falls_through`,
+    `a_memory_hungry_module_is_refused_instead_of_killing_the_host`) — real
+    coverage of those two specific threats, by a different mechanism than
+    adversarial WASI-escape guests.
+  - **R9** (a trap must not abort the host) holds in `autumn-edge` only as
+    an inherent property of using `wasmi` (an interpreter: a guest trap
+    surfaces as an ordinary `Result::Err`, never a process abort or OS
+    signal, with no join-boundary/catch-unwind machinery needed the way a
+    native-code worker would require) — not because a dedicated test
+    triggers a real wasm trap and asserts the process survives. No such
+    test exists in the pre-existing suite today.
+  - **R10** (a slow guest starves the async runtime) has **no mitigation
+    at all** in `autumn-edge`, dedicated test or otherwise: `grep -rn
+    "spawn_blocking\|Semaphore\|concurrency" autumn-edge/src/` returns
+    nothing. `EdgeArtifact::run` is a plain synchronous function; a caller
+    awaiting it from an async context blocks that task for as long as the
+    guest's fuel budget allows before the interpreter traps it. This is a
+    real, previously-unstated gap this assay surfaces as a byproduct, not
+    a threat this file claims to test — worth naming to whoever picks up
+    Keystone's memo next, since `plugin_sandbox`'s own R10 control
+    (`spawn_blocking` plus a bounded concurrency permit) has no
+    `autumn-edge` analogue at all.
+
+  R5, R8, and R11–R17 are either not reachable from `autumn-edge`'s API
+  shape (no database seam, no manifest, credential headers stripped before
+  the guest ever runs) or were simply out of scope for "cheapest apparatus
+  that can falsify the specific baseline Keystone's memo questioned" — this
+  was never meant to be a full port of the 17-item table, only enough of it
+  to answer the pre-registered question.
+  **Update (fourth Codex review round)**: the R1–R4 classification above
+  was itself a correction, prompted by a review comment pointing out that
+  R4 is explicitly defined in the plan doc
+  (`docs/plans/2026-08-27-sandboxed-plugins-first-slice.md:45`, "Network
+  egress via `sock_*`") and that the socket probes therefore exercise R4,
+  not R2 as originally labeled here — confirmed by re-reading the full
+  R1–R17 table (`grep -n '^| R' docs/plans/...`), which shows all seventeen
+  rows present with no gaps. Reclassified accordingly; no apparatus change,
+  write-up only.
+  **Update (fifth Codex review round)**: the R6/R7/R9/R10 breakdown above
+  is itself a correction too. An earlier version of this bullet claimed
+  R10 already had dedicated coverage alongside R6/R7/R9. A review correctly
+  pointed out `autumn-edge` has neither `spawn_blocking` nor a concurrency
+  permit anywhere, confirmed by the grep above — R10 has no mitigation, and
+  the claim was simply wrong. While re-verifying, R9's claim was also
+  tightened from "dedicated coverage" to "holds inherently, untested" once
+  checking showed no existing test actually triggers a real wasm trap and
+  asserts survival, rather than wait for that gap to be found in a separate
+  round. Write-up only, no apparatus change.
 - **Negative controls, run and reverted, not merged**: to prove the
   "answers empty" probes actually falsify (rather than passing vacuously),
   two separate registrations were each temporarily edited to leak, the
