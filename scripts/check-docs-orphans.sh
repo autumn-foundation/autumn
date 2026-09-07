@@ -2225,28 +2225,40 @@ def mask_invisible_subtrees(view, src):
     callers share stay valid. `src` carries the same span with attribute
     values intact, since the view has already had them blanked.
     """
-    at = 0
-    while True:
+    return _mask_vis(view, src, 0, len(view))
+
+
+def _mask_vis(view, src, lo, hi):
+    """`mask_invisible_subtrees` over one range, recursing into what it keeps.
+
+    The recursion is the point: hiding can ALTERNATE. A `visibility:visible`
+    subtree preserved inside a hidden one may itself contain a
+    `visibility:hidden` element, and jumping past the whole restored region
+    left that inner one unmasked — `hidden > visible > hidden` painted
+    nothing but read as a label. Each kept span is therefore re-entered, and
+    the range shrinks every time, so it terminates.
+    """
+    at = lo
+    while at < hi:
         m = style_hidden_search(src, at, _VISIBILITY_DECL, _VISIBILITY_HIDDEN)
-        if not m:
+        if not m or m.start() >= hi:
             return view
         # The same guard `hidden_open` applies: a tag the view has already
         # blanked — inside a comment or a script — hides nothing.
         if not (m.start() < len(view) and view[m.start()] == '<'):
             at = m.start() + 1
             continue
-        end = element_end(view, m, m.group(1))
+        end = min(element_end(view, m, m.group(1)), hi)
         keep = _shown_spans(view, src, m.end(), end)
-        blanked = list(view[m.start():end])
+        chars = list(view)
+        for i in range(m.start(), end):
+            if not any(a <= i < b for a, b in keep):
+                chars[i] = ' '
+        view = ''.join(chars)
         for a, b in keep:
-            for i in range(a - m.start(), b - m.start()):
-                blanked[i] = view[m.start() + i]
-        for i in range(len(blanked)):
-            off = m.start() + i
-            if not any(a <= off < b for a, b in keep):
-                blanked[i] = ' '
-        view = view[:m.start()] + ''.join(blanked) + view[end:]
+            view = _mask_vis(view, src, a, b)
         at = end
+    return view
 
 
 def _shown_spans(view, src, start, end):
@@ -2878,6 +2890,33 @@ def edges_from(f):
     #    open a comment either.
     # 3. Comments last, over what survives.
     txt = strip_comments(mask_invisible(txt))
+    # 4. HIDDEN SUBTREES, document-wide and before any extractor runs.
+    #    `has_content` masked these inside a link's own content, which answered
+    #    "is this label visible" but never "is this link visible AT ALL":
+    #    `<div hidden><a href="docs/guide/mail.md">Mail</a></div>` renders no
+    #    route, and neither does the same wrapper around a bare path, yet both
+    #    were extracted. Only script/comment ancestors were being checked, via
+    #    `inert_spans`, so an ordinary hidden wrapper let an orphan through.
+    #    Both spellings of hiding, and both views, because every extractor
+    #    below reads one of them.
+    #    `display:none` and the `hidden` attribute only. `visibility` is NOT
+    #    masked here and that is deliberate: it is the one form of hiding a
+    #    DESCENDANT can undo, so blanking the subtree destroys the anchor tag
+    #    before the override can be seen — two tests caught exactly that. It
+    #    stays where the override is visible, on the anchor and its content.
+    #
+    #    KNOWN GAP, and a false negative: an anchor under a `visibility:hidden`
+    #    ANCESTOR — `<div style="visibility:hidden"><a href=…>Mail</a></div>` —
+    #    inherits hidden, paints nothing and hit-tests to the body, but is
+    #    still recorded. Masking it here is what the two tests above forbid,
+    #    and consulting a separate visibility map instead only moves the
+    #    conflict: the map blanks the anchor's own tag, so an anchor that a
+    #    DESCENDANT re-shows would then be dropped. Both readings are wrong for
+    #    one case each, which is the signal that the answer is a real style
+    #    resolver over a parsed tree rather than a third overlapping pass.
+    #    Filed with the other two gaps rather than guessed at.
+    txt = mask_hidden_subtrees(txt, raw)
+    img_view = mask_hidden_subtrees(img_view, raw)
     out = set()
     base = posixpath.dirname(f)
 
@@ -6424,6 +6463,40 @@ self_test() {
     > "$c9li/docs/guide/jobs.md"
   git -C "$c9li" add -A && git -C "$c9li" commit -qm hidden-subtree-with-visible-inner
   check "a visible subtree inside a hidden one still shows" pass "$c9li"
+
+  # A HIDDEN ANCESTOR renders no route. `has_content` masked hidden subtrees
+  # inside a link's own content, which answered "is this label visible" but
+  # never "is this link visible at all" — only script and comment ancestors
+  # were checked, so an ordinary hidden wrapper let an orphan through.
+  local c9lj="$tmp/c9lj"; make_corpus "$c9lj"
+  printf '# Jobs\n\n<div hidden><a href="docs/guide/mail.md">Mail</a></div>\n' \
+    > "$c9lj/docs/guide/jobs.md"
+  git -C "$c9lj" add -A && git -C "$c9lj" commit -qm hidden-ancestor-anchor
+  check "an anchor under a hidden ancestor is not a route" fail "$c9lj"
+
+  # ...the `display:none` spelling of the same wrapper.
+  local c9lk="$tmp/c9lk"; make_corpus "$c9lk"
+  printf '# Jobs\n\n<div style="display:none"><a href="docs/guide/mail.md">Mail</a></div>\n' \
+    > "$c9lk/docs/guide/jobs.md"
+  git -C "$c9lk" add -A && git -C "$c9lk" commit -qm display-none-ancestor-anchor
+  check "an anchor under display:none is not a route" fail "$c9lk"
+
+  # ...and a BARE PATH inside one, since the masking has to precede every
+  # extractor rather than just the anchor scan.
+  local c9ll="$tmp/c9ll"; make_corpus "$c9ll"
+  printf '# Jobs\n\n<div hidden>See docs/guide/mail.md</div>\n' \
+    > "$c9ll/docs/guide/jobs.md"
+  git -C "$c9ll" add -A && git -C "$c9ll" commit -qm hidden-ancestor-bare-path
+  check "a bare path under a hidden ancestor is not visible" fail "$c9ll"
+
+  # Hiding ALTERNATES: a `visibility:visible` subtree kept inside a hidden one
+  # may itself hide something. Jumping past the whole restored region left the
+  # inner element unmasked, so `hidden > visible > hidden` read as a label.
+  local c9lm="$tmp/c9lm"; make_corpus "$c9lm"
+  printf '# Jobs\n\n<a href="mail.md"><span style="visibility:hidden"><span style="visibility:visible"><span style="visibility:hidden">Secret</span></span></span></a>\n' \
+    > "$c9lm/docs/guide/jobs.md"
+  git -C "$c9lm" add -A && git -C "$c9lm" commit -qm visibility-alternating
+  check "a re-hidden subtree inside a restored one stays hidden" fail "$c9lm"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
