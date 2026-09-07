@@ -309,12 +309,57 @@ _PUBLISH_INHERITS = re.compile(
 # is arbitrary third-party data Cargo itself ignores — cargo-deb, cargo-dist and
 # friends all keep their settings there — and a `publish = false` sitting in one
 # of those was being read as the package's own, dropping a publishable crate's
-# README from the roots. That is the LOUD direction (a page reported orphaned
-# that is not one), unlike the last two findings here, but it still blocks a
-# valid docs change on a manifest Cargo accepts.
+# README from the roots. That much is the LOUD direction (a page reported
+# orphaned that is not one), unlike the last two findings here, but it still
+# blocks a valid docs change on a manifest Cargo accepts.
+#
+# Scoping is not itself loud, though, and the first version of this comment
+# claimed it was. Getting the table wrong DROPS keys, and a dropped
+# `publish = false` reads as publishable, which seeds an unpublishable
+# package's README as a reader root — silent, the direction that hides an
+# orphan. Every approximation below is therefore measured against a scanner
+# that lacks it, not reasoned about.
 _TOML_HEADER = re.compile(r'^[ \t]*\[\[?[ \t]*([^\[\]]*?)[ \t]*\]\]?[ \t]*(?:#.*)?$')
-_TOML_ML = re.compile(r'"""|\'\'\'')
 _DOTTED_CACHE = {}
+
+
+def _opens_multiline(line):
+    """The multi-line delimiter left open at the end of `line`, or None.
+
+    A single scan that skips what cannot open one: comments, and single-line
+    strings of either kind. Both matter, and in the direction that hides
+    orphans rather than the one that reports false ones. A `\"\"\"` inside a
+    comment — `# see \"\"\" this` — read as an opener swallows every following
+    line until some other line happens to contain another, and a swallowed
+    `publish = false` makes an unpublishable package's README a reader root.
+    That is the silent failure this whole rule keeps producing, so it is
+    measured here rather than argued about: two self-tests pin the comment and
+    single-line-string cases, and both fail against a scanner without this.
+    """
+    i = 0
+    n = len(line)
+    while i < n:
+        # A triple delimiter has to be tested before the single quote that
+        # starts it, or every one of them opens a single-line string instead.
+        if line.startswith('"""', i) or line.startswith("'''", i):
+            tok = line[i:i + 3]
+            close = line.find(tok, i + 3)
+            if close < 0:
+                return tok
+            i = close + 3
+        elif line[i] == '#':
+            return None                      # comment runs to end of line
+        elif line[i] == '"':
+            i += 1
+            while i < n and line[i] != '"':  # basic strings take escapes
+                i += 2 if line[i] == '\\' else 1
+            i += 1
+        elif line[i] == "'":
+            close = line.find("'", i + 1)    # literal strings do not
+            i = n if close < 0 else close + 1
+        else:
+            i += 1
+    return None
 
 
 def _toml_lines(manifest):
@@ -322,12 +367,10 @@ def _toml_lines(manifest):
 
     `table` is the enclosing header's name, or None before the first header.
 
-    Line-scanned, like every other pattern in this file. The one construct that
-    has to be tracked is the multi-line string, because a `\"\"\"` block whose
+    Line-scanned, like every other pattern in this file. The construct that has
+    to be tracked is the multi-line string, because a `\"\"\"` block whose
     CONTENT contains a line reading `[package]` would otherwise re-scope every
-    key after it. The toggle is approximate — it misreads a `\"\"\"` that appears
-    inside a single-line string or a comment — and that residue can only
-    mis-scope a key, which reports a false orphan rather than hiding a real one.
+    key after it.
     """
     table = None
     ml = None
@@ -342,17 +385,7 @@ def _toml_lines(manifest):
         if m is not None:
             table = m.group(1)
             continue
-        rest = line
-        while True:
-            d = _TOML_ML.search(rest)
-            if d is None:
-                break
-            after = rest[d.end():]
-            close = after.find(d.group(0))
-            if close < 0:
-                ml = d.group(0)
-                break
-            rest = after[close + len(d.group(0)):]
+        ml = _opens_multiline(line)
         yield table, line
 
 
@@ -7080,6 +7113,31 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m6/pkg/README.md"
   git -C "$c9m6" add -A && git -C "$c9m6" commit -qm multiline-header
   check "a header inside a multi-line string is not a header" pass "$c9m6"
+
+  # ...and the delimiter tracking must not fire on a `"""` that cannot open
+  # anything. In a COMMENT it swallows every following line until some other
+  # line happens to contain another, and here that loses `publish = false` and
+  # reads an unpublishable package as publishable — seeding its README as a
+  # reader root, the direction that HIDES an orphan.
+  local c9m7="$tmp/c9m7"; make_corpus "$c9m7"
+  mkdir -p "$c9m7/pkg"
+  printf '[package]\nname = "pkg"\n# see """ this\npublish = false\nreadme = "README.md"\n' \
+    > "$c9m7/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m7/pkg/README.md"
+  git -C "$c9m7" add -A && git -C "$c9m7" commit -qm triple-quote-in-comment
+  check "a triple quote in a comment opens nothing" fail "$c9m7"
+
+  # Same for one inside an ordinary single-line string. A LITERAL string is
+  # what makes this reachable — a basic string cannot hold three consecutive
+  # quotes without escaping them, and `\"\"\"` is not the delimiter — so this is
+  # the spelling that actually puts a live `"""` run on a key's own line.
+  local c9m8="$tmp/c9m8"; make_corpus "$c9m8"
+  mkdir -p "$c9m8/pkg"
+  printf '[package]\nname = "pkg"\ndescription = '"'"'a """ thing'"'"'\npublish = false\nreadme = "README.md"\n' \
+    > "$c9m8/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m8/pkg/README.md"
+  git -C "$c9m8" add -A && git -C "$c9m8" commit -qm triple-quote-in-string
+  check "a triple quote inside a string opens nothing" fail "$c9m8"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
