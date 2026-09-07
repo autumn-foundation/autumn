@@ -61,6 +61,7 @@ mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
+mod custom_domains;
 mod custom_layer;
 #[cfg(feature = "db")]
 mod data_classification;
