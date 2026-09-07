@@ -447,6 +447,94 @@ impl AdminModel for FeatureFlagAdminModel {
         })
     }
 
+    fn execute_action(
+        &self,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+        action: &str,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'_, u64> {
+        use diesel_async::RunQueryDsl;
+
+        // `FeatureFlagAdminModel` never declares soft delete
+        // (`supports_soft_delete()` is the trait default, `false`), so
+        // `actions()` (traits.rs) only ever offers `"delete"` — the admin UI
+        // can't reach `"restore"` or `"purge"` for this model. Those two
+        // branches below, and the unhandled-action branch, are unchanged
+        // copies of the trait default's per-id loop: kept only so a direct
+        // or out-of-band `execute_action` call gets the exact same "does not
+        // support soft delete" (or "unhandled action") error it always did,
+        // not because they need batching — `self.restore`/`self.purge` are
+        // the trait's default methods, which return `Err` on the very first
+        // id regardless of loop shape, so there is no N+1 to eliminate there.
+        if action == "delete" {
+            let pool = pool.clone();
+            return Box::pin(async move {
+                // Batch every id into ONE round trip instead of the trait
+                // default's one-CTE-per-id loop (an operator selecting
+                // hundreds of stale flags in the admin list and clicking
+                // "Delete selected" otherwise costs one statement, and one
+                // connection checkout, per flag). Same CTE shape as the
+                // single-row `delete()`: the audit INSERT's `SELECT key,
+                // 'deleted', NULL FROM deleted` already fans out to one row
+                // per id the `DELETE ... RETURNING key` actually removed, so
+                // widening the predicate to `id = ANY($1)` is enough — an id
+                // that doesn't exist contributes no row to `deleted` and so
+                // no audit row either, exactly like the loop it replaces.
+                //
+                // The returned count matches the *ids submitted*, not rows
+                // actually deleted, exactly like the loop this replaces
+                // (which incremented its counter once per id regardless of
+                // whether that id matched a row).
+                let mut conn = pool
+                    .get()
+                    .await
+                    .map_err(|e| AdminError::Database(e.to_string()))?;
+                diesel::sql_query(
+                    "WITH deleted AS ( \
+                         DELETE FROM autumn_feature_flags WHERE id = ANY($1) RETURNING key \
+                     ), \
+                     _audit AS ( \
+                         INSERT INTO feature_flag_changes (key, mutation, actor) \
+                         SELECT key, 'deleted', NULL FROM deleted \
+                     ) \
+                     SELECT COUNT(*) AS count FROM deleted",
+                )
+                .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                .get_result::<CountRow>(&mut conn)
+                .await
+                .map_err(|e| AdminError::Database(e.to_string()))?;
+                Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+            });
+        }
+
+        let action = action.to_owned();
+        let pool = pool.clone();
+        Box::pin(async move {
+            match action.as_str() {
+                "restore" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.restore(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                "purge" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.purge(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                other => Err(AdminError::Other(format!(
+                    "unhandled bulk action '{other}'; \
+                     override AdminModel::execute_action to support it"
+                ))),
+            }
+        })
+    }
+
     fn has_history(&self) -> bool {
         true
     }
