@@ -1288,6 +1288,21 @@ mv /srv/autumn/myapp/current/app.db* /srv/autumn/myapp/shared/data/
 Then re-run `autumn deploy up`. From that point on nothing is ever relocated: the
 file stays in `shared/data` and each release is linked at it.
 
+**If you already hand-symlinked the data file** at a database you keep elsewhere,
+the deploy stops on that too, and prints a different one-time migration — `mv` on
+a symlink moves the link, not the database behind it:
+
+```sh
+autumn db backup                      # first, from the project dir
+systemctl stop myapp-blue.service myapp-green.service
+mv "$(readlink -f /srv/autumn/myapp/current/app.db)"* /srv/autumn/myapp/shared/data/
+rm -f /srv/autumn/myapp/current/app.db
+```
+
+The deploy refuses rather than link past your symlink: the shared file does not
+exist yet, so the migration would create an empty database there and the cutover
+would serve it while yours sat untouched at the old path.
+
 The deploy never deletes a database file. A real file it finds at the link path
 in some other release — a rollback target from before the migration — is set
 aside as `shared/data/<file>.superseded`, out of retention's reach; a deploy that

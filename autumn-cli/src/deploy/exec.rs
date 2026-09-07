@@ -1765,6 +1765,12 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
 ///    also no atomic move — between the `mv` and the link, a new pooled
 ///    connection creates an empty database at the old path. So the deploy stops
 ///    and tells the operator to stop the app and move the file once, by hand.
+///
+///    A `current` that is a **symlink** is refused on the same terms. It is not
+///    tested for, because it cannot be anything else: the shared file is absent
+///    in this branch, so a link pointing AT it dangles and fails `-e`. Any link
+///    that gets here points at a database the operator keeps elsewhere, and
+///    linking past it would serve an empty one and orphan theirs.
 /// 2. **Set aside a stale real file.** A rollback target from before that
 ///    migration still holds its own database. It is moved beside the shared file
 ///    as `<file>.superseded`, under `shared/`, where retention never reaches it.
@@ -1808,6 +1814,23 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
         current_q = shell_quote(&current),
         shared_parent_q = shell_quote(&shared_parent),
     );
+    // A `current` that is a SYMLINK is refused too, and needs its own message:
+    // it points at a database the operator manages elsewhere, and `mv` on the
+    // link would move the link, not that database.
+    let linked_refusal = format!(
+        "autumn deploy: {current} is a symlink to a SQLite database outside \
+         {shared}. The data file must live there to survive a deploy, so this \
+         deploy stopped rather than link past it and serve an empty database."
+    );
+    let linked_recovery = format!(
+        "Run this on the host once, then deploy again: systemctl stop \
+         {blue_q} {green_q}; mv \"$(readlink -f {current_q})\"* {shared_parent_q}/; \
+         rm -f {current_q}",
+        blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
+        green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
+        current_q = shell_quote(&current),
+        shared_parent_q = shell_quote(&shared_parent),
+    );
     let occupied =
         format!("autumn deploy: refusing to move {in_release} aside: {superseded} already exists");
 
@@ -1815,8 +1838,10 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
         "link-data",
         format!(
             "mkdir -p {shared_parent_q} {release_parent_q} && \
-             if [ ! -e {shared_q} ] && [ -e {current_q} ] && [ ! -L {current_q} ]; then \
-             echo {refusal_q} >&2; echo {recovery_q} >&2; exit 1; \
+             if [ ! -e {shared_q} ] && [ -e {current_q} ]; then \
+             if [ -L {current_q} ]; then \
+             echo {linked_refusal_q} >&2; echo {linked_recovery_q} >&2; \
+             else echo {refusal_q} >&2; echo {recovery_q} >&2; fi; exit 1; \
              fi && \
              if [ -e {in_release_q} ] && [ ! -L {in_release_q} ]; then \
              if [ -e {superseded_q} ]; then echo {occupied_q} >&2; exit 1; fi; \
@@ -1835,6 +1860,8 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
             in_release_q = shell_quote(&in_release),
             refusal_q = shell_quote(&refusal),
             recovery_q = shell_quote(&recovery),
+            linked_refusal_q = shell_quote(&linked_refusal),
+            linked_recovery_q = shell_quote(&linked_recovery),
             occupied_q = shell_quote(&occupied),
         ),
     ))
@@ -7361,17 +7388,17 @@ mod tests {
     #[test]
     fn the_data_link_op_refuses_to_relocate_a_live_database() {
         let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // The refusal fires when the shared file is absent and `current`
+        // resolves to something. `-L` then only picks WHICH message — it must
+        // not gate the refusal, or a legacy symlinked database is linked past.
         assert!(
             op.shell
                 .contains("[ ! -e '/srv/autumn/myapp/shared/data/app.db' ]")
                 && op
                     .shell
-                    .contains("[ -e '/srv/autumn/myapp/current/app.db' ]")
-                && op
-                    .shell
-                    .contains("[ ! -L '/srv/autumn/myapp/current/app.db' ]"),
-            "the refusal must fire only when the shared file is absent and the current \
-             release holds a REAL (not already-linked) file: {}",
+                    .contains("[ -e '/srv/autumn/myapp/current/app.db' ]"),
+            "the refusal must fire when the shared file is absent and the current \
+             release still holds a database: {}",
             op.shell
         );
         assert!(
@@ -7412,11 +7439,17 @@ mod tests {
     fn the_data_link_op_never_expands_a_configured_path() {
         let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
         let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
-        assert!(
-            !op.shell.contains('"'),
-            "no double quotes: a shell-quoted path inside them still expands: {}",
-            op.shell
-        );
+        // A double quote may appear only INSIDE a single-quoted word. The
+        // hazard is a shell-quoted path sitting in an expandable position, not
+        // the character itself — the symlink recovery prints a deliberate
+        // `"$(readlink -f '…')"` for the operator, inert until they paste it.
+        for (index, _) in op.shell.match_indices('"') {
+            assert!(
+                inside_single_quotes(&op.shell, index),
+                "a double quote outside single quotes makes paths expandable: {}",
+                op.shell
+            );
+        }
         // The substitution survives only inside single quotes, where it is inert.
         for (index, _) in op.shell.match_indices("$(touch pwned)") {
             assert!(
@@ -7482,6 +7515,43 @@ mod tests {
             op.shell
                 .contains(r"mv '\''/srv/autumn/myapp/current/app data.db'\''*"),
             "the source must be one quoted word: {}",
+            op.shell
+        );
+    }
+
+    /// A `current` that is a SYMLINK to an operator-managed database must be
+    /// refused too. Linking past it points the release at a shared file that
+    /// does not exist; the migration then creates an empty one and cutover
+    /// serves it while the real database is orphaned.
+    #[test]
+    fn the_data_link_op_refuses_a_legacy_symlinked_database() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // The guard turns only on the shared file being absent and `current`
+        // resolving to something. A link pointing at the shared file dangles
+        // here, so it fails `-e` and never reaches the refusal.
+        assert!(
+            op.shell.contains(
+                "if [ ! -e '/srv/autumn/myapp/shared/data/app.db' ] && \
+                 [ -e '/srv/autumn/myapp/current/app.db' ]; then"
+            ),
+            "an existing `current` must be refused whether or not it is a link: {}",
+            op.shell
+        );
+        assert!(
+            !op.shell
+                .contains("[ ! -L '/srv/autumn/myapp/current/app.db' ]; then"),
+            "the symlink case must not be excluded from the refusal: {}",
+            op.shell
+        );
+        // It gets its own message: `mv` on a link moves the link, not the
+        // database, so the real-file recovery would be wrong here.
+        assert!(
+            op.shell
+                .contains("is a symlink to a SQLite database outside")
+                && op
+                    .shell
+                    .contains(r#"mv "$(readlink -f '\''/srv/autumn/myapp/current/app.db'\'')"*"#),
+            "the symlink recovery must move the link TARGET: {}",
             op.shell
         );
     }
