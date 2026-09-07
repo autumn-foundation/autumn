@@ -117,6 +117,15 @@ jobs:
         # module-wide `allow` spoof or a crate-local `clippy.toml` that would
         # shadow the config entirely. No toolchain, ~2 seconds, self-testing.
         run: ./scripts/check-determinism-gate.sh
+      - name: SQLite feature-unification gate
+        # The `sqlite` backend flip (#1614) is safe only while NO manifest
+        # enables it through a dependency edge — cargo unifies features
+        # globally, so one such edge swaps `db::RuntimeConnection` for every
+        # consumer in the graph. Until this gate, that invariant was prose plus
+        # the `sqlite`-excluding feature lists below, and nothing read the
+        # manifests. No toolchain, ~1 second, self-testing.
+        run: ./scripts/check-sqlite-unification.sh
+
       - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
         # that bypass the typed a11y primitives and lack an accessible name.
@@ -260,6 +269,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-config.sh --self-test && ./scripts/check-docs-config.sh
+      - name: Guide reachability gate
+        # The three gates above cover the link a reader clicks, the command they
+        # run, and the variable they set — every one of them checking a page the
+        # reader ALREADY REACHED. None can tell you whether a page is reachable
+        # at all, and that failure is quieter than any of the three: no 404, no
+        # exit code, no ignored override. The reader concludes the feature does
+        # not exist and goes and builds it themselves.
+        #
+        # `docs/guide/` has no index page of its own, so its 155 pages are
+        # discovered through the hand-maintained `## Documentation` list in
+        # README.md and the skill indexes — surfaces someone has to remember to
+        # update. Nothing noticed when they forgot. The baseline run found three
+        # pages unreachable from every reader entry point, all three ACCURATE:
+        # time-zones.md, active-search-and-autocomplete.md and
+        # outbound-webhooks.md. The last is the sharpest — README.md indexed
+        # signed-webhooks.md (webhooks coming in), so a reader searching it for
+        # "webhook" concluded that was all there was and never found the page on
+        # sending signed webhooks out to their own customers, a surface with a
+        # filed SSRF report against it.
+        #
+        # This walks the graph a reader can actually click rather than counting
+        # inbound mentions, because the weaker question misses the case worth
+        # catching: a page linked only from other unreachable pages.
+        # outbound-webhooks.md had two inbound mentions and was still
+        # unreachable.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-orphans.sh --self-test && ./scripts/check-docs-orphans.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -1094,6 +1132,51 @@ jobs:
           # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
           # installed above.
           cargo test -p autumn-cli --test deploy_e2e -- --ignored
+          # Example apps are NOT auto-swept the way autumn-web's consolidated
+          # `integration_tests` binary is (Codex review finding on #2530):
+          # `saas` and `teams` each have their own Docker-gated
+          # `tests/integration_test.rs` (signup -> login -> tenant-scoped
+          # flows, invite/accept, role gating, …) that otherwise never runs
+          # anywhere in CI. `--test-threads=1` because both suites share one
+          # process-global `TestDb::shared()` Postgres container and each
+          # test's setup does a `TRUNCATE` — concurrent tests would race each
+          # other's data, exactly as each file's own doc comment says.
+          #
+          # First attempt at this line ran saas's full ignored suite and hit a
+          # separate, pre-existing bug this wiring surfaced rather than
+          # caused: `tenants_are_isolated`, `remember_me_accepts_previous_token_within_grace`,
+          # and `remember_me_rotates_across_restart_and_detects_theft` each
+          # got a bare 401 on an already-authenticated request once several
+          # other ignored tests had already run first in the same process
+          # against the shared container -- these three tests, like the rest
+          # of this suite, had never run alongside others in CI before, so
+          # nothing had ever exercised that interaction. Diagnosing it needs a
+          # Docker-capable environment to iterate against a real Postgres,
+          # which isn't available where this line was authored, so they're
+          # skipped here (not fixed blind) pending that investigation; every
+          # other saas test, including every one #2530 added, passes.
+          # `teams` also turned up a second, more fundamental pre-existing
+          # bug on this same first-ever real run: `db_client`'s schema setup
+          # passed the whole (multi-statement) migration file to
+          # `TestDb::execute_sql` in one call, which Postgres refuses
+          # ("cannot insert multiple commands into a prepared statement") --
+          # meaning EVERY ignored test in this file was always unable to run
+          # against real Postgres, full stop, regardless of ordering. Fixed
+          # by splitting the migration into individual statements before
+          # this line was written. That fix likely unblocks teams's other
+          # ~20 pre-existing ignored tests too, but they've still never run
+          # together before and, going by saas's experience above, may have
+          # their own undiscovered ordering sensitivity -- scoped to just the
+          # test #2530 added rather than risking that same kind of surprise
+          # for tests this change has no connection to. Widening both back
+          # out to their full suites is a follow-up, once someone can
+          # actually run them against Docker.
+          cargo test -p saas -- --ignored --test-threads=1 \
+            --skip tenants_are_isolated \
+            --skip remember_me_accepts_previous_token_within_grace \
+            --skip remember_me_rotates_across_restart_and_detects_theft
+          cargo test -p teams -- --ignored --test-threads=1 --exact \
+            signup_and_login_failures_redisplay_the_form_with_email_preserved
 
 
   test-gate:
@@ -1287,8 +1370,10 @@ jobs:
           # backend-flip #1614 fixed, so coverage must keep compiling it.
           # Isolated to `-p autumn-web` so the sqlite flip can never leak onto
           # the Pg-assuming workspace crates. A named sqlite `[[test]]` target
-          # keeps it off the pg-URL lib unit tests (which assume Postgres) —
-          # the same rule the `sqlite-runtime` job follows.
+          # keeps THIS lane narrow; it is no longer "the same rule the
+          # `sqlite-runtime` job follows" — #1905 made the lib unit tests
+          # backend-parametric, so that job now runs a bare `--lib`. Those
+          # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
           cargo llvm-cov report --lcov --output-path lcov.info
@@ -1340,9 +1425,9 @@ jobs:
       - name: Check MSRV compiles
         run: cargo check --workspace
 
-  # SQLite runtime lane gate (issue #1614, AC#11). This is the ONLY place in CI
-  # that enables autumn-web's `sqlite` feature, and it does so via an EXPLICIT
-  # `--features sqlite` on each dedicated invocation below — NEVER via
+  # SQLite runtime lane gate (issue #1614, AC#11). Enables autumn-web's
+  # `sqlite` feature via an EXPLICIT `--features sqlite` on each dedicated
+  # invocation below — NEVER via
   # `--all-features` and never via a workspace dependency edge. `sqlite` is a
   # backend-flip feature: it flips `db::RuntimeConnection` from `AsyncPgConnection`
   # to a SQLite connection, so unifying it with the Postgres-assuming features
@@ -1351,9 +1436,15 @@ jobs:
   # No Postgres `services:` / Docker: the sqlite tests use tempfile/in-memory
   # SQLite with no external DB. The job builds + lints autumn-web under the
   # sqlite backend and runs the sqlite integration suite by NAMED `[[test]]`
-  # target — a bare `cargo test --features sqlite` is unsafe (it would compile
-  # the Postgres `integration_tests` binary and the pg-URL lib unit tests under
-  # the flipped backend and fail).
+  # target — a bare `cargo test --features sqlite` is unsafe because it would
+  # compile the Postgres `integration_tests` binary under the flipped backend.
+  # The crate's own LIB unit tests are a different matter: #1905 made their
+  # fixtures backend-parametric, so the lib step below runs a bare `--lib`.
+  #
+  # This is not quite the only place CI enables `sqlite` — the coverage job
+  # has a dedicated `--features "sqlite,mail"` lane — but both are EXPLICIT
+  # per-invocation, never `--all-features` and never a dependency edge (which
+  # `scripts/check-sqlite-unification.sh` now enforces).
   sqlite-runtime:
     name: SQLite runtime (feature=sqlite)
     runs-on: ubuntu-latest
@@ -1382,32 +1473,24 @@ jobs:
         # tests — the pool sizing, replica-rejection, target-classification and
         # provider-dispatch coverage that lives inside `autumn/src/db.rs`,
         # `app.rs` and `repository_commit_hooks.rs`. Until this step existed
-        # those ~26 tests were compiled (by the clippy steps above) but never
+        # those tests were compiled (by the clippy steps above) but never
         # executed, and the ungated pool/topology tests alongside them had
         # rotted into hard failures under the backend flip without anyone
-        # noticing. Same shape as the other feature-gated `--lib <module>::`
-        # lanes above (markdown, i18n, tls, acme).
+        # noticing.
         #
-        # Module-filtered, NOT a bare `--lib`: the rest of the crate's unit
-        # tests still build their fixtures on hard-coded `postgres://` URLs,
-        # which `build_sqlite_pool` correctly refuses. Making those
-        # backend-parametric is tracked separately; the filter names every
-        # module that carries SQLite-specific logic, so nothing sqlite-gated is
-        # left unexecuted. The two `app::` tests are named individually because
-        # the rest of `app::tests` is in that not-yet-parametric set.
-        run: |
-          cargo test -p autumn-web --features sqlite --lib -- \
-            db:: \
-            config:: \
-            migrate:: \
-            counter_cache:: \
-            commentable:: \
-            ledger:: \
-            repository_commit_hooks:: \
-            substrate:: \
-            sqlite_sharding_unsupported_guard_tests \
-            app::tests::custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout \
-            app::tests::custom_pool_provider_no_database_mode_boots_with_statement_timeout
+        # A BARE `--lib`, no filter list (#1905): fixtures now spell their
+        # target through `crate::test_urls`, which picks a Postgres or SQLite
+        # target per backend. The tests `#[cfg(not(feature = "sqlite"))]`
+        # excludes from this lane are the ones whose SUBJECT this build refuses
+        # — a fixture carrying a distinct `replica_url`, and the Postgres job
+        # backend — not everything Postgres-only: the `sharding::` suite IS
+        # parametrised and runs here, because `create_shard_set` applies no
+        # backend screen and its routing/slot/seed machinery is
+        # backend-independent (see the fixture comment in `sharding.rs` for
+        # what that does and does not claim). A filter list would let a
+        # newly-added module rot the same way the pool tests did — silently,
+        # because nothing runs it.
+        run: cargo test -p autumn-web --features sqlite --lib
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,

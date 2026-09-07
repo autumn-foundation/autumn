@@ -42,6 +42,12 @@ wasmi = { version = "0.40", optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Compiles hand-written adversarial WAT guests for the WASI-deny probes
+# (`tests/host_wasi_deny_probes.rs`) at test time, pure Rust — no
+# `wasm32-wasip1` toolchain needed to run them. Same purpose, same crate
+# version, as the sibling `autumn` crate's identical use for its
+# `plugin_sandbox` escape suite.
+wat = "1"
 
 [features]
 default = []
