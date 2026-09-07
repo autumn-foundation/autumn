@@ -248,9 +248,9 @@ pub enum ScrubError {
         /// `child (inherits parent)` descriptions, sorted.
         tables: Vec<String>,
     },
-    /// A table this run promises to empty carries a user-defined trigger that
-    /// fires on `DELETE`. That emptying pass is the run's LAST write, so
-    /// anything the trigger writes lands after every rewrite and is never
+    /// A table this run promises to empty carries a user-defined trigger or
+    /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
+    /// write, so anything it writes lands after every rewrite and is never
     /// verified.
     EmptyingTriggerLeak {
         /// The table names, sorted.
@@ -503,15 +503,16 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::EmptyingTriggerLeak { tables } => write!(
                 f,
-                "{} table(s) this run empties carry a user-defined trigger that fires on \
-                 `DELETE`:\n{}\n  \
+                "{} table(s) this run empties carry a user-defined trigger or rewrite rule \
+                 that fires on `DELETE`:\n{}\n  \
                  Emptying them is the LAST thing the run writes \u{2014} it has to be, because a \
                  trigger on a scrubbed table can otherwise re-fill them with the very PII \
-                 being removed. A `DELETE` trigger on one of them therefore runs after every \
-                 column rewrite, and can copy the rows it is removing into an ordinary \
-                 table that has already been scrubbed. Nothing downstream can catch that: \
-                 the run verifies these tables are empty, not where their triggers wrote. \
-                 Drop or disable the trigger on the copy before scrubbing.",
+                 being removed. Anything attached to a `DELETE` on one of them therefore runs \
+                 after every column rewrite, and can copy the rows it is removing into an \
+                 ordinary table that has already been scrubbed. Nothing downstream can catch \
+                 that: the run verifies these tables are empty, not where their triggers and \
+                 rules wrote. On the copy, `ALTER TABLE ... DISABLE TRIGGER ...` or \
+                 `DROP RULE ... ON ...` before scrubbing.",
                 tables.len(),
                 bullet_list(tables),
             ),
@@ -3441,9 +3442,23 @@ fn probe_database_facts(
     // `tgtype` bit 3 is the DELETE event. These are the ones that matter for
     // the run's last write, so the refusal can name exactly the tables that
     // carry one rather than every table carrying any trigger at all.
-    let delete_triggered_tables = names(&triggers_reaching("AND (t.tgtype & 8) <> 0 "), &mut conn)?
-        .into_iter()
-        .collect();
+    // Rules are the other way a `DELETE` runs code the plan never saw. Unlike a
+    // trigger they fire only on the relation the statement NAMES — measured on
+    // PostgreSQL 16: a rule on a leaf partition or an inheritance child does not
+    // fire for `DELETE FROM parent` — so this needs no walk up `pg_inherits`.
+    // `ev_type` `4` is DELETE; `_RETURN` is the SELECT rule every view carries.
+    let mut delete_triggered_tables: BTreeSet<String> =
+        names(&triggers_reaching("AND (t.tgtype & 8) <> 0 "), &mut conn)?
+            .into_iter()
+            .collect();
+    delete_triggered_tables.extend(names(
+        "SELECT DISTINCT rel.relname AS name FROM pg_rewrite r \
+         JOIN pg_class rel ON rel.oid = r.ev_class \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE r.ev_type = '4' AND r.rulename <> '_RETURN' \
+         AND r.ev_enabled IN ('O', 'A')",
+        &mut conn,
+    )?);
 
     // `m` (materialized views) belongs here as much as the table relkinds do: a
     // schema holding only `analytics.user_emails AS SELECT … FROM public.users`
@@ -3736,6 +3751,7 @@ fn session_settings() -> Vec<String> {
         "SET LOCAL IntervalStyle = 'iso_8601'",
         "SET LOCAL TimeZone = 'UTC'",
         "SET LOCAL bytea_output = 'hex'",
+        "SET LOCAL lc_monetary = 'C'",
         "SET LOCAL extra_float_digits = 3",
     ]
     .into_iter()
@@ -4138,6 +4154,7 @@ mod tests {
             "TimeZone",
             "bytea_output",
             "extra_float_digits",
+            "lc_monetary",
         ] {
             assert!(
                 pinned.contains(setting),

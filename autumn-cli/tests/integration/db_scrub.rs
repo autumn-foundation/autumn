@@ -1646,6 +1646,70 @@ async fn a_composite_key_survives_a_control_character_in_a_column_name() {
     );
 }
 
+/// A rewrite rule is the other way a `DELETE` runs code the plan never saw.
+///
+/// `ON DELETE ... DO ALSO` copies `OLD` wherever the rule says, and the
+/// emptying pass is the run's last write — so the copy lands after every
+/// rewrite, in a table nothing verifies. The trigger refusal alone did not see
+/// it, because rules live in `pg_rewrite`, not `pg_trigger`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_on_delete_rule_on_an_emptied_table_is_refused() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "delete_rule").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            CREATE RULE audit_archive AS ON DELETE TO audit_logs \
+                DO ALSO INSERT INTO autumn_jobs (args) VALUES (OLD.actor_email);",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/delete_rule");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        stderr.contains("audit_logs") && stderr.contains("rule"),
+        "the refusal must name the table and say a rule is why: {stderr}"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM autumn_jobs WHERE args LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "nothing may have been archived by a refused run"
+    );
+
+    // And the remedy the refusal names has to work.
+    client
+        .batch_execute("DROP RULE audit_archive ON audit_logs")
+        .await
+        .unwrap();
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "the never_include table must still be emptied"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "and the rule that can no longer fire must have archived nothing"
+    );
+}
+
 /// A statement-level trigger on a leaf must not refuse the run.
 ///
 /// `DELETE FROM parent` fires a child's **row**-level triggers and not its

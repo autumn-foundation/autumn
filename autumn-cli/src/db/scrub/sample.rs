@@ -1553,6 +1553,14 @@ impl SamplePlan {
         self.tables
             .iter()
             .filter_map(|table| match table.role {
+                // Nothing to remove, so nothing to state. An exact-100% root is
+                // the same case as a full copy and is skipped for the same
+                // reason: a `DELETE` matching no rows still fires a
+                // statement-level trigger, and `report_triggers` does not warn
+                // about a table it knows is not subsetted — so the run would
+                // have side effects it never mentioned, on a flag that asks for
+                // everything to be kept.
+                _ if !table.role.is_subsetted() => None,
                 SampleRole::AlwaysInclude => None,
                 SampleRole::NeverInclude => {
                     Some(format!("DELETE FROM {}", qualified(&table.table)))
@@ -3351,6 +3359,33 @@ mod tests {
         assert!(
             plan.walk_edges.iter().all(|e| e.name != "countries_job_fk"),
             "but it must not enter the walk"
+        );
+    }
+
+    #[test]
+    fn an_exact_100_percent_root_is_not_deleted_from() {
+        // The predicate would match no rows, but a statement-level `DELETE`
+        // trigger fires on a zero-row statement all the same — and
+        // `report_triggers` says nothing about a table it knows is not
+        // subsetted, so the run would have side effects it never announced, on
+        // a flag that asked for every row to be kept.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Percent(100.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let deletes = plan.delete_statements();
+        assert!(
+            !deletes.iter().any(|s| s.contains(r#""public"."users""#)),
+            "a root that removes nothing must not be deleted from: {deletes:?}"
+        );
+        // Its children are still sampled, so they still are.
+        assert!(
+            deletes.iter().any(|s| s.contains(r#""public"."comments""#)),
+            "but a genuinely subsetted table must be: {deletes:?}"
         );
     }
 

@@ -278,8 +278,9 @@ The seed defaults to `0`, so a run is reproducible whether or not you pass one.
 That guarantee holds across operators, not just across repeats on one machine.
 The key is hashed from its text rendering, and several session settings change
 what that rendering is — `DateStyle` for a `date` or `timestamp` key,
-`bytea_output`, `extra_float_digits`, `IntervalStyle`, `TimeZone` — so the scrub
-pins all of them for its own transaction. Without that, the same seed over the
+`bytea_output`, `extra_float_digits`, `IntervalStyle`, `TimeZone`,
+`lc_monetary` for a `money` key — so the scrub pins all of them for its own
+transaction. Without that, the same seed over the
 same `date` primary key selects a different subset under `DateStyle = ISO, YMD`
 than under `Postgres, DMY`, and neither operator has any way to tell.
 
@@ -369,8 +370,9 @@ into an ordinary classified table that has already been scrubbed — putting rea
 values into a table the run reports as clean, and into any `--output` artifact.
 No ordering avoids it (the trigger graph decides, and can be cyclic) and no
 postcondition catches it (a trigger body can write anywhere), so a `DELETE`
-trigger on a table the run empties is refused before anything is written, by
-`--check` and `--dry-run` too. Drop or disable the trigger on the copy
+trigger — or an `ON DELETE` rewrite rule, which reaches the same destinations
+through `pg_rewrite` rather than `pg_trigger` — on a table the run empties is
+refused before anything is written, by `--check` and `--dry-run` too. Drop or disable the trigger on the copy
 (`ALTER TABLE audit_logs DISABLE TRIGGER audit_archive`) and the run proceeds —
 a disabled trigger cannot fire, so it does not hold the refusal. The check
 follows `pg_inherits` down, too: `DELETE FROM parent` fires a trigger declared
