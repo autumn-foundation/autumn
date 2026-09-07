@@ -75,6 +75,7 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `plugin_residue` **(trunk-dev)** | Orphaned plugin wiring (issue #1631). Warns when a plugin is declared in `[dependencies]` but never mounted (`autumn plugin add <name>` finishes the install, `autumn plugin remove <name>` takes the dependency back — for a community `autumn-plugin-*` crate, add the `.plugin(...)` call from its README, since `add` never writes one). Fails when a plugin's fully-qualified type is mounted but the crate is not declared, which does not compile. Warns when migrations a plugin declares are still recorded as applied and the plugin is gone (`autumn plugin remove <name> --drop-data` reverts them); that last finding needs a configured database and the `diesel` CLI, and is skipped otherwise |
 | `platform_support` **(trunk-dev)** | Never fails — reports this platform's Windows support tier (issue #1616). On Windows its `detail` names the Tier 1 (native) and Tier 2 (WSL2) commands and the vcpkg/`VCPKG_ROOT` prerequisite for `generate auth --passkeys` |
 | `edge_routes` **(trunk-dev)** | Fails when an `#[edge]` handler also carries `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]`/`#[intercept]`: remove one of the two — edge routes are unauthenticated read-path routes served without origin middleware. Warns when a marked handler is missing from `edge_routes![]`, or when `src/bin/edge-capsule.rs` is absent |
+| `dependencies` **(trunk-dev)** | Dependency policy findings (issue #1633). Fix or waive in `deny.toml` — a waiver is an `[advisories] ignore` entry, the same store the CI gate reads. Never fails for a missing cargo-deny or advisory database: those **pass** with a `not evaluated` detail, since warning would make `autumn doctor --strict` exit 1 on every machine without an optional tool. Warns with no verdict when `deny.toml` is not valid TOML, or declares a section in a spelling the generated CI workflow's grep cannot see |
 
 ## Platform support check (unreleased — trunk-dev, issue #1616)
 
@@ -277,6 +278,41 @@ reports informationally (those tools are not required for a SQLite app;
 SQLite backup/restore is tracked in #1909) rather than warning misleadingly. A
 `sqlite://` URL is only accepted as the lone primary in a single-role,
 single-host topology (SQLite is single-writer / no read-replica role).
+
+## Dependency policy check (unreleased — trunk-dev, issue #1633)
+
+`autumn doctor` grades the app's lockfile against its own `deny.toml`, using the
+same auditor, policy file, waiver store and check list as the CI gate the
+scaffold generates — so a local verdict predicts the CI verdict.
+
+```
+❌ dependencies — 1 finding, 1 blocking — cargo-deny 0.20.2; checks: advisories; advisory data 0 days old
+   RUSTSEC-2020-0071 vulnerability (high) time 0.1.45 — Potential segfault in the time crate
+```
+
+Reading the status:
+
+- **fail** — a finding the policy denies. Severity is consequence, not
+  taxonomy: denied findings grade high or critical (a CVSS v3 base score
+  separates the two), warned findings grade low or medium.
+- **warn** — only warn-level findings (duplicate or yanked crates), stale
+  advisory data (over 7 days), or **no verdict**: a `deny.toml` that is not
+  valid TOML, a section spelling only doctor's parse can see, or an auditor
+  error the diagnostic parse could not account for.
+- **pass** — no live findings, *or* the policy was not evaluated because
+  cargo-deny is not installed or no advisory database is present. A pass whose
+  detail reads `not evaluated` is not a clean bill of health; read the detail.
+
+Waivers go in `deny.toml` as `[advisories] ignore` entries and are read by
+doctor, `autumn dev` and CI alike — there is no second waiver format. A waived
+finding shows as waived and never fails.
+
+Neither doctor nor `autumn dev` fetches the advisory database; both run
+`cargo deny --offline`. Tell a user reporting a stale-data warning to run
+`cargo deny fetch db`. Two parity differences with CI are reported rather than
+hidden: CI pins its cargo-deny version while a local run uses whatever is
+installed (doctor names the version it used), and CI fetches the database every
+run (doctor names its data age). See `docs/guide/supply-chain.md`.
 
 ## Secrets redaction
 

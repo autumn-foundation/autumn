@@ -3313,11 +3313,15 @@ fn is_framework_prologue_call(call: &ExprCall) -> bool {
     let Expr::Path(path) = &*call.func else {
         return false;
     };
+    // The literal "autumn_web" is only the unrenamed default; a rename or
+    // `crate = "..."` override (#1828) means an earlier-expanded guard's own
+    // (already-finalized) prologue call is rooted at the actively resolved
+    // name instead.
     let rooted = path
         .path
         .segments
         .first()
-        .is_some_and(|first| first.ident == "autumn_web");
+        .is_some_and(|first| first.ident == crate::crate_path::current_target_path_segment());
     rooted
         && path.path.segments.len() > 1
         && path

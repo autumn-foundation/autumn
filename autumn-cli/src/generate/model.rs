@@ -225,7 +225,7 @@ fn plan_model_with_options_impl(
     // triggers (issue #1910) — so it is no longer rejected here.
     let backend = detect_backend(project_root);
     // A UUID primary key needs app-side id generation on SQLite (no
-    // `gen_random_uuid()`), which is part of the deferred runtime slice #1905;
+    // `gen_random_uuid()`), which the runtime slice deferred to #2555;
     // reject `--id uuid` on a SQLite app at generate time rather than emit a
     // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
@@ -4297,12 +4297,13 @@ mod tests {
     }
 
     /// `generate model --id uuid` on a `SQLite` app is rejected at generate time
-    /// citing #1905 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
+    /// citing #2555 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
     /// the generated `New*` insert type omits `#[id]` fields, so a `TEXT PRIMARY
     /// KEY` column would accept NULL/omitted ids. App-side UUID generation is
-    /// deferred to the runtime slice #1905.
+    /// tracked in #2555 — the runtime slice (#1905) deferred it and has since
+    /// closed, so the message must not send a reader to a closed issue.
     #[test]
-    fn sqlite_app_uuid_primary_key_is_rejected_citing_1905() {
+    fn sqlite_app_uuid_primary_key_is_rejected_citing_the_tracking_issue() {
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
             let err = plan_model_with_options(
@@ -4321,7 +4322,7 @@ mod tests {
                 matches!(err, GenerateError::Config(_)),
                 "expected Config error, got: {err:?}"
             );
-            assert!(msg.contains("1905"), "must cite issue #1905: {msg}");
+            assert!(msg.contains("2555"), "must cite issue #2555: {msg}");
             assert!(
                 msg.contains("SQLite") && msg.contains("UUID"),
                 "message must be actionable: {msg}"

@@ -15,10 +15,12 @@
 #
 # Also enforced: `autumn a11y verify` (accessibility), `autumn routes audit`
 # (route auth-coverage security manifest) — both run against the prebuilt
-# `autumn` CLI installed mid-job — and `cargo deny check advisories`, which
-# fails the build when any crate in this app's dependency tree carries a known
-# RustSec security advisory. That audit reads `deny.toml` at the repository
-# root; waive an advisory by adding an entry there, never by weakening or
+# `autumn` CLI installed mid-job — and `cargo deny check`, which fails the
+# build when any crate in this app's dependency tree carries a known RustSec
+# security advisory. That audit reads `deny.toml` at the repository root and
+# checks whatever that file declares: advisories always, plus `[licenses]`,
+# `[bans]` or `[sources]` once you uncomment them. `autumn doctor` runs the
+# same policy locally. Waive a finding in `deny.toml`, never by weakening or
 # deleting the step.
 #
 # The companion `.github/workflows/posture-gate.yml` takes the next step on
@@ -147,8 +149,28 @@ jobs:
 
       # Runs against the database fetched above, so a failure here is a real
       # advisory rather than a network blip.
-      - name: Audit dependencies (RustSec advisories)
-        run: cargo deny --offline check advisories
+      #
+      # The check list is derived from `deny.toml`: advisories always, plus
+      # every optional section the policy declares. `autumn doctor` derives it
+      # the same way, so uncommenting `[licenses]`, `[bans]` or `[sources]`
+      # widens the local check and this gate together — a lockfile cannot pass
+      # locally and fail here for a dependency reason.
+      - name: Audit dependencies (RustSec advisories and declared policy)
+        run: |
+          # Matches every TOML spelling of a section header or key: [bans],
+          # [ bans ], ["bans"], ['bans'], [bans.build], [[bans.deny]],
+          # bans.deny = …, bans = { … }. `autumn doctor` parses the file as
+          # TOML and reaches the same answer; grep cannot, so the two are held
+          # together by a test that runs this loop and doctor over the same
+          # policies. A commented line never matches.
+          checks="advisories"
+          for section in bans licenses sources; do
+            if grep -qE "^[[:space:]]*(\[\[?[[:space:]]*)?[\"']?$section[\"']?[[:space:]]*[].=]" deny.toml; then
+              checks="$checks $section"
+            fi
+          done
+          echo "policy sections in force: $checks"
+          cargo deny --offline check $checks
 
       # Accessibility gate: install the release pinned to this app's own
       # autumn-web version and scan raw html! markup for a11y violations.
