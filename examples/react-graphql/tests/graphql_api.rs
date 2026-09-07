@@ -230,7 +230,9 @@ async fn a_missing_pool_is_a_redacted_graphql_error() {
 #[test]
 fn committed_schema_matches_the_live_sdl() {
     let live = notes::build_schema().sdl();
-    let committed = include_str!("../schema.graphql");
+    // A Windows checkout may hand `include_str!` CRLF line endings; the live
+    // SDL is always LF. Compare content, not line-ending convention.
+    let committed = include_str!("../schema.graphql").replace("\r\n", "\n");
     assert_eq!(
         live.trim(),
         committed.trim(),
