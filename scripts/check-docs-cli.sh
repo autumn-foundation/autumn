@@ -3116,7 +3116,7 @@ def _reportable_flag(name):
             and not _PROSE_IN_FLAG.search(name))
 
 
-def _scan_options_only(tokens, i, node, path, flags, surface):
+def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
     """Judge the OPTIONS in `tokens[i:]`, resolving no NEW command defects.
 
     Reached once a positional has been met on a node that also has subcommands,
@@ -3141,11 +3141,13 @@ def _scan_options_only(tokens, i, node, path, flags, surface):
             return None
         if not (tok.startswith('-') and len(tok) > 1):
             if filled >= slots and tok in node['children']:
-                path = path + ' ' + tok         # the subcommand after the values
-                node = surface[path]
-                filled, slots = 0, len(node['hyphen_slots'])
-            else:
-                filled += 1                     # a value, or another positional
+                # The child resolves the ambiguity that sent us here, so the
+                # ordinary walk can take over again — including its
+                # `requires_sub` and required-argument checks, which this
+                # options-only mode does not have and must not reimplement.
+                return _walk(tokens, i + 1, path + ' ' + tok,
+                             surface, runnable, flags)
+            filled += 1                         # a value, or another positional
             i += 1
             continue
         if node['trailing']:
@@ -3216,8 +3218,20 @@ def resolve(tokens, surface, runnable=False, flags=None):
         return None
     if tokens[0] not in surface:
         return 'autumn ' + tokens[0]
-    path = tokens[0]
-    i = 1
+    return _walk(tokens, 1, tokens[0], surface, runnable, flags)
+
+
+def _walk(tokens, i, path, surface, runnable, flags):
+    """The token walk proper, entered at `tokens[i]` with `path` resolved.
+
+    Split out so that `_scan_options_only` can hand control BACK to it once a
+    positional's ambiguity has been resolved by an exact child name. It stayed
+    in options-only mode instead, and so never applied the child's
+    `requires_sub` or required-argument checks: `autumn routes /admin posture`
+    and `autumn routes /admin posture bogus` both passed, though clap rejects
+    each. Two walks that must agree about what a command needs is the same trap
+    that put the waiver grammar out of step with the detector; there is now one.
+    """
     while i < len(tokens):
         tok = tokens[i]
         node = surface[path]
@@ -3359,7 +3373,8 @@ def resolve(tokens, surface, runnable=False, flags=None):
             # Only option-shaped tokens are judged from here. Anything else may
             # be another positional value, or the value of an option, and no
             # further subcommand resolution is attempted.
-            return _scan_options_only(tokens, i, node, path, flags, surface)
+            return _scan_options_only(tokens, i, node, path, flags,
+                                      surface, runnable)
         if not TOKEN.match(tok):
             return None
         return 'autumn ' + path + ' ' + tok
@@ -3573,7 +3588,12 @@ def self_test():
             #[arg(long)]
             strict: bool,
         },
+        // A child that itself REQUIRES a subcommand, so the handback to the
+        // ordinary walk has something to prove.
+        #[command(subcommand)]
+        Posture(PostureSubcommands),
     }
+    enum PostureSubcommands { Digest }
     // A positional that accepts a hyphen-leading value, as the real
     // `ConfigCommands::Set.value` does.
     enum ConfigCommands {
@@ -3786,6 +3806,21 @@ def self_test():
            'a compact short after a leaf positional is not drift')
     expect(opts_of('replay capsule.json -zz') == [('replay', '-zz')],
            '…but an unresolvable one still is')
+
+    # Once the child is selected the ordinary walk takes over, so the child's
+    # own `requires_sub` and phantom-subcommand checks apply again. Staying in
+    # options-only mode past the handback let `autumn routes /admin posture`
+    # and `… posture bogus` both pass, though clap rejects each.
+    expect(resolve(tk('routes /admin posture bogus'), surface)
+           == 'autumn routes posture bogus',
+           'a phantom subcommand under a followed child must be reported')
+    expect(resolve(tk('routes /admin posture'), surface, runnable=True)
+           == 'autumn routes posture',
+           "a followed child's required subcommand is still required")
+    expect(resolve(tk('routes /admin posture digest'), surface) is None,
+           'a complete command through that path resolves')
+    expect(resolve(tk('routes /admin posture'), surface) is None,
+           '…and in PROSE a bare group is still just its name')
 
     # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
     # used to read these stopped at the list's first `]`, so the field vanished
