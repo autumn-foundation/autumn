@@ -289,6 +289,29 @@ fn query_budget_compile_fail_tests() {
     // The same N+1, against the real generated repository surface.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/query_budget_repository_n_plus_one.rs");
+    // Prospect assay (ledger, 2026-09-06): the accessor-tracking path
+    // (`state.db()`) that a `#[job]`/`#[scheduled]` handler is structurally
+    // limited to, since neither macro's signature can name a typed
+    // `Db`/`…Repository` parameter the way a route handler does. Both catch
+    // the N+1 with no code change to the analysis — see the report for the
+    // full assay.
+    t.compile_fail("tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs");
+    t.compile_fail("tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs");
+    // The real `#[job]`/`#[scheduled]` attributes stacked with
+    // `#[query_budget]` (PR #2546 review): the fixtures above prove the
+    // accessor-tracking mechanism, but only the real attributes prove the
+    // two macros actually compose against each other.
+    t.compile_fail("tests/compile-fail/query_budget_real_job_accessor_n_plus_one.rs");
+    t.compile_fail("tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs");
+    // A handle obtained through an async/fallible accessor (PR #2546 review,
+    // round 2): `self.conn().await?`, the real shape in
+    // `autumn-search/src/postgres.rs`'s `write_documents`.
+    t.compile_fail("tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs");
+    // The `.expect(...)`/`.unwrap()` idiom `autumn/src/seed.rs` documents as
+    // its own canonical usage (PR #2546 review, round 5) — the same
+    // accessor-tracking gap as the `?` shape above, for a different
+    // unwrapping spelling.
+    t.compile_fail("tests/compile-fail/query_budget_expect_accessor_n_plus_one.rs");
 }
 
 /// Every `#[agent_operable]` / `authority_grant!` compile-fail fixture, with
@@ -447,6 +470,18 @@ fn compile_pass_tests_a() {
     t.pass("tests/compile-pass/query_budget_valid.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/query_budget_route.rs");
+    // Prospect assay control (ledger, 2026-09-06): the job-shaped accessor
+    // pattern batched ahead of the loop compiles clean — the analysis is
+    // actually counting, not just always rejecting the job/scheduled shape.
+    t.pass("tests/compile-pass/query_budget_job_shaped_accessor_batched.rs");
+    // A bare `.await` (no `?`) on a fallible accessor must not promote the
+    // `Result` itself to a handle (PR #2546 review, round 3) — otherwise
+    // `result.is_err()` here would be miscounted as a database query.
+    t.pass("tests/compile-pass/query_budget_bare_await_not_promoted.rs");
+    // An awaited call whose name collides with a `HANDLE_BUILDERS` entry is
+    // the terminal query, not a handle-refining step (PR #2546 review,
+    // round 4) — its result must not be promoted to a handle either.
+    t.pass("tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]

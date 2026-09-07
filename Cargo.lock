@@ -569,9 +569,11 @@ dependencies = [
 name = "autumn-macros"
 version = "0.7.0"
 dependencies = [
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+ "temp-env",
 ]
 
 [[package]]
@@ -7103,6 +7105,7 @@ dependencies = [
  "maud",
  "pq-sys",
  "redis",
+ "reqwest 0.12.28",
  "scoped-futures",
  "serde",
  "serde_json",
@@ -7263,6 +7266,8 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "cookie",
+ "cookie_store",
  "futures-channel",
  "futures-core",
  "futures-util",

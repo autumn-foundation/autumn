@@ -4452,9 +4452,9 @@ mod tests {
     /// A replica target to pair with `primary`.
     ///
     /// Postgres-only, and deliberately so: `database_backend_consistency`
-    /// refuses any `replica_url` alongside a SQLite primary, so every caller is
-    /// `#[cfg(not(feature = "sqlite"))]` and there is no SQLite spelling to
-    /// give. The SQLite side of the replica contract lives in the
+    /// refuses any `replica_url` alongside a `SQLite` primary, so every caller is
+    /// `#[cfg(not(feature = "sqlite"))]` and there is no `SQLite` spelling to
+    /// give. The `SQLite` side of the replica contract lives in the
     /// `create_topology_*_sqlite_replica` tests.
     #[cfg(not(feature = "sqlite"))]
     fn test_replica_url(_primary: &str, name: &str) -> String {

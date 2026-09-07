@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file
+  whose generator template changed since the project was generated (issue
+  #1835). `generate` now records a digest of every file it owns in
+  `.autumn/generated.toml`, and `destroy` accepts a file matching either that
+  digest or the current render. A real edit matches neither and is still
+  refused without `--force`, and the applied-migration guard is unchanged.
+  Commit the manifest — it is the baseline a later checkout compares against.
+  A project generated before the manifest existed keeps the previous
+  behaviour: compare against the current render only, `--force` to override.
+  Each entry also records the inputs that produced it — the command's
+  arguments, a fingerprint of the `autumn.generate.toml` they resolve from, and
+  the resolved database backend — so the digest counts only when all three
+  match. `autumn destroy model Post` after `autumn generate model Post
+  title:String` is still refused; editing the recipe, or moving the project
+  between SQLite and Postgres, drops the baseline rather than trusting it; and
+  files written by `autumn new --starter`, which uses the same machinery, are
+  never a generator's to delete.
+  A side effect of the digest being taken over LF-normalised text: a CRLF
+  checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
+  whether or not a manifest entry backs it.
+
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
   a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
@@ -73,6 +94,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whenever several subsystems open the database at boot, which the durable
   SQLite job runtime above does.
 
+- **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
+  (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
+  its query functions by `diesel::pg::Pg`, which rejects the SQLite
+  `RuntimeConnection`, so the store did not compile on a SQLite app. Every such
+  bound in the generated auth surface (the four session revoke/list functions and
+  the seven remember-me chain functions) is now
+  `::autumn_web::RuntimeBackend` — the alias that resolves to `diesel::pg::Pg` by
+  default and `diesel::sqlite::Sqlite` under the `sqlite` feature — so the
+  scaffolded store compiles and runs on whichever backend the app selected.
+  Postgres behaviour is unchanged; the alias resolves to the same backend it
+  already used. The scaffolded `docs/guide/session-management.md` also emits its
+  operator SQL in the app's own dialect: the stale-row sweep is
+  `datetime('now', '-90 days')` on SQLite (was Postgres-only `NOW() - INTERVAL`),
+  and its retrofit `CREATE TABLE` is now rendered from the same helper as the
+  migration, so the two cannot drift. The scaffolded `docs/guide/oauth.md`
+  documents its `oauth_identities` schema in the app's dialect for the same
+  reason. A new `sqlite_tracked_sessions` test runs the generated store's shape
+  against a real, file-backed SQLite database over a multi-connection pool —
+  login tracking, the revocation gate (including a revoke committed on another
+  connection), the `UNIQUE` digest guard, `last_seen_at` refresh, rotation
+  rebinding, the three revoke paths, the documented retention sweep across both
+  timestamp encodings, and `ON DELETE CASCADE` on account deletion. A
+  `sqlite_test_targets_are_ci_named` hygiene test now fails the build if any
+  `sqlite`-gated `[[test]]` target is missing from the CI job that names them,
+  so a future target cannot ship dark. Guide:
+  `docs/guide/sqlite-in-production.md`.
+- **cli:** dependency advisories and policy reach the dev loop (issue #1633).
+  `autumn doctor` gains a `dependencies` check that grades the app's lockfile
+  against its own `deny.toml` — the same policy file, waiver store, check list
+  and auditor that #1600's CI gate runs, so a local verdict predicts the CI
+  verdict. Two differences remain and are reported rather than hidden: CI pins
+  cargo-deny 0.20.2 while a local run uses whatever is installed, and CI
+  fetches the advisory database every run while doctor reads local data and
+  names its age. Each finding reports its advisory or violation id, severity,
+  crate and title; a waived finding shows as waived and never fails, and a
+  tree with nothing live is exactly one line. Severity is consequence: what the
+  policy denies grades high or critical (CVSS v3 separates the two), what it
+  warns about grades low or medium. `autumn dev` reports only findings the
+  policy **denies** — the ones that turn CI red — so a clean tree, a fully
+  waived tree and a tree with only warn-level findings all add nothing to its
+  output; a critical advisory gets a startup banner. The audit is read after
+  the initial build, so a cold start never waits on it. Neither command
+  fetches: both run `cargo deny --offline`, doctor warns once when the advisory
+  data is over 7 days old, and a missing auditor or database is a **pass** that
+  reads `not evaluated` — never a silent pass, and never a warning that would
+  make `autumn doctor --strict` red on every machine that has not installed an
+  optional tool. `autumn new` now scaffolds `[licenses]`, `[bans]` and
+  `[sources]` into `deny.toml` as commented, quiet defaults, and the generated
+  CI workflow derives its check list from the sections that file declares — in
+  every TOML spelling, by the same rule doctor uses — so uncommenting one
+  widens the local check and the CI gate together. See
+  docs/guide/supply-chain.md.
+- **autumn-macros:** every macro's generated code now resolves the
+  `autumn-web` crate path via [`proc-macro-crate`](https://docs.rs/proc-macro-crate)
+  instead of a hardcoded `::autumn_web` (issue #1828), so a downstream crate
+  that depends on `autumn-web` under a renamed Cargo key (`web = { package =
+  "autumn-web" }`) can use `#[get]`, `#[model]`, `#[repository]` and every
+  other Autumn macro with no changes. For the rarer case of hosting two
+  differently-keyed `autumn-web` versions in one crate at once (e.g.
+  mid-upgrade), where automatic detection is ambiguous, every attribute macro
+  additionally accepts an explicit `crate = "..."` override, e.g.
+  `#[get("/x", crate = "autumn_web_05")]`.
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
   `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
@@ -2025,6 +2108,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
+  post's slug and make its permalink silently serve a different post (issue
+  #2544):** `unique_slug()`/`unique_slug_excluding()` proved uniqueness with a
+  `SELECT COUNT` before the `INSERT`/`UPDATE` that relied on it — a
+  check-then-act race two concurrent submits (a double-click, or a
+  flaky-network auto-retry) could both win, landing two posts on the same
+  `(subreddit_id, slug)`. Nothing at the database level backed that
+  invariant (`posts.slug` had only a plain, non-unique index, unlike
+  `subreddits.slug`/`users.username`), so once duplicated, `show()`'s
+  unordered `.filter(slug...).filter(subreddit_id...).first()` returned an
+  arbitrary one of the two forever — the other post's own permalink now
+  silently served someone else's title, body, and comments with a `200` and
+  no error. Fixed with a composite `UNIQUE (subreddit_id, slug)` constraint
+  (migration `20260906163932_posts_slug_unique_per_subreddit`) plus a retry
+  loop in `submit`/`update`: the existing `SELECT`-based guess stays as a
+  fast path, but a losing insert/update now comes back as a unique-violation
+  on that named constraint, which the loser catches and retries with the
+  next candidate slug instead of colliding with the winner. Regression-tested
+  by driving the real compiled binary with 10 fully concurrent, identical
+  `/submit` requests and asserting no duplicate `(subreddit_id, slug)` pair
+  survives (`tests/post_slug_race_e2e.rs`).
+
+- **`#[query_budget]` silently missed queries issued through a handle bound
+  via an async/fallible accessor (e.g. `let mut conn = self.conn().await?;`),
+  a real shape in `PostgresSearchStore::write_documents`:** neither
+  `Analyzer::expr_is_handle` nor `chain_root_is_handle` peeled
+  `Expr::Await`/`Expr::Try` before checking whether a call was one of the
+  recognized handle accessors (`db`, `repo`, `repository`, `pool`, `conn`,
+  `connection`), so `conn` never entered the tracked-handle set and every
+  later query issued through it (e.g. a diesel-async
+  `query.execute(&mut conn)` inside a loop) went uncounted with **no
+  diagnostic at all** — worse than the analysis's own "never assume
+  query-free" contract, which is meant to *report* what it cannot prove, not
+  silently drop it. `expr_is_handle` now recognizes `self.conn().await?`
+  through a new, deliberately narrower `awaited_expr_is_fresh_handle` helper
+  that only fires on the `?`-unwrapped shape — a bare `self.conn().await`
+  (no `?`) still yields the `Result` itself, not the handle, and is not
+  promoted, so a later `result.is_err()`/`.unwrap()` is not miscounted as a
+  query. [no-plugin] — analysis-only fix inside `autumn-macros`; no API
+  change.
 - **macros: stacked `#[secured]`/`#[step_up]`/`#[throttle]` above a route
   attribute broke instead of composing (issue #2516):** #1668 moved each of
   these three body guards' checks out of the handler body and into a
@@ -2306,7 +2429,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[public]` to all three handlers, matching the pattern documented right
   above them in the template. [no-plugin] — restores previously-documented
   behavior; no new or changed API.
-
 - **`route_macro` lost a guarded handler's OpenAPI response schema under
   `#[throttle]`/`#[step_up]` (issue #2516):** #2488 moved the
   `#[throttle]`/`#[step_up]` auth/rate-limit checks out of the handler body
@@ -2394,7 +2516,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern doesn't, plus the mirror-image ordering where a lock that
   genuinely wins the race correctly rejects the concurrent login instead of
   silently granting a session.
-
 - **🧭 Wayfinder: keyboard bypass-blocks link added to 6 supported example
   apps (a11y `bypass` Serious 7/8 → 0/8; `landmark-one-main` Moderate 1/8 → 0/8):**
   `autumn check --a11y` — the framework's own WCAG audit, run against each
@@ -3801,6 +3922,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as "applied"). Measured against a 50,000-row fixture with a 2,050-id bulk
   action: revoke statement calls 2,050 → 1. See
   `docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`.
+
+- **`FeatureFlagAdminModel`'s admin panel bulk "delete" action now issues
+  one `DELETE` CTE instead of one per selected flag:** it never overrode
+  `AdminModel::execute_action`'s trait default, so it inherited the same
+  per-id loop the `TokenAdminModel` fix above closed — a full connection
+  checkout plus a single-row `DELETE ... WHERE id = $1 RETURNING key`
+  (feeding the `feature_flag_changes` audit insert) per id. It now
+  overrides `execute_action` for `"delete"` to batch every id into one
+  `WHERE id = ANY($1)` round trip; the returned count, final row state,
+  and audit trail are unchanged (an already-deleted or nonexistent id is
+  still a silent no-op, still counted as "applied"). Measured against a
+  4,000-row fixture with an 820-id bulk action: delete-CTE statement
+  calls 820 → 1, buffers 9,639 → 6,977 (-27.6%). See
+  `docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`.
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
