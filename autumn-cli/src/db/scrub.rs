@@ -3386,11 +3386,17 @@ fn probe_database_facts(
     .into_iter()
     .collect();
 
+    // `tgenabled` matters as much as `tgisinternal`: a trigger disabled with
+    // `ALTER TABLE ... DISABLE TRIGGER` stays in the catalog but cannot fire, and
+    // disabling it is exactly what this warning (and the refusal below) tells
+    // operators to do. `O` fires for an ordinary session and `A` fires always;
+    // `D` never fires and `R` only under `session_replication_role = replica`,
+    // which a scrub does not set.
     let triggered_tables = names(
         "SELECT DISTINCT rel.relname AS name FROM pg_trigger t \
          JOIN pg_class rel ON rel.oid = t.tgrelid \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE NOT t.tgisinternal",
+         WHERE NOT t.tgisinternal AND t.tgenabled IN ('O', 'A')",
         &mut conn,
     )?
     .into_iter()
@@ -3400,11 +3406,26 @@ fn probe_database_facts(
     // event. These are the ones that matter for the run's last write, so the
     // refusal can name exactly the tables that carry one rather than every
     // table carrying any trigger at all.
+    //
+    // Walked UP `pg_inherits`, because the emptying statement names the parent:
+    // `DELETE FROM parent` fires a row-level trigger declared directly on a leaf
+    // partition (or on a legacy `INHERITS` child), so a trigger anywhere below a
+    // table has to mark that table. Descendants need no walk of their own — a
+    // trigger on a partitioned parent is cloned onto its partitions, and the
+    // parent is already named here.
     let delete_triggered_tables = names(
-        "SELECT DISTINCT rel.relname AS name FROM pg_trigger t \
-         JOIN pg_class rel ON rel.oid = t.tgrelid \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE NOT t.tgisinternal AND (t.tgtype & 8) <> 0",
+        "WITH RECURSIVE fires AS ( \
+           SELECT t.tgrelid AS oid FROM pg_trigger t \
+           WHERE NOT t.tgisinternal AND (t.tgtype & 8) <> 0 \
+           AND t.tgenabled IN ('O', 'A') \
+         ), ancestry AS ( \
+           SELECT oid FROM fires \
+           UNION \
+           SELECT i.inhparent FROM pg_inherits i JOIN ancestry a ON a.oid = i.inhrelid \
+         ) \
+         SELECT DISTINCT rel.relname AS name FROM ancestry a \
+         JOIN pg_class rel ON rel.oid = a.oid \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public'",
         &mut conn,
     )?
     .into_iter()

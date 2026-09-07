@@ -362,7 +362,11 @@ values into a table the run reports as clean, and into any `--output` artifact.
 No ordering avoids it (the trigger graph decides, and can be cyclic) and no
 postcondition catches it (a trigger body can write anywhere), so a `DELETE`
 trigger on a table the run empties is refused before anything is written, by
-`--check` and `--dry-run` too. Drop or disable the trigger on the copy.
+`--check` and `--dry-run` too. Drop or disable the trigger on the copy
+(`ALTER TABLE audit_logs DISABLE TRIGGER audit_archive`) and the run proceeds —
+a disabled trigger cannot fire, so it does not hold the refusal. The check
+follows `pg_inherits` down, too: `DELETE FROM parent` fires a trigger declared
+on a leaf partition, so a trigger anywhere below an emptied table refuses it.
 
 After that pass, every promised-empty table is **counted**, and a run that finds
 rows in one aborts. Ordering the removals cannot rule this out: each `DELETE`

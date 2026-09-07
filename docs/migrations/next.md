@@ -472,8 +472,10 @@ anything, `--check` and `--dry-run` included:
 ```
 
 **Who is affected.** Only a target whose purged or `never_include` tables carry
-a user-defined `DELETE` trigger. `INSERT`/`UPDATE`-only triggers are unaffected
-and still merely warn, and a target with no such triggers behaves exactly as
+a user-defined `DELETE` trigger that can fire — including one declared on a leaf
+partition of such a table, since `DELETE FROM parent` fires it.
+`INSERT`/`UPDATE`-only triggers are unaffected and still merely warn, a disabled
+trigger does not count, and a target with no such triggers behaves exactly as
 before. This reaches an unsampled `autumn db scrub` too, wherever
 `[framework] purge` names a table with one.
 

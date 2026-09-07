@@ -1504,6 +1504,154 @@ async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
     );
 }
 
+/// The refusal follows `pg_inherits` down: `DELETE FROM parent` fires a trigger
+/// declared on a leaf partition, so a trigger anywhere below an emptied table
+/// has to mark it.
+///
+/// Without the walk the check compares names only, sees no trigger on the
+/// partitioned parent, and lets the run through — which commits the leak, since
+/// a trigger that spills sideways into a classified table refills nothing and
+/// so passes the promised-empty re-count.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_delete_trigger_on_a_leaf_partition_of_an_emptied_table_is_refused() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "leaf_partition_trigger").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL NOT NULL, \
+                shard INT NOT NULL, \
+                args TEXT NOT NULL \
+            ) PARTITION BY RANGE (shard); \
+            CREATE TABLE autumn_jobs_p0 PARTITION OF autumn_jobs \
+                FOR VALUES FROM (0) TO (10); \
+            CREATE FUNCTION refill_jobs() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO autumn_jobs (shard, args) VALUES (1, OLD.email); \
+                RETURN NEW; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER users_refill BEFORE UPDATE ON users \
+                FOR EACH ROW EXECUTE FUNCTION refill_jobs(); \
+            CREATE FUNCTION spill_leaf() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO comments (user_id, body) \
+                    SELECT id, OLD.args FROM users LIMIT 1; \
+                RETURN OLD; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER leaf_spill AFTER DELETE ON autumn_jobs_p0 \
+                FOR EACH ROW EXECUTE FUNCTION spill_leaf();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/leaf_partition_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    // Unsampled: the leak reaches an ordinary scrub through `[framework] purge`,
+    // and the partitioned parent is what the emptying statement names.
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub"], &envs);
+    assert!(
+        stderr.contains("autumn_jobs") && stderr.contains("DELETE"),
+        "the refusal must name the PARENT the statement empties: {stderr}"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM comments WHERE body LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "and nothing may have spilled into the classified table"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
+        )
+        .await,
+        200,
+        "a refusal before any write leaves the source untouched"
+    );
+}
+
+/// Disabling the trigger has to actually work — the refusal says to do it.
+///
+/// `ALTER TABLE ... DISABLE TRIGGER` leaves the row in `pg_trigger` with
+/// `tgenabled = 'D'`, so a catalog query that ignores that column keeps
+/// refusing and the documented remedy does nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn disabling_the_delete_trigger_lifts_the_refusal() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "disabled_trigger").await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION spill_audit() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO comments (user_id, body) \
+                    SELECT id, OLD.actor_email FROM users LIMIT 1; \
+                RETURN OLD; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER audit_spill AFTER DELETE ON audit_logs \
+                FOR EACH ROW EXECUTE FUNCTION spill_audit();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/disabled_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    client
+        .batch_execute("ALTER TABLE audit_logs DISABLE TRIGGER audit_spill")
+        .await
+        .unwrap();
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "the never_include table must still be emptied"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users WHERE email LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "and the PII must still be scrubbed"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM comments WHERE body LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "with nothing spilled by the trigger that can no longer fire"
+    );
+}
+
 /// A `DELETE` trigger on a table the run empties is refused before any write.
 ///
 /// The emptying pass has to run LAST — that is what makes "this table ends up
