@@ -11329,14 +11329,21 @@ mod tests {
     /// at boot against its own configured database with: "Failed to create
     /// database pool: `SQLite` is a recognized database backend but its runtime
     /// pool is only available in a build of autumn-web compiled with
-    /// `--features sqlite`; this is a default (Postgres) build". Manually
-    /// adding `features = ["sqlite"]` avoids that crash but still leaves an
-    /// unnecessary `pq-sys` (bundled libpq, requiring a C toolchain) in a
-    /// project that can never reach a Postgres server — the opposite of the
-    /// "zero-ops... no database server to install" pitch in
-    /// `docs/guide/sqlite-in-production.md`, whose support matrix explicitly
-    /// claims `generate auth` "compiles and runs on either backend" / "on
-    /// whichever backend the app selected".
+    /// `--features sqlite`; this is a default (Postgres) build".
+    ///
+    /// The assertions below check the generated app's own `Cargo.toml` for
+    /// *redundant* direct declarations only (a fix here cannot, by itself,
+    /// give a `SQLite` app a Postgres-free build): `autumn-web`'s own `sqlite`
+    /// feature keeps `pq-sys`/`diesel/postgres` in the resolved dependency
+    /// graph regardless of anything this generator writes, via `db`'s own
+    /// unconditional Postgres deps (`cargo tree -p autumn-web
+    /// --no-default-features --features sqlite -i pq-sys` still shows
+    /// `pq-sys` as a direct dependency of `autumn-web` itself) — tracked
+    /// separately as issue #2605, caught in review on this same PR (#2604).
+    /// What this test *does* guard: the CLI should not make that already-bad
+    /// situation worse by also hard-coding a duplicate, equally-unnecessary
+    /// `pq-sys`/`diesel-postgres`/`diesel-async-postgres` declaration directly
+    /// into the generated app's own manifest.
     ///
     /// Quarantined until `MODEL_DEPS` (shared with `generate model` /
     /// `generate scaffold`) is made backend-aware the same way DDL rendering
@@ -11413,10 +11420,15 @@ mod tests {
              backend: {diesel_async_line}"
         );
 
+        // `autumn-web`'s own `sqlite` feature keeps `pq-sys` in the resolved
+        // dependency graph regardless of the generated app's own manifest
+        // (issue #2605) — this only guards against the CLI adding a second,
+        // equally-unnecessary *direct* declaration on top of that.
         assert!(
             !cargo_toml.contains("pq-sys"),
-            "a SQLite-only app should never need `pq-sys` (bundled libpq) — it \
-             can never reach a Postgres server: {cargo_toml}"
+            "a SQLite-only app's own Cargo.toml should not hard-code a \
+             redundant, unnecessary direct `pq-sys` (bundled libpq) \
+             dependency — it can never reach a Postgres server: {cargo_toml}"
         );
     }
 
