@@ -302,7 +302,7 @@ pub fn quote_ident(ident: &str) -> String {
 /// never an `M`. Both therefore build their statements from this view, so one
 /// set of builders serves both and the two can never emit different SQL.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SqlView {
+pub struct SqlView {
     pub child_table: &'static str,
     pub child_pk: &'static str,
     pub child_soft_delete: bool,
@@ -331,7 +331,7 @@ impl SqlView {
     }
 }
 
-fn view<M: 'static>(spec: &CounterCacheSpec<M>) -> SqlView {
+const fn view<M: 'static>(spec: &CounterCacheSpec<M>) -> SqlView {
     SqlView {
         child_table: spec.child_table,
         child_pk: spec.child_pk,
@@ -412,13 +412,18 @@ fn aggregate_expr(view: &SqlView, alias: &str) -> String {
 ///
 /// The `1 = 1` seed absorbs `filter_sql`'s leading ` AND `, which every other
 /// caller concatenates onto a predicate it already has.
+///
+/// The `CAST` is not cosmetic: this value is *decoded* into an `i64`, and a bare
+/// integer literal is `integer` on Postgres, so the driver would refuse the
+/// four bytes it got where it expected eight. Casting also normalises a legacy
+/// 32-bit summed column to the width the maintained value is read at.
 fn contrib_case_expr(view: &SqlView, alias: &str) -> String {
     let contrib = contrib_expr(view, alias);
     if view.filter_sql.is_empty() {
-        return contrib;
+        return format!("CAST({contrib} AS BIGINT)");
     }
     let filter = filter_predicate(view, alias);
-    format!("CASE WHEN 1 = 1{filter} THEN {contrib} ELSE 0 END")
+    format!("CAST(CASE WHEN 1 = 1{filter} THEN {contrib} ELSE 0 END AS BIGINT)")
 }
 
 /// `AND <parent>.<tenant> = __autumn_cc_child.<tenant>`, for the statements that
@@ -745,6 +750,18 @@ pub async fn counter_cache_after_insert_many<M: Send + Sync + 'static>(
 /// One parent row a mutation will move: `(spec index, parent id, delta,
 /// witness child id)`.
 type Contribution = (usize, i64, i64, i64);
+
+/// One leg's pre-mutation `(parent id, contribution)` for a child row.
+///
+/// `None` when the row contributes to no parent at all: it does not exist, its
+/// foreign key is NULL, or it is soft-deleted. A row the derivation's filter
+/// rejects is `Some((parent, 0))` — it *has* a parent, and it weighs nothing,
+/// which is what makes a filter flip on an unchanged parent visible as a delta.
+pub type CapturedContribution = Option<(i64, i64)>;
+
+/// Every leg's [`CapturedContribution`] for a batch of children, keyed by child
+/// primary key and sorted by it, as the bulk update paths consume it.
+pub type CapturedContributions = Vec<(i64, Vec<CapturedContribution>)>;
 
 /// Apply every contribution in the lock order all counter-cached mutations
 /// agree on: `(parent_table, parent_id)`.
@@ -1099,7 +1116,7 @@ pub async fn counter_cache_capture_fks<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
-) -> AutumnResult<Vec<Option<(i64, i64)>>> {
+) -> AutumnResult<Vec<CapturedContribution>> {
     if specs.is_empty() {
         return Ok(Vec::new());
     }
@@ -1161,7 +1178,7 @@ pub async fn counter_cache_capture_fks<M: 'static>(
 pub async fn counter_cache_after_update<M: Send + Sync + 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
-    before: &[Option<(i64, i64)>],
+    before: &[CapturedContribution],
     record: &M,
 ) -> AutumnResult<()> {
     let mut moves: Vec<Contribution> = Vec::with_capacity(specs.len() * 2);
@@ -1183,7 +1200,7 @@ pub async fn counter_cache_after_update<M: Send + Sync + 'static>(
 /// A soft-deleted child is counted by nobody, so neither its old nor its new
 /// parent may move. The generated `update` does not filter soft-deleted rows, so
 /// this is reachable.
-fn contribution_of<M: 'static>(spec: &CounterCacheSpec<M>, record: &M) -> Option<(i64, i64)> {
+fn contribution_of<M: 'static>(spec: &CounterCacheSpec<M>, record: &M) -> CapturedContribution {
     if !(spec.live_of)(record) {
         return None;
     }
@@ -1198,8 +1215,8 @@ fn contribution_of<M: 'static>(spec: &CounterCacheSpec<M>, record: &M) -> Option
 /// skipped when it is 0, so a row the filter rejects never touches a parent row.
 fn push_diff(
     index: usize,
-    old: Option<(i64, i64)>,
-    new: Option<(i64, i64)>,
+    old: CapturedContribution,
+    new: CapturedContribution,
     witness: i64,
     out: &mut Vec<Contribution>,
 ) {
@@ -1241,12 +1258,12 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
     child_ids: &[i64],
-) -> AutumnResult<Vec<(i64, Vec<Option<(i64, i64)>>)>> {
+) -> AutumnResult<CapturedContributions> {
     if specs.is_empty() || child_ids.is_empty() {
         return Ok(Vec::new());
     }
     let id_list = id_list(child_ids);
-    let mut by_child: HashMap<i64, Vec<Option<(i64, i64)>>> = HashMap::new();
+    let mut by_child: HashMap<i64, Vec<CapturedContribution>> = HashMap::new();
     for (index, spec) in specs.iter().enumerate() {
         let view = view(spec);
         debug_assert_spec_idents(&view);
@@ -1297,7 +1314,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
             entry[index] = row.fk_value.map(|fk| (fk, row.contrib_value));
         }
     }
-    let mut out: Vec<(i64, Vec<Option<(i64, i64)>>)> = by_child.into_iter().collect();
+    let mut out: CapturedContributions = by_child.into_iter().collect();
     out.sort_unstable_by_key(|(id, _)| *id);
     Ok(out)
 }
@@ -1316,7 +1333,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
 pub async fn counter_cache_after_update_many<M: Send + Sync + 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
-    before: &[(i64, Vec<Option<(i64, i64)>>)],
+    before: &[(i64, Vec<CapturedContribution>)],
     records: &[M],
 ) -> AutumnResult<()> {
     if specs.is_empty() {
@@ -1393,7 +1410,7 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
     // parent". Recording one would make the post-upsert side — which now checks
     // `live_of` and yields `None` for a row that stays deleted — decrement a
     // parent that had already dropped it.
-    let before: HashMap<i64, Vec<Option<(i64, i64)>>> = existing
+    let before: HashMap<i64, Vec<CapturedContribution>> = existing
         .iter()
         .map(|row| {
             (
@@ -1453,7 +1470,7 @@ const RECOMPUTE_BATCH: i64 = 1_000;
 /// delta skips a cross-tenant child and a filtered-out row, so a repair that
 /// counted either would undo the isolation — or the filter — on the very next
 /// sweep.
-pub(crate) fn ground_truth_sql(view: &SqlView) -> String {
+pub fn ground_truth_sql(view: &SqlView) -> String {
     let Quoted {
         child_table,
         fk_column,
@@ -1472,7 +1489,7 @@ pub(crate) fn ground_truth_sql(view: &SqlView) -> String {
 }
 
 /// The `UPDATE` that rebuilds `ids`' maintained values from the source of truth.
-pub(crate) fn recompute_update_sql(view: &SqlView, ids: &str) -> String {
+pub fn recompute_update_sql(view: &SqlView, ids: &str) -> String {
     let Quoted {
         parent_table,
         parent_pk,
@@ -1496,7 +1513,7 @@ pub(crate) fn recompute_update_sql(view: &SqlView, ids: &str) -> String {
 /// One aggregate statement over the parent table, so it is a single round trip
 /// per derivation — but it is a full scan, which is why it is reported by an
 /// operator endpoint rather than measured on the request path.
-pub(crate) fn drift_sql(view: &SqlView) -> String {
+pub fn drift_sql(view: &SqlView) -> String {
     let Quoted {
         parent_table,
         counter_column,
@@ -1553,7 +1570,7 @@ async fn recompute_batch(
 /// and its checkpoint **together**: it opens one transaction and runs this plus
 /// the checkpoint write inside it. A checkpoint committed separately from the
 /// batch it describes would double-apply or skip a batch after a crash.
-pub(crate) async fn recompute_batch_statements(
+pub async fn recompute_batch_statements(
     conn: &mut RuntimeConnection,
     view: &SqlView,
     ids: &[i64],
@@ -1585,7 +1602,7 @@ pub(crate) async fn recompute_batch_statements(
 /// enumerating. A parent inserted after its page was read is simply not in this
 /// sweep, which is harmless: it starts at the column default and its children
 /// are counted by the delta paths.
-pub(crate) async fn parent_id_page(
+pub async fn parent_id_page(
     conn: &mut RuntimeConnection,
     view: &SqlView,
     cursor: Option<i64>,
@@ -1613,7 +1630,7 @@ pub(crate) async fn parent_id_page(
 ///
 /// The non-generic core of [`counter_cache_recompute`], so the derivation
 /// repair path ([`crate::derivation::recompute`]) runs exactly the same sweep.
-pub(crate) async fn recompute_view(
+pub async fn recompute_view(
     conn: &mut RuntimeConnection,
     view: &SqlView,
     parent_id: Option<i64>,
@@ -1975,7 +1992,8 @@ mod tests {
         // unchanged parent is visible as `0 -> 1`.
         assert_eq!(
             contrib_case_expr(&filtered, CHILD_ALIAS),
-            "CASE WHEN 1 = 1 AND (__autumn_cc_child.\"published\" = TRUE) THEN 1 ELSE 0 END"
+            "CAST(CASE WHEN 1 = 1 AND (__autumn_cc_child.\"published\" = TRUE) \
+             THEN 1 ELSE 0 END AS BIGINT)"
         );
     }
 

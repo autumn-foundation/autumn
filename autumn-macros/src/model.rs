@@ -2195,6 +2195,7 @@ fn emit_counter_caches_impl(
             /// Registered definition of one `#[derivation]` on this model
             /// (#1769): framework plumbing, not a public API.
             #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
             pub static #def_ident: ::autumn_web::derivation::DerivationDef =
                 ::autumn_web::derivation::DerivationDef {
                     name: #name,

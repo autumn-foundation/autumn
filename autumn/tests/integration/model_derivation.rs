@@ -101,9 +101,7 @@ pub struct DvComment {
     #[id]
     pub id: i64,
     pub post_id: i64,
-    #[default]
     pub published: bool,
-    #[default]
     pub score: i64,
 }
 
@@ -147,7 +145,6 @@ pub struct DvCappedComment {
     #[id]
     pub id: i64,
     pub post_id: i64,
-    #[default]
     pub published: bool,
 }
 
@@ -194,7 +191,6 @@ pub struct DvRevision {
     #[id]
     pub id: i64,
     pub page_id: i64,
-    #[default]
     pub published: bool,
     #[default]
     pub deleted_at: Option<chrono::NaiveDateTime>,
@@ -289,12 +285,7 @@ async fn setup() -> (
     let guard = DB_LOCK.lock().await;
     let (handle, pool) = start_postgres().await;
     let mut conn = pool.get().await.expect("conn");
-    for stmt in DDL {
-        diesel::sql_query(*stmt)
-            .execute(&mut conn)
-            .await
-            .unwrap_or_else(|e| panic!("DDL failed ({stmt}): {e}"));
-    }
+    create_schema(&mut conn).await;
     conn.batch_execute(DERIVATIONS_DDL)
         .await
         .expect("derivation state table DDL");
@@ -392,6 +383,37 @@ async fn post_snapshot(conn: &mut AsyncPgConnection, post_id: i64) -> SnapshotRo
     .get_result::<SnapshotRow>(conn)
     .await
     .expect("read post snapshot")
+}
+
+/// Create the fixture schema, if it is not there already.
+async fn create_schema(conn: &mut AsyncPgConnection) {
+    for stmt in DDL {
+        diesel::sql_query(*stmt)
+            .execute(conn)
+            .await
+            .unwrap_or_else(|e| panic!("DDL failed ({stmt}): {e}"));
+    }
+}
+
+/// Replace `dv_posts` with `total` rows that already carry derived values.
+///
+/// The derived columns are seeded directly: this measures the *read* cost of a
+/// maintained derivation, so how the values got there is beside the point.
+async fn reseed_posts_with_derived_values(conn: &mut AsyncPgConnection, total: usize) {
+    diesel::sql_query("TRUNCATE dv_comments, dv_posts RESTART IDENTITY CASCADE")
+        .execute(conn)
+        .await
+        .expect("reset");
+    for i in 0..total {
+        diesel::sql_query(
+            "INSERT INTO dv_posts (title, published_comment_count, visible_score) \
+             VALUES ($1, 2, 5)",
+        )
+        .bind::<Text, _>(format!("p{i}"))
+        .execute(conn)
+        .await
+        .expect("seed post");
+    }
 }
 
 fn def(name: &str) -> &'static DerivationDef {
@@ -559,15 +581,26 @@ async fn ac1_a_filtered_count_and_sum_ignore_rows_the_filter_rejects() {
     }
 
     let snap = post_snapshot(&mut conn, post).await;
-    assert_eq!(snap.persisted_count, 3, "the unpublished comment is invisible");
+    assert_eq!(
+        snap.persisted_count, 3,
+        "the unpublished comment is invisible"
+    );
     assert_eq!(snap.persisted_count, snap.truth_count);
     assert_eq!(
         snap.persisted_sum, 12,
         "only published, positively-scored comments are summed"
     );
     assert_eq!(snap.persisted_sum, snap.truth_sum);
-    assert_eq!(drift(&mut conn, def(COUNT_DERIVATION)).await.expect("drift"), 0);
-    assert_eq!(drift(&mut conn, def(SUM_DERIVATION)).await.expect("drift"), 0);
+    assert_eq!(
+        drift(&mut conn, def(COUNT_DERIVATION))
+            .await
+            .expect("drift"),
+        0
+    );
+    assert_eq!(
+        drift(&mut conn, def(SUM_DERIVATION)).await.expect("drift"),
+        0
+    );
 }
 
 /// `save_many` folds a batch into one statement per parent and still honours
@@ -819,8 +852,16 @@ async fn ac3_concurrent_inserts_yield_exactly_n_with_zero_drift() {
     assert_eq!(snap.persisted_count, snap.truth_count);
     assert_eq!(snap.persisted_sum, expected);
     assert_eq!(snap.persisted_sum, snap.truth_sum);
-    assert_eq!(drift(&mut conn, def(COUNT_DERIVATION)).await.expect("drift"), 0);
-    assert_eq!(drift(&mut conn, def(SUM_DERIVATION)).await.expect("drift"), 0);
+    assert_eq!(
+        drift(&mut conn, def(COUNT_DERIVATION))
+            .await
+            .expect("drift"),
+        0
+    );
+    assert_eq!(
+        drift(&mut conn, def(SUM_DERIVATION)).await.expect("drift"),
+        0
+    );
 }
 
 // ── AC4: updates move exactly what changed ─────────────────────────────────
@@ -1017,7 +1058,10 @@ async fn ac4_deleting_an_unqualified_row_moves_nothing() {
 
     repo.delete_by_id(draft.id).await.expect("delete the draft");
     let after_single = post_snapshot(&mut conn, post).await;
-    assert_eq!((after_single.persisted_count, after_single.persisted_sum), (1, 5));
+    assert_eq!(
+        (after_single.persisted_count, after_single.persisted_sum),
+        (1, 5)
+    );
 
     // The bulk path computes its delta with one aggregate, so it has to filter
     // too — otherwise a batch of drafts would drive the value negative.
@@ -1025,7 +1069,10 @@ async fn ac4_deleting_an_unqualified_row_moves_nothing() {
         .await
         .expect("delete_many the drafts");
     let after_bulk = post_snapshot(&mut conn, post).await;
-    assert_eq!((after_bulk.persisted_count, after_bulk.persisted_sum), (1, 5));
+    assert_eq!(
+        (after_bulk.persisted_count, after_bulk.persisted_sum),
+        (1, 5)
+    );
     assert_eq!(after_bulk.persisted_count, after_bulk.truth_count);
     assert_eq!(after_bulk.persisted_sum, after_bulk.truth_sum);
 
@@ -1100,13 +1147,11 @@ async fn ac5_only_the_changed_derivation_is_enqueued() {
     );
 
     // Now one definition changes under us: the recorded hash is stale.
-    diesel::sql_query(
-        "UPDATE _autumn_derivations SET definition_hash = 'stale' WHERE name = $1",
-    )
-    .bind::<Text, _>(COUNT_DERIVATION)
-    .execute(&mut conn)
-    .await
-    .expect("stale the stored hash");
+    diesel::sql_query("UPDATE _autumn_derivations SET definition_hash = 'stale' WHERE name = $1")
+        .bind::<Text, _>(COUNT_DERIVATION)
+        .execute(&mut conn)
+        .await
+        .expect("stale the stored hash");
 
     let enqueued = ensure_derivations(&mut conn).await.expect("reconcile");
     assert_eq!(
@@ -1135,7 +1180,10 @@ async fn ac5_only_the_changed_derivation_is_enqueued() {
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)
         .expect("the changed derivation is reported");
-    assert_eq!(entry.stored_hash.as_deref(), Some(entry.definition_hash.as_str()));
+    assert_eq!(
+        entry.stored_hash.as_deref(),
+        Some(entry.definition_hash.as_str())
+    );
 }
 
 // ── AC6: resumable backfill ────────────────────────────────────────────────
@@ -1174,7 +1222,9 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
     .await
     .expect("enqueue the count");
     assert_eq!(
-        drift(&mut conn, def(COUNT_DERIVATION)).await.expect("drift"),
+        drift(&mut conn, def(COUNT_DERIVATION))
+            .await
+            .expect("drift"),
         5,
         "every parent starts drifted"
     );
@@ -1240,7 +1290,9 @@ async fn ac6_a_killed_backfill_resumes_from_its_checkpoint() {
         );
     }
     assert_eq!(
-        drift(&mut conn, def(COUNT_DERIVATION)).await.expect("drift"),
+        drift(&mut conn, def(COUNT_DERIVATION))
+            .await
+            .expect("drift"),
         0
     );
 
@@ -1264,13 +1316,11 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
     mark_all_complete(&mut conn).await;
 
     let post = seed_post(&mut conn, "drifted").await;
-    diesel::sql_query(
-        "INSERT INTO dv_comments (post_id, published, score) VALUES ($1, TRUE, 7)",
-    )
-    .bind::<BigInt, _>(post)
-    .execute(&mut conn)
-    .await
-    .expect("legacy comment");
+    diesel::sql_query("INSERT INTO dv_comments (post_id, published, score) VALUES ($1, TRUE, 7)")
+        .bind::<BigInt, _>(post)
+        .execute(&mut conn)
+        .await
+        .expect("legacy comment");
     diesel::sql_query("UPDATE dv_posts SET published_comment_count = 99 WHERE id = $1")
         .bind::<BigInt, _>(post)
         .execute(&mut conn)
@@ -1282,11 +1332,20 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)
         .expect("the count is reported");
-    assert_eq!(count.stored_hash.as_deref(), Some(count.definition_hash.as_str()));
+    assert_eq!(
+        count.stored_hash.as_deref(),
+        Some(count.definition_hash.as_str())
+    );
     assert_eq!(count.backfill_state, Some(BackfillState::Complete));
     assert_eq!(count.checkpoint, None);
-    assert!(count.updated_at.is_some(), "the row records when it changed");
-    assert_eq!(count.drift, 1, "one parent disagrees with the source of truth");
+    assert!(
+        count.updated_at.is_some(),
+        "the row records when it changed"
+    );
+    assert_eq!(
+        count.drift, 1,
+        "one parent disagrees with the source of truth"
+    );
     let sum = drifted
         .iter()
         .find(|entry| entry.name == SUM_DERIVATION)
@@ -1294,22 +1353,32 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
     assert_eq!(sum.drift, 1, "the sum never saw the legacy comment either");
 
     assert_eq!(
-        recompute(&mut conn, COUNT_DERIVATION).await.expect("recompute"),
+        recompute(&mut conn, COUNT_DERIVATION)
+            .await
+            .expect("recompute"),
         1,
         "one parent is repaired"
     );
     assert_eq!(
-        recompute(&mut conn, SUM_DERIVATION).await.expect("recompute"),
+        recompute(&mut conn, SUM_DERIVATION)
+            .await
+            .expect("recompute"),
         1
     );
     assert_eq!(
         derived(&mut conn, "dv_posts", "published_comment_count", post).await,
         1
     );
-    assert_eq!(derived(&mut conn, "dv_posts", "visible_score", post).await, 7);
+    assert_eq!(
+        derived(&mut conn, "dv_posts", "visible_score", post).await,
+        7
+    );
 
     for entry in derivation_status(&mut conn).await.expect("status") {
-        assert_eq!(entry.drift, 0, "no derivation may drift after a recompute: {entry:?}");
+        assert_eq!(
+            entry.drift, 0,
+            "no derivation may drift after a recompute: {entry:?}"
+        );
     }
 
     // Idempotent: a healthy derivation is repaired zero times and written not
@@ -1333,23 +1402,27 @@ async fn ac7_status_reports_state_and_recompute_clears_the_drift() {
 mod query_count {
     use autumn_web::prelude::*;
     use autumn_web::test::TestApp;
-    use diesel::prelude::*;
+    // `diesel::QueryDsl` only — `diesel::prelude::*` would also bring the
+    // *synchronous* `RunQueryDsl` into scope and make `load` ambiguous.
+    use diesel::QueryDsl as _;
     use diesel_async::RunQueryDsl as _;
 
-    use super::{DB_LOCK, DDL, dv_posts, start_postgres};
+    use super::{
+        DB_LOCK, create_schema, dv_posts, reseed_posts_with_derived_values, start_postgres,
+    };
 
     /// One `SELECT` over the parent table, derived columns included — no join
     /// to the child table and no per-row query.
     #[get("/dv-posts")]
     async fn list_dv_posts(mut db: Db) -> AutumnResult<Json<Vec<(i64, i64, i64)>>> {
-        let rows = dv_posts::table
+        let rows: Vec<(i64, i64, i64)> = dv_posts::table
             .select((
                 dv_posts::id,
                 dv_posts::published_comment_count,
                 dv_posts::visible_score,
             ))
             .order(dv_posts::id)
-            .load::<(i64, i64, i64)>(&mut *db)
+            .load(&mut *db)
             .await?;
         Ok(Json(rows))
     }
@@ -1359,19 +1432,7 @@ mod query_count {
     async fn ac8_listing_parents_with_derived_columns_is_one_query() {
         let _guard = DB_LOCK.lock().await;
         let (_pg, pool) = start_postgres().await;
-        {
-            let mut conn = pool.get().await.expect("conn");
-            for stmt in DDL {
-                diesel::sql_query(*stmt)
-                    .execute(&mut conn)
-                    .await
-                    .unwrap_or_else(|e| panic!("DDL failed ({stmt}): {e}"));
-            }
-            diesel::sql_query("TRUNCATE dv_comments, dv_posts RESTART IDENTITY CASCADE")
-                .execute(&mut conn)
-                .await
-                .expect("reset");
-        }
+        create_schema(&mut pool.get().await.expect("conn")).await;
 
         let client = TestApp::new()
             .routes(routes![list_dv_posts])
@@ -1379,23 +1440,7 @@ mod query_count {
             .build();
 
         for total in [1usize, 40usize] {
-            {
-                let mut conn = pool.get().await.expect("conn");
-                diesel::sql_query("TRUNCATE dv_comments, dv_posts RESTART IDENTITY CASCADE")
-                    .execute(&mut conn)
-                    .await
-                    .expect("reset");
-                for i in 0..total {
-                    diesel::sql_query(
-                        "INSERT INTO dv_posts (title, published_comment_count, visible_score) \
-                         VALUES ($1, 2, 5)",
-                    )
-                    .bind::<diesel::sql_types::Text, _>(format!("p{i}"))
-                    .execute(&mut conn)
-                    .await
-                    .expect("seed post");
-                }
-            }
+            reseed_posts_with_derived_values(&mut pool.get().await.expect("conn"), total).await;
 
             let resp = client.get("/dv-posts").send().await;
             resp.assert_ok();
@@ -1404,13 +1449,23 @@ mod query_count {
                 total,
                 "every parent is listed"
             );
+            // Counted against the fixture table, not the whole request: a
+            // recycled pooled connection is validated with a `SELECT $1` ping
+            // on checkout, which is pool housekeeping rather than a read of the
+            // derivation.
+            let reads = resp
+                .queries()
+                .iter()
+                .filter(|query| query.sql.contains("dv_posts"))
+                .count();
             assert_eq!(
-                resp.query_count(),
+                reads,
                 1,
                 "a maintained derivation is read as a column, so the query count \
                  must not grow with the number of parents ({total}): {:?}",
                 resp.queries()
             );
+            resp.assert_no_n_plus_one();
         }
     }
 }

@@ -80,17 +80,18 @@ pub struct SdPost {
 #[autumn_web::repository(SdPost, table = "sd_posts")]
 pub trait SdPostRepository {}
 
+// No `#[belongs_to]`: its generated association loader is typed to
+// `AsyncPgConnection`, so declaring one here would not compile under the
+// SQLite backend flip. The derivations therefore name their foreign key
+// explicitly, which also covers the `fk = <column>` override.
 #[autumn_web::model(table = "sd_comments")]
-#[belongs_to(SdPost, fk = post_id)]
-#[derivation(SdPost, column = "published_comment_count", filter = published)]
-#[derivation(SdPost, column = "visible_score", transform = sum(score), filter = published && score > 0)]
+#[derivation(SdPost, column = "published_comment_count", fk = post_id, filter = published)]
+#[derivation(SdPost, column = "visible_score", fk = post_id, transform = sum(score), filter = published && score > 0)]
 pub struct SdComment {
     #[id]
     pub id: i64,
     pub post_id: i64,
-    #[default]
     pub published: bool,
-    #[default]
     pub score: i64,
 }
 
@@ -248,7 +249,9 @@ async fn a_filtered_count_and_sum_are_maintained_on_insert() {
 
     let mut conn = pool.get().await.expect("conn");
     assert_eq!(
-        drift(&mut conn, def(COUNT_DERIVATION)).await.expect("drift"),
+        drift(&mut conn, def(COUNT_DERIVATION))
+            .await
+            .expect("drift"),
         0
     );
     assert_eq!(
@@ -441,19 +444,19 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
     let mut posts = Vec::new();
     for i in 0..5 {
         let post = seed_post(&pool, &format!("p{i}")).await;
-        diesel::sql_query(
-            "INSERT INTO sd_comments (post_id, published, score) VALUES (?, 1, 2)",
-        )
-        .bind::<BigInt, _>(post)
-        .execute(&mut conn)
-        .await
-        .expect("legacy comment");
+        diesel::sql_query("INSERT INTO sd_comments (post_id, published, score) VALUES (?, 1, 2)")
+            .bind::<BigInt, _>(post)
+            .execute(&mut conn)
+            .await
+            .expect("legacy comment");
         posts.push(post);
     }
 
     ensure_derivations(&mut conn).await.expect("enqueue");
     assert_eq!(
-        drift(&mut conn, def(COUNT_DERIVATION)).await.expect("drift"),
+        drift(&mut conn, def(COUNT_DERIVATION))
+            .await
+            .expect("drift"),
         5
     );
 
@@ -494,7 +497,9 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
         assert_eq!(derived(&pool, "visible_score", *post).await, 2);
     }
     assert_eq!(
-        drift(&mut conn, def(COUNT_DERIVATION)).await.expect("drift"),
+        drift(&mut conn, def(COUNT_DERIVATION))
+            .await
+            .expect("drift"),
         0
     );
 

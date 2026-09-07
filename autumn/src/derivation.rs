@@ -188,7 +188,7 @@ impl DerivationDef {
     /// The repair paths (recompute, backfill, drift) are set-based and need no
     /// model type, so they run the *same* builders the delta paths do — one
     /// definition of the ground truth, not two that can disagree.
-    pub(crate) fn sql_view(&self) -> SqlView {
+    pub(crate) const fn sql_view(&self) -> SqlView {
         SqlView {
             child_table: self.child_table,
             child_pk: self.child_pk,
@@ -396,7 +396,10 @@ async fn load_state(conn: &mut RuntimeConnection) -> AutumnResult<HashMap<String
         .load::<StateRow>(conn)
         .await
         .map_err(AutumnError::from)?;
-    Ok(rows.into_iter().map(|row| (row.name.clone(), row)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.name.clone(), row))
+        .collect())
 }
 
 /// Enqueue `def` for a backfill from the start.
@@ -446,7 +449,10 @@ pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Ve
     let mut enqueued = Vec::new();
     for def in defs {
         let hash = def.definition_hash();
-        if state.get(def.name).is_some_and(|row| row.definition_hash == hash) {
+        if state
+            .get(def.name)
+            .is_some_and(|row| row.definition_hash == hash)
+        {
             continue;
         }
         enqueue(conn, def).await?;
@@ -581,9 +587,8 @@ pub async fn run_backfill(
                 report.in_progress.push(def.name.to_owned());
                 return Ok(report);
             }
-            let ids =
-                crate::counter_cache::parent_id_page(conn, &view, cursor, options.batch_size)
-                    .await?;
+            let ids = crate::counter_cache::parent_id_page(conn, &view, cursor, options.batch_size)
+                .await?;
             let Some(&last) = ids.last() else {
                 mark_complete(conn, def.name).await?;
                 report.completed.push(def.name.to_owned());
@@ -592,9 +597,8 @@ pub async fn run_backfill(
             cursor = Some(last);
             let name = def.name;
             let rows = i64::try_from(ids.len()).unwrap_or(i64::MAX);
-            let repaired = scoped_immediate_transaction::<usize, AutumnError, _>(
-                conn,
-                move |conn| {
+            let repaired =
+                scoped_immediate_transaction::<usize, AutumnError, _>(conn, move |conn| {
                     async move {
                         let repaired =
                             crate::counter_cache::recompute_batch_statements(conn, &view, &ids)
@@ -603,9 +607,8 @@ pub async fn run_backfill(
                         Ok(repaired)
                     }
                     .scope_boxed()
-                },
-            )
-            .await?;
+                })
+                .await?;
             report.rows_repaired += repaired;
             batches += 1;
         }
