@@ -330,7 +330,7 @@ fn score(
         let factor = weight_factor(weight);
         for (index, query_token) in tokens.iter().enumerate() {
             if let Some(&count) = field_tokens.get(query_token.as_str()) {
-                total += factor * count as f32;
+                total = factor.mul_add(count as f32, total);
                 if let Some(slot) = matched.get_mut(index) {
                     *slot = true;
                 }
