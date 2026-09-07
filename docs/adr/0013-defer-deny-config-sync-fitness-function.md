@@ -26,13 +26,16 @@ moving on.
 
 ## Evidence (Tier 2 — repository record)
 
-1. **The invariant is explicit and repeated in three places**, none of them
+1. **The invariant is explicit and repeated in two places**, neither of them
    code: `deny-sqlite.toml`'s own header ("KEEP `[advisories].ignore`,
    `[licenses].allow`, and `[sources]` IN SYNC with deny.toml — only the
    `[graph]` features and the `unused-ignored-advisory` knob below
-   intentionally differ"), `deny.toml`'s header, and CONTRIBUTING.md §"Supply
-   chain (cargo-deny)" ("The two configs share the same advisories/licenses/
-   sources policy — keep them in sync").
+   intentionally differ") and CONTRIBUTING.md §"Supply chain (cargo-deny)"
+   ("The two configs share the same advisories/licenses/sources policy —
+   keep them in sync"). `deny.toml`'s own header only notes that a companion
+   `deny-sqlite.toml` exists and scans a second graph — it does not itself
+   assert the sync obligation; that instruction lives one-directionally, in
+   the file that came second.
 2. **No test checks it.** The one test that touches both files,
    `the_frameworks_own_waivers_carry_a_reason`
    (`autumn-cli/tests/integration/dependency_audit.rs:898-914`), loops over
@@ -95,12 +98,15 @@ that is routine hygiene work and needs no architecture review.
 
 ## Seam kept open
 
-No new seam is needed. Both files already funnel through the same reproducible
-entry points (`scripts/check-advisories.sh`, the `supply-chain` CI job,
-`autumn doctor`'s `dependencies` check added in #1633), so a future equality
-check has an obvious home — a repo-hygiene test parsing both TOML files and
+No new seam is needed. Both files are already read by reproducible, scriptable
+entry points — `scripts/check-advisories.sh` runs both configs, and the
+`supply-chain` CI job runs both as separate steps — so a future equality check
+has an obvious home there: a repo-hygiene test parsing both TOML files and
 asserting `[advisories].ignore`, `[licenses].allow`, and `[sources]` match
-field-for-field — without restructuring anything that exists today.
+field-for-field, without restructuring anything that exists today. `autumn
+doctor`'s `dependencies` check (#1633) is not such a seam: `autumn-cli/src/deps.rs`
+hard-codes `POLICY_FILE = "deny.toml"` and never reads `deny-sqlite.toml`, so
+it audits only one of the two graphs this ADR is about.
 
 ## Trigger to revisit
 
