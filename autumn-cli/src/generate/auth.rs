@@ -886,7 +886,7 @@ fn plan_auth_with_providers_ex_impl(
     plan.create(docs_dir.join("gdpr-compliance.md"), render_gdpr_docs_file());
     plan.create(
         docs_dir.join("session-management.md"),
-        render_sessions_docs_file(&pascal_name, &snake_name, &table),
+        render_sessions_docs_file(backend, &pascal_name, &snake_name, &table),
     );
 
     // ── src/main.rs — module declarations + route registration ────────────
@@ -1256,7 +1256,7 @@ fn plan_auth_options_impl(
         let docs_dir = project_root.join("docs").join("guide");
         plan.create(
             docs_dir.join("oauth.md"),
-            render_oauth_docs_file(&oauth.providers),
+            render_oauth_docs_file(backend, &oauth.providers, &user_table),
         );
 
         // ── Cargo.toml: add oauth2 feature to autumn-web ─────────────────────
@@ -1952,6 +1952,40 @@ fn remember_table_name(snake_name: &str) -> String {
     format!("{snake_name}_remember_tokens")
 }
 
+/// DDL for the tracked-sessions table, in the app's own dialect.
+///
+/// Shared by the scaffolded migration and the generated session-management
+/// guide (issue #1908) so a `SQLite` app is never handed Postgres-only
+/// `BIGSERIAL` / `NOW()` DDL, and the two copies cannot drift.
+fn render_sessions_table_ddl(
+    backend: autumn_web::config::DatabaseBackend,
+    snake_name: &str,
+    user_table: &str,
+) -> String {
+    let d = AuthDdl::for_backend(backend);
+    let sess_table = sessions_table_name(snake_name);
+    format!(
+        "CREATE TABLE {sess_table} (\n\
+         \x20   id {pk},\n\
+         \x20   user_id {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,\n\
+         \x20   token_digest TEXT NOT NULL UNIQUE,\n\
+         \x20   ip TEXT NOT NULL DEFAULT '',\n\
+         \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_family TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
+         \x20   label TEXT NULL,\n\
+         \x20   last_seen_at {created_at},\n\
+         \x20   created_at {created_at}\n\
+         );\n\
+         \n\
+         CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);\n",
+        pk = d.pk,
+        big_int = d.big_int,
+        created_at = d.ts_not_null_default_now,
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn render_migration_up(
     backend: autumn_web::config::DatabaseBackend,
@@ -2025,28 +2059,10 @@ fn render_migration_up(
     // Active login sessions (issue #819): one row per login, keyed by the
     // SHA-256 digest of the opaque server-side session id. Only the digest
     // is stored so a database leak cannot be replayed as a session cookie.
-    let sess_table = sessions_table_name(snake_name);
     let _ = write!(
         out,
-        "\n\
-         CREATE TABLE {sess_table} (\n\
-         \x20   id {pk},\n\
-         \x20   user_id {big_int} NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
-         \x20   token_digest TEXT NOT NULL UNIQUE,\n\
-         \x20   ip TEXT NOT NULL DEFAULT '',\n\
-         \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
-         \x20   ua_family TEXT NOT NULL DEFAULT '',\n\
-         \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
-         \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
-         \x20   label TEXT NULL,\n\
-         \x20   last_seen_at {created_at},\n\
-         \x20   created_at {created_at}\n\
-         );\n\
-         \n\
-         CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);\n",
-        pk = d.pk,
-        big_int = d.big_int,
-        created_at = d.ts_not_null_default_now,
+        "\n{ddl}",
+        ddl = render_sessions_table_ddl(backend, snake_name, table),
     );
     // Persistent "remember-me" login chains (issue #1397): one row per device
     // login-chain, keyed by the stable opaque `series`. `token_hash` rotates on
@@ -2290,7 +2306,7 @@ impl {user_pascal} {{
     /// All active login sessions for this account, most recently seen first.
     pub async fn sessions(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<Vec<{user_pascal}Session>> {{
         {sess_table}::table
             .filter({sess_table}::user_id.eq(self.id))
@@ -2310,7 +2326,7 @@ impl {user_pascal} {{
     /// was actually revoked.
     pub async fn revoke_session(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
         session_id: i64,
     ) -> autumn_web::AutumnResult<bool> {{
         let rows = diesel::delete(
@@ -2333,7 +2349,7 @@ impl {user_pascal} {{
     /// number of sessions revoked.
     pub async fn revoke_other_sessions(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
         current_token_digest: &str,
     ) -> autumn_web::AutumnResult<usize> {{
         diesel::delete(
@@ -2354,7 +2370,7 @@ impl {user_pascal} {{
     /// Used on password change, where all existing sessions are suspect.
     pub async fn revoke_all_sessions(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<usize> {{
         diesel::delete({sess_table}::table.filter({sess_table}::user_id.eq(self.id)))
             .execute(conn)
@@ -2458,7 +2474,7 @@ impl {user_pascal}RememberToken {{
 
 /// Persist a new remember chain for a successful "remember me" login.
 pub async fn insert_remember_token(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     row: &New{user_pascal}RememberToken,
 ) -> autumn_web::AutumnResult<()> {{
     diesel::insert_into({rem_table}::table)
@@ -2475,7 +2491,7 @@ pub async fn insert_remember_token(
 
 /// Look a chain up by its stable series id.
 pub async fn find_remember_token(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     series: &str,
 ) -> autumn_web::AutumnResult<Option<{user_pascal}RememberToken>> {{
     {rem_table}::table
@@ -2498,7 +2514,7 @@ pub async fn find_remember_token(
 /// request already rotated the chain, 1 on success), so the caller can detect a
 /// lost race and re-evaluate rather than silently double-rotating (issue #1397).
 pub async fn rotate_remember_token(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     series: &str,
     old_hash: &str,
     new_hash: &str,
@@ -2528,7 +2544,7 @@ pub async fn rotate_remember_token(
 
 /// Delete a single chain by series (theft / this-device logout revocation).
 pub async fn delete_remember_series(
-    conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     series: &str,
 ) -> autumn_web::AutumnResult<usize> {{
     diesel::delete({rem_table}::table.filter({rem_table}::series.eq(series)))
@@ -2547,7 +2563,7 @@ impl {user_pascal} {{
     /// revoked individually (issue #1397.6).
     pub async fn remember_tokens(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<Vec<{user_pascal}RememberToken>> {{
         {rem_table}::table
             .filter({rem_table}::user_id.eq(self.id))
@@ -2567,7 +2583,7 @@ impl {user_pascal} {{
     /// chain was actually revoked (issue #1397.6).
     pub async fn revoke_remember_series(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
         series: &str,
     ) -> autumn_web::AutumnResult<bool> {{
         let rows = diesel::delete(
@@ -2591,7 +2607,7 @@ impl {user_pascal} {{
     /// rejected. Returns the number of chains revoked.
     pub async fn revoke_all_remember_tokens(
         &self,
-        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
     ) -> autumn_web::AutumnResult<usize> {{
         diesel::delete({rem_table}::table.filter({rem_table}::user_id.eq(self.id)))
             .execute(conn)
@@ -7141,8 +7157,20 @@ fn revoke_other_sessions_keeps_current_session_alive() {{
 /// handler APIs, the auto-revocation policy, the privacy posture for stored
 /// IP / User-Agent data, and how to plug in a custom UA parser (issue #819).
 #[allow(clippy::too_many_lines)]
-fn render_sessions_docs_file(pascal_name: &str, snake_name: &str, user_table: &str) -> String {
+fn render_sessions_docs_file(
+    backend: autumn_web::config::DatabaseBackend,
+    pascal_name: &str,
+    snake_name: &str,
+    user_table: &str,
+) -> String {
     let sess_table = sessions_table_name(snake_name);
+    // The stale-row sweep and the retrofit DDL are copy-paste SQL for the
+    // operator, so both must be in the app's own dialect (issue #1908).
+    let stale_cutoff = match backend {
+        autumn_web::config::DatabaseBackend::Postgres => "NOW() - INTERVAL '90 days'",
+        autumn_web::config::DatabaseBackend::Sqlite => "datetime('now', '-90 days')",
+    };
+    let sessions_ddl = render_sessions_table_ddl(backend, snake_name, user_table);
     format!(
         r#"# Active Session Management
 
@@ -7227,7 +7255,7 @@ recognise their own devices. Treat both as personal data:
   rows until revoked — pick a retention window and scrub on a schedule:
 
   ```sql
-  DELETE FROM {sess_table} WHERE last_seen_at < NOW() - INTERVAL '90 days';
+  DELETE FROM {sess_table} WHERE last_seen_at < {stale_cutoff};
   ```
 
   Pair this with your session cookie `max_age_secs` so rows do not outlive
@@ -7268,22 +7296,7 @@ Already generated the auth starter before session management existed? The
 upgrade is one additive table:
 
 ```sql
-CREATE TABLE {sess_table} (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,
-    token_digest TEXT NOT NULL UNIQUE,
-    ip TEXT NOT NULL DEFAULT '',
-    user_agent TEXT NOT NULL DEFAULT '',
-    ua_family TEXT NOT NULL DEFAULT '',
-    ua_os TEXT NOT NULL DEFAULT '',
-    ua_device TEXT NOT NULL DEFAULT '',
-    label TEXT NULL,
-    last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);
-```
+{sessions_ddl}```
 
 Existing logged-in sessions have no row, so `require_tracked_session`
 treats them as revoked: every user re-authenticates once after the
@@ -8087,7 +8100,14 @@ fn user_table_placeholder_{snake_name}() -> &'static str {{
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_oauth_docs_file(providers: &[String]) -> String {
+fn render_oauth_docs_file(
+    backend: autumn_web::config::DatabaseBackend,
+    providers: &[String],
+    user_table: &str,
+) -> String {
+    // The documented schema must match the migration this same run writes, so
+    // it takes its column types from the same dialect table (issue #1908).
+    let d = AuthDdl::for_backend(backend);
     let provider_list = providers.join(", ");
     let provider_config_examples = providers
         .iter()
@@ -8227,13 +8247,13 @@ sticky-session misconfiguration.
 
 ```sql
 CREATE TABLE oauth_identities (
-    id         BIGSERIAL PRIMARY KEY,
+    id         {pk},
     provider   TEXT NOT NULL,
     subject    TEXT NOT NULL,         -- provider's user identifier (sub / id)
-    user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id    {big_int} NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,
     email      TEXT NULL,
     name       TEXT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at {created_at},
     UNIQUE (provider, subject)        -- collision guard: one local account per identity
 );
 ```
@@ -8243,6 +8263,9 @@ account. A second local user trying to claim the same identity returns an error 
 never silently merges accounts.
 "#,
         first_provider = providers.first().map_or("github", String::as_str),
+        pk = d.pk,
+        big_int = d.big_int,
+        created_at = d.ts_not_null_default_now,
     )
 }
 
@@ -11288,6 +11311,128 @@ mod tests {
         }
     }
 
+    /// Collect every generated `.rs` file under `root`, recursively.
+    fn generated_rust_files(root: &Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push((path.clone(), fs::read_to_string(&path).unwrap()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Scaffold the full auth surface into a project whose configured backend
+    /// is `url`, and return every generated `.rs` file.
+    fn auth_scaffold_rust_files(url: &str) -> Vec<(std::path::PathBuf, String)> {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            format!("[database]\nprimary_url = \"{url}\"\n"),
+        )
+        .unwrap();
+        plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions {
+                providers: Vec::new(),
+            },
+            true, // totp
+            true, // passkeys
+            true, // magic_link
+        )
+        .expect("generate auth must scaffold")
+        .execute(Flags::default())
+        .unwrap();
+        generated_rust_files(&tmp.path().join("src"))
+    }
+
+    /// DB-backed sessions store on `SQLite` (issue #1908): the generated
+    /// session/remember store must bound its connections by the backend-agnostic
+    /// `::autumn_web::RuntimeBackend` alias, never a hard-coded `diesel::pg::Pg`.
+    /// A `pg::Pg` bound does not accept the `SQLite` `RuntimeConnection`, so the
+    /// scaffolded app would not compile on a `SQLite` target.
+    #[test]
+    fn auth_store_connection_bounds_are_backend_agnostic() {
+        for url in ["sqlite://app.db", "postgres://localhost/app"] {
+            let files = auth_scaffold_rust_files(url);
+            for (path, body) in &files {
+                // The whole path, not just the connection bound: a regression
+                // could reintroduce Postgres as `SelectableHelper<diesel::pg::Pg>`
+                // or `check_for_backend(diesel::pg::Pg)`. The auth surface emits
+                // no legitimate `Pg` reference, so absence is the right bar.
+                assert!(
+                    !body.contains("diesel::pg::Pg"),
+                    "{} hard-codes the Postgres backend ({url})",
+                    path.display()
+                );
+            }
+            let session_model = files
+                .iter()
+                .find(|(p, _)| p.ends_with("user_session.rs"))
+                .expect("the sessions store model must be generated");
+            assert!(
+                session_model
+                    .1
+                    .contains("Backend = ::autumn_web::RuntimeBackend"),
+                "the sessions store must bind RuntimeBackend ({url}): {}",
+                session_model.1
+            );
+        }
+    }
+
+    /// The scaffolded session-management guide hands the operator SQL for the
+    /// sessions table. It must be in the app's own dialect (issue #1908):
+    /// Postgres keeps `NOW() - INTERVAL`, `SQLite` gets `datetime('now', …)`.
+    #[test]
+    fn sessions_doc_sql_matches_the_app_backend() {
+        let pg = render_sessions_docs_file(
+            autumn_web::config::DatabaseBackend::Postgres,
+            "User",
+            "user",
+            "users",
+        );
+        assert!(
+            pg.contains("last_seen_at < NOW() - INTERVAL '90 days'"),
+            "Postgres retention SQL must be unchanged: {pg}"
+        );
+        assert!(
+            pg.contains("id BIGSERIAL PRIMARY KEY")
+                && pg.contains("last_seen_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+            "Postgres migration-path DDL must be unchanged: {pg}"
+        );
+
+        let sqlite = render_sessions_docs_file(
+            autumn_web::config::DatabaseBackend::Sqlite,
+            "User",
+            "user",
+            "users",
+        );
+        assert!(
+            sqlite.contains("last_seen_at < datetime('now', '-90 days')"),
+            "SQLite retention SQL must use datetime(): {sqlite}"
+        );
+        assert!(
+            sqlite.contains("id INTEGER PRIMARY KEY AUTOINCREMENT")
+                && sqlite.contains("last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
+                && sqlite.contains("user_id INTEGER NOT NULL REFERENCES users(id)"),
+            "SQLite migration-path DDL must be SQLite dialect: {sqlite}"
+        );
+        for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+            assert!(
+                !sqlite.contains(leak),
+                "SQLite sessions guide leaked Postgres-only `{leak}`: {sqlite}"
+            );
+        }
+    }
+
     /// Regression guard: on a Postgres app (the default) the auth migration
     /// stays byte-for-byte the historical Postgres DDL.
     #[test]
@@ -11377,6 +11522,41 @@ mod tests {
                     && pg.contains("user_id BIGINT NOT NULL REFERENCES users(id)")
                     && pg.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW()"),
                 "{table} Postgres DDL must stay historical: {pg}"
+            );
+        }
+    }
+
+    /// The scaffolded OAuth guide documents the schema of the migration the same
+    /// run writes, so it must be in the same dialect (issue #1908) — the drift
+    /// `render_sessions_table_ddl` removed for the sessions guide.
+    #[test]
+    fn oauth_doc_schema_matches_the_app_backend() {
+        use autumn_web::config::DatabaseBackend;
+
+        let providers = vec!["github".to_owned()];
+
+        let pg = render_oauth_docs_file(DatabaseBackend::Postgres, &providers, "users");
+        assert!(
+            pg.contains("id         BIGSERIAL PRIMARY KEY,")
+                && pg
+                    .contains("user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,")
+                && pg.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW(),"),
+            "the Postgres OAuth guide must be unchanged: {pg}"
+        );
+
+        let sqlite = render_oauth_docs_file(DatabaseBackend::Sqlite, &providers, "users");
+        assert!(
+            sqlite.contains("id         INTEGER PRIMARY KEY AUTOINCREMENT,")
+                && sqlite.contains(
+                    "user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+                )
+                && sqlite.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,"),
+            "the SQLite OAuth guide must be SQLite dialect: {sqlite}"
+        );
+        for leak in ["BIGSERIAL", "BIGINT", "NOW()"] {
+            assert!(
+                !sqlite.contains(leak),
+                "the SQLite OAuth guide leaked Postgres-only `{leak}`: {sqlite}"
             );
         }
     }

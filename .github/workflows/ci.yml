@@ -347,6 +347,45 @@ jobs:
       - name: cargo-deny check (licenses, sources; sqlite backend graph)
         run: cargo deny --config deny-sqlite.toml check licenses sources
 
+  # ---------------------------------------------------------------------------
+  # THE TEST SUITE IS SHARDED ACROSS RUNNERS.
+  #
+  # It used to be one `Test (<os>)` job per OS that ran, in sequence: the whole
+  # workspace suite, then eight feature-flipped re-builds, then the Docker sweep.
+  # On the 2026-08-26 trunk run that job was 128 minutes on Windows and 92 on
+  # macOS, and it WAS the critical path of CI (2h27m end to end). Measured from
+  # that run's logs, the time went:
+  #
+  #                             ubuntu    macos   windows
+  #   compile (cargo test -W)    11.6m    29.1m     27.0m
+  #   run: integration_tests     14.4m    17.4m     46.8m
+  #     ...of which trybuild     10.3m    12.0m     37.1m   <-- ONE #[test]
+  #   run: 142 other binaries     1.9m     5.0m      4.7m
+  #   gated feature re-builds    25.0m    38.3m     44.0m
+  #
+  # Two facts drive the split below:
+  #
+  #   1. `compile_fail::*` (trybuild) was 71-79% of the consolidated
+  #      `integration_tests` binary's run time, and it is the TAIL -- the binary
+  #      finished 0.2s after trybuild did, on every OS. Each case shells out a
+  #      nested `cargo` build, trybuild serialises them behind its project-dir
+  #      lock, and libtest cannot split a single `#[test]`. So it does not get
+  #      faster by adding threads; it gets faster by moving to its own runners.
+  #   2. The eight gated feature lanes are INDEPENDENT re-builds of autumn-web
+  #      under disjoint feature sets. Run in sequence they are ~44 minutes of
+  #      pure recompilation on Windows; run side by side they are ~11.
+  #
+  # What is NOT sharded, deliberately: everything still runs `cargo test
+  # --workspace`, so every shard sees the same globally-unified feature set that
+  # decides which `#[cfg]`-gated trybuild fixtures exist. Narrowing a shard to
+  # `-p autumn-web --test integration_tests` would silently drop fixtures.
+  # The duplicated compile that costs is the price of that guarantee.
+  #
+  # Adding a shard: add it to the matrix AND to `test-gate`'s `needs`. Branch
+  # protection should require ONLY `Test suite` (the `test-gate` job) -- it is
+  # the one check name that stays stable as shards are added and removed.
+  # ---------------------------------------------------------------------------
+
   test:
     name: Test (${{ matrix.os }})
     needs: [lint, meta]
@@ -360,8 +399,8 @@ jobs:
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          # The full workspace build (especially the wide-feature +
-          # Postgres-container step below) sits near the runner's disk
+          # The full workspace build (and, in `test-docker`, the wide-feature
+          # Postgres-container sweep on top of it) sits near the runner's disk
           # ceiling; a cold-cache PR build tips it over ("No space left on
           # device"). Reclaim the preinstalled toolchains a Rust build never
           # uses before the cache is restored.
@@ -378,11 +417,227 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
+        with:
+          # This job and every `trybuild` shard run the IDENTICAL `cargo test
+          # --workspace` build and differ only in which tests they then run, so
+          # they share one cache entry instead of five near-identical copies.
+          # This job is the only writer (the shards set `save-if: false`).
+          shared-key: workspace-test
+          # Save the target dir even when the test STEP fails. rust-cache skips
+          # its save on a failed job by default, and because this job is the
+          # sole writer of the shared key, a red `test` means no shard ever
+          # gets a warm cache — exactly when a warm cache matters most, since
+          # a red suite is what you iterate against. What is being cached is
+          # compiled artifacts; their validity does not depend on whether the
+          # tests that ran afterwards passed.
+          cache-on-failure: true
       - name: Run tests
-        run: cargo test --workspace
+        # Two skips, each handed to a lane of its own:
+        #
+        # `compile_fail::` goes to the `trybuild` job below. `sim_` goes to the
+        # step right after this one. Both are substring skips over module paths
+        # that nothing else shares, so the three lanes partition the suite
+        # exactly — measured on the consolidated binary: 1840 + 10 + 37 = 1887,
+        # with no test matching two filters.
+        run: |
+          cargo test --workspace -- --skip compile_fail:: --skip sim_
+      - name: Run the simulation suite single-threaded
+        # WHY A SEPARATE, SINGLE-THREADED LANE.
+        #
+        # The `sim_*` modules are determinism tests: each builds a
+        # `tokio::runtime::Builder::new_current_thread().start_paused(true)`
+        # runtime and asserts a seed replays byte-identically. They are
+        # sensitive to CPU oversubscription, and sharding made that worse, not
+        # better. Pulling trybuild out of this binary freed the whole libtest
+        # thread pool: the same ~1880 tests that used to trickle through the
+        # gaps between trybuild's long-running cases (863s on ubuntu) now run at
+        # full parallelism in ~61s. On the 4-vCPU `ubuntu-latest` runner that
+        # 14x compression is enough to flip these tests — `Test (ubuntu-latest)`
+        # failed both attempts of run 8482, on `sim_retry_storm` and then
+        # `sim_fault_plan`, while macOS and Windows passed on re-run.
+        # Reproduced locally on a 4-core box: the same binary WITH trybuild
+        # (888s) shows no `sim_*` failure, WITHOUT it (27s) does.
+        #
+        # So they get the environment they were written for. This is the same
+        # principle as the trybuild shard — a lane per execution requirement —
+        # not a quarantine: every one of these 37 tests still runs, still
+        # blocks merge, and is not skipped anywhere.
+        #
+        # It runs as a STEP of this job rather than a job of its own so it
+        # reuses the target dir just compiled above: no extra runner, no second
+        # workspace build, and the tests themselves take seconds.
+        #
+        # The root cause is the tests' sensitivity to contention, which this
+        # only sidesteps; making them robust under an oversubscribed pool is
+        # worth its own issue.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --workspace -- sim_ --test-threads=1 | tee "${RUNNER_TEMP}/sim.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/sim.log" \
+            || { echo "::error::the sim_ lane ran no tests — the filter no longer matches the sim_* modules"; exit 1; }
+
+  trybuild:
+    name: Trybuild ${{ matrix.shard }}
+    needs: [lint, meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        # The four shards partition `compile_fail::` exactly. `pass_a`/`pass_b`
+        # are two halves of one fixture list (see the comment on
+        # `compile_pass_tests_a`); `rest` is everything else in the module --
+        # the feature-gated registries and the two guide-consistency tests,
+        # which together measured under a second.
+        shard: [fail, pass_a, pass_b, rest]
+    # Linux only. trybuild was the whole tail of this workflow: on the first
+    # fully-green sharded run the seven macOS/Windows shards took 38-55 min
+    # each and `Trybuild pass_a (windows)` at 55.1 min WAS the critical path,
+    # against 6-9 min for the same shards on Linux.
+    #
+    # What that buys, and what it costs: a trybuild case asserts the exact
+    # rustc diagnostic text of a committed `.stderr` golden. Those goldens are
+    # sensitive to the rustc VERSION, not to the OS -- all three legs pinned
+    # `dtolnay/rust-toolchain@stable` and rendered byte-identical output, which
+    # is why the same golden file serves all three. So running them three times
+    # re-proved the same property on three machines. What is genuinely lost is
+    # a diagnostic that differs per platform (a path separator or an OS-gated
+    # `#[cfg]` reaching a fixture); nothing in the current fixture set is
+    # OS-conditional, and a compile error that only appears on Windows would
+    # still be caught by `Test (windows-latest)` failing to build.
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The full workspace build (and, in `test-docker`, the wide-feature
+          # Postgres-container sweep on top of it) sits near the runner's disk
+          # ceiling; a cold-cache PR build tips it over ("No space left on
+          # device"). Reclaim the preinstalled toolchains a Rust build never
+          # uses before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        with:
+          # Restore the entry the `test` job writes: same build, same features.
+          shared-key: workspace-test
+          # RESTORE ONLY. Four shards racing to upload the same multi-GB target
+          # dir buys nothing, and on windows-latest that upload is what killed
+          # `Trybuild pass_a` in run 8362 — the shard itself had already passed
+          # at 53m, then the cache-save post step ran 47 more minutes and the
+          # runner dropped the job. `test` is the single writer.
+          save-if: false
+      - name: Run the trybuild shard
+        # `cargo test --workspace` (not `-p autumn-web --test integration_tests`)
+        # on purpose: the fixtures registered by `compile_fail.rs` are
+        # `#[cfg(feature = ...)]`-gated, so the set that exists depends on the
+        # GLOBALLY unified feature resolution of a workspace build. Narrowing
+        # the package selection here would quietly compile fewer of them out and
+        # still report green. Every other test in the workspace is filtered out
+        # by the shard's own filter, so the extra targets only cost their link.
+        #
+        # `assert_ran` for the reason the TLS/ACME lanes give: `cargo test` exits
+        # 0 when a filter matches NOTHING, so a rename in `compile_fail.rs` would
+        # otherwise leave a shard green having compiled nothing at all.
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.shard }}" in
+            fail)   filter=(compile_fail::compile_fail_tests) ;;
+            pass_a) filter=(compile_fail::compile_pass_tests_a) ;;
+            pass_b) filter=(compile_fail::compile_pass_tests_b) ;;
+            rest)   filter=(compile_fail::
+                      --skip compile_fail::compile_fail_tests
+                      --skip compile_fail::compile_pass_tests_a
+                      --skip compile_fail::compile_pass_tests_b) ;;
+          esac
+          cargo test --workspace -- "${filter[@]}" | tee "${RUNNER_TEMP}/trybuild.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/trybuild.log" \
+            || { echo "::error::trybuild shard ${{ matrix.shard }} ran no tests — the filter no longer matches anything in compile_fail.rs"; exit 1; }
+      - name: Drop the trybuild scratch tree
+        if: always()
+        # trybuild compiles every case as a real crate under
+        # `target/tests/trybuild`; that tree measures ~16 GB after a full
+        # `compile_pass` shard. It is pure scratch — regenerated each run,
+        # never a build input — but no cache action's prune knows that layout,
+        # so leaving it in place makes any post-run upload try to ship all of
+        # it. `save-if: false` above already prevents that; this keeps the
+        # disk bounded too, and keeps the hazard from returning silently if
+        # anyone ever flips that flag back.
+        shell: bash
+        run: rm -rf target/tests
+
+  test-features:
+    name: Test ${{ matrix.lane }}
+    needs: [lint, meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each lane is a feature set that `cargo test --workspace` does not
+        # compile, so each is its own re-build of autumn-web. They share nothing
+        # but the source tree, which is why they belong on separate runners.
+        #
+        # Linux only. These lanes ask "does this feature's own suite pass?",
+        # which is a question about the feature, not about the platform -- and
+        # `feature-combinations.yml` already proves every feature COMPILES
+        # standalone via `cargo hack --each-feature`. Running five lanes on
+        # three OSes was 15 jobs to answer one question five times; three of
+        # them (redis-tls, tls, acme) were already Linux-only. Cross-platform
+        # behaviour is still covered where it belongs: the default feature set
+        # runs on all three OSes in `test`, and `Windows Tier 1 journey` drives
+        # a real app end-to-end on Windows.
+        lane:
+          [
+            markdown,
+            inbound-mail,
+            i18n,
+            plugin-sandbox,
+            system-tests,
+            redis-tls,
+            tls,
+            acme,
+          ]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The full workspace build (and, in `test-docker`, the wide-feature
+          # Postgres-container sweep on top of it) sits near the runner's disk
+          # ceiling; a cold-cache PR build tips it over ("No space left on
+          # device"). Reclaim the preinstalled toolchains a Rust build never
+          # uses before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        with:
+          # One target dir per feature set; see the note on the trybuild job.
+          key: ${{ matrix.lane }}
       - name: Run markdown-gated tests (user-content sanitizer)
-        # `markdown` is not a default feature, so the `cargo test --workspace`
-        # above compiles neither the stored-XSS regression corpus
+        if: matrix.lane == 'markdown'
+        # `markdown` is not a default feature, so the `test` job's `cargo test
+        # --workspace` compiles neither the stored-XSS regression corpus
         # (`autumn/tests/integration/rich_text.rs`, gated on
         # `markdown` + `maud`) nor the `markdown::user_content` doctests. That
         # corpus IS the safety guarantee for user-submitted rich text
@@ -392,6 +647,7 @@ jobs:
           cargo test -p autumn-web --features markdown --lib markdown::
           cargo test -p autumn-web --features markdown --doc markdown::
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
+        if: matrix.lane == 'inbound-mail'
         # `inbound-mail` and its provider aliases are not default features, so
         # `cargo test --workspace` compiles neither `inbound_mail`'s in-module
         # suite nor `autumn/tests/integration/inbound_mail_integration.rs`
@@ -402,19 +658,21 @@ jobs:
           cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail" --lib inbound_mail
           cargo test -p autumn-web --features "inbound-mail,inbound-mailgun,inbound-ses,mail,test-support" --test integration_tests inbound_mail
       - name: Run i18n-gated tests (translatable model fields)
-        # `i18n` is not a default feature, so the `cargo test --workspace` above
-        # compiles neither `i18n::translatable`'s in-module suite nor the two
+        if: matrix.lane == 'i18n'
+        # `i18n` is not a default feature, so the `test` job's `cargo test
+        # --workspace` compiles neither `i18n::translatable`'s in-module suite nor the two
         # `#![cfg(feature = "i18n")]` integration modules. Those are the whole
         # behavioural proof for #1384 — per-locale persistence, the fallback
         # walk, the documented sentinel, and the ambient-locale request path —
         # so they have to run in a lane that blocks merge rather than only in
         # the (non-blocking, Codecov-driven) coverage job. The Docker-gated
         # round-trip tests in `translatable_model` are swept separately by the
-        # "Run Docker-dependent tests" step below.
+        # `test-docker` job.
         run: |
           cargo test -p autumn-web --features i18n --lib i18n::
           cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
       - name: Run plugin-sandbox tests (untrusted-plugin containment)
+        if: matrix.lane == 'plugin-sandbox'
         # `plugin-sandbox` is not a default feature, so `cargo test --workspace`
         # compiles neither the sandbox's in-module suites nor
         # `autumn/tests/integration/plugin_sandbox.rs`. That integration module IS
@@ -431,9 +689,24 @@ jobs:
           cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests plugin_sandbox
           cargo test -p autumn-web --features plugin-sandbox --doc plugin_sandbox
 
+      - name: Run system-test harness (non-browser) tests
+        if: matrix.lane == 'system-tests'
+        # `system-tests` is not a default feature. The `test` job's `cargo test
+        # --workspace` happens to compile it today only because `example-e2e` depends
+        # on `autumn-web` with that feature and workspace feature unification
+        # turns it on — accidental coverage that would vanish silently if that
+        # one dependency were ever dev-scoped or dropped. Name it explicitly so
+        # the harness's own tests (browser resolution, transient-CDP retry
+        # loop, `SystemTest::layer`) stay covered on purpose. The `#[ignore]`d
+        # browser tests need Chromium and run in publish-gate.yml's
+        # browser-provisioned job.
+        run: |
+          cargo test -p autumn-web --features system-tests --lib system_test::
+          cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
       - name: Run redis-TLS-gated tests (rediss:// CryptoProvider guard)
-        # `redis` and `ws` are not `autumn-web` default features. The
-        # workspace `cargo test` above happens to compile this suite anyway,
+        if: matrix.lane == 'redis-tls'
+        # `redis` and `ws` are not `autumn-web` default features. The `test`
+        # job's workspace `cargo test` happens to compile this suite anyway,
         # because resolver-3 feature unification pulls `redis` in from
         # `autumn-cache-redis`/`autumn-cli` and `ws` from the `reddit-clone`
         # example — a coincidence of what other members want, not anything
@@ -451,7 +724,6 @@ jobs:
         # Linux only: the assertions are about process-global state and fork
         # isolation, neither of which is platform-specific, and `rusty_fork`
         # re-execs the test binary — cheapest on the fast runner.
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           assert_ran() {
@@ -465,8 +737,9 @@ jobs:
             | tee "${RUNNER_TEMP}/cache-redis.log"
           assert_ran "${RUNNER_TEMP}/cache-redis.log" "autumn-cache-redis unit tests"
       - name: Run direct-TLS (HTTPS) tests
-        # `tls` is not a default feature, so the workspace `cargo test` above
-        # compiles neither `tls`'s in-module suite nor the `[server.tls]`
+        if: matrix.lane == 'tls'
+        # `tls` is not a default feature, so the `test` job's workspace `cargo
+        # test` compiles neither `tls`'s in-module suite nor the `[server.tls]`
         # integration modules. Those are the behavioural proof for #1603 — the
         # listener itself (`tls_serving`) plus the app-surface parity the ACs
         # name: the framework probes, the inbound request timeout, SSE, `wss://`
@@ -486,7 +759,6 @@ jobs:
         # checked for a non-zero pass count: `cargo test` exits 0 when a filter
         # matches NOTHING, so a cfg drift that stopped compiling these modules
         # in would otherwise leave this step green with zero HTTPS coverage.
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           assert_ran() {
@@ -503,26 +775,26 @@ jobs:
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
       - name: Run ACME-gated tests (certificate provisioning + renewal)
-        # `acme` is not a default feature either, so the workspace `cargo test`
-        # above compiles neither `acme`'s in-module suite nor `acme_end_to_end`.
+        if: matrix.lane == 'acme'
+        # `acme` is not a default feature either, so the `test` job's workspace
+        # `cargo test` compiles neither `acme`'s in-module suite nor `acme_end_to_end`.
         # That suite is the behavioural proof for #1608 — first-boot issuance and
         # the HTTP→HTTPS redirect, a forced near-expiry rotation with no restart,
         # a restart reusing the stored account and certificate, and a failed order
         # reaching health plus the error-reporting seam — driven through a real
         # `instant-acme` client against an in-process fake CA (`acme_fake_ca`).
-        # No Docker and no network, so it belongs in this fast lane rather than
-        # the Docker sweep below.
+        # No Docker and no network, so it belongs in this lane rather than the
+        # `test-docker` job.
         #
-        # The `tls` half of this path is covered by the direct-TLS step above;
+        # The `tls` half of this path is covered by the `tls` lane;
         # `acme` implies `tls`, so this step deliberately runs only the ACME
         # suites rather than rebuilding and re-running those.
         #
-        # Linux only, and `assert_ran` for the same two reasons the step above
+        # Linux only, and `assert_ran` for the same two reasons the `tls` lane
         # gives: the renewal tests wait on real elapsed time, and `cargo test`
         # exits 0 when a filter matches NOTHING — so a cfg drift that stopped
         # compiling these modules in would otherwise leave this step green with
         # zero ACME coverage.
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           assert_ran() {
@@ -564,7 +836,7 @@ jobs:
         # `test-threads=1`-equivalent by construction: exactly one ignored
         # test in this filter, and it binds Pebble's fixed HTTP-01 port
         # (5002) directly, so it must not run concurrently with itself.
-        if: runner.os == 'Linux'
+        if: matrix.lane == 'acme'
         run: |
           set -euo pipefail
           assert_ran() {
@@ -575,19 +847,6 @@ jobs:
             --test integration_tests acme_pebble:: -- --ignored \
             | tee "${RUNNER_TEMP}/acme-pebble.log"
           assert_ran "${RUNNER_TEMP}/acme-pebble.log" "acme_pebble"
-      - name: Run system-test harness (non-browser) tests
-        # `system-tests` is not a default feature. The `cargo test --workspace`
-        # above happens to compile it today only because `example-e2e` depends
-        # on `autumn-web` with that feature and workspace feature unification
-        # turns it on — accidental coverage that would vanish silently if that
-        # one dependency were ever dev-scoped or dropped. Name it explicitly so
-        # the harness's own tests (browser resolution, transient-CDP retry
-        # loop, `SystemTest::layer`) stay covered on purpose. The `#[ignore]`d
-        # browser tests need Chromium and run in publish-gate.yml's
-        # browser-provisioned job.
-        run: |
-          cargo test -p autumn-web --features system-tests --lib system_test::
-          cargo test -p autumn-web --features system-tests --test integration_tests system_test_api
 
   # The Docker/testcontainer sweep runs as its own job rather than as the last
   # step of `test` (#1747). As step 16 of that job it inherited a disk already
@@ -603,11 +862,11 @@ jobs:
   # claimant of. They keep their `runner.os == 'Linux'` guards, which stay true
   # on this runner, so the commands are byte-for-byte the ones that ran before.
   #
-  # NOTE: this is a NEW check name, so branch protection — which requires the
-  # per-OS `Test (…)` checks — does not require it yet. Until an admin adds it,
-  # a failure here is visible on the PR but does not itself block merge. #2519
-  # restructures these jobs more broadly and carries the same follow-up; expect
-  # to reconcile with it (it names the equivalent job `test-docker` too).
+  # Reconciled with #2519 (this PR), which #1747 anticipated: the job keeps its
+  # `Test (Docker)` name and every step below, and is now one of the four
+  # families the `test-gate` job aggregates. Branch protection should require
+  # `Test suite` (`test-gate`) rather than this check or the per-OS `Test (…)`
+  # ones — that is the one name that survives adding or removing a shard.
   test-docker:
     name: Test (Docker)
     needs: [lint, meta]
@@ -682,6 +941,7 @@ jobs:
           cargo test -p autumn-web --test scoped_tokens_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           cargo test -p autumn-admin-plugin --test token_admin_bulk_delete_batch_profile -- --ignored
+          cargo test -p autumn-admin-plugin --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
           # Media-room reaper phase-2 profiling harness: asserts the sweep's
           # reap set, its boundary cases (created_at / last_seen_at exactly ON
           # the cutoff), and its namespace isolation against a
@@ -829,10 +1089,75 @@ jobs:
           # installed above.
           cargo test -p autumn-cli --test deploy_e2e -- --ignored
 
+
+  test-gate:
+    name: Test suite
+    # The stable, shard-count-independent name for BRANCH PROTECTION. It fails
+    # if any shard failed or was cancelled; a `needs:` alone would let a skipped
+    # shard pass silently.
+    #
+    # Nothing else should hang off this job. Anything with `needs: [test-gate]`
+    # inherits two properties it almost certainly does not want: it cannot start
+    # until the SLOWEST shard finishes (the Windows trybuild shard, ~57m), and
+    # it is SKIPPED whenever any one of the ~34 shard jobs is red — and a
+    # skipped required check can never be satisfied, so the PR stops being
+    # mergeable even once the real failure is understood. `coverage` and `loom`
+    # were briefly wired here and hit exactly that; they depend on `test`.
+    needs: [test, trybuild, test-features, test-docker]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "shard results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "::error::a test shard did not succeed ($results)"; exit 1; }
+          done
+
   coverage:
-    name: Coverage
+    name: Coverage (${{ matrix.lane }})
+    # `test`, NOT `test-gate`: coverage instruments the workspace suite, so the
+    # `test` job is the only thing it actually depends on. Hanging it off the
+    # aggregate would make an unrelated red shard (a feature lane, a trybuild
+    # shard) skip coverage entirely, and would delay its start until the
+    # slowest shard finished. See the note on `test-gate`.
     needs: [test, meta]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Four lanes over the legs this job used to run back-to-back in one
+        # 55-minute step. Once trybuild moved to Linux only, coverage WAS the
+        # critical path, so splitting it is what moves the workflow's floor.
+        #
+        # The split is by feature set, because that is what forces a rebuild:
+        # `workspace` and `autumn-web` are the two expensive instrumented
+        # builds and get a runner each; `sandbox-sqlite` carries the two
+        # feature-flipped lanes; `db-ignored` carries the Docker/testcontainer
+        # `--ignored` legs, which are wall-clock-bound rather than CPU-bound.
+        #
+        # Each lane reports its own lcov and uploads under its own Codecov
+        # flag; Codecov merges the four uploads for the commit. That is the
+        # supported way to shard llvm-cov across runners -- merging raw
+        # profdata instead would mean shipping each lane's instrumented object
+        # files between jobs.
+        lane: [workspace, autumn-web, sandbox-sqlite, db-ignored]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    env:
+      # Every autumn-web feature EXCEPT `sqlite`. Hoisted to job scope so the
+      # lanes below share one definition. It is the coverage sibling of
+      # `autumn_web_semver_features` in scripts/check-semver.sh (both
+      # deliberately EXCLUDE `sqlite` to avoid the backend flip described on
+      # the `workspace` lane); keep the `sqlite`-exclusion invariant in sync.
+      # Coverage is not bound by the crates.io baseline, so this list is a
+      # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
+      # `acme`, `managed-pg*`, `system-tests`, `test-support`, ...).
+      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
+      # `postgresql_embedded`'s build script downloads Postgres binaries via
+      # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
+      # fails the build with a 403. Authenticate with the job's token to get
+      # the higher rate limit.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space
@@ -852,6 +1177,10 @@ jobs:
           df -h
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          # One cache per lane: each builds a different feature set, so sharing
+          # a key would thrash the entry rather than warm it.
+          key: coverage-${{ matrix.lane }}
       - name: Install cargo-llvm-cov
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
@@ -859,14 +1188,10 @@ jobs:
         uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-llvm-cov
-      - name: Generate coverage
-        env:
-          # `postgresql_embedded`'s build script downloads Postgres binaries via
-          # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
-          # fails the build with a 403. Authenticate with the job's token to get
-          # the higher rate limit.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate coverage (workspace catch-all)
+        if: matrix.lane == 'workspace'
         run: |
+          set -euo pipefail
           cargo llvm-cov clean --workspace
           # `--all-features` on a `--workspace` run is structurally unsafe here.
           # Only two workspace members own a `sqlite` feature — autumn-web and
@@ -881,35 +1206,68 @@ jobs:
           # apps. Cargo has no "all-features except one crate feature" flag, and
           # excluding victim crates one-by-one is whack-a-mole. Instead exclude
           # the two crates that OWN a `sqlite` feature so NO selected package can
-          # turn the flip on, then cover each explicitly:
-          #   - autumn-web: covered below with an explicit Postgres feature list
-          #     (`$PG_FEATURES`, every feature EXCEPT `sqlite`) plus a dedicated
-          #     sqlite+mail lane (see #1614 note below).
+          # turn the flip on; each is covered by a lane of its own:
+          #   - autumn-web: the `autumn-web` lane, with `$PG_FEATURES`.
           #   - autumn-cli: its `postgres`/`sqlite` backends are MUTUALLY
           #     EXCLUSIVE ("NEVER `--all-features`", per autumn-cli/Cargo.toml),
           #     so it can never be part of an `--all-features` build at all; it is
-          #     covered by its own `-p autumn-cli` test lanes below.
+          #     covered by the `db-ignored` lane's `-p autumn-cli` legs.
           # With both feature-owners excluded the catch-all resolves autumn-web
           # to Postgres, so autumn-admin-plugin / autumn-media-plugin / the
           # example apps compile again and need NO exclusion.
-          #
-          # `$PG_FEATURES` = every autumn-web feature except `sqlite`. It is the
-          # coverage sibling of `autumn_web_semver_features` in
-          # scripts/check-semver.sh (both deliberately EXCLUDE `sqlite` to avoid
-          # the backend flip); keep the `sqlite`-exclusion invariant in sync.
-          # Coverage is not bound by the crates.io baseline, so this list is a
-          # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
-          # `acme`, `managed-pg*`, `system-tests`, `test-support`, …).
-          PG_FEATURES="ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
           cargo llvm-cov --workspace --exclude autumn-web --exclude autumn-cli \
             --all-features --no-report
-          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES"
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate coverage (autumn-web, Postgres feature set)
+        if: matrix.lane == 'autumn-web'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov clean --workspace
+          # `--skip compile_fail::`, the same skip the `test` job uses, for a
+          # reason specific to coverage: a trybuild case compiles its fixture
+          # as a separate crate in a NESTED cargo process, which this run does
+          # not instrument, so the whole module contributes no coverage signal
+          # at all. It is not free, either — it was 1066s of this lane, and it
+          # writes ~16 GB into `target/tests/trybuild` (measured on the
+          # trybuild shards, which drop that tree afterwards for exactly this
+          # reason) on top of an instrumented tree that is already the most
+          # disk-hungry build in the workflow. It failed here as `31 of 31
+          # tests failed` while `Trybuild pass_b` was green in the same run, so
+          # the fixtures are fine and this was an artifact of the environment,
+          # not a regression. `compile_fail::` still runs, and still gates
+          # merge, in the four `trybuild` shards.
+          #
+          # `--skip sim_` for the SECOND reason the `test` job skips it, and it
+          # is this lane's own doing: dropping `compile_fail::` above frees the
+          # libtest thread pool exactly the way pulling trybuild into its own
+          # job did, and the `sim_*` determinism tests fail under that
+          # concurrency (`sim_retry_storm`, `sim_fault_plan` — see the `Run the
+          # simulation suite single-threaded` step). Before that skip this lane
+          # still ran trybuild, so the simulations were trickling through its
+          # gaps and never saw full parallelism. Skipping trybuild without
+          # skipping `sim_` would hand this lane the known-flaky execution mode
+          # and let it fail otherwise-green PRs (Codex review).
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            -- --skip compile_fail:: --skip sim_
+          # The same subset, single-threaded, still instrumented — so coverage
+          # keeps the `sim_*` modules rather than trading a flake for a hole.
+          # No rebuild: same package, same features, same target dir, so this
+          # re-runs binaries the step above already built.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            -- sim_ --test-threads=1
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate coverage (plugin-sandbox + sqlite)
+        if: matrix.lane == 'sandbox-sqlite'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov clean --workspace
           # The plugin-sandbox suites have their own merge-blocking test lane
-          # above; without a coverage leg the whole module is instrumented and
-          # never executed, which reads as a large new uncovered surface.
+          # in `test-features`; without a coverage leg the whole module is
+          # instrumented and never executed, which reads as a large new
+          # uncovered surface.
           #
           # The test-name filter goes after `--`, unlike the `cargo test` lane
-          # above where it is a bare positional. `cargo llvm-cov` has its own
+          # where it is a bare positional. `cargo llvm-cov` has its own
           # subcommands (`report`, `clean`, `nextest`, …), so a bare word in
           # that position is read as one:
           #     error: unrecognized subcommand plugin_sandbox
@@ -917,16 +1275,22 @@ jobs:
             --lib -- plugin_sandbox
           cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
             --test integration_tests -- plugin_sandbox
-          # Explicit sqlite+mail lane (#1614). Excluding autumn-cli above removed
-          # the only place the `--all-features` catch-all compiled autumn-web
-          # under the `sqlite` + `mail` union — which is exactly the
-          # `DbSuppressionStore` backend-flip this PR fixes, so coverage must
-          # keep compiling it. Restore it here, isolated to `-p autumn-web` so the
-          # sqlite flip can never leak onto the Pg-assuming workspace crates. A
-          # named sqlite `[[test]]` target keeps it off the pg-URL lib unit tests
-          # (which assume Postgres) — same rule the `sqlite-runtime` job follows.
+          # Explicit sqlite+mail lane (#1614). Excluding autumn-cli from the
+          # catch-all removed the only place it compiled autumn-web under the
+          # `sqlite` + `mail` union — exactly the `DbSuppressionStore`
+          # backend-flip #1614 fixed, so coverage must keep compiling it.
+          # Isolated to `-p autumn-web` so the sqlite flip can never leak onto
+          # the Pg-assuming workspace crates. A named sqlite `[[test]]` target
+          # keeps it off the pg-URL lib unit tests (which assume Postgres) —
+          # the same rule the `sqlite-runtime` job follows.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate coverage (Docker/testcontainer --ignored legs)
+        if: matrix.lane == 'db-ignored'
+        run: |
+          set -euo pipefail
+          cargo llvm-cov clean --workspace
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test db_hooks_lifecycle -- --ignored
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
@@ -939,6 +1303,8 @@ jobs:
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_bulk_delete_batch_profile -- --ignored
+          cargo llvm-cov --no-report -p autumn-admin-plugin \
+            --test feature_flag_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
@@ -950,6 +1316,10 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
+          # One flag per lane so Codecov can tell the four uploads apart and
+          # merge them into a single commit report rather than treating a later
+          # upload as a replacement for an earlier one.
+          flags: ${{ matrix.lane }}
           fail_ci_if_error: false
 
   msrv:
@@ -1058,6 +1428,7 @@ jobs:
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_dependent_destroy \
+            --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
             --test sim_chaos \
             --test sim_fault_plan_db \
@@ -1122,6 +1493,7 @@ jobs:
   # the preemption budget + job timeout bound the state-space search.
   loom:
     name: Loom
+    # `test`, NOT `test-gate` — same reasoning as `coverage` above.
     needs: [test, meta]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     timeout-minutes: 30

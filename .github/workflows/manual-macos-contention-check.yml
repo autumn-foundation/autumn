@@ -1,0 +1,62 @@
+name: Manual macOS contention check (Semaphore rerun harness)
+
+# Manual dispatch only. Uses real macOS CI minutes. Ask before running.
+# Reruns cargo test --workspace on fresh macos-latest VMs to check for the
+# live_upgrade/cache_stampede/sim_fault_plan timing cluster. Each sample
+# gets its own VM, so no sample starts with a warm cache from another.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit to test. Must build and run cargo test --workspace."
+        required: true
+      samples:
+        description: "Number of independent fresh-VM samples to run"
+        required: false
+        default: "10"
+        type: choice
+        options: ["5", "10", "20"]
+
+env:
+  # Same values as ci.yml.
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_MIN_STACK: 8388608
+
+jobs:
+  # Job id must stay "test" to reuse ci.yml's cache entry.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    runs-on: macos-latest
+    if: fromJSON(inputs.samples) >= matrix.n
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Run tests, do not stop at the first failure
+        run: cargo test --workspace --no-fail-fast 2>&1 | tee run.log
+      - name: Check each target test's result
+        if: always()
+        run: |
+          for pattern in \
+            "upgrades_in_place_under_load_without_dropping" \
+            "cache_stampede::swr_serves_stale_and_refreshes_in_background" \
+            "sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times"
+          do
+            grep -q "$pattern" run.log \
+              && grep "$pattern" run.log \
+              || echo "MISSING: no result line for $pattern"
+          done
+      - name: Upload this sample's full log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: contention-check-sample-${{ matrix.n }}
+          path: run.log
+          retention-days: 14
