@@ -363,24 +363,19 @@ def _subcommand_type(payload):
     return _last(m.group(2)), not m.group(1)
 
 
-def _positionals(payload):
-    """(takes_any, required_count) for a variant's positional arguments.
+def _positional_fields(payload):
+    """Yield `(attr_text, type)` for each POSITIONAL field, in declaration order.
 
-    `takes_any` matters because a positional makes the next token in `autumn db
-    pull posts` unjudgeable — it is a table name, not a subcommand — so the walk
-    stops there rather than reporting drift it cannot prove.
+    Shared by `_positionals` and `_hyphen_slots` so the two can never disagree
+    about what a positional is or what order they come in — a second, parallel
+    walk is how the waiver grammar and the detector drifted apart, and the same
+    trap applies here.
 
-    `required_count` matters because clap rejects the command outright without
-    them, and it is a COUNT rather than a flag because a command can require
-    more than one: `autumn generate controller pages` supplies `name` and stops,
-    but `actions` is `required = true` as well, so clap still rejects it.
-    `autumn replay` exits with "the following required arguments were not
-    provided: <CAPSULE>". Required-ness is the field's type — a bare `String` is
-    required, `Option<T>` and `Vec<T>` are not — and the field carries no
-    `#[arg]` attribute at all in that case, which is why this walks fields
-    rather than matching attributes.
+    Walks lines rather than matching attributes because a positional often
+    carries NO `#[arg]` at all: `ConfigCommands::Set.key` is a bare
+    `key: String`, and a field the walk cannot see is a slot counted in the
+    wrong place.
     """
-    takes_any, required = False, 0
     attrs = []
     pending = ''
     for raw in payload.split('\n'):
@@ -408,8 +403,29 @@ def _positionals(payload):
             continue
         if re.search(r'\b(long|short)\b', attr_text):
             continue                            # a named option, not a positional
+        yield attr_text, m.group(2).strip()
+
+
+def _positionals(payload):
+    """(takes_any, required_count) for a variant's positional arguments.
+
+    `takes_any` matters because a positional makes the next token in `autumn db
+    pull posts` unjudgeable — it is a table name, not a subcommand — so the walk
+    stops there rather than reporting drift it cannot prove.
+
+    `required_count` matters because clap rejects the command outright without
+    them, and it is a COUNT rather than a flag because a command can require
+    more than one: `autumn generate controller pages` supplies `name` and stops,
+    but `actions` is `required = true` as well, so clap still rejects it.
+    `autumn replay` exits with "the following required arguments were not
+    provided: <CAPSULE>". Required-ness is the field's type — a bare `String` is
+    required, `Option<T>` and `Vec<T>` are not — and the field carries no
+    `#[arg]` attribute at all in that case, which is why this walks fields
+    rather than matching attributes.
+    """
+    takes_any, required = False, 0
+    for attr_text, ftype in _positional_fields(payload):
         takes_any = True
-        ftype = m.group(2).strip()
         # Not required when clap can supply it: an explicit `default_value`
         # (`autumn upgrade`'s `path: String` defaults to "." and the guide runs
         # it bare 20 times), an `Option<>`, or a `Vec<>` that accepts none.
@@ -537,8 +553,8 @@ def _options(payload, structs=None, seen=()):
     return opts
 
 
-def _hyphen_operands(payload):
-    """How many POSITIONALS of this command accept a hyphen-leading value.
+def _hyphen_slots(payload):
+    """Which POSITIONAL SLOTS accept a hyphen-leading value, in order.
 
     `ConfigCommands::Set.value` is `#[arg(allow_hyphen_values = true)]`, so
     `autumn config set retries -1` is a correct line — and reporting `-1` as an
@@ -546,20 +562,24 @@ def _hyphen_operands(payload):
     works. That is worse than the gap it closes: a gate that cries wolf on
     correct docs stops being read.
 
-    Counted rather than flagged, so the budget is spent: `config set` allows ONE
-    such operand, so `--actorr` after it is still judged. `trailing_var_arg`
-    fields are excluded — those are handled by `_trailing`, which stops the walk
-    outright rather than consuming one token.
+    Positional, not a count. A count was the first version and it leaked in the
+    other direction: the allowance belongs to ONE SLOT (`value`, the second),
+    and a plain budget stayed unspent when that slot was filled by an ordinary
+    token, so `autumn config set retries 3 --actorr` — which clap rejects,
+    both positionals being full — consumed `--actorr` against a stale allowance
+    and reported nothing. Indexing by slot spends it when the slot is filled,
+    however it is filled.
+
+    `trailing_var_arg` fields are excluded: those are `_trailing`'s, which stops
+    the walk outright rather than consuming one token.
     """
-    n = 0
-    for attrs, _field, _ftype in _arg_fields(payload):
-        if re.search(r'\b(long|short)\b', attrs):
-            continue                            # an option, not a positional
-        if re.search(r'\btrailing_var_arg\s*=\s*true', attrs):
+    slots = []
+    for attr_text, _ftype in _positional_fields(payload):
+        if re.search(r'\btrailing_var_arg\s*=\s*true', attr_text):
             continue
-        if re.search(r'\ballow_hyphen_values\s*=\s*true', attrs):
-            n += 1
-    return n
+        slots.append(
+            bool(re.search(r'\ballow_hyphen_values\s*=\s*true', attr_text)))
+    return slots
 
 
 def _trailing(payload):
@@ -596,7 +616,7 @@ def build_surface(sources):
                     spellings.update(re.findall(r'"([^"]+)"', group))
                 node = {'children': {}, 'positionals': False, 'options': {},
                         'requires_sub': False, 'required_args': 0,
-                        'trailing': False, 'hyphen_operands': 0}
+                        'trailing': False, 'hyphen_slots': []}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -617,7 +637,7 @@ def build_surface(sources):
                             node['positionals'], node['required_args'] = _positionals(structs[it])
                             node['options'] = _options(structs[it], structs)
                             node['trailing'] = _trailing(structs[it])
-                            node['hyphen_operands'] = _hyphen_operands(structs[it])
+                            node['hyphen_slots'] = _hyphen_slots(structs[it])
                 elif kind == 'struct':
                     st, required = _subcommand_type(payload)
                     if st:
@@ -626,7 +646,7 @@ def build_surface(sources):
                     node['positionals'], node['required_args'] = _positionals(payload)
                     node['options'] = _options(payload, structs)
                     node['trailing'] = _trailing(payload)
-                    node['hyphen_operands'] = _hyphen_operands(payload)
+                    node['hyphen_slots'] = _hyphen_slots(payload)
                 for spelling in spellings:
                     tree[spelling] = node
             return tree
@@ -652,7 +672,7 @@ def build_surface(sources):
                          'requires_sub': v['requires_sub'],
                          'required_args': v['required_args'],
                          'trailing': v['trailing'],
-                         'hyphen_operands': v['hyphen_operands']}
+                         'hyphen_slots': v['hyphen_slots']}
             flat.update(flatten(v['children'], key))
         return flat
 
@@ -674,7 +694,7 @@ def build_surface(sources):
             opts.update(_options(structs['Cli'], structs))
         return {'children': set(), 'positionals': False, 'options': opts,
                 'requires_sub': True, 'required_args': 0, 'trailing': False,
-                'hyphen_operands': 0}
+                'hyphen_slots': []}
 
     flat = flatten(tree)
     if flat:                                    # only alongside a real surface
@@ -2338,15 +2358,23 @@ WAIVER = re.compile(r'<!--\s*cli-surface-allow:\s*autumn\s+([a-z0-9 -]+?)\s*(?:�
 # `WAIVER` matches it overlaps keeps each marker read exactly once, as whichever
 # kind it is. `—` or `:` separate the reason here; `--` cannot, since the thing
 # to its left is itself spelled with dashes.
-# The option is spelled exactly as `_FLAG_SHAPE` allows — a long `--name`, or a
-# short of ONE letter — and must be followed by whitespace. Both halves matter:
-# accepting `-name` split the existing `autumn system-test` waiver into the
-# command `system` and an option `-test`, which quietly turned a real command
-# waiver into a flag waiver for a flag nothing reports, re-admitting the very
-# defect that waiver was holding back.
+# The option is captured loosely and then validated with `_reportable_flag` —
+# the SAME predicate the detector uses — so the two cannot disagree about what
+# is waivable. They did: the detector was widened to report `--show_config`
+# while this pattern still allowed only letters, digits and hyphens, so the one
+# spelling a page might most want to name ("`--show_config` is not a flag") was
+# reportable and un-waivable at once, and the command pattern then misread the
+# marker as a bare waiver for `dev`.
+#
+# The command is optional (a root option is waived with no command before it)
+# and, when present, must be followed by WHITESPACE. That is what keeps
+# `autumn system-test — planned` from reading as the command `system` plus an
+# option `-test`: in a hyphenated command name there is no space before the
+# `-`. An earlier version used a one-letter rule for shorts instead, which
+# happened to stop that case but also made `-zz` un-waivable while reportable.
 FLAG_WAIVER = re.compile(
-    r'<!--\s*cli-surface-allow:\s*autumn\s+([a-z0-9 -]*?)\s*'
-    r'(--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z])(?=\s)\s*(?:—|:)\s*(\S.*?)-->')
+    r'<!--\s*cli-surface-allow:\s*autumn\s+(?:([a-z0-9][a-z0-9 -]*?)\s+)?'
+    r'(-\S*)\s*(?:—|:)\s*(\S.*?)-->')
 
 INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
 # `docs/plugins.md` is a live product guide sitting at the `docs/` root rather
@@ -3183,11 +3211,12 @@ def resolve(tokens, surface, runnable=False, flags=None):
             # `name` and stops, but `actions` is `required = true` too.
             supplied = 0
             operands_only = False
-            # Positionals declared `allow_hyphen_values`, spent one per
-            # hyphen-leading token that is not a declared option. A declared
-            # option still wins, so `autumn config set k v --actor me` reads
-            # `--actor` as the flag it is, while `-1` is the value it is.
-            hyphen_budget = node['hyphen_operands']
+            # Positional slots declared `allow_hyphen_values`. Indexed by
+            # `supplied` — the slot about to be filled — so the allowance is
+            # spent when its slot is, however it is filled. A declared option
+            # still wins, so `autumn config set k v --actor me` reads `--actor`
+            # as the flag it is, while `-1` is the value it is.
+            hyphen_slots = node['hyphen_slots']
             while i < len(tokens):
                 t2 = tokens[i]
                 if t2 == '--':
@@ -3207,11 +3236,12 @@ def resolve(tokens, surface, runnable=False, flags=None):
                     if node['trailing'] and supplied:
                         return None
                     o = t2.split('=', 1)[0]
-                    if o not in node['options'] and hyphen_budget:
+                    if (o not in node['options']
+                            and supplied < len(hyphen_slots)
+                            and hyphen_slots[supplied]):
                         # The value of an `allow_hyphen_values` positional, not
-                        # a flag. Counts as a supplied argument, and spends the
-                        # budget so a later unknown flag is still reported.
-                        hyphen_budget -= 1
+                        # a flag. Filling the slot is what spends the allowance,
+                        # so a later unknown flag is still reported.
                         supplied += 1
                         i += 1
                         continue
@@ -3288,9 +3318,13 @@ def scan(root, surface, files):
         flag_allowed = collections.defaultdict(set)
         flag_spans = []
         for m in FLAG_WAIVER.finditer(text):
+            if not _reportable_flag(m.group(2)):
+                # Not a spelling the detector would ever report, so this is not
+                # a flag waiver; leave it to the command pattern.
+                continue
             marker_line = text.count('\n', 0, m.start()) + 1
             marker_block = line_block[marker_line]
-            key = (m.group(1).strip() + ' ' + m.group(2)).strip()
+            key = ((m.group(1) or '').strip() + ' ' + m.group(2)).strip()
             flag_allowed[key].update({marker_block, marker_block - 1})
             flag_spans.append(m.span())
         for m in WAIVER.finditer(text):
@@ -3594,14 +3628,20 @@ def self_test():
     # --- `allow_hyphen_values` on a positional. `autumn config set retries -1`
     # is a CORRECT line, and reporting `-1` would be the gate telling an author
     # to break a page that works — worse than the gap it closes.
-    expect(surface['config set']['hyphen_operands'] == 1,
-           'an allow_hyphen_values positional must be counted')
+    expect(surface['config set']['hyphen_slots'] == [False, True],
+           f"the allowance is per SLOT, in order: {surface['config set']['hyphen_slots']}")
     expect(opts_of('config set retries -1') == [],
            "a hyphen-leading value of an allow_hyphen_values positional is not a flag")
     expect(opts_of('config set retries -1 --actor me') == [],
            'a declared option after such a value still resolves')
     expect(opts_of('config set retries -1 --actorr me') == [('config set', '--actorr')],
-           'the budget is spent, so a later unknown flag is still reported')
+           'the allowance is spent, so a later unknown flag is still reported')
+    # …and spent by an ORDINARY value too. A plain budget stayed unspent here,
+    # so `--actorr` was consumed against an allowance whose slot was full.
+    expect(opts_of('config set retries 3 --actorr') == [('config set', '--actorr')],
+           'a filled slot spends its allowance however it was filled')
+    expect(opts_of('config set -1 x') == [('config set', '-1')],
+           'the allowance belongs to slot 1, so a hyphen in slot 0 is reported')
     expect(opts_of('console -1') == [('console', '-1')],
            'a command with no such positional still reports a hyphen token')
 
@@ -4674,6 +4714,20 @@ def self_test():
     expect(FLAG_WAIVER.search(
         '<!-- cli-surface-allow: autumn console -p — why -->').group(2) == '-p',
         'a one-letter short option is a flag waiver')
+    # The waiver grammar must cover EVERY spelling the detector reports, or a
+    # page can be told about a defect it has no way to waive. These are the two
+    # the widened detector added.
+    for spelling in ('--show_config', '-zz'):
+        m = FLAG_WAIVER.search(
+            f'<!-- cli-surface-allow: autumn dev {spelling} — why -->')
+        expect(m and m.group(2) == spelling and m.group(1) == 'dev',
+               f'{spelling} is reportable, so it must be waivable: {m and m.groups()}')
+        expect(_reportable_flag(spelling),
+               f'{spelling} must be reportable for that waiver to be needed')
+    # A root option is waived with no command before it.
+    m = FLAG_WAIVER.search('<!-- cli-surface-allow: autumn --helpp — why -->')
+    expect(m and m.group(1) is None and m.group(2) == '--helpp',
+           f'a root option waiver names no command: {m and m.groups()}')
     # …and the command waiver it would have been misread as is not created, so
     # real command drift on the waived command still reports.
     cmd_still = '\n'.join([
