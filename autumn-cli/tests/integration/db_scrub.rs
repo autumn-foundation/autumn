@@ -1587,6 +1587,65 @@ async fn a_delete_trigger_on_a_leaf_partition_of_an_emptied_table_is_refused() {
     );
 }
 
+/// A composite key whose column names contain the aggregate separator.
+///
+/// The constraint probe used to join each side's column names with `U+001F` and
+/// split them back apart, on the assumption that no identifier could contain
+/// it. Postgres accepts any character in a quoted identifier, so such a name was
+/// torn in half and the halves zipped against the other side's — emitting a join
+/// over columns that do not exist, or (when only one side was affected) a
+/// shorter, WEAKER join over ones that do.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_composite_key_survives_a_control_character_in_a_column_name() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    admin
+        .batch_execute("CREATE DATABASE control_char_key")
+        .await
+        .unwrap();
+    let client = connect(&format!("{base}/control_char_key")).await;
+    let us = '\u{1f}';
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE parents (id INT PRIMARY KEY, a INT NOT NULL, \"b{us}c\" INT NOT NULL, \
+                UNIQUE (a, \"b{us}c\")); \
+             CREATE TABLE kids (id INT PRIMARY KEY, pa INT NOT NULL, \"pb{us}c\" INT NOT NULL, \
+                FOREIGN KEY (pa, \"pb{us}c\") REFERENCES parents (a, \"b{us}c\")); \
+             INSERT INTO parents SELECT g, g, g FROM generate_series(1, 10) g; \
+             INSERT INTO kids SELECT g, g, g FROM generate_series(1, 10) g;"
+        ))
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project_sources(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        "[defaults]\nsafe_columns = [\"id\"]\n\n\
+         [tables.parents]\nsafe = [\"a\", \"b\\u001Fc\"]\n\n\
+         [tables.parents.encrypted]\n\n\
+         [tables.kids]\nsafe = [\"pa\", \"pb\\u001Fc\"]\n",
+    )
+    .unwrap();
+    let url = format!("{base}/control_char_key");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "parents=50%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM parents").await,
+        5,
+        "the sample must apply rather than fail on a column it mis-parsed"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM kids").await,
+        5,
+        "and the composite key must have carried the children along"
+    );
+}
+
 /// A statement-level trigger on a leaf must not refuse the run.
 ///
 /// `DELETE FROM parent` fires a child's **row**-level triggers and not its

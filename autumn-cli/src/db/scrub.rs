@@ -3098,12 +3098,15 @@ struct ConstraintRow {
     name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     child: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    child_cols: String,
+    /// The key's columns in key order, as an array rather than a joined
+    /// string: a Postgres identifier may contain any character, so no separator
+    /// is safe to split on afterwards.
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Text>)]
+    child_cols: Vec<String>,
     #[diesel(sql_type = diesel::sql_types::Text)]
     parent: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    parent_cols: String,
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Text>)]
+    parent_cols: Vec<String>,
     /// True for `MATCH FULL`, whose composite NULL rule differs from the
     /// default `MATCH SIMPLE`.
     #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -3115,11 +3118,6 @@ struct ConstraintRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     cloned: bool,
 }
-
-/// The column-name separator the constraint probe aggregates on. Postgres
-/// identifiers can contain a comma, so a printable separator would be
-/// ambiguous; `US` (unit separator) cannot appear in one.
-const KEY_SEPARATOR: char = '\u{1f}';
 
 fn pair_set(rows: Vec<PairRow>) -> BTreeSet<(String, String)> {
     rows.into_iter().map(|r| (r.tbl, r.col)).collect()
@@ -3199,7 +3197,6 @@ fn probe_database_facts(
     // The set above answers "may this column be rewritten"; `--sample` asks a
     // different question — "which rows must travel together" — and that needs
     // the constraint, in key order, both sides paired.
-    let sep = KEY_SEPARATOR;
     let cloned = if has_catalog_column(&mut conn, "pg_constraint", "conparentid")? {
         "c.conparentid <> 0"
     } else {
@@ -3207,11 +3204,11 @@ fn probe_database_facts(
     };
     let constraint_rows: Vec<ConstraintRow> = sql_query(format!(
         "SELECT c.conname AS name, rel.relname AS child, frel.relname AS parent, \
-         (SELECT string_agg(att.attname, '{sep}' ORDER BY k.ord) \
+         (SELECT array_agg(att.attname::text ORDER BY k.ord) \
           FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
           JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = k.attnum) \
          AS child_cols, \
-         (SELECT string_agg(att.attname, '{sep}' ORDER BY k.ord) \
+         (SELECT array_agg(att.attname::text ORDER BY k.ord) \
           FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) \
           JOIN pg_attribute att ON att.attrelid = c.confrelid AND att.attnum = k.attnum) \
          AS parent_cols, \
@@ -3232,17 +3229,9 @@ fn probe_database_facts(
         .map(|row| sample::ForeignKeyConstraint {
             name: row.name,
             child_table: row.child,
-            child_columns: row
-                .child_cols
-                .split(KEY_SEPARATOR)
-                .map(str::to_owned)
-                .collect(),
+            child_columns: row.child_cols,
             parent_table: row.parent,
-            parent_columns: row
-                .parent_cols
-                .split(KEY_SEPARATOR)
-                .map(str::to_owned)
-                .collect(),
+            parent_columns: row.parent_cols,
             match_full: row.match_full,
         })
         .collect();

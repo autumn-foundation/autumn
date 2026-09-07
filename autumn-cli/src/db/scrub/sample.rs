@@ -224,6 +224,14 @@ pub enum SampleError {
     },
     /// The closure walk did not converge (defensive; unreachable in practice).
     IterationLimit,
+    /// A foreign key whose two sides have different column counts. Impossible
+    /// from the catalog, and silently corrupting if it ever happened: the join
+    /// is built by zipping the two lists, so the extra components would simply
+    /// be dropped and the walk would follow a weaker key than the constraint.
+    KeyArityMismatch {
+        /// `constraint (child -> parent): N vs M column(s)`, sorted.
+        keys: Vec<String>,
+    },
     /// A table the run promised would be empty holds rows once every write is
     /// done. A trigger fired by one emptying statement can insert into a table
     /// an earlier statement already emptied, so ordering the deletes cannot rule
@@ -390,6 +398,17 @@ impl std::fmt::Display for SampleError {
                  break the cycle on the copy before sampling.",
                 tables.len(),
                 bullets(tables),
+            ),
+            Self::KeyArityMismatch { keys } => write!(
+                f,
+                "{} foreign key(s) report a different number of columns on each side:\n{}\n  \
+                 The walk joins the two sides component by component, so a mismatch would \
+                 silently follow a weaker key than the constraint declares \u{2014} keeping or \
+                 removing rows the database never related. The catalog should never report \
+                 this; if it does, the schema is worth inspecting before any sample is taken \
+                 from it.",
+                keys.len(),
+                bullets(keys),
             ),
             Self::IterationLimit => write!(
                 f,
@@ -783,10 +802,40 @@ type ClassifiedEdges = (
     BTreeSet<String>,
 );
 
+/// Refuse a foreign key whose two sides report different column counts.
+///
+/// Every join this module builds zips the child's columns against the parent's,
+/// and `zip` stops at the shorter list — so a mismatch would emit a join WEAKER
+/// than the constraint, silently relating rows the database does not. The
+/// catalog cannot produce one; this exists so that if it ever did, the run would
+/// stop rather than quietly sample the wrong rows.
+fn check_key_arity(foreign_keys: &[ForeignKeyConstraint]) -> Result<(), SampleError> {
+    let mut keys: Vec<String> = foreign_keys
+        .iter()
+        .filter(|edge| edge.child_columns.len() != edge.parent_columns.len())
+        .map(|edge| {
+            format!(
+                "{} ({} -> {}): {} vs {} column(s)",
+                comment_safe(&edge.name),
+                comment_safe(&edge.child_table),
+                comment_safe(&edge.parent_table),
+                edge.child_columns.len(),
+                edge.parent_columns.len(),
+            )
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    keys.sort();
+    Err(SampleError::KeyArityMismatch { keys })
+}
+
 fn classify_edges(
     inputs: &SampleInputs<'_>,
     roles: &BTreeMap<String, SampleRole>,
 ) -> Result<ClassifiedEdges, SampleError> {
+    check_key_arity(inputs.foreign_keys)?;
     let describe = |edge: &ForeignKeyConstraint| {
         format!(
             "{} -> {} ({})",
@@ -1268,6 +1317,11 @@ pub fn comment_safe(name: &str) -> String {
 }
 
 /// The `ON` clause joining a child to its parent across every key component.
+///
+/// The two sides are zipped, and `zip` stops at the shorter one — which would
+/// silently emit a WEAKER join than the constraint, matching rows the key does
+/// not. `classify_edges` refuses a mismatched key before this runs, so the two
+/// lists are known to be the same length here.
 fn join_on(edge: &ForeignKeyConstraint, child: &str, parent: &str) -> String {
     edge.child_columns
         .iter()
@@ -3297,6 +3351,33 @@ mod tests {
         assert!(
             plan.walk_edges.iter().all(|e| e.name != "countries_job_fk"),
             "but it must not enter the walk"
+        );
+    }
+
+    #[test]
+    fn a_key_whose_sides_disagree_on_arity_is_refused() {
+        // The join zips the two column lists, and `zip` stops at the shorter —
+        // so a mismatch would emit a join WEAKER than the constraint and relate
+        // rows the database does not. The catalog cannot report this, which is
+        // exactly why it must not be handled by silently dropping components.
+        let (tables, _) = schema();
+        let mut lopsided = fk("comments_user_fk", "comments", "user_id", "users", "id");
+        lopsided.child_columns.push("body".to_owned());
+        let err = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &[lopsided],
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, SampleError::KeyArityMismatch { .. }),
+            "a lopsided key must be refused, not zipped short: {message}"
+        );
+        assert!(
+            message.contains("comments_user_fk") && message.contains("2 vs 1"),
+            "and the refusal must name the key and both counts: {message}"
         );
     }
 
