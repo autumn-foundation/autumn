@@ -333,6 +333,63 @@ fn option_field_emits_nullable_schema() {
     );
 }
 
+// ── Conditional omission on the read schema (issue #802) ───────────────
+
+mod schema_conditional {
+    autumn_web::reexports::diesel::table! {
+        conditional_rows (id) {
+            id -> Int8,
+            title -> Text,
+            tags -> Text,
+        }
+    }
+}
+
+use schema_conditional::conditional_rows;
+
+#[autumn_web::model(table = "conditional_rows")]
+pub struct ConditionalRow {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    /// Omitted from a response whenever the predicate matches.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tags: String,
+}
+
+/// The read schema keeps the property but must NOT require it.
+///
+/// Sound because this schema describes a RESPONSE only — the generated API
+/// takes `New*` / `Update*` as request bodies, never the query struct. A
+/// response tripping the predicate omits `tags`, and a strict generated client
+/// would reject that response if the schema demanded it.
+///
+/// `#[derive(OpenApiSchema)]` deliberately refuses this shape instead, because
+/// the same type there may be a `Json<T>` request and `skip_serializing_if`
+/// governs serialization alone — serde still rejects a request that omits it.
+#[test]
+fn read_schema_keeps_conditionally_omitted_field_but_does_not_require_it() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = ConditionalRow::schema();
+
+    assert!(
+        schema["properties"]["tags"].is_object(),
+        "the field does reach some responses: {schema}"
+    );
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("required")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(required.contains(&"title"), "{required:?}");
+    assert!(
+        !required.contains(&"tags"),
+        "a response may omit it, so a client must not demand it: {required:?}"
+    );
+}
+
 // ── Serde-rename fidelity on `#[model]` (issue #1972, Part 2 / Item 1) ──
 
 mod schema_rename {

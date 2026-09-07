@@ -7492,6 +7492,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // in kind: the field DOES appear in some responses, so the property stays —
     // it just cannot be `required`, because a response that trips the predicate
     // omits it and a strict client would reject that response.
+    //
+    // Sound HERE and only here, because this schema describes a RESPONSE: the
+    // generated repository API takes `New*` / `Update*` as its request bodies,
+    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
+    // — the same type may be a `Json<T>` request — so it refuses the shape
+    // instead, since `skip_serializing_if` governs serialization alone and
+    // serde still rejects a request that omits the field.
     let query_struct_schema_body = emit_schema_fn_body_full(
         &serializable_field_refs,
         false,

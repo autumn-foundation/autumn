@@ -45,6 +45,31 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
     let schema_body = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(named) => {
+                // A non-`Option` field with `#[serde(skip_serializing_if)]` is
+                // direction-dependent in a way one schema cannot express:
+                // responses may omit it, requests must still carry it. Marking
+                // it required breaks a client READING a response; marking it
+                // optional breaks a client SENDING one. Refuse, as with the
+                // other directional attributes. On an `Option<T>` field --
+                // `skip_serializing_if = "Option::is_none"`, the common case --
+                // there is no conflict: it is already not required.
+                if let Some(field) = named.named.iter().find(|f| {
+                    crate::schema::field_has_skip_serializing_if(f)
+                        && !crate::schema::is_option_type(&f.ty)
+                }) {
+                    return syn::Error::new_spanned(
+                        field,
+                        "#[derive(OpenApiSchema)] cannot describe a non-`Option` field with \
+                         `#[serde(skip_serializing_if = ...)]`: one schema covers both requests \
+                         and responses, but that attribute governs serialization only -- a \
+                         response may omit the field while serde still rejects a request that \
+                         does. Make the field `Option<T>` (where the attribute costs nothing, \
+                         since it is already optional), or write the `OpenApiSchema` impl by \
+                         hand and register it with `OpenApiConfig::register_schema`.",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
                 // The emitters expect `&[&&Field]` (they were written
                 // against the `Vec<&&Field>` the model macro collects); build
                 // that shape here.
@@ -55,15 +80,21 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 // entries match the serialized wire names — same
                 // helper/precedence `#[model]` and `FormModel` use.
                 let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
-                // Same rule as the `#[model]` read schema: a
-                // `skip_serializing_if` field reaches some responses, so the
-                // property stays, but it cannot be `required`.
+                // NOT the `#[model]` read-schema rule. That schema describes a
+                // response only -- the generated API takes `New*` / `Update*`
+                // as request bodies -- so dropping a `skip_serializing_if`
+                // field from `required` is right there. This derive is applied
+                // to types used as `Json<T>` REQUESTS as well, and
+                // `skip_serializing_if` governs serialization alone: serde
+                // still rejects a request that omits the field. One schema
+                // cannot say both, so the ambiguous shape is refused above and
+                // everything reaching here is symmetric.
                 crate::schema::emit_schema_fn_body_full(
                     &field_ref_refs,
                     false,
                     &[],
                     rename_all_rule.as_deref(),
-                    &crate::schema::field_has_skip_serializing_if,
+                    &|_| false,
                 )
             }
             _ => {

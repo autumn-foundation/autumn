@@ -246,23 +246,36 @@ fn opaque_predicate_distinguishes_a_fieldless_struct_from_a_placeholder() {
 
 // ── Requiredness follows serde, not the Rust type ──────────────────
 
+// A non-`Option` field with `#[serde(skip_serializing_if)]` is now a compile
+// error on this derive, so the positive case lives in `repository_openapi.rs`
+// against a `#[model]`, whose read schema describes a response only.
+//
+// The reason for the split: `skip_serializing_if` governs serialization alone.
+// A response may omit the field; serde still rejects a REQUEST that omits it.
+// The `#[model]` query struct is response-only — the generated API takes
+// `New*` / `Update*` as request bodies — so dropping it from `required` is
+// sound there. This derive is applied to request types too, so one schema
+// cannot be right for both and the shape is refused:
+//
+//   #[derive(OpenApiSchema)]
+//   struct Bad {
+//       #[serde(skip_serializing_if = "Vec::is_empty")]
+//       tags: Vec<String>,          // must NOT compile
+//   }
+//
+// On `Option<T>` there is no conflict — already not required — and it compiles:
 #[derive(Serialize, Deserialize, OpenApiSchema)]
 #[allow(dead_code)]
-struct ConditionallyOmitted {
+struct OptionalWithSkip {
     always: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    sometimes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sometimes: Option<String>,
 }
 
 #[test]
-fn a_conditionally_omitted_field_keeps_its_property_but_is_not_required() {
-    let schema = <ConditionallyOmitted as OpenApiSchema>::schema();
-
-    // The property stays — the field DOES appear in some responses.
-    assert!(
-        schema["properties"]["sometimes"].is_object(),
-        "conditionally omitted is not the same as absent: {schema}"
-    );
+fn skip_serializing_if_on_an_option_is_accepted_and_already_optional() {
+    let schema = <OptionalWithSkip as OpenApiSchema>::schema();
+    assert!(schema["properties"]["sometimes"].is_object(), "{schema}");
 
     let required: Vec<&str> = schema["required"]
         .as_array()
@@ -271,8 +284,7 @@ fn a_conditionally_omitted_field_keeps_its_property_but_is_not_required() {
     assert!(required.contains(&"always"), "{schema}");
     assert!(
         !required.contains(&"sometimes"),
-        "a response tripping the predicate omits it, so a strict client must not \
-         demand it: {schema}"
+        "an Option is not required regardless of the skip predicate: {schema}"
     );
 }
 
