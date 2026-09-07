@@ -43,13 +43,22 @@ moving on.
    has a `reason =`; it never compares the two files' entries to each other.
    No other test, script, or CI step (`.github/workflows/ci.yml`,
    `scripts/check-advisories.sh`) diffs or cross-checks them either.
-3. **Today the invariant holds**, checked directly rather than assumed: all
-   three shared waiver entries (`RUSTSEC-2023-0071`, `RUSTSEC-2024-0384`,
-   `RUSTSEC-2026-0253`) have byte-identical `id =` and `reason =` fields in
-   both files. Only the surrounding `#` comments differ, and deliberately so
-   — `deny-sqlite.toml` says "kept identical to deny.toml on purpose... full
-   rationale lives there" and gives a shorter version. That is intentional
-   deduplication of prose, not drift.
+3. **The invariant has a 51-day track record, not just a snapshot.** Both
+   files were added together on 2026-07-18 (`ec4f3ef8`, #2050). Since then,
+   three commits changed the shared waiver list and correctly touched both
+   files (`ec4f3ef8`'s initial three entries; `3ffdc62e`, adding the
+   `RUSTSEC-2026-0253` ignore to both; `f01bb5df`, dropping the stale
+   `RUSTSEC-2026-0173` ignore from both), while three more commits
+   (`29edfb8a`, `041f58c7`, `f29d4b4a`) correctly touched *only* `deny.toml`
+   — each added one feature to `[graph].features`, which is
+   `deny.toml`-only surface the invariant explicitly excludes. Today, checked
+   directly rather than assumed, all three current shared waiver entries
+   (`RUSTSEC-2023-0071`, `RUSTSEC-2024-0384`, `RUSTSEC-2026-0253`) have
+   byte-identical `id =` and `reason =` fields in both files. Only the
+   surrounding `#` comments differ, and deliberately so — `deny-sqlite.toml`
+   says "kept identical to deny.toml on purpose... full rationale lives
+   there" and gives a shorter version. That is intentional deduplication of
+   prose, not drift.
 4. **A concrete, dated test of that reliance is already on the calendar**: all
    three shared entries carry the same `review-by: 2026-10-01`. That date
    requires a human to open and edit both files in the same PR, by hand, with
@@ -65,16 +74,17 @@ moving on.
 
 ## Do nothing / decide later — 12-month baseline
 
-No incident has ever been caused by this gap — the invariant has held since
-`deny-sqlite.toml` was added (2026-09-03) through today. The honest cost of
+No incident has ever been caused by this gap — the invariant has held for the
+full 51 days since `deny-sqlite.toml` was added alongside `deny.toml`
+(2026-07-18), across three separate hand-synced edits. The honest cost of
 leaving it alone is not zero, though, and it is not indefinite either: on or
 before 2026-10-01, whoever triages the three review-by waivers has to touch
-both files by hand, and nothing catches a partial edit. If both files are
-updated together, as they have been, nothing changes. If they are not, the
-first symptom is a false-negative CI pass — the sqlite backend graph, or the
-default graph, silently keeping a waiver for an advisory the other graph has
-already resolved — which is invisible until someone reads both files
-side-by-side, exactly as this review just did.
+both files by hand again, and nothing catches a partial edit. If both files
+are updated together, as they have been every time so far, nothing changes.
+If they are not, the first symptom is a false-negative CI pass — the sqlite
+backend graph, or the default graph, silently keeping a waiver for an
+advisory the other graph has already resolved — which is invisible until
+someone reads both files side-by-side, exactly as this review just did.
 
 ## Impact floor check
 
@@ -121,14 +131,31 @@ Revisit this decision if either occurs:
 ## Reproduce
 
 ```bash
+# IMPORTANT: a shallow clone answers the history queries below WRONG — it
+# silently reports the oldest commit it happens to have as the "add" commit.
+# Unshallow first, the same way ADR 0012's own evidence section does.
+git rev-parse --is-shallow-repository   # if "true":
+git fetch --unshallow origin
+
 # The documented invariant, in both files' own words
 grep -n "IN SYNC\|share the same advisories" deny-sqlite.toml CONTRIBUTING.md
+grep -n "IN SYNC\|keep.*sync" deny.toml   # deny.toml itself asserts no such obligation
 
 # The only test touching both files checks reasons, not cross-file equality
-sed -n '896,914p' autumn-cli/tests/integration/dependency_audit.rs
+sed -n '898,914p' autumn-cli/tests/integration/dependency_audit.rs
 
 # No script or CI step diffs the two files against each other
 grep -rn "deny-sqlite" .github/workflows/ci.yml scripts/check-advisories.sh
+
+# Real origin: both files landed together on 2026-07-18, not more recently
+git log origin/trunk-dev --diff-filter=A --format='%h %ad %s' --date=short \
+  -- deny.toml deny-sqlite.toml
+
+# The three commits since that correctly kept the shared sections in sync,
+# and the three that correctly touched only deny.toml (a [graph].features-only
+# change, which the invariant excludes)
+git log origin/trunk-dev --format='%h %ad %s' --date=short -- deny.toml deny-sqlite.toml
+git show --stat --format='' <sha> -- deny.toml deny-sqlite.toml   # per commit above
 
 # Today the shared waivers are in fact identical (id + reason fields)
 for id in RUSTSEC-2023-0071 RUSTSEC-2024-0384 RUSTSEC-2026-0253; do
