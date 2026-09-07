@@ -2436,19 +2436,47 @@ def hidden_open(view, src, at):
     already blanked it, and the offsets line up because every view here is
     length-preserving.
     """
-    a = HIDDEN_OPEN.search(view, at)
-    b, pos = None, at
+    found = [HIDDEN_OPEN.search(view, at), _closed_dialog_search(view, at)]
+    pos = at
     while True:
         c = style_hidden_search(src, pos)
         if not c:
             break
         if c.start() < len(view) and view[c.start()] == '<':
-            b = c
+            found.append(c)
             break
         pos = c.start() + 1
-    if a and b:
-        return a if a.start() <= b.start() else b
-    return a or b
+    hits = [m for m in found if m]
+    return min(hits, key=lambda m: m.start()) if hits else None
+
+
+# A `<dialog>` with no `open` attribute is hidden by the USER-AGENT stylesheet
+# — 0x0 in Chromium, where the same element carrying `open` is 30x17. So it
+# belongs with `template` in the family of elements whose contents a browser
+# does not show, and `template` was already handled; this was the omission
+# beside it.
+#
+# It cannot simply join `HIDDEN_TAGS`, because that list hides by NAME and this
+# one hides only WITHOUT the attribute. Same shape as `<input type="hidden">`:
+# an element whose painting depends on an attribute, so the attribute is read.
+DIALOG_TAG = re.compile(
+    r'<(dialog)((?:' + _TWS + r'+' + ATTR + r')*)' + _TWS + r'*/?>', re.I)
+# A bare `open`, or `open=` with any value. `open="false"` still opens the
+# dialog — it is a boolean attribute, so presence is what counts — which is why
+# this looks for the NAME and never reads its value.
+_OPEN_ATTR = re.compile(r'(?:^|[\s/])open(?:' + _TWS + r'*=|[\s/]|$)', re.I)
+
+
+def _closed_dialog_search(txt, at):
+    """The next `<dialog>` opening tag that has no `open` attribute."""
+    pos = at
+    while True:
+        m = DIALOG_TAG.search(txt, pos)
+        if not m:
+            return None
+        if not _OPEN_ATTR.search(m.group(2)):
+            return m
+        pos = m.start() + 1
 
 
 # HTML void elements. They have no close tag and no contents, so a `hidden` one
@@ -6664,6 +6692,23 @@ self_test() {
     > "$c9lq/docs/guide/jobs.md"
   git -C "$c9lq" add -A && git -C "$c9lq" commit -qm backtick-in-raw-attribute
   check "a backtick in a raw tag is not a code delimiter" fail "$c9lq"
+
+  # A `<dialog>` with no `open` is hidden by the USER-AGENT stylesheet — 0x0 in
+  # Chromium — so a link inside it is not a route. It belongs with `template`,
+  # which was already handled; this was the omission beside it.
+  local c9lr="$tmp/c9lr"; make_corpus "$c9lr"
+  printf '# Jobs\n\n<dialog><a href="mail.md">Mail</a></dialog>\n' \
+    > "$c9lr/docs/guide/jobs.md"
+  git -C "$c9lr" add -A && git -C "$c9lr" commit -qm closed-dialog
+  check "a link in a closed dialog is not a route" fail "$c9lr"
+
+  # ...but WITH `open` the same element is 30x17 and the link is live, which is
+  # why `dialog` cannot simply join the hide-by-name list.
+  local c9ls="$tmp/c9ls"; make_corpus "$c9ls"
+  printf '# Jobs\n\n<dialog open><a href="mail.md">Mail</a></dialog>\n' \
+    > "$c9ls/docs/guide/jobs.md"
+  git -C "$c9ls" add -A && git -C "$c9ls" commit -qm open-dialog
+  check "a link in an open dialog is a route" pass "$c9ls"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
