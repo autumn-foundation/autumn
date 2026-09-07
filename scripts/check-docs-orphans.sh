@@ -425,7 +425,14 @@ def _string_value(m):
 # matched, so the crate contributed no entry surface at all. A literal string
 # takes no escapes — that is the whole difference between the two forms — so
 # only the basic group is decoded.
-_TOML_ESCAPE = re.compile(r'\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|(.))')
+# The third alternative is TOML's LINE CONTINUATION: a backslash whose last
+# non-whitespace position on the line is itself trims the newline and all
+# whitespace up to the next non-whitespace character. `readme = """\` then
+# `  docs/intro.md"""` is `docs/intro.md` to Cargo, and `(.)` alone never
+# matched it — `.` does not cross a newline — so the backslash and indentation
+# survived into the path and matched no tracked file.
+_TOML_ESCAPE = re.compile(
+    r'\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|([ \t]*\r?\n[ \t\r\n]*)|(.))')
 _TOML_SIMPLE = {'b': '\b', 't': '\t', 'n': '\n', 'f': '\f', 'r': '\r',
                 '"': '"', '\\': '\\', '/': '/'}
 
@@ -437,9 +444,11 @@ def _decode_basic(text):
             return chr(int(m.group(1), 16))
         if m.group(2) is not None:
             return chr(int(m.group(2), 16))
+        if m.group(3) is not None:
+            return ''                       # line continuation: all of it goes
         # An unknown escape is invalid TOML; keeping the character is the
         # reading that cannot invent a path Cargo would not resolve.
-        return _TOML_SIMPLE.get(m.group(3), m.group(3))
+        return _TOML_SIMPLE.get(m.group(4), m.group(4))
     return _TOML_ESCAPE.sub(one, text)
 
 
@@ -7854,6 +7863,26 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n2/pkg/README.md"
   git -C "$c9n2" add -A && git -C "$c9n2" commit -qm inline-escaped-quote
   check "an escaped quote does not end an inline table string" fail "$c9n2"
+
+  # TOML's LINE CONTINUATION: a trailing backslash trims the newline and the
+  # indentation after it, so this names `intro.md`. `.` does not cross a
+  # newline, so the old escape pattern left the backslash in the path.
+  local c9n3="$tmp/c9n3"; make_corpus "$c9n3"
+  mkdir -p "$c9n3/pkg"
+  printf '[package]\nname = "pkg"\nreadme = """\\\n  intro.md"""\n' \
+    > "$c9n3/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n3/pkg/intro.md"
+  git -C "$c9n3" add -A && git -C "$c9n3" commit -qm line-continuation
+  check "a line continuation trims the newline after it" pass "$c9n3"
+
+  # ...but a LITERAL multi-line string has no escapes at all, so a trailing
+  # backslash there is part of the name rather than a continuation.
+  local c9n4="$tmp/c9n4"; make_corpus "$c9n4"
+  mkdir -p "$c9n4/pkg"
+  printf "[package]\nname = \"pkg\"\nreadme = '''in\\\\tro.md'''\n" > "$c9n4/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n4/pkg/in\\tro.md"
+  git -C "$c9n4" add -A && git -C "$c9n4" commit -qm literal-multiline-no-escapes
+  check "a literal multi-line readme takes no escapes" pass "$c9n4"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
