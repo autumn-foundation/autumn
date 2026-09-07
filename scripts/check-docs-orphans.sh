@@ -453,12 +453,18 @@ def _decode_basic(text):
 
 
 def _inline_table(value):
-    """An inline table's entries as `key = value` strings, else None.
+    """A COMPLETE inline table's entries as `key = value` strings, else None.
 
     `package = { name = "pkg", readme = "README.md" }` is a valid manifest and
     `cargo metadata` resolves it to an ordinary package — recognising neither a
     `[package]` header nor a `package.*` dotted key classified it as virtual,
     dropping a real entry surface.
+
+    None also means UNTERMINATED, which is how the caller knows to read on.
+    Cargo's parser accepts an inline table spread over several lines even
+    though TOML 1.0 forbids newlines inside one, and resolves it normally —
+    measured, not assumed. Returning the entries found so far would have marked
+    the package table seen and silently dropped every later key.
     """
     s = value.lstrip()
     if not s.startswith('{'):
@@ -468,6 +474,7 @@ def _inline_table(value):
     depth = 0
     quote = None
     esc = False
+    closed = False
     for ch in s[1:]:
         if quote is not None:
             cur += ch
@@ -494,6 +501,7 @@ def _inline_table(value):
             cur += ch
         elif ch == '}':
             if depth == 0:
+                closed = True
                 break
             depth -= 1
             cur += ch
@@ -502,6 +510,8 @@ def _inline_table(value):
             cur = ''
         else:
             cur += ch
+    if not closed:
+        return None
     entries.append(cur)
     return [e.strip() for e in entries if e.strip()]
 
@@ -772,12 +782,15 @@ def _toml_table(manifest, name):
         reports `publish: []`, exactly as for the plain spelling.
       - an INLINE table. `package = { name = "pkg", readme = "README.md" }` is
         a whole package; recognising neither form classified the manifest as
-        virtual and dropped a real entry surface.
+        virtual and dropped a real entry surface. It may also run over several
+        lines — TOML 1.0 forbids that, Cargo's parser accepts it — so the rows
+        are materialised and read forward until the table closes.
     """
     want = tuple(name.split('.'))
+    rows = list(_toml_lines(manifest))
     out = []
     seen = False
-    for table, line, live in _toml_lines(manifest):
+    for idx, (table, line, live) in enumerate(rows):
         if table == want:
             seen = True
             out.append(line)
@@ -794,8 +807,17 @@ def _toml_table(manifest, name):
             # spelling they arrived in; `_line_key` decodes them back.
             out.append('.'.join('"' + s.replace('\\', '\\\\').replace('"', '\\"')
                                 + '"' for s in segs[len(want):]) + ' =' + value)
-        elif segs == want:
-            entries = _inline_table(value)
+        elif segs == want and value.lstrip().startswith('{'):
+            # Read forward until the braces close. `_inline_table` returns None
+            # for an unterminated table precisely so this loop knows to keep
+            # going rather than accept the opening line's entries as the whole.
+            text = value
+            entries = _inline_table(text)
+            nxt = idx + 1
+            while entries is None and nxt < len(rows):
+                text += '\n' + rows[nxt][1]
+                entries = _inline_table(text)
+                nxt += 1
             if entries is not None:
                 seen = True
                 out.extend(entries)
@@ -7883,6 +7905,17 @@ self_test() {
   printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n4/pkg/in\\tro.md"
   git -C "$c9n4" add -A && git -C "$c9n4" commit -qm literal-multiline-no-escapes
   check "a literal multi-line readme takes no escapes" pass "$c9n4"
+
+  # An inline table may run over several lines. TOML 1.0 forbids that; Cargo's
+  # parser accepts it and reports `publish: []` here, so passing only the
+  # opening line's text marked the package seen and dropped every later key.
+  local c9n5="$tmp/c9n5"; make_corpus "$c9n5"
+  mkdir -p "$c9n5/pkg"
+  printf 'package = {\nname = "pkg",\npublish = false,\nreadme = "README.md" }\n' \
+    > "$c9n5/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n5/pkg/README.md"
+  git -C "$c9n5" add -A && git -C "$c9n5" commit -qm multiline-inline-table
+  check "a multi-line inline table is read whole" fail "$c9n5"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
