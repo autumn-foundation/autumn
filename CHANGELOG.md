@@ -95,7 +95,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent reaches the child, which the plan models separately); an exact `100%`
   root counts as removing no rows, so it no longer trips the outside-reference
   refusal; and `--dry-run` wraps its SQL in `BEGIN`/`COMMIT`, without which the
-  printed `ON COMMIT DROP` keep-sets could not be run as shown. A foreign key declared on a partition rather than
+  printed `ON COMMIT DROP` keep-sets could not be run as shown. With `--output`,
+  the artifact is now captured BEFORE the sampled tables are compacted: locks are
+  released at commit, and running a whole-schema `VACUUM (FULL)` first would
+  stretch the commit-to-dump window — during which a concurrent write could land
+  unscrubbed rows in the artifact — from moments to minutes, for no benefit,
+  since `pg_dump` is logical and a compacted table dumps to the same bytes. A foreign key declared on a partition rather than
   cloned onto it from its partitioned parent is likewise refused, rather than
   dropped from the walk and the integrity re-check as if it were a clone. The
   re-check honours each constraint's own NULL rule, so a partly-NULL composite

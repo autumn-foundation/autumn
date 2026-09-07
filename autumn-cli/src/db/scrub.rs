@@ -2533,6 +2533,7 @@ fn classify_and_apply(
             );
         }
     };
+    let mut pending_compaction: Vec<(&str, &str, &sample::SamplePlan, i64)> = Vec::new();
     for (label, url, plan, facts, sampling) in &plans {
         let purges = purge_statements(&facts.framework_tables, &sources.config);
         let (applied, sampled) = execute(
@@ -2551,16 +2552,25 @@ fn classify_and_apply(
         }
         if let (Some(sampling), Some(sampled)) = (sampling.as_ref(), sampled) {
             report_sample_outcome(label, &sampled);
-            // Deleting rows leaves the table files exactly as large as they
-            // were, so a sample that is not compacted still needs the source's
-            // disk and still dumps slowly. This is the step that makes the
-            // subset actually laptop-sized, and it can only run after the
-            // commit: VACUUM FULL rewrites each table and cannot join a
-            // transaction.
-            report_reclaimed_size(url, label, sampling, sampled.size_before);
+            pending_compaction.push((url.as_str(), label.as_str(), sampling, sampled.size_before));
         }
     }
 
+    // The artifact is captured BEFORE compaction, not after.
+    //
+    // Every lock is released at commit, so any window between committing and
+    // dumping is one in which a concurrent write can land unscrubbed rows in a
+    // target and have them captured into an artifact advertised as a scrubbed
+    // subset. Compaction is per-table `VACUUM FULL` over the whole schema,
+    // which on a large source is long — running it first would stretch that
+    // window from moments to minutes. It also contributes nothing to the
+    // artifact: `pg_dump` is logical, so a compacted table dumps to exactly the
+    // same bytes as an uncompacted one. Compaction is about the live copy's
+    // disk, so it can wait until the artifact is safely written.
+    //
+    // The remaining window — commit to the dump's own snapshot — is inherent to
+    // dumping a database the scrub has already released, and is why the guide
+    // says to scrub a restored copy rather than something still taking writes.
     if let Some(dir) = &args.output {
         eprintln!("\u{2500}\u{2500} writing a scrubbed artifact \u{2500}\u{2500}");
         super::backup::backup(&super::backup::BackupArgs {
@@ -2571,6 +2581,15 @@ fn classify_and_apply(
             target: super::backup::TargetSelector::All,
             upload: false,
         })?;
+    }
+
+    // Deleting rows leaves the table files exactly as large as they were, so a
+    // sample that is not compacted still needs the source's disk. This is the
+    // step that makes the live subset actually laptop-sized, and it can only run
+    // after the commit: VACUUM FULL rewrites each table and cannot join a
+    // transaction.
+    for (url, label, sampling, size_before) in pending_compaction {
+        report_reclaimed_size(url, label, sampling, size_before);
     }
 
     eprintln!("\n\u{2713} Scrub complete.");

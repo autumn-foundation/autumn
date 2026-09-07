@@ -364,6 +364,19 @@ where the server never revisits the rows that predate it. Afterwards each
 subsetted table is rewritten with `VACUUM (FULL, ANALYZE)` — deleting rows on its
 own frees no disk, and the point of a sample is the disk.
 
+With `--output`, the artifact is captured **before** the compaction, not after.
+Every lock is released when the scrub commits, so the gap between committing and
+dumping is a gap in which a concurrent write could land unscrubbed rows in the
+artifact; compaction is `VACUUM (FULL)` over every subsetted table, which on a
+large source would stretch that gap from moments to minutes. It contributes
+nothing to the artifact either — `pg_dump` is logical, so a compacted table dumps
+to the same bytes — so it runs afterwards, on the live copy, where the reclaimed
+disk is the point.
+
+That leaves the unavoidable gap between the commit and the dump's own snapshot.
+It is another reason the target should be a restored copy rather than a database
+still taking writes: a scrub cannot hold locks it has already released.
+
 Pair it with `--output` to hand a teammate a small, scrubbed artifact:
 
 ```sh
