@@ -4,9 +4,11 @@
 //! contract ("no `path_open`, ... no socket import ... `environ_*`/`args_*`
 //! answer empty"), but until this file, nothing exercised that contract with
 //! a hostile guest — the crate's own `#[cfg(test)]` suite covers fuel,
-//! memory limits, KV wiring and frame parsing, and the sibling
-//! `plugin_sandbox` escape suite this was borrowed from speaks a different
-//! wire protocol and cannot be pointed at this host unmodified. See
+//! memory limits, KV wiring and frame parsing, `tests/runtime_io.rs` covers
+//! routing/capability-gating/credential-stripping through the public API,
+//! and the sibling `plugin_sandbox` escape suite this was borrowed from
+//! speaks a different wire protocol and cannot be pointed at this host
+//! unmodified. None of that is adversarial WASI-escape coverage. See
 //! `docs/reports/2026-09-07-prospect-edge-host-wasi-deny-probes.md`.
 //!
 //! Every guest here is hand-written WAT, compiled at test time by the

@@ -93,7 +93,16 @@ or the Ledger/Bolt personas it names) — same decider named there.
 - **Prior-art check:** `autumn-edge` has no `tests/` directory today and its
   in-module `#[cfg(test)]` suite (16 tests, `autumn-edge/src/host.rs`) covers
   fuel exhaustion, memory limits, KV wiring, and frame parsing — zero
-  adversarial WASI-escape guests. `plugin_sandbox`'s escape corpus
+  adversarial WASI-escape guests. **Correction (sixth Codex review round,
+  filed against the completed report — see below): this claim was simply
+  wrong.** `autumn-edge/tests/runtime_io.rs` already existed (22 tests,
+  dated before this PR) covering routing, capability gating, credential
+  stripping and frame-loop behavior through the crate's public API — real,
+  substantial integration coverage this bullet missed entirely. It is not
+  adversarial WASI-escape coverage (no test in it imports a hostile WASI
+  function), so the underlying gap this assay closes is still real, but
+  "no `tests/` directory" was a checkable, false statement, not an
+  approximation. `plugin_sandbox`'s escape corpus
   (`autumn/src/plugin_sandbox/test_guests.rs`, `HELLO`/`READ_FILE`/
   `ENVIRONMENT`/`ARGUMENTS`/`HOST_COMMAND`/`UNDEFINED_WASI`/…) speaks that
   crate's own JSON-over-NDJSON wire protocol and cannot be pointed at
@@ -292,9 +301,13 @@ pre-set line; the `sock_send` probe is additional, welcome, but
 non-registered evidence, reported alongside rather than blended in.
 
 Full crate suite re-run clean alongside the new tests (`cargo test -p
-autumn-edge --features host`: 22 existing `#[cfg(test)]`/integration tests +
-2 doctests, all passing, confirming the new dev-dependency and
-feature-gated test file didn't disturb anything already there). `cargo fmt
+autumn-edge --features host`: 65 existing library `#[cfg(test)]` tests +
+22 existing `runtime_io` integration tests + 2 doctests — **corrected
+count, sixth Codex review round: an earlier version of this line said "22
+existing tests" total, missing the 65 library tests entirely, the same
+`autumn-edge/tests/runtime_io.rs` oversight as the Prior-art bullet above**
+— all passing, confirming the new dev-dependency and feature-gated test
+file didn't disturb anything already there). `cargo fmt
 -p autumn-edge` and `cargo clippy -p autumn-edge --features host
 --all-targets -- -D warnings` clean (one pre-existing, unrelated
 `unknown_lints` warning from a stale `clippy::unused_async_trait_impl` name
