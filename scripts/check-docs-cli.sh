@@ -64,22 +64,34 @@
 #      `path` is a POSITIONAL and the line clap accepts is `autumn lifecycle
 #      check .`.
 #
-#      Gating flags needs four clap forms that gating commands did not, each of
-#      which is a false positive if missed:
+#      Gating flags needs clap forms that gating commands did not, each of which
+#      is a false positive — the gate telling an author to break a page that
+#      works — if missed:
 #        - `#[command(flatten)]`, so `graph impact` inherits `GraphArgs`'s
 #          `--json` along with the other three `graph` subcommands;
 #        - `trailing_var_arg`, so the six task arguments the guide documents
 #          (`autumn task cleanup-posts --confirm`) are seen as forwarded to the
 #          task rather than judged against the CLI;
-#        - clap's own `--help`/`-h`/`--version`/`-V`, declared nowhere in the
-#          derive input and present on every command;
+#        - `allow_hyphen_values` on a POSITIONAL, so `autumn config set retries
+#          -1` reads as the correct line it is. Counted, not flagged, so the
+#          budget is spent and `--actorr` after it is still judged;
+#        - clap's own `--help`/`-h`, present on every command and declared
+#          nowhere in the derive input — but NOT `--version`, which
+#          `#[command(version)]` puts on the root alone (nothing here sets
+#          `propagate_version`, so `autumn migrate --version` is an error, and
+#          a gate that vouched for it would be worse than no gate);
 #        - a bracket-BALANCED read of `#[arg(…)]` (see `_arg_fields`), without
 #          which every option whose attribute carries a list — five of them,
 #          including `sbom --binary` and `upgrade --accept` — is invisible.
-#      A token that merely starts with `-` is not judged unless it is spelled
-#      like a flag: the corpus writes prose arrows (`0.5.0 -> 0.6.0`) and
+#      Options passed to the ROOT are resolved too, against a root node keyed
+#      `''`: `autumn --help` and `autumn --version` are real lines in this
+#      corpus, and without it `autumn --helpp` read exactly like them.
+#      A token that starts with `-` is judged unless it carries prose
+#      PUNCTUATION — the corpus writes arrows (`0.5.0 -> 0.6.0`) and
 #      slash-joined shorthand (`autumn token issue --name/--scope/--expires-at`)
-#      in command position, and neither is a line anyone can copy.
+#      in command position, and neither is a line anyone can copy. The filter is
+#      never by canonical spelling: requiring `--[a-z-]+` dropped exactly the
+#      misspellings this exists for (`--show_config` for `--show-config`).
 #
 # Both `requires_sub` and the required-positional COUNT were validated against
 # the built binary's `--help` usage strings across all 173 command paths: exact
@@ -450,6 +462,14 @@ def _positionals(payload):
 # in the first position, so a bare flag there resolves to nothing.
 BUILTIN_OPTIONS = {'--help': False, '-h': False}
 
+# …and `#[command(version)]` on the root `Cli`, which is what puts `--version`
+# on `autumn` itself. DERIVED, not assumed: assuming the root declares it is the
+# same mistake in the other direction as assuming subcommands inherit it, and
+# the corpus runs `autumn --version` in `skills/generate/SKILL.md`, so an
+# assumption that went stale would report a correct line.
+_ROOT_VERSION = re.compile(
+    r'#\[command\([^)]*\bversion\b[^)]*\)\]\s*(?:pub\s+)?struct\s+Cli\b')
+
 _ARG_OPEN = re.compile(r'#\[arg\(')
 _ARG_TAIL = re.compile(
     r'\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*,')
@@ -517,6 +537,31 @@ def _options(payload, structs=None, seen=()):
     return opts
 
 
+def _hyphen_operands(payload):
+    """How many POSITIONALS of this command accept a hyphen-leading value.
+
+    `ConfigCommands::Set.value` is `#[arg(allow_hyphen_values = true)]`, so
+    `autumn config set retries -1` is a correct line — and reporting `-1` as an
+    undeclared flag would be this gate telling an author to break a page that
+    works. That is worse than the gap it closes: a gate that cries wolf on
+    correct docs stops being read.
+
+    Counted rather than flagged, so the budget is spent: `config set` allows ONE
+    such operand, so `--actorr` after it is still judged. `trailing_var_arg`
+    fields are excluded — those are handled by `_trailing`, which stops the walk
+    outright rather than consuming one token.
+    """
+    n = 0
+    for attrs, _field, _ftype in _arg_fields(payload):
+        if re.search(r'\b(long|short)\b', attrs):
+            continue                            # an option, not a positional
+        if re.search(r'\btrailing_var_arg\s*=\s*true', attrs):
+            continue
+        if re.search(r'\ballow_hyphen_values\s*=\s*true', attrs):
+            n += 1
+    return n
+
+
 def _trailing(payload):
     """Does this command forward everything after its positional, untouched?
 
@@ -551,7 +596,7 @@ def build_surface(sources):
                     spellings.update(re.findall(r'"([^"]+)"', group))
                 node = {'children': {}, 'positionals': False, 'options': {},
                         'requires_sub': False, 'required_args': 0,
-                        'trailing': False}
+                        'trailing': False, 'hyphen_operands': 0}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -572,6 +617,7 @@ def build_surface(sources):
                             node['positionals'], node['required_args'] = _positionals(structs[it])
                             node['options'] = _options(structs[it], structs)
                             node['trailing'] = _trailing(structs[it])
+                            node['hyphen_operands'] = _hyphen_operands(structs[it])
                 elif kind == 'struct':
                     st, required = _subcommand_type(payload)
                     if st:
@@ -580,6 +626,7 @@ def build_surface(sources):
                     node['positionals'], node['required_args'] = _positionals(payload)
                     node['options'] = _options(payload, structs)
                     node['trailing'] = _trailing(payload)
+                    node['hyphen_operands'] = _hyphen_operands(payload)
                 for spelling in spellings:
                     tree[spelling] = node
             return tree
@@ -604,11 +651,35 @@ def build_surface(sources):
                          'options': opts,
                          'requires_sub': v['requires_sub'],
                          'required_args': v['required_args'],
-                         'trailing': v['trailing']}
+                         'trailing': v['trailing'],
+                         'hyphen_operands': v['hyphen_operands']}
             flat.update(flatten(v['children'], key))
         return flat
 
-    return flatten(tree)
+    def root_node():
+        """The root command itself, keyed `''`.
+
+        `autumn --help` and `autumn --version` are real lines in this corpus and
+        `autumn --helpp` is not, but the walk reaches the root with no command
+        word, so it bailed before any option was judged and every root-level
+        spelling — typos included — went unchecked. `''` is a key `flatten`
+        cannot produce (its keys are built from non-empty spellings), so it
+        cannot collide with a command path; every place that enumerates or
+        counts the surface filters it out.
+        """
+        opts = dict(BUILTIN_OPTIONS)
+        if _ROOT_VERSION.search(text):
+            opts.update({'--version': False, '-V': False})
+        if 'Cli' in structs:                    # any real `#[arg]` on the root
+            opts.update(_options(structs['Cli'], structs))
+        return {'children': set(), 'positionals': False, 'options': opts,
+                'requires_sub': True, 'required_args': 0, 'trailing': False,
+                'hyphen_operands': 0}
+
+    flat = flatten(tree)
+    if flat:                                    # only alongside a real surface
+        flat[''] = root_node()
+    return flat
 
 
 def cli_sources(root):
@@ -3044,6 +3115,18 @@ def resolve(tokens, surface, runnable=False, flags=None):
         # same defect as a bare `autumn db` — and in prose it is just the name
         # of the binary, which the corpus writes constantly.
         return 'autumn' if runnable else None
+    if tokens[0].startswith('-') and len(tokens[0]) > 1:
+        # An option passed to the root itself. The root is a command like any
+        # other and clap rejects a spelling it does not declare, but it is
+        # reached with no command word, so the `TOKEN` bail below used to swallow
+        # every root-level flag — `autumn --helpp` read exactly like the
+        # `autumn --help` the guide runs. Not walked past: the root takes a
+        # required subcommand, so there is nothing after it to judge.
+        name = tokens[0].split('=', 1)[0]
+        if name not in surface.get('', {'options': {}})['options']:
+            if flags is not None and _reportable_flag(name):
+                flags.append(('', name))
+        return None
     if not TOKEN.match(tokens[0]):
         return None
     if tokens[0] not in surface:
@@ -3100,6 +3183,11 @@ def resolve(tokens, surface, runnable=False, flags=None):
             # `name` and stops, but `actions` is `required = true` too.
             supplied = 0
             operands_only = False
+            # Positionals declared `allow_hyphen_values`, spent one per
+            # hyphen-leading token that is not a declared option. A declared
+            # option still wins, so `autumn config set k v --actor me` reads
+            # `--actor` as the flag it is, while `-1` is the value it is.
+            hyphen_budget = node['hyphen_operands']
             while i < len(tokens):
                 t2 = tokens[i]
                 if t2 == '--':
@@ -3119,6 +3207,14 @@ def resolve(tokens, surface, runnable=False, flags=None):
                     if node['trailing'] and supplied:
                         return None
                     o = t2.split('=', 1)[0]
+                    if o not in node['options'] and hyphen_budget:
+                        # The value of an `allow_hyphen_values` positional, not
+                        # a flag. Counts as a supplied argument, and spends the
+                        # budget so a later unknown flag is still reported.
+                        hyphen_budget -= 1
+                        supplied += 1
+                        i += 1
+                        continue
                     if '=' in t2:               # value attached; name still checked
                         if o not in node['options']:
                             if flags is not None and _reportable_flag(o):
@@ -3310,6 +3406,8 @@ def self_test():
             #[command(flatten)]
             args: GraphArgs,
         },
+        #[command(subcommand, name = "config")]
+        Config(ConfigCommands),
         Controller {
             name: String,
             #[arg(required = true)]
@@ -3339,6 +3437,22 @@ def self_test():
         path: String,
     }
     enum UpgradeCommands { Apply }
+    // A positional that accepts a hyphen-leading value, as the real
+    // `ConfigCommands::Set.value` does.
+    enum ConfigCommands {
+        Set {
+            key: String,
+            #[arg(allow_hyphen_values = true)]
+            value: String,
+            #[arg(long, value_name = "ACTOR")]
+            actor: Option<String>,
+        },
+    }
+    #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
+    struct Cli {
+        #[command(subcommand)]
+        command: Commands,
+    }
     struct GraphArgs {
         #[arg(long)]
         json: bool,
@@ -3455,6 +3569,41 @@ def self_test():
            'an underscore misspelling of a real flag must be reported')
     expect(opts_of('migrate -zz') == [('migrate', '-zz')],
            'an unresolvable compact short must be reported')
+
+    # --- options passed to the ROOT. `autumn --help` and `autumn --version` are
+    # both real lines in this corpus; `autumn --helpp` is not, and used to read
+    # exactly like them because the walk bailed on a dashed first token before
+    # judging anything.
+    expect(opts_of('--help') == [] and opts_of('-h') == [],
+           'a root option clap always supplies is not drift')
+    expect(opts_of('--version') == [],
+           '#[command(version)] on the root makes `autumn --version` valid')
+    expect(opts_of('--helpp') == [('', '--helpp')],
+           'a root-level typo must be reported')
+    expect(surface[''] and '' not in {p for p in surface if p},
+           'the root is keyed by a string no command path can collide with')
+    # …and the root's `--version` is DERIVED: a `Cli` without it must not get one.
+    noversion = build_surface(['''
+        #[command(name = "autumn", about = "x")]
+        struct Cli { #[command(subcommand)] command: Commands, }
+        enum Commands { Console }
+    '''])
+    expect('--version' not in noversion['']['options'],
+           'a root without #[command(version)] must not be given one')
+
+    # --- `allow_hyphen_values` on a positional. `autumn config set retries -1`
+    # is a CORRECT line, and reporting `-1` would be the gate telling an author
+    # to break a page that works — worse than the gap it closes.
+    expect(surface['config set']['hyphen_operands'] == 1,
+           'an allow_hyphen_values positional must be counted')
+    expect(opts_of('config set retries -1') == [],
+           "a hyphen-leading value of an allow_hyphen_values positional is not a flag")
+    expect(opts_of('config set retries -1 --actor me') == [],
+           'a declared option after such a value still resolves')
+    expect(opts_of('config set retries -1 --actorr me') == [('config set', '--actorr')],
+           'the budget is spent, so a later unknown flag is still reported')
+    expect(opts_of('console -1') == [('console', '-1')],
+           'a command with no such positional still reports a hyphen token')
 
     # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
     # used to read these stopped at the list's first `]`, so the field vanished
@@ -5590,7 +5739,7 @@ def self_test():
 
 def main():
     surface = build_surface(cli_sources(ROOT))
-    if not surface:
+    if not any(p for p in surface):             # the root key alone is not a surface
         print('ERROR: parsed an empty command surface from autumn-cli/src — '
               'the clap derive input moved or changed shape, and this gate '
               'cannot tell drift from a parser failure. Fix the parser.',
@@ -5599,7 +5748,7 @@ def main():
 
     if MODE in ('--list', '--list-options'):
         show_opts = MODE == '--list-options'
-        for path in sorted(surface):
+        for path in sorted(p for p in surface if p):
             if show_opts:
                 # Everything but clap's own, which are on every command and
                 # would treble the output without telling anyone anything.
@@ -5608,16 +5757,18 @@ def main():
                 print(f'{path}    {" ".join(own)}' if own else path)
             else:
                 print(path)
-        print(f'\n{len([p for p in surface if " " not in p])} top-level commands, '
-              f'{len(surface)} command paths, '
-              f'{sum(len(v["options"]) for v in surface.values())} option spellings')
+        real = {p: v for p, v in surface.items() if p}
+        print(f'\n{len([p for p in real if " " not in p])} top-level commands, '
+              f'{len(real)} command paths, '
+              f'{sum(len(v["options"]) for v in real.values())} option spellings')
         return 0
 
     files = corpus(ROOT)
     defects, flag_defects, waived = scan(ROOT, surface, files)
-    options = sum(len(v['options']) for v in surface.values())
+    real = {p: v for p, v in surface.items() if p}
+    options = sum(len(v['options']) for v in real.values())
     print(f'corpus: {len(files)} reader-facing markdown files')
-    print(f'surface: {len(surface)} command paths, {options} option spellings '
+    print(f'surface: {len(real)} command paths, {options} option spellings '
           f'parsed from autumn-cli/src')
     print(f'defects: {len(defects)} command, {len(flag_defects)} flag'
           + (f' ({waived} waived)' if waived else ''))
@@ -5625,8 +5776,9 @@ def main():
         print()
         for f, lineno, cmd_path, opt, argv in flag_defects:
             line = ('autumn ' + argv).strip()
-            print(f'{f}:{lineno}: `autumn {cmd_path}` has no `{opt}`  '
-                  f'(line: {line})')
+            # `cmd_path` is '' for an option passed to the root itself.
+            print(f'{f}:{lineno}: `{("autumn " + cmd_path).strip()}` has no '
+                  f'`{opt}`  (line: {line})')
         print()
         print('Each line above tells a reader to pass an option the command '
               'does not declare; clap answers with "unexpected argument" and '
