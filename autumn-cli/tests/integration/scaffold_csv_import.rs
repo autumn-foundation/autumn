@@ -1205,6 +1205,51 @@ fn normalized_relative_path(path: &Path, root: &Path) -> String {
     parts.join("/")
 }
 
+/// `migrations/20260907011642_create_posts` → `migrations/<timestamp>_create_posts`
+/// wherever it appears in `line`. The body-side twin of
+/// [`normalized_relative_path`], for files that embed migration paths
+/// (`.autumn/generated.toml`'s digest table keys).
+fn normalize_migration_stamp(line: &str) -> String {
+    const PREFIX: &str = "migrations/";
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find(PREFIX) {
+        let (head, tail) = rest.split_at(i + PREFIX.len());
+        out.push_str(head);
+        let stamp_len = tail.bytes().take_while(u8::is_ascii_digit).count();
+        if stamp_len == 14 && tail.as_bytes().get(14) == Some(&b'_') {
+            out.push_str("<timestamp>");
+            rest = &tail[14..];
+        } else {
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn normalize_migration_stamp_rewrites_only_full_stamps() {
+    assert_eq!(
+        normalize_migration_stamp(r#"[files."migrations/20260907011642_create_posts/up.sql"]"#),
+        r#"[files."migrations/<timestamp>_create_posts/up.sql"]"#
+    );
+    // Two paths on one line, both rewritten.
+    assert_eq!(
+        normalize_migration_stamp("migrations/20260907011642_a migrations/20260907011643_b"),
+        "migrations/<timestamp>_a migrations/<timestamp>_b"
+    );
+    // Not a 14-digit stamp, or no `_` after it: left alone.
+    assert_eq!(
+        normalize_migration_stamp("migrations/2026_x migrations/20260907011642x"),
+        "migrations/2026_x migrations/20260907011642x"
+    );
+    assert_eq!(
+        normalize_migration_stamp("digest = \"abc\""),
+        "digest = \"abc\""
+    );
+}
+
 /// The normalization above is what a Windows CI run caught: it used to strip a
 /// literal `"migrations/"` prefix, which never matched a `\`-separated path, so
 /// the timestamp survived and a second-boundary straddle became a hard failure
@@ -1280,9 +1325,17 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                     // flag under test — so the recorded command differs while
                     // the digests, which describe the output this gate is
                     // about, must not. Compare the digests, drop the command.
+                    //
+                    // Its table keys embed the migration directory too
+                    // (`[files."migrations/20260907011642_create_posts/up.sql"]`),
+                    // so the same second-boundary straddle the path
+                    // normalization above guards against would otherwise
+                    // survive inside this file's body — which is exactly what
+                    // a Windows CI run caught (issue #2590).
                     let body = if rel.ends_with(".autumn/generated.toml") {
                         body.lines()
                             .filter(|line| !line.starts_with("invocation = "))
+                            .map(normalize_migration_stamp)
                             .collect::<Vec<_>>()
                             .join("\n")
                     } else {
