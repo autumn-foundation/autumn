@@ -564,4 +564,66 @@ mod tests {
         assert!(json.get("token_hash").is_none());
         assert!(json.get("token").is_none());
     }
+
+    // ── execute_action fallthrough (restore/purge/unhandled) ──────────
+    //
+    // TokenAdminModel never supports soft delete, so these three branches
+    // always error on the first id without touching the pool —
+    // characterizing them pins the exact error text ahead of routing them
+    // through the shared trait helper (Echo merge with FeatureFlagAdminModel).
+
+    fn dummy_pool()
+    -> diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection> {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+        let mgr = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(
+            "postgresql://test",
+        );
+        Pool::builder(mgr).build().expect("build pool")
+    }
+
+    #[tokio::test]
+    async fn execute_action_restore_errors_soft_delete_unsupported() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "restore", vec![1, 2])
+            .await
+            .expect_err("restore must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_purge_errors_soft_delete_unsupported() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "purge", vec![1])
+            .await
+            .expect_err("purge must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_unhandled_action_errors_with_action_name() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "archive", vec![1])
+            .await
+            .expect_err("unknown action must error");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("unhandled bulk action 'archive'"));
+    }
 }
