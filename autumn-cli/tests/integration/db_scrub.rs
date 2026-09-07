@@ -1442,6 +1442,123 @@ async fn sampling_refuses_a_table_no_root_can_reach() {
     );
 }
 
+/// A purge the sample's own emptied rows reference has to wait for the sample.
+///
+/// `[framework] purge` runs at the START of the transaction so a framework table
+/// referencing a sampled one is already empty when the sample removes its
+/// parents. That order is wrong for the mirror shape — an app table pointing INTO
+/// a purged table — so the plan defers that one purge. Without the deferral the
+/// `DELETE FROM autumn_jobs` hits `audit_logs`'s rows and the whole run rolls
+/// back, which is exactly what this asserts does not happen.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_purge_an_emptied_table_references_runs_after_the_sample() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_purge_order").await;
+    // A framework-owned table, and an excluded app table that references it.
+    // `audit_logs` is `never_include`, so the sample empties it — which is what
+    // makes the deferred purge possible at all.
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args JSONB NOT NULL \
+            ); \
+            INSERT INTO autumn_jobs (args) VALUES ('{\"note\": \"payload\"}'); \
+            ALTER TABLE audit_logs ADD COLUMN job_id BIGINT REFERENCES autumn_jobs (id); \
+            UPDATE audit_logs SET job_id = (SELECT id FROM autumn_jobs LIMIT 1);",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!(
+            "{}\n[framework]\npurge = [\"autumn_jobs\"]\n",
+            SAMPLE_SCRUB_TOML.replace(
+                "[tables.audit_logs]\nsafe = [\"action\"]",
+                "[tables.audit_logs]\nsafe = [\"action\", \"job_id\"]",
+            )
+        ),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_purge_order");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the deferred purge must still empty its table"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "and the excluded table it referenced is emptied by the sample"
+    );
+    assert!(
+        count(&client, "SELECT count(*) FROM users").await < 200,
+        "the sample itself must still have run"
+    );
+}
+
+/// The shape no order satisfies: rows the sample KEEPS reference a purged table.
+/// Purging before the sample hits them and purging after still hits them, so the
+/// run refuses up front rather than failing mid-transaction.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_a_retained_reference_into_a_purged_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_purge_conflict").await;
+    // Same edge, but from `tags`, whose rows the sample keeps.
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args JSONB NOT NULL \
+            ); \
+            ALTER TABLE tags ADD COLUMN job_id BIGINT REFERENCES autumn_jobs (id);",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!(
+            "{}\n[framework]\npurge = [\"autumn_jobs\"]\n",
+            SAMPLE_SCRUB_TOML.replace(
+                "[tables.tags]\nsafe = [\"label\"]",
+                "[tables.tags]\nsafe = [\"label\", \"job_id\"]",
+            )
+        ),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_purge_conflict");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("autumn_jobs"),
+        "the refusal must name the purged table: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused sample must not have deleted anything"
+    );
+}
+
 /// AC #5's other refusal shape, end to end: a reference INTO an excluded table
 /// would dangle, so the run aborts non-zero naming the edge.
 #[tokio::test]

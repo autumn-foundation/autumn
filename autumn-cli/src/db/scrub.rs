@@ -2880,6 +2880,12 @@ struct ConstraintRow {
     parent: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     parent_cols: String,
+    /// True when Postgres cloned this constraint onto a partition from its
+    /// partitioned parent. The parent's own constraint covers the same rows, so
+    /// a clone must not be walked or verified a second time — while a key
+    /// declared directly on a partition is NOT a clone and must not be dropped.
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    cloned: bool,
 }
 
 /// The column-name separator the constraint probe aggregates on. Postgres
@@ -2966,6 +2972,11 @@ fn probe_database_facts(
     // different question — "which rows must travel together" — and that needs
     // the constraint, in key order, both sides paired.
     let sep = KEY_SEPARATOR;
+    let cloned = if has_catalog_column(&mut conn, "pg_constraint", "conparentid")? {
+        "c.conparentid <> 0"
+    } else {
+        "false"
+    };
     let constraint_rows: Vec<ConstraintRow> = sql_query(format!(
         "SELECT c.conname AS name, rel.relname AS child, frel.relname AS parent, \
          (SELECT string_agg(att.attname, '{sep}' ORDER BY k.ord) \
@@ -2975,7 +2986,8 @@ fn probe_database_facts(
          (SELECT string_agg(att.attname, '{sep}' ORDER BY k.ord) \
           FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) \
           JOIN pg_attribute att ON att.attrelid = c.confrelid AND att.attnum = k.attnum) \
-         AS parent_cols \
+         AS parent_cols, \
+         {cloned} AS cloned \
          FROM pg_constraint c \
          JOIN pg_class rel ON rel.oid = c.conrelid \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
@@ -2987,6 +2999,7 @@ fn probe_database_facts(
     .map_err(|e| ScrubError::Sql(e.to_string()))?;
     let foreign_keys: Vec<sample::ForeignKeyConstraint> = constraint_rows
         .into_iter()
+        .filter(|row| !row.cloned)
         .map(|row| sample::ForeignKeyConstraint {
             name: row.name,
             child_table: row.child,
@@ -3505,8 +3518,12 @@ fn execute(
             .execute(conn)?;
         }
         // Purges run FIRST so a framework-owned table that references a
-        // sampled one is already empty when the sample removes its parents.
-        for (table, statement) in purges {
+        // sampled one is already empty when the sample removes its parents —
+        // except the ones the plan defers, which are the mirror image: a table
+        // the sample empties references them, so they have to wait for it.
+        let no_deferral = BTreeSet::new();
+        let deferred: &BTreeSet<String> = sampling.map_or(&no_deferral, |s| &s.purge_after);
+        for (table, statement) in purges.iter().filter(|(t, _)| !deferred.contains(t)) {
             let rows = sql_query(statement).execute(conn)?;
             counts.push((format!("{table} (emptied)"), rows));
         }
@@ -3515,6 +3532,13 @@ fn execute(
         // sampled but not scrubbed: both happen in this one transaction.
         if let Some(sampling) = sampling {
             outcome = Some(sample::apply(conn, sampling)?);
+        }
+        // The deferred purges, now that the sample has emptied what referenced
+        // them. Empty unless a plan deferred one, so an unsampled scrub still
+        // runs every purge in the single pass above.
+        for (table, statement) in purges.iter().filter(|(t, _)| deferred.contains(t)) {
+            let rows = sql_query(statement).execute(conn)?;
+            counts.push((format!("{table} (emptied)"), rows));
         }
         for table in &plan.tables {
             if let Some(sql) = &table.sql {

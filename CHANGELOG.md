@@ -78,7 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   One ordering change reaches every scrub, sampled or not: `[framework] purge`
   now empties its tables at the START of the transaction rather than after the
   column rewrites, so a framework-owned table that references a sampled one is
-  already empty when the sample removes the rows it points at.
+  already empty when the sample removes the rows it points at — except a purge
+  the sample's own emptied rows reference, which waits until after it instead,
+  and the shape no order satisfies (rows the sample KEEPS referencing a purged
+  table) is refused up front. A foreign key declared on a partition rather than
+  cloned onto it from its partitioned parent is likewise refused, rather than
+  dropped from the walk and the integrity re-check as if it were a clone.
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded

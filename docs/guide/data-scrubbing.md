@@ -292,7 +292,18 @@ Sampling refuses before it deletes anything when it cannot prove the result:
   them whole with `always_include` takes it out of the removals and breaks the
   cycle);
 - a **framework-owned table referencing a sampled one** — those rows are outside
-  the sample, so empty them in the same run with `[framework] purge`.
+  the sample, so empty them in the same run with `[framework] purge`;
+- a **retained table referencing a purged one** — the mirror image. A purge of a
+  framework table normally runs before the sample, so that the case above holds;
+  when a table the sample *empties* references it, the purge waits until after
+  the sample instead. But when a table whose rows the sample *keeps* references
+  it, no order works and the run refuses: stop purging that table, or drop the
+  referencing one with `never_include`;
+- a **foreign key declared on a partition** rather than on its partitioned
+  parent. The sample plays a partition's rows through that parent, whose rows
+  span every partition, so it cannot honour a key binding one partition alone.
+  Declare the key on the partitioned parent — Postgres then clones it to each
+  partition, and the clone is followed through the parent as usual.
 
 `autumn db scrub --check --sample users=1%` proves the plan is complete and
 writes nothing — run it in CI next to the classification check. The foreign key

@@ -179,6 +179,20 @@ pub enum SampleError {
         /// `child -> parent (constraint)` descriptions, sorted.
         edges: Vec<String>,
     },
+    /// A foreign key declared directly on a leaf partition rather than cloned
+    /// from its partitioned parent. The plan is keyed on the parent, whose rows
+    /// span every partition, so neither the walk nor the integrity re-check can
+    /// represent an edge that binds one partition only.
+    PartitionLocalForeignKey {
+        /// `child -> parent (constraint)` descriptions, sorted.
+        edges: Vec<String>,
+    },
+    /// A table the sample keeps rows in references a framework-owned table that
+    /// `[framework] purge` empties, so no order of the two satisfies the key.
+    RetainedReferencesPurged {
+        /// `child -> parent (constraint)` descriptions, sorted.
+        edges: Vec<String>,
+    },
     /// A table in the sampled universe has no primary key, so its rows have no
     /// identity the walk can select on.
     NoRowKey {
@@ -299,6 +313,28 @@ impl std::fmt::Display for SampleError {
                 edges.len(),
                 bullets(edges),
             ),
+            Self::PartitionLocalForeignKey { edges } => write!(
+                f,
+                "{} foreign key(s) are declared on a partition rather than on its \
+                 partitioned parent:\n{}\n  \
+                 The sample selects and removes a partition's rows through that parent, \
+                 whose rows span every partition, so it cannot honour a key that binds \
+                 one partition only. Declare the foreign key on the partitioned parent \
+                 so PostgreSQL clones it to each partition, or drop the table with \
+                 `never_include` in {SAMPLE_SECTION}.",
+                edges.len(),
+                bullets(edges),
+            ),
+            Self::RetainedReferencesPurged { edges } => write!(
+                f,
+                "{} reference(s) point from rows the sample keeps into a table \
+                 `[framework] purge` empties:\n{}\n  \
+                 Emptying the parent would leave the kept rows dangling, and no order of \
+                 the two removals avoids it. Stop purging that table, or drop the \
+                 referencing table with `never_include` in {SAMPLE_SECTION}.",
+                edges.len(),
+                bullets(edges),
+            ),
             Self::NoRowKey { tables } => write!(
                 f,
                 "{} table(s) in the sample have no primary key:\n{}\n  \
@@ -375,6 +411,11 @@ pub struct SamplePlan {
     pub walk_edges: Vec<ForeignKeyConstraint>,
     /// Every foreign key inside the universe, for the integrity re-check.
     pub verify_edges: Vec<ForeignKeyConstraint>,
+    /// Framework-owned tables whose `[framework] purge` must run AFTER the
+    /// sample: a table the sample empties references them, so purging first
+    /// would hit the reference. Every other purge still runs first, so a
+    /// framework table referencing a sampled one is empty before its parents go.
+    pub purge_after: BTreeSet<String>,
 }
 
 /// Everything the planner needs, gathered by the caller.
@@ -515,7 +556,7 @@ pub fn build_plan(inputs: &SampleInputs<'_>) -> Result<SamplePlan, SampleError> 
 
     check_rules(inputs, &keys)?;
     let roles = resolve_roles(inputs, &keys)?;
-    let (internal, walk) = classify_edges(inputs, &roles)?;
+    let (internal, walk, purge_after) = classify_edges(inputs, &roles)?;
     check_coverage(&roles, &walk)?;
     check_row_keys(&roles, &keys)?;
 
@@ -544,6 +585,7 @@ pub fn build_plan(inputs: &SampleInputs<'_>) -> Result<SamplePlan, SampleError> 
         tables,
         walk_edges: walk,
         verify_edges: internal,
+        purge_after,
     })
 }
 
@@ -669,10 +711,16 @@ fn resolve_roles(
 
 /// Split every foreign key into the ones inside the sample and the ones the
 /// walk follows, refusing the two shapes that would dangle.
+type ClassifiedEdges = (
+    Vec<ForeignKeyConstraint>,
+    Vec<ForeignKeyConstraint>,
+    BTreeSet<String>,
+);
+
 fn classify_edges(
     inputs: &SampleInputs<'_>,
     roles: &BTreeMap<String, SampleRole>,
-) -> Result<(Vec<ForeignKeyConstraint>, Vec<ForeignKeyConstraint>), SampleError> {
+) -> Result<ClassifiedEdges, SampleError> {
     let describe = |edge: &ForeignKeyConstraint| {
         format!(
             "{} -> {} ({})",
@@ -682,11 +730,20 @@ fn classify_edges(
 
     let mut outside_refs = Vec::new();
     let mut dangling = Vec::new();
+    let mut partition_local = Vec::new();
+    let mut retained_into_purged = Vec::new();
+    let mut purge_after = BTreeSet::new();
     let mut internal = Vec::new();
     for edge in inputs.foreign_keys {
+        // A constraint cloned from a partitioned parent was already dropped by
+        // the caller, which can tell a clone from a partition-local key by its
+        // catalog parentage. Anything still naming a partition is therefore
+        // declared on that partition alone — an edge the plan cannot express,
+        // because it keys every partition's rows on the parent.
         if inputs.partitions.contains(&edge.child_table)
             || inputs.partitions.contains(&edge.parent_table)
         {
+            partition_local.push(describe(edge));
             continue;
         }
         let child = roles.get(&edge.child_table);
@@ -712,8 +769,34 @@ fn classify_edges(
             {
                 outside_refs.push(describe(edge));
             }
+            // The mirror image: a table the sample removes rows from points INTO
+            // a purged framework table. Purges run before the sample so the case
+            // above holds, which would empty the parent while these rows still
+            // reference it — so this one purge has to wait until the sample has
+            // emptied its child. That is only possible when the sample empties
+            // the child completely; if it keeps rows, no order satisfies the key.
+            (Some(child_role), None) if inputs.purged.contains(&edge.parent_table) => {
+                if *child_role == SampleRole::NeverInclude {
+                    purge_after.insert(edge.parent_table.clone());
+                } else {
+                    retained_into_purged.push(describe(edge));
+                }
+            }
             _ => {}
         }
+    }
+
+    if !partition_local.is_empty() {
+        partition_local.sort();
+        return Err(SampleError::PartitionLocalForeignKey {
+            edges: partition_local,
+        });
+    }
+    if !retained_into_purged.is_empty() {
+        retained_into_purged.sort();
+        return Err(SampleError::RetainedReferencesPurged {
+            edges: retained_into_purged,
+        });
     }
 
     if !outside_refs.is_empty() {
@@ -735,7 +818,7 @@ fn classify_edges(
         })
         .cloned()
         .collect();
-    Ok((internal, walk))
+    Ok((internal, walk, purge_after))
 }
 
 /// Refuse any table rows can never flow into: sampling it would empty it
@@ -2027,18 +2110,126 @@ mod tests {
     }
 
     #[test]
-    fn a_partition_is_sampled_through_its_parent_table() {
-        // A partition's rows are removed through the parent, and its foreign
-        // keys are clones of the parent's, so an edge naming one must not
-        // reach the plan at all.
+    fn a_purge_waits_for_the_sample_when_an_emptied_table_references_it() {
+        // `audit_logs` (never_include, so the sample empties it) references the
+        // purged `autumn_jobs`. Purging first would hit those rows, so the plan
+        // defers that one purge until the sample has emptied its child.
         let (tables, mut keys) = schema();
         keys.push(fk(
-            "comments_2026_user_fk",
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            plan.purge_after,
+            BTreeSet::from(["autumn_jobs".to_owned()]),
+            "the purge its emptied child references must run after the sample"
+        );
+    }
+
+    #[test]
+    fn a_purge_a_retained_table_references_is_refused() {
+        // Same edge, but from `comments`, whose rows the sample KEEPS. Purging
+        // before the sample hits them and purging after still hits them, so no
+        // order exists and the plan refuses instead of failing mid-transaction.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "comments_job_fk",
+            "comments",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap_err();
+        let SampleError::RetainedReferencesPurged { edges } = err else {
+            panic!("expected a retained-into-purged refusal, got {err:?}");
+        };
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].contains("comments_job_fk"), "{edges:?}");
+    }
+
+    #[test]
+    fn a_purge_nothing_sampled_references_still_runs_first() {
+        // The unchanged majority: no sampled table points at the purged one, so
+        // nothing is deferred and the single pre-sample pass runs every purge.
+        let (tables, keys) = schema();
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert!(plan.purge_after.is_empty());
+    }
+
+    #[test]
+    fn a_partition_local_foreign_key_is_refused_rather_than_dropped() {
+        // A key declared on the partition itself, not cloned from the parent
+        // (the caller filters clones out by catalog parentage, so one reaching
+        // here is partition-local). The plan plays every partition's rows
+        // through the partitioned parent, so it cannot honour a key that binds
+        // one partition — dropping it silently would leave the edge out of both
+        // the walk and the integrity re-check, which is the fail-open this
+        // feature exists to avoid.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "comments_2026_local_fk",
             "comments_2026",
             "user_id",
             "users",
             "id",
         ));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::from(["comments_2026".to_owned()]),
+        })
+        .unwrap_err();
+        let SampleError::PartitionLocalForeignKey { edges } = err else {
+            panic!("expected a partition-local refusal, got {err:?}");
+        };
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].contains("comments_2026_local_fk"), "{edges:?}");
+    }
+
+    #[test]
+    fn a_partition_with_no_local_foreign_key_plans_through_its_parent() {
+        // The clone case: with the clones filtered out upstream, no edge names
+        // the partition and the plan plays its rows through the parent.
+        let (tables, keys) = schema();
         let plan = build_plan(&SampleInputs {
             roots: &[root("users", SampleAmount::Count(10))],
             seed: 7,
