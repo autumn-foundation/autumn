@@ -582,8 +582,36 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         // schema already admits null, and `oneOf` demands that EXACTLY ONE
         // branch match — so `oneOf [{unconstrained}, {"type":"null"}]` would
         // reject the very null it is meant to permit, because null matches both.
+        //
+        // But `is_serde_json_value` matches the LAST PATH SEGMENT, so it also
+        // fires for an application type of one's own called `Value`. That type
+        // is ordinary: if it carries `#[derive(OpenApiSchema)]` its schema is a
+        // normal non-null object and it NEEDS the null branch, or serializing
+        // `None` emits a null the schema forbids. A proc macro cannot tell the
+        // two apart, so the choice is deferred to runtime — the same escape the
+        // scalar table uses for its own last-segment collisions.
         if is_serde_json_value(&type_name_str(&inner)) {
-            return unconstrained_json_tokens(&inner);
+            let inner_ty = &inner;
+            return quote! {{
+                match ::autumn_web::openapi::registered_derived_schema(
+                    ::core::any::type_name::<#inner_ty>()
+                ) {
+                    // A colliding application `Value` with a real schema: wrap
+                    // it like any other optional type.
+                    ::core::option::Option::Some(__derived) => {
+                        ::autumn_web::reexports::serde_json::json!({
+                            "oneOf": [__derived, { "type": "null" }]
+                        })
+                    }
+                    // Genuine `serde_json::Value`: already admits null.
+                    ::core::option::Option::None => {
+                        ::autumn_web::reexports::serde_json::json!({
+                            "description": "Arbitrary JSON: an object, array, string, number, \
+                                            boolean or null.",
+                        })
+                    }
+                }
+            }};
         }
         let inner_tokens = emit_json_schema_tokens(&inner);
         return quote! {{

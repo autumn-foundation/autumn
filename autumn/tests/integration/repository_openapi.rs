@@ -459,6 +459,44 @@ fn an_optional_json_value_is_not_wrapped_in_one_of() {
     assert!(prop.get("type").is_none(), "it stays unconstrained: {prop}");
 }
 
+/// An application type whose LAST PATH SEGMENT collides with `serde_json::Value`
+/// while being an ordinary struct with a real schema.
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+pub struct Value {
+    pub label: String,
+}
+
+/// Written as the bare `Value`, exactly as a colliding import would be.
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+pub struct HoldsCollidingValue {
+    pub colliding: Option<Value>,
+}
+
+/// `is_serde_json_value` matches the LAST PATH SEGMENT, so it fires for an
+/// application type called `Value` too. That type is ordinary — it needs the
+/// null branch like any other optional field, or serializing `None` emits a
+/// null its own schema forbids. The choice is therefore made at RUNTIME, from
+/// the derived-schema inventory, not from the token spelling.
+#[test]
+fn an_optional_colliding_value_still_gets_its_null_branch() {
+    let schema = <HoldsCollidingValue as autumn_web::openapi::OpenApiSchema>::schema();
+    let prop = &schema["properties"]["colliding"];
+
+    let branches = prop["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a colliding `Value` is an ordinary type: {prop}"));
+    assert!(
+        branches.iter().any(|b| b["type"] == "null"),
+        "it must keep its null branch: {prop}"
+    );
+    assert!(
+        branches
+            .iter()
+            .any(|b| b["properties"]["label"]["type"] == "string"),
+        "and resolve to its own real schema, not the unconstrained one: {prop}"
+    );
+}
+
 // ── New* datetime matches its own deserializer (issue #802) ────────────
 
 mod schema_datetime {
