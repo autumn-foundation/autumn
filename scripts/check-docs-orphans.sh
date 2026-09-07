@@ -283,10 +283,22 @@ def read(f):
 # and reads the package as publishable with an auto-detected README: silent.
 
 
+def _quoted(name):
+    """A regex fragment matching one TOML key segment, quoted or bare.
+
+    EVERY segment gets this, not just the first. `publish."workspace" = true`
+    is valid TOML that Cargo honours — it reports `publish: []` for a member
+    inheriting `publish = false` that way — and matching only a bare
+    `workspace` there dropped the inheritance and read the package as
+    publishable. Same silent direction as the leading key.
+    """
+    q = re.escape(name)
+    return r'(?:' + q + r'|"' + q + r'"|\'' + q + r'\')'
+
+
 def _key(name):
     """A regex fragment matching a TOML key at line start, quoted or bare."""
-    q = re.escape(name)
-    return r'^[ \t]*(?:' + q + r'|"' + q + r'"|\'' + q + r'\')[ \t]*'
+    return r'^[ \t]*' + _quoted(name) + r'[ \t]*'
 
 
 _README_STRING = re.compile(
@@ -330,8 +342,9 @@ _README_BOOL = re.compile(_key('readme') + r'=[ \t]*(false|true)\b', re.M)
 # Cargo also refuses `readme = false` in `[workspace.package]` ("was not
 # defined"), so an inherited value is always a path.
 _README_INHERITS = re.compile(
-    _key('readme') + r'\.[ \t]*workspace[ \t]*=[ \t]*true'
-    r'|' + _key('readme') + r'=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
+    _key('readme') + r'\.[ \t]*' + _quoted('workspace') + r'[ \t]*=[ \t]*true'
+    r'|' + _key('readme') + r'=[ \t]*\{[^}]*' + _quoted('workspace')
+    + r'[ \t]*=[ \t]*true[^}]*\}',
     re.M)
 # Publishability gates all of the above: nothing renders the README of a
 # package that is never published, so it stays an ordinary waypoint.
@@ -351,8 +364,9 @@ _PUBLISH_DECL = re.compile(
 # handled so the first one to appear is not a fresh defect, and because the
 # error this guards is the quiet one.
 _PUBLISH_INHERITS = re.compile(
-    _key('publish') + r'\.[ \t]*workspace[ \t]*=[ \t]*true'
-    r'|' + _key('publish') + r'=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
+    _key('publish') + r'\.[ \t]*' + _quoted('workspace') + r'[ \t]*=[ \t]*true'
+    r'|' + _key('publish') + r'=[ \t]*\{[^}]*' + _quoted('workspace')
+    + r'[ \t]*=[ \t]*true[^}]*\}',
     re.M)
 
 # Every pattern above reads a key Cargo reads from ONE table, so they have to be
@@ -543,12 +557,9 @@ def _toml_table(manifest, name):
     if dotted is None:
         # Each segment may be quoted independently — `"package".publish` —
         # so the prefix is built from the same alternation `_key` uses.
-        def _seg(p):
-            q = re.escape(p)
-            return r'(?:' + q + r'|"' + q + r'"|\'' + q + r'\')'
         dotted = re.compile(
             r'^[ \t]*' + r'[ \t]*\.[ \t]*'.join(
-                _seg(p) for p in name.split('.')) + r'[ \t]*\.[ \t]*')
+                _quoted(p) for p in name.split('.')) + r'[ \t]*\.[ \t]*')
         _DOTTED_CACHE[name] = dotted
     out = []
     seen = False
@@ -7486,6 +7497,31 @@ self_test() {
   printf '# Crate\n\n- [Mail](docs/guide/mail.md)\n' > "$c9mn/CRATE.md"
   git -C "$c9mn" add -A && git -C "$c9mn" commit -qm readme-above-package
   check "a README above its package is still an entry surface" pass "$c9mn"
+
+  # EVERY segment of a dotted key may be quoted, not just the first: Cargo
+  # honours `publish."workspace" = true` — reporting `publish: []` for a member
+  # inheriting `publish = false` that way — and matching a bare `workspace`
+  # there dropped the inheritance and read the package as publishable.
+  local c9mr="$tmp/c9mr"; make_corpus "$c9mr"
+  mkdir -p "$c9mr/pkg"
+  printf '[workspace]\nmembers = ["pkg"]\n\n[workspace.package]\npublish = false\n' \
+    > "$c9mr/Cargo.toml"
+  printf '[package]\nname = "pkg"\npublish."workspace" = true\nreadme = "README.md"\n' \
+    > "$c9mr/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mr/pkg/README.md"
+  git -C "$c9mr" add -A && git -C "$c9mr" commit -qm quoted-workspace-segment
+  check "a quoted workspace segment still inherits" fail "$c9mr"
+
+  # ...and inside the inline-table spelling of the same thing.
+  local c9ms="$tmp/c9ms"; make_corpus "$c9ms"
+  mkdir -p "$c9ms/pkg"
+  printf '[workspace]\nmembers = ["pkg"]\n\n[workspace.package]\npublish = false\n' \
+    > "$c9ms/Cargo.toml"
+  printf '[package]\nname = "pkg"\npublish = { "workspace" = true }\nreadme = "README.md"\n' \
+    > "$c9ms/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ms/pkg/README.md"
+  git -C "$c9ms" add -A && git -C "$c9ms" commit -qm quoted-inline-workspace
+  check "a quoted workspace key in an inline table inherits" fail "$c9ms"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
