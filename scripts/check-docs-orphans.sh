@@ -1965,13 +1965,37 @@ _TYPE_ATTR = re.compile(
     r'(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))', re.I)
 
 
+def decode_attribute(value):
+    """An attribute value as the DOM holds it, references resolved.
+
+    THE ONE RULE EVERY ATTRIBUTE READER HERE NEEDS, stated once because it has
+    now been missed twice in three commits — for `style` and then, in the very
+    next commit, for `type`. The HTML tokenizer resolves character references
+    in an attribute value before anything downstream sees it, so
+    `type="hidd&#101;n"` IS the hidden type and `style="display&#58;none"` IS
+    `display:none`. Comparing the encoded source instead misses both.
+
+    `html.unescape`, never `decode_char_refs`: an attribute is tokenizer
+    territory, so the lenient rules apply — a numeric reference without its
+    semicolon decodes here and would not in a Markdown destination. Checked
+    against Chromium's own `getAttribute` on seven spellings, semicolonless
+    and hex among them; they agree, including on leaving an unknown named
+    reference like `&NotAThing;` alone.
+
+    DECODE, THEN COMPARE EXACTLY. Decoding can introduce whitespace that
+    changes the answer rather than being noise to trim: `type="&#32;hidden"`
+    becomes ` hidden`, which is not the hidden type and paints 185x17.
+    """
+    return html.unescape(value)
+
+
 def _input_paints(tag):
     """Whether an `<input>` renders anything the reader could click."""
     m = _TYPE_ATTR.search(tag)
     if not m:
         return True
     value = next(g for g in m.groups() if g is not None)
-    return value.lower() != 'hidden'
+    return decode_attribute(value).lower() != 'hidden'
 
 
 def _paints_an_input(view, raw_span):
@@ -2159,7 +2183,7 @@ def _style_value(m):
     tokenizer to rule it out is not worth it here.
     """
     raw = m.group(2) if m.group(2) is not None else m.group(3)
-    return html.unescape(raw) if raw else raw
+    return decode_attribute(raw) if raw else raw
 
 
 def style_hidden_search(txt, at):
@@ -6080,6 +6104,32 @@ self_test() {
     > "$c9kt/docs/guide/jobs.md"
   git -C "$c9kt" add -A && git -C "$c9kt" commit -qm hidden-subtree-input
   check "an input in a hidden subtree is not content" fail "$c9kt"
+
+  # The tokenizer decodes an attribute value before anything sees it, so this
+  # IS the hidden type and paints nothing. Comparing the encoded source called
+  # it a text input and made an empty anchor a route.
+  local c9ku="$tmp/c9ku"; make_corpus "$c9ku"
+  printf '# Jobs\n\n<a href="mail.md"><input type="hidd&#101;n"></a>\n' \
+    > "$c9ku/docs/guide/jobs.md"
+  git -C "$c9ku" add -A && git -C "$c9ku" commit -qm input-type-entity
+  check "a character reference in a type is decoded" fail "$c9ku"
+
+  # ...by the TOKENIZER's rules: a numeric reference without its semicolon is
+  # decoded in an attribute, where a Markdown destination would keep it.
+  local c9kv="$tmp/c9kv"; make_corpus "$c9kv"
+  printf '# Jobs\n\n<a href="mail.md"><input type="hidd&#101n"></a>\n' \
+    > "$c9kv/docs/guide/jobs.md"
+  git -C "$c9kv" add -A && git -C "$c9kv" commit -qm input-type-entity-no-semi
+  check "a semicolonless reference in a type is decoded" fail "$c9kv"
+
+  # ...and decoding can INTRODUCE the whitespace that decides the answer, so
+  # the comparison stays exact afterwards: this decodes to ` hidden`, which is
+  # not the hidden type and paints. Stripping after decoding strands the page.
+  local c9kw="$tmp/c9kw"; make_corpus "$c9kw"
+  printf '# Jobs\n\n<a href="mail.md"><input type="&#32;hidden"></a>\n' \
+    > "$c9kw/docs/guide/jobs.md"
+  git -C "$c9kw" add -A && git -C "$c9kw" commit -qm input-type-entity-space
+  check "a decoded leading space is not the hidden type" pass "$c9kw"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
