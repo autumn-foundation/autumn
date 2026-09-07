@@ -30,11 +30,33 @@ didn't override `execute_action`, so it inherited this loop. Its `delete()`
 is a `pool.get()` + single-row CTE round trip
 (`DELETE FROM autumn_experiments WHERE id = $1 RETURNING name`, cascading
 to that experiment's sticky assignments and staff overrides, and feeding
-an audit `INSERT` into `autumn_experiment_changes`) — so an operator
-selecting hundreds of concluded/archived experiments in a multi-year-old
-app's cleanup and clicking "Delete selected" cost one statement, and one
-connection checkout, **per experiment**, not per click. This is the same
-shape already closed for `TokenAdminModel`
+an audit `INSERT` into `autumn_experiment_changes`) — one statement, and
+one connection checkout, per experiment, not per bulk-action request.
+
+**Reachability, precisely stated** (caught by review): `model_action`
+itself places no cap on how many `ids=` entries one POST carries — that's
+a route-level property, not a UI one. The *stock* admin list template,
+though, only ever emits a checkbox for the current page's rows
+(`templates.rs`), and `ExperimentAdminModel` doesn't override
+`per_page()`'s 25-row default, so a single click in the shipped UI tops
+out at 25 ids, not 615. The 615-id workload this harness measures is real
+production traffic reachable through: a scripted/API client hitting the
+same unauthenticated-by-shape `POST /admin/experiments/actions` endpoint
+directly (the endpoint has no ids cap to bypass); an app that raises
+`per_page()` or adds a "select all matching filter" control on top of the
+same endpoint (a one-line, common admin-panel feature this codebase
+doesn't happen to ship yet); or simply the SAME per-id loop running once
+per 25-id page as an operator pages through a large cleanup — 25 requests
+of 25 ids apiece pay the identical N+1 tax as one request of 615, just
+spread across more round trips of the browser's own. The defect measured
+and the fix applied are the same either way: `execute_action`'s per-id
+loop runs on every `POST /admin/experiments/actions`, page-sized or not.
+This report benchmarks the endpoint's own worst case (one large request)
+because that's the shape `TokenAdminModel`'s and `FeatureFlagAdminModel`'s
+prior reports already benchmark it at, not because the shipped UI can
+submit it in one click today.
+
+This is the same shape already closed for `TokenAdminModel`
 (`docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`) and
 `FeatureFlagAdminModel`
 (`docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`);

@@ -16,15 +16,26 @@
 //! looped over `ids` and called `self.delete(&pool, id)` once per id — a
 //! full `pool.get()` + single-row CTE round trip (delete the experiment,
 //! cascade-delete its sticky assignments and staff overrides, write one
-//! audit row) per id, with no batching at all (traits.rs). An operator
-//! selecting hundreds of concluded/archived experiments in a
-//! multi-year-old app's cleanup and clicking "Delete selected" therefore
-//! cost hundreds of statements for what is, on the wire, one predicate —
-//! exactly the shape already closed for `TokenAdminModel`
+//! audit row) per id, with no batching at all (traits.rs) — hundreds of
+//! statements for what is, on the wire, one predicate, exactly the shape
+//! already closed for `TokenAdminModel`
 //! (`docs/reports/2026-08-31-ledger-admin-bulk-delete-batch/`) and
 //! `FeatureFlagAdminModel`
 //! (`docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`);
 //! `ExperimentAdminModel` never got the same override.
+//!
+//! `model_action` itself caps `ids` at nothing -- that's a route-level
+//! property. The *stock* admin list template only renders a checkbox for
+//! the current page's rows, and `ExperimentAdminModel` doesn't override
+//! `per_page()`'s 25-row default, so today's shipped UI tops a single
+//! click out at 25 ids, not the 615 this harness submits. See the
+//! "Reachability, precisely stated" note in
+//! `docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/README.md`
+//! (added after review) for why the 615-id shape is still the right thing
+//! to benchmark: the endpoint has no cap to bypass, and the same per-id
+//! loop this fix replaces runs once per `POST /admin/experiments/actions`
+//! regardless of how many ids that request carries, so 25 requests of 25
+//! ids pay the identical N+1 tax as one request of 615.
 //!
 //! **Requires Docker.** Run manually with:
 //!
