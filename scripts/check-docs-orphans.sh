@@ -2458,17 +2458,44 @@ def edges_from(f):
             # and U+00A0 are NOT removed — they percent-encode and stay in the
             # path, which is why only these three go.
             raw = raw.translate({0x09: None, 0x0a: None, 0x0d: None})
+            # A BACKSLASH IS A PATH SEPARATOR to the URL parser, so
+            # `<a href="docs\guide\mail.md">` navigates to
+            # `docs/guide/mail.md` and is a route the reader can click. This
+            # gate compared the backslash spelling against tracked filenames,
+            # matched nothing, and reported the page as an orphan.
+            # Measured in Chromium through `new URL()`, under an `https:` base
+            # and a `file:` base alike — they agree, so which one the reader
+            # is on does not have to be decided here.
+            #
+            # MARKDOWN IS THE OTHER WAY, and that asymmetry is the whole
+            # reason this sits in the raw branch: cmark-gfm percent-encodes
+            # the backslash, emitting `href="docs%5Cguide%5Cmail.md"`, and
+            # `%5C` is a literal backslash in the path that reaches the
+            # tracked file not at all. Same source characters, two
+            # destinations, because one passes through a Markdown renderer
+            # first. Converting both would invent a route out of a link that
+            # renders as a dead one.
+            #
+            # Before `unquote`, so a raw href that spells `%5C` keeps its
+            # literal backslash rather than being folded into a separator.
+            raw = raw.replace('\\', '/')
         raw = raw.split('#', 1)[0].split('?', 1)[0].strip(' \t\n\r\f\v')
         raw = urllib.parse.unquote(raw)
         raw = (raw.replace('\x00\x00', '\\\\')
                .replace('\x01\x01', '\\!')
                .replace('\x02\x02', '\\<'))
-        # Only for a MARKDOWN destination. A backslash in a raw HTML `href`
-        # is a literal character, so `<a href="docs/guide/mail\.md">` points
-        # at `mail\.md` and reaches the tracked file not at all — unescaping
-        # it recorded an edge no reader can follow. Verified against
-        # markdown-it-py, which keeps the backslash in the raw href and
-        # drops it from `[mail](docs/guide/mail\.md)`.
+        # Only for a MARKDOWN destination: Markdown drops the backslash from
+        # an escaped punctuation character, and a raw `href` has no Markdown
+        # escapes to drop. Unescaping one recorded an edge no reader can
+        # follow. Verified against markdown-it-py, which keeps the backslash
+        # in the raw href and drops it from `[mail](docs/guide/mail\.md)`.
+        #
+        # CORRECTION to what this said before: it called the backslash in a
+        # raw href "a literal character" pointing at `mail\.md`. It is not —
+        # the URL parser reads it as a separator, so that href points at
+        # `docs/guide/mail/.md`, which is a different wrong answer. The
+        # decision was right and the reason was not, and the separator rule
+        # above is where that measurement now lives.
         if markdown:
             raw = UNESCAPE.sub(r'\1', raw)
         if not raw.endswith('.md'):
@@ -5558,6 +5585,34 @@ self_test() {
     > "$c9js/README.md"
   git -C "$c9js" add -A && git -C "$c9js" commit -qm deep-nested-external-dest
   check "a deeply nested label still blanks its destination" fail "$c9js"
+
+  # A BACKSLASH IS A PATH SEPARATOR to the URL parser, so a raw anchor written
+  # this way navigates to `docs/guide/mail.md` and is a route. Measured in
+  # Chromium under an `https:` and a `file:` base alike.
+  local c9jt="$tmp/c9jt"; make_corpus "$c9jt"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<a href="docs\\guide\\mail.md">Mail</a>\n' \
+    > "$c9jt/README.md"
+  git -C "$c9jt" add -A && git -C "$c9jt" commit -qm raw-href-backslash
+  check "a raw href backslash is a path separator" pass "$c9jt"
+
+  # ...but `%5C` is a LITERAL backslash in the path and reaches the tracked
+  # file not at all. Converting after percent-decoding folds the two spellings
+  # together and invents this route.
+  local c9ju="$tmp/c9ju"; make_corpus "$c9ju"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n<a href="docs%%5Cguide%%5Cmail.md">Mail</a>\n' \
+    > "$c9ju/README.md"
+  git -C "$c9ju" add -A && git -C "$c9ju" commit -qm raw-href-percent-5c
+  check "a percent-encoded backslash is not a separator" fail "$c9ju"
+
+  # ...and MARKDOWN is the other way round: cmark-gfm percent-encodes the
+  # backslash, emitting `href="docs%5Cguide%5Cmail.md"`, so the same source
+  # characters render a dead link. Applying the raw rule to both branches
+  # would invent a route out of it.
+  local c9jv="$tmp/c9jv"; make_corpus "$c9jv"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n\n[Mail](docs\\guide\\mail.md)\n' \
+    > "$c9jv/README.md"
+  git -C "$c9jv" add -A && git -C "$c9jv" commit -qm markdown-dest-backslash
+  check "a Markdown destination backslash is not a separator" fail "$c9jv"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
