@@ -145,6 +145,55 @@ async fn guard_layer_protects_every_plugin_route() {
         .assert_body_contains("type Note {");
 }
 
+/// Under the `prod` profile the framework's CSRF layer is on. The shell then
+/// carries the token in `<meta name="csrf-token">`, and the client echoes it
+/// in `X-CSRF-Token` (the cookie is HttpOnly, so the meta tag is the only
+/// way page script can learn it). Proven here with CSRF switched on
+/// explicitly: a bare POST is refused, a POST carrying cookie + header is not.
+#[tokio::test]
+async fn csrf_token_flows_from_the_shell_to_graphql_mutations() {
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.security.csrf.enabled = true;
+    let client = TestApp::new()
+        .routes(react_graphql::routes())
+        .plugin(graphql())
+        .config(config)
+        .build();
+
+    let shell = client.get("/").send().await;
+    shell.assert_ok().assert_selector("meta[name=csrf-token]");
+    let token = shell.selector_attr("meta[name=csrf-token]", "content")[0]
+        .clone()
+        .expect("token in the meta tag");
+    let cookie = shell
+        .header("set-cookie")
+        .expect("csrf cookie set on the shell response")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+
+    // No header: refused before any resolver runs.
+    client
+        .post(GRAPHQL_PATH)
+        .header("cookie", &cookie)
+        .json(&json!({ "query": "{ __typename }" }))
+        .send()
+        .await
+        .assert_status(403);
+
+    // Cookie + header, as the client sends them: through to the schema.
+    client
+        .post(GRAPHQL_PATH)
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &token)
+        .json(&json!({ "query": "{ __typename }" }))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("\"__typename\":\"Query\"");
+}
+
 #[tokio::test]
 async fn a_get_without_a_query_string_is_a_400() {
     client_without_db()

@@ -45,6 +45,7 @@ untouched because the bundle is an external ES module.
 | `PluginContract` + conformance harness | `src/graphql_plugin.rs`, `tests/graphql_api.rs` | Declares the `autumn-web` series; `run_conformance` proves attribution, prefix, collisions and contract in one test |
 | Maud page shell + `asset_url` | `src/lib.rs` | Autumn renders the document; `asset_url` gives fingerprinted URLs in a release build with an asset manifest |
 | Committed Vite bundle, fixed file names | `frontend/vite.config.ts` | `app.js` / `app.css` with no content hash, so the shell references them by name |
+| CSRF under `prod` | `src/lib.rs`, `frontend/src/api.ts` | `CsrfToken` → `<meta name="csrf-token">` in the shell; the client sends `X-CSRF-Token`; tested with CSRF forced on |
 | Single-binary deploy | `src/lib.rs`, `Cargo.toml` | `autumn build --embed` bakes the bundle into the binary via `embed_static!()` + `.embedded_static(..)`; `asset_url` switches to the embedded fingerprint manifest |
 | Typed GraphQL client, no Apollo | `frontend/src/api.ts` | One `fetch` per operation, typed against `frontend/src/types.ts` |
 | Schema drift gate | `tests/graphql_api.rs`, `schema.graphql` | The committed SDL must equal what the server serves — the TypeScript types are written against it |
@@ -170,8 +171,50 @@ git), then compiles with the `embed-assets` feature. `src/lib.rs` opts in with
 `embed_static!()` and `.embedded_static(..)` behind that feature, so the
 release binary serves `/static/app/app.c7bfed64.js` and friends from its own
 bytes with `cache-control: immutable`, and `asset_url` in the shell resolves
-to those hashed names. Copy the one file anywhere, point
-`AUTUMN_DATABASE__URL` at a Postgres, and it runs — no `static/` sidecar.
+to those hashed names.
+
+A release binary runs under the `prod` profile, and two of this example's
+choices need stating there rather than assumed:
+
+- **Migrations.** Applying them at boot is a dev-profile default; in `prod`
+  the framework leaves it to an explicit `autumn migrate` unless
+  `[database] auto_migrate = true` — which this example's `autumn.toml`
+  sets, because it is a single process. A multi-replica fleet should keep
+  that off and run `autumn migrate` as a release step.
+- **Trusted hosts.** `prod` refuses to start without a Host-header
+  allow-list; `autumn.toml` lists the loopback names for the deploy below,
+  and a real deployment lists its real hostname(s).
+- **CSRF.** `prod` turns the framework's CSRF layer on. The shell renders
+  the token as `<meta name="csrf-token">` (via the `CsrfToken` extractor —
+  the cookie is `HttpOnly`, so this is how page script learns it) and the
+  client echoes it in `X-CSRF-Token` on every mutation: the same
+  double-submit contract the framework's htmx helper uses. In dev the tag is
+  absent and CSRF is off. `react_app_works_under_the_prod_profile` runs the
+  whole browser journey under `prod` to prove it.
+- **The public write API.** The framework refuses to start in `prod` when a
+  `#[repository(api = …)]` exposes `POST`/`PUT`/`DELETE` without a
+  `policy = …`. This example's API is deliberately unauthenticated, so
+  `autumn.toml` opts out with `[security] allow_unauthorized_repository_api
+  = true`; a real app adds a policy (and guards the GraphQL mount) instead.
+
+So the one-file deploy is the binary **plus its `autumn.toml`** (or the
+equivalent `AUTUMN_*` variables), plus the one thing every Autumn app needs
+in `prod` and must never have in a file: a signing secret. Copy them
+anywhere, point `AUTUMN_DATABASE__URL` at a Postgres, and it migrates, seeds,
+and serves:
+
+```bash
+mkdir /tmp/deploy && cp target/release/react-graphql examples/react-graphql/autumn.toml /tmp/deploy/
+cd /tmp/deploy && \
+  AUTUMN_SECURITY__SIGNING_SECRET=$(openssl rand -hex 32) \
+  AUTUMN_DATABASE__URL=postgres://autumn:autumn@localhost:5432/notes \
+  ./react-graphql
+```
+
+Leave the secret out and `prod` refuses to start, naming the variable; leave
+`allow_unauthorized_repository_api` out and it refuses to start, naming the
+unguarded `POST`/`PUT`/`DELETE` routes. Both refusals are the framework
+doing its job; the config above is this example choosing to be public.
 
 A dev build never enables the feature, so `npm run build` output is picked up
 from disk without recompiling Rust.

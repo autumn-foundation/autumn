@@ -60,15 +60,26 @@ static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!
 /// the framework's standard `/static` mount, and referenced through
 /// [`asset_url`] so a release build with an asset manifest gets fingerprinted
 /// URLs for free.
+///
+/// The shell also carries the CSRF token as `<meta name="csrf-token">` when
+/// the framework's CSRF layer is active (it is, by default, under the `prod`
+/// profile). The CSRF cookie is `HttpOnly`, so this meta tag is how page
+/// script learns the token; the client echoes it in `X-CSRF-Token` on every
+/// mutation, which is the same double-submit contract the framework's htmx
+/// helper follows. In dev, where CSRF is off, the extractor yields `None`
+/// and the tag is simply absent.
 #[get("/")]
 #[public]
-pub async fn index() -> Markup {
+pub async fn index(csrf: Option<CsrfToken>) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                @if let Some(csrf) = &csrf {
+                    meta name="csrf-token" content=(csrf.token());
+                }
                 title { "Autumn Notes" }
                 link rel="stylesheet" href=(asset_url("app/app.css"));
             }

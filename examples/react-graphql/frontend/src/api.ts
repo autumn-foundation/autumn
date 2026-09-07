@@ -23,9 +23,21 @@ export async function graphql<T>(
   query: string,
   variables: Record<string, unknown> = {},
 ): Promise<T> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json",
+  };
+  // Autumn's CSRF layer (on by default in the `prod` profile) wants the token
+  // from the server-rendered shell's `<meta name="csrf-token">` echoed back in
+  // this header on every mutating request — the CSRF cookie itself is
+  // HttpOnly. Under `npm run dev` the shell is Vite's index.html, which has no
+  // such tag, and the dev profile has CSRF off, so the header is simply
+  // omitted.
+  const csrf = document.querySelector<HTMLMetaElement>('meta[name="csrf-token"]')?.content;
+  if (csrf) headers["x-csrf-token"] = csrf;
   const response = await fetch("/graphql", {
     method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
+    headers,
     body: JSON.stringify({ query, variables }),
   });
   if (!response.ok) {
