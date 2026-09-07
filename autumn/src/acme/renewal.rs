@@ -368,13 +368,13 @@ pub struct AcmeRenewalTask {
 /// shared [`Http01Tokens`] map immediately and removed again when the guard
 /// drops — so no matter which `?` in the order flow returns `Err`, published
 /// tokens never leak into the map to accumulate across repeated failures.
-struct PublishedTokens<'a> {
+pub(crate) struct PublishedTokens<'a> {
     tokens: &'a Http01Tokens,
     published: Vec<String>,
 }
 
 impl<'a> PublishedTokens<'a> {
-    const fn new(tokens: &'a Http01Tokens) -> Self {
+    pub(crate) const fn new(tokens: &'a Http01Tokens) -> Self {
         Self {
             tokens,
             published: Vec::new(),
@@ -712,33 +712,7 @@ impl AcmeRenewalTask {
         &'a self,
         order: &mut instant_acme::Order,
     ) -> Result<PublishedTokens<'a>, String> {
-        use instant_acme::{AuthorizationStatus, ChallengeType};
-
-        // Every token handed to the guard is inserted into the shared map
-        // immediately and removed again when the guard drops — so no matter
-        // which `?` returns `Err`, published tokens never leak into the map to
-        // accumulate across repeated failures.
-        let mut published = PublishedTokens::new(&self.tokens);
-        let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
-            let mut authz = result.map_err(|e| format!("failed to fetch authorization: {e}"))?;
-            if authz.status == AuthorizationStatus::Valid {
-                continue;
-            }
-            let mut challenge = authz
-                .challenge(ChallengeType::Http01)
-                .ok_or_else(|| "authorization offered no http-01 challenge".to_owned())?;
-            let token = challenge.token.clone();
-            let key_auth = challenge.key_authorization().as_str().to_owned();
-            // Publish BEFORE signalling ready so the CA can fetch it — and
-            // track it in the guard so a failing `set_ready` still cleans up.
-            published.publish(token, key_auth);
-            challenge
-                .set_ready()
-                .await
-                .map_err(|e| format!("failed to signal challenge ready: {e}"))?;
-        }
-        Ok(published)
+        answer_http01(&self.tokens, order).await
     }
 
     /// Answer every pending authorization over DNS-01 and wait for the order to
@@ -1014,21 +988,11 @@ impl AcmeRenewalTask {
     /// invalid and the next attempt spends another of the CA's five
     /// failed-validations-per-hour.
     async fn await_order_ready(&self, order: &mut instant_acme::Order) -> Result<(), String> {
-        use instant_acme::{OrderStatus, RetryPolicy};
-
-        let policy = if self.dns.is_some() {
-            RetryPolicy::default().timeout(DNS01_ORDER_READY_TIMEOUT)
-        } else {
-            RetryPolicy::default()
-        };
-        let status = order
-            .poll_ready(&policy)
-            .await
-            .map_err(|e| format!("order did not become ready: {e}"))?;
-        if status != OrderStatus::Ready {
-            return Err(format!("ACME order ended in unexpected state {status:?}"));
-        }
-        Ok(())
+        await_order_ready(
+            order,
+            self.dns.is_some().then_some(DNS01_ORDER_READY_TIMEOUT),
+        )
+        .await
     }
 
     /// Finalize the ready order, persist the issued pair, and hot-swap it into
@@ -1068,97 +1032,169 @@ impl AcmeRenewalTask {
     /// Generate a fresh keypair + CSR (DER) for the configured domains. Returns
     /// the CSR DER and the private key PEM.
     fn generate_csr(&self) -> Result<(Vec<u8>, String), String> {
-        use rcgen::{CertificateParams, DistinguishedName, KeyPair};
-        let key_pair =
-            KeyPair::generate().map_err(|e| format!("failed to generate cert key: {e}"))?;
-        let mut params = CertificateParams::new(self.config.domains.clone())
-            .map_err(|e| format!("failed to build CSR params: {e}"))?;
-        params.distinguished_name = DistinguishedName::new();
-        let csr = params
-            .serialize_request(&key_pair)
-            .map_err(|e| format!("failed to serialize CSR: {e}"))?;
-        Ok((csr.der().to_vec(), key_pair.serialize_pem()))
-    }
-
-    /// Build an ACME account builder whose HTTP client trusts the right roots.
-    ///
-    /// Calls [`ensure_default_crypto_provider`] first — see there for why a
-    /// missing process default is a panic rather than an error.
-    ///
-    /// With no `ca_root_path` the client verifies the directory against the
-    /// platform trust store, which is what Let's Encrypt (staging and production
-    /// alike — both API endpoints carry publicly-trusted certificates) needs. A
-    /// private CA or a Pebble test server serves its directory under a root the
-    /// host does not know, so `ca_root_path` replaces the trust anchors with
-    /// that root; without it the client cannot complete the TLS handshake and
-    /// every order fails.
-    ///
-    /// Both the register and the restore path go through here, so a restart
-    /// against a private directory works exactly like a first boot.
-    fn account_builder(&self) -> Result<instant_acme::AccountBuilder, String> {
-        ensure_default_crypto_provider();
-        self.config.ca_root_path.as_ref().map_or_else(
-            || {
-                instant_acme::Account::builder()
-                    .map_err(|e| format!("failed to build ACME client: {e}"))
-            },
-            |path| {
-                instant_acme::Account::builder_with_root(path).map_err(|e| {
-                    format!(
-                        "failed to build ACME client with [server.tls.acme] ca_root_path {}: {e}",
-                        path.display()
-                    )
-                })
-            },
-        )
+        generate_csr(&self.config.domains)
     }
 
     /// Load the persisted ACME account, or register a fresh one and persist it.
     async fn load_or_register_account(&self) -> Result<instant_acme::Account, String> {
-        use instant_acme::{AccountCredentials, NewAccount};
-
-        let directory_url = crate::acme::directory_url(&self.config.directory);
-
-        if let Some(bytes) = self
-            .store
-            .load_account()
-            .await
-            .map_err(|e| format!("failed to read stored ACME account: {e}"))?
-        {
-            let credentials: AccountCredentials = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("stored ACME account is corrupt: {e}"))?;
-            let account = self
-                .account_builder()?
-                .from_credentials(credentials)
-                .await
-                .map_err(|e| format!("failed to restore ACME account: {e}"))?;
-            return Ok(account);
-        }
-
-        let contact = format!("mailto:{}", self.config.contact_email.trim());
-        let contacts = [contact.as_str()];
-        let (account, credentials) = self
-            .account_builder()?
-            .create(
-                &NewAccount {
-                    contact: &contacts,
-                    terms_of_service_agreed: true,
-                    only_return_existing: false,
-                },
-                directory_url,
-                None,
-            )
-            .await
-            .map_err(|e| format!("failed to register ACME account: {e}"))?;
-
-        let serialized = serde_json::to_vec(&credentials)
-            .map_err(|e| format!("failed to serialize ACME account: {e}"))?;
-        self.store
-            .save_account(&serialized)
-            .await
-            .map_err(|e| format!("failed to persist ACME account: {e}"))?;
-        Ok(account)
+        load_or_register_account(self.store.as_ref(), &self.config).await
     }
+}
+
+/// Publish an HTTP-01 response for every pending authorization in `order` and
+/// tell the CA each is ready, returning the RAII guard that un-publishes them.
+///
+/// Shared by the whole-deployment renewal loop and the per-tenant custom-domain
+/// issuer (#1635), which answer identical challenges against different token
+/// maps.
+///
+/// Every token handed to the guard is inserted into the shared map immediately
+/// and removed again when the guard drops — so no matter which `?` returns
+/// `Err`, published tokens never leak into the map to accumulate across
+/// repeated failures.
+pub(crate) async fn answer_http01<'a>(
+    tokens: &'a Http01Tokens,
+    order: &mut instant_acme::Order,
+) -> Result<PublishedTokens<'a>, String> {
+    use instant_acme::{AuthorizationStatus, ChallengeType};
+
+    let mut published = PublishedTokens::new(tokens);
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result.map_err(|e| format!("failed to fetch authorization: {e}"))?;
+        if authz.status == AuthorizationStatus::Valid {
+            continue;
+        }
+        let mut challenge = authz
+            .challenge(ChallengeType::Http01)
+            .ok_or_else(|| "authorization offered no http-01 challenge".to_owned())?;
+        let token = challenge.token.clone();
+        let key_auth = challenge.key_authorization().as_str().to_owned();
+        // Publish BEFORE signalling ready so the CA can fetch it — and track it
+        // in the guard so a failing `set_ready` still cleans up.
+        published.publish(token, key_auth);
+        challenge
+            .set_ready()
+            .await
+            .map_err(|e| format!("failed to signal challenge ready: {e}"))?;
+    }
+    Ok(published)
+}
+
+/// Poll `order` until the CA marks it ready, failing on any other end state.
+///
+/// `timeout` overrides the client default; DNS-01 needs the longer one because
+/// the CA re-queries public DNS.
+pub(crate) async fn await_order_ready(
+    order: &mut instant_acme::Order,
+    timeout: Option<Duration>,
+) -> Result<(), String> {
+    use instant_acme::{OrderStatus, RetryPolicy};
+
+    let policy = timeout.map_or_else(RetryPolicy::default, |t| RetryPolicy::default().timeout(t));
+    let status = order
+        .poll_ready(&policy)
+        .await
+        .map_err(|e| format!("order did not become ready: {e}"))?;
+    if status != OrderStatus::Ready {
+        return Err(format!("ACME order ended in unexpected state {status:?}"));
+    }
+    Ok(())
+}
+
+/// Generate a fresh keypair + CSR (DER) for `domains`. Returns the CSR DER and
+/// the private key PEM.
+pub(crate) fn generate_csr(domains: &[String]) -> Result<(Vec<u8>, String), String> {
+    use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+    let key_pair = KeyPair::generate().map_err(|e| format!("failed to generate cert key: {e}"))?;
+    let mut params = CertificateParams::new(domains.to_vec())
+        .map_err(|e| format!("failed to build CSR params: {e}"))?;
+    params.distinguished_name = DistinguishedName::new();
+    let csr = params
+        .serialize_request(&key_pair)
+        .map_err(|e| format!("failed to serialize CSR: {e}"))?;
+    Ok((csr.der().to_vec(), key_pair.serialize_pem()))
+}
+
+/// Build an ACME account builder whose HTTP client trusts the right roots.
+///
+/// Calls [`ensure_default_crypto_provider`] first — see there for why a missing
+/// process default is a panic rather than an error.
+///
+/// With no `ca_root_path` the client verifies the directory against the
+/// platform trust store, which is what Let's Encrypt (staging and production
+/// alike — both API endpoints carry publicly-trusted certificates) needs. A
+/// private CA or a Pebble test server serves its directory under a root the
+/// host does not know, so `ca_root_path` replaces the trust anchors with that
+/// root; without it the client cannot complete the TLS handshake and every
+/// order fails.
+pub(crate) fn account_builder(
+    config: &AcmeConfig,
+) -> Result<instant_acme::AccountBuilder, String> {
+    ensure_default_crypto_provider();
+    config.ca_root_path.as_ref().map_or_else(
+        || instant_acme::Account::builder().map_err(|e| format!("failed to build ACME client: {e}")),
+        |path| {
+            instant_acme::Account::builder_with_root(path).map_err(|e| {
+                format!(
+                    "failed to build ACME client with [server.tls.acme] ca_root_path {}: {e}",
+                    path.display()
+                )
+            })
+        },
+    )
+}
+
+/// Load the persisted ACME account, or register a fresh one and persist it.
+///
+/// Both the register and the restore path go through here, so a restart against
+/// a private directory works exactly like a first boot — and a per-tenant order
+/// reuses the SAME account as the deployment's own certificate rather than
+/// registering a second one.
+pub(crate) async fn load_or_register_account(
+    store: &dyn AcmeStore,
+    config: &AcmeConfig,
+) -> Result<instant_acme::Account, String> {
+    use instant_acme::{AccountCredentials, NewAccount};
+
+    let directory_url = crate::acme::directory_url(&config.directory);
+
+    if let Some(bytes) = store
+        .load_account()
+        .await
+        .map_err(|e| format!("failed to read stored ACME account: {e}"))?
+    {
+        let credentials: AccountCredentials = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("stored ACME account is corrupt: {e}"))?;
+        let account = account_builder(config)?
+            .from_credentials(credentials)
+            .await
+            .map_err(|e| format!("failed to restore ACME account: {e}"))?;
+        return Ok(account);
+    }
+
+    let contact = format!("mailto:{}", config.contact_email.trim());
+    let contacts = [contact.as_str()];
+    let (account, credentials) = account_builder(config)?
+        .create(
+            &NewAccount {
+                contact: &contacts,
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            directory_url,
+            None,
+        )
+        .await
+        .map_err(|e| format!("failed to register ACME account: {e}"))?;
+
+    let serialized = serde_json::to_vec(&credentials)
+        .map_err(|e| format!("failed to serialize ACME account: {e}"))?;
+    store
+        .save_account(&serialized)
+        .await
+        .map_err(|e| format!("failed to persist ACME account: {e}"))?;
+    Ok(account)
 }
 
 /// Pin the process-level rustls `CryptoProvider` to `ring` if nothing has set one.
@@ -1184,7 +1220,7 @@ impl AcmeRenewalTask {
 /// requirement is only that *a* default exists before rustls looks for one, and
 /// silently replacing an application's deliberate choice would be worse than
 /// the panic this prevents.
-fn ensure_default_crypto_provider() {
+pub(crate) fn ensure_default_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         // Errors only if another thread won the race to install one, which
         // satisfies the requirement just as well.

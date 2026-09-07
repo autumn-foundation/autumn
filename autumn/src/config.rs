@@ -7244,6 +7244,169 @@ pub struct AcmeConfig {
     /// absent, issuance stays on #1608's HTTP-01 path and wildcards are rejected.
     #[serde(default)]
     pub dns: Option<AcmeDnsConfig>,
+
+    /// Tenant custom domains (issue #1635). Present under
+    /// `[server.tls.acme.custom_domains]`.
+    ///
+    /// When enabled, tenants connect their own hostnames, each getting its own
+    /// verified, per-domain certificate served by SNI. Absent means no tenant
+    /// hostname is registrable and SNI selection is unchanged.
+    #[serde(default)]
+    pub custom_domains: Option<CustomDomainsConfig>,
+}
+
+/// `[server.tls.acme.custom_domains]` — tenant-connected hostnames with
+/// per-domain ACME certificates (issue #1635).
+///
+/// The whole feature is config-only: no per-domain entries ever appear here.
+/// Domains are registered at runtime through
+/// [`CustomDomainRegistry`](crate::custom_domain::CustomDomainRegistry), which
+/// is what makes a 1,000-tenant deployment a fixed twenty lines of config.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomDomainsConfig {
+    /// Turn the feature on. Off by default: enabling it opens an ACME order
+    /// path driven by tenant-supplied hostnames.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The ingress hostname tenants CNAME their subdomains at.
+    #[serde(default)]
+    pub ingress_hostname: Option<String>,
+
+    /// The ingress IPv4 addresses tenants point apex domains at with A records.
+    #[serde(default)]
+    pub ingress_ipv4: Vec<std::net::Ipv4Addr>,
+
+    /// The ingress IPv6 addresses, for AAAA records.
+    #[serde(default)]
+    pub ingress_ipv6: Vec<std::net::Ipv6Addr>,
+
+    /// Directory holding the domain registry. Default: `config/acme/domains`.
+    #[serde(default = "default_custom_domains_dir")]
+    pub store_dir: PathBuf,
+
+    /// Most domains this deployment will accept. Default: `1000`.
+    #[serde(default = "default_custom_domains_max")]
+    pub max_domains: usize,
+
+    /// Certificates held in memory at once. Beyond this, a handshake for a
+    /// cold domain re-reads its certificate from the store. Default: `256`.
+    #[serde(default = "default_custom_domains_cert_cache")]
+    pub cert_cache_size: usize,
+
+    /// ACME orders allowed per domain per day. Default: `5`.
+    #[serde(default = "default_custom_domains_per_domain_per_day")]
+    pub issuance_per_domain_per_day: u32,
+
+    /// ACME orders allowed across all domains per hour. Default: `50`.
+    #[serde(default = "default_custom_domains_global_per_hour")]
+    pub issuance_global_per_hour: u32,
+
+    /// First retry delay after a failure; doubles per consecutive failure.
+    /// Default: `300` (5 minutes).
+    #[serde(default = "default_custom_domains_base_backoff")]
+    pub failure_backoff_secs: u64,
+
+    /// Cap on the doubling backoff. Default: `86400` (a day).
+    #[serde(default = "default_custom_domains_max_backoff")]
+    pub max_failure_backoff_secs: u64,
+
+    /// How often the orchestrator verifies, issues and renews. Default: `60`.
+    #[serde(default = "default_custom_domains_poll_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for CustomDomainsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ingress_hostname: None,
+            ingress_ipv4: Vec::new(),
+            ingress_ipv6: Vec::new(),
+            store_dir: default_custom_domains_dir(),
+            max_domains: default_custom_domains_max(),
+            cert_cache_size: default_custom_domains_cert_cache(),
+            issuance_per_domain_per_day: default_custom_domains_per_domain_per_day(),
+            issuance_global_per_hour: default_custom_domains_global_per_hour(),
+            failure_backoff_secs: default_custom_domains_base_backoff(),
+            max_failure_backoff_secs: default_custom_domains_max_backoff(),
+            poll_interval_secs: default_custom_domains_poll_secs(),
+        }
+    }
+}
+
+impl CustomDomainsConfig {
+    /// Validate the custom-domain wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.ingress_hostname.as_ref().is_none_or(|h| h.trim().is_empty())
+            && self.ingress_ipv4.is_empty()
+            && self.ingress_ipv6.is_empty()
+        {
+            return Err(
+                "[server.tls.acme.custom_domains] needs somewhere for tenants to point DNS: set                  ingress_hostname (the CNAME target for tenant subdomains) and/or                  ingress_ipv4 / ingress_ipv6 (the A/AAAA records apex domains need). Without                  one, no tenant can be given usable DNS instructions and no domain can ever                  verify"
+                    .to_owned(),
+            );
+        }
+        if self.max_domains == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] max_domains must be at least 1; 0 rejects                  every registration"
+                    .to_owned(),
+            );
+        }
+        if self.cert_cache_size == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] cert_cache_size must be at least 1: a                  zero-sized cache would re-read every certificate on every handshake"
+                    .to_owned(),
+            );
+        }
+        if self.issuance_per_domain_per_day == 0 || self.issuance_global_per_hour == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] issuance_per_domain_per_day and                  issuance_global_per_hour must both be at least 1; 0 refuses every order and no                  domain can ever become active"
+                    .to_owned(),
+            );
+        }
+        if self.failure_backoff_secs == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] failure_backoff_secs must be at least 1: a                  zero backoff retries a permanently broken domain every tick and burns the CA's                  rate limits"
+                    .to_owned(),
+            );
+        }
+        if self.max_failure_backoff_secs < self.failure_backoff_secs {
+            return Err(format!(
+                "[server.tls.acme.custom_domains] max_failure_backoff_secs ({}) must be at least                  failure_backoff_secs ({}): the cap is applied to the doubling delay, so a                  smaller cap silently disables the backoff",
+                self.max_failure_backoff_secs, self.failure_backoff_secs
+            ));
+        }
+        if self.poll_interval_secs == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] poll_interval_secs must be at least 1; 0 spins                  the orchestrator"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The ingress this deployment tells tenants to point at.
+    #[must_use]
+    pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
+        crate::custom_domain::ExpectedIngress {
+            hostname: self
+                .ingress_hostname
+                .as_ref()
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty()),
+            ipv4: self.ingress_ipv4.clone(),
+            ipv6: self.ingress_ipv6.clone(),
+        }
+    }
 }
 
 impl AcmeConfig {
@@ -7363,6 +7526,9 @@ impl AcmeConfig {
         }
         if let Some(dns) = &self.dns {
             dns.validate()?;
+        }
+        if let Some(custom) = &self.custom_domains {
+            custom.validate()?;
         }
         Ok(())
     }
@@ -9363,6 +9529,46 @@ const fn default_acme_http_challenge_port() -> u16 {
 /// leaves ample slack for retries.
 const fn default_acme_renew_before_days() -> u32 {
     30
+}
+
+/// Default custom-domain registry directory.
+fn default_custom_domains_dir() -> PathBuf {
+    PathBuf::from("config/acme/domains")
+}
+
+/// Default cap on registered tenant domains.
+const fn default_custom_domains_max() -> usize {
+    1000
+}
+
+/// Default number of per-domain certificates held in memory.
+const fn default_custom_domains_cert_cache() -> usize {
+    256
+}
+
+/// Default per-domain daily ACME order budget.
+const fn default_custom_domains_per_domain_per_day() -> u32 {
+    5
+}
+
+/// Default deployment-wide hourly ACME order budget.
+const fn default_custom_domains_global_per_hour() -> u32 {
+    50
+}
+
+/// Default first retry delay after a custom-domain failure.
+const fn default_custom_domains_base_backoff() -> u64 {
+    300
+}
+
+/// Default cap on the custom-domain retry backoff.
+const fn default_custom_domains_max_backoff() -> u64 {
+    86_400
+}
+
+/// Default custom-domain orchestrator poll interval.
+const fn default_custom_domains_poll_secs() -> u64 {
+    60
 }
 
 /// Default credentials-store key holding the DNS provider credential

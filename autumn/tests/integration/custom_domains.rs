@@ -337,21 +337,21 @@ async fn a_verified_custom_domain_resolves_to_its_tenant() {
 fn issuance_is_rate_limited_per_domain_and_globally() {
     let limiter = IssuanceLimiter::new(2, 3, 300, 86_400);
 
-    assert_eq!(limiter.check("a.test", 0, NOW), IssuanceDecision::Allow);
+    assert_eq!(limiter.check("a.test", NOW), IssuanceDecision::Allow);
     limiter.record_attempt("a.test", NOW);
-    assert_eq!(limiter.check("a.test", 0, NOW), IssuanceDecision::Allow);
+    assert_eq!(limiter.check("a.test", NOW), IssuanceDecision::Allow);
     limiter.record_attempt("a.test", NOW);
     // Third attempt for the same domain inside the window is refused.
     assert!(matches!(
-        limiter.check("a.test", 0, NOW),
+        limiter.check("a.test", NOW),
         IssuanceDecision::PerDomainLimit { .. }
     ));
 
     // A different domain still gets through until the global budget is spent.
-    assert_eq!(limiter.check("b.test", 0, NOW), IssuanceDecision::Allow);
+    assert_eq!(limiter.check("b.test", NOW), IssuanceDecision::Allow);
     limiter.record_attempt("b.test", NOW);
     assert!(matches!(
-        limiter.check("c.test", 0, NOW),
+        limiter.check("c.test", NOW),
         IssuanceDecision::GlobalLimit { .. }
     ));
 }
@@ -359,7 +359,8 @@ fn issuance_is_rate_limited_per_domain_and_globally() {
 #[test]
 fn repeated_failures_back_off_exponentially_and_cap() {
     let limiter = IssuanceLimiter::new(100, 100, 300, 3600);
-    assert_eq!(limiter.check("a.test", 0, NOW), IssuanceDecision::Allow);
+    assert_eq!(limiter.check("a.test", NOW), IssuanceDecision::Allow);
+    assert_eq!(limiter.backoff_for(2), 600);
     assert_eq!(
         autumn_web::custom_domain::backoff_secs(1, 300, 3600),
         300

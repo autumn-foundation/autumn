@@ -86,6 +86,12 @@ pub trait AcmeStore: Send + Sync {
         id: &'a CertId,
         cert: &'a StoredCert,
     ) -> StoreFuture<'a, io::Result<()>>;
+
+    /// Delete the certificate for `id`. Deleting an absent one succeeds.
+    ///
+    /// Offboarding a tenant custom domain (#1635) deletes its certificate here
+    /// rather than leaving it on disk forever.
+    fn delete_cert<'a>(&'a self, id: &'a CertId) -> StoreFuture<'a, io::Result<()>>;
 }
 
 /// Filesystem-backed [`AcmeStore`] rooted at a cache directory.
@@ -271,6 +277,27 @@ impl AcmeStore for FsAcmeStore {
             publish_staged(chain_tmp, &chain_path).await?;
             publish_staged(key_tmp, &key_path).await
         })
+    }
+
+    fn delete_cert<'a>(&'a self, id: &'a CertId) -> StoreFuture<'a, io::Result<()>> {
+        let chain_path = self.chain_path(id);
+        let key_path = self.key_path(id);
+        Box::pin(async move {
+            // Remove the key first: a crash between the two leaves a chain with
+            // no key, which every loader already treats as absent — the reverse
+            // would leave a usable private key for a domain no longer served.
+            remove_optional(&key_path).await?;
+            remove_optional(&chain_path).await
+        })
+    }
+}
+
+/// Remove a file, treating "already gone" as success.
+async fn remove_optional(path: &Path) -> io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 

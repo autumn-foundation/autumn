@@ -61,6 +61,8 @@ mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
+#[cfg(feature = "acme")]
+mod custom_domain_issuance;
 mod custom_domains;
 mod custom_layer;
 #[cfg(feature = "db")]

@@ -1087,11 +1087,6 @@ pub enum IssuanceDecision {
         /// Seconds until the global window rolls.
         retry_after_secs: i64,
     },
-    /// The domain is still inside its failure backoff.
-    Backoff {
-        /// Seconds until the next attempt is allowed.
-        retry_after_secs: i64,
-    },
 }
 
 impl IssuanceDecision {
@@ -1111,9 +1106,6 @@ impl IssuanceDecision {
             )),
             Self::GlobalLimit { retry_after_secs } => Some(format!(
                 "deployment-wide issuance budget is spent; retrying in {retry_after_secs}s"
-            )),
-            Self::Backoff { retry_after_secs } => Some(format!(
-                "backing off after repeated failures; retrying in {retry_after_secs}s"
             )),
         }
     }
@@ -1179,18 +1171,19 @@ impl IssuanceLimiter {
         )
     }
 
-    /// May `hostname` be ordered for now?
+    /// May `hostname` be ordered now, as far as the *budgets* are concerned?
     ///
-    /// Checked in escalating order of scope — backoff, then the domain's own
-    /// budget, then the deployment's — so the reason reported is the most
-    /// specific one.
+    /// Deliberately says nothing about failure backoff: the retry deadline
+    /// lives on the domain record ([`CustomDomain::next_attempt_unix`], set
+    /// from [`Self::backoff_for`]) and is enforced by
+    /// [`CustomDomain::is_due`]. Two places holding that deadline would
+    /// disagree — an earlier draft refused every retry here forever, because
+    /// the failure count alone can never say the wait is over.
+    ///
+    /// The domain's own budget is checked before the deployment's, so the
+    /// reason reported is the most specific one.
     #[must_use]
-    pub fn check(
-        &self,
-        hostname: &str,
-        consecutive_failures: u32,
-        now_unix: i64,
-    ) -> IssuanceDecision {
+    pub fn check(&self, hostname: &str, now_unix: i64) -> IssuanceDecision {
         let attempts = read_lock(&self.attempts);
         let domain_hits = attempts
             .per_domain
@@ -1206,16 +1199,6 @@ impl IssuanceLimiter {
         if global_hits.len() >= self.global_per_hour as usize {
             return IssuanceDecision::GlobalLimit {
                 retry_after_secs: retry_after(&global_hits, now_unix, GLOBAL_WINDOW_SECS),
-            };
-        }
-        drop(attempts);
-        let backoff = i64::try_from(self.backoff_for(consecutive_failures)).unwrap_or(i64::MAX);
-        if backoff > 0 && consecutive_failures > 0 {
-            // The caller enforces the *deadline* via `CustomDomain::is_due`;
-            // this only reports how long that deadline is, so the two never
-            // disagree about the backoff schedule.
-            return IssuanceDecision::Backoff {
-                retry_after_secs: backoff,
             };
         }
         IssuanceDecision::Allow
@@ -1386,6 +1369,12 @@ mod sni {
             let mut inner = write_lock(&self.inner);
             inner.certs.remove(hostname);
             inner.order.retain(|h| h != hostname);
+        }
+
+        /// The most certificates this cache will hold.
+        #[must_use]
+        pub const fn capacity(&self) -> usize {
+            self.capacity
         }
 
         /// How many certificates are resident.
@@ -1625,7 +1614,7 @@ mod tests {
     fn a_spent_budget_reports_when_it_rolls() {
         let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
         limiter.record_attempt("a.test", 1000);
-        match limiter.check("a.test", 0, 1500) {
+        match limiter.check("a.test", 1500) {
             IssuanceDecision::PerDomainLimit { retry_after_secs } => {
                 assert_eq!(retry_after_secs, 1000 + PER_DOMAIN_WINDOW_SECS - 1500);
             }
@@ -1633,22 +1622,20 @@ mod tests {
         }
         // Once the window has rolled the domain is allowed again.
         assert_eq!(
-            limiter.check("a.test", 0, 1000 + PER_DOMAIN_WINDOW_SECS + 1),
+            limiter.check("a.test", 1000 + PER_DOMAIN_WINDOW_SECS + 1),
             IssuanceDecision::Allow
         );
         // Offboarding clears the history.
         limiter.forget("a.test");
-        assert_eq!(limiter.check("a.test", 0, 1500), IssuanceDecision::Allow);
+        assert_eq!(limiter.check("a.test", 1500), IssuanceDecision::Allow);
     }
 
     #[test]
-    fn a_failing_domain_is_told_to_back_off() {
+    fn the_budget_says_nothing_about_backoff() {
+        // The retry deadline is the domain record's job; the limiter only ever
+        // reports a spent budget, so a failing domain is not refused twice.
         let limiter = IssuanceLimiter::new(10, 10, 300, 3600);
-        assert_eq!(
-            limiter.check("a.test", 3, 1000),
-            IssuanceDecision::Backoff {
-                retry_after_secs: 1200
-            }
-        );
+        assert_eq!(limiter.check("a.test", 1000), IssuanceDecision::Allow);
+        assert_eq!(limiter.backoff_for(3), 1200);
     }
 }
