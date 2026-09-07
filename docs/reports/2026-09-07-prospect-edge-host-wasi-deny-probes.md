@@ -165,16 +165,26 @@ named in the pre-registration.
     triggers a real wasm trap and asserts the process survives. No such
     test exists in the pre-existing suite today.
   - **R10** (a slow guest starves the async runtime) has **no mitigation
-    at all** in `autumn-edge`, dedicated test or otherwise: `grep -rn
+    mechanism** in `autumn-edge`, dedicated test or otherwise: `grep -rn
     "spawn_blocking\|Semaphore\|concurrency" autumn-edge/src/` returns
-    nothing. `EdgeArtifact::run` is a plain synchronous function; a caller
-    awaiting it from an async context blocks that task for as long as the
-    guest's fuel budget allows before the interpreter traps it. This is a
-    real, previously-unstated gap this assay surfaces as a byproduct, not
-    a threat this file claims to test — worth naming to whoever picks up
-    Keystone's memo next, since `plugin_sandbox`'s own R10 control
+    nothing, and `EdgeArtifact::run` is a plain synchronous function.
+    **Correction (seventh Codex review round):** an earlier version of this
+    bullet called this "a real, previously-unstated gap" without checking
+    whether anything actually calls `run` from a production async request
+    path — it doesn't. `grep -rln EdgeArtifact` across the whole tree finds
+    exactly three files: `host.rs` itself, this PR's own test file, and
+    `examples/edge-greeting/tests/conformance.rs`, whose every test is
+    `#[ignore]`d (needs the `wasm32-wasip1` target). `autumn-edge/src/runtime.rs`
+    — the actual `serve`/`serve_io` production entry points — never calls
+    `host::`/`EdgeArtifact` at all. So there is no live starvation path
+    today: this is a **requirement for whoever later wires this
+    deliberately-synchronous library onto an async serving path**, not a
+    demonstrated current vulnerability. Worth naming to whoever picks up
+    Keystone's memo next regardless — `plugin_sandbox`'s own R10 control
     (`spawn_blocking` plus a bounded concurrency permit) has no
-    `autumn-edge` analogue at all.
+    `autumn-edge` analogue, so that integration work isn't done yet — but
+    "no mitigation for a threat that has no current attack surface" and "a
+    real gap" are different claims, and only the first is true today.
 
   R5, R8, and R11–R17 are either not reachable from `autumn-edge`'s API
   shape (no database seam, no manifest, credential headers stripped before
@@ -272,6 +282,25 @@ named in the pre-registration.
   correctly read as a failure); reverted the control immediately after —
   `git diff --stat autumn-edge/src/host.rs` again shows zero net change to
   that file in this PR.
+- **Update (seventh Codex review round) — a real soundness gap in the
+  link-refusal probes themselves, found and fixed.** `assert_denied_at_load`
+  only checked the generic `"could not be instantiated"` prefix of the
+  fallthrough detail, never the specific import named in it. A review
+  correctly pointed out this meant a probe could pass on *any* unrelated
+  instantiation failure — including the exact regression it exists to
+  catch: if the linker started satisfying `path_open` (or `sock_connect`,
+  `sock_send`, `env::system`) while some other part of the same module
+  happened to fail to link for an unrelated reason, the probe would still
+  read as "refused" without ever checking that the refusal named the
+  import under test. Fixed by threading the expected import name
+  (`"path_open"`, `"sock_connect"`, `"sock_send"`, `"env::system"`) through
+  to `assert_denied_at_load` and asserting the detail contains it —
+  confirmed each is the literal substring wasmi's own error produces by
+  printing one for the invented-namespace case directly
+  (`"...cannot find definition for import env::system with type
+  Func(...)"`), the same way the Verdict section's structural finding was
+  verified two rounds earlier. No apparatus regression: all six probes
+  still pass with the tightened check.
 
 ## 📊 Assay
 

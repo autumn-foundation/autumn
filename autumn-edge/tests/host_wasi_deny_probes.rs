@@ -28,7 +28,16 @@ fn run(wat: &str) -> EdgeOutcome {
         .expect("host-side setup never fails for these probes")
 }
 
-fn assert_denied_at_load(outcome: &EdgeOutcome) {
+/// `expected_import` is the specific import name the guest declares (e.g.
+/// `"path_open"`). A Codex review correctly pointed out that checking only
+/// the generic `"could not be instantiated"` prefix would let this probe
+/// pass on *any* unrelated instantiation failure — including the exact
+/// regression it exists to catch, if the linker started satisfying this
+/// import while some other part of the module happened to fail to link for
+/// an unrelated reason. Requiring the import's own name in the detail (this
+/// report's own Verdict section confirms wasmi's error includes it) ties
+/// the pass to the specific denial under test.
+fn assert_denied_at_load(outcome: &EdgeOutcome, expected_import: &str) {
     let EdgeOutcome::Fallthrough { reason, detail } = outcome else {
         panic!("expected a fallthrough, the guest was served: {outcome:?}");
     };
@@ -37,6 +46,10 @@ fn assert_denied_at_load(outcome: &EdgeOutcome) {
         detail.contains("could not be instantiated"),
         "expected an instantiation-time refusal, got: {detail}"
     );
+    assert!(
+        detail.contains(expected_import),
+        "expected the refusal to name `{expected_import}`, got: {detail}"
+    );
 }
 
 /// R1: no ambient filesystem. A guest that imports `path_open` — the one
@@ -44,12 +57,15 @@ fn assert_denied_at_load(outcome: &EdgeOutcome) {
 /// must fail to link, because `autumn-edge`'s shim never defines it.
 #[test]
 fn filesystem_import_is_refused_at_load() {
-    assert_denied_at_load(&run(r#"(module
+    assert_denied_at_load(
+        &run(r#"(module
   (import "wasi_snapshot_preview1" "path_open"
     (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")))
-"#));
+"#),
+        "path_open",
+    );
 }
 
 /// R4 (network egress via `sock_*`): a guest that imports the exact socket
@@ -66,12 +82,15 @@ fn filesystem_import_is_refused_at_load() {
 /// probe; R4 is the plan doc's own row for `sock_*` specifically.)
 #[test]
 fn socket_connect_import_is_refused_at_load() {
-    assert_denied_at_load(&run(r#"(module
+    assert_denied_at_load(
+        &run(r#"(module
   (import "wasi_snapshot_preview1" "sock_connect"
     (func $sock_connect (param i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")))
-"#));
+"#),
+        "sock_connect",
+    );
 }
 
 /// R4 (network egress via `sock_*`), second representative: the same
@@ -80,12 +99,15 @@ fn socket_connect_import_is_refused_at_load() {
 /// that regressed.
 #[test]
 fn socket_send_import_is_refused_at_load() {
-    assert_denied_at_load(&run(r#"(module
+    assert_denied_at_load(
+        &run(r#"(module
   (import "wasi_snapshot_preview1" "sock_send"
     (func $sock_send (param i32 i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")))
-"#));
+"#),
+        "sock_send",
+    );
 }
 
 /// R2 (invented namespace): a guest that imports a host escape hatch nobody
@@ -94,11 +116,14 @@ fn socket_send_import_is_refused_at_load() {
 /// naming; an unresolved import from any module name is refused.
 #[test]
 fn invented_namespace_import_is_refused_at_load() {
-    assert_denied_at_load(&run(r#"(module
+    assert_denied_at_load(
+        &run(r#"(module
   (import "env" "system" (func $system (param i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")))
-"#));
+"#),
+        "env::system",
+    );
 }
 
 /// R3 (environment): the module doc says `environ_get`/`environ_sizes_get`
