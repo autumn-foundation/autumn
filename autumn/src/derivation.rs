@@ -27,21 +27,24 @@
 //!
 //! # What this module adds
 //!
-//! The counter cache is maintained from the moment it is declared, because the
-//! column and the code ship together. A derivation over an existing table does
-//! not have that luxury, so this module owns the part the specs cannot:
+//! A counter cache is correct from its first row, because the column and the
+//! code that maintains it ship together. A derivation is usually declared over
+//! a table that already holds data, so the existing rows have to be repaired.
+//! This module owns that part:
 //!
 //! * **Content addressing.** [`DerivationDef::definition_hash`] hashes the
-//!   lowered shape — tables, columns, transform, filter SQL. A changed filter
-//!   changes the hash; a rename or a reformat does not.
+//!   lowered shape: tables, columns, transform, filter SQL. A changed filter
+//!   changes the hash. A rename or a reformat does not.
 //! * **Reconciliation.** [`ensure_derivations`] compares each registered
 //!   derivation's hash against `_autumn_derivations` and enqueues a backfill for
-//!   the ones that changed, leaving the rest alone.
+//!   the ones that changed. It leaves the rest alone.
 //! * **Resumable repair.** [`run_backfill`] rebuilds parents in checkpointed
-//!   batches, committing each batch and its checkpoint together, so a killed
-//!   process resumes rather than restarts.
+//!   batches. Each batch is one transaction that locks the state row, pages from
+//!   the checkpoint it finds there, repairs the page and advances the
+//!   checkpoint. A killed process resumes, and several replicas cooperate on one
+//!   sweep instead of racing.
 //! * **Observability.** [`derivation_status`] reports each derivation's state
-//!   and its drift from the source of truth; `/actuator/derivations` serves it.
+//!   and its drift from the source of truth. `/actuator/derivations` serves it.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -97,6 +100,21 @@ fn ph(_n: usize) -> String {
 const IS_DISTINCT_FROM: &str = "IS DISTINCT FROM";
 #[cfg(all(test, feature = "sqlite"))]
 const IS_DISTINCT_FROM: &str = "IS NOT";
+
+// Row lock on the state row. On Postgres `FOR UPDATE` blocks any other
+// transaction that wants the same row. On `SQLite` the enclosing
+// `BEGIN IMMEDIATE` already excludes every other writer in the database, so the
+// clause degrades to nothing and the read is a cheap indexed lookup.
+#[cfg(not(feature = "sqlite"))]
+const FOR_UPDATE: &str = " FOR UPDATE";
+#[cfg(feature = "sqlite")]
+const FOR_UPDATE: &str = "";
+
+/// The cap on a drift scan, in parent rows.
+///
+/// A drift figure equal to this value means "at least this many", not "exactly
+/// this many". See [`DerivationStatus::drift`].
+pub const DRIFT_SCAN_LIMIT: i64 = 10_000;
 
 // ── Definition ───────────────────────────────────────────────────────────────
 
@@ -273,6 +291,15 @@ fn find(name: &str) -> Option<&'static DerivationDef> {
         .find(|def| def.name == name)
 }
 
+/// Reject a registry that cannot be reconciled.
+///
+/// Both collisions below are programming errors, like a duplicate route, so
+/// every entry point checks them rather than only the boot path.
+fn check_registry(defs: &[&DerivationDef]) -> AutumnResult<()> {
+    check_unique_names(defs)?;
+    check_unique_columns(defs)
+}
+
 /// Reject two derivations claiming one name.
 ///
 /// They would share a `_autumn_derivations` row, so each boot would see the
@@ -282,13 +309,40 @@ fn check_unique_names(defs: &[&DerivationDef]) -> AutumnResult<()> {
     for pair in defs.windows(2) {
         if pair[0].name == pair[1].name {
             return Err(AutumnError::from(std::io::Error::other(format!(
-                "two derivations are both named `{}`: {}::{} and {}::{} — give one \
-                 a `name = \"…\"` so each has its own backfill state",
+                "two derivations are both named `{}`: {}::{} and {}::{}. Give one \
+                 a `name = \"...\"` so each has its own backfill state",
                 pair[0].name,
                 pair[0].module_path,
                 pair[0].model,
                 pair[1].module_path,
                 pair[1].model,
+            ))));
+        }
+    }
+    Ok(())
+}
+
+/// Reject two derivations maintaining one parent column.
+///
+/// Every mutation path applies each derivation's own delta, so one column with
+/// two derivations counts twice. No repair can fix that: the two definitions
+/// disagree on what the column means, so each sweep would undo the other.
+fn check_unique_columns(defs: &[&DerivationDef]) -> AutumnResult<()> {
+    let mut seen: HashMap<(&str, &str), &DerivationDef> = HashMap::new();
+    for def in defs {
+        if let Some(first) = seen.insert((def.parent_table, def.column), def) {
+            return Err(AutumnError::from(std::io::Error::other(format!(
+                "two derivations both maintain `{}.{}`: `{}` on {}::{} and `{}` on \
+                 {}::{}. The column would count twice, so remove one or point it \
+                 at another column",
+                def.parent_table,
+                def.column,
+                first.name,
+                first.module_path,
+                first.model,
+                def.name,
+                def.module_path,
+                def.model,
             ))));
         }
     }
@@ -308,6 +362,10 @@ pub enum BackfillState {
     /// Every parent has been repaired at least once. The delta paths keep it
     /// current from here.
     Complete,
+    /// A `_autumn_derivations` row whose derivation this binary does not
+    /// declare, left behind by a removed or renamed definition. Never stored:
+    /// the state table's `CHECK` does not admit the spelling.
+    Unregistered,
 }
 
 impl BackfillState {
@@ -318,9 +376,12 @@ impl BackfillState {
             Self::Pending => "pending",
             Self::Running => "running",
             Self::Complete => "complete",
+            Self::Unregistered => "unregistered",
         }
     }
 
+    /// Parse a stored spelling. `unregistered` is deliberately not accepted: it
+    /// is a report-only state, so a row carrying it is a corrupt row.
     fn parse(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(Self::Pending),
@@ -328,6 +389,11 @@ impl BackfillState {
             "complete" => Some(Self::Complete),
             _ => None,
         }
+    }
+
+    /// Whether a backfill sweep still has work to do for this state.
+    const fn is_sweepable(self) -> bool {
+        matches!(self, Self::Pending | Self::Running)
     }
 }
 
@@ -342,22 +408,39 @@ impl std::fmt::Display for BackfillState {
 pub struct DerivationStatus {
     /// The derivation's name.
     pub name: String,
-    /// The hash of the definition this process has linked.
-    pub definition_hash: String,
+    /// The hash of the definition this process has linked, or `None` for a
+    /// state row this binary declares no derivation for
+    /// ([`BackfillState::Unregistered`]).
+    pub definition_hash: Option<String>,
     /// The hash recorded in `_autumn_derivations`, or `None` when no row exists
     /// yet. A value different from `definition_hash` means a backfill is due.
     pub stored_hash: Option<String>,
     /// The recorded backfill state, or `None` when no row exists yet.
     pub backfill_state: Option<BackfillState>,
-    /// The last repaired parent primary key, when a backfill is in progress.
+    /// The last repaired parent primary key. It stays populated after the
+    /// backfill completes, because it records the last position the sweep
+    /// applied rather than an in-flight cursor.
     pub checkpoint: Option<i64>,
-    /// How many parent rows the backfill has repaired in total.
+    /// How many parent rows the backfill has visited. The checkpoint pages the
+    /// parents and the repair assigns the ground truth to each, so this counts
+    /// visits, not writes: a page that already agreed is visited and not
+    /// written.
     pub backfilled_rows: i64,
     /// When the row last changed, as the database rendered it.
     pub updated_at: Option<String>,
     /// How many parent rows disagree with the source of truth right now. `0` is
     /// the healthy value; anything else is drift [`recompute`] repairs.
-    pub drift: i64,
+    ///
+    /// The scan stops at [`DRIFT_SCAN_LIMIT`], so a value equal to that limit
+    /// means "at least that many". `None` when the scan could not run
+    /// (see [`Self::drift_error`]) or when the derivation is unregistered.
+    pub drift: Option<i64>,
+    /// Why the drift scan did not run, when it did not.
+    ///
+    /// A missing derived column is the common case: the migration that adds it
+    /// has not been applied yet. The other derivations are still reported, so
+    /// one broken derivation cannot hide the rest.
+    pub drift_error: Option<String>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -439,11 +522,14 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 ///
 /// # Errors
 ///
-/// Returns an error when two registered derivations share a name, or when the
-/// state table cannot be read or written.
+/// Returns an error when two registered derivations share a name, when two
+/// maintain the same parent column, or when the state table cannot be read or
+/// written. The first two are programming errors, and the boot path treats them
+/// as fatal: a column with two derivations double counts, which is data
+/// corruption rather than staleness.
 pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Vec<&'static str>> {
     let defs = registered_derivations();
-    check_unique_names(&defs)?;
+    check_registry(&defs)?;
 
     let state = load_state(conn).await?;
     let mut enqueued = Vec::new();
@@ -498,119 +584,232 @@ pub struct BackfillReport {
 }
 
 /// Advance one derivation's checkpoint. Runs inside the batch's transaction.
+///
+/// Guarded by name **and** hash. Another replica may have re-enqueued this
+/// derivation under a new definition between the lock and this write only if the
+/// lock was released, which cannot happen inside the transaction; the guard is
+/// what makes that reasoning independent of the lock, so a checkpoint can never
+/// describe a definition other than the one that produced it.
 async fn advance_checkpoint(
     conn: &mut RuntimeConnection,
     name: &str,
+    hash: &str,
     checkpoint: i64,
     rows: i64,
 ) -> AutumnResult<()> {
     let sql = format!(
         "UPDATE {STATE_TABLE} SET checkpoint = {checkpoint}, \
          backfilled_rows = backfilled_rows + {rows}, backfill_state = 'running', \
-         updated_at = {NOW} WHERE name = {}",
-        ph(1)
+         updated_at = {NOW} WHERE name = {} AND definition_hash = {}",
+        ph(1),
+        ph(2)
     );
     diesel::sql_query(sql)
         .bind::<Text, _>(name.to_owned())
+        .bind::<Text, _>(hash.to_owned())
         .execute(conn)
         .await
         .map_err(AutumnError::from)?;
     Ok(())
 }
 
-/// Mark one derivation's backfill finished.
-async fn mark_complete(conn: &mut RuntimeConnection, name: &str) -> AutumnResult<()> {
+/// Mark one derivation's backfill finished, guarded by name and hash.
+///
+/// The hash guard is the important half: marking a derivation complete records
+/// "every parent now matches this definition". Writing that against a row that
+/// carries a different definition would declare the new definition complete with
+/// values the old one produced.
+async fn mark_complete(conn: &mut RuntimeConnection, name: &str, hash: &str) -> AutumnResult<()> {
     let sql = format!(
         "UPDATE {STATE_TABLE} SET backfill_state = 'complete', updated_at = {NOW} \
-         WHERE name = {}",
-        ph(1)
+         WHERE name = {} AND definition_hash = {}",
+        ph(1),
+        ph(2)
     );
     diesel::sql_query(sql)
         .bind::<Text, _>(name.to_owned())
+        .bind::<Text, _>(hash.to_owned())
         .execute(conn)
         .await
         .map_err(AutumnError::from)?;
     Ok(())
+}
+
+/// The state row as one batch transaction re-reads it under its lock.
+#[derive(diesel::QueryableByName)]
+struct LockedRow {
+    #[diesel(sql_type = Text)]
+    definition_hash: String,
+    #[diesel(sql_type = Text)]
+    backfill_state: String,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    checkpoint: Option<i64>,
+}
+
+/// What one batch transaction did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    /// The state row no longer asks this process to sweep. It is gone, it
+    /// carries another definition, or it is already complete.
+    Stopped,
+    /// The page was empty, so the sweep reached the end of the parent table and
+    /// the row is now `complete`.
+    Completed,
+    /// One page was repaired and the checkpoint moved past it.
+    Advanced {
+        /// Parent rows this page actually wrote.
+        repaired: usize,
+    },
+}
+
+/// One backfill batch, as one transaction.
+///
+/// The transaction is the whole design. It locks the state row first, so the row
+/// is both the cursor and the mutex: any number of replicas can call this
+/// concurrently and they take turns on one sweep instead of each running their
+/// own. Every step after the lock reads the state the lock protects:
+///
+/// 1. lock the state row and re-read hash, state and checkpoint;
+/// 2. stop when the row is gone, carries another definition, or is complete;
+/// 3. page parent ids after the checkpoint the row carries, inside this
+///    transaction;
+/// 4. an empty page means the end of the table: mark complete and stop;
+/// 5. otherwise lock the parents in ascending id order, assign the ground truth,
+///    then advance the checkpoint and the visited-row count.
+///
+/// Steps 4 and 5 guard their writes by name and hash, so a definition that
+/// changed under this process cannot be marked complete or advanced with values
+/// the previous definition produced.
+async fn run_one_batch(
+    conn: &mut RuntimeConnection,
+    def: &'static DerivationDef,
+    batch_size: i64,
+) -> AutumnResult<Batch> {
+    let view = def.sql_view();
+    let name = def.name;
+    let hash = def.definition_hash();
+    scoped_immediate_transaction::<Batch, AutumnError, _>(conn, move |conn| {
+        async move {
+            let lock_sql = format!(
+                "SELECT definition_hash, backfill_state, checkpoint FROM {STATE_TABLE} \
+                 WHERE name = {}{FOR_UPDATE}",
+                ph(1)
+            );
+            let locked = diesel::sql_query(lock_sql)
+                .bind::<Text, _>(name)
+                .load::<LockedRow>(&mut *conn)
+                .await
+                .map_err(AutumnError::from)?
+                .into_iter()
+                .next();
+
+            let Some(row) = locked else {
+                return Ok(Batch::Stopped);
+            };
+            if row.definition_hash != hash {
+                return Ok(Batch::Stopped);
+            }
+            if !BackfillState::parse(&row.backfill_state).is_some_and(BackfillState::is_sweepable) {
+                return Ok(Batch::Stopped);
+            }
+
+            let ids =
+                crate::counter_cache::parent_id_page(&mut *conn, &view, row.checkpoint, batch_size)
+                    .await?;
+            let Some(&last) = ids.last() else {
+                mark_complete(&mut *conn, name, &hash).await?;
+                return Ok(Batch::Completed);
+            };
+            let visited = i64::try_from(ids.len()).unwrap_or(i64::MAX);
+            let repaired =
+                crate::counter_cache::recompute_batch_statements(&mut *conn, &view, &ids).await?;
+            advance_checkpoint(&mut *conn, name, &hash, last, visited).await?;
+            Ok(Batch::Advanced { repaired })
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 /// Repair every parent of every enqueued derivation, in resumable batches.
 ///
-/// Parent ids are paged **outside** any transaction; each page is then repaired
-/// and its checkpoint advanced inside **one** transaction. That pairing is what
-/// makes a killed backfill safe: the checkpoint can never describe a batch that
-/// did not commit, and the repair *assigns* the ground truth rather than
-/// adjusting it, so re-running a batch is idempotent anyway.
+/// Each batch is **one** transaction that locks the derivation's state row,
+/// re-reads its hash, state and checkpoint, pages the parents after that
+/// checkpoint, repairs them and advances the checkpoint. See [`run_one_batch`]
+/// for the exact sequence.
 ///
-/// Safe against live traffic for the same reason a recompute is: each batch
-/// locks the parents it is about to rebuild before reading their children, so it
-/// can neither clobber a committed delta nor read a half-applied one.
+/// The state-row lock is the cross-process mutex. Several replicas booting a new
+/// definition therefore cooperate on one sweep: each takes the row in turn, sees
+/// the checkpoint the previous one committed, and repairs the next page. No
+/// advisory lock is involved, `backfilled_rows` stays exact, and no page is
+/// repaired twice.
 ///
-/// A derivation whose stored hash no longer matches this binary's is skipped:
-/// another process has re-enqueued it under a different definition, and
-/// repairing to the old shape would write values that process would only have to
-/// undo.
+/// A definition that changed under this process is dropped rather than repaired.
+/// Every state write is guarded by name **and** hash, so the process that
+/// re-enqueued it owns the sweep and this one cannot mark the new definition
+/// complete with values the old one produced.
+///
+/// [`BackfillOptions::max_batches`] bounds the call, not the sweep. When the
+/// budget runs out, every derivation still pending or running is reported in
+/// [`BackfillReport::in_progress`] and the next call resumes from the committed
+/// checkpoints.
 ///
 /// # Errors
 ///
 /// Propagates any database error from the paging, repair or checkpoint
-/// statements.
+/// statements, and returns an error when the registry carries a duplicate name
+/// or two derivations on one parent column.
 pub async fn run_backfill(
     conn: &mut RuntimeConnection,
     options: &BackfillOptions,
 ) -> AutumnResult<BackfillReport> {
     debug_assert!(options.batch_size > 0, "a backfill batch must hold a row");
+    let defs = registered_derivations();
+    check_registry(&defs)?;
+
     let mut report = BackfillReport::default();
     let mut batches = 0usize;
 
+    // One read outside the transactions, only to pick the candidates. Each batch
+    // re-reads its row under the row lock, so this snapshot never decides a
+    // write.
     let state = load_state(conn).await?;
-    let mut pending: Vec<(&'static DerivationDef, Option<i64>)> = Vec::new();
-    for (name, row) in &state {
-        let Some(state) = BackfillState::parse(&row.backfill_state) else {
-            continue;
-        };
-        if state == BackfillState::Complete {
-            continue;
-        }
-        let Some(def) = find(name) else { continue };
-        if def.definition_hash() != row.definition_hash {
-            continue;
-        }
-        pending.push((def, row.checkpoint));
-    }
-    pending.sort_unstable_by_key(|(def, _)| def.name);
+    let candidates: Vec<&'static DerivationDef> = defs
+        .into_iter()
+        .filter(|def| {
+            state.get(def.name).is_some_and(|row| {
+                row.definition_hash == def.definition_hash()
+                    && BackfillState::parse(&row.backfill_state)
+                        .is_some_and(BackfillState::is_sweepable)
+            })
+        })
+        .collect();
 
-    for (def, stored_checkpoint) in pending {
-        let view = def.sql_view();
-        let mut cursor = stored_checkpoint;
+    let mut budget_spent = false;
+    for def in candidates {
+        // The budget stops the call, not the report: a derivation this call
+        // never reached is still pending, so it belongs in `in_progress`.
+        if budget_spent {
+            report.in_progress.push(def.name.to_owned());
+            continue;
+        }
         loop {
             if options.max_batches.is_some_and(|max| batches >= max) {
+                budget_spent = true;
                 report.in_progress.push(def.name.to_owned());
-                return Ok(report);
-            }
-            let ids = crate::counter_cache::parent_id_page(conn, &view, cursor, options.batch_size)
-                .await?;
-            let Some(&last) = ids.last() else {
-                mark_complete(conn, def.name).await?;
-                report.completed.push(def.name.to_owned());
                 break;
-            };
-            cursor = Some(last);
-            let name = def.name;
-            let rows = i64::try_from(ids.len()).unwrap_or(i64::MAX);
-            let repaired =
-                scoped_immediate_transaction::<usize, AutumnError, _>(conn, move |conn| {
-                    async move {
-                        let repaired =
-                            crate::counter_cache::recompute_batch_statements(conn, &view, &ids)
-                                .await?;
-                        advance_checkpoint(conn, name, last, rows).await?;
-                        Ok(repaired)
-                    }
-                    .scope_boxed()
-                })
-                .await?;
-            report.rows_repaired += repaired;
-            batches += 1;
+            }
+            match run_one_batch(conn, def, options.batch_size).await? {
+                Batch::Stopped => break,
+                Batch::Completed => {
+                    report.completed.push(def.name.to_owned());
+                    break;
+                }
+                Batch::Advanced { repaired } => {
+                    report.rows_repaired += repaired;
+                    batches += 1;
+                }
+            }
         }
     }
     Ok(report)
@@ -638,16 +837,21 @@ pub async fn recompute(conn: &mut RuntimeConnection, name: &str) -> AutumnResult
     crate::counter_cache::recompute_view(conn, &def.sql_view(), None).await
 }
 
-/// How many parent rows disagree with the source of truth.
+/// How many parent rows disagree with the source of truth, up to
+/// [`DRIFT_SCAN_LIMIT`].
 ///
-/// One aggregate statement, but a full scan of the parent table — an operator
-/// measurement, not a request-path one.
+/// One aggregate statement. The cap is what keeps it usable on a large table: a
+/// figure equal to the limit means "at least that many", which is all an
+/// operator needs to decide to recompute. Still an operator measurement rather
+/// than a request-path one.
 ///
 /// # Errors
 ///
-/// Propagates any database error from the `SELECT`.
+/// Propagates any database error from the `SELECT`. A missing derived column is
+/// the common case, and it is reported per derivation rather than failing the
+/// whole status read (see [`derivation_status`]).
 pub async fn drift(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnResult<i64> {
-    let sql = crate::counter_cache::drift_sql(&def.sql_view());
+    let sql = crate::counter_cache::drift_sql(&def.sql_view(), DRIFT_SCAN_LIMIT);
     Ok(diesel::sql_query(sql)
         .get_result::<CountRow>(conn)
         .await
@@ -656,33 +860,72 @@ pub async fn drift(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnR
 }
 
 /// Report every registered derivation: its definition, its recorded backfill
-/// state, and its current drift.
+/// state, and its current drift. Then report every state row this binary
+/// declares no derivation for.
 ///
 /// A derivation with no state row reports `stored_hash: None` and
-/// `backfill_state: None` — the shape a binary that has not booted against this
-/// database yet produces.
+/// `backfill_state: None`, which is the shape a binary that has not booted
+/// against this database yet produces. A state row with no derivation reports
+/// [`BackfillState::Unregistered`] and `definition_hash: None`, which is what a
+/// removed or renamed definition leaves behind. Such a row is reported rather
+/// than deleted, because only an operator can tell a removed derivation apart
+/// from a rolling deploy that has not finished.
+///
+/// A failing drift scan is reported on its own row in
+/// [`DerivationStatus::drift_error`] and does not stop the others. A derived
+/// column that is not there yet is the common case, and it must not hide the
+/// derivations that are healthy.
+///
+/// Rows come back sorted by name.
 ///
 /// # Errors
 ///
-/// Propagates any database error from the state read or the drift scans.
+/// Propagates any database error from the state read, and returns an error when
+/// the registry carries a duplicate name or two derivations on one parent
+/// column.
 pub async fn derivation_status(
     conn: &mut RuntimeConnection,
 ) -> AutumnResult<Vec<DerivationStatus>> {
+    let defs = registered_derivations();
+    check_registry(&defs)?;
+
     let state = load_state(conn).await?;
-    let mut out = Vec::new();
-    for def in registered_derivations() {
+    let mut out = Vec::with_capacity(defs.len() + state.len());
+    for def in &defs {
         let row = state.get(def.name);
+        let (drifted, drift_error) = match drift(conn, def).await {
+            Ok(count) => (Some(count), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         out.push(DerivationStatus {
             name: def.name.to_owned(),
-            definition_hash: def.definition_hash(),
+            definition_hash: Some(def.definition_hash()),
             stored_hash: row.map(|row| row.definition_hash.clone()),
             backfill_state: row.and_then(|row| BackfillState::parse(&row.backfill_state)),
             checkpoint: row.and_then(|row| row.checkpoint),
             backfilled_rows: row.map_or(0, |row| row.backfilled_rows),
             updated_at: row.and_then(|row| row.updated_at.clone()),
-            drift: drift(conn, def).await?,
+            drift: drifted,
+            drift_error,
         });
     }
+    for (name, row) in &state {
+        if defs.iter().any(|def| def.name == name.as_str()) {
+            continue;
+        }
+        out.push(DerivationStatus {
+            name: name.clone(),
+            definition_hash: None,
+            stored_hash: Some(row.definition_hash.clone()),
+            backfill_state: Some(BackfillState::Unregistered),
+            checkpoint: row.checkpoint,
+            backfilled_rows: row.backfilled_rows,
+            updated_at: row.updated_at.clone(),
+            drift: None,
+            drift_error: None,
+        });
+    }
+    out.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(out)
 }
 

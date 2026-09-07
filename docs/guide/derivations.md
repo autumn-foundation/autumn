@@ -122,8 +122,9 @@ the derived write fails, the row mutation rolls back with it.
 | `update` with an unchanged foreign key | add the difference between the new and the old contribution |
 | `update` that reassigns the foreign key | subtract the old contribution from the old parent, add the new one to the new parent |
 | a filter flip on an unchanged parent | add or subtract that one contribution |
-| `delete_by_id` / `delete_many` / `purge` | subtract the row's contribution |
+| `delete_by_id` / `delete_many` | subtract the row's contribution |
 | soft `delete_by_id` | subtract; the row survives and the value reflects live rows |
+| `purge` | subtract, and only if the row was still live |
 | `restore` | add the contribution back, and only if the row was soft-deleted |
 | `dependent` cascades on the parent | as for a counter cache, per affected child |
 
@@ -239,6 +240,9 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
     cargo test -p autumn-web --test integration_tests --features test-support \
     model_derivation -- --ignored
 ```
+
+<!-- config-key-allow: AUTUMN_TEST_PG_URL — a test-harness variable read by the framework's own suite, not an application config key -->
+
 
 ## Limits
 

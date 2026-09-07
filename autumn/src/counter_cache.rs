@@ -255,31 +255,50 @@ pub fn is_plain_identifier(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Debug-only guard that every identifier a view splices into SQL is plain.
+/// Guard that every identifier a view splices into SQL is plain.
 ///
-/// `contrib_sql` and `filter_sql` are not identifiers — they are lowered
-/// fragments of quoted identifiers, literals, operators and the `{c}`
-/// placeholder — so they are checked for the two things that would let a
-/// hand-built spec change the *shape* of a statement rather than a value in it.
-fn debug_assert_spec_idents(view: &SqlView) {
-    debug_assert!(
+/// A hard assert, not a debug one. The module doc claims a hand-built spec
+/// cannot smuggle SQL, so a release build has to honour that claim too.
+///
+/// `filter_sql` is deliberately not scanned for SQL syntax. It is a lowered
+/// fragment of quoted identifiers, literals, operators and the `{c}` alias
+/// placeholder, so a substring scan would reject a legal quoted literal:
+/// `filter = status == "a -- b"` carries a comment marker inside a string, and
+/// the macro already escapes and validates the literal it lowers. What matters
+/// at run time is that no placeholder survives substitution, which
+/// [`with_alias`] asserts.
+///
+/// `contrib_sql` is checked structurally instead of by substring: the lowering
+/// only ever produces the literal `1` or one quoted child column.
+fn assert_spec_idents(view: &SqlView) {
+    assert!(
         is_plain_identifier(view.child_table)
             && is_plain_identifier(view.child_pk)
             && is_plain_identifier(view.fk_column)
             && is_plain_identifier(view.parent_table)
             && is_plain_identifier(view.parent_pk)
-            && is_plain_identifier(view.counter_column),
+            && is_plain_identifier(view.counter_column)
+            && view.tenant_column.is_none_or(is_plain_identifier),
         "counter-cache spec carries a non-identifier name; it would be spliced \
          verbatim into SQL"
     );
-    debug_assert!(
-        !view.contrib_sql.contains(';')
-            && !view.contrib_sql.contains("--")
-            && !view.filter_sql.contains(';')
-            && !view.filter_sql.contains("--"),
-        "a lowered derivation fragment carries a statement terminator or a \
-         comment; it would be spliced verbatim into SQL"
+    assert!(
+        is_lowered_contribution(view.contrib_sql),
+        "counter-cache spec carries a contribution that is neither `1` nor one \
+         child column; it would be spliced verbatim into SQL"
     );
+}
+
+/// Whether `sql` is a contribution expression the `#[derivation]` lowering can
+/// produce: the literal `1` (a row count), or one plain child column behind the
+/// `{c}` alias placeholder (a weighted sum).
+fn is_lowered_contribution(sql: &str) -> bool {
+    if sql == "1" {
+        return true;
+    }
+    sql.strip_prefix("{c}.\"")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .is_some_and(is_plain_identifier)
 }
 
 /// Wrap `ident` in the SQL identifier quotes both backends accept.
@@ -377,7 +396,7 @@ fn quoted(view: &SqlView) -> Quoted {
 /// emits the alias as a placeholder and each statement substitutes its own.
 fn with_alias(sql: &str, alias: &str) -> String {
     let out = sql.replace("{c}", alias);
-    debug_assert!(
+    assert!(
         !out.contains('{'),
         "a lowered fragment carries an unresolved placeholder: {out}"
     );
@@ -478,6 +497,22 @@ fn tenant_predicate(view: &SqlView, child_id: i64) -> String {
     )
 }
 
+/// The left-hand side of a `SET c = <acc> +/- ...` adjustment.
+///
+/// A plain counter cache reads the column bare, so its SQL stays byte-identical
+/// to what it was before derivations existed. A derivation wraps it in
+/// `COALESCE(c, 0)`: a derivation is adopted on an existing table, where the
+/// column can still be NULL, and `NULL +/- expr` is NULL. One such adjustment
+/// would poison the column, and a NULL maintained value is the one outcome no
+/// repair can tell apart from legitimate drift.
+fn accumulator(view: &SqlView, counter_column: &str) -> String {
+    if view.is_plain() {
+        counter_column.to_owned()
+    } else {
+        format!("COALESCE({counter_column}, 0)")
+    }
+}
+
 /// `AND __autumn_cc_child.deleted_at IS NULL` (or `IS NOT NULL`) for a
 /// soft-deleting child, empty for a child with no `deleted_at` column.
 fn live_predicate(view: &SqlView, want_live: bool) -> String {
@@ -506,7 +541,7 @@ pub async fn counter_cache_apply_delta<M: 'static>(
     scope: TenantScope,
 ) -> AutumnResult<()> {
     let view = view(spec);
-    debug_assert_spec_idents(&view);
+    assert_spec_idents(&view);
     let Quoted {
         parent_table,
         parent_pk,
@@ -517,8 +552,9 @@ pub async fn counter_cache_apply_delta<M: 'static>(
         TenantScope::SameTenantAsChild(child_id) => tenant_predicate(&view, child_id),
         TenantScope::Unscoped => String::new(),
     };
+    let accumulator = accumulator(&view, &counter_column);
     let sql = format!(
-        "UPDATE {parent_table} SET {counter_column} = {counter_column} + {PH1} \
+        "UPDATE {parent_table} SET {counter_column} = {accumulator} + {PH1} \
          WHERE {parent_table}.{parent_pk} = {PH2}{tenant}"
     );
     diesel::sql_query(sql)
@@ -557,7 +593,7 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
     child_state: ChildState,
 ) -> AutumnResult<()> {
     let view = view(spec);
-    debug_assert_spec_idents(&view);
+    assert_spec_idents(&view);
     let state_predicate = match child_state {
         ChildState::Any => String::new(),
         ChildState::Live => live_predicate(&view, true),
@@ -641,8 +677,9 @@ fn weighted_delta_by_child_id_sql(
     let filter = filter_predicate(view, CHILD_ALIAS);
     let contrib = contrib_expr(view, CHILD_ALIAS);
     let sign = if subtract { "-" } else { "+" };
+    let accumulator = accumulator(view, &counter_column);
     format!(
-        "UPDATE {parent_table} SET {counter_column} = {counter_column} {sign} \
+        "UPDATE {parent_table} SET {counter_column} = {accumulator} {sign} \
          COALESCE((SELECT {contrib} FROM {child_table} AS {CHILD_ALIAS} \
            WHERE {CHILD_ALIAS}.{child_pk} = {child_id} \
              AND {CHILD_ALIAS}.{fk_column} IS NOT NULL{state_predicate}{filter}), 0) \
@@ -965,7 +1002,7 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
     // One statement, not one per spec: every spec here is a leg of the *same*
     // child model, so they all name the same table and primary key.
     let first = view(&specs[0]);
-    debug_assert_spec_idents(&first);
+    assert_spec_idents(&first);
     diesel::sql_query(child_lock_sql(&first, &id_list))
         .load::<IdRow>(conn)
         .await
@@ -973,7 +1010,7 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
 
     for index in specs_in_lock_order(specs) {
         let view = view(&specs[index]);
-        debug_assert_spec_idents(&view);
+        assert_spec_idents(&view);
         let sql = bulk_decrement_sql(&view, &id_list);
         diesel::sql_query(sql)
             .execute(conn)
@@ -1037,8 +1074,9 @@ fn bulk_decrement_sql(view: &SqlView, id_list: &str) -> String {
     // plain column comparison inside each — no extra round trip, and a
     // cross-tenant child contributes to neither the count nor the row set.
     let tenant = tenant_predicate_joined(view);
+    let accumulator = accumulator(view, &counter_column);
     format!(
-        "UPDATE {parent_table} SET {counter_column} = {counter_column} - \
+        "UPDATE {parent_table} SET {counter_column} = {accumulator} - \
          (SELECT {aggregate} FROM {child_table} AS {CHILD_ALIAS} \
           WHERE {CHILD_ALIAS}.{fk_column} = {parent_table}.{parent_pk} \
             AND {CHILD_ALIAS}.{child_pk} IN ({id_list}){live}{filter}{tenant}) \
@@ -1123,7 +1161,7 @@ pub async fn counter_cache_capture_fks<M: 'static>(
     let mut out = Vec::with_capacity(specs.len());
     for spec in specs {
         let view = view(spec);
-        debug_assert_spec_idents(&view);
+        assert_spec_idents(&view);
         let Quoted {
             child_table,
             child_pk,
@@ -1266,7 +1304,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
     let mut by_child: HashMap<i64, Vec<CapturedContribution>> = HashMap::new();
     for (index, spec) in specs.iter().enumerate() {
         let view = view(spec);
-        debug_assert_spec_idents(&view);
+        assert_spec_idents(&view);
         let Quoted {
             child_table,
             child_pk,
@@ -1508,12 +1546,15 @@ pub fn recompute_update_sql(view: &SqlView, ids: &str) -> String {
     )
 }
 
-/// How many parent rows disagree with the source of truth.
+/// How many parent rows disagree with the source of truth, up to `limit`.
 ///
-/// One aggregate statement over the parent table, so it is a single round trip
-/// per derivation — but it is a full scan, which is why it is reported by an
-/// operator endpoint rather than measured on the request path.
-pub fn drift_sql(view: &SqlView) -> String {
+/// One aggregate statement per derivation, so it is a single round trip. The
+/// `LIMIT` inside the derived table is what bounds the work: the question an
+/// operator asks is "is this derivation drifting", not "by exactly how much on
+/// a billion-row table", and a count that reaches `limit` answers it. Without
+/// the cap this is a full scan of the parent table with a correlated aggregate
+/// per row.
+pub fn drift_sql(view: &SqlView, limit: i64) -> String {
     let Quoted {
         parent_table,
         counter_column,
@@ -1521,8 +1562,10 @@ pub fn drift_sql(view: &SqlView) -> String {
     } = quoted(view);
     let ground_truth = ground_truth_sql(view);
     format!(
-        "SELECT COUNT(*) AS count FROM {parent_table} \
-         WHERE {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth}"
+        "SELECT COUNT(*) AS count FROM \
+         (SELECT 1 AS drifted FROM {parent_table} \
+          WHERE {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth} \
+          LIMIT {limit}) AS __autumn_cc_drift"
     )
 }
 
@@ -1578,7 +1621,7 @@ pub async fn recompute_batch_statements(
     if ids.is_empty() {
         return Ok(0);
     }
-    debug_assert_spec_idents(view);
+    assert_spec_idents(view);
     let id_list = id_list(ids);
     let parent_table = quote_ident(view.parent_table);
     let parent_pk = quote_ident(view.parent_pk);
@@ -1608,7 +1651,7 @@ pub async fn parent_id_page(
     cursor: Option<i64>,
     limit: i64,
 ) -> AutumnResult<Vec<i64>> {
-    debug_assert_spec_idents(view);
+    assert_spec_idents(view);
     let parent_table = quote_ident(view.parent_table);
     let parent_pk = quote_ident(view.parent_pk);
     let mut page_sql = format!("SELECT {parent_pk} AS id FROM {parent_table}");
@@ -1635,7 +1678,7 @@ pub async fn recompute_view(
     view: &SqlView,
     parent_id: Option<i64>,
 ) -> AutumnResult<usize> {
-    debug_assert_spec_idents(view);
+    assert_spec_idents(view);
     if let Some(id) = parent_id {
         return recompute_batch(conn, view, &[id]).await;
     }
@@ -1957,6 +2000,69 @@ mod tests {
             !recompute_update_sql(&plain, "1").contains("COALESCE"),
             "a plain counter cache must not grow a COALESCE"
         );
+        assert_eq!(
+            accumulator(&plain, "\"comment_count\""),
+            "\"comment_count\"",
+            "a plain counter cache reads its column bare"
+        );
+        assert!(
+            !bulk_decrement_sql(&plain, "7").contains("COALESCE"),
+            "a plain bulk decrement must not grow a COALESCE"
+        );
+    }
+
+    #[test]
+    fn a_derivation_delta_never_writes_null_into_the_maintained_column() {
+        // A derivation is adopted on an existing table, so the column can still
+        // be NULL. `NULL +/- expr` is NULL, and a NULL maintained value cannot
+        // be told apart from drift, so every adjusting statement coalesces.
+        let mut filtered = spec(false);
+        filtered.filter_sql = " AND ({c}.\"published\" = TRUE)";
+        let filtered = view(&filtered);
+        assert_eq!(
+            accumulator(&filtered, "\"comment_count\""),
+            "COALESCE(\"comment_count\", 0)"
+        );
+        assert!(
+            bulk_decrement_sql(&filtered, "7")
+                .contains("SET \"comment_count\" = COALESCE(\"comment_count\", 0) -"),
+            "{}",
+            bulk_decrement_sql(&filtered, "7")
+        );
+        let sum = view(&sum_spec());
+        assert!(
+            weighted_delta_by_child_id_sql(&sum, 1, false, "", "")
+                .contains("SET \"visible_score\" = COALESCE(\"visible_score\", 0) +"),
+            "the by-id weighted delta coalesces too"
+        );
+    }
+
+    #[test]
+    fn a_lowered_contribution_is_either_one_or_a_single_child_column() {
+        // The run-time backstop for `contrib_sql`: a structural check, so a
+        // legal quoted literal is never mistaken for smuggled SQL.
+        assert!(is_lowered_contribution("1"));
+        assert!(is_lowered_contribution("{c}.\"score\""));
+        assert!(!is_lowered_contribution("{c}.\"score\" + 1"));
+        assert!(!is_lowered_contribution("(SELECT 1)"));
+        assert!(!is_lowered_contribution(""));
+        assert!(!is_lowered_contribution("{c}.\"a\"; DROP TABLE posts --\""));
+    }
+
+    #[test]
+    fn a_filter_may_carry_a_comment_marker_inside_a_quoted_literal() {
+        // The previous substring scan panicked on this in debug builds: `--`
+        // and `;` are inert inside a quoted literal, and the macro escapes the
+        // literal it lowers, so only the identifiers and the contribution are
+        // checked at run time.
+        let mut filtered = spec(false);
+        filtered.filter_sql = " AND ({c}.\"status\" = 'a -- b; c')";
+        let filtered = view(&filtered);
+        assert_spec_idents(&filtered);
+        assert!(
+            bulk_decrement_sql(&filtered, "7").contains("'a -- b; c'"),
+            "the literal reaches the statement unaltered"
+        );
     }
 
     #[test]
@@ -1975,7 +2081,8 @@ mod tests {
         let delete = bulk_decrement_sql(&filtered, "7,8");
         assert_eq!(
             delete,
-            "UPDATE \"posts\" SET \"comment_count\" = \"comment_count\" - \
+            "UPDATE \"posts\" SET \"comment_count\" = \
+             COALESCE(\"comment_count\", 0) - \
              (SELECT COUNT(*) FROM \"comments\" AS __autumn_cc_child \
               WHERE __autumn_cc_child.\"post_id\" = \"posts\".\"id\" \
                 AND __autumn_cc_child.\"id\" IN (7,8) \
@@ -2027,7 +2134,8 @@ mod tests {
         let sql = weighted_delta_by_child_id_sql(&view(&sum_spec()), 9, false, "", "");
         assert!(
             sql.starts_with(
-                "UPDATE \"posts\" SET \"visible_score\" = \"visible_score\" + \
+                "UPDATE \"posts\" SET \"visible_score\" = \
+                 COALESCE(\"visible_score\", 0) + \
                  COALESCE((SELECT __autumn_cc_child.\"score\""
             ),
             "{sql}"
@@ -2046,7 +2154,7 @@ mod tests {
 
         let down = weighted_delta_by_child_id_sql(&view(&sum_spec()), 9, true, "", "");
         assert!(
-            down.contains("\"visible_score\" = \"visible_score\" - COALESCE("),
+            down.contains("\"visible_score\" = COALESCE(\"visible_score\", 0) - COALESCE("),
             "{down}"
         );
     }
@@ -2077,12 +2185,18 @@ mod tests {
 
     #[test]
     fn drift_is_one_aggregate_over_the_parent_table() {
-        let sql = drift_sql(&view(&sum_spec()));
+        let sql = drift_sql(&view(&sum_spec()), 10_000);
         assert!(
-            sql.starts_with("SELECT COUNT(*) AS count FROM \"posts\""),
+            sql.starts_with(
+                "SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"posts\""
+            ),
             "{sql}"
         );
         assert!(sql.contains(IS_DISTINCT_FROM), "{sql}");
+        assert!(
+            sql.ends_with(" LIMIT 10000) AS __autumn_cc_drift"),
+            "the scan is capped, so a huge table cannot make this endpoint hang: {sql}"
+        );
     }
 
     #[test]

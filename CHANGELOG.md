@@ -73,11 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automatically when a derivation is registered. `GET /actuator/derivations`
   (sensitive-gated) reports each derivation's hashes, backfill state, checkpoint
   and current drift, and `recompute(conn, name)` repairs it. `CounterCacheSpec`
-  gains four doc-hidden plumbing fields (`contrib_of`, `contrib_sql`,
-  `filter_sql`, `derivation`); the only API-visible change is that the
-  doc-hidden `counter_cache_capture_fks`/`_many` now return
-  `(parent, contribution)` pairs rather than parent ids. See
-  `docs/guide/derivations.md`.
+  gains four plumbing fields `#[model]` fills in (`contrib_of`, `contrib_sql`,
+  `filter_sql`, `derivation`), so a hand-written spec literal needs four more
+  lines; it is framework plumbing and not constructed by hand. The one other
+  API-visible change is that the doc-hidden
+  `counter_cache_capture_fks`/`_many` now return `(parent, contribution)` pairs
+  rather than parent ids. See `docs/guide/derivations.md`.
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
