@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **web:** `AutumnError`'s `Display` now appends the failing fields to a
+  validation error, sorted by field name — `Validation failed: email: Must be
+  a valid email address` instead of the bare `Validation failed` (issue
+  #2587). Exact `Display` output is outside the SemVer surface (see
+  `STABILITY.md`), and the `application/problem+json` body is unaffected: it
+  renders the wrapped error, so `detail` still reads `Validation failed` with
+  the fields in `errors`. Job and scheduled-task failure strings are
+  unaffected too — the failure capsule, the `last_error` column, alerts and
+  the `sys:tasks` broadcast now record `message()`, so a capsule recorded
+  before this change still replays as a match. Keep untrusted text out of
+  `#[validate(message = "...")]`: `Display` output reaches your logs.
+
 - **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file
   whose generator template changed since the project was generated (issue
   #1835). `generate` now records a digest of every file it owns in
@@ -56,13 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem
   code the `application/problem+json` body carries
-  (`autumn.validation_failed`, `autumn.not_found`, …), and `Display` appends
-  the failing fields in sorted order — `Validation failed: email: Must be a
-  valid email address`. A consumer with no HTTP response to parse (a GraphQL
-  resolver, a `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl) no longer
-  has to re-run `validator` to say which field failed. Purely additive; the
-  problem-details body is byte-identical, including its bare `Validation
-  failed` `detail`.
+  (`autumn.validation_failed`, `autumn.not_found`, …), and `message()`
+  returns the wrapped error's message alone — the string the body's `detail`
+  shows. A consumer with no HTTP response to parse (a GraphQL resolver, a
+  `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl) no longer has to
+  re-run `validator` to say which field failed. The body is unchanged: `code`
+  now comes from one derivation shared with `code()`, so the two cannot
+  disagree. Guide: `docs/guide/forms.md`, "Reading the failure back".
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded

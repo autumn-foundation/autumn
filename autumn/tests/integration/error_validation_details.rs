@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 
 use autumn_web::error::AutumnError;
+use autumn_web::prelude::*;
+use autumn_web::test::TestApp;
 use autumn_web::validation::ValidateExt;
 use axum::response::IntoResponse;
 use http::StatusCode;
@@ -27,10 +29,10 @@ fn reject() -> AutumnError {
         title: String::new(),
         author: "nope".into(),
     };
-    match note.validate() {
-        Ok(_) => panic!("the fixture is invalid"),
-        Err(err) => err,
-    }
+    let Err(err) = note.validate() else {
+        panic!("the fixture passed validation; it is meant to fail");
+    };
+    err
 }
 
 #[test]
@@ -76,7 +78,10 @@ fn other_errors_carry_no_details() {
 #[tokio::test]
 async fn accessors_agree_with_the_problem_details_body() -> Result<(), axum::Error> {
     let expected_code = reject().code();
-    let expected_details = reject().details().cloned().unwrap_or_default();
+    let expected_details = reject()
+        .details()
+        .cloned()
+        .expect("a validation error carries details");
 
     let response = reject().into_response();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -84,7 +89,7 @@ async fn accessors_agree_with_the_problem_details_body() -> Result<(), axum::Err
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let json: serde_json::Value = serde_json::from_slice(&body).expect("problem+json body");
 
-    assert_eq!(json["code"], expected_code);
+    assert_eq!(json["code"], &*expected_code);
     // `detail` still renders the bare title; the HTTP contract is unchanged.
     assert_eq!(json["detail"], "Validation failed");
 
@@ -105,4 +110,36 @@ async fn accessors_agree_with_the_problem_details_body() -> Result<(), axum::Err
         .collect();
     assert_eq!(rendered, expected_details);
     Ok(())
+}
+
+#[post("/notes")]
+async fn create_note() -> AutumnResult<&'static str> {
+    Err(reject())
+}
+
+#[tokio::test]
+async fn the_rendered_detail_is_still_the_bare_title() {
+    // Through the whole stack, not `into_response` alone: the exception
+    // filter re-renders the body from `AutumnErrorInfo`, which carries the
+    // wrapped message. The field list must not reach `detail`.
+    let response = TestApp::new()
+        .routes(routes![create_note])
+        .build()
+        .post("/notes")
+        .header("accept", "application/json")
+        .send()
+        .await;
+
+    response.assert_status(422);
+    let json: serde_json::Value = response.json();
+
+    assert_eq!(json["detail"], "Validation failed");
+    assert_eq!(json["code"], "autumn.validation_failed");
+    let fields: Vec<&str> = json["errors"]
+        .as_array()
+        .expect("errors array")
+        .iter()
+        .map(|entry| entry["field"].as_str().expect("field"))
+        .collect();
+    assert_eq!(fields, ["author", "title"]);
 }

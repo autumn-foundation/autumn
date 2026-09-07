@@ -8272,7 +8272,9 @@ async fn execute_task_result(
 
     match result {
         Ok(Ok(())) => Ok(duration_ms),
-        Ok(Err(e)) => Err((duration_ms, e.to_string())),
+        // `message`, not `Display`: this string is stored as the task's
+        // `last_error`, sent in alerts, and broadcast on `sys:tasks`.
+        Ok(Err(e)) => Err((duration_ms, e.message())),
         Err(panic) => Err((duration_ms, format_scheduled_task_panic(panic.as_ref()))),
     }
 }

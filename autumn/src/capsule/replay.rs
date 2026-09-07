@@ -707,7 +707,9 @@ pub async fn execute_job(
         },
         Ok(Err(error)) => CapsuleOutcome::Status {
             code: 500,
-            message: error.to_string(),
+            // `message`, not `Display`: paired against the recorded
+            // string, which `job::run_job_handler` also records this way.
+            message: error.message(),
             problem_type: None,
         },
         Err(payload) => CapsuleOutcome::Panic {

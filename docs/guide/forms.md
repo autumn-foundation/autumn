@@ -253,29 +253,36 @@ let row: Validated<ImportRow> = raw_row.validate()?;
 the framework, it derefs to `T` for reading, and it deliberately does **not**
 implement `DerefMut`, so it cannot be mutated back into an invalid state.
 
-#### Reading the failure back
+### Reading the failure back
 
 Off the HTTP path nothing renders the 422 for you, so read the field map off
 the error instead of re-running `validator` yourself:
 
 ```rust,ignore
-match raw_row.validate() {
-    Ok(row) => import(row),
-    Err(err) => {
+for (index, raw_row) in rows.into_iter().enumerate() {
+    match raw_row.validate() {
+        Ok(row) => import(row),
         // "Validation failed: email: Must be a valid email address"
-        tracing::warn!("row {index} rejected: {err}");
-        for (field, messages) in err.details().into_iter().flatten() {
-            reject_field(field, messages);
-        }
+        Err(error) => tracing::warn!(row = index, error = %error, "skipped invalid row"),
     }
 }
 ```
 
-`AutumnError::details()` is `Some` for a validation failure and `None`
-otherwise, `AutumnError::code()` returns the same stable code the
-`problem+json` body carries (`autumn.validation_failed`, …), and `Display`
-appends the failing fields in sorted order. The HTTP response is unchanged:
-its `detail` still reads `Validation failed`, with the fields in `errors`.
+Three accessors, on any `AutumnError`:
+
+- `details()` returns the field map for a validation failure, `None`
+  otherwise. It is a `HashMap`, so sort the keys before you render them.
+- `code()` returns the stable code the `problem+json` body carries —
+  `autumn.validation_failed`, `autumn.not_found`, and so on.
+- `message()` returns the wrapped error's message alone, which is what the
+  body's `detail` shows.
+
+`Display` appends the failing fields to `message()`, sorted by field name.
+Keep untrusted text out of your `#[validate(message = "...")]` strings: this
+output reaches your logs.
+
+The HTTP response does not change. Its `detail` still reads `Validation
+failed`, with the fields in `errors`.
 
 ### Which one?
 
