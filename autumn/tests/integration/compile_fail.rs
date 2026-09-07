@@ -289,6 +289,29 @@ fn query_budget_compile_fail_tests() {
     // The same N+1, against the real generated repository surface.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/query_budget_repository_n_plus_one.rs");
+    // Prospect assay (ledger, 2026-09-06): the accessor-tracking path
+    // (`state.db()`) that a `#[job]`/`#[scheduled]` handler is structurally
+    // limited to, since neither macro's signature can name a typed
+    // `Db`/`…Repository` parameter the way a route handler does. Both catch
+    // the N+1 with no code change to the analysis — see the report for the
+    // full assay.
+    t.compile_fail("tests/compile-fail/query_budget_accessor_handle_n_plus_one.rs");
+    t.compile_fail("tests/compile-fail/query_budget_job_shaped_accessor_n_plus_one.rs");
+    // The real `#[job]`/`#[scheduled]` attributes stacked with
+    // `#[query_budget]` (PR #2546 review): the fixtures above prove the
+    // accessor-tracking mechanism, but only the real attributes prove the
+    // two macros actually compose against each other.
+    t.compile_fail("tests/compile-fail/query_budget_real_job_accessor_n_plus_one.rs");
+    t.compile_fail("tests/compile-fail/query_budget_real_scheduled_accessor_n_plus_one.rs");
+    // A handle obtained through an async/fallible accessor (PR #2546 review,
+    // round 2): `self.conn().await?`, the real shape in
+    // `autumn-search/src/postgres.rs`'s `write_documents`.
+    t.compile_fail("tests/compile-fail/query_budget_await_try_accessor_n_plus_one.rs");
+    // The `.expect(...)`/`.unwrap()` idiom `autumn/src/seed.rs` documents as
+    // its own canonical usage (PR #2546 review, round 5) — the same
+    // accessor-tracking gap as the `?` shape above, for a different
+    // unwrapping spelling.
+    t.compile_fail("tests/compile-fail/query_budget_expect_accessor_n_plus_one.rs");
 }
 
 /// Every `#[agent_operable]` / `authority_grant!` compile-fail fixture, with
@@ -358,8 +381,8 @@ fn agent_authority_compile_fail_tests() {
 
 /// The `#[agent_operable]` compile-*pass* half (#1691), for the reason its
 /// compile-fail sibling has its own test: a self-contained feature worth
-/// running on its own, and two fewer lines in a `compile_pass_tests` that is
-/// already over the line limit.
+/// running on its own, and two fewer lines in the `compile_pass_tests_*` halves,
+/// which are already over the line limit.
 #[test]
 fn agent_authority_compile_pass_tests() {
     let t = trybuild::TestCases::new();
@@ -395,12 +418,16 @@ fn cache_coherence_compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
 }
 
+// Split into `_a` / `_b` halves so CI can run them as two parallel trybuild
+// shards (see the `trybuild` job in .github/workflows/ci.yml). Each half owns a
+// disjoint slice of the SAME fixture list — nothing is gated on the split, so a
+// new fixture may be appended to either half. `compile_pass` cases are the
+// expensive ones: unlike a `compile_fail` case, which stops at the first
+// diagnostic, each one compiles AND links a whole crate against autumn-web —
+// which is why they were 25 of the 37 minutes trybuild spent on Windows in the
+// run that motivated the split.
 #[test]
-// Same shape as `compile_fail_tests` above, and allowed for the same reason: a
-// flat registry of trybuild fixtures, one `t.pass(...)` per guarantee, with no
-// structure worth extracting.
-#[allow(clippy::too_many_lines)]
-fn compile_pass_tests() {
+fn compile_pass_tests_a() {
     let t = trybuild::TestCases::new();
 
     // Build-time cache coherence (#1716): a declared dependency set, an
@@ -443,6 +470,18 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/query_budget_valid.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/query_budget_route.rs");
+    // Prospect assay control (ledger, 2026-09-06): the job-shaped accessor
+    // pattern batched ahead of the loop compiles clean — the analysis is
+    // actually counting, not just always rejecting the job/scheduled shape.
+    t.pass("tests/compile-pass/query_budget_job_shaped_accessor_batched.rs");
+    // A bare `.await` (no `?`) on a fallible accessor must not promote the
+    // `Result` itself to a handle (PR #2546 review, round 3) — otherwise
+    // `result.is_err()` here would be miscounted as a database query.
+    t.pass("tests/compile-pass/query_budget_bare_await_not_promoted.rs");
+    // An awaited call whose name collides with a `HANDLE_BUILDERS` entry is
+    // the terminal query, not a handle-refining step (PR #2546 review,
+    // round 4) — its result must not be promoted to a handle either.
+    t.pass("tests/compile-pass/query_budget_awaited_builder_name_not_promoted.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
@@ -507,6 +546,12 @@ fn compile_pass_tests() {
     // uses `serialize_as`, as every `#[encrypted]` field does (#1340).
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted_hooks.rs");
+}
+
+// The second half of the `compile_pass` fixture list; see `compile_pass_tests_a`.
+#[test]
+fn compile_pass_tests_b() {
+    let t = trybuild::TestCases::new();
 
     // Sharding extractors + repository with_pool over a shard (requires db feature)
     #[cfg(feature = "db")]
