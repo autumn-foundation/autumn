@@ -3130,6 +3130,28 @@ def _reportable_flag(name):
             and not _PROSE_IN_FLAG.search(name))
 
 
+def _starts_trailing(node, supplied):
+    """Does an UNKNOWN hyphen token here start a `trailing_var_arg` capture?
+
+    `hyphen_slots` counts only the command's own positionals, so its length is
+    the index at which the trailing field begins. When that field is the FIRST
+    positional the boundary is zero, and the very first hyphen token starts the
+    capture: `Test.cargo_args` is `trailing_var_arg` + `allow_hyphen_values`
+    with nothing before it, so `autumn test --nocapture` forwards `--nocapture`
+    to cargo and is a correct line.
+
+    Asked only AFTER `_classify_option`, so the command's own options keep
+    precedence — `autumn test --reset` is still the CLI's.
+
+    Shared by the outer option branch and the leaf loop, which see the same
+    token in different states: an option token never reaches the leaf loop (the
+    outer branch takes every one of them), so a rule taught to only one of them
+    is a rule that does not apply where it is needed. That is how this arrived:
+    the first attempt lived in the leaf loop alone and changed nothing.
+    """
+    return node['trailing'] and supplied >= len(node['hyphen_slots'])
+
+
 def _classify_option(tok, node):
     """What IS this option token, to `node`? `(kind, eaten)`.
 
@@ -3296,6 +3318,8 @@ def _walk(tokens, i, path, surface, runnable, flags):
             if kind in ('known', 'cluster'):
                 i += eaten
                 continue
+            if _starts_trailing(node, 0):
+                return None                     # forwarded verbatim, not judged
             # Not declared here. Reported when it is spelled like a flag; then
             # an attached value can be walked PAST (its arity is inside the
             # token) while a detached one stops the walk, since whether it eats
@@ -3331,12 +3355,10 @@ def _walk(tokens, i, path, surface, runnable, flags):
                     i += 1
                     continue
                 if not operands_only and t2.startswith('-') and len(t2) > 1:
-                    # `trailing_var_arg`: once this command's own positional has
-                    # been supplied, clap stops interpreting and forwards the
-                    # rest verbatim. `autumn task cleanup-posts --confirm` sends
-                    # `--confirm` to the task, and the guide documents six such
-                    # arguments that the CLI itself has never declared.
-                    if node['trailing'] and supplied:
+                    # `trailing_var_arg`: once the capture is under way, clap
+                    # forwards the rest verbatim. `autumn task cleanup-posts
+                    # --confirm` sends `--confirm` to the task.
+                    if node['trailing'] and supplied > len(hyphen_slots):
                         return None
                     o = t2.split('=', 1)[0]
                     kind, eaten = _classify_option(t2, node)
@@ -3345,6 +3367,8 @@ def _walk(tokens, i, path, surface, runnable, flags):
                     if kind in ('known', 'cluster'):
                         i += eaten
                         continue
+                    if _starts_trailing(node, supplied):
+                        return None             # forwarded verbatim, not judged
                     if supplied < len(hyphen_slots) and hyphen_slots[supplied]:
                         # Not a flag at all: the value of an
                         # `allow_hyphen_values` positional. Filling the slot
@@ -3543,6 +3567,19 @@ def self_test():
             binary: Option<String>,
             #[arg(long, conflicts_with_all = ["binary"])]
             locked: bool,
+        },
+        // A trailing capture that is the command's FIRST positional, as the
+        // real `Test.cargo_args` is: there is no CLI-flag position in front of
+        // it, so the first unknown hyphen token starts the capture.
+        Test {
+            #[arg(long)]
+            reset: bool,
+            #[arg(
+                value_name = "CARGO_TEST_ARGS",
+                trailing_var_arg = true,
+                allow_hyphen_values = true
+            )]
+            cargo_args: Vec<String>,
         },
         // `trailing_var_arg`: everything after the positional goes to the task,
         // so the CLI never sees those flags and must not judge them.
@@ -3933,6 +3970,19 @@ def self_test():
            "a trailing_var_arg command's OWN flag position is still judged")
     expect(opts_of('task name -- --arg value') == [],
            'nothing after `--` is a flag of this command to judge')
+    # …and when the trailing field is the FIRST positional there is no CLI-flag
+    # position in front of it, so the first unknown hyphen token starts the
+    # capture. `autumn test --nocapture` forwards `--nocapture` to cargo.
+    expect(surface['test']['trailing'] and surface['test']['hyphen_slots'] == [],
+           'the trailing field is the only positional, so the boundary is zero')
+    expect(opts_of('test --nocapture') == [],
+           'an unknown hyphen token starts a first-positional trailing capture')
+    expect(opts_of('test --reset') == [],
+           "…while the command's OWN option keeps precedence")
+    expect(opts_of('test --nocapture some_test') == [],
+           'and everything after it is forwarded too')
+    expect(resolve(tk('test --nocapture'), surface, runnable=True) is None,
+           'such a line is complete, not missing an argument')
 
     # Not every dashed token is a flag: the corpus writes prose arrows and
     # slash-joined shorthand in command position, and neither is copyable.
