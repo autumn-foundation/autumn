@@ -301,13 +301,12 @@ impl AdminModel for TokenAdminModel {
         // `TokenAdminModel` never declares soft delete (`supports_soft_delete`
         // is the trait default, `false`), so `actions()` (traits.rs) only
         // ever offers `"delete"` — the admin UI can't reach `"restore"` or
-        // `"purge"` for this model. Those two branches below are unchanged
-        // copies of the trait default's per-id loop: kept only so a
-        // direct/out-of-band `execute_action` call gets the exact same
-        // "unhandled action" (or soft-delete-unsupported) error it always
-        // did, not because they need batching — `self.restore`/`self.purge`
-        // already return `Err` on their first id via the trait's default
-        // `restore`/`purge`, so there is no N+1 to eliminate there.
+        // `"purge"` for this model. Only `"delete"` needs the batched fast
+        // path below; `"restore"`, `"purge"`, and any other action name fall
+        // through to the shared `dispatch_restore_purge_or_unhandled` helper
+        // (traits.rs), which a direct or out-of-band `execute_action` call
+        // still reaches for the same "unhandled action" (or
+        // soft-delete-unsupported) error it always got.
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
@@ -341,32 +340,7 @@ impl AdminModel for TokenAdminModel {
             });
         }
 
-        let action = action.to_owned();
-        let pool = pool.clone();
-        Box::pin(async move {
-            match action.as_str() {
-                "restore" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.restore(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                "purge" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.purge(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                other => Err(AdminError::Other(format!(
-                    "unhandled bulk action '{other}'; \
-                     override AdminModel::execute_action to support it"
-                ))),
-            }
-        })
+        crate::traits::dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }
 }
 

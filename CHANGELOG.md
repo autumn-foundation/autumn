@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.**
+  `TokenAdminModel` and `FeatureFlagAdminModel` each override
+  `AdminModel::execute_action` to batch their `"delete"` bulk action into one
+  query, and both carried an unchanged copy of the trait default's
+  `"restore"`/`"purge"`/unhandled-action dispatch loop alongside it — a third
+  copy of the same logic, after the trait's own default. Both overrides now
+  delegate the non-`"delete"` cases to a shared
+  `dispatch_restore_purge_or_unhandled` helper instead. No behavior change:
+  the affected error paths are unreachable in practice (neither model
+  declares soft-delete support), and characterization tests pin the exact
+  error text before and after. Internal-only; no public API change.
+
 - **SQLite runtime honesty (issues #1905 / #2539).** The runtime landed in
   #2537; three things still behaved or read as though it had not.
 
