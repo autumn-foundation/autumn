@@ -350,6 +350,55 @@ fn a_defaulted_field_is_present_but_not_required() {
     );
 }
 
+// A CONTAINER `#[serde(default)]` lets every field be absent from a request.
+#[derive(Serialize, Deserialize, OpenApiSchema, Default)]
+#[serde(default)]
+#[allow(dead_code)]
+struct AllDefaulted {
+    a: String,
+    b: i64,
+}
+
+#[test]
+fn a_container_default_makes_every_field_optional() {
+    let schema = <AllDefaulted as OpenApiSchema>::schema();
+    assert!(schema["properties"]["a"].is_object(), "{schema}");
+    assert!(schema["properties"]["b"].is_object(), "{schema}");
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        required.is_empty(),
+        "the handler accepts {{}}, so no field may be demanded: {schema}"
+    );
+}
+
+// A list-valued serde meta BEFORE `rename_all` must not hide it. The scanner
+// has to consume `bound(...)` to reach the rename rule; failing to do so made
+// `parse_nested_meta` abort and report "no rule", advertising raw names while
+// serde applied camelCase.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[serde(bound(serialize = ""), rename_all = "camelCase")]
+#[allow(dead_code)]
+struct ListMetaBeforeRenameAll {
+    word_count: i64,
+}
+
+#[test]
+fn a_list_valued_meta_does_not_hide_a_later_rename_all() {
+    let schema = <ListMetaBeforeRenameAll as OpenApiSchema>::schema();
+    assert!(
+        schema["properties"]["wordCount"].is_object(),
+        "rename_all after a list-valued meta must still be read: {schema}"
+    );
+    assert!(
+        schema["properties"].get("word_count").is_none(),
+        "the raw name would be a contract serde does not honor: {schema}"
+    );
+}
+
 // Refused shapes, audited as one family rather than one per review round.
 // trybuild owns the compile-fail cases; listed so the contract reads in one
 // place:

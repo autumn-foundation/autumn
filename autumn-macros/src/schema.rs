@@ -54,9 +54,8 @@ pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<Strin
                         Ok(())
                     });
                 }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });

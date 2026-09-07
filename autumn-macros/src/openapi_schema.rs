@@ -60,9 +60,18 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 // Honor a container `#[serde(rename_all = "...")]` — the split
                 // form is refused above, so this side is the only side.
                 let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+                // A container `#[serde(default)]` (bare or `= "path"`) lets
+                // EVERY field be absent from a request, filled from the struct
+                // default. Nothing is required then. Safe in both directions:
+                // a response still carries every field, so a client that does
+                // not demand them is not misled, while a request client is no
+                // longer forced to send what the handler does not need.
+                let container_default = crate::schema::serde_bare_word(&input.attrs, &["default"])
+                    .is_some()
+                    || crate::schema::serde_valued_key(&input.attrs, &["default"]).is_some();
                 crate::schema::emit_schema_fn_body_full(
                     &field_ref_refs,
-                    false,
+                    container_default,
                     &[],
                     rename_all_rule.as_deref(),
                     // A `#[serde(default)]` field may be omitted from a request
