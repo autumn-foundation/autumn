@@ -2277,6 +2277,40 @@ def _shown_spans(view, src, start, end):
     return spans
 
 
+# WHERE THIS GATE STOPS MODELLING CSS, and why it stops here rather than one
+# property later.
+#
+# Four ways of hiding are handled — the `hidden` attribute, `display:none`,
+# `visibility`, and `inert` — because each turned up as a real defect and each
+# has a bounded rule. `opacity:0` was reported next and is equally real. It is
+# not handled, and neither are its siblings, because the class has no edge.
+# Eleven spellings, each measured in Chromium on an anchor whose only content
+# is the word `Mail`, none of which a reader can see:
+#
+#   opacity:0            30x17  hit IN    opacity:0%           30x17  hit IN
+#   color:transparent    30x17  hit IN    filter:opacity(0)    30x17  hit IN
+#   content-visibility   30x17  hit IN    clip-path:circle(0)  30x18  hit out
+#   position off-screen  30x18  no hit    font-size:0            0x0
+#   transform:scale(0)     0x0            text-indent:-9999px    0x18
+#   width:0;overflow:hidden 0x18
+#
+# No single property decides it. `filter:opacity(0)` and `content-visibility`
+# both report `opacity: 1`, a full box and a successful hit test, so even a
+# correct `opacity` rule misses them; three more are invisible only through the
+# interaction of two properties. Closing this needs computed style over a
+# parsed tree — the same answer as the three gaps already filed — and adding
+# per-property rules until then buys a shrinking fraction of the class at a
+# rising risk of the rules disagreeing with each other.
+#
+# THE THREAT MODEL SETTLES IT. This gate exists to catch a page nobody
+# remembered to link. It is not adversary-resistant and does not need to be:
+# hiding a link with CSS in a Markdown docs page, to make an orphan look
+# reachable, is not a mistake anyone makes by accident. The four handled cases
+# earn their place because a docs author really can wrap a section in
+# `<div hidden>` or leave a `display:none` draft behind. Nobody writes
+# `<a style="clip-path:circle(0)">` in a guide without meaning to.
+
+
 def _invisible_anchor(tag_src, content_src):
     """Whether an anchor paints nothing because of `visibility`.
 
