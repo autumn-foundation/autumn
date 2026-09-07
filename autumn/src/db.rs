@@ -102,6 +102,10 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
+/// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
+#[cfg(feature = "sqlite")]
+pub mod sqlite_types;
+
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
 /// A boxed async callback registered for post-transaction execution.

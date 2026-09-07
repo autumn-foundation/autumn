@@ -379,12 +379,16 @@ opentelemetry-otlp = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 tokio-cron-scheduler.workspace = true
 validator.workspace = true
-uuid = { version = "1", features = ["v4"] }
+# `serde` is library-side, not test-only: `db::sqlite_types::SqliteUuid` is
+# `#[serde(transparent)]` over `uuid::Uuid`, so the lib does not compile under
+# `--features sqlite` without it.
+uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 rand_chacha = "0.9"
 chrono = { workspace = true }
 chrono-tz.workspace = true
-rust_decimal.workspace = true
+# `serde` is a default feature, named here because `SqliteDecimal` depends on it.
+rust_decimal = { workspace = true, features = ["serde"] }
 croner = "3.0.1"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
@@ -737,6 +741,21 @@ path = "tests/sqlite_crud_basic.rs"
 [[test]]
 name = "sqlite_field_conversions"
 path = "tests/sqlite_field_conversions.rs"
+
+# `Uuid` / `Decimal` / generated-enum model fields on SQLite (issue #1924).
+# `uuid::Uuid` and `rust_decimal::Decimal` are foreign types with no possible
+# diesel SQLite conversion, so they ride the local newtypes
+# `db::sqlite_types::{SqliteUuid, SqliteDecimal}`. Proves a `#[model]` carrying
+# required and nullable `Uuid`/`Decimal` fields plus a generated `enum{…}` field
+# compiles, round-trips (incl. NULLs and canonical decimal text), and binds in a
+# WHERE clause on an in-memory SQLite pool with no Docker.
+# Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run:
+# `cargo test -p autumn-web --features sqlite --test sqlite_uuid_decimal_conversions`.
+[[test]]
+name = "sqlite_uuid_decimal_conversions"
+path = "tests/sqlite_uuid_decimal_conversions.rs"
 
 # `serde_json::Value` model-field round-trip on SQLite (issue #1341): proves a
 # `#[model]` carrying a required `serde_json::Value` and an

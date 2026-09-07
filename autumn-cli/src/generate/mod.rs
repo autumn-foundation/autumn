@@ -153,8 +153,8 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
 /// `[[database.shards]]` topology. But `DatabaseConfig::validate_backend_consistency`
 /// rejects *any* `database.shards` against a `SQLite` primary, so no valid
 /// `SQLite` config can ever use a generated sharded resource. Unlike UUID ids
-/// (#1905) or the unsupported field kinds (#1924) — and unlike FTS, now
-/// supported on `SQLite` via FTS5 (#1910) — this is **not** a deferred slice:
+/// (#1905) — and unlike FTS (now supported via FTS5, #1910) and every field
+/// kind (now converted, #1924) — this is **not** a deferred slice:
 /// `SQLite` is single-host / single-writer, so
 /// horizontal sharding is Postgres-only and permanently out of scope for
 /// `SQLite` (see `docs/guide/sqlite-in-production.md`). Rather than emit a
@@ -424,17 +424,11 @@ where
 ///
 /// The `SQLite` column/schema mapping ([`dsl::FieldKind::sqlite_schema_type`])
 /// changes the DDL and diesel sql-type, but the `#[model]` struct field still
-/// renders as its Rust type. As of #1924 `DateTime<Utc>` (via
-/// `TimestamptzSqlite`) and `Attachment` (`autumn_web::storage::Blob`, via
-/// `autumn-web`'s local `Text`/`Sqlite` impls) round-trip on `SQLite`. The
-/// still-rejected kinds are `Uuid` (`uuid::Uuid`), `Decimal`
-/// (`rust_decimal::Decimal`), and `Enum`: their Rust types are foreign to
-/// `autumn-web` (so the orphan rule forbids `autumn-web` adding the required
-/// `Sqlite` conversion) and diesel/`rust_decimal`'s own impls are
-/// Postgres-only, so a generated `SQLite` app using such a field fails to
-/// compile. Rather than emit uncompilable code, generation fails here with an
-/// actionable message (AC #4). Wrapper-based support for these remaining kinds
-/// is tracked in issue #1924.
+/// renders as a Rust type that needs a working conversion. As of #1924 every
+/// DSL kind has one, so this never fires today — it stays as the actionable
+/// message a NEW kind gets if it returns `false` from
+/// [`dsl::FieldKind::sqlite_has_diesel_conversion`] rather than emit code that
+/// cannot compile (AC #4).
 #[must_use]
 pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> GenerateError {
     GenerateError::Config(format!(
@@ -442,9 +436,7 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
          `{rust_type}`: diesel implements no FromSql/ToSql for that type on its SQLite \
          backend in a generated app's feature set, so a generated SQLite app using this \
          field would fail to compile. Supported SQLite field kinds are: {kinds}. \
-         SQLite support for the remaining Uuid / Decimal / enum fields is tracked in \
-         https://github.com/autumn-foundation/autumn/issues/1924 — use a \
-         supported field kind, or target a Postgres database.",
+         Use a supported field kind, or target a Postgres database.",
         kinds = dsl::SQLITE_SUPPORTED_KINDS,
     ))
 }
@@ -455,9 +447,12 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
 /// [`sqlite_field_kind_unsupported_error`]. Postgres callers never invoke this,
 /// so their output is unaffected.
 ///
+/// Every kind converts as of #1924, so this is a standing guard rather than an
+/// active gate — see [`dsl::FieldKind::sqlite_has_diesel_conversion`].
+///
 /// # Errors
 /// Returns [`GenerateError::Config`] for the first field whose kind has no
-/// working diesel `SQLite` conversion (`Uuid`, `Decimal`, `Enum`).
+/// working diesel `SQLite` conversion.
 pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<(), GenerateError> {
     for f in fields {
         if !f.kind.sqlite_has_diesel_conversion() {

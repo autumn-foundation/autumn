@@ -167,6 +167,7 @@ jobs:
   # Runs:
   #   generated_project_compiles_runs_and_serves  (e2e.rs)
   #   generated_scaffold_cargo_checks             (generate.rs)
+  #   generated_sqlite_scaffold_cargo_checks      (generate.rs, #1924)
   #   generated_policy_scaffold_cargo_checks      (generate.rs)
   #   generated_nested_scaffold_cargo_checks      (generate.rs)
   #   generated_counter_cache_scaffold_cargo_checks (generate.rs, #2431)
@@ -228,6 +229,15 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_scaffold_cargo_checks -- --ignored --exact
+
+      # Issue #1924: the only machine proof that a SQLite-configured scaffold —
+      # Uuid, decimal, enum, DateTime, Attachment and json fields — compiles.
+      # `cargo check` (not --all-targets): the smoke test is still Postgres-only
+      # until the SQLite TestDb lands with #1905.
+      - name: generated_sqlite_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_sqlite_scaffold_cargo_checks -- --ignored --exact
 
       - name: generated_policy_scaffold_cargo_checks
         run: |

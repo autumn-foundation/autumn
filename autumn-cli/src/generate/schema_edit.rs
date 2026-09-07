@@ -324,7 +324,7 @@ pub fn create_table_sql_with_metadata_and_id_for(
         {
             let _ = write!(sql, " DEFAULT {default}");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(sql, " {check}");
         }
     }
@@ -944,23 +944,94 @@ pub fn unique_index_sql(table: &str, field: &str, fields: &[Field]) -> String {
     format!("CREATE UNIQUE INDEX {name} ON {table} ({field});\n")
 }
 
-/// For an `enum{…}` field, the trailing ` CHECK (col IN ('a', 'b', …))`
-/// clause that enforces the closed set at the database layer. `None` for
-/// every other field kind.
+/// The trailing `CHECK (…)` clause a column needs to enforce at the database
+/// layer what its declared type promises, or `None` when the column type
+/// already enforces it.
 ///
-/// Variants are validated `snake_case` identifiers (see
-/// [`super::dsl::parse_field`]), so no SQL-escaping is needed here.
-fn enum_check_suffix(field: &Field) -> Option<String> {
-    if !field.kind.is_enum() {
-        return None;
+/// Two kinds need one:
+///
+/// - `enum{…}` on both backends — the closed variant set, since the column is
+///   `TEXT` either way.
+/// - `decimal{p,s}` on `SQLite` only (issue #1924) — Postgres gets a real
+///   `NUMERIC(p, s)`, but the `SQLite` column is `TEXT`, so without this the
+///   declared precision and scale bind nothing and a repository write can
+///   persist `123456.789` into a `decimal{5,2}`.
+fn column_check_suffix(field: &Field, backend: DatabaseBackend) -> Option<String> {
+    if field.kind.is_enum() {
+        // Variants are validated `snake_case` identifiers (see
+        // `super::dsl::parse_field`), so no SQL-escaping is needed here.
+        let quoted = field
+            .variants
+            .iter()
+            .map(|v| format!("'{v}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("CHECK ({} IN ({quoted}))", field.name));
     }
-    let quoted = field
-        .variants
-        .iter()
-        .map(|v| format!("'{v}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("CHECK ({} IN ({quoted}))", field.name))
+    if backend == DatabaseBackend::Sqlite
+        && let FieldKind::Decimal { precision, scale } = field.kind
+    {
+        return Some(sqlite_decimal_check(&field.name, precision, scale));
+    }
+    None
+}
+
+/// The `SQLite` `CHECK` that enforces `NUMERIC(precision, scale)` over a `TEXT`
+/// column (issue #1924).
+///
+/// `SQLite` has no fixed-precision numeric type and no regular expressions, so
+/// the constraint is spelled with string builtins over the stored text, which
+/// `db::sqlite_types::SqliteDecimal` always writes as a plain, normalized
+/// decimal literal. Four conditions, in order:
+///
+/// 1. only digits remain once the sign and the point are removed;
+/// 2. at most one decimal point;
+/// 3. a `-`, if present, is leading;
+/// 4. the fractional part is at most `scale` digits, and the integer part at
+///    most `precision - scale` digits once leading zeros are stripped.
+///
+/// (4) is the invariant `NUMERIC` enforces. It rejects rather than rounds,
+/// unlike Postgres, which rounds a value to `scale` — a loud failure beats
+/// silently storing what the schema says is out of range. `NULL` passes; the
+/// column's own `NOT NULL` decides that.
+fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
+    // The unsigned text. Repeated rather than named: a SQLite `CHECK` has no `let`.
+    let abs = format!("replace({column},'-','')");
+    let frac_len =
+        format!("CASE WHEN instr({abs},'.') = 0 THEN 0 ELSE length({abs}) - instr({abs},'.') END");
+    let int_part = format!(
+        "CASE WHEN instr({abs},'.') = 0 THEN {abs} ELSE substr({abs}, 1, instr({abs},'.') - 1) END"
+    );
+    // The digits alone — sign and point removed. Condition 1 proves it is all
+    // digits, so its length is the digit count.
+    let digits = format!("replace(replace({column},'-',''),'.','')");
+    let conditions = [
+        // 0: actually stored as TEXT. `TEXT` affinity does NOT convert a BLOB,
+        // so `x'31392e3939'` keeps storage class blob while every string
+        // function below reads it as `19.99` and waves it through — and diesel's
+        // `FromSql<Text, Sqlite>` for `String` then refuses the blob before
+        // `Decimal` ever sees it. Same unloadable-row failure as conditions 1-5,
+        // one storage class further out.
+        format!("typeof({column}) = 'text'"),
+        // 1-5: a plain decimal literal. Without the digit count and the sign
+        // count, `''`, `'-'`, `'.'`, `'--1'` and `'-1-'` all pass — values a
+        // raw INSERT, an import or a hand-written migration can produce, which
+        // would satisfy the constraint and then fail `SqliteDecimal::from_sql`,
+        // leaving a row that cannot be loaded.
+        format!("ltrim({digits}, '0123456789') = ''"),
+        format!("length({digits}) >= 1"),
+        format!("length({column}) - length(replace({column},'.','')) <= 1"),
+        format!("length({column}) - length(replace({column},'-','')) <= 1"),
+        format!("(instr({column},'-') = 0 OR instr({column},'-') = 1)"),
+        // 6: scale.
+        format!("{frac_len} <= {scale}"),
+        // 7: precision, as the integer-digit budget NUMERIC(p, s) allows.
+        format!(
+            "length(ltrim({int_part}, '0')) <= {}",
+            precision.saturating_sub(scale)
+        ),
+    ];
+    format!("CHECK ({column} IS NULL OR ({}))", conditions.join(" AND "))
 }
 
 /// Result of inferring a migration shape from its name.
@@ -1210,7 +1281,7 @@ pub fn add_columns_up_sql_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
@@ -1598,7 +1669,7 @@ pub fn remove_columns_down_sql_for(
         if let Some(target) = f.reference_table() {
             let _ = write!(out, " REFERENCES {target}(id)");
         }
-        if let Some(check) = enum_check_suffix(f) {
+        if let Some(check) = column_check_suffix(f, backend) {
             let _ = write!(out, " {check}");
         }
         out.push_str(";\n");
@@ -7781,6 +7852,79 @@ fn main() {
     }
 
     // ── ensure_autumn_web_feature ─────────────────────────────────────────
+
+    /// The `SQLite` decimal `CHECK` is SQL, so it is tested by running it —
+    /// against a real in-memory `SQLite`, not by matching the string (issue
+    /// #1924). Covers the digit budgets it exists for, and the malformed text
+    /// that an earlier version admitted: a value that satisfies the constraint
+    /// but fails `SqliteDecimal::from_sql` is a row nothing can load.
+    #[test]
+    fn sqlite_decimal_check_enforces_precision_scale_and_shape() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        // `decimal{10,2}`: at most 8 integer digits and 2 fractional.
+        let check = sqlite_decimal_check("price", 10, 2);
+        conn.batch_execute(&format!("CREATE TABLE t (price TEXT NULL {check})"))
+            .expect("the generated CHECK must be valid SQLite SQL");
+
+        let accepts = |conn: &mut diesel::SqliteConnection, value: &str| {
+            diesel::sql_query(format!("INSERT INTO t (price) VALUES ('{value}')"))
+                .execute(conn)
+                .is_ok()
+        };
+
+        for value in ["0", "0.1", "19.99", "-19.99", "12345678.99", "-0.01"] {
+            assert!(accepts(&mut conn, value), "`{value}` is in range");
+        }
+        for value in [
+            // Over budget.
+            "123456789.99",
+            "19.999",
+            "123456.789",
+            // Malformed: no digit, or a stray/duplicated sign.
+            "",
+            "-",
+            ".",
+            "-.",
+            "--1",
+            "-1-",
+            "1.2.3",
+            "abc",
+        ] {
+            assert!(!accepts(&mut conn, value), "`{value}` must be rejected");
+        }
+
+        // Storage class, not just text shape. A BLOB whose BYTES spell a valid
+        // decimal is the one case `TEXT` affinity will NOT convert, so it keeps
+        // storage class blob and `FromSql<Text, Sqlite>` refuses it — an
+        // unloadable row unless the CHECK rejects it up front.
+        assert!(
+            diesel::sql_query("INSERT INTO t (price) VALUES (x'31392e3939')")
+                .execute(&mut conn)
+                .is_err(),
+            "a blob spelling `19.99` must be rejected: TEXT affinity does not convert it"
+        );
+        // Unquoted numeric literals ARE converted by TEXT affinity, so they are
+        // stored as text and load fine — the CHECK must not reject them.
+        for literal in ["19.99", "19", "-0.01"] {
+            assert!(
+                diesel::sql_query(format!("INSERT INTO t (price) VALUES ({literal})"))
+                    .execute(&mut conn)
+                    .is_ok(),
+                "`{literal}` is converted to TEXT by affinity and must be accepted"
+            );
+        }
+
+        // NULL is the column's own business, not the CHECK's.
+        assert!(
+            diesel::sql_query("INSERT INTO t (price) VALUES (NULL)")
+                .execute(&mut conn)
+                .is_ok(),
+            "NULL must pass; NOT NULL decides that"
+        );
+    }
 
     #[test]
     fn ensure_feature_status_reports_not_found_when_dep_absent() {

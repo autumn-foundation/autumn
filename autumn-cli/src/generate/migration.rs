@@ -160,10 +160,10 @@ pub fn plan_migration_with_options(
             // lock_version:String` would block the very escape hatch the other
             // error messages point at.
             super::model::validate_lock_version_field(&fields, &[])?;
-            // A field kind with no working diesel SQLite conversion (Uuid,
-            // Attachment, Decimal) would leak an uncompilable column into the
-            // generated SQLite app, so reject it here too — same guard as
-            // `generate model`/`scaffold` (AC #4, #1924).
+            // The same standing guard `generate model`/`scaffold` carries: a
+            // field kind with no working diesel SQLite conversion would leak an
+            // uncompilable column into the app. Every kind converts as of #1924
+            // (AC #4).
             if backend == autumn_web::config::DatabaseBackend::Sqlite {
                 super::reject_sqlite_unsupported_field_kinds(&fields)?;
             }
@@ -945,28 +945,39 @@ pub struct Post {
         });
     }
 
-    /// A `SQLite` `Add…To…` / `Remove…From…` migration rejects field kinds that
-    /// still have no working diesel `SQLite` conversion (`Uuid`, `Decimal`,
-    /// `Enum`) at generate time, citing #1924 (issue #1614 AC #4). `DateTime` and
-    /// `Attachment` are accepted as of #1924 (see the `dsl`/`model` tests).
+    /// A `SQLite` `Add…To…` / `Remove…From…` migration now accepts every field
+    /// kind: #1924 gave `Uuid`, `Decimal` and `Enum` working `SQLite`
+    /// conversions, so the generate-time rejection no longer fires. All three
+    /// store `TEXT`.
+    ///
+    /// Nullable columns here, deliberately: `SQLite`'s own `ALTER TABLE ADD
+    /// COLUMN` rule still refuses a `NOT NULL` column with no default, which is
+    /// a separate gate (#1918) this test must not trip over.
     #[test]
-    fn column_migrations_on_sqlite_reject_unsupported_field_kinds_citing_1924() {
+    fn column_migrations_on_sqlite_accept_uuid_decimal_and_enum_after_1924() {
         with_no_db_env(|| {
-            for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
-                let tmp = sqlite_project();
-                let err =
-                    plan_migration(tmp.path(), name, &["token:Uuid".into()], "20260427000000")
-                        .unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    matches!(err, GenerateError::Config(_)),
-                    "{name}: expected Config error, got: {err:?}"
-                );
-                assert!(msg.contains("1924"), "{name}: must cite #1924: {msg}");
-                assert!(
-                    msg.contains("uuid::Uuid"),
-                    "{name}: message must name the Rust type: {msg}"
-                );
+            for token in [
+                "token:Option<Uuid>",
+                "price:Option<decimal{10,2}>",
+                "status:Option<enum{draft,published}>",
+            ] {
+                for name in ["AddTokenToPosts", "RemoveTokenFromPosts"] {
+                    let tmp = sqlite_project();
+                    let plan = plan_migration(tmp.path(), name, &[token.into()], "20260427000000")
+                        .unwrap_or_else(|e| {
+                            panic!("{name} with `{token}` must plan on SQLite (#1924): {e}")
+                        });
+                    let up = sql_action(&plan, "up.sql");
+                    let down = sql_action(&plan, "down.sql");
+                    for sql in [&up, &down] {
+                        for leak in ["UUID", "NUMERIC"] {
+                            assert!(
+                                !sql.contains(leak),
+                                "{name}/{token}: SQLite SQL leaked `{leak}`: {sql}"
+                            );
+                        }
+                    }
+                }
             }
         });
     }

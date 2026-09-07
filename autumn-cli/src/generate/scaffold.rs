@@ -12,12 +12,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
+use autumn_web::config::DatabaseBackend;
+
 use super::dsl::{
     EncryptedMode, Field, FieldKind, IdType, parse_fields, randomized_equality_lookup_reason,
 };
 use super::emit::{Action, Plan, Revert};
 use super::model::{
-    ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata,
+    ModelOptions, augment_fields_for_soft_delete, field_by_name, parse_model_metadata_for,
     plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{humanize_label, pascal, pluralize, snake};
@@ -434,6 +436,9 @@ fn plan_scaffold_with_options_impl(
     for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    // Selects the SQLite-vs-Postgres halves of the scaffold's output: the field
+    // Rust types, the dependency set, and `autumn-web`'s feature list (#1924).
+    let backend = super::detect_backend(project_root);
     // Gate: UUID primary keys are not yet supported for scaffolds. Every scaffold
     // emits a `#[autumn_web::repository]`, whose macro-generated REST API is
     // currently hard-coded to `i64` primary keys (`Path<i64>`, `find_by_id`,
@@ -697,7 +702,7 @@ fn plan_scaffold_with_options_impl(
             &options_with_key.model,
         )?
     };
-    let mut metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    let mut metadata = parse_model_metadata_for(backend, &fields, &options_with_key.model)?;
     // Issue #1367: see `model::plan_model` — `by` is emitted only when the
     // author model it names is really there.
     metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
@@ -718,7 +723,7 @@ fn plan_scaffold_with_options_impl(
             slug.name
         )));
     }
-    let queries = parse_query_specs(&fields, &options_with_key.queries, for_revert)?;
+    let queries = parse_query_specs(&fields, &options_with_key.queries, for_revert, backend)?;
     let form_fields = fields
         .iter()
         .filter(|field| !metadata.defaults().contains_key(&field.name))
@@ -847,7 +852,6 @@ fn plan_scaffold_with_options_impl(
         // On a revert, the shared table stays as long as ANY other model still
         // declares `#[commentable]` — it is one table for all of them, so
         // taking it out with this model would break every other one.
-        let backend = super::detect_backend(project_root);
         let revert_would_orphan_another_model = for_revert
             && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
         let emitted = !revert_would_orphan_another_model
@@ -1267,6 +1271,7 @@ fn plan_scaffold_with_options_impl(
             nesting.as_ref(),
             options_with_key.import,
             &labels,
+            backend,
         );
         let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
             .map_err(|refused| {
@@ -2282,7 +2287,7 @@ fn plan_scaffold_with_options_impl(
     // would clobber the first (each rendering is computed at plan time
     // against the on-disk Cargo.toml).
     plan.actions.retain(|a| !a.path().ends_with("Cargo.toml"));
-    let mut combined: Vec<(&str, &str)> = super::model::MODEL_DEPS
+    let mut combined: Vec<(&str, &str)> = super::model::model_deps(backend)
         .iter()
         .copied()
         .chain(SCAFFOLD_EXTRA_DEPS.iter().copied())
@@ -2305,7 +2310,12 @@ fn plan_scaffold_with_options_impl(
     if fields.iter().any(|f| f.kind.is_decimal()) {
         combined.push((
             "rust_decimal",
-            "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }",
+            match backend {
+                DatabaseBackend::Postgres => {
+                    "{ version = \"1\", features = [\"db-diesel2-postgres\", \"serde\"] }"
+                }
+                DatabaseBackend::Sqlite => "{ version = \"1\", features = [\"serde\"] }",
+            },
         ));
     }
     plan_cargo_deps(
@@ -2314,6 +2324,45 @@ fn plan_scaffold_with_options_impl(
         &combined,
         &project_root.join("src/models"),
     );
+
+    // Re-applied here, not inherited: the `retain` above dropped every staged
+    // `Cargo.toml` action, including the `sqlite` feature `plan_model` added
+    // (issue #1924) — the same reason `maud` and `i18n` are re-applied below.
+    if backend == DatabaseBackend::Sqlite {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, "sqlite");
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: "sqlite".to_owned(),
+            owner_dir: Some(project_root.join("src/models")),
+        });
+        // The one file this scaffold writes that is known not to compile here.
+        // Say so at generate time rather than let `cargo test` be the messenger.
+        if !for_revert {
+            plan.warn(format!(
+                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`, a Postgres-only \
+                 testcontainer, so `cargo test` will not compile on this SQLite app. The app \
+                 itself is unaffected — `cargo run`, `cargo build` and `autumn migrate` all \
+                 work. A SQLite `TestDb` lands with the runtime slice, \
+                 https://github.com/autumn-foundation/autumn/issues/1905 — until then, delete \
+                 that file or gate it behind a Postgres-only cargo feature."
+            ));
+        }
+    }
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
     // (issue #1124), which are gated behind autumn-web's `maud` feature — enable
@@ -2836,6 +2885,9 @@ fn parse_query_specs(
     fields: &[Field],
     queries: &[String],
     for_revert: bool,
+    // The lookup argument's Rust type must match the model field's, which
+    // differs for `Uuid`/`Decimal` on SQLite (issue #1924).
+    backend: DatabaseBackend,
 ) -> Result<Vec<QuerySpec>, GenerateError> {
     let mut parsed = Vec::with_capacity(queries.len());
     for query in queries {
@@ -2905,7 +2957,7 @@ fn parse_query_specs(
         parsed.push(QuerySpec {
             method: method.to_owned(),
             field_name: field_name.to_owned(),
-            rust_type: field.rust_type(),
+            rust_type: field.rust_type_for(backend),
         });
     }
     // Every `unique` field (issue #1032) gets a `find_by_<field>` repository
@@ -2922,7 +2974,7 @@ fn parse_query_specs(
             parsed.push(QuerySpec {
                 method: format!("find_by_{}", field.name),
                 field_name: field.name.clone(),
-                rust_type: field.rust_type(),
+                rust_type: field.rust_type_for(backend),
             });
         }
     }
@@ -3260,6 +3312,9 @@ fn render_model_form(
     // changes here is that `parse_local_datetime` also accepts the format the
     // CSV export writes, so an exported file re-imports on its datetime columns.
     import: bool,
+    // The form field types must match the model's, which differ for
+    // `Uuid`/`Decimal` on SQLite (issue #1924).
+    backend: DatabaseBackend,
 ) -> ModelFormParts {
     use std::fmt::Write;
     let mut struct_fields = String::new();
@@ -3459,7 +3514,7 @@ fn render_model_form(
             // pre-fill `0` and silently pass both `required` and a range that
             // spans the zero default. `into_new` unwraps the validated
             // `Some(_)`; `from_row` wraps a persisted native value in `Some`.
-            let rust_type = f.rust_type();
+            let rust_type = f.rust_type_for(backend);
             let _ = writeln!(struct_fields, "    pub {name}: Option<{rust_type}>,");
             let _ = writeln!(
                 into_new,
@@ -3488,7 +3543,7 @@ fn render_model_form(
             // A nullable field of the same kind needs none of this:
             // `Option<T>::default()` is `None`, which serializes to `null` and
             // renders blank via `field_value`.
-            let rust_type = f.rust_type();
+            let rust_type = f.rust_type_for(backend);
             let _ = writeln!(struct_fields, "    pub {name}: String,");
             let _ = writeln!(
                 into_new,
@@ -3512,7 +3567,7 @@ fn render_model_form(
             let _ = writeln!(
                 struct_fields,
                 "    pub {name}: {rust_type},",
-                rust_type = f.rust_type()
+                rust_type = f.rust_type_for(backend)
             );
             let _ = writeln!(into_new, "        {name}: form.{name}.clone(),");
             let _ = writeln!(from_row, "            {name}: row.{name}.clone(),");
@@ -3620,6 +3675,9 @@ fn render_routes_file(
     // Disabled (`--i18n` off) it returns each caller's literal expression
     // verbatim, so this whole template renders byte-for-byte as before.
     labels: &scaffold_i18n::ViewLabels,
+    // Selects the form field Rust types, which differ for `Uuid`/`Decimal` on
+    // SQLite (issue #1924).
+    backend: DatabaseBackend,
 ) -> String {
     let id_rust = id_type.rust_type();
     // Issue #1349: with `--i18n`, every view-rendering handler takes the
@@ -4321,6 +4379,7 @@ fn render_routes_file(
         validations,
         nesting.map(|n| n.fk.as_str()),
         import_enabled,
+        backend,
     );
     // Enum fields need their generated Rust type in scope here — `into_new`
     // parses into it and the `From<&Row>` seed matches against its variants
@@ -6463,6 +6522,7 @@ mod attachment_read_back_tests {{
         //
         // Rebound as `mut` so the two trash-only columns can be pushed after it.
         let trash_columns = render_columns_vec(
+            backend,
             pascal_name,
             snake_name,
             fields,
@@ -6789,6 +6849,7 @@ pub async fn move_down(
         String::new()
     } else {
         render_columns_vec(
+            backend,
             pascal_name,
             snake_name,
             fields,
@@ -6822,6 +6883,7 @@ pub async fn move_down(
         columns_let
     } else {
         render_columns_vec(
+            backend,
             pascal_name,
             snake_name,
             fields,
@@ -7628,6 +7690,7 @@ pub async fn index(
     // wrapper, and the two nested handlers. Empty for a flat scaffold.
     let nested_section = nesting.map_or_else(String::new, |n| {
         render_nested_section(
+            backend,
             pascal_name,
             snake_name,
             plural,
@@ -8348,6 +8411,8 @@ pub async fn events(
               coherent block of generated code"
 )]
 fn render_nested_section(
+    // Passed through to the child list's column vec (issue #1924).
+    backend: DatabaseBackend,
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
@@ -8429,6 +8494,7 @@ fn render_nested_section(
         );
     }
     let columns = render_columns_vec(
+        backend,
         pascal_name,
         snake_name,
         &list_fields,
@@ -11418,7 +11484,15 @@ const fn kind_is_sortable(kind: FieldKind) -> bool {
 /// the header link promises. Either way the control lies about what it does, so
 /// don't render it (same posture as the nested child list, which withholds
 /// `.sortable(..)` rather than stamp an `aria-sort` that never changes).
-const fn field_is_sortable(field: &Field) -> bool {
+/// A `decimal` column is the third case, and only on `SQLite` (issue #1924):
+/// the column is `TEXT` there, so `ORDER BY` compares strings — `"9"` after
+/// `"10"`. The `#[model]` macro leaves such a column out of its sort allowlist
+/// for that reason, so the header link would be dead *and* stamp an `aria-sort`
+/// that never matches the rows. Withhold it, exactly as for an encrypted column.
+const fn field_is_sortable(field: &Field, backend: DatabaseBackend) -> bool {
+    if matches!(backend, DatabaseBackend::Sqlite) && field.kind.is_decimal() {
+        return false;
+    }
     kind_is_sortable(field.kind) && !field.is_encrypted()
 }
 
@@ -11436,6 +11510,9 @@ const fn field_is_sortable(field: &Field) -> bool {
               header/cell emission the four surfaces must agree on"
 )]
 fn render_columns_vec(
+    // Decides whether a `decimal` column may advertise a sortable header
+    // (issue #1924) — see `field_is_sortable`.
+    backend: DatabaseBackend,
     pascal_name: &str,
     snake_name: &str,
     fields: &[Field],
@@ -11496,7 +11573,7 @@ fn render_columns_vec(
         } else {
             format!("\"{}\"", title_case(&f.name))
         };
-        let sortable_suffix = if sortable && field_is_sortable(f) {
+        let sortable_suffix = if sortable && field_is_sortable(f, backend) {
             format!(".sortable(\"{}\")", f.name)
         } else {
             String::new()

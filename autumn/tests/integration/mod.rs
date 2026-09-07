@@ -338,6 +338,7 @@ mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+mod sqlite_ci_coverage;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]

@@ -1424,6 +1424,7 @@ jobs:
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
             --test sqlite_field_conversions \
+            --test sqlite_uuid_decimal_conversions \
             --test sqlite_json_field_conversion \
             --test sqlite_upsert_isolation \
             --test sqlite_votable \

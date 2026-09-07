@@ -115,6 +115,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   additionally accepts an explicit `crate = "..."` override, e.g.
   `#[get("/x", crate = "autumn_web_05")]`.
 
+- **sqlite:** `Uuid`, `decimal{p,s}` and `enum{…}` model fields now work on a
+  SQLite app — the last three field kinds `autumn generate` refused (#1924).
+  `uuid::Uuid` and `rust_decimal::Decimal` belong to other crates, and so does
+  every diesel item their conversion would name, so `autumn-web` can implement
+  nothing for them; they render the new `TEXT`-backed newtypes
+  `autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}` instead, which are
+  `Copy`, deref to the wrapped type, convert with `From`/`Into`, and are
+  `#[serde(transparent)]`. A generated `enum` is local to your app, so the model
+  generator emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. All three
+  store `TEXT`. `SqliteDecimal` writes the normalized value, so it keeps sign and
+  every significant digit but **not** trailing-zero scale: a column holding
+  `0.10` reads back as `0.1`, and one holding `19.9` reads back as `19.9` where
+  Postgres `NUMERIC(10,2)` would give `19.90`. The values are numerically equal —
+  format for display rather than relying on the stored scale. Normalizing is what
+  makes SQLite's byte-wise `=` and `UNIQUE` agree with Rust equality. Note also
+  that a `TEXT` column sorts lexicographically, so `ORDER BY` on a decimal column
+  compares strings — see `docs/guide/sqlite-in-production.md`. Postgres output is
+  unchanged.
+- **sqlite:** a SQLite app's `Cargo.toml` now describes the SQLite backend
+  (#1924): diesel on its `sqlite` feature with the bundled `libsqlite3-sys`,
+  `diesel-async` on the sync-connection wrapper, `autumn-web`'s `sqlite`
+  feature, and no `pq-sys`. Before this a generated SQLite app pulled the
+  Postgres dependency set and could not compile at all.
+- **sqlite:** a `decimal{p,s}` column now carries a generated `CHECK` enforcing
+  the declared precision and scale (#1924). The SQLite column is `TEXT`, so
+  without it the declaration bound nothing and a repository write could persist
+  `123456.789` into a `decimal{5,2}`. Postgres keeps its native `NUMERIC(p,s)`
+  and gains no `CHECK`. Note that Postgres *rounds* a value to `scale` where
+  SQLite rejects it — round before saving if your input can be wider.
+- **sqlite:** a `decimal` `--default` is now written as a quoted, normalized
+  text literal (#1924). Unquoted, SQLite evaluated `DEFAULT 0.10` numerically
+  and TEXT affinity stored `0.1`; a wide default became scientific notation that
+  could not be read back at all. It is normalized through the real `Decimal` so
+  it is byte-identical to what `SqliteDecimal` writes — otherwise a row holding
+  its own default would not match a `find_by_…` for that value, and a unique
+  index would admit both spellings.
+
+### Fixed
+
+- **macros:** the `#[model]` association preloader named `diesel::pg::Pg`
+  directly, so a `--belongs-to … --counter-cache` scaffold did not compile on a
+  SQLite app. It now names `autumn_web::RuntimeBackend`, the alias that already
+  exists for this — the same type on Postgres (#1924).
+- **macros:** `#[model]` recognises the SQLite `Uuid`/`Decimal` newtypes where
+  it previously matched only `Uuid`/`Decimal` by name (#1924), so `.fake()`
+  factories mint distinct values instead of one shared nil UUID (which collided
+  on a `:unique` column), `form_for` renders a decimal as a number input, and a
+  `Uuid` column keeps its sortable index header. A `SqliteDecimal` column is
+  deliberately *not* sortable: its `TEXT` column orders lexicographically, so
+  the header would lie.
+- **schema:** `autumn schema parse` silently dropped every `Uuid` and `decimal`
+  column of a SQLite app, so snapshots and diffs were computed against an
+  incomplete schema (#1924).
+- **cli:** `autumn destroy` no longer strips `autumn-web`'s `sqlite` feature
+  when the last model goes. It is a whole-app backend flip, not a per-resource
+  capability, and without it the app's `sqlite://` URL is refused at boot
+  (#1924).
+
+### Changed
+
+- **cli:** a generated `Scope::list` now takes `autumn_web::RuntimeConnection`
+  instead of a hard-coded `diesel_async::AsyncPgConnection`, matching what
+  `generate auth` already emits. The same type on Postgres, so behaviour is
+  unchanged — but the emitted bytes of `src/policies/<model>.rs` differ, and a
+  SQLite app needs it to compile at all (#1924).
+
+### Added
+
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
   `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new
