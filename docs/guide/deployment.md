@@ -1295,9 +1295,18 @@ a symlink moves the link, not the database behind it:
 ```sh
 autumn db backup                      # first, from the project dir
 systemctl stop myapp-blue.service myapp-green.service
-mv "$(readlink -f /srv/autumn/myapp/current/app.db)"* /srv/autumn/myapp/shared/data/
+src=$(readlink -f /srv/autumn/myapp/current/app.db)
+mv "$src" /srv/autumn/myapp/shared/data/app.db
+for s in -wal -shm -journal; do
+  [ -e "$src$s" ] && mv "$src$s" /srv/autumn/myapp/shared/data/app.db$s
+done
 rm -f /srv/autumn/myapp/current/app.db
 ```
+
+Each file moves to its **exact** shared name rather than just into `shared/data`:
+your symlink may point at a different basename (`legacy.sqlite`), and leaving it
+under that name puts the database beside the one the deploy opens instead of at
+it — so the next deploy would create an empty one anyway.
 
 The deploy refuses rather than link past your symlink: the shared file does not
 exist yet, so the migration would create an empty database there and the cutover

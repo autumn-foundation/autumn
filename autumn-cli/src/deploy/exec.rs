@@ -1822,14 +1822,19 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
          {shared}. The data file must live there to survive a deploy, so this \
          deploy stopped rather than link past it and serve an empty database."
     );
+    // Each file moves to its EXACT shared name, not merely into the shared
+    // directory: the link target may carry a different basename, and landing the
+    // database next to the name the deploy expects rather than at it leaves the
+    // next deploy creating an empty one — the very loss this refusal prevents.
     let linked_recovery = format!(
         "Run this on the host once, then deploy again: systemctl stop \
-         {blue_q} {green_q}; mv \"$(readlink -f {current_q})\"* {shared_parent_q}/; \
-         rm -f {current_q}",
+         {blue_q} {green_q}; src=$(readlink -f {current_q}); mv \"$src\" {shared_q}; \
+         for s in -wal -shm -journal; do [ -e \"$src$s\" ] && mv \"$src$s\" {shared_q}$s; \
+         done; rm -f {current_q}",
         blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
         green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
         current_q = shell_quote(&current),
-        shared_parent_q = shell_quote(&shared_parent),
+        shared_q = shell_quote(&shared),
     );
     let occupied =
         format!("autumn deploy: refusing to move {in_release} aside: {superseded} already exists");
@@ -7547,11 +7552,26 @@ mod tests {
         // database, so the real-file recovery would be wrong here.
         assert!(
             op.shell
-                .contains("is a symlink to a SQLite database outside")
-                && op
-                    .shell
-                    .contains(r#"mv "$(readlink -f '\''/srv/autumn/myapp/current/app.db'\'')"*"#),
-            "the symlink recovery must move the link TARGET: {}",
+                .contains("is a symlink to a SQLite database outside"),
+            "the symlink case needs its own refusal: {}",
+            op.shell
+        );
+        // The target moves to the EXACT shared name. Moving it merely INTO the
+        // shared directory keeps a differently-named target's basename, and the
+        // next deploy then creates an empty database at the name it does expect.
+        assert!(
+            op.shell.contains(
+                r#"src=$(readlink -f '\''/srv/autumn/myapp/current/app.db'\''); mv "$src" '\''/srv/autumn/myapp/shared/data/app.db'\''"#
+            ),
+            "the symlink recovery must move the target to the exact shared path: {}",
+            op.shell
+        );
+        // Sidecars follow it, each to the matching shared name.
+        assert!(
+            op.shell.contains(
+                r#"do [ -e "$src$s" ] && mv "$src$s" '\''/srv/autumn/myapp/shared/data/app.db'\''$s"#
+            ),
+            "each sidecar must move to the matching shared name: {}",
             op.shell
         );
     }
