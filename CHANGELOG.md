@@ -109,7 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constraint over a pre-existing orphan would otherwise hide — including from a
   full-copy or exact-100% table, which keeps every row and so is the likeliest to
   still hold one. `--dry-run` prints the emptiness assertions too, as `DO` blocks
-  that abort, so the advertised SQL refuses exactly where the real run does. A foreign key declared on a partition rather than
+  that abort, so the advertised SQL refuses exactly where the real run does — as
+  do the foreign key checks, and the printed sequence now opens with the same
+  `SHARE ROW EXCLUSIVE` locks the run takes, without which a paste into a target
+  still accepting writes would let a row inserted after its `DELETE` survive. A foreign key declared on a partition rather than
   cloned onto it from its partitioned parent is likewise refused, rather than
   dropped from the walk and the integrity re-check as if it were a clone. The
   re-check honours each constraint's own NULL rule, so a partly-NULL composite

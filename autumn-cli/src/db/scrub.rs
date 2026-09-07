@@ -2462,6 +2462,12 @@ fn classify_and_apply(
             let purges = purge_statements(&facts.framework_tables, &sources.config);
             let phases = emptying_phases(&purges, deferred, sampling.as_ref());
             eprintln!("  BEGIN;");
+            // The same locks `execute` takes, before any destructive statement:
+            // without them a pasted run lets a concurrent insert land after the
+            // DELETE that was supposed to remove it.
+            for statement in lock_statements(plan, &purges, sampling.as_ref()) {
+                eprintln!("  {statement};");
+            }
             for (_, statement) in &phases.before {
                 eprintln!("  {statement};");
             }
@@ -2687,7 +2693,10 @@ fn report_sample_sql(url: &str, label: &str, plan: &sample::SamplePlan) -> Resul
         eprintln!("  {statement};");
     }
     for (constraint, statement) in plan.integrity_statements() {
-        eprintln!("  {statement}; -- verifies {constraint}");
+        eprintln!(
+            "  {}; -- verifies {constraint}",
+            integrity_assertion(&statement)
+        );
     }
     Ok(())
 }
@@ -3498,6 +3507,58 @@ fn emptying_phases<'a>(
     }
 }
 
+/// Every table the run locks, deduplicated and ordered, as `LOCK TABLE` SQL.
+///
+/// Shared with the dry run: an operator pasting the printed sequence into a
+/// target that still takes writes must exclude the same writers the command
+/// does, or a row inserted after that table's `DELETE` survives unsampled and
+/// unscrubbed — a difference between the advertised SQL and the real one that
+/// shows up as data, not as an error.
+fn lock_statements(
+    plan: &ScrubPlan,
+    purges: &[(String, String)],
+    sampling: Option<&sample::SamplePlan>,
+) -> Vec<String> {
+    let mut locked: Vec<&str> = plan
+        .tables
+        .iter()
+        .map(|t| t.table.as_str())
+        .chain(purges.iter().map(|(table, _)| table.as_str()))
+        // Every table the sample reads or empties, too: a row inserted into one
+        // after the walk selected from it would survive a run that reports the
+        // table subsetted.
+        .chain(
+            sampling
+                .into_iter()
+                .flat_map(sample::SamplePlan::locked_tables),
+        )
+        .collect();
+    locked.sort_unstable();
+    locked.dedup();
+    locked
+        .into_iter()
+        .map(|table| {
+            format!(
+                "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+                qualified_ident(table)
+            )
+        })
+        .collect()
+}
+
+/// The SQL that asserts a foreign key re-count found no orphans.
+///
+/// `execute` reads the count so it can report how many; the dry run prints this,
+/// because a bare `SELECT count(*)` in a pasted sequence returns a number and
+/// then commits anyway — exactly the run the command refuses.
+fn integrity_assertion(check: &str) -> String {
+    format!(
+        "DO $$ BEGIN IF ({check}) > 0 THEN \
+         RAISE EXCEPTION 'a foreign key this run checked does not resolve'; \
+         END IF; END $$"
+    )
+}
+
 /// The SQL that asserts a promised-empty table really is empty.
 ///
 /// `execute` runs the equivalent as a counted query so it can name the row
@@ -3686,28 +3747,8 @@ fn execute(
         // producer inserting into a purged job/sync/token table after that
         // `DELETE` took its snapshot would otherwise survive a run that reports
         // the table emptied.
-        let locked = plan
-            .tables
-            .iter()
-            .map(|t| t.table.as_str())
-            .chain(purges.iter().map(|(table, _)| table.as_str()))
-            // Every table the sample reads or empties, too: a row inserted into
-            // one after the walk selected from it would survive a run that
-            // reports the table subsetted.
-            .chain(
-                sampling
-                    .into_iter()
-                    .flat_map(sample::SamplePlan::locked_tables),
-            );
-        let mut locked: Vec<&str> = locked.collect();
-        locked.sort_unstable();
-        locked.dedup();
-        for table in locked {
-            sql_query(format!(
-                "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
-                qualified_ident(table)
-            ))
-            .execute(conn)?;
+        for statement in lock_statements(plan, purges, sampling) {
+            sql_query(statement).execute(conn)?;
         }
         // Purges run FIRST so a framework-owned table that references a
         // sampled one is already empty when the sample removes its parents —
