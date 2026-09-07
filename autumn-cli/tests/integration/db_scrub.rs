@@ -2208,9 +2208,11 @@ async fn the_printed_dry_run_walks_to_the_same_fixpoint_the_command_does() {
         "the printed transaction must pin the same session settings: {dry_err}"
     );
     assert!(
-        dry_err.contains(r#"\connect -reuse-previous=off "deep_printed""#),
+        dry_err.contains(r#"\connect -reuse-previous=off ""#)
+            && dry_err.contains("/deep_printed")
+            && !dry_err.contains("postgres:postgres@"),
         "and must move the session to this target's own endpoint, inheriting \
-         nothing from the previous one: {dry_err}"
+         nothing from the previous one and printing no password: {dry_err}"
     );
     let script = printed_transaction(&dry_err);
     clients[1]

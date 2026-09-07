@@ -3678,36 +3678,61 @@ fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> V
     tables
 }
 
-/// The `psql` meta-command that moves the session to one target, in full.
+/// The `psql` meta-command that moves the session to one target.
 ///
 /// A bare `\connect dbname` reuses the host, port and user of the existing
 /// connection, so on a fleet whose shards are the same database name on
 /// different servers it silently keeps running against the first one — the
-/// boundary would look like it switched and would not have. Every component is
-/// therefore passed positionally, with `-reuse-previous=off` so nothing is
-/// inherited, and `-` for a component the URL does not carry.
+/// boundary would look like it switched and would not have.
 ///
-/// The password is never emitted: `psql` prompts, or reads `.pgpass`.
+/// The whole connection string is therefore passed as a conninfo, rather than
+/// rebuilt from parts. Reconstruction is where this goes wrong: a query
+/// parameter overrides the authority it duplicates (`?host=` beats the URL's
+/// own host, as `pg::sanitize_db_url` exists to normalise), so an endpoint
+/// assembled from `Url::host_str` and friends can name a database the run never
+/// touches — and this string is the header on destructive SQL.
+///
+/// Only the password is removed. If it cannot be removed with certainty the
+/// line is not emitted at all: a comment naming the target is a lesser failure
+/// than a printed credential.
 fn psql_connect(url: &str) -> String {
-    let parsed = url::Url::parse(url).ok();
-    let component = |value: Option<String>| {
-        value
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| "-".to_owned(), |v| quote_psql_arg(&v))
-    };
-    let db = component(Some(parsed_db_name(url)).filter(|n| n != "<unknown>"));
-    let user = component(parsed.as_ref().map(|u| u.username().to_owned()));
-    let host = component(
-        parsed
-            .as_ref()
-            .and_then(|u| u.host_str().map(str::to_owned)),
-    );
-    let port = component(
-        parsed
-            .as_ref()
-            .and_then(|u| u.port().map(|p| p.to_string())),
-    );
-    format!("\\connect -reuse-previous=off {db} {user} {host} {port}")
+    password_free_conninfo(url).map_or_else(
+        || {
+            format!(
+                "-- connect to the {} target yourself before running the block below; \
+                 its connection string could not be printed without its password",
+                parsed_db_name(url)
+            )
+        },
+        |conninfo| {
+            format!(
+                "\\connect -reuse-previous=off {}",
+                quote_psql_arg(&conninfo)
+            )
+        },
+    )
+}
+
+/// `url` with any password removed, or `None` if that cannot be guaranteed.
+fn password_free_conninfo(url: &str) -> Option<String> {
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        // `set_password` returns Err only for a URL that cannot have one
+        // (`mailto:` and friends), which a connection string is not.
+        return parsed.set_password(None).ok().map(|()| parsed.into());
+    }
+    // Keyword form: `host=... dbname=... password=...`. Dropping a bare
+    // `password=` token is only sound while no value is quoted or escaped,
+    // because a quoted value may itself contain whitespace — so anything
+    // carrying a quote or a backslash is refused rather than guessed at.
+    if url.contains('\'') || url.contains('"') || url.contains('\\') {
+        return None;
+    }
+    Some(
+        url.split_whitespace()
+            .filter(|token| !token.starts_with("password="))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// One `psql` meta-command argument, double-quoted with backslash escapes —
@@ -4125,18 +4150,44 @@ mod tests {
         // shards share a database name on different servers would keep running
         // against the first one while looking like it had moved.
         let line = super::psql_connect("postgres://scrubby:hunter2@db1.internal:6543/app");
-        assert_eq!(
-            line,
-            r#"\connect -reuse-previous=off "app" "scrubby" "db1.internal" "6543""#
+        assert!(
+            line.starts_with(r#"\connect -reuse-previous=off ""#),
+            "the boundary must inherit nothing from the previous connection: {line}"
         );
         assert!(
             !line.contains("hunter2"),
             "the password must never reach the printed script: {line}"
         );
-        // Components the URL does not carry become `-`, which `psql` reads as
-        // "use the default" rather than "reuse the previous connection's".
-        let sparse = super::psql_connect("postgres:///app");
-        assert_eq!(sparse, r#"\connect -reuse-previous=off "app" - - -"#);
+        assert!(
+            line.contains("db1.internal") && line.contains("6543") && line.contains("app"),
+            "and the endpoint must survive: {line}"
+        );
+
+        // The whole string is passed through, not rebuilt from parts: a query
+        // parameter overrides the authority component it duplicates, so an
+        // endpoint reassembled from the URL's own host would name the wrong
+        // database on the header of destructive SQL.
+        let overridden = super::psql_connect("postgres://authority/app?host=queryhost&dbname=copy");
+        assert!(
+            overridden.contains("host=queryhost") && overridden.contains("dbname=copy"),
+            "an override must survive into the printed boundary: {overridden}"
+        );
+
+        // Keyword form carries no authority at all, so rebuilding produced
+        // nothing but defaults.
+        let keyword = super::psql_connect("host=db2.internal dbname=app password=hunter2");
+        assert!(
+            keyword.contains("db2.internal") && !keyword.contains("hunter2"),
+            "keyword form must survive without its password: {keyword}"
+        );
+
+        // A quoted keyword value cannot be split on whitespace with certainty,
+        // so nothing is printed rather than risking the credential.
+        let quoted = super::psql_connect("host=db2 password='two words' dbname=app");
+        assert!(
+            !quoted.starts_with("\\connect") && !quoted.contains("two words"),
+            "an unsplittable conninfo must degrade to a comment: {quoted}"
+        );
     }
 
     #[test]
