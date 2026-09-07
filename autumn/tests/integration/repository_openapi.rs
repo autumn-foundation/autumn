@@ -396,17 +396,44 @@ fn model_schema_honors_serde_rename_all_and_field_rename() {
     assert!(!required.contains(&"category"));
 }
 
+/// The write companions advertise RAW identifiers, not the model's serde names
+/// (issue #802) — the inverse of `model_schema_honors_serde_rename_all_and_field_rename`
+/// above, and deliberately so.
+///
+/// This test previously asserted the opposite, that `NewRenamedRow::schema()`
+/// was camelCased like the model. That was wrong about the struct it describes:
+/// the generated `New*` / `Update*` structs get `#[derive(Serialize,
+/// Deserialize)]` but NOT the model's container attributes, and their fields do
+/// not carry field-level `#[serde(rename)]` either — so serde decodes a POST
+/// body under the bare Rust identifiers. `form_for_derive.rs` proves it at
+/// runtime, round-tripping `title=…&author_name=…&word_count=…` into a `NewX`.
+///
+/// The mismatch was harmless while nothing consumed these schemas. Once
+/// `#[model]` registers them, a camelCased create schema makes every generated
+/// client's POST fail with a missing-field error, so the schema has to describe
+/// the struct that actually exists.
+///
+/// The read schema still honors renames, and correctly: the query struct DOES
+/// receive the container attributes.
 #[test]
-fn new_model_schema_honors_serde_renames() {
+fn new_model_schema_advertises_raw_identifiers_not_serde_renames() {
     use autumn_web::openapi::OpenApiSchema;
-    // NewRenamedRow drops the id; the rename rules still apply to the rest.
     let schema = NewRenamedRow::schema();
     let props = schema["properties"].as_object().expect("properties");
+
+    // What `NewRenamedRow` actually deserializes.
     assert!(
-        props.contains_key("wordCount"),
-        "camelCased on New: {schema}"
+        props.contains_key("word_count"),
+        "raw identifier on New: {schema}"
     );
-    assert!(props.contains_key("kind"), "field rename on New: {schema}");
+    assert!(
+        props.contains_key("category"),
+        "field rename NOT applied on New: {schema}"
+    );
+    // The model's serde spellings must not appear — they would be rejected.
+    assert!(!props.contains_key("wordCount"), "no camelCase: {schema}");
+    assert!(!props.contains_key("kind"), "no field rename: {schema}");
+
     assert!(!props.contains_key("id"), "New excludes id: {schema}");
 }
 

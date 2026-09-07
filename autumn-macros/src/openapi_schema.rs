@@ -55,10 +55,15 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 // entries match the serialized wire names — same
                 // helper/precedence `#[model]` and `FormModel` use.
                 let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
-                crate::schema::emit_schema_fn_body(
+                // Same rule as the `#[model]` read schema: a
+                // `skip_serializing_if` field reaches some responses, so the
+                // property stays, but it cannot be `required`.
+                crate::schema::emit_schema_fn_body_full(
                     &field_ref_refs,
                     false,
+                    &[],
                     rename_all_rule.as_deref(),
+                    &crate::schema::field_has_skip_serializing_if,
                 )
             }
             _ => {
