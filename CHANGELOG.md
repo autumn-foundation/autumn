@@ -52,6 +52,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **db:** `#[derivation]` maintains a **filtered or weighted** derived column on
+  a parent row (#1769). Declared on the child, below `#[model]`:
+  `#[derivation(Post, column = "published_comment_count", filter = published)]`,
+  or `#[derivation(Post, column = "visible_score", transform = sum(score),
+  filter = published && score > 0)]`. One filter declaration is lowered twice,
+  to a Rust predicate for the record paths and to a SQL predicate for the
+  set-based ones, so the two can never disagree; the grammar covers `bool`,
+  integer and `String` fields and their `Option` forms, with SQL NULL semantics.
+  Every generated repository mutation maintains it **inside the same transaction
+  as the row mutation** with atomic set-based SQL, including bulk paths,
+  soft delete, restore, `dependent` cascades, a re-parent (the old contribution
+  off the old parent, the new one onto the new) and a filter flip on an unchanged
+  parent. A `#[derivation]` is a superset of `counter_cache`, which is now its
+  unfiltered special case with byte-identical SQL. Each derivation is
+  content-addressed by a `definition_hash` over its lowered shape, so a changed
+  filter enqueues a resumable, checkpointed, idempotent backfill (`run_backfill`,
+  `BackfillOptions`) and a rename or reformat does not; the framework-owned
+  `_autumn_derivations` state table ships as a framework migration, applied
+  automatically when a derivation is registered. `GET /actuator/derivations`
+  (sensitive-gated) reports each derivation's hashes, backfill state, checkpoint
+  and current drift, and `recompute(conn, name)` repairs it. `CounterCacheSpec`
+  gains four doc-hidden plumbing fields (`contrib_of`, `contrib_sql`,
+  `filter_sql`, `derivation`); the only API-visible change is that the
+  doc-hidden `counter_cache_capture_fks`/`_many` now return
+  `(parent, contribution)` pairs rather than parent ids. See
+  `docs/guide/derivations.md`.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite

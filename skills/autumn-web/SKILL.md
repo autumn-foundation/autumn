@@ -745,6 +745,26 @@ paths are **not** yet maintained: a derived `delete_by_<field>` and
 `find_or_create_by_<field>` — `recompute` is the remedy. See
 `docs/guide/counter-cache.md`.
 
+**For a filtered or weighted count, use `#[derivation]`** on the child, below
+`#[model]` **(0.7.0, #1769)**: `#[derivation(Post, column =
+"published_comment_count", filter = published)]`, or `#[derivation(Post, column
+= "visible_score", transform = sum(score), filter = published && score > 0)]`.
+It is a superset of `counter_cache` (which is the unfiltered case) and rides the
+same mutation paths and same-transaction, atomic set-based SQL, including bulk
+paths, soft delete/restore, cascades, re-parenting and a filter flip on an
+unchanged parent. The filter grammar is `field`, `!field`, `field OP <int|bool|
+string literal>`, `field.is_some()`/`is_none()`, `a && b` and parentheses over
+`bool`/integer/`String` fields and their `Option` forms; each filter is lowered
+to both Rust and SQL, and string ordering comparisons and float literals are
+compile errors. Other keys: `fk`, `tenant`, `name`. The parent column is the
+app's migration (`BIGINT NOT NULL DEFAULT 0`); the `_autumn_derivations` state
+table ships as a framework migration and is applied automatically. Each
+derivation is content-addressed, so a changed filter enqueues a resumable,
+idempotent backfill at boot (`run_backfill`, `BackfillOptions`), and
+`GET /actuator/derivations` (sensitive-gated) reports hashes, backfill state,
+checkpoint and drift, with `recompute(conn, name)` as the repair. See
+`docs/guide/derivations.md`.
+
 Deleting a parent can cascade to its children in one transaction — declare
 `dependent(...)` on the parent's `#[repository]` instead of hand-writing the
 child cleanup **(0.6.0)**:

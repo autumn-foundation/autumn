@@ -1083,6 +1083,43 @@ pub use autumn_macros::story;
 ///     pub title: String,
 /// }
 /// ```
+///
+/// # Maintained derived columns
+///
+/// `#[belongs_to(Post, counter_cache)]` maintains `posts.comment_count` from
+/// this model's repository. `#[derivation]` is its filtered and weighted
+/// superset (#1769): it maintains a `count` or a `sum(<field>)` over the child
+/// rows a filter accepts, on a column of the parent.
+///
+/// ```rust,ignore
+/// use autumn_web::model;
+///
+/// #[model(table = "comments")]
+/// #[belongs_to(Post, fk = post_id)]
+/// #[derivation(Post, column = "published_comment_count", filter = published)]
+/// #[derivation(Post, column = "visible_score", transform = sum(score),
+///              filter = published && score > 0)]
+/// pub struct Comment {
+///     #[id]
+///     pub id: i64,
+///     pub post_id: i64,
+///     pub published: bool,
+///     pub score: i64,
+/// }
+/// ```
+///
+/// Write it **below** `#[model]`, which consumes it. Both columns are
+/// maintained by every generated repository mutation, inside the same
+/// transaction as the row mutation, with atomic set-based SQL. The filter is
+/// lowered to a Rust predicate and to a SQL predicate from one declaration, so
+/// the two cannot disagree; it accepts `bool`, integer and `String` fields and
+/// their `Option` forms.
+///
+/// The parent column is the application's migration (`BIGINT NOT NULL DEFAULT
+/// 0`). Each derivation is content-addressed, so a changed definition enqueues a
+/// resumable backfill at startup. See the [`derivation`] module for the
+/// registry, backfill and status API, `GET /actuator/derivations` for state and
+/// drift, and `docs/guide/derivations.md` for the guide.
 #[cfg(feature = "db")]
 pub use autumn_macros::model;
 /// Annotate an OAuth2/OIDC callback handler.
