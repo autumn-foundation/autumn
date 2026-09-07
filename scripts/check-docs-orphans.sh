@@ -2672,8 +2672,20 @@ def _prose_only(txt):
     for kind, seg in split_fences(txt):
         if kind != 'prose':
             out.append(' ' * len(seg))
-        else:
-            out.append(CODE_SPAN.sub(lambda m: ' ' * len(m.group(0)), seg))
+            continue
+        # A backtick inside a raw HTML TAG is attribute text, not a code
+        # delimiter — `<div title="`">` opens a tag, and the quoted backtick
+        # never delimits anything. Blanking between two of them swallowed a
+        # `display:none` opener sitting in between, so the hidden subtree went
+        # undetected and its path counted as visible.
+        tags = [(m.start(), m.end()) for m in ANY_TAG.finditer(seg)]
+
+        def _blank(m):
+            if any(a <= m.start() < b for a, b in tags):
+                return m.group(0)
+            return ' ' * len(m.group(0))
+
+        out.append(CODE_SPAN.sub(_blank, seg))
     return ''.join(out)
 
 
@@ -3036,7 +3048,20 @@ def edges_from(f):
         # above is where that measurement now lives.
         if markdown:
             raw = UNESCAPE.sub(r'\1', raw)
-        if not raw.endswith('.md'):
+        if raw and not raw.endswith('.md'):
+            # A destination naming a DIRECTORY resolves through its
+            # `README.md` — that is what the reader lands on, and
+            # `STABILITY.md` already links `[migration guide](docs/migrations/)`
+            # twice. Rejecting everything without a `.md` suffix discarded the
+            # hop, so a guide reachable only through a directory index was an
+            # orphan. `check-docs-links.sh` accepts the same destination, so
+            # this gate disagreeing with it was the defect.
+            #
+            # Appended rather than special-cased: a destination that names no
+            # directory simply produces a path nothing tracks, and the
+            # traversable test below rejects it exactly as before.
+            raw = posixpath.join(raw, 'README.md')
+        elif not raw:
             return
         # A destination that leaves the site cannot make a guide page
         # reachable, however much of a repo path it happens to spell.
@@ -6566,6 +6591,30 @@ self_test() {
     > "$c9lo/docs/guide/jobs.md"
   git -C "$c9lo" add -A && git -C "$c9lo" commit -qm hidden-sample-in-code-span
   check "a hidden element in a code span is a visible sample" pass "$c9lo"
+
+  # A destination naming a DIRECTORY resolves through its `README.md` — that is
+  # what the reader lands on. `STABILITY.md` already links
+  # `[migration guide](docs/migrations/)`, and the sibling link gate accepts
+  # it, so rejecting everything without a `.md` suffix made this gate disagree
+  # with the corpus it checks.
+  local c9lp="$tmp/c9lp"; make_corpus "$c9lp"
+  mkdir -p "$c9lp/docs/migrations"
+  printf '# App\n\n- [Jobs](docs/guide/jobs.md)\n- [Migrations](docs/migrations/)\n' \
+    > "$c9lp/README.md"
+  printf '# Migrations\n\n- [Mail](../guide/mail.md)\n' \
+    > "$c9lp/docs/migrations/README.md"
+  git -C "$c9lp" add -A && git -C "$c9lp" commit -qm directory-link-via-readme
+  check "a directory link routes through its README" pass "$c9lp"
+
+  # A backtick inside a raw HTML TAG is attribute text, not a code delimiter.
+  # Treating it as one blanked the span between two of them — including the
+  # `display:none` opener in the middle — so the hidden subtree went undetected
+  # and the invisible path inside it counted as visible.
+  local c9lq="$tmp/c9lq"; make_corpus "$c9lq"
+  printf '# Jobs\n\n<div title="`"><span style="display:none">docs/guide/mail.md</span><i title="`"></i></div>\n' \
+    > "$c9lq/docs/guide/jobs.md"
+  git -C "$c9lq" add -A && git -C "$c9lq" commit -qm backtick-in-raw-attribute
+  check "a backtick in a raw tag is not a code delimiter" fail "$c9lq"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
