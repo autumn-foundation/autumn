@@ -1006,6 +1006,13 @@ fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
     // digits, so its length is the digit count.
     let digits = format!("replace(replace({column},'-',''),'.','')");
     let conditions = [
+        // 0: actually stored as TEXT. `TEXT` affinity does NOT convert a BLOB,
+        // so `x'31392e3939'` keeps storage class blob while every string
+        // function below reads it as `19.99` and waves it through — and diesel's
+        // `FromSql<Text, Sqlite>` for `String` then refuses the blob before
+        // `Decimal` ever sees it. Same unloadable-row failure as conditions 1-5,
+        // one storage class further out.
+        format!("typeof({column}) = 'text'"),
         // 1-5: a plain decimal literal. Without the digit count and the sign
         // count, `''`, `'-'`, `'.'`, `'--1'` and `'-1-'` all pass — values a
         // raw INSERT, an import or a hand-written migration can produce, which
@@ -7887,6 +7894,27 @@ fn main() {
             "abc",
         ] {
             assert!(!accepts(&mut conn, value), "`{value}` must be rejected");
+        }
+
+        // Storage class, not just text shape. A BLOB whose BYTES spell a valid
+        // decimal is the one case `TEXT` affinity will NOT convert, so it keeps
+        // storage class blob and `FromSql<Text, Sqlite>` refuses it — an
+        // unloadable row unless the CHECK rejects it up front.
+        assert!(
+            diesel::sql_query("INSERT INTO t (price) VALUES (x'31392e3939')")
+                .execute(&mut conn)
+                .is_err(),
+            "a blob spelling `19.99` must be rejected: TEXT affinity does not convert it"
+        );
+        // Unquoted numeric literals ARE converted by TEXT affinity, so they are
+        // stored as text and load fine — the CHECK must not reject them.
+        for literal in ["19.99", "19", "-0.01"] {
+            assert!(
+                diesel::sql_query(format!("INSERT INTO t (price) VALUES ({literal})"))
+                    .execute(&mut conn)
+                    .is_ok(),
+                "`{literal}` is converted to TEXT by affinity and must be accepted"
+            );
         }
 
         // NULL is the column's own business, not the CHECK's.

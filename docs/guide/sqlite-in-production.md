@@ -536,9 +536,12 @@ which `REAL` would not.
 
 **Precision and scale are enforced by a `CHECK`.** The column is `TEXT`, so the
 migration carries a generated `CHECK` that holds the declared budget — at most
-`scale` fractional digits and `precision - scale` integer digits — and that the
-value is a plain decimal literal at all, so a hand-written row cannot satisfy the
-constraint and then fail to load. Postgres *rounds* a value to `scale`; SQLite
+`scale` fractional digits and `precision - scale` integer digits — that the
+value is a plain decimal literal at all, and that it is genuinely stored as
+`TEXT`, so a hand-written row cannot satisfy the constraint and then fail to
+load. (That last one matters because `TEXT` affinity converts an unquoted number
+but *not* a blob: `x'31392e3939'` would otherwise sit in the column spelling
+`19.99` while refusing to load.) Postgres *rounds* a value to `scale`; SQLite
 has no way to, so it rejects instead. Round before saving
 (`Decimal::round_dp`) if your input can carry more digits than the column
 declares.
