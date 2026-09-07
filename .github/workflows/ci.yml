@@ -1395,6 +1395,7 @@ jobs:
             config:: \
             migrate:: \
             counter_cache:: \
+            derivation:: \
             commentable:: \
             ledger:: \
             repository_commit_hooks:: \
@@ -1427,6 +1428,7 @@ jobs:
             --test sqlite_json_field_conversion \
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
+            --test sqlite_derivation \
             --test sqlite_dependent_destroy \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \

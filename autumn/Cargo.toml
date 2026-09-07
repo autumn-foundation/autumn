@@ -781,6 +781,21 @@ path = "tests/sqlite_upsert_isolation.rs"
 name = "sqlite_votable"
 path = "tests/sqlite_votable.rs"
 
+# SQLite proof for maintained derived read models (issue #1769). The Postgres
+# behaviour suite is Docker/server-gated and never compiles the `sqlite` arms a
+# derivation adds — the `IS NOT` spelling of NULL-safe inequality, the
+# positional `?` binds, the `BEGIN IMMEDIATE` each backfill batch takes and the
+# `CAST(updated_at AS TEXT)` status read against a TEXT column — so this is the
+# only place they are type-checked and run. Filtered count and sum on insert,
+# delete, reparent, filter flip, resumable backfill, status and drift, against
+# an in-memory SQLite pool (no Docker). Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_derivation`.
+[[test]]
+name = "sqlite_derivation"
+path = "tests/sqlite_derivation.rs"
+
 # SQLite version-history end-to-end proof (issue #1996). Drives a
 # `versioned = true` repository against an in-memory SQLite pool: a create +
 # update + delete each append a `_autumn_version_history` row, `version_history()`
