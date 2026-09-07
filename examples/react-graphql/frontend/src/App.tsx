@@ -10,6 +10,23 @@ export function App() {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // Notes with a mutation in flight. Their Pin/Delete buttons are disabled
+  // meanwhile, so two toggles can never be outstanding at once: the server
+  // serialises flips under a row lock, but two responses on separate
+  // connections may still settle out of order, and the UI would apply the
+  // stale one last.
+  const [pending, setPending] = useState<Set<string>>(() => new Set());
+
+  function withPending<T>(id: string, work: () => Promise<T>): Promise<T> {
+    setPending((current) => new Set(current).add(id));
+    return work().finally(() =>
+      setPending((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      }),
+    );
+  }
 
   const refresh = useCallback(async () => {
     try {
@@ -43,8 +60,9 @@ export function App() {
   }
 
   async function onTogglePinned(id: string) {
+    if (pending.has(id)) return;
     try {
-      const updated = await togglePinned(id);
+      const updated = await withPending(id, () => togglePinned(id));
       setNotes((current) => current.map((n) => (n.id === id ? updated : n)));
       setStatus({ kind: "ready" });
     } catch (err) {
@@ -53,10 +71,13 @@ export function App() {
   }
 
   async function onDelete(id: string) {
+    if (pending.has(id)) return;
     try {
-      if (await deleteNote(id)) {
-        setNotes((current) => current.filter((n) => n.id !== id));
-      }
+      // `false` means the row was already gone (another tab, a REST client):
+      // either way it is absent now, so drop it locally rather than leave a
+      // ghost that can never be removed.
+      await withPending(id, () => deleteNote(id));
+      setNotes((current) => current.filter((n) => n.id !== id));
       // A success clears any alert left by an earlier failed action (e.g.
       // "note is pinned" from a refused delete that has since been unpinned).
       setStatus({ kind: "ready" });
@@ -128,11 +149,18 @@ export function App() {
             {pinned.length > 0 && `, ${pinned.length} pinned`}
           </p>
           {pinned.length > 0 && (
-            <NoteList heading="Pinned" notes={pinned} onTogglePinned={onTogglePinned} onDelete={onDelete} />
+            <NoteList
+              heading="Pinned"
+              notes={pinned}
+              pending={pending}
+              onTogglePinned={onTogglePinned}
+              onDelete={onDelete}
+            />
           )}
           <NoteList
             heading={pinned.length > 0 ? "Everything else" : "All notes"}
             notes={unpinned}
+            pending={pending}
             onTogglePinned={onTogglePinned}
             onDelete={onDelete}
           />
@@ -158,11 +186,12 @@ export function App() {
 interface NoteListProps {
   heading: string;
   notes: Note[];
+  pending: Set<string>;
   onTogglePinned: (id: string) => void;
   onDelete: (id: string) => void;
 }
 
-function NoteList({ heading, notes, onTogglePinned, onDelete }: NoteListProps) {
+function NoteList({ heading, notes, pending, onTogglePinned, onDelete }: NoteListProps) {
   if (notes.length === 0) return null;
   return (
     <section>
@@ -176,10 +205,19 @@ function NoteList({ heading, notes, onTogglePinned, onDelete }: NoteListProps) {
             </div>
             {note.body !== "" && <p className="note-body">{note.body}</p>}
             <div className="note-actions">
-              <button type="button" onClick={() => onTogglePinned(note.id)}>
+              <button
+                type="button"
+                disabled={pending.has(note.id)}
+                onClick={() => onTogglePinned(note.id)}
+              >
                 {note.pinned ? "Unpin" : "Pin"}
               </button>
-              <button type="button" className="danger" onClick={() => onDelete(note.id)}>
+              <button
+                type="button"
+                className="danger"
+                disabled={pending.has(note.id)}
+                onClick={() => onDelete(note.id)}
+              >
                 Delete
               </button>
             </div>
