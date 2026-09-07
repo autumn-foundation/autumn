@@ -1699,6 +1699,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two new `autumn-cli/tests/integration/repo_hygiene.rs` tests guard both
   halves of the wiring going forward. [no-plugin]
 
+### Fixed
+
+- **🧭 Wayfinder: signup/login error path in `examples/saas` and
+  `examples/teams` (error-path-inventory: adjacent/persists/recoverable/data-preserved,
+  broken failure modes 5 → 0 across both apps):** a failed login on both
+  example apps `Err(...)`'d straight to the framework's generic full-page
+  `ErrorPageFilter` error screen instead of re-rendering the login form the
+  way a rejected signup already did in the same file — throwing the user off
+  the login page entirely and losing the email they had typed, on the one
+  page every unauthenticated session must pass through. `examples/saas`
+  signup separately joined every password-policy failure message with
+  `"\n"` into a single `<p>`; HTML collapses that to one space, so two or
+  more failures (e.g. "too short" and "too similar to your email") rendered
+  as one run-on sentence instead of the itemized list issue #1345.6 asked
+  for, and the typed email was dropped on every re-render regardless.
+  Fix: both apps now carry a `login_page(email, error)` (teams also threads
+  `next`) mirroring the existing `signup_page` convention, so every realistic
+  signup/login validation failure — wrong credentials, an invalid email, an
+  over-long password, a rejected policy — re-renders its own form at HTTP 200
+  with the typed email (and, on teams, the `?next=` redirect) preserved and
+  the error(s) shown inline via `role="alert"`; `signup_page`'s error param
+  changed from one joined string to a `<ul>` of `<li>` messages. Two
+  known-corrupt-state branches in `teams` login (a user with zero
+  memberships, an unparseable stored role) are unreachable via either app's
+  own signup flow and are left on the generic error page. Baseline and
+  after-fix are both captured as new Docker-testcontainer integration tests:
+  `examples/saas/tests/integration_test.rs`'s
+  `signup_lists_every_password_policy_failure_and_keeps_the_typed_email` and
+  updated `signup_rejects_weak_password`, and
+  `examples/teams/tests/integration_test.rs`'s
+  `login_with_wrong_password_stays_on_the_form`.
+
 ### Changed
 
 - **ci: the Docker/testcontainer sweep runs as its own `Test (Docker)` job

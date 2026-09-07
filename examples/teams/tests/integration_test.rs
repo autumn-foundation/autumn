@@ -91,15 +91,55 @@ async fn protected_route_redirects_to_login_when_unauthenticated() {
 
 // ── Full flow (requires Docker) ──────────────────────────────────────────────
 
+/// Split a `.sql` migration file into individual statements.
+///
+/// `execute_sql` runs each call through Diesel's extended-query (prepared
+/// statement) protocol, which Postgres refuses outright for a multi-statement
+/// string ("cannot insert multiple commands into a prepared statement") —
+/// `execute_sql`'s own doc example is a single `CREATE TABLE`, and
+/// `examples/saas`'s equivalent test schema calls it once per table for
+/// exactly this reason. `up.sql` has to run as one `execute_sql` call per
+/// statement instead. Comment lines are stripped before splitting on `;`:
+/// two of them contain a literal `;` in prose (e.g. "...typed FK; application
+/// code...", "`pending`; accepting..."), which a naive split would otherwise
+/// treat as a statement boundary.
+fn schema_statements(sql: &str) -> Vec<String> {
+    let without_comments: String = sql
+        .lines()
+        .map(|line| line.split("--").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    without_comments
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Create the schema and return a CSRF-disabled, DB-backed client. `mail_dir`
 /// captures every invite email as an `.eml` file (AC4's "delivered to the dev
 /// mailbox").
+///
+/// `TestDb::shared()` is one process-wide database (a `OnceCell`-cached
+/// testcontainer + pool, per `autumn_web::test::TestDb`), not a fresh one per
+/// test, and `up.sql`'s plain `CREATE TABLE` (no `IF NOT EXISTS` — unlike
+/// `execute_sql`'s own documented idempotent-SQL convention) is meant to run
+/// once per database. Running it again here for every test — this module's
+/// documented `--test-threads=1` (serial) contract makes a plain flag safe —
+/// would panic the second test onward with `relation "users" already exists`
+/// (Codex finding on this PR's `--test-threads=1` fix).
+static SCHEMA_READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 async fn db_client(mail_dir: &std::path::Path) -> TestClient {
     let db = TestDb::shared().await;
-    db.execute_sql(include_str!(
-        "../migrations/00000000000000_create_teams/up.sql"
-    ))
-    .await;
+    if SCHEMA_READY.get().is_none() {
+        for statement in schema_statements(include_str!(
+            "../migrations/00000000000000_create_teams/up.sql"
+        )) {
+            db.execute_sql(&statement).await;
+        }
+        let _ = SCHEMA_READY.set(());
+    }
     db.execute_sql("TRUNCATE invitations, memberships, organizations, users RESTART IDENTITY")
         .await;
 
@@ -183,6 +223,74 @@ async fn signup_creates_organization_with_owner_membership() {
         .assert_ok()
         .assert_body_contains("owner@acme.test")
         .assert_body_contains("owner");
+}
+
+/// A failed login used to `Err(...)` straight to the framework's generic
+/// full-page error screen (a raw 401), throwing the user off the login page
+/// entirely and losing both the typed email and the `?next=` destination.
+/// It now stays on the login page (HTTP 200) with the email re-filled, the
+/// `next` redirect preserved as a hidden field, and the error shown inline
+/// (Wayfinder finding, error-path inventory on the signup/login flow).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn login_with_wrong_password_stays_on_the_form() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    signup(&client, "owner@acme.test").await;
+    client.log_out();
+
+    let resp = client
+        .post("/login?next=%2Fmembers")
+        .form("email=owner@acme.test&password=wrong-password&next=/members")
+        .send()
+        .await;
+    resp.assert_ok();
+    let body = resp.text();
+    assert!(
+        body.contains("Invalid email or password"),
+        "expected the credentials error shown inline on the login form, got: {body}"
+    );
+    assert!(
+        body.contains(r#"value="owner@acme.test""#),
+        "expected the typed email to survive the failed login, got: {body}"
+    );
+    assert!(
+        body.contains(r#"name="next" value="/members""#),
+        "expected the next-redirect destination to survive the failed login, got: {body}"
+    );
+}
+
+/// A successful login must bound an oversized `next` the same way the GET
+/// and failed-POST renders already do. Before this fix, only the login-page
+/// renders were bounded — the success path's redirect still used the raw,
+/// unbounded `form.next`, so an attacker-sized `next` sailed straight into
+/// the `Location` header on the one path that was never checked (Codex
+/// finding on this PR).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn login_bounds_an_oversized_next_on_success_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+    signup(&client, "bounded@acme.test").await;
+    client.log_out();
+
+    let oversized_next = format!("/members?{}", "a".repeat(3000));
+    let resp = client
+        .post("/login")
+        .form(&format!(
+            "email=bounded@acme.test&password=Tr0ubad0ur-Xy7-correct-horse&next={oversized_next}"
+        ))
+        .send()
+        .await;
+    resp.assert_status(303);
+    let location = resp
+        .header("location")
+        .expect("redirect has a Location header");
+    assert!(
+        location.len() <= 2048,
+        "expected the redirect target bounded to MAX_NEXT_LEN (2048), got {} chars",
+        location.len()
+    );
 }
 
 /// AC4 + AC5(a) + success metric: inviting sends a real email (captured as an
@@ -1107,4 +1215,45 @@ async fn removed_member_loses_access_immediately_despite_cached_session() {
         .send()
         .await
         .assert_status(401);
+}
+
+#[cfg(test)]
+mod schema_statements_tests {
+    use super::schema_statements;
+
+    /// Every statement in the real migration parses as non-empty SQL with no
+    /// leftover comment text, and none contains a stray `--` (which would
+    /// mean a comment got merged into a statement instead of stripped) — a
+    /// regression test for the "cannot insert multiple commands into a
+    /// prepared statement" failure this parsing exists to avoid.
+    #[test]
+    fn splits_the_real_migration_into_individual_statements() {
+        let statements = schema_statements(include_str!(
+            "../migrations/00000000000000_create_teams/up.sql"
+        ));
+        assert_eq!(statements.len(), 9, "statements: {statements:#?}");
+        for statement in &statements {
+            assert!(!statement.is_empty());
+            assert!(
+                !statement.contains("--"),
+                "comment leaked into a statement: {statement}"
+            );
+        }
+        assert!(statements[0].starts_with("CREATE TABLE users"));
+        assert!(
+            statements
+                .last()
+                .unwrap()
+                .starts_with("CREATE UNIQUE INDEX")
+        );
+    }
+
+    /// A `;` inside a `--` comment must not be treated as a statement
+    /// boundary (the actual bug this function was written to avoid).
+    #[test]
+    fn semicolon_inside_a_comment_is_not_a_statement_boundary() {
+        let sql = "-- a comment; with a semicolon\nCREATE TABLE t (id INT);";
+        let statements = schema_statements(sql);
+        assert_eq!(statements, vec!["CREATE TABLE t (id INT)".to_owned()]);
+    }
 }
