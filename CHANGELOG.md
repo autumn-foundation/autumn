@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **🧭 Wayfinder: `examples/invoice`'s on-screen detail page is now a real
   HTML document (a11y `html-has-lang`/`bypass` Serious 2→0,
-  `landmark-one-main` Moderate 1→0):** `autumn check --a11y`, run against the
+  `landmark-one-main` Moderate 1→0) [no-plugin]:** `autumn check --a11y`, run against the
   live `/invoices/{id}` route (`supported`-tier, Chromium-smoked by
   `tests/system/smoke.rs`), found the on-screen page was a bare Maud
   fragment with no `<!DOCTYPE>`, `<html>`, `<head>`, or `<main>` — `Invoice`'s
