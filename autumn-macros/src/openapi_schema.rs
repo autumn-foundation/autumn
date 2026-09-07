@@ -9,7 +9,7 @@
 //! `{"type":"object","title":"X"}` placeholder.
 //!
 //! For structs this mirrors the schema `#[model]` already generates
-//! (`crate::schema::emit_schema_fn_body`): each field becomes a JSON-schema
+//! (`crate::schema::emit_schema_fn_body_full`): each field becomes a JSON-schema
 //! property and every non-`Option` field is `required`. For enums it emits the
 //! closed-set form (`{"type":"string","enum":[…]}`) that serde's default
 //! externally-tagged representation produces for unit variants — the shape a
@@ -45,7 +45,7 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
     let schema_body = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(named) => {
-                // `emit_schema_fn_body` expects `&[&&Field]` (it was written
+                // The emitters expect `&[&&Field]` (they were written
                 // against the `Vec<&&Field>` the model macro collects); build
                 // that shape here.
                 let field_refs: Vec<&syn::Field> = named.named.iter().collect();

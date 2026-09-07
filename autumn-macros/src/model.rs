@@ -7455,7 +7455,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     // Compute schema bodies for OpenApiSchema impls.
-    // all_fields is Vec<&Field>; emit_schema_fn_body expects &[&&Field].
+    // all_fields is Vec<&Field>; the schema emitters expect &[&&Field].
     // Thread the container `#[serde(rename_all)]` rule so the advertised schema
     // property names match the wire names the (de)serialized struct uses.
     let schema_rename_all_rule = serde_rename_all_serialize_rule(outer_attrs);

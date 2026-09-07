@@ -603,33 +603,10 @@ fn scalar_json_schema(
 
 /// Emit the body of `OpenApiSchema::schema()` for a list of fields.
 ///
-/// `all_optional` is `true` for `UpdateX` structs where every field is
-/// conceptually optional (backed by `Patch<T>`).
-pub fn emit_schema_fn_body(
-    fields: &[&&Field],
-    all_optional: bool,
-    rename_all_rule: Option<&str>,
-) -> TokenStream {
-    emit_schema_fn_body_ext(fields, all_optional, &[], rename_all_rule)
-}
-
-pub fn emit_schema_fn_body_ext(
-    fields: &[&&Field],
-    all_optional: bool,
-    extra_required: &[&&Field],
-    rename_all_rule: Option<&str>,
-) -> TokenStream {
-    emit_schema_fn_body_full(
-        fields,
-        all_optional,
-        extra_required,
-        rename_all_rule,
-        &|_| false,
-    )
-}
-
-/// As [`emit_schema_fn_body_ext`], plus `treat_as_optional`: a predicate naming
-/// fields that must NOT be `required` even though their type is not `Option<T>`.
+/// `all_optional` is `true` for `Update*` structs where every field is
+/// conceptually optional (backed by `Patch<T>`); `extra_required` names fields
+/// to force into the `required` set; and `treat_as_optional` names fields that
+/// must NOT be `required` even though their type is not `Option<T>`.
 ///
 /// Requiredness has to follow what the generated `Deserialize` accepts, not what
 /// the Rust type looks like. `#[model]` puts `#[serde(default)]` on a
