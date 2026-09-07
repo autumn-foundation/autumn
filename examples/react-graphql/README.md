@@ -319,6 +319,24 @@ declared routes flip to `Gated` with the label as their middleware in
 with `InMemoryApiTokenStore`. (A global `AppBuilder::layer` guards
 everything; `guard` is for guarding just this mount.)
 
+One more line for a bearer-only mount: under `prod` the framework's CSRF
+layer is on and classifies requests by method and path only, so a `POST
+/graphql` carrying a valid bearer token — and no CSRF cookie or header,
+because a non-browser client has neither — is still a `403` before the guard
+runs. CSRF is a defence against *ambient* credentials (cookies), which a
+bearer token is not, so exempt the mount:
+
+```toml
+[security.csrf]
+exempt_paths = ["/graphql"]
+```
+
+Do that only when the mount is guarded by something non-ambient; a
+session-authenticated mount must keep CSRF and send the token as this
+example's client does. (A browser client of a bearer-guarded mount that
+also has the shell's `<meta name="csrf-token">` can simply keep sending the
+header instead.)
+
 ## Tests
 
 ```bash
