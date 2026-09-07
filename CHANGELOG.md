@@ -70,9 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter enqueues a resumable, checkpointed, idempotent backfill (`run_backfill`,
   `BackfillOptions`) and a rename or reformat does not; the framework-owned
   `_autumn_derivations` state table ships as a framework migration, applied
-  automatically when a derivation is registered. `GET /actuator/derivations`
-  (sensitive-gated) reports each derivation's hashes, backfill state, checkpoint
-  and current drift, and `recompute(conn, name)` repairs it. `CounterCacheSpec`
+  automatically when a derivation is registered (on every shard primary too).
+  Each batch locks its state row, so replicas take turns on one sweep.
+  `GET /actuator/derivations` (sensitive-gated) reports each derivation's
+  hashes, backfill state, checkpoint and current drift (capped at
+  `DRIFT_SCAN_LIMIT`, with a per-derivation `drift_error` and an `unregistered`
+  state for a leftover row), and `recompute(conn, name)` repairs it. Beyond
+  `column`, `transform` and `filter`, the attribute takes `fk`, `parent_table`,
+  `tenant` and `name`; a duplicate parent column or derivation name stops the
+  boot before it opens a connection. `CounterCacheSpec`
   gains four plumbing fields `#[model]` fills in (`contrib_of`, `contrib_sql`,
   `filter_sql`, `derivation`), so a hand-written spec literal needs four more
   lines; it is framework plumbing and not constructed by hand. The one other

@@ -762,9 +762,12 @@ parent that overrides its table; the parent pk is always `id`), `tenant`,
 app's migration (`BIGINT NOT NULL DEFAULT 0`); the `_autumn_derivations` state
 table ships as a framework migration and is applied automatically. Each
 derivation is content-addressed, so a changed filter enqueues a resumable,
-idempotent backfill at boot (`run_backfill`, `BackfillOptions`), and
-`GET /actuator/derivations` (sensitive-gated) reports hashes, backfill state,
-checkpoint and drift, with `recompute(conn, name)` as the repair. See
+idempotent backfill at boot (`run_backfill`, `BackfillOptions`; each batch locks
+its state row, so replicas take turns), and `GET /actuator/derivations`
+(sensitive-gated) reports hashes, backfill state, checkpoint and drift (capped
+at `DRIFT_SCAN_LIMIT`, `drift_error` per derivation, `unregistered` for a
+leftover state row), with `recompute(conn, name)` as the repair. A duplicate
+parent column or derivation name stops the boot. See
 `docs/guide/derivations.md`.
 
 Deleting a parent can cascade to its children in one transaction — declare
