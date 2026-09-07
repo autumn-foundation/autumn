@@ -4003,8 +4003,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   audit trail are unchanged (an already-deleted or nonexistent id is still a
   silent no-op, still counted as "applied"). Measured against a 3,000-row
   fixture (plus ~270k assignment and ~4.5k override rows) with a 615-id bulk
-  action: delete-CTE statement calls 615 → 1, buffers 17,303 → 14,246
-  (-17.7%). See
+  action: delete-CTE statement calls 615 → 1, buffers 17,287 → 14,247
+  (-17.6%). See
   `docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/`.
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at

@@ -47,9 +47,10 @@ UI actually manages) — a plausible size for a long-lived app that never
 prunes concluded/archived experiments. 35% NULL `description`, state
 skewed toward `concluded` (50%) and `archived` (25%) over `running` (15%)
 and `draft` (10%) — the long-tail shape of an app that ships new
-experiments continuously but rarely deletes old ones — `winner` set on 70%
-of concluded rows and NULL elsewhere, and `exclusion_group` NULL for 60% of
-rows, else one of 15 group names (cardinality skew).
+experiments continuously but rarely deletes old ones — `winner` set on
+~71.4% of concluded rows (measured and printed by the harness itself, not
+assumed) and NULL elsewhere, and `exclusion_group` NULL for 60% of rows,
+else one of 15 group names (cardinality skew).
 
 Each experiment carries a variable number of sticky assignments
 (`autumn_experiment_assignments`, 10–170 rows per experiment depending on
@@ -118,13 +119,17 @@ WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = ANY($1) RETURNING na
 Every id-scoped delete CTE, its cascading assignment/override deletes, the
 audit `INSERT` they trigger, and the loop's own `pool.get()` call collapse
 into one round trip carrying one bound `bigint[]` array instead of 615
-separately-prepared, separately-executed statements. The diagnostic
-`EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` in both dumps shows the
-identical per-row plan shape (index scan on `autumn_experiments_pkey`,
-bitmap-index-scan-driven cascade deletes on both child tables, CTE-scan-
-driven audit insert, the `autumn_experiment_change_notify` trigger firing
-once per deleted row) — this is a round-trip-count change, not a
-plan-shape change.
+separately-prepared, separately-executed statements. Both dumps end with
+two diagnostic `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` runs, each
+rolled back: the pre-fix single-id shape (`id = 2`) and — so the "same plan
+either side" claim rests on the statement `execute_action` actually issues
+post-fix, not just on analogy with the single-id case — the real post-fix
+batched shape (`id = ANY(ARRAY[2,3,4,6,7])`, a representative array of
+surviving ids). Both show the identical per-row plan (index scan on
+`autumn_experiments_pkey`, bitmap-index-scan-driven cascade deletes on both
+child tables, CTE-scan-driven audit insert, the
+`autumn_experiment_change_notify` trigger firing once per deleted row) —
+this is a round-trip-count change, not a plan-shape change.
 
 ## 💡 Hypothesis
 
@@ -176,13 +181,13 @@ reset before the run. Full statement dumps in `baseline/output.txt`
 | | before | after |
 |---|---:|---:|
 | delete CTE statement calls | 615 | **1** |
-| delete CTE statement buffers | 17,303 | **14,246** |
+| delete CTE statement buffers | 17,287 | **14,247** |
 | ids submitted (for reference) | 615 | 615 |
 
 Statement count drops from **one per id to one per bulk action** — the
 admissible-on-its-own N+1 floor ("statement count per request drops from
 O(n) to O(1)... needs no other justification"). Buffers touched also drop
-**17.7%** (17,303 → 14,246): every one of the 615 per-id statements paid
+**17.6%** (17,287 → 14,247): every one of the 615 per-id statements paid
 its own planning/CTE-setup overhead, its own bitmap-index-scan setup on
 both cascading child tables, and, for the 45 pre-deleted + 15 nonexistent
 ids, a wasted point-lookup-that-finds-nothing; batching removes 614 of

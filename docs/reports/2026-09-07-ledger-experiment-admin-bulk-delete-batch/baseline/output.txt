@@ -1,87 +1,158 @@
    Compiling autumn-admin-plugin v0.7.0 (/home/user/autumn/autumn-admin-plugin)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.46s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.80s
      Running tests/experiment_admin_bulk_delete_batch_profile.rs (target/debug/deps/experiment_admin_bulk_delete_batch_profile-9dd6fd1977c23e5d)
 
 running 1 test
 test experiment_admin_bulk_delete_batch_profile ... 
+-- fixture: 1500 concluded rows (50% of 3000 expected), 1071 with a winner (71.4%) --
+
 -- bulk-delete selection: 615 ids (555 exist, 45 pre-deleted, 15 nonexistent) --
 
 === pg_stat_statements: bulk delete 600 ids ===
-calls=615    buffers=17303    WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = $1 RETURNING name ), _del_assignments AS ( DELETE FROM autumn_experiment_assignments WHERE experiment IN (SELECT name FROM deleted) ), _del_overrides AS ( DELETE FROM autumn_experiment_overrides WHERE experiment IN (SELECT name FROM deleted) ), _audit AS ( INSERT INTO autumn_experiment_changes (experiment, mutation, actor) SELECT name, $2, $3 FROM deleted ) SELECT COUNT(*) AS count FROM deleted
--- delete CTE statement: calls=615 buffers=17303 --
+calls=615    buffers=17287    WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = $1 RETURNING name ), _del_assignments AS ( DELETE FROM autumn_experiment_assignments WHERE experiment IN (SELECT name FROM deleted) ), _del_overrides AS ( DELETE FROM autumn_experiment_overrides WHERE experiment IN (SELECT name FROM deleted) ), _audit AS ( INSERT INTO autumn_experiment_changes (experiment, mutation, actor) SELECT name, $2, $3 FROM deleted ) SELECT COUNT(*) AS count FROM deleted
+-- delete CTE statement: calls=615 buffers=17287 --
 
--- statement-count claim: 615 ids submitted, delete CTE calls=615 buffers=17303 --
+-- statement-count claim: 615 ids submitted, delete CTE calls=615 buffers=17287 --
 
 === deleted-audit names dump (555 names, sorted) ===
 exp_1000,exp_1005,exp_1010,exp_1015,exp_1020,exp_1025,exp_1030,exp_1035,exp_1040,exp_1045,exp_1050,exp_1055,exp_1060,exp_1065,exp_1070,exp_1075,exp_1080,exp_1085,exp_1090,exp_1095,exp_1100,exp_1105,exp_1110,exp_1115,exp_1120,exp_1125,exp_1130,exp_1135,exp_1140,exp_1145,exp_1150,exp_1155,exp_1160,exp_1165,exp_1170,exp_1175,exp_1180,exp_1185,exp_1190,exp_1195,exp_1200,exp_1205,exp_1210,exp_1215,exp_1220,exp_1225,exp_1230,exp_1235,exp_1240,exp_1245,exp_1250,exp_1255,exp_1260,exp_1265,exp_1270,exp_1275,exp_1280,exp_1285,exp_1290,exp_1295,exp_1300,exp_1305,exp_1310,exp_1315,exp_1320,exp_1325,exp_1330,exp_1335,exp_1340,exp_1345,exp_1350,exp_1355,exp_1360,exp_1365,exp_1370,exp_1375,exp_1380,exp_1385,exp_1390,exp_1395,exp_1400,exp_1405,exp_1410,exp_1415,exp_1420,exp_1425,exp_1430,exp_1435,exp_1440,exp_1445,exp_1450,exp_1455,exp_1460,exp_1465,exp_1470,exp_1475,exp_1480,exp_1485,exp_1490,exp_1495,exp_1500,exp_1505,exp_1510,exp_1515,exp_1520,exp_1525,exp_1530,exp_1535,exp_1540,exp_1545,exp_1550,exp_1555,exp_1560,exp_1565,exp_1570,exp_1575,exp_1580,exp_1585,exp_1590,exp_1595,exp_1600,exp_1605,exp_1610,exp_1615,exp_1620,exp_1625,exp_1630,exp_1635,exp_1640,exp_1645,exp_1650,exp_1655,exp_1660,exp_1665,exp_1670,exp_1675,exp_1680,exp_1685,exp_1690,exp_1695,exp_1700,exp_1705,exp_1710,exp_1715,exp_1720,exp_1725,exp_1730,exp_1735,exp_1740,exp_1745,exp_1750,exp_1755,exp_1760,exp_1765,exp_1770,exp_1775,exp_1780,exp_1785,exp_1790,exp_1795,exp_1800,exp_1805,exp_1810,exp_1815,exp_1820,exp_1825,exp_1830,exp_1835,exp_1840,exp_1845,exp_1850,exp_1855,exp_1860,exp_1865,exp_1870,exp_1875,exp_1880,exp_1885,exp_1890,exp_1895,exp_1900,exp_1905,exp_1910,exp_1915,exp_1920,exp_1925,exp_1930,exp_1935,exp_1940,exp_1945,exp_1950,exp_1955,exp_1960,exp_1965,exp_1970,exp_1975,exp_1980,exp_1985,exp_1990,exp_1995,exp_2000,exp_2005,exp_2010,exp_2015,exp_2020,exp_2025,exp_2030,exp_2035,exp_2040,exp_2045,exp_2050,exp_2055,exp_2060,exp_2065,exp_2070,exp_2075,exp_2080,exp_2085,exp_2090,exp_2095,exp_2100,exp_2105,exp_2110,exp_2115,exp_2120,exp_2125,exp_2130,exp_2135,exp_2140,exp_2145,exp_2150,exp_2155,exp_2160,exp_2165,exp_2170,exp_2175,exp_2180,exp_2185,exp_2190,exp_2195,exp_2200,exp_2205,exp_2210,exp_2215,exp_2220,exp_2225,exp_2230,exp_2235,exp_2240,exp_2245,exp_2250,exp_2255,exp_2260,exp_2265,exp_2270,exp_2275,exp_2280,exp_2285,exp_2290,exp_2295,exp_230,exp_2300,exp_2305,exp_2310,exp_2315,exp_2320,exp_2325,exp_2330,exp_2335,exp_2340,exp_2345,exp_235,exp_2350,exp_2355,exp_2360,exp_2365,exp_2370,exp_2375,exp_2380,exp_2385,exp_2390,exp_2395,exp_240,exp_2400,exp_2405,exp_2410,exp_2415,exp_2420,exp_2425,exp_2430,exp_2435,exp_2440,exp_2445,exp_245,exp_2450,exp_2455,exp_2460,exp_2465,exp_2470,exp_2475,exp_2480,exp_2485,exp_2490,exp_2495,exp_250,exp_2500,exp_2505,exp_2510,exp_2515,exp_2520,exp_2525,exp_2530,exp_2535,exp_2540,exp_2545,exp_255,exp_2550,exp_2555,exp_2560,exp_2565,exp_2570,exp_2575,exp_2580,exp_2585,exp_2590,exp_2595,exp_260,exp_2600,exp_2605,exp_2610,exp_2615,exp_2620,exp_2625,exp_2630,exp_2635,exp_2640,exp_2645,exp_265,exp_2650,exp_2655,exp_2660,exp_2665,exp_2670,exp_2675,exp_2680,exp_2685,exp_2690,exp_2695,exp_270,exp_2700,exp_2705,exp_2710,exp_2715,exp_2720,exp_2725,exp_2730,exp_2735,exp_2740,exp_2745,exp_275,exp_2750,exp_2755,exp_2760,exp_2765,exp_2770,exp_2775,exp_2780,exp_2785,exp_2790,exp_2795,exp_280,exp_2800,exp_2805,exp_2810,exp_2815,exp_2820,exp_2825,exp_2830,exp_2835,exp_2840,exp_2845,exp_285,exp_2850,exp_2855,exp_2860,exp_2865,exp_2870,exp_2875,exp_2880,exp_2885,exp_2890,exp_2895,exp_290,exp_2900,exp_2905,exp_2910,exp_2915,exp_2920,exp_2925,exp_2930,exp_2935,exp_2940,exp_2945,exp_295,exp_2950,exp_2955,exp_2960,exp_2965,exp_2970,exp_2975,exp_2980,exp_2985,exp_2990,exp_2995,exp_300,exp_3000,exp_305,exp_310,exp_315,exp_320,exp_325,exp_330,exp_335,exp_340,exp_345,exp_350,exp_355,exp_360,exp_365,exp_370,exp_375,exp_380,exp_385,exp_390,exp_395,exp_400,exp_405,exp_410,exp_415,exp_420,exp_425,exp_430,exp_435,exp_440,exp_445,exp_450,exp_455,exp_460,exp_465,exp_470,exp_475,exp_480,exp_485,exp_490,exp_495,exp_500,exp_505,exp_510,exp_515,exp_520,exp_525,exp_530,exp_535,exp_540,exp_545,exp_550,exp_555,exp_560,exp_565,exp_570,exp_575,exp_580,exp_585,exp_590,exp_595,exp_600,exp_605,exp_610,exp_615,exp_620,exp_625,exp_630,exp_635,exp_640,exp_645,exp_650,exp_655,exp_660,exp_665,exp_670,exp_675,exp_680,exp_685,exp_690,exp_695,exp_700,exp_705,exp_710,exp_715,exp_720,exp_725,exp_730,exp_735,exp_740,exp_745,exp_750,exp_755,exp_760,exp_765,exp_770,exp_775,exp_780,exp_785,exp_790,exp_795,exp_800,exp_805,exp_810,exp_815,exp_820,exp_825,exp_830,exp_835,exp_840,exp_845,exp_850,exp_855,exp_860,exp_865,exp_870,exp_875,exp_880,exp_885,exp_890,exp_895,exp_900,exp_905,exp_910,exp_915,exp_920,exp_925,exp_930,exp_935,exp_940,exp_945,exp_950,exp_955,exp_960,exp_965,exp_970,exp_975,exp_980,exp_985,exp_990,exp_995
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): point DELETE by id (the pre-fix loop's per-id statement shape), rolled back — diagnostic only ===
 WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = 2 RETURNING name ), _del_assignments AS ( DELETE FROM autumn_experiment_assignments WHERE experiment IN (SELECT name FROM deleted) ), _del_overrides AS ( DELETE FROM autumn_experiment_overrides WHERE experiment IN (SELECT name FROM deleted) ), _audit AS ( INSERT INTO autumn_experiment_changes (experiment, mutation, actor) SELECT name, 'deleted', NULL FROM deleted ) SELECT COUNT(*) AS count FROM deleted
-Aggregate  (cost=349.55..349.56 rows=1 width=8) (actual time=0.024..0.025 rows=1 loops=1)
+Aggregate  (cost=352.73..352.74 rows=1 width=8) (actual time=0.028..0.030 rows=1 loops=1)
   Output: count(*)
   Buffers: shared hit=5
   CTE deleted
-    ->  Delete on public.autumn_experiments  (cost=0.28..8.30 rows=1 width=6) (actual time=0.020..0.021 rows=1 loops=1)
+    ->  Delete on public.autumn_experiments  (cost=0.28..8.30 rows=1 width=6) (actual time=0.024..0.025 rows=1 loops=1)
           Output: autumn_experiments.name
           Buffers: shared hit=5
-          ->  Index Scan using autumn_experiments_pkey on public.autumn_experiments  (cost=0.28..8.30 rows=1 width=6) (actual time=0.014..0.014 rows=1 loops=1)
+          ->  Index Scan using autumn_experiments_pkey on public.autumn_experiments  (cost=0.28..8.30 rows=1 width=6) (actual time=0.015..0.016 rows=1 loops=1)
                 Output: autumn_experiments.ctid
                 Index Cond: (autumn_experiments.id = 2)
                 Buffers: shared hit=3
   CTE _del_assignments
-    ->  Delete on public.autumn_experiment_assignments  (cost=5.18..330.13 rows=0 width=0) (actual time=0.056..0.056 rows=0 loops=1)
+    ->  Delete on public.autumn_experiment_assignments  (cost=5.19..333.31 rows=0 width=0) (actual time=0.067..0.067 rows=0 loops=1)
           Buffers: shared hit=95
-          ->  Nested Loop  (cost=5.18..330.13 rows=95 width=62) (actual time=0.022..0.036 rows=90 loops=1)
+          ->  Nested Loop  (cost=5.19..333.31 rows=96 width=62) (actual time=0.025..0.040 rows=90 loops=1)
                 Output: autumn_experiment_assignments.ctid, deleted_1.*
                 Buffers: shared hit=5
-                ->  HashAggregate  (cost=0.02..0.03 rows=1 width=88) (actual time=0.001..0.002 rows=1 loops=1)
+                ->  HashAggregate  (cost=0.02..0.03 rows=1 width=88) (actual time=0.003..0.003 rows=1 loops=1)
                       Output: deleted_1.*, deleted_1.name
                       Group Key: deleted_1.name
                       Batches: 1  Memory Usage: 24kB
-                      ->  CTE Scan on deleted deleted_1  (cost=0.00..0.02 rows=1 width=88) (actual time=0.000..0.001 rows=1 loops=1)
+                      ->  CTE Scan on deleted deleted_1  (cost=0.00..0.02 rows=1 width=88) (actual time=0.002..0.003 rows=1 loops=1)
                             Output: deleted_1.*, deleted_1.name
-                ->  Bitmap Heap Scan on public.autumn_experiment_assignments  (cost=5.16..329.14 rows=95 width=14) (actual time=0.020..0.028 rows=90 loops=1)
+                ->  Bitmap Heap Scan on public.autumn_experiment_assignments  (cost=5.17..332.31 rows=96 width=14) (actual time=0.021..0.029 rows=90 loops=1)
                       Output: autumn_experiment_assignments.ctid, autumn_experiment_assignments.experiment
                       Recheck Cond: (autumn_experiment_assignments.experiment = deleted_1.name)
                       Heap Blocks: exact=2
                       Buffers: shared hit=5
-                      ->  Bitmap Index Scan on idx_autumn_exp_assignments_experiment  (cost=0.00..5.14 rows=95 width=0) (actual time=0.016..0.016 rows=90 loops=1)
+                      ->  Bitmap Index Scan on idx_autumn_exp_assignments_experiment  (cost=0.00..5.14 rows=96 width=0) (actual time=0.016..0.016 rows=90 loops=1)
                             Index Cond: (autumn_experiment_assignments.experiment = deleted_1.name)
                             Buffers: shared hit=3
   CTE _del_overrides
-    ->  Delete on public.autumn_experiment_overrides  (cost=4.32..11.08 rows=0 width=0) (actual time=0.015..0.015 rows=0 loops=1)
+    ->  Delete on public.autumn_experiment_overrides  (cost=4.32..11.08 rows=0 width=0) (actual time=0.018..0.018 rows=0 loops=1)
           Buffers: shared hit=5
-          ->  Nested Loop  (cost=4.32..11.08 rows=2 width=62) (actual time=0.012..0.013 rows=2 loops=1)
+          ->  Nested Loop  (cost=4.32..11.08 rows=2 width=62) (actual time=0.015..0.016 rows=2 loops=1)
                 Output: autumn_experiment_overrides.ctid, deleted_2.*
                 Buffers: shared hit=3
-                ->  HashAggregate  (cost=0.02..0.03 rows=1 width=88) (actual time=0.004..0.004 rows=1 loops=1)
+                ->  HashAggregate  (cost=0.02..0.03 rows=1 width=88) (actual time=0.005..0.005 rows=1 loops=1)
                       Output: deleted_2.*, deleted_2.name
                       Group Key: deleted_2.name
                       Batches: 1  Memory Usage: 24kB
-                      ->  CTE Scan on deleted deleted_2  (cost=0.00..0.02 rows=1 width=88) (actual time=0.002..0.002 rows=1 loops=1)
+                      ->  CTE Scan on deleted deleted_2  (cost=0.00..0.02 rows=1 width=88) (actual time=0.002..0.003 rows=1 loops=1)
                             Output: deleted_2.*, deleted_2.name
-                ->  Bitmap Heap Scan on public.autumn_experiment_overrides  (cost=4.30..11.03 rows=2 width=14) (actual time=0.007..0.007 rows=2 loops=1)
+                ->  Bitmap Heap Scan on public.autumn_experiment_overrides  (cost=4.30..11.03 rows=2 width=14) (actual time=0.008..0.009 rows=2 loops=1)
                       Output: autumn_experiment_overrides.ctid, autumn_experiment_overrides.experiment
                       Recheck Cond: (autumn_experiment_overrides.experiment = deleted_2.name)
                       Heap Blocks: exact=1
                       Buffers: shared hit=3
-                      ->  Bitmap Index Scan on idx_autumn_exp_overrides_experiment  (cost=0.00..4.30 rows=2 width=0) (actual time=0.004..0.004 rows=2 loops=1)
+                      ->  Bitmap Index Scan on idx_autumn_exp_overrides_experiment  (cost=0.00..4.30 rows=2 width=0) (actual time=0.005..0.005 rows=2 loops=1)
                             Index Cond: (autumn_experiment_overrides.experiment = deleted_2.name)
                             Buffers: shared hit=2
   CTE _audit
-    ->  Insert on public.autumn_experiment_changes  (cost=0.00..0.03 rows=0 width=0) (actual time=0.077..0.077 rows=0 loops=1)
+    ->  Insert on public.autumn_experiment_changes  (cost=0.00..0.03 rows=0 width=0) (actual time=0.065..0.065 rows=0 loops=1)
           Buffers: shared hit=8 dirtied=1 written=1
-          ->  CTE Scan on deleted deleted_3  (cost=0.00..0.03 rows=1 width=112) (actual time=0.030..0.031 rows=1 loops=1)
+          ->  CTE Scan on deleted deleted_3  (cost=0.00..0.03 rows=1 width=112) (actual time=0.005..0.005 rows=1 loops=1)
                 Output: nextval('autumn_experiment_changes_id_seq'::regclass), deleted_3.name, 'deleted'::text, NULL::text, now()
                 Buffers: shared hit=1
-  ->  CTE Scan on deleted  (cost=0.00..0.02 rows=1 width=0) (actual time=0.021..0.022 rows=1 loops=1)
+  ->  CTE Scan on deleted  (cost=0.00..0.02 rows=1 width=0) (actual time=0.026..0.027 rows=1 loops=1)
         Output: deleted.name
         Buffers: shared hit=5
 Query Identifier: -5134730829356772731
-Planning Time: 0.211 ms
-Trigger autumn_experiment_change_notify on autumn_experiment_changes: time=0.036 calls=1
-Execution Time: 0.334 ms
+Planning Time: 0.251 ms
+Trigger autumn_experiment_change_notify on autumn_experiment_changes: time=0.037 calls=1
+Execution Time: 0.363 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched DELETE by id = ANY($1) (the actual post-fix statement shape execute_action now issues), rolled back — diagnostic only ===
+WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = ANY(ARRAY[2,3,4,6,7]) RETURNING name ), _del_assignments AS ( DELETE FROM autumn_experiment_assignments WHERE experiment IN (SELECT name FROM deleted) ), _del_overrides AS ( DELETE FROM autumn_experiment_overrides WHERE experiment IN (SELECT name FROM deleted) ), _audit AS ( INSERT INTO autumn_experiment_changes (experiment, mutation, actor) SELECT name, 'deleted', NULL FROM deleted ) SELECT COUNT(*) AS count FROM deleted
+Aggregate  (cost=1659.73..1659.74 rows=1 width=8) (actual time=0.053..0.055 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=26
+  CTE deleted
+    ->  Delete on public.autumn_experiments  (cost=0.28..32.37 rows=5 width=6) (actual time=0.037..0.047 rows=5 loops=1)
+          Output: autumn_experiments.name
+          Buffers: shared hit=26
+          ->  Index Scan using autumn_experiments_pkey on public.autumn_experiments  (cost=0.28..32.37 rows=5 width=6) (actual time=0.030..0.037 rows=5 loops=1)
+                Output: autumn_experiments.ctid
+                Index Cond: (autumn_experiments.id = ANY ('{2,3,4,6,7}'::integer[]))
+                Buffers: shared hit=16
+  CTE _del_assignments
+    ->  Delete on public.autumn_experiment_assignments  (cost=5.28..1571.72 rows=0 width=0) (actual time=0.377..0.377 rows=0 loops=1)
+          Buffers: shared hit=555
+          ->  Nested Loop  (cost=5.28..1571.72 rows=478 width=62) (actual time=0.027..0.189 rows=530 loops=1)
+                Output: autumn_experiment_assignments.ctid, deleted_1.*
+                Buffers: shared hit=25
+                ->  HashAggregate  (cost=0.11..0.16 rows=5 width=88) (actual time=0.005..0.006 rows=5 loops=1)
+                      Output: deleted_1.*, deleted_1.name
+                      Group Key: deleted_1.name
+                      Batches: 1  Memory Usage: 24kB
+                      ->  CTE Scan on deleted deleted_1  (cost=0.00..0.10 rows=5 width=88) (actual time=0.002..0.003 rows=5 loops=1)
+                            Output: deleted_1.*, deleted_1.name
+                ->  Bitmap Heap Scan on public.autumn_experiment_assignments  (cost=5.17..313.35 rows=96 width=14) (actual time=0.016..0.025 rows=106 loops=5)
+                      Output: autumn_experiment_assignments.ctid, autumn_experiment_assignments.experiment
+                      Recheck Cond: (autumn_experiment_assignments.experiment = deleted_1.name)
+                      Heap Blocks: exact=10
+                      Buffers: shared hit=25
+                      ->  Bitmap Index Scan on idx_autumn_exp_assignments_experiment  (cost=0.00..5.14 rows=96 width=0) (actual time=0.012..0.012 rows=106 loops=5)
+                            Index Cond: (autumn_experiment_assignments.experiment = deleted_1.name)
+                            Buffers: shared hit=15
+  CTE _del_overrides
+    ->  Delete on public.autumn_experiment_overrides  (cost=4.41..55.41 rows=0 width=0) (actual time=0.037..0.037 rows=0 loops=1)
+          Buffers: shared hit=24
+          ->  Nested Loop  (cost=4.41..55.41 rows=10 width=62) (actual time=0.014..0.033 rows=10 loops=1)
+                Output: autumn_experiment_overrides.ctid, deleted_2.*
+                Buffers: shared hit=14
+                ->  HashAggregate  (cost=0.11..0.16 rows=5 width=88) (actual time=0.006..0.007 rows=5 loops=1)
+                      Output: deleted_2.*, deleted_2.name
+                      Group Key: deleted_2.name
+                      Batches: 1  Memory Usage: 24kB
+                      ->  CTE Scan on deleted deleted_2  (cost=0.00..0.10 rows=5 width=88) (actual time=0.002..0.003 rows=5 loops=1)
+                            Output: deleted_2.*, deleted_2.name
+                ->  Bitmap Heap Scan on public.autumn_experiment_overrides  (cost=4.30..11.03 rows=2 width=14) (actual time=0.004..0.004 rows=2 loops=5)
+                      Output: autumn_experiment_overrides.ctid, autumn_experiment_overrides.experiment
+                      Recheck Cond: (autumn_experiment_overrides.experiment = deleted_2.name)
+                      Heap Blocks: exact=4
+                      Buffers: shared hit=14
+                      ->  Bitmap Index Scan on idx_autumn_exp_overrides_experiment  (cost=0.00..4.30 rows=2 width=0) (actual time=0.003..0.003 rows=2 loops=5)
+                            Index Cond: (autumn_experiment_overrides.experiment = deleted_2.name)
+                            Buffers: shared hit=10
+  CTE _audit
+    ->  Insert on public.autumn_experiment_changes  (cost=0.00..0.12 rows=0 width=0) (actual time=0.044..0.044 rows=0 loops=1)
+          Buffers: shared hit=30
+          ->  CTE Scan on deleted deleted_3  (cost=0.00..0.12 rows=5 width=112) (actual time=0.004..0.007 rows=5 loops=1)
+                Output: nextval('autumn_experiment_changes_id_seq'::regclass), deleted_3.name, 'deleted'::text, NULL::text, now()
+                Buffers: shared hit=5
+  ->  CTE Scan on deleted  (cost=0.00..0.10 rows=5 width=0) (actual time=0.038..0.051 rows=5 loops=1)
+        Output: deleted.name
+        Buffers: shared hit=26
+Query Identifier: 6015348588649673649
+Planning:
+  Buffers: shared hit=36
+Planning Time: 0.490 ms
+Trigger autumn_experiment_change_notify on autumn_experiment_changes: time=0.043 calls=5
+Execution Time: 0.684 ms
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.57s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.64s
 

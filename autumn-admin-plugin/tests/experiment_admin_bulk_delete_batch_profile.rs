@@ -52,7 +52,11 @@
 //! state skewed toward `concluded` (50%) and `archived` (25%) over
 //! `running` (15%) and `draft` (10%) — the long-tail shape of an app that
 //! ships new experiments continuously but rarely deletes old ones — with
-//! `winner` set on 70% of concluded rows and NULL elsewhere, and
+//! `winner` set on roughly 70% of concluded rows (measured and printed by
+//! the harness, not assumed: `gs % 7 < 5` selects within `concluded` using
+//! a modulus coprime to the 20-wide state-assignment cycle, so the two
+//! conditions land independently rather than the two `CASE` predicates
+//! silently correlating through a shared divisor) and NULL elsewhere, and
 //! `exclusion_group` NULL for 60% of rows, else one of 15 group names
 //! (cardinality skew).
 //!
@@ -124,11 +128,11 @@ fn seed_fixture(conn: &mut PgConnection) {
          SELECT \
            'exp_' || gs, \
            CASE WHEN gs % 20 < 7 THEN NULL ELSE 'experiment description ' || gs END, \
-           (ARRAY['draft','running','concluded','concluded','concluded','concluded','concluded', \
+           (ARRAY['concluded','concluded','concluded','concluded','concluded','concluded','concluded', \
                   'concluded','concluded','concluded','archived','archived','archived','archived', \
-                  'archived','running','running','draft','concluded','archived'])[1 + (gs % 20)]::autumn_experiment_state, \
+                  'archived','running','running','running','draft','draft'])[1 + (gs % 20)]::autumn_experiment_state, \
            '[{{\"name\":\"control\",\"weight\":50}},{{\"name\":\"treatment\",\"weight\":50}}]', \
-           CASE WHEN (gs % 20) IN (2,3,4,6,7,8,18) AND gs % 10 < 7 \
+           CASE WHEN (gs % 20) < 10 AND gs % 7 < 5 \
                 THEN (ARRAY['control','treatment'])[1 + (gs % 2)] ELSE NULL END, \
            CASE WHEN gs % 5 < 3 THEN NULL ELSE 'group_' || (gs % 15) END, \
            TIMESTAMP '2023-01-01 00:00:00' + (gs || ' hours')::interval, \
@@ -362,6 +366,39 @@ async fn experiment_admin_bulk_delete_batch_profile() {
     );
 
     seed_fixture(&mut conn);
+
+    // Measure the fixture's actual state/winner distribution rather than
+    // assume it (the same "measured, not assumed" rule the pre-existing
+    // id count below follows) -- `gs % 20` and `gs % 7` are independent
+    // moduli, but only a real count proves the two `CASE` predicates in
+    // `seed_fixture` land where the doc comment above claims.
+    let concluded_count =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM autumn_experiments WHERE state = 'concluded'")
+            .get_result::<CountRow>(&mut conn)
+            .expect("count concluded rows")
+            .n;
+    let concluded_with_winner = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM autumn_experiments \
+         WHERE state = 'concluded' AND winner IS NOT NULL",
+    )
+    .get_result::<CountRow>(&mut conn)
+    .expect("count concluded rows with a winner")
+    .n;
+    let winner_pct = 100.0 * concluded_with_winner as f64 / concluded_count as f64;
+    println!(
+        "\n-- fixture: {concluded_count} concluded rows (50% of {TOTAL_ROWS} expected), \
+         {concluded_with_winner} with a winner ({winner_pct:.1}%) --"
+    );
+    assert_eq!(
+        concluded_count,
+        TOTAL_ROWS / 2,
+        "state array must assign exactly 50% of rows to 'concluded'"
+    );
+    assert!(
+        (60.0..=80.0).contains(&winner_pct),
+        "winner assignment must land near the documented ~70% of concluded rows, got {winner_pct:.1}%"
+    );
+
     let (ids, existing_before_action) = select_bulk_delete_ids(&mut conn);
     let expected_ids_len = ids.len();
     println!(
@@ -489,6 +526,38 @@ async fn experiment_admin_bulk_delete_batch_profile() {
              rolled back — diagnostic only",
             "WITH deleted AS ( \
                  DELETE FROM autumn_experiments WHERE id = 2 RETURNING name \
+             ), \
+             _del_assignments AS ( \
+                 DELETE FROM autumn_experiment_assignments \
+                 WHERE experiment IN (SELECT name FROM deleted) \
+             ), \
+             _del_overrides AS ( \
+                 DELETE FROM autumn_experiment_overrides \
+                 WHERE experiment IN (SELECT name FROM deleted) \
+             ), \
+             _audit AS ( \
+                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                 SELECT name, 'deleted', NULL FROM deleted \
+             ) \
+             SELECT COUNT(*) AS count FROM deleted",
+        );
+        Err(diesel::result::Error::RollbackTransaction)
+    })
+    .ok();
+
+    // The actual post-fix statement shape (`id = ANY($1)`), run against a
+    // small representative array of ids that survived the bulk action
+    // (none are multiples of `BULK_IDS_STEP`, so none were in the
+    // submitted set) -- confirms the batched array-predicate plan is the
+    // same index-scan/bitmap-cascade shape as the single-id plan above,
+    // not just asserted from the single-id case by analogy.
+    conn.transaction::<(), diesel::result::Error, _>(|conn| {
+        explain(
+            conn,
+            "batched DELETE by id = ANY($1) (the actual post-fix statement \
+             shape execute_action now issues), rolled back — diagnostic only",
+            "WITH deleted AS ( \
+                 DELETE FROM autumn_experiments WHERE id = ANY(ARRAY[2,3,4,6,7]) RETURNING name \
              ), \
              _del_assignments AS ( \
                  DELETE FROM autumn_experiment_assignments \
