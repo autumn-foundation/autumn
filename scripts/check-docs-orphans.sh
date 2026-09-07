@@ -323,18 +323,23 @@ _TOML_HEADER = re.compile(r'^[ \t]*\[\[?[ \t]*([^\[\]]*?)[ \t]*\]\]?[ \t]*(?:#.*
 _DOTTED_CACHE = {}
 
 
-def _opens_multiline(line):
-    """The multi-line delimiter left open at the end of `line`, or None.
+def _scan_toml_line(line):
+    """`(comment_start, open_delimiter)` for one line of TOML.
 
-    A single scan that skips what cannot open one: comments, and single-line
-    strings of either kind. Both matter, and in the direction that hides
-    orphans rather than the one that reports false ones. A `\"\"\"` inside a
-    comment — `# see \"\"\" this` — read as an opener swallows every following
-    line until some other line happens to contain another, and a swallowed
-    `publish = false` makes an unpublishable package's README a reader root.
-    That is the silent failure this whole rule keeps producing, so it is
-    measured here rather than argued about: two self-tests pin the comment and
-    single-line-string cases, and both fail against a scanner without this.
+    `comment_start` is where an unquoted `#` begins a comment, or None.
+    `open_delimiter` is a multi-line delimiter left open at end of line, or
+    None. One scanner answers both because they are the same question — what on
+    this line is quoted and what is not — and both mis-answers hide orphans
+    rather than report false ones:
+
+      - a `\"\"\"` inside a comment (`# see \"\"\" this`) read as an opener swallows
+        every following line until some other line happens to contain another.
+        A swallowed `publish = false` reads as publishable, which seeds an
+        unpublishable package's README as a reader root.
+      - a `#` inside a string read as a comment truncates a real value.
+
+    So both are measured, not argued: self-tests pin the comment and
+    single-line-string cases and fail against a scanner lacking this.
     """
     i = 0
     n = len(line)
@@ -345,10 +350,10 @@ def _opens_multiline(line):
             tok = line[i:i + 3]
             close = line.find(tok, i + 3)
             if close < 0:
-                return tok
+                return None, tok
             i = close + 3
         elif line[i] == '#':
-            return None                      # comment runs to end of line
+            return i, None                   # comment runs to end of line
         elif line[i] == '"':
             i += 1
             while i < n and line[i] != '"':  # basic strings take escapes
@@ -359,13 +364,52 @@ def _opens_multiline(line):
             i = n if close < 0 else close + 1
         else:
             i += 1
-    return None
+    return None, None
+
+
+def _strip_toml_comments(text):
+    """`text` with TOML comments removed, quoting respected.
+
+    Needed because a value can be spread over lines with a comment inside it:
+    `publish = [\\n  # intentionally private\\n]` is an EMPTY allowlist to Cargo
+    — it reports `publish: []` — but its captured interior is not empty text,
+    so a bare emptiness test read the package as publishable.
+
+    The quoting-awareness is NOT observable through the only caller today, and
+    saying so is more useful than a test that pretends otherwise. `_publishable`
+    asks one question of the result — is it blank — and a populated list always
+    retains its first entry's opening quote, which a greedy `#`-to-end-of-line
+    strip cannot remove unless a `#` precedes it, in which case the quote is
+    inside a comment and the list really is empty. So both readings agree on
+    every input. This shares `_scan_toml_line` anyway, because one notion of
+    "what is quoted" is simpler to keep right than two.
+    """
+    out = []
+    ml = None
+    for line in text.split('\n'):
+        if ml is not None:
+            if ml not in line:
+                out.append(line)
+                continue
+            out.append(line.split(ml, 1)[0] + ml)
+            line = line.split(ml, 1)[1]
+            ml = None
+            at, ml = _scan_toml_line(line)
+            out[-1] += line if at is None else line[:at]
+            continue
+        at, ml = _scan_toml_line(line)
+        out.append(line if at is None else line[:at])
+    return '\n'.join(out)
 
 
 def _toml_lines(manifest):
     """Yield `(table, line)` for each line of TOML outside a multi-line string.
 
     `table` is the enclosing header's name, or None before the first header.
+
+    A header yields its own empty line, so a table that exists but declares no
+    keys is still distinguishable from one that never appears at all — the
+    difference between a manifest that defines a package and a virtual one.
 
     Line-scanned, like every other pattern in this file. The construct that has
     to be tracked is the multi-line string, because a `\"\"\"` block whose
@@ -384,13 +428,21 @@ def _toml_lines(manifest):
         m = _TOML_HEADER.match(line)
         if m is not None:
             table = m.group(1)
+            yield table, ''
             continue
-        ml = _opens_multiline(line)
+        _at, ml = _scan_toml_line(line)
         yield table, line
 
 
 def _toml_table(manifest, name):
-    """The body of top-level TOML table `name`, as text.
+    """The body of top-level TOML table `name`, or None if it never appears.
+
+    Absent and empty are different answers, and only one of them means "this
+    manifest describes no package". A virtual workspace manifest — a nested
+    `Cargo.toml` carrying only `[workspace]` — defines no crate, so no registry
+    renders a landing page for it and the README beside it is an ordinary
+    waypoint. Reading its missing `[package]` as a table full of defaults
+    seeded that README as a reader root, hiding anything indexed only there.
 
     Root-level dotted keys are folded in with their prefix stripped: written
     before any header, `package.publish = false` IS `[package]`'s `publish`,
@@ -405,23 +457,25 @@ def _toml_table(manifest, name):
                 re.escape(p) for p in name.split('.')) + r'[ \t]*\.[ \t]*')
         _DOTTED_CACHE[name] = dotted
     out = []
+    seen = False
     for table, line in _toml_lines(manifest):
         if table == name:
+            seen = True
             out.append(line)
         elif table is None:
             m = dotted.match(line)
             if m is not None:
+                seen = True
                 out.append(line[m.end():])
-    return '\n'.join(out)
+    return '\n'.join(out) if seen else None
 
 
 def _publishable(manifest):
-    """Whether a package manifest allows publishing at all."""
-    manifest = _toml_table(manifest, 'package')
+    """Whether a package's `[package]` table allows publishing at all."""
     m = _PUBLISH_DECL.search(manifest)
     if m is None and _PUBLISH_INHERITS.search(manifest):
         m = _PUBLISH_DECL.search(
-            _toml_table(read('Cargo.toml'), 'workspace.package'))
+            _toml_table(read('Cargo.toml'), 'workspace.package') or '')
     if m is None:
         return True
     value = m.group(1)
@@ -429,24 +483,27 @@ def _publishable(manifest):
         return False
     if value.startswith('['):
         # An empty allowlist publishes nowhere; a populated one publishes
-        # somewhere, and that registry renders the README.
-        return value[1:-1].strip() != ''
+        # somewhere, and that registry renders the README. Comments are
+        # stripped first because a list spread over lines can carry one —
+        # `publish = [\n  # intentionally private\n]` is EMPTY to Cargo, which
+        # reports `publish: []`, but its interior is not empty text.
+        return _strip_toml_comments(value[1:-1]).strip() != ''
     return True
 
 
 def _readme_path(manifest, pkg):
     """The file Cargo publishes as this package's README, or None for no README.
 
-    `pkg` is the manifest's directory; the returned path is repo-relative.
+    `manifest` is the package's `[package]` table; `pkg` is the manifest's
+    directory. The returned path is repo-relative.
     """
-    manifest = _toml_table(manifest, 'package')
     if _README_INHERITS.search(manifest):
         # Inherited values resolve against the workspace root, so both the
         # manifest to read the key from AND the directory it is relative to
         # move up. A root manifest with no `[workspace.package] readme` is a
         # manifest Cargo rejects; auto-detecting the root README there is
         # harmless, since that file is already a root on its own account.
-        manifest = _toml_table(read('Cargo.toml'), 'workspace.package')
+        manifest = _toml_table(read('Cargo.toml'), 'workspace.package') or ''
         pkg = ''
     m = _README_STRING.search(manifest)
     if m is not None:
@@ -475,10 +532,13 @@ def _crate_readme_roots():
     for f in tracked:
         if posixpath.basename(f) != 'Cargo.toml':
             continue
-        manifest = read(f)
-        if not _publishable(manifest):
+        package = _toml_table(read(f), 'package')
+        # No `[package]` table at all is a VIRTUAL manifest — a `Cargo.toml`
+        # carrying only `[workspace]`. It declares no crate, so no registry
+        # renders a landing page and the README beside it is a plain waypoint.
+        if package is None or not _publishable(package):
             continue
-        cand = _readme_path(manifest, posixpath.dirname(f))
+        cand = _readme_path(package, posixpath.dirname(f))
         if cand is not None and cand in tracked_set:
             out.add(cand)
     return out
@@ -7138,6 +7198,44 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m8/pkg/README.md"
   git -C "$c9m8" add -A && git -C "$c9m8" commit -qm triple-quote-in-string
   check "a triple quote inside a string opens nothing" fail "$c9m8"
+
+  # An empty allowlist stays empty when it is spread over lines with a comment
+  # inside it — `cargo metadata` reports `publish: []` for this manifest — but
+  # the captured interior is not empty TEXT, so a bare emptiness test read the
+  # package as publishable and seeded its README.
+  local c9m9="$tmp/c9m9"; make_corpus "$c9m9"
+  mkdir -p "$c9m9/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\npublish = [\n  # intentionally private\n]\n' \
+    > "$c9m9/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9m9/pkg/README.md"
+  git -C "$c9m9" add -A && git -C "$c9m9" commit -qm commented-empty-allowlist
+  check "a commented empty allowlist is still empty" fail "$c9m9"
+
+  # There is deliberately NO test here for a `#` inside a quoted registry name
+  # (`publish = ["reg#1"]`). One was written and deleted: it passed against a
+  # greedy `#`-to-end-of-line strip as well as the quoting-aware one, because
+  # the two cannot disagree here. See `_strip_toml_comments`.
+
+  # A VIRTUAL manifest — only `[workspace]`, no `[package]` — declares no
+  # crate, so nothing renders a registry landing page for it and the README
+  # beside it is an ordinary waypoint. Reading the missing table as one full of
+  # defaults seeded that README as a root and hid whatever it indexed.
+  local c9mb="$tmp/c9mb"; make_corpus "$c9mb"
+  mkdir -p "$c9mb/nested"
+  printf '[workspace]\nmembers = []\n' > "$c9mb/nested/Cargo.toml"
+  printf '# Nested\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mb/nested/README.md"
+  git -C "$c9mb" add -A && git -C "$c9mb" commit -qm virtual-manifest
+  check "a virtual workspace manifest seeds no crate README" fail "$c9mb"
+
+  # ...but an EMPTY `[package]` table is not a missing one. Absent and empty
+  # have to stay different answers, or the guard above swallows a real package
+  # whose keys Cargo would fill in.
+  local c9mc="$tmp/c9mc"; make_corpus "$c9mc"
+  mkdir -p "$c9mc/pkg"
+  printf '[package]\n\n[dependencies]\n' > "$c9mc/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mc/pkg/README.md"
+  git -C "$c9mc" add -A && git -C "$c9mc" commit -qm empty-package-table
+  check "an empty package table is not a missing one" pass "$c9mc"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
