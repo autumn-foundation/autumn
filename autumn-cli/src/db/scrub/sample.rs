@@ -191,6 +191,13 @@ pub enum SampleError {
         /// `child -> parent (constraint)` descriptions, sorted.
         edges: Vec<String>,
     },
+    /// One `[framework] purge` is required both before the sample (something it
+    /// references is subsetted) and after it (something that references it is
+    /// emptied by the sample). No single position satisfies both.
+    PurgeOrderContradiction {
+        /// One `table: must be emptied before X but after Y` line, sorted.
+        tables: Vec<String>,
+    },
     /// A table the sample keeps rows in references a framework-owned table that
     /// `[framework] purge` empties, so no order of the two satisfies the key.
     RetainedReferencesPurged {
@@ -328,6 +335,18 @@ impl std::fmt::Display for SampleError {
                  `never_include` in {SAMPLE_SECTION}.",
                 edges.len(),
                 bullets(edges),
+            ),
+            Self::PurgeOrderContradiction { tables } => write!(
+                f,
+                "{} purged table(s) would have to be emptied both before and after \
+                 the sample:\n{}\n  \
+                 A purge normally runs first, so removing the rows it points at is \
+                 safe; but one the sample's own emptied rows reference has to wait \
+                 for the sample instead. A table needing both leaves no order the \
+                 run can take. Stop purging it, or drop the table that references \
+                 it with `never_include` in {SAMPLE_SECTION}.",
+                tables.len(),
+                bullets(tables),
             ),
             Self::RetainedReferencesPurged { edges } => write!(
                 f,
@@ -737,6 +756,8 @@ fn classify_edges(
     let mut partition_local = Vec::new();
     let mut retained_into_purged = Vec::new();
     let mut purge_after = BTreeSet::new();
+    let mut purged_before: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut purged_after_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut internal = Vec::new();
     for edge in inputs.foreign_keys {
         // A constraint cloned from a partitioned parent was already dropped by
@@ -773,6 +794,17 @@ fn classify_edges(
             {
                 outside_refs.push(describe(edge));
             }
+            // The same shape, excused because the child IS purged: its rows are
+            // gone before the sample removes the parents they point at. That
+            // excuse holds only while this purge runs FIRST, so remember the
+            // edge — if the branch below then defers the very same purge, the
+            // two conclusions contradict and neither order is safe.
+            (None, Some(parent_role)) if parent_role.is_subsetted() => {
+                purged_before
+                    .entry(edge.child_table.clone())
+                    .or_default()
+                    .push(describe(edge));
+            }
             // The mirror image: a table the sample removes rows from points INTO
             // a purged framework table. Purges run before the sample so the case
             // above holds, which would empty the parent while these rows still
@@ -782,6 +814,10 @@ fn classify_edges(
             (Some(child_role), None) if inputs.purged.contains(&edge.parent_table) => {
                 if *child_role == SampleRole::NeverInclude {
                     purge_after.insert(edge.parent_table.clone());
+                    purged_after_edges
+                        .entry(edge.parent_table.clone())
+                        .or_default()
+                        .push(describe(edge));
                 } else {
                     retained_into_purged.push(describe(edge));
                 }
@@ -796,6 +832,7 @@ fn classify_edges(
             edges: partition_local,
         });
     }
+    check_purge_order(&purge_after, &purged_before, &purged_after_edges)?;
     if !retained_into_purged.is_empty() {
         retained_into_purged.sort();
         return Err(SampleError::RetainedReferencesPurged {
@@ -823,6 +860,40 @@ fn classify_edges(
         .cloned()
         .collect();
     Ok((internal, walk, purge_after))
+}
+
+/// Refuse a `[framework] purge` that one edge needs before the sample and
+/// another needs after it.
+///
+/// A purge normally runs first, which is what lets `classify_edges` excuse a
+/// framework table referencing a subsetted one: its rows are gone before the
+/// sample removes the parents they point at. A purge whose own child the sample
+/// empties has to wait instead. A table in both sets leaves no position: the
+/// only valid order interleaves the sample's deletes around the purge (excluded
+/// child, then the purge, then the sampled parent), which one atomic sample
+/// between two purge passes cannot express.
+fn check_purge_order(
+    purge_after: &BTreeSet<String>,
+    before: &BTreeMap<String, Vec<String>>,
+    after: &BTreeMap<String, Vec<String>>,
+) -> Result<(), SampleError> {
+    let mut contradictions: Vec<String> = purge_after
+        .iter()
+        .filter_map(|table| {
+            Some(format!(
+                "{table}: before {}, yet after {}",
+                before.get(table)?.join(", "),
+                after.get(table)?.join(", "),
+            ))
+        })
+        .collect();
+    if contradictions.is_empty() {
+        return Ok(());
+    }
+    contradictions.sort();
+    Err(SampleError::PurgeOrderContradiction {
+        tables: contradictions,
+    })
 }
 
 /// Refuse any table rows can never flow into: sampling it would empty it
@@ -2169,6 +2240,66 @@ mod tests {
             BTreeSet::from(["autumn_jobs".to_owned()]),
             "the purge its emptied child references must run after the sample"
         );
+    }
+
+    #[test]
+    fn a_purge_needed_both_before_and_after_the_sample_is_refused() {
+        // The interaction the two purge branches miss when read alone:
+        // `audit_logs` (never_include) -> autumn_jobs defers that purge past the
+        // sample, while autumn_jobs -> users is excused ONLY because the purge
+        // runs before the sample removes users rows. Both cannot hold. The one
+        // valid order interleaves the sample's own deletes around the purge
+        // (audit_logs, then autumn_jobs, then users), which a single atomic
+        // sample between two purge passes cannot express — so it is refused.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap_err();
+        let SampleError::PurgeOrderContradiction { tables } = err else {
+            panic!("expected a purge-order contradiction, got {err:?}");
+        };
+        assert_eq!(tables.len(), 1);
+        assert!(tables[0].starts_with("autumn_jobs:"), "{tables:?}");
+        assert!(
+            tables[0].contains("jobs_user_fk") && tables[0].contains("audit_logs_job_fk"),
+            "the diagnostic must name both sides of the contradiction: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn a_purge_that_only_references_a_sampled_table_still_runs_first() {
+        // Only the excused direction: autumn_jobs -> users, nothing referencing
+        // autumn_jobs. Purge-first is correct and nothing is deferred.
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert!(plan.purge_after.is_empty());
     }
 
     #[test]

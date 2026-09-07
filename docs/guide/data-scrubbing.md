@@ -299,6 +299,11 @@ Sampling refuses before it deletes anything when it cannot prove the result:
   the sample instead. But when a table whose rows the sample *keeps* references
   it, no order works and the run refuses: stop purging that table, or drop the
   referencing one with `never_include`;
+- a **purge needed both before and after the sample**: one framework table that
+  references a subsetted table (so its purge must run first) *and* is referenced
+  by a table the sample empties (so its purge must run last). The only valid
+  order interleaves the sample's own deletes around the purge, which one atomic
+  sample between two purge passes cannot express;
 - a **foreign key declared on a partition** rather than on its partitioned
   parent. The sample plays a partition's rows through that parent, whose rows
   span every partition, so it cannot honour a key binding one partition alone.
