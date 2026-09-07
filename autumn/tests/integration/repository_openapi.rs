@@ -397,6 +397,76 @@ fn a_reshaped_model_does_not_register_its_field_schema() {
     );
 }
 
+// ── New* datetime matches its own deserializer (issue #802) ────────────
+
+mod schema_datetime {
+    autumn_web::reexports::diesel::table! {
+        dated_rows (id) {
+            id -> Int8,
+            title -> Text,
+            occurred_at -> Timestamptz,
+        }
+    }
+}
+
+use schema_datetime::dated_rows;
+
+#[autumn_web::model(table = "dated_rows")]
+pub struct DatedRow {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `#[model]` injects its own datetime-local-tolerant deserializer on every
+/// `New*` datetime field, and that adapter accepts the offsetless shape an HTML
+/// `datetime-local` control posts as well as RFC 3339. `format: date-time`
+/// describes only the latter, so a strict validator would reject a create body
+/// the generated POST handler accepts.
+///
+/// Widened rather than direction-split: every value a response emits is RFC
+/// 3339 and so inside the union, which keeps one schema honest for both sides.
+#[test]
+fn the_new_schema_admits_the_offsetless_datetime_its_deserializer_takes() {
+    let schema =
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<NewDatedRow>())
+            .expect("the create companion registers its schema");
+    let prop = &schema["properties"]["occurred_at"];
+
+    assert_eq!(
+        prop["type"], "string",
+        "the property stays a string: {prop}"
+    );
+    assert!(
+        prop.get("format").is_none(),
+        "`format: date-time` would exclude the offsetless value the generated \
+         deserializer accepts: {prop}"
+    );
+
+    // A field the adapter does NOT touch must be left exactly as it was.
+    assert_eq!(
+        schema["properties"]["title"]["type"], "string",
+        "a non-datetime property must be untouched"
+    );
+    assert!(
+        schema["properties"]["title"].get("description").is_none(),
+        "the widening must not leak onto neighbouring properties"
+    );
+}
+
+/// The READ schema is a response and carries no such adapter, so it keeps the
+/// precise `format: date-time` a client generator turns into a real date type.
+#[test]
+fn the_read_schema_keeps_the_precise_datetime_format() {
+    let schema = autumn_web::openapi::registered_derived_schema(std::any::type_name::<DatedRow>())
+        .expect("the model registers its read schema");
+    assert_eq!(
+        schema["properties"]["occurred_at"]["format"], "date-time",
+        "a response only ever emits RFC 3339, so precision is kept: {schema}"
+    );
+}
+
 // ── The Update* patch schema is nullable on both sides (issue #802) ────
 
 /// Every mutable field of an `Update*` companion is a `Patch<T>`, and `null`

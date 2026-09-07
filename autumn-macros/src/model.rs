@@ -7587,6 +7587,57 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // `NewModel` fields are plain `T`, not `Patch<T>` — nothing to widen.
         false,
     );
+    // A `NewModel` datetime field carries the datetime-local-tolerant
+    // deserializer this macro injects itself (`datetime_local_serde_attr`, wired
+    // in at the `new_fields` construction above). That adapter accepts BOTH RFC
+    // 3339 and the offsetless shape `<input type="datetime-local">` posts, while
+    // this schema is built from the original field type and `scalar_json_schema`
+    // labels every `DateTime` `format: date-time` — whose RFC 3339 production
+    // requires an offset. A strict validator therefore rejects a create body the
+    // generated POST handler accepts.
+    //
+    // Widened to the union rather than split by direction: every value a
+    // response emits is RFC 3339, which is inside the union, so one schema stays
+    // honest for both sides. That is the same reasoning as the `Patch<T>`
+    // nullability widening, and is what distinguishes this from the two
+    // direction-blind cases in #2607, where the correct request and response
+    // schemas genuinely disagree and no single document can serve both.
+    //
+    // The predicate is `datetime_local_serde_attr` itself, not a re-derivation of
+    // "is this a datetime": the schema must describe exactly the fields that
+    // actually receive the adapter, or the two drift.
+    let datetime_local_property_names: Vec<String> = fields_for_new
+        .iter()
+        .filter(|f| datetime_local_serde_attr(&f.ty).is_some())
+        .filter_map(|f| {
+            // `raw_field_names: true` above, so the property is the bare ident.
+            let raw = f.ident.as_ref()?.to_string();
+            Some(raw.strip_prefix("r#").unwrap_or(&raw).to_owned())
+        })
+        .collect();
+    let new_struct_schema_body = if datetime_local_property_names.is_empty() {
+        new_struct_schema_body
+    } else {
+        quote! {{
+            let mut __autumn_new_schema = { #new_struct_schema_body };
+            if let Some(__autumn_props) = __autumn_new_schema
+                .get_mut("properties")
+                .and_then(|__p| __p.as_object_mut())
+            {
+                for __autumn_name in [#(#datetime_local_property_names),*] {
+                    if let Some(__autumn_prop) = __autumn_props.get_mut(__autumn_name) {
+                        *__autumn_prop = ::autumn_web::reexports::serde_json::json!({
+                            "type": "string",
+                            "description": "RFC 3339, or an offsetless local datetime \
+                                            (YYYY-MM-DDTHH:MM[:SS[.f]]) as posted by an \
+                                            HTML `datetime-local` control.",
+                        });
+                    }
+                }
+            }
+            __autumn_new_schema
+        }}
+    };
     // Every mutable field of `UpdateModel` is declared `Patch<T>`, and `null`
     // is a MEANINGFUL value on both sides of the wire for one: `Deserialize`
     // maps `null` to `Patch::Clear` ("unset this column"), and `Serialize`
