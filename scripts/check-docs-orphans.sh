@@ -189,6 +189,15 @@ def _is_agent_entry(f):
     Depth is what distinguishes an entry file from a supporting one, so it is
     checked rather than the basename alone: `references/` sits one level
     deeper and no longer matches.
+
+    `AGENT.md` is NOT an entry filename here, and neither is a nested
+    `agents/<name>/AGENT.md`. Both were carried over from the cross-product
+    this replaced, on the reasoning that keeping them was the conservative
+    choice — which had it backwards. The repository tracks no such file and
+    no convention here documents one, so they only ever added a way for an
+    ordinary supporting page to confer reachability because of its basename,
+    which is an orphan passing. Seeding a root on a guessed convention is not
+    the safe direction; it is the one that hides defects.
     """
     if not f.endswith('.md'):
         return False
@@ -198,13 +207,11 @@ def _is_agent_entry(f):
         parts = f[len(prefix):].split('/')
         if parts[0] == 'skills':
             # `skills/<name>/SKILL.md` — the entry file, never a page beside it.
-            if len(parts) == 3 and parts[2] in ('SKILL.md', 'AGENT.md'):
+            if len(parts) == 3 and parts[2] == 'SKILL.md':
                 return True
         elif parts[0] == 'agents':
-            # `agents/<name>.md`, plus the directory spelling of the same thing.
+            # `agents/<name>.md` — one file per agent, and no deeper.
             if len(parts) == 2:
-                return True
-            if len(parts) == 3 and parts[2] in ('AGENT.md', 'SKILL.md'):
                 return True
     return False
 
@@ -2048,8 +2055,15 @@ HIDDEN_OPEN = re.compile(
 STYLE_ATTR_OPEN = re.compile(
     r'<([A-Za-z][A-Za-z0-9-]*)(?:' + _TWS + r'+' + ATTR + r')*?'
     + _TWS + r'+style' + _TWS + r'*=' + _TWS + r'*'
-    r'(?:"([^"]*)"|\'([^\']*)\')'
+    r'(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))'
     r'(?:' + _TWS + r'+' + ATTR + r')*' + _TWS + r'*/?>', re.I)
+# The UNQUOTED branch is the general attribute grammar's, and leaving it out
+# meant `<a style=display:none href=mail.md>` — valid HTML that Chromium hides
+# with a 0x0 box — was read as having no inline style at all, so an empty
+# anchor counted as a route. Its own grammar is what bounds it: an unquoted
+# value ends at the first space, so `style=display: none` really does set only
+# `display:` and really does paint, measured, and that is not a case to
+# "fix" by allowing spaces.
 # The property boundary matters on its own: `--display:none` is a custom
 # PROPERTY and changes nothing, so an unbounded match rejected a live link.
 _DISPLAY_DECL = re.compile(r'\s*display' + _TWS + r'*:([^;]*)', re.I)
@@ -2182,7 +2196,7 @@ def _style_value(m):
     over-decoded form is, which is a contrivance; writing an attribute-aware
     tokenizer to rule it out is not worth it here.
     """
-    raw = m.group(2) if m.group(2) is not None else m.group(3)
+    raw = next((g for g in m.group(2, 3, 4) if g is not None), None)
     return decode_attribute(raw) if raw else raw
 
 
@@ -6130,6 +6144,30 @@ self_test() {
     > "$c9kw/docs/guide/jobs.md"
   git -C "$c9kw" add -A && git -C "$c9kw" commit -qm input-type-entity-space
   check "a decoded leading space is not the hidden type" pass "$c9kw"
+
+  # An attribute value may be UNQUOTED, and this anchor is hidden — 0x0 in
+  # Chromium. Accepting only quoted values read it as having no inline style
+  # at all, so an empty anchor counted as a route.
+  # (The `style=display: none` spelling was written here as a companion and
+  # removed: an unquoted value ends at the first space, so it really does set
+  # only `display:` and really does paint — but every variant reaches that
+  # same answer by a different route, so the case pinned nothing. The measured
+  # fact lives on `STYLE_ATTR_OPEN` instead.)
+  local c9kx="$tmp/c9kx"; make_corpus "$c9kx"
+  printf '# Jobs\n\n<a style=display:none href=mail.md>Mail</a>\n' \
+    > "$c9kx/docs/guide/jobs.md"
+  git -C "$c9kx" add -A && git -C "$c9kx" commit -qm unquoted-style-attribute
+  check "an unquoted inline style still hides" fail "$c9kx"
+
+  # `AGENT.md` is not an entry filename: the skills convention is `SKILL.md`,
+  # and seeding a root on a basename no convention documents only lets an
+  # ordinary supporting page confer reachability.
+  local c9ky="$tmp/c9ky"; make_corpus "$c9ky"
+  mkdir -p "$c9ky/skills/x"
+  printf '# S\n\ntext\n' > "$c9ky/skills/x/SKILL.md"
+  printf '# A\n\n- [Mail](docs/guide/mail.md)\n' > "$c9ky/skills/x/AGENT.md"
+  git -C "$c9ky" add -A && git -C "$c9ky" commit -qm agent-md-is-not-a-skill-root
+  check "an AGENT.md beside a skill is not a root" fail "$c9ky"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
