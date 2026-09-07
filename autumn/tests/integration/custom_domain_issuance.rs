@@ -112,6 +112,7 @@ impl DomainIssuer for ScriptedIssuer {
 
 struct Harness {
     task: CustomDomainTask,
+    store: Arc<FsAcmeStore>,
     registry: Arc<CustomDomainRegistry>,
     cache: Arc<CustomDomainCertCache>,
     alerts: Arc<Mutex<Vec<String>>>,
@@ -130,6 +131,7 @@ fn harness_with_limiter(
 ) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let store_out = Arc::clone(&store);
     let registry = Arc::new(CustomDomainRegistry::new(
         Arc::new(MemoryCustomDomainStore::new()),
         100,
@@ -163,6 +165,7 @@ fn harness_with_limiter(
     };
     Harness {
         task,
+        store: store_out,
         registry,
         cache,
         alerts,
@@ -607,4 +610,143 @@ async fn health_is_up_while_a_failing_domain_still_serves_and_down_once_it_expir
 
     // Once the certificate is actually dead the deployment is Down.
     assert_eq!(indicator.grade(NOW + 86_401).status, HealthStatus::Down);
+}
+
+// ── Regressions found by review ──────────────────────────────────────────
+
+#[tokio::test]
+async fn an_ingress_configured_only_as_a_hostname_still_verifies() {
+    // `getaddrinfo` follows CNAMEs and reports addresses, never the CNAME, so
+    // an operator who configures only `ingress_hostname` would see every
+    // tenant domain sit at pending_dns forever unless the ingress hostname is
+    // resolved to addresses and compared against those.
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        TableVerifier::new(&[
+            ("app.clientco.com", points_here()),
+            ("ingress.myapp.com", points_here()),
+        ]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.ingress = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ipv4: vec![],
+        ipv6: vec![],
+    };
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Active,
+        "a hostname-only ingress must still verify"
+    );
+}
+
+#[tokio::test]
+async fn a_domain_pointing_elsewhere_still_fails_against_a_hostname_only_ingress() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        TableVerifier::new(&[
+            ("app.clientco.com", points_elsewhere()),
+            ("ingress.myapp.com", points_here()),
+        ]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.ingress = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ipv4: vec![],
+        ipv6: vec![],
+    };
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::PendingDns
+    );
+    assert_eq!(issuer.count(), 0);
+}
+
+#[tokio::test]
+async fn an_ingress_that_cannot_be_resolved_does_not_pass_everything() {
+    // If the ingress hostname itself does not resolve, the expected set is
+    // empty — which must NOT be read as "every address matches".
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.ingress = ExpectedIngress {
+        hostname: Some("unresolvable.myapp.com".to_owned()),
+        ipv4: vec![],
+        ipv6: vec![],
+    };
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::PendingDns
+    );
+    assert_eq!(issuer.count(), 0);
+}
+
+#[tokio::test]
+async fn a_handshake_for_a_domain_past_the_cache_loads_its_certificate_from_disk() {
+    use autumn_web::acme::tenant_domains::FsSniCertSource;
+    use autumn_web::custom_domain::{CustomDomainCertCache, SniCertResolver};
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+
+    // A cache far smaller than the registry: the certificate is evicted, and
+    // the handshake must still be served — otherwise a 1,000-domain
+    // deployment with a 256-entry cache silently stops serving 744 tenants
+    // after a restart.
+    let cache = Arc::new(CustomDomainCertCache::new(1));
+    let base = Arc::new(autumn_web::tls::ReloadableCertResolver::new(
+        autumn_web::tls::certified_key_from_pem(
+            CERT_PEM.as_bytes(),
+            KEY_PEM.as_bytes(),
+            &autumn_web::tls::crypto_provider(),
+        )
+        .unwrap(),
+    ));
+    let resolver = SniCertResolver::new(
+        base,
+        vec!["myapp.com".to_owned()],
+        Arc::clone(&h.registry),
+        Arc::clone(&cache),
+    )
+    .with_source(Arc::new(FsSniCertSource::new(
+        Arc::clone(&h.store),
+        autumn_web::tls::crypto_provider(),
+    )));
+
+    assert!(cache.get("app.clientco.com").is_none());
+    assert!(
+        resolver.certificate_for("app.clientco.com").is_some(),
+        "a cold domain must load its certificate on the handshake path"
+    );
+    assert!(cache.get("app.clientco.com").is_some(), "and be cached after");
+    // An unregistered hostname is still refused without ever touching disk.
+    assert!(resolver.certificate_for("attacker.example.net").is_none());
 }

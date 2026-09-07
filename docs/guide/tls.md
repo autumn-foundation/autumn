@@ -813,8 +813,14 @@ The registry is one `0600` JSON file per domain, loaded into an in-memory index
 before the listener binds — a restart routes and serves every connected domain
 on the first request. Certificates load **incrementally**: at most
 `cert_cache_size` are held in memory, and a handshake for a colder domain reads
-its certificate back from the store. Nothing requires every certificate to be
-resident.
+its certificate back from the store and caches it. Nothing requires every
+certificate to be resident, so `cert_cache_size` is a memory knob, not a
+correctness one.
+
+Like the rest of the ACME path, custom domains assume a **single host**: the
+HTTP-01 token map and the certificate store are per-process, and the
+custom-domain loop does not leader-elect. Behind a load balancer, use
+[reverse-proxy termination](#terminating-tls-at-a-reverse-proxy) instead.
 
 ### Offboarding and retention
 

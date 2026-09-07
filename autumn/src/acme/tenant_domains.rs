@@ -219,7 +219,7 @@ impl CustomDomainTask {
     /// Check where one hostname points and record the result.
     async fn verify_one(&self, hostname: &str, now_unix: i64) {
         let observed = self.verifier.observe(hostname).await;
-        let outcome = grade_dns_verification(&observed, &self.ingress);
+        let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
         let failures = self
             .registry
             .get(hostname)
@@ -230,6 +230,38 @@ impl CustomDomainTask {
         {
             tracing::warn!(hostname, "failed to persist custom-domain verification: {e}");
         }
+    }
+
+    /// The ingress to compare a tenant's DNS against.
+    ///
+    /// A resolver reports the ADDRESSES a name ends at, following any CNAME
+    /// silently — so an operator who configured only `ingress_hostname` has
+    /// nothing to compare an observed address against. Resolve the ingress
+    /// hostname each pass and use its addresses, rather than requiring the
+    /// operator to duplicate them in config where they would go stale.
+    ///
+    /// Resolved per tick, not cached: an ingress behind a load balancer whose
+    /// address changes must not leave every tenant domain failing verification
+    /// until the process restarts.
+    async fn effective_ingress(&self) -> ExpectedIngress {
+        let mut ingress = self.ingress.clone();
+        if !ingress.ipv4.is_empty() || !ingress.ipv6.is_empty() {
+            return ingress;
+        }
+        let Some(host) = ingress.hostname.clone() else {
+            return ingress;
+        };
+        if let crate::custom_domain::ObservedTarget::Addresses(addrs) =
+            self.verifier.observe(&host).await
+        {
+            for addr in addrs {
+                match addr {
+                    std::net::IpAddr::V4(v4) => ingress.ipv4.push(v4),
+                    std::net::IpAddr::V6(v6) => ingress.ipv6.push(v6),
+                }
+            }
+        }
+        ingress
     }
 
     /// Order (or renew) one hostname's certificate, budget permitting.
@@ -479,6 +511,47 @@ impl CustomDomainTask {
             }
         }
         Ok(removed)
+    }
+}
+
+/// A [`SniCertSource`](crate::custom_domain::SniCertSource) reading the
+/// filesystem certificate store on the handshake path.
+///
+/// Two `read`s and a parse, only for a hostname the registry has already
+/// confirmed is registered and active. That is what lets `cert_cache_size` be
+/// much smaller than the number of connected domains without any of them
+/// stopping being served.
+#[derive(Debug)]
+pub struct FsSniCertSource {
+    store: Arc<crate::acme::store::FsAcmeStore>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl FsSniCertSource {
+    /// A source over `store`, parsing with `provider`.
+    #[must_use]
+    pub const fn new(
+        store: Arc<crate::acme::store::FsAcmeStore>,
+        provider: Arc<CryptoProvider>,
+    ) -> Self {
+        Self { store, provider }
+    }
+}
+
+impl crate::custom_domain::SniCertSource for FsSniCertSource {
+    fn load(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let (chain_path, key_path) = self
+            .store
+            .find_cert_for_domains(&[hostname.to_owned()])?;
+        let chain = std::fs::read(&chain_path).ok()?;
+        let key = std::fs::read(&key_path).ok()?;
+        match crate::tls::certified_key_from_pem(&chain, &key, &self.provider) {
+            Ok(certified) => Some(certified),
+            Err(e) => {
+                tracing::warn!(hostname, "stored custom-domain certificate is unusable: {e}");
+                None
+            }
+        }
     }
 }
 

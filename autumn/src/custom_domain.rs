@@ -314,6 +314,16 @@ pub fn grade_dns_verification(
             }
         }
         ObservedTarget::Addresses(addrs) if addrs.is_empty() => VerificationOutcome::Unresolved,
+        // Nothing to compare against: an ingress with no addresses (and whose
+        // hostname could not be resolved to any) cannot confirm anything, and
+        // an empty expected set must never read as "every address matches".
+        ObservedTarget::Addresses(_) if expected.ipv4.is_empty() && expected.ipv6.is_empty() => {
+            VerificationOutcome::PointsElsewhere {
+                detail: "this deployment's ingress addresses are unknown, so the hostname cannot \
+                         be confirmed to point here"
+                    .to_owned(),
+            }
+        }
         ObservedTarget::Addresses(addrs) => {
             let unmatched: Vec<String> = addrs
                 .iter()
@@ -1516,12 +1526,31 @@ mod sni {
     /// (3) is the abuse gate AC4 asks for: an attacker pointing DNS at this
     /// deployment and opening a handshake for an unregistered name gets a TLS
     /// alert, and no code path from here reaches the ACME provider.
+    ///
+    /// A registered domain whose certificate is not resident is loaded through
+    /// the optional [`SniCertSource`] — the other half of AC6's incremental
+    /// loading. Without it, a deployment with more domains than
+    /// `cert_cache_size` would stop serving every domain past the cache after a
+    /// restart.
     #[derive(Debug)]
     pub struct SniCertResolver {
         base: Arc<crate::tls::ReloadableCertResolver>,
         base_names: Vec<String>,
         registry: Arc<CustomDomainRegistry>,
         cache: Arc<CustomDomainCertCache>,
+        source: Option<Arc<dyn SniCertSource>>,
+    }
+
+    /// Loads one domain's certificate on the handshake path.
+    ///
+    /// Deliberately **synchronous**: `rustls` resolves a certificate inside the
+    /// handshake, which is not an async context. The implementation reads two
+    /// small files, and only on a cache miss for a hostname already proven
+    /// registered — never for an attacker-supplied name — so the blocking cost
+    /// is bounded by the eviction rate, not by request volume.
+    pub trait SniCertSource: Send + Sync + std::fmt::Debug {
+        /// The stored certificate for `hostname`, if one loads.
+        fn load(&self, hostname: &str) -> Option<Arc<CertifiedKey>>;
     }
 
     impl SniCertResolver {
@@ -1542,7 +1571,15 @@ mod sni {
                     .collect(),
                 registry,
                 cache,
+                source: None,
             }
+        }
+
+        /// Load a registered domain's certificate from `source` on a cache miss.
+        #[must_use]
+        pub fn with_source(mut self, source: Arc<dyn SniCertSource>) -> Self {
+            self.source = Some(source);
+            self
         }
 
         /// The certificate to serve for `server_name`, or `None` to refuse.
@@ -1552,10 +1589,18 @@ mod sni {
             if self.base_covers(&name) {
                 return Some(self.base.current());
             }
+            // The registry check comes BEFORE any I/O: an unregistered name
+            // must cost nothing but a hash lookup, however many are thrown at
+            // the listener.
             if !self.registry.is_servable(&name) {
                 return None;
             }
-            self.cache.get(&name)
+            if let Some(cached) = self.cache.get(&name) {
+                return Some(cached);
+            }
+            let loaded = self.source.as_ref()?.load(&name)?;
+            self.cache.insert(&name, Arc::clone(&loaded));
+            Some(loaded)
         }
 
         /// Does the operator's own certificate cover `name`?
@@ -1584,7 +1629,7 @@ mod sni {
 }
 
 #[cfg(feature = "tls")]
-pub use sni::{CustomDomainCertCache, SniCertResolver};
+pub use sni::{CustomDomainCertCache, SniCertResolver, SniCertSource};
 
 // ── Lock helpers ─────────────────────────────────────────────────────────
 

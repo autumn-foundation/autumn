@@ -9104,12 +9104,24 @@ async fn build_acme_tls_listener(
         custom_domains.as_ref().map_or_else(
             || std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
             |cd| {
-                std::sync::Arc::new(crate::custom_domain::SniCertResolver::new(
-                    std::sync::Arc::clone(&resolver),
-                    acme_cfg.domains.clone(),
-                    std::sync::Arc::clone(&cd.registry),
-                    std::sync::Arc::clone(&cd.cache),
-                ))
+                std::sync::Arc::new(
+                    crate::custom_domain::SniCertResolver::new(
+                        std::sync::Arc::clone(&resolver),
+                        acme_cfg.domains.clone(),
+                        std::sync::Arc::clone(&cd.registry),
+                        std::sync::Arc::clone(&cd.cache),
+                    )
+                    // A domain evicted from the bounded cache (or never warmed,
+                    // in a deployment with more domains than the cache holds)
+                    // loads its certificate here rather than stopping being
+                    // served.
+                    .with_source(std::sync::Arc::new(
+                        crate::acme::tenant_domains::FsSniCertSource::new(
+                            std::sync::Arc::clone(&cd.store),
+                            std::sync::Arc::clone(&provider),
+                        ),
+                    )),
+                )
             },
         );
     let server_config =
