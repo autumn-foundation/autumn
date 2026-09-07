@@ -323,6 +323,51 @@ async fn rest_and_graphql_see_the_same_rows() {
         .assert_json::<Value, _>(|note| assert_eq!(note["title"], "Welcome to Autumn Notes"));
 }
 
+/// The generated REST write handlers and the GraphQL mutations share one
+/// repository, so `#[normalize]`, `#[validate]` and the hooks apply to both.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn rest_writes_go_through_the_same_hooks() {
+    let client = seeded_client().await;
+
+    // Trimmed by `#[normalize(trim)]` on the way in, same as `createNote`.
+    let created: Value = client
+        .post("/api/notes")
+        .json(&json!({ "title": "  From REST  ", "body": "", "pinned": false }))
+        .send()
+        .await
+        .assert_success()
+        .json();
+    assert_eq!(created["title"], "From REST", "trimmed: {created}");
+    let id = created["id"].as_i64().expect("id");
+
+    // ...and visible to GraphQL immediately.
+    let body = gql(&client, "{ notes { id title } }", json!({})).await;
+    assert_eq!(body["data"]["notes"][0]["id"], id.to_string());
+    assert_eq!(body["data"]["notes"][0]["title"], "From REST");
+
+    // A blank title is refused by the model rules (the REST handler validates
+    // the payload before `save`; `before_create` would catch it too).
+    client
+        .post("/api/notes")
+        .json(&json!({ "title": "   ", "body": "", "pinned": false }))
+        .send()
+        .await
+        .assert_status(422);
+
+    // The pinned welcome note meets the same `before_delete` hook over REST.
+    client
+        .delete("/api/notes/2")
+        .send()
+        .await
+        .assert_status(422);
+    client
+        .delete(&format!("/api/notes/{id}"))
+        .send()
+        .await
+        .assert_success();
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn mutations_round_trip_through_the_repository() {

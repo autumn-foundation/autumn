@@ -83,7 +83,8 @@ curl -s http://127.0.0.1:3000/ | grep -o '<div id="root">'
 curl -s http://127.0.0.1:3000/graphql \
   -H 'content-type: application/json' \
   -d '{"query":"{ notes { id title pinned } }"}'
-# => {"data":{"notes":[{"id":2,"title":"Welcome to Autumn Notes","pinned":true},{"id":1,"title":"Try the GraphQL endpoint","pinned":false}]}}
+# => {"data":{"notes":[{"id":"2","title":"Welcome to Autumn Notes","pinned":true},{"id":"1","title":"Try the GraphQL endpoint","pinned":false}]}}
+#    (`id` is the GraphQL `ID` scalar — a string on the wire; the REST handler below shows it as a JSON number)
 
 # The same rows through the generated REST handler (a `Page` envelope):
 curl -s http://127.0.0.1:3000/api/notes | head -c 120
@@ -96,7 +97,7 @@ curl -s 'http://127.0.0.1:3000/graphql?query=%7B%20notes(pinnedOnly:true)%20%7B%
 curl -s http://127.0.0.1:3000/graphql \
   -H 'content-type: application/json' \
   -d '{"query":"mutation { createNote(input: {title: \"  From curl  \"}) { id title } }"}'
-# => {"data":{"createNote":{"id":3,"title":"From curl"}}}
+# => {"data":{"createNote":{"id":"3","title":"From curl"}}}
 
 # The model's rule, surfaced as a GraphQL error with the HTTP status it would have carried:
 curl -s http://127.0.0.1:3000/graphql \
@@ -107,8 +108,15 @@ curl -s http://127.0.0.1:3000/graphql \
 # The hook: the seeded welcome note is pinned, so it cannot be deleted:
 curl -s http://127.0.0.1:3000/graphql \
   -H 'content-type: application/json' \
-  -d '{"query":"mutation { deleteNote(id: 2) }"}'
+  -d '{"query":"mutation { deleteNote(id: \"2\") }"}'
 # => {"data":null,"errors":[{"message":"note 2 is pinned; unpin it before deleting", ...}]}
+
+# The same rules through the generated REST handlers — one repository, one set of hooks:
+curl -s -X POST http://127.0.0.1:3000/api/notes -H 'content-type: application/json' \
+  -d '{"title":"  From REST  ","body":"","pinned":false}'
+# => {"id":4,"title":"From REST",...}          (trimmed by #[normalize])
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE http://127.0.0.1:3000/api/notes/2
+# => 422                                      (refused by the before_delete hook)
 
 # The schema, for generating client types:
 curl -s http://127.0.0.1:3000/graphql/sdl
@@ -293,6 +301,9 @@ cd frontend && npm run typecheck
 | GET | `/` | app | The page shell React mounts into |
 | GET | `/api/notes` | `#[repository(api)]` | Paged JSON list of notes (`content`, `page`, `total_elements`, …) |
 | GET | `/api/notes/{id}` | `#[repository(api)]` | One note as JSON, or 404 |
+| POST | `/api/notes` | `#[repository(api)]` | Create from `{title, body, pinned}`; validated, trimmed, hooked like `createNote` |
+| PUT | `/api/notes/{id}` | `#[repository(api)]` | Partial update (`Patch` fields) |
+| DELETE | `/api/notes/{id}` | `#[repository(api)]` | Delete; a pinned note is a 422 from the same `before_delete` hook |
 | GET | `/static/app/app.js`, `/static/app/app.css` | framework | The committed Vite bundle |
 | POST | `/graphql` | plugin | Execute `{ query, variables?, operationName? }` |
 | GET | `/graphql?query=…` | plugin | Execute a read in query-string form; mutations are refused with `405` |

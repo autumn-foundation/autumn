@@ -86,10 +86,12 @@ pub async fn index() -> Markup {
     }
 }
 
-/// The app's own (non-plugin) routes: the page shell plus the two read-only
-/// REST handlers `#[repository(api = "/api/notes")]` generated. Mounting them
-/// next to the GraphQL endpoint shows both surfaces reading the same rows
-/// through the same repository.
+/// The app's own (non-plugin) routes: the page shell plus the five JSON REST
+/// handlers `#[repository(api = "/api/notes")]` generated. Mounting them next
+/// to the GraphQL endpoint shows both surfaces reading — and writing — the
+/// same rows through the same repository: a `POST /api/notes` is trimmed and
+/// validated exactly like `createNote`, and `DELETE /api/notes/2` meets the
+/// same `before_delete` hook `deleteNote` does.
 ///
 /// `routes!` needs a fully-qualified handler path, and the route-info helper
 /// it expands to is private to this crate, so the list is built here rather
@@ -100,6 +102,9 @@ pub fn routes() -> Vec<autumn_web::Route> {
         crate::index,
         crate::repositories::note_api_list,
         crate::repositories::note_api_get,
+        crate::repositories::note_api_create,
+        crate::repositories::note_api_update,
+        crate::repositories::note_api_delete,
     ]
 }
 
