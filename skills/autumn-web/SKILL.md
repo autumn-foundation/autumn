@@ -1235,6 +1235,68 @@ deliveries. Presets: `stripe`, `github`, `slack`, `generic`.
 
 Read `docs/guide/signed-webhooks.md` and `examples/signed-webhooks/`.
 
+Everything above is webhooks arriving **in**. For the other direction — letting
+your own users/customers register an endpoint and dispatching signed events to
+it — use `autumn_web::webhook_outbound`: `WebhookSubscription` (their endpoint,
+signing secret and subscribed topics), a pluggable `OutboundWebhookHandler`, and
+`WebhookOutboundManager` off `AppState`. The
+`autumn_webhook_delivery` job signs and POSTs it with retries and deactivation;
+dead-letter inspection and replay live under `/actuator/webhooks/*`.
+
+Two things to get right when generating this code:
+
+- **There is no default store.** `OutboundWebhookPlugin::new(store)` takes one as
+  a required argument. `InMemoryOutboundWebhookHandler` ships with the framework
+  but is process-local — subscriptions and delivery logs vanish on restart and
+  are not shared across replicas — so it is for tests, development and
+  single-process apps. Anything multi-replica needs a durable shared
+  implementation of the trait. (`OutboundWebhookStore` /
+  `InMemoryOutboundWebhookStore` are compatibility aliases; prefer the
+  `…Handler` names in new code.)
+- **`dispatch()` is not transactional.** It writes a delivery-log row per
+  subscription and *then* enqueues the job; no transaction spans the pluggable
+  store and the queue, so a crash between the two leaves a logged event that was
+  never enqueued. Do not present it to a user as an outbox guarantee, and do not
+  write a reconciler over the log table to claim one: a successful enqueue
+  writes no marker, so an enqueued row is indistinguishable from one whose
+  process died first, and a sweeper can only duplicate or drop. Implementing the
+  trait does not fix it either — `OutboundWebhookHandler` is storage-only and the
+  enqueue happens after it returns, so no impl can make the two atomic. If an app
+  needs a stronger guarantee, do NOT invent an exactly-once design here — the
+  answer depends on the job backend, the handler, and how the app sequences its
+  own transaction against `dispatch()`. Tell the user the constraints and let
+  them decide:
+    - `Ok` from `dispatch()` is not durability. The default
+      `jobs.backend = "local"` queue is in-process and non-durable, so a crash
+      loses it; durable delivery needs `postgres`/`redis` jobs AND a durable
+      `OutboundWebhookHandler`.
+    - No stable event or delivery ID is transmitted: nothing Autumn sends
+      distinguishes a first attempt from a retry of the same event, and the
+      `Autumn-Signature` header's `t=` is recomputed per attempt but is
+      neither unique nor stable — it is a whole-second `Utc::now().timestamp()`
+      and nothing guarantees two attempts differ. On the `local` backend they
+      routinely do not: equal jitter puts the first retry 500-1000 ms later, so
+      the same second yields a byte-identical signature. (`redis`/`postgres` do
+      not jitter and retry at the exact exponential delay — do not describe
+      jitter as backend-neutral.) (Do not enumerate
+      the headers — under `telemetry-otlp` the shared client also injects W3C
+      `traceparent`/`tracestate`.) Receiver-side deduplication needs an ID the
+      app mints into the payload itself.
+    - Retries duplicate only after the job is enqueued, so `dispatch()` is
+      neither at-least-once nor at-most-once. Idempotency buys protection from
+      duplicates, not from loss.
+  An enqueue that fails is the one handled case —
+  marked `is_dlq` and replayable — but only on the default enqueue path. With a
+  `WebhookDelegateExt` installed, `dispatch()` calls the delegate instead of
+  enqueuing and a delegate error is returned without marking the row, so a
+  failed delegated delivery never reaches the DLQ.
+
+Do not
+hand-roll outbound delivery with a bare HTTP client — the user-supplied
+destination URL is an SSRF sink (`docs/security/2026-09-03-webhook-ssrf/`), and
+the subsystem is where that is handled. Read
+`docs/guide/outbound-webhooks.md`.
+
 ## Mail CSS inlining — render styled in Gmail/Outlook (0.6.0)
 
 Gmail strips `<style>` in many contexts and Outlook (Word engine) ignores
@@ -1774,6 +1836,9 @@ for the common cases:
 | `infinite_feed(items, next_cursor, &FeedConfig)` / `feed_page(items, next_cursor, &FeedConfig)` | htmx infinite-scroll / "Load more" feed from a `CursorPage`: single `hx-get` sentinel carries the cursor and appends the next page in place (no reload, no duplicate rows). `FeedMode::{Reveal,Button}`; progressive `<a href>` fallback. `feed_page` is the append fragment a handler returns for each page (`page.next_cursor.as_deref()`) |
 | `bulk_actions_form(&BulkActionsConfig, csrf_token, csrf_field, submit_token, submit_field, content)` / `bulk_select_checkbox(id, &cfg)` / `bulk_actions_toolbar(&cfg)` | No-JS bulk-select + "Delete selected" over a list (#1312): wrap the list in `bulk_actions_form` (a `POST` form carrying the hidden CSRF and one-time submit-token fields plus the submit button), and put one `bulk_select_checkbox` — `name="ids"`, `aria-label="Select row <id>"` — in each row's first cell. Keep page furniture ("New …" link, search box) *outside* the form. Always pass the submit-token pair on a destructive form: a tokenless request passes through `SubmitTokenLayer` unguarded, so a double-click would re-run the whole batch. `BulkActionsConfig::new(action)` + `.field_name(..)`/`.submit_label(..)`/`.select_label(..)`. The toolbar emits no confirmation prompt: inline `onclick` confirms are blocked by the default `script-src 'self'` CSP, and `confirm_action` submits its own form so it cannot carry the selection — to confirm a batch, post it to an interstitial page that lists the rows and asks for a second submit. `autumn generate scaffold` wires all of this automatically |
 | `comment_thread(&cfg, &CommentView::from_thread(&nodes))` / `CommentThread::new(dom_id, action)` | The view half of `#[commentable]` (#1367): nested `<ol>` comment thread with a `<details>`-disclosed inline reply form on every node. Ordinary `<form method="post">` (works with scripting off) that also carries `hx-post`/`hx-target`/`hx-swap="outerHTML"` to swap the thread in place. Thread `.csrf_token(...)` and `.return_to(path)` for the no-JS round trip, `.max_depth(n)` so the UI never offers a reply the write path would `422`, `.read_only(Some(prompt))` for a signed-out visitor |
+| `active_search(id, label, &ActiveSearchConfig)` / `active_search_empty_state(msg)` | Search box whose results appear as the user types — htmx-driven, server-rendered Maud fragments; you author no JavaScript, but the page must load htmx. The handler returns the results fragment; `active_search_empty_state` is the no-matches body. Emits a `<noscript>` GET-form fallback (`docs/guide/active-search-and-autocomplete.md`) |
+| `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
+| `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 
 ### Whole-form rendering — `form_for` (0.6.0)

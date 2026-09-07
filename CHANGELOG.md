@@ -114,6 +114,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-upgrade), where automatic detection is ambiguous, every attribute macro
   additionally accepts an explicit `crate = "..."` override, e.g.
   `#[get("/x", crate = "autumn_web_05")]`.
+- **docs:** three guide pages a reader could not reach are now indexed in the
+  root `README.md`, and `scripts/check-docs-orphans.sh` keeps every guide page
+  reachable. The corpus already gated the three things a reader copies off a
+  page — the link they click (`check-docs-links.sh`), the command they run
+  (`check-docs-cli.sh`) and the `AUTUMN_*` variable they set
+  (`check-docs-config.sh`) — but all three check a page the reader already
+  reached. Nothing checked whether a page could be reached at all, and that
+  failure is the quietest of the four: no 404, no exit code, no ignored
+  override, just a reader concluding the feature does not exist. `docs/guide/`
+  has no index page of its own, so its 155 pages are found through the
+  hand-maintained `## Documentation` list and the skill indexes, and nothing
+  noticed when a page was left off both. The baseline run found
+  `time-zones.md`, `active-search-and-autocomplete.md` and
+  `outbound-webhooks.md` unreachable from every reader entry point. Making
+  `outbound-webhooks.md` reachable then surfaced eight wrong claims about
+  delivery semantics in it, corrected here — every symbol it named resolved in
+  the current source the whole time, which is what a structural gate can check
+  and is not the same as being right.
+  `outbound-webhooks.md` is the sharpest: the README indexed
+  `signed-webhooks.md` (webhooks coming *in*), so a reader searching it for
+  "webhook" concluded that was all there was and never found the page on
+  sending signed webhooks *out* to endpoints their own customers register — a
+  surface with a filed SSRF report against it, whose only two mentions anywhere
+  were that report and a `///` comment, neither of them clickable. The gate
+  walks the graph a reader can click rather than counting inbound mentions,
+  because the weaker question misses exactly that case; the new index entries
+  are written in the words a reader searches for ("time zone", "timezone",
+  "autocomplete", "typeahead", "as you type", "outbound webhooks"), none of
+  which appeared anywhere in the README before. Wired into the docs-only CI
+  job; no toolchain needed.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,

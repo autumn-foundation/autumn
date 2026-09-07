@@ -260,6 +260,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-config.sh --self-test && ./scripts/check-docs-config.sh
+      - name: Guide reachability gate
+        # The three gates above cover the link a reader clicks, the command they
+        # run, and the variable they set — every one of them checking a page the
+        # reader ALREADY REACHED. None can tell you whether a page is reachable
+        # at all, and that failure is quieter than any of the three: no 404, no
+        # exit code, no ignored override. The reader concludes the feature does
+        # not exist and goes and builds it themselves.
+        #
+        # `docs/guide/` has no index page of its own, so its 155 pages are
+        # discovered through the hand-maintained `## Documentation` list in
+        # README.md and the skill indexes — surfaces someone has to remember to
+        # update. Nothing noticed when they forgot. The baseline run found three
+        # pages unreachable from every reader entry point, all three ACCURATE:
+        # time-zones.md, active-search-and-autocomplete.md and
+        # outbound-webhooks.md. The last is the sharpest — README.md indexed
+        # signed-webhooks.md (webhooks coming in), so a reader searching it for
+        # "webhook" concluded that was all there was and never found the page on
+        # sending signed webhooks out to their own customers, a surface with a
+        # filed SSRF report against it.
+        #
+        # This walks the graph a reader can actually click rather than counting
+        # inbound mentions, because the weaker question misses the case worth
+        # catching: a page linked only from other unreachable pages.
+        # outbound-webhooks.md had two inbound mentions and was still
+        # unreachable.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-orphans.sh --self-test && ./scripts/check-docs-orphans.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
