@@ -290,7 +290,37 @@ def _key(name):
 
 
 _README_STRING = re.compile(
-    _key('readme') + r'=[ \t]*(?:"([^"]*)"|\'([^\']*)\')', re.M)
+    _key('readme') + r'=[ \t]*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\')', re.M)
+# A basic string carries ESCAPES, and Cargo decodes them before resolving the
+# path: `readme = "\\u0069ntro.md"` comes back out of `cargo metadata` as
+# `intro.md`. Returning the encoded source meant the tracked README was never
+# matched, so the crate contributed no entry surface at all. A literal string
+# takes no escapes — that is the whole difference between the two forms — so
+# only the basic group is decoded.
+_TOML_ESCAPE = re.compile(r'\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|(.))')
+_TOML_SIMPLE = {'b': '\b', 't': '\t', 'n': '\n', 'f': '\f', 'r': '\r',
+                '"': '"', '\\': '\\', '/': '/'}
+
+
+def _decode_basic(text):
+    """A TOML basic string's value, escapes resolved."""
+    def one(m):
+        if m.group(1) is not None:
+            return chr(int(m.group(1), 16))
+        if m.group(2) is not None:
+            return chr(int(m.group(2), 16))
+        # An unknown escape is invalid TOML; keeping the character is the
+        # reading that cannot invent a path Cargo would not resolve.
+        return _TOML_SIMPLE.get(m.group(3), m.group(3))
+    return _TOML_ESCAPE.sub(one, text)
+
+
+# Cargo auto-detects THREE filenames when `readme` is omitted, in this order,
+# taking the first that exists — confirmed against `cargo metadata`, which
+# reports `README.txt` for a package carrying only that. Hard-coding `README.md`
+# meant a crate whose landing page is one of the others contributed no root, so
+# a guide indexed only there was reported orphaned.
+_AUTO_README = ('README.md', 'README.txt', 'README')
 _README_BOOL = re.compile(_key('readme') + r'=[ \t]*(false|true)\b', re.M)
 # A fifth spelling, and the same silent failure: an INHERITED `readme` resolves
 # against the workspace root, not the member directory — `readme.workspace =
@@ -555,11 +585,17 @@ def _publishable(manifest):
     return True
 
 
-def _readme_path(manifest, pkg):
-    """The file Cargo publishes as this package's README, or None for no README.
+def _readme_paths(manifest, pkg):
+    """Files Cargo may publish as this package's README, best candidate first.
 
     `manifest` is the package's `[package]` table; `pkg` is the manifest's
-    directory. The returned path is repo-relative.
+    directory. Returned paths are repo-relative, and empty means the package
+    publishes no README at all.
+
+    More than one only for the auto-detect case, where Cargo takes the first of
+    `README.md`, `README.txt`, `README` that exists. The caller picks the first
+    that is TRACKED, which differs from Cargo only when an untracked file would
+    have won — and an untracked file carries no edges here anyway.
     """
     if _README_INHERITS.search(manifest):
         # Inherited values resolve against the workspace root, so both the
@@ -571,26 +607,30 @@ def _readme_path(manifest, pkg):
         pkg = ''
     m = _README_STRING.search(manifest)
     if m is not None:
-        # Whichever quote form matched; a literal string takes no escapes, so
-        # both groups are the path exactly as written.
-        named = m.group(1) if m.group(1) is not None else m.group(2)
+        # Only the BASIC form carries escapes; a literal string is its own
+        # value, which is the whole difference between the two.
+        named = ([_decode_basic(m.group(1))] if m.group(1) is not None
+                 else [m.group(2)])
     else:
         b = _README_BOOL.search(manifest)
         if b is not None and b.group(1) == 'false':
             # The explicit opt-out: the package is published with no README,
             # so no registry page renders one and nothing is an entry surface.
-            return None
+            return []
         # `readme = true` and an omitted key are the same instruction:
-        # auto-detect the `README.md` beside the manifest.
-        named = 'README.md'
-    # `posixpath.normpath`, not this file's `normalize`, which is defined
-    # far below — and stdlib is the right tool anyway: this resolves a
-    # manifest path, not a Markdown destination.
-    cand = posixpath.normpath(posixpath.join(pkg, named) if pkg else named)
-    # Outside its own package directory it is some other file's job.
-    if pkg and not cand.startswith(pkg + '/'):
-        return None
-    return cand
+        # auto-detect, which is three filenames rather than one.
+        named = list(_AUTO_README)
+    out = []
+    for name in named:
+        # `posixpath.normpath`, not this file's `normalize`, which is defined
+        # far below — and stdlib is the right tool anyway: this resolves a
+        # manifest path, not a Markdown destination.
+        cand = posixpath.normpath(posixpath.join(pkg, name) if pkg else name)
+        # Outside its own package directory it is some other file's job.
+        if pkg and not cand.startswith(pkg + '/'):
+            continue
+        out.append(cand)
+    return out
 
 
 def _crate_readme_roots():
@@ -604,9 +644,12 @@ def _crate_readme_roots():
         # renders a landing page and the README beside it is a plain waypoint.
         if package is None or not _publishable(package):
             continue
-        cand = _readme_path(package, posixpath.dirname(f))
-        if cand is not None and cand in tracked_set:
-            out.add(cand)
+        for cand in _readme_paths(package, posixpath.dirname(f)):
+            # First tracked candidate wins, which is Cargo's own "first that
+            # exists" over the files this corpus can actually carry edges from.
+            if cand in tracked_set:
+                out.add(cand)
+                break
     return out
 
 
@@ -7330,6 +7373,56 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mh/pkg/README.md"
   git -C "$c9mh" add -A && git -C "$c9mh" commit -qm quoted-readme-key
   check "a literal-quoted readme key is still readme" fail "$c9mh"
+
+  # A BASIC string carries escapes and Cargo decodes them before resolving the
+  # path — `cargo metadata` reports `intro.md` for this manifest. Returning the
+  # encoded source matched no tracked file, so the crate contributed no entry
+  # surface and the page it indexes was reported orphaned.
+  local c9mi="$tmp/c9mi"; make_corpus "$c9mi"
+  mkdir -p "$c9mi/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "\\u0069ntro.md"\n' > "$c9mi/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mi/pkg/intro.md"
+  git -C "$c9mi" add -A && git -C "$c9mi" commit -qm escaped-readme-path
+  check "an escaped readme path decodes to the same file" pass "$c9mi"
+
+  # ...but a LITERAL string takes no escapes, which is the whole difference
+  # between the forms: here the file really is named with a backslash-u, and
+  # decoding it would name a file that does not exist.
+  local c9mj="$tmp/c9mj"; make_corpus "$c9mj"
+  mkdir -p "$c9mj/pkg"
+  printf "[package]\nname = \"pkg\"\nreadme = '\\\\u0069ntro.md'\n" > "$c9mj/pkg/Cargo.toml"
+  printf '# Intro\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mj/pkg/\\u0069ntro.md"
+  git -C "$c9mj" add -A && git -C "$c9mj" commit -qm literal-no-escapes
+  check "a literal readme path is not unescaped" pass "$c9mj"
+
+  # Cargo auto-detects three filenames, not one: with no `readme` key and no
+  # `README.md`, `README.txt` is the published landing page — `cargo metadata`
+  # reports it. Hard-coding `README.md` found no root and orphaned the page.
+  local c9mk="$tmp/c9mk"; make_corpus "$c9mk"
+  mkdir -p "$c9mk/pkg"
+  printf '[package]\nname = "pkg"\n' > "$c9mk/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mk/pkg/README.txt"
+  git -C "$c9mk" add -A && git -C "$c9mk" commit -qm autodetect-readme-txt
+  check "auto-detection finds README.txt" pass "$c9mk"
+
+  # ...and the extensionless spelling, last in Cargo's order.
+  local c9ml="$tmp/c9ml"; make_corpus "$c9ml"
+  mkdir -p "$c9ml/pkg"
+  printf '[package]\nname = "pkg"\n' > "$c9ml/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ml/pkg/README"
+  git -C "$c9ml" add -A && git -C "$c9ml" commit -qm autodetect-readme-bare
+  check "auto-detection finds an extensionless README" pass "$c9ml"
+
+  # ...in Cargo's ORDER, which is what makes this three candidates rather than
+  # three roots: `README.md` wins, so a link that only `README.txt` carries is
+  # not a route and the page stays orphaned.
+  local c9mm="$tmp/c9mm"; make_corpus "$c9mm"
+  mkdir -p "$c9mm/pkg"
+  printf '[package]\nname = "pkg"\n' > "$c9mm/pkg/Cargo.toml"
+  printf '# Pkg\n\ntext\n' > "$c9mm/pkg/README.md"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mm/pkg/README.txt"
+  git -C "$c9mm" add -A && git -C "$c9mm" commit -qm autodetect-order
+  check "auto-detection stops at the first match" fail "$c9mm"
 
   # There is deliberately NO test here for a `#` inside a quoted registry name
   # (`publish = ["reg#1"]`). One was written and deleted: it passed against a
