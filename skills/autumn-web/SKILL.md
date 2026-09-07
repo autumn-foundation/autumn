@@ -2677,6 +2677,7 @@ autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/Mi
 autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
 autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
+autumn db scrub --sample users=1% --seed 42            # scrub AND subset in one pass: 1% of users plus every row they relate to, reproducibly
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
@@ -2905,10 +2906,11 @@ prunes to the newest N runs. `autumn db restore <ARTIFACT> [--shard NAME]
 same production guard as `db drop` (refuses non-dev/test without `--force`). See
 `docs/guide/deployment.md`.
 
-### `autumn db scrub` (issue #1602)
+### `autumn db scrub` (issues #1602, #1636)
 
 `autumn db scrub [--artifact ARTIFACT] [--output DIR] [--config PATH] [--check]
-[--dry-run] [--force]` turns a production database — or an `autumn db backup`
+[--dry-run] [--force] [--sample TABLE=COUNT|PERCENT%] [--seed N]` turns a
+production database — or an `autumn db backup`
 artifact restored into the resolved target — into an anonymized copy safe for
 staging/dev. It rewrites every PII-classified column with deterministic,
 constraint-valid fake values, resolving the target(s) exactly like `db backup`
@@ -2976,8 +2978,34 @@ database's statements run in one transaction.
 
 `--check` classifies and writes nothing, exiting non-zero on any unclassified
 column — run it in CI after the migrate step. `--dry-run` prints the exact SQL.
-`--output DIR` re-dumps the scrubbed database as a fresh backup run. See
-`docs/guide/data-scrubbing.md`.
+`--output DIR` re-dumps the scrubbed database as a fresh backup run.
+
+**Sampling (#1636).** `--sample users=1%` (or `users=500`, repeatable) emits a
+referentially-intact SUBSET instead of the whole copy, so a production copy fits
+on a laptop. From the named roots the walk follows the database's own foreign key
+graph: it **descends** into rows that reference a selected row (that is "1% of
+users plus all their data") and **ascends** into rows a selected row references
+so every foreign key resolves — but never descends back out of a row it only
+ascended into, or one shared org would drag the whole database back in. Two rules
+sit beside the PII declaration: `[sample] always_include` copies reference data
+whole (and is never descended from), `never_include` drops a table entirely.
+Selection is deterministic — ordered by a hash of `--seed` (default `0`) and the
+row key — so the same seed reproduces the identical subset.
+
+The subset is a phase of the scrub's own transaction, never a separate command,
+so no flag combination emits sampled-but-unscrubbed rows. It is fail-closed like
+the classification and aborts before removing a row when it cannot prove the
+result: a table no root can reach (being *connected* is not enough — see the
+descend rule above), a foreign key into a `never_include` table, a table with no
+primary key, a reference cycle among the tables it deletes from, or a table
+outside the sample that references one it subsets (empty that one with
+`[framework] purge`). Every foreign key is re-counted inside the transaction, so
+a violation rolls the run back, and each run reports per-table row counts and the
+size once the subsetted tables are compacted with `VACUUM (FULL, ANALYZE)`.
+`--check` proves the plan on a sample too. The amount is **per target**: with
+shards, `--sample users=500` selects up to 500 rows from each database.
+
+See `docs/guide/data-scrubbing.md`.
 
 ### `[retention]` + `autumn db retention` (0.7.0, issue #1605)
 
