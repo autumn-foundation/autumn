@@ -1442,6 +1442,68 @@ async fn sampling_refuses_a_table_no_root_can_reach() {
     );
 }
 
+/// A trigger that writes PII into a purged table AFTER the rewrites must not
+/// leave it there.
+///
+/// `[framework] purge` runs early so the sample's deletes are possible, but an
+/// `UPDATE` trigger on a scrubbed table copies `OLD` values — the real PII —
+/// into its audit table while the rewrites run, long after that early pass. The
+/// purge after the rewrites is what makes the guarantee true; without it the run
+/// reports `autumn_jobs (emptied)` while the original addresses sit in it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "purge_trigger").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            CREATE FUNCTION audit_user() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO autumn_jobs (args) VALUES (OLD.email); \
+                RETURN NEW; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER users_audit BEFORE UPDATE ON users \
+                FOR EACH ROW EXECUTE FUNCTION audit_user();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/purge_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the trigger's rows must be purged after the rewrites, not before them"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM autumn_jobs WHERE args LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "no original address may survive in the purged table"
+    );
+}
+
 /// A purge the sample's own emptied rows reference has to wait for the sample.
 ///
 /// `[framework] purge` runs at the START of the transaction so a framework table

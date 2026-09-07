@@ -84,7 +84,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table) is refused up front, as is a purge one edge needs before the sample and
   another needs after it; a deferred purge also carries the purges it references
   into the same phase, so the split never separates two framework tables that
-  reference each other. A foreign key declared on a partition rather than
+  reference each other. The purge also runs a final pass AFTER the column
+  rewrites, which is the pass the guarantee rests on: an audit trigger on a
+  scrubbed table can copy `OLD` values — the original PII — into a purged table
+  while the rewrites run, so a purge that ran only beforehand would report the
+  table emptied while it held real data. A foreign key declared on a partition rather than
   cloned onto it from its partitioned parent is likewise refused, rather than
   dropped from the walk and the integrity re-check as if it were a clone. The
   re-check honours each constraint's own NULL rule, so a partly-NULL composite

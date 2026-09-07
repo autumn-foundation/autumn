@@ -3537,11 +3537,18 @@ fn execute(
         // sampled one is already empty when the sample removes its parents —
         // except the ones the plan defers, which are the mirror image: a table
         // the sample empties references them, so they have to wait for it.
+        //
+        // These early passes exist to make the DELETEs possible, not to make the
+        // guarantee true: the authoritative pass is the one after the rewrites,
+        // because a trigger on a scrubbed table can write fresh rows — carrying
+        // the very PII being removed — into a purged table after these run.
+        // Rows removed are accumulated across all passes and reported once.
         let no_deferral = BTreeSet::new();
         let deferred: &BTreeSet<String> = sampling.map_or(&no_deferral, |s| &s.purge_after);
+        let mut purged_rows: BTreeMap<&str, usize> = BTreeMap::new();
         for (table, statement) in purges.iter().filter(|(t, _)| !deferred.contains(t)) {
             let rows = sql_query(statement).execute(conn)?;
-            counts.push((format!("{table} (emptied)"), rows));
+            *purged_rows.entry(table.as_str()).or_default() += rows;
         }
         // Then the subset, so the rewrites below touch only the rows that
         // survive it — and so no combination of flags can commit a row that was
@@ -3554,7 +3561,7 @@ fn execute(
         // runs every purge in the single pass above.
         for (table, statement) in purges.iter().filter(|(t, _)| deferred.contains(t)) {
             let rows = sql_query(statement).execute(conn)?;
-            counts.push((format!("{table} (emptied)"), rows));
+            *purged_rows.entry(table.as_str()).or_default() += rows;
         }
         for table in &plan.tables {
             if let Some(sql) = &table.sql {
@@ -3565,6 +3572,19 @@ fn execute(
                 let rows = rewrite_encrypted_column(conn, &table.table, &table.row_key, rewrite)?;
                 counts.push((format!("{}.{}", table.table, rewrite.column), rows));
             }
+        }
+        // The authoritative purge, after every rewrite. An `UPDATE` trigger on a
+        // scrubbed table — or a `DELETE` trigger fired by the sample — can copy
+        // `OLD` values into an audit or history table, so a purge that ran only
+        // before those would report a table emptied while it holds rows carrying
+        // the original PII. Emptying again here is what makes `[framework]
+        // purge` mean what it says; the passes above only order the deletes.
+        for (table, statement) in purges {
+            let rows = sql_query(statement).execute(conn)?;
+            *purged_rows.entry(table.as_str()).or_default() += rows;
+        }
+        for (table, rows) in purged_rows {
+            counts.push((format!("{table} (emptied)"), rows));
         }
         // Inside the transaction, so a refresh the role is not allowed to run
         // rolls the rewrites back rather than committing base tables that a
