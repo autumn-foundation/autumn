@@ -152,9 +152,9 @@ grep -rn "deny-sqlite" .github/workflows/ci.yml scripts/check-advisories.sh
 git log origin/trunk-dev --diff-filter=A --format='%h %ad %s' --date=short \
   -- deny.toml deny-sqlite.toml
 
-# The three commits since that correctly kept the shared sections in sync,
-# and the three that correctly touched only deny.toml (a [graph].features-only
-# change, which the invariant excludes)
+# The creation commit plus the two post-creation commits that correctly kept
+# the shared sections in sync, and the three that correctly touched only
+# deny.toml (a [graph].features-only change, which the invariant excludes)
 git log origin/trunk-dev --format='%h %ad %s' --date=short -- deny.toml deny-sqlite.toml
 git show --stat --format='' <sha> -- deny.toml deny-sqlite.toml   # per commit above
 
