@@ -916,6 +916,19 @@ path = "tests/sqlite_dependent_destroy.rs"
 name = "sqlite_read_only_tx"
 path = "tests/sqlite_read_only_tx.rs"
 
+# DB-backed sessions store on SQLite (issue #1908): the `generate auth` tracked-
+# sessions store binds `::autumn_web::RuntimeBackend` instead of `diesel::pg::Pg`,
+# so it accepts the SQLite `RuntimeConnection`. Mirrors the generated DDL, schema
+# block and store functions and runs them against a real SQLite database — login
+# tracking, the revocation gate, `last_seen_at` refresh, rotation rebinding, and
+# the three revoke paths. Only meaningful under `--features sqlite`; the file is
+# `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an empty
+# (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features sqlite --test sqlite_tracked_sessions`.
+[[test]]
+name = "sqlite_tracked_sessions"
+path = "tests/sqlite_tracked_sessions.rs"
+
 # Explicit-URL pool proof for the SQLite test harness (issue #1614, Codex P2):
 # `TestApp::with_transactional_db("sqlite:...")` must build a real (plain, non-
 # transactional) SQLite pool from the recorded URL instead of dropping it and
