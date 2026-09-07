@@ -248,6 +248,13 @@ pub enum ScrubError {
         /// `child (inherits parent)` descriptions, sorted.
         tables: Vec<String>,
     },
+    /// The connection is in a `session_replication_role` other than `origin`,
+    /// where `ENABLE REPLICA` triggers and rules fire and ordinary ones do not
+    /// — inverting the enablement rule every hazard check here is built on.
+    ReplicaSessionRole {
+        /// The role the connection reports.
+        role: String,
+    },
     /// A table this run promises to empty carries a user-defined trigger or
     /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
     /// write, so anything it writes lands after every rewrite and is never
@@ -500,6 +507,16 @@ impl std::fmt::Display for ScrubError {
                  from it.",
                 tables.len(),
                 bullet_list(tables),
+            ),
+            Self::ReplicaSessionRole { role } => write!(
+                f,
+                "This connection runs with `session_replication_role = {role}`, not `origin`.\n  \
+                 That inverts which hooks fire: a trigger or rule marked `ENABLE REPLICA` runs \
+                 and an ordinary one does not, so every check here that asks whether a `DELETE` \
+                 can execute code is answering for the wrong session. A replica-only archive \
+                 trigger on a table this run empties would copy the rows it removes into a \
+                 table nothing verifies, past a refusal that never saw it. Connect without \
+                 `options=-c session_replication_role=...`, or reset it before scrubbing.",
             ),
             Self::EmptyingTriggerLeak { tables } => write!(
                 f,
@@ -1112,7 +1129,7 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
         // A partition's rows are rewritten through its parent, so planning it
         // again would double-update them (and, on a table with no primary key,
         // re-randomize the values the parent pass just wrote).
-        if inputs.facts.partitions.contains(&table.name) {
+        if inputs.facts.partitions.contains_key(&table.name) {
             continue;
         }
         let rule = inputs.config.tables.get(&table.name);
@@ -2446,6 +2463,15 @@ fn classify_and_apply(
             return Err(ScrubError::RowLevelSecurity { tables: rls });
         }
 
+        // Before any hazard check that reads `tgenabled` or `ev_enabled`: in
+        // replica mode those columns mean the opposite of what the checks
+        // assume, so their answers cannot be trusted at all.
+        if facts.replication_role != "origin" {
+            return Err(ScrubError::ReplicaSessionRole {
+                role: facts.replication_role,
+            });
+        }
+
         // The emptying pass runs LAST — after every column rewrite — because
         // that is the only order in which "this table ends up empty" survives a
         // rewrite trigger re-filling it. The cost is that its own `DELETE`
@@ -2524,7 +2550,7 @@ fn classify_and_apply(
             // transaction against whichever database the session happens to be
             // connected to — sampling one of them repeatedly, with row counts
             // taken from the others, and leaving the rest untouched.
-            eprintln!("  {}", psql_connect(url));
+            eprintln!("  {}", psql_connect(label, url));
             eprintln!("  BEGIN;");
             // The same session pins `execute` sets, before anything reads or
             // writes: without them a role-level `search_path` resolves the
@@ -2703,7 +2729,7 @@ fn build_sample_plan_for(
     // twice, exactly as `build_plan` skips it for the rewrites.
     let universe: Vec<(String, Vec<String>)> = tables
         .iter()
-        .filter(|t| !facts.partitions.contains(&t.name))
+        .filter(|t| !facts.partitions.contains_key(&t.name))
         .map(|t| (t.name.clone(), t.primary_key.clone()))
         .collect();
     let framework: BTreeSet<String> = facts.framework_tables.iter().cloned().collect();
@@ -3034,9 +3060,11 @@ pub struct DatabaseFacts {
     /// Columns covered by a `NULLS NOT DISTINCT` unique index, where more than
     /// one `NULL` is itself a uniqueness violation.
     pub nulls_not_distinct_columns: BTreeSet<(String, String)>,
-    /// Tables that are partitions of another table. Their rows are rewritten
-    /// through the parent, so planning them again double-updates.
-    pub partitions: BTreeSet<String>,
+    /// Tables that are partitions, each mapped to the top-level table it
+    /// belongs to. Their rows are rewritten through that parent, so planning
+    /// them again double-updates — and the mapping also says whose role decides
+    /// whether a key declared on a leaf can be ignored.
+    pub partitions: BTreeMap<String, String>,
     /// Tables with row-level security enabled. A non-bypassing role silently
     /// updates only the rows its policies expose — a fail-open a scrub cannot
     /// tolerate.
@@ -3047,6 +3075,10 @@ pub struct DatabaseFacts {
     /// Tables carrying user-defined triggers, which can copy pre-scrub values
     /// into another table mid-scrub.
     pub triggered_tables: BTreeSet<String>,
+    /// The connection's `session_replication_role`. Anything but `origin`
+    /// inverts which triggers and rules fire, so the hazard checks below would
+    /// be answering for a session the run is not in.
+    pub replication_role: String,
     /// The subset of those whose triggers fire on `DELETE`. The run's emptying
     /// pass is its last write, so a trigger here fires after every rewrite and
     /// can put pre-scrub values into a table already scrubbed.
@@ -3130,6 +3162,14 @@ struct ConstraintRow {
     /// declared directly on a partition is NOT a clone and must not be dropped.
     #[diesel(sql_type = diesel::sql_types::Bool)]
     cloned: bool,
+}
+
+/// A `(tbl, col)` probe read as a map rather than a set of pairs.
+fn pair_rows(sql: &str, conn: &mut PgConnection) -> Result<BTreeMap<String, String>, ScrubError> {
+    let rows: Vec<PairRow> = sql_query(sql)
+        .load(conn)
+        .map_err(|e| ScrubError::Sql(e.to_string()))?;
+    Ok(rows.into_iter().map(|r| (r.tbl, r.col)).collect())
 }
 
 fn pair_set(rows: Vec<PairRow>) -> BTreeSet<(String, String)> {
@@ -3385,18 +3425,30 @@ fn probe_database_facts(
         Ok(rows.into_iter().map(|r| r.name).collect())
     };
 
-    let partitions = if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
-        names(
-            "SELECT rel.relname AS name FROM pg_class rel \
-             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             WHERE rel.relispartition AND rel.relkind IN ('r', 'p', 'f')",
-            &mut conn,
-        )?
-        .into_iter()
-        .collect()
-    } else {
-        BTreeSet::new()
-    };
+    // Each partition mapped to the top-level table it belongs to, not just
+    // named: a key declared on a leaf is unrepresentable in general, but
+    // harmless when the run empties that leaf's whole tree, and only the
+    // mapping can tell the two apart.
+    let partitions: BTreeMap<String, String> =
+        if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
+            pair_rows(
+                "WITH RECURSIVE up AS ( \
+               SELECT rel.oid, rel.oid AS leaf FROM pg_class rel \
+               JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+               WHERE rel.relispartition AND rel.relkind IN ('r', 'p', 'f') \
+               UNION ALL \
+               SELECT i.inhparent, up.leaf FROM pg_inherits i JOIN up ON up.oid = i.inhrelid \
+             ) \
+             SELECT DISTINCT leafrel.relname AS tbl, rootrel.relname AS col \
+             FROM up \
+             JOIN pg_class leafrel ON leafrel.oid = up.leaf \
+             JOIN pg_class rootrel ON rootrel.oid = up.oid \
+             WHERE NOT rootrel.relispartition",
+                &mut conn,
+            )?
+        } else {
+            BTreeMap::new()
+        };
 
     // A declarative partition is also a `pg_inherits` child, so the partition
     // case is excluded explicitly — those the sample models through the parent
@@ -3442,6 +3494,18 @@ fn probe_database_facts(
     // `tgtype` bit 3 is the DELETE event. These are the ones that matter for
     // the run's last write, so the refusal can name exactly the tables that
     // carry one rather than every table carrying any trigger at all.
+    // Read rather than pinned: `session_replication_role` needs privileges an
+    // ordinary scrub role does not have — measured, a non-superuser cannot set
+    // it even to its own default — so `SET LOCAL` would break every unprivileged
+    // run to close a hazard only a privileged one can create.
+    let replication_role = names(
+        "SELECT current_setting('session_replication_role') AS name",
+        &mut conn,
+    )?
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| "origin".to_owned());
+
     // Rules are the other way a `DELETE` runs code the plan never saw. Unlike a
     // trigger they fire only on the relation the statement NAMES — measured on
     // PostgreSQL 16: a rule on a leaf partition or an inheritance child does not
@@ -3552,6 +3616,7 @@ fn probe_database_facts(
         rls_tables,
         legacy_inheritance,
         triggered_tables,
+        replication_role,
         delete_triggered_tables,
         materialized_views,
         other_schemas,
@@ -3695,13 +3760,13 @@ fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> V
 /// Only the password is removed. If it cannot be removed with certainty the
 /// line is not emitted at all: a comment naming the target is a lesser failure
 /// than a printed credential.
-fn psql_connect(url: &str) -> String {
+fn psql_connect(label: &str, url: &str) -> String {
     password_free_conninfo(url).map_or_else(
         || {
             format!(
-                "-- connect to the {} target yourself before running the block below; \
-                 its connection string could not be printed without its password",
-                parsed_db_name(url)
+                "-- connect to the {label} target yourself before running the block \
+                 below; its connection string is in keyword form, which cannot be \
+                 printed without risking its password"
             )
         },
         |conninfo| {
@@ -3722,40 +3787,30 @@ fn psql_connect(url: &str) -> String {
 const SECRET_KEYWORDS: [&str; 2] = ["password", "sslpassword"];
 
 /// `url` with every password removed, or `None` if that cannot be guaranteed.
+///
+/// Only the URI form is handled. Keyword form (`host=db password = secret`)
+/// looks tokenizable and is not: `libpq` allows whitespace around the `=`, and
+/// values may be single-quoted with backslash escapes, so "split on whitespace
+/// and drop the secret tokens" has now been wrong twice in a row — once for a
+/// quoted value, once for a spaced `=`. Rather than reach for a third
+/// tokenizer, that form is declined outright, which makes the promise above
+/// true by construction instead of by enumerating the ways it can be written.
 fn password_free_conninfo(url: &str) -> Option<String> {
-    if let Ok(mut parsed) = url::Url::parse(url) {
-        // `set_password` returns Err only for a URL that cannot have one
-        // (`mailto:` and friends), which a connection string is not.
-        parsed.set_password(None).ok()?;
-        let kept: Vec<(String, String)> = parsed
-            .query_pairs()
-            .filter(|(key, _)| !is_secret_keyword(key))
-            .map(|(key, value)| (key.into_owned(), value.into_owned()))
-            .collect();
-        if kept.is_empty() {
-            parsed.set_query(None);
-        } else {
-            parsed.query_pairs_mut().clear().extend_pairs(kept);
-        }
-        return Some(parsed.into());
+    let mut parsed = url::Url::parse(url).ok()?;
+    // `set_password` returns Err only for a URL that cannot have one
+    // (`mailto:` and friends), which a connection string is not.
+    parsed.set_password(None).ok()?;
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| !is_secret_keyword(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if kept.is_empty() {
+        parsed.set_query(None);
+    } else {
+        parsed.query_pairs_mut().clear().extend_pairs(kept);
     }
-    // Keyword form: `host=... dbname=... password=...`. Dropping a secret token
-    // is only sound while no value is quoted or escaped, because a quoted value
-    // may itself contain whitespace — so anything carrying a quote or a
-    // backslash is refused rather than guessed at.
-    if url.contains('\'') || url.contains('"') || url.contains('\\') {
-        return None;
-    }
-    Some(
-        url.split_whitespace()
-            .filter(|token| {
-                token
-                    .split_once('=')
-                    .is_none_or(|(key, _)| !is_secret_keyword(key))
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    Some(parsed.into())
 }
 
 /// Whether a connection-string keyword carries a credential. Compared without
@@ -4180,7 +4235,10 @@ mod tests {
         // A bare `\\connect dbname` inherits host, port and user, so a fleet whose
         // shards share a database name on different servers would keep running
         // against the first one while looking like it had moved.
-        let line = super::psql_connect("postgres://scrubby:hunter2@db1.internal:6543/app");
+        let line = super::psql_connect(
+            "control",
+            "postgres://scrubby:hunter2@db1.internal:6543/app",
+        );
         assert!(
             line.starts_with(r#"\connect -reuse-previous=off ""#),
             "the boundary must inherit nothing from the previous connection: {line}"
@@ -4198,29 +4256,50 @@ mod tests {
         // parameter overrides the authority component it duplicates, so an
         // endpoint reassembled from the URL's own host would name the wrong
         // database on the header of destructive SQL.
-        let overridden = super::psql_connect("postgres://authority/app?host=queryhost&dbname=copy");
+        let overridden = super::psql_connect(
+            "control",
+            "postgres://authority/app?host=queryhost&dbname=copy",
+        );
         assert!(
             overridden.contains("host=queryhost") && overridden.contains("dbname=copy"),
             "an override must survive into the printed boundary: {overridden}"
         );
 
-        // Keyword form carries no authority at all, so rebuilding produced
-        // nothing but defaults.
-        let keyword = super::psql_connect("host=db2.internal dbname=app password=hunter2");
-        assert!(
-            keyword.contains("db2.internal") && !keyword.contains("hunter2"),
-            "keyword form must survive without its password: {keyword}"
-        );
+        // Keyword form is declined outright rather than tokenized. `libpq`
+        // allows whitespace around the `=` and single-quoted values with
+        // backslash escapes, so a whitespace split reads `password = secret` as
+        // three unrelated tokens and prints the credential — which is exactly
+        // what two successive tokenizers here got wrong.
+        for keyword in [
+            "host=db2.internal dbname=app password=hunter2",
+            "host=db2.internal dbname=app password = hunter2",
+            "host=db2 password='two words' dbname=app",
+        ] {
+            let line = super::psql_connect("control", keyword);
+            assert!(
+                !line.contains("hunter2") && !line.contains("two words"),
+                "no keyword form may print its password: {line}"
+            );
+            assert!(
+                !line.contains("\\connect"),
+                "and none may claim to move the session: {line}"
+            );
+            assert!(
+                line.contains("control"),
+                "the operator must still be told which target it was: {line}"
+            );
+        }
 
         // A URI carries the password two ways, and the query form is the
         // EFFECTIVE one where both appear — so clearing the userinfo alone
         // prints the credential that actually authenticates.
-        let in_query = super::psql_connect("postgres://bob@db/app?password=secret2");
+        let in_query = super::psql_connect("control", "postgres://bob@db/app?password=secret2");
         assert!(
             !in_query.contains("secret2"),
             "a query-string password must be stripped too: {in_query}"
         );
         let both = super::psql_connect(
+            "control",
             "postgres://alice:secret1@db/app?password=secret2&sslpassword=k3y&application_name=x",
         );
         assert!(
@@ -4230,19 +4309,6 @@ mod tests {
         assert!(
             both.contains("application_name=x"),
             "and every non-secret parameter must stay: {both}"
-        );
-        let keyword_ssl = super::psql_connect("host=db sslpassword=k3y dbname=app");
-        assert!(
-            !keyword_ssl.contains("k3y") && keyword_ssl.contains("dbname=app"),
-            "keyword form carries the same secrets: {keyword_ssl}"
-        );
-
-        // A quoted keyword value cannot be split on whitespace with certainty,
-        // so nothing is printed rather than risking the credential.
-        let quoted = super::psql_connect("host=db2 password='two words' dbname=app");
-        assert!(
-            !quoted.starts_with("\\connect") && !quoted.contains("two words"),
-            "an unsplittable conninfo must degrade to a comment: {quoted}"
         );
     }
 
@@ -5031,7 +5097,7 @@ mod tests {
         let mut partition = users_table();
         partition.name = "users_2026_01".to_owned();
         let facts = DatabaseFacts {
-            partitions: BTreeSet::from(["users_2026_01".to_owned()]),
+            partitions: BTreeMap::from([("users_2026_01".to_owned(), "users".to_owned())]),
             ..DatabaseFacts::default()
         };
         let config = parse_config_str(

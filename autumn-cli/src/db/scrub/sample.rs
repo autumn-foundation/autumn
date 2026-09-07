@@ -507,7 +507,8 @@ pub struct SampleInputs<'a> {
     /// Partitions of a partitioned table. Their rows are selected and removed
     /// through the parent, and their foreign keys are clones of the parent's,
     /// so an edge naming one is skipped rather than double-counted.
-    pub partitions: &'a BTreeSet<String>,
+    /// Each partition mapped to the top-level table it belongs to.
+    pub partitions: &'a BTreeMap<String, String>,
 }
 
 /// Parse one `--sample <table>=<count|percent%>` argument.
@@ -831,6 +832,55 @@ fn check_key_arity(foreign_keys: &[ForeignKeyConstraint]) -> Result<(), SampleEr
     Err(SampleError::KeyArityMismatch { keys })
 }
 
+/// What to do with an edge that names a partition.
+enum PartitionVerdict {
+    /// Not a partition edge at all — carry on classifying it.
+    Classify,
+    /// A key the plan cannot express.
+    Refuse,
+    /// Expressible or not, it cannot matter: the run empties every row on the
+    /// side that would reference anything.
+    Ignore,
+}
+
+/// Whether an edge naming a partition can be planned, must be refused, or is
+/// moot.
+///
+/// A constraint cloned from a partitioned parent was already dropped by the
+/// caller, which tells a clone from a partition-local key by its catalog
+/// parentage. Anything still naming a partition is declared on that partition
+/// alone — which the plan cannot express, because it keys every partition's
+/// rows on the parent.
+///
+/// Unless the run empties the CHILD's whole tree. `DELETE FROM parent` takes
+/// every leaf row with it, so an outgoing key from an excluded leaf has nothing
+/// left to dangle and nothing worth walking — and refusing it would advertise
+/// `never_include` as the remedy for a schema `never_include` cannot rescue.
+/// Only the child side qualifies: emptying the table a key POINTS AT is the
+/// dangling case, not this one.
+fn partition_verdict(
+    inputs: &SampleInputs<'_>,
+    roles: &BTreeMap<String, SampleRole>,
+    edge: &ForeignKeyConstraint,
+) -> PartitionVerdict {
+    let excluded_leaf = |table: &String| {
+        inputs
+            .partitions
+            .get(table)
+            .and_then(|root| roles.get(root))
+            .is_some_and(|role| *role == SampleRole::NeverInclude)
+    };
+    if excluded_leaf(&edge.child_table) {
+        return PartitionVerdict::Ignore;
+    }
+    if inputs.partitions.contains_key(&edge.child_table)
+        || inputs.partitions.contains_key(&edge.parent_table)
+    {
+        return PartitionVerdict::Refuse;
+    }
+    PartitionVerdict::Classify
+}
+
 fn classify_edges(
     inputs: &SampleInputs<'_>,
     roles: &BTreeMap<String, SampleRole>,
@@ -854,16 +904,13 @@ fn classify_edges(
     let mut verify_only: Vec<ForeignKeyConstraint> = Vec::new();
     let mut internal = Vec::new();
     for edge in inputs.foreign_keys {
-        // A constraint cloned from a partitioned parent was already dropped by
-        // the caller, which can tell a clone from a partition-local key by its
-        // catalog parentage. Anything still naming a partition is therefore
-        // declared on that partition alone — an edge the plan cannot express,
-        // because it keys every partition's rows on the parent.
-        if inputs.partitions.contains(&edge.child_table)
-            || inputs.partitions.contains(&edge.parent_table)
-        {
-            partition_local.push(describe(edge));
-            continue;
+        match partition_verdict(inputs, roles, edge) {
+            PartitionVerdict::Refuse => {
+                partition_local.push(describe(edge));
+                continue;
+            }
+            PartitionVerdict::Ignore => continue,
+            PartitionVerdict::Classify => {}
         }
         let child = roles.get(&edge.child_table);
         let parent = roles.get(&edge.parent_table);
@@ -2002,7 +2049,7 @@ mod tests {
             foreign_keys,
             framework_tables: &BTreeSet::new(),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
     }
 
@@ -2372,7 +2419,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap_err();
         assert_eq!(
@@ -2499,7 +2546,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap_err();
         assert_eq!(
@@ -2524,7 +2571,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert!(
@@ -2572,7 +2619,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert_eq!(
@@ -2613,7 +2660,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &framework,
             purged: &framework,
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert_eq!(
@@ -2661,7 +2708,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &framework,
             purged: &framework,
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap_err();
         let SampleError::PurgeOrderContradiction { tables } = err else {
@@ -2688,7 +2735,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert_eq!(
@@ -2711,7 +2758,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap_err();
         assert!(
@@ -2733,7 +2780,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::new(),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert_eq!(role_of(&plan, "comments"), SampleRole::Related);
@@ -2765,7 +2812,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap_err();
         let SampleError::PurgeOrderContradiction { tables } = err else {
@@ -2793,7 +2840,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert!(plan.purge_after.is_empty());
@@ -2820,7 +2867,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap_err();
         let SampleError::RetainedReferencesPurged { edges } = err else {
@@ -2843,7 +2890,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert!(plan.purge_after.is_empty());
@@ -2874,7 +2921,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::new(),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::from(["comments_2026".to_owned()]),
+            partitions: &BTreeMap::from([("comments_2026".to_owned(), "comments".to_owned())]),
         })
         .unwrap_err();
         let SampleError::PartitionLocalForeignKey { edges } = err else {
@@ -2897,7 +2944,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::new(),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::from(["comments_2026".to_owned()]),
+            partitions: &BTreeMap::from([("comments_2026".to_owned(), "comments".to_owned())]),
         })
         .unwrap();
         assert!(
@@ -2979,7 +3026,7 @@ mod tests {
                 foreign_keys: &keys,
                 framework_tables: &BTreeSet::new(),
                 purged: &BTreeSet::new(),
-                partitions: &BTreeSet::new(),
+                partitions: &BTreeMap::new(),
             })
             .unwrap()
             .seed_statements(&counts)
@@ -3347,7 +3394,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert!(
@@ -3359,6 +3406,61 @@ mod tests {
         assert!(
             plan.walk_edges.iter().all(|e| e.name != "countries_job_fk"),
             "but it must not enter the walk"
+        );
+    }
+
+    #[test]
+    fn an_outgoing_key_from_an_excluded_partition_leaf_is_not_refused() {
+        // The refusal's own advice is to drop the table with `never_include` —
+        // so it must not fire on a schema that has already done that. Emptying
+        // the partitioned parent takes every leaf row with it, leaving the key
+        // nothing to dangle and nothing to walk.
+        // A partition is absent from `tables`: the caller plans its rows through
+        // the parent, exactly as `build_sample_plan_for` filters them out.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "leaf_lookup_fk",
+            "audit_logs_p0",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let partitions = BTreeMap::from([("audit_logs_p0".to_owned(), "audit_logs".to_owned())]);
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &partitions,
+        })
+        .expect("an excluded leaf's outgoing key must not be refused");
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "leaf_lookup_fk"),
+            "and it must not enter the walk either"
+        );
+
+        // The same key with the parent NOT excluded is still refused: the plan
+        // keys a partition's rows on its parent and cannot express one binding
+        // a single leaf.
+        let mut kept = fixture_rules();
+        kept.never_include.clear();
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &kept,
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &partitions,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, SampleError::PartitionLocalForeignKey { .. }),
+            "a leaf whose rows survive must still be refused: {err}"
         );
     }
 
@@ -3441,7 +3543,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert!(
@@ -3482,7 +3584,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         let locked = plan.locked_tables();
@@ -3524,7 +3626,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert!(
@@ -3553,7 +3655,7 @@ mod tests {
             foreign_keys: &keys,
             framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
             purged: &BTreeSet::new(),
-            partitions: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
         })
         .unwrap();
         assert!(
