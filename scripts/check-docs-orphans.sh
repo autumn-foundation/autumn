@@ -237,8 +237,68 @@ def is_root(f):
                 and f.count('/') == 2))
 
 
-roots = [f for f in tracked if is_root(f)]
 node_set = set(nodes)
+
+
+def read(f):
+    try:
+        with open(posixpath.join(root, f), encoding='utf-8', errors='ignore') as fh:
+            return fh.read()
+    except OSError:
+        return ''
+
+
+# A package README is what a registry renders as that crate's landing page —
+# crates.io and docs.rs show it with nothing linking to it, which is the same
+# thing that makes `SKILL.md` and the instruction files entry surfaces rather
+# than waypoints. As a waypoint one is inert, so a guide indexed only from a
+# subcrate's README was an orphan.
+#
+# Cargo's own rule, both halves: an explicit `readme = "..."` naming a file in
+# the package directory, or — with no `readme` key at all — an auto-detected
+# `README.md` beside the manifest. Only the explicit half occurs in this
+# repository today; the default is here so the next package that relies on it
+# is not a fresh defect.
+#
+# `publish = false` excludes it: nothing renders the README of a package that
+# is never published, so it stays an ordinary waypoint. And a `readme` pointing
+# OUTSIDE its package — `readme = "../README.md"`, which three packages here
+# use — names the workspace root README, already a root on its own account.
+_README_KEY = re.compile(r'^\s*readme\s*=\s*"([^"]*)"', re.M)
+_PUBLISH_FALSE = re.compile(r'^\s*publish\s*=\s*false\s*$', re.M)
+
+
+def _crate_readme_roots():
+    out = set()
+    for f in tracked:
+        if posixpath.basename(f) != 'Cargo.toml':
+            continue
+        manifest = read(f)
+        if _PUBLISH_FALSE.search(manifest):
+            continue
+        pkg = posixpath.dirname(f)
+        m = _README_KEY.search(manifest)
+        named = m.group(1) if m else 'README.md'
+        # `posixpath.normpath`, not this file's `normalize`, which is defined
+        # far below — and stdlib is the right tool anyway: this resolves a
+        # manifest path, not a Markdown destination.
+        cand = posixpath.normpath(posixpath.join(pkg, named) if pkg else named)
+        # Outside its own package directory it is some other file's job.
+        if pkg and not cand.startswith(pkg + '/'):
+            continue
+        if cand in tracked_set:
+            out.add(cand)
+    return out
+
+
+tracked_set = set(tracked)
+crate_readmes = _crate_readme_roots()
+roots = [f for f in tracked if is_root(f) or f in crate_readmes]
+# Recomputed here rather than above because `_crate_readme_roots` reads files,
+# and `read` is defined below `is_root`. Placing the call above it raised a
+# NameError that failed the whole run — the FOURTH time this file has been bitten
+# by something placed above what it is made of, and the first where the thing
+# was a function rather than a pattern fragment.
 # Pages that are neither entry surfaces nor things we assert on, but that a
 # reader can be routed THROUGH — a skill's `references/*.md`. They carry edges
 # only once something reachable links them.
@@ -255,14 +315,6 @@ waypoints = {f for f in tracked
              if f.endswith('.md') and f not in roots and f not in node_set
              and f not in HISTORY and not f.startswith(HISTORY)}
 traversable = node_set | waypoints
-
-
-def read(f):
-    try:
-        with open(posixpath.join(root, f), encoding='utf-8', errors='ignore') as fh:
-            return fh.read()
-    except OSError:
-        return ''
 
 
 # `](target)`. The destination grammar is lifted from the sibling
@@ -6709,6 +6761,38 @@ self_test() {
     > "$c9ls/docs/guide/jobs.md"
   git -C "$c9ls" add -A && git -C "$c9ls" commit -qm open-dialog
   check "a link in an open dialog is a route" pass "$c9ls"
+
+  # A publishable package's README is what a registry renders as that crate's
+  # landing page — a reader arrives at it with nothing linking there, which is
+  # what makes it an entry surface rather than an inert waypoint.
+  local c9lt="$tmp/c9lt"; make_corpus "$c9lt"
+  mkdir -p "$c9lt/autumn-search"
+  printf '[package]\nname = "autumn-search"\nreadme = "README.md"\n' \
+    > "$c9lt/autumn-search/Cargo.toml"
+  printf '# Search\n\n- [Mail](../docs/guide/mail.md)\n' \
+    > "$c9lt/autumn-search/README.md"
+  git -C "$c9lt" add -A && git -C "$c9lt" commit -qm crate-readme-is-a-root
+  check "a published crate README is an entry surface" pass "$c9lt"
+
+  # ...and Cargo's default counts too: with no `readme` key it auto-detects the
+  # `README.md` beside the manifest, so that page is published just the same.
+  local c9lu="$tmp/c9lu"; make_corpus "$c9lu"
+  mkdir -p "$c9lu/autumn-search"
+  printf '[package]\nname = "autumn-search"\n' > "$c9lu/autumn-search/Cargo.toml"
+  printf '# Search\n\n- [Mail](../docs/guide/mail.md)\n' \
+    > "$c9lu/autumn-search/README.md"
+  git -C "$c9lu" add -A && git -C "$c9lu" commit -qm crate-readme-autodetected
+  check "an auto-detected crate README is an entry surface" pass "$c9lu"
+
+  # ...but `publish = false` means nothing renders it, so it stays a waypoint —
+  # inert until something links it, exactly like any other supporting page.
+  local c9lv="$tmp/c9lv"; make_corpus "$c9lv"
+  mkdir -p "$c9lv/fuzz"
+  printf '[package]\nname = "fuzz"\npublish = false\nreadme = "README.md"\n' \
+    > "$c9lv/fuzz/Cargo.toml"
+  printf '# Fuzz\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9lv/fuzz/README.md"
+  git -C "$c9lv" add -A && git -C "$c9lv" commit -qm unpublished-readme-not-a-root
+  check "an unpublished crate README is not a root" fail "$c9lv"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
