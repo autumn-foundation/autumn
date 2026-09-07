@@ -2518,7 +2518,19 @@ fn classify_and_apply(
                 sampling.as_ref().map_or(&no_deferral, |s| &s.purge_after);
             let purges = purge_statements(&facts.framework_tables, &sources.config);
             let phases = emptying_phases(&purges, deferred, sampling.as_ref());
+            // Each target is a DIFFERENT database, and the printed stream is one
+            // file. Without a boundary, pasting it runs every target's
+            // transaction against whichever database the session happens to be
+            // connected to — sampling one of them repeatedly, with row counts
+            // taken from the others, and leaving the rest untouched.
+            eprintln!("  \\connect {}", quote_ident(&parsed_db_name(url)));
             eprintln!("  BEGIN;");
+            // The same session pins `execute` sets, before anything reads or
+            // writes: without them a role-level `search_path` resolves the
+            // generated calls somewhere else entirely.
+            for statement in session_settings() {
+                eprintln!("  {statement};");
+            }
             // The same locks `execute` takes, before any destructive statement:
             // without them a pasted run lets a concurrent insert land after the
             // DELETE that was supposed to remove it.
@@ -3651,6 +3663,24 @@ fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> V
     tables
 }
 
+/// The session settings the scrub pins for the whole transaction.
+///
+/// A role- or database-level `search_path` (tenant schemas) would otherwise
+/// redirect an unqualified name — every `md5`, `quote_nullable` and `count` the
+/// generated SQL calls — to something the classification never saw, and
+/// `quote_literal`'s doubled quotes would mean something else under
+/// `standard_conforming_strings = off`.
+///
+/// Shared with the dry run: printing the statements without them advertises SQL
+/// that resolves differently from the command it claims to be, on exactly the
+/// targets whose `search_path` made the pinning necessary.
+fn session_settings() -> [String; 2] {
+    [
+        "SET LOCAL search_path = pg_catalog, public".to_owned(),
+        "SET LOCAL standard_conforming_strings = on".to_owned(),
+    ]
+}
+
 /// Every table the run locks, deduplicated and ordered, as `LOCK TABLE` SQL.
 ///
 /// Shared with the dry run: an operator pasting the printed sequence into a
@@ -3890,10 +3920,7 @@ fn execute(
         // database-level `search_path` (tenant schemas) cannot redirect a write
         // to a table nothing classified, and `quote_literal`'s doubled quotes
         // cannot be re-interpreted under `standard_conforming_strings = off`.
-        conn.batch_execute(
-            "SET LOCAL search_path = pg_catalog, public; \
-             SET LOCAL standard_conforming_strings = on",
-        )?;
+        conn.batch_execute(&session_settings().join("; "))?;
         // Hold the tables for the duration: the plan was built from a snapshot
         // taken on another connection, and a row inserted between the two would
         // otherwise survive the scrub unnoticed. SHARE ROW EXCLUSIVE blocks

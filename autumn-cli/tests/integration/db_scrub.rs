@@ -2132,6 +2132,20 @@ async fn the_printed_dry_run_walks_to_the_same_fixpoint_the_command_does() {
         "the walk must print as a loop, not as statements plus a comment saying \
          to repeat them: {dry_err}"
     );
+    // The session pins `execute` sets, and the boundary that says which database
+    // the transaction belongs to. Without the pins a role-level `search_path`
+    // resolves the generated `md5` somewhere else and the paste writes different
+    // values than the command does; without the boundary a multi-target stream
+    // runs every transaction against whichever database psql is on.
+    assert!(
+        dry_err.contains("SET LOCAL search_path = pg_catalog, public;")
+            && dry_err.contains("SET LOCAL standard_conforming_strings = on;"),
+        "the printed transaction must pin the same session settings: {dry_err}"
+    );
+    assert!(
+        dry_err.contains(r#"\connect "deep_printed""#),
+        "and must say which database it is for: {dry_err}"
+    );
     let script = printed_transaction(&dry_err);
     clients[1]
         .batch_execute(&script)
