@@ -128,25 +128,37 @@ named in the pre-registration.
   trap") would need to either emit a minimal valid response frame or extend
   this harness with a stderr-reporting convention; neither was needed for
   the six probes here.
-- 5 of the plan doc's 17 named threats (R1–R17) are pre-registered and
-  covered: filesystem (R1), one real-function representative of "closed
-  world" (R2, via `sock_connect` — the pre-registration's own named
-  example), one invented-namespace host escape (also R2-shaped, mirroring
-  `plugin_sandbox`'s `HOST_COMMAND`), and environment/argv leakage (R3,
-  both the size call and the value call for each). A sixth, supplemental
-  probe covers the same R2 threat class a second way (`sock_send`), added
-  during review — see the pre-registration-fidelity update below for why it
-  is reported separately rather than folded into the registered count.
-  R11–R17 (header/cookie stripping, manifest/artifact integrity,
-  consent surfacing) are **plugin_sandbox-only concepts** — `autumn-edge`
-  has no manifest, no declared-capability grant surface, and strips
-  credential headers before the frame is built (i.e. before the guest ever
-  runs), so those threats don't have an edge-host analogue to probe in the
-  first place. R4/R6–R9 were in the plan doc's own gaps (its table skips R4
-  and jumps R3→R5); this assay did not chase them down since they're not
-  part of Keystone's memo either. This is a targeted subset chosen for
-  "cheapest apparatus that can falsify the specific baseline Keystone's
-  memo questioned," not a full port of the 17-item table.
+- 5 pre-registered probes cover 4 of the plan doc's 17 named threat rows
+  (R1–R17 — **correction below: the doc's table has no gaps; an earlier
+  version of this bullet wrongly claimed R4 was missing from it**):
+  filesystem (R1, `path_open`), a permissive-linker/unknown-import escape
+  (R2, the invented `env::system` namespace — mirroring `plugin_sandbox`'s
+  `HOST_COMMAND`), environment/argv leakage (R3, both the size call and the
+  value call for each), and network egress via `sock_*` (R4, via
+  `sock_connect` — the pre-registration's own named example). A sixth,
+  supplemental probe covers R4 a second way (`sock_send`), added during
+  review — see the pre-registration-fidelity update below for why it is
+  reported separately rather than folded into the registered count.
+  R5–R10 (a database import, resource/hang controls) and R11–R17
+  (header/cookie stripping, manifest/artifact integrity, consent surfacing)
+  are not covered by this file: R6/R7/R9/R10 already have dedicated,
+  pre-existing coverage in `autumn-edge/src/host.rs`'s own `#[cfg(test)]`
+  suite (fuel exhaustion, memory limits, trap handling — not adversarial
+  WASI-escape guests, but real coverage of those specific threats by a
+  different mechanism); R5, R8, and R11–R17 are either not reachable from
+  `autumn-edge`'s API shape (no database seam, no manifest, credential
+  headers stripped before the guest ever runs) or were simply out of scope
+  for "cheapest apparatus that can falsify the specific baseline Keystone's
+  memo questioned" — this was never meant to be a full port of the 17-item
+  table, only enough of it to answer the pre-registered question.
+  **Update (fourth Codex review round)**: this correction itself was
+  prompted by a review comment pointing out that R4 is explicitly defined
+  in the plan doc (`docs/plans/2026-08-27-sandboxed-plugins-first-slice.md:45`,
+  "Network egress via `sock_*`") and that the socket probes therefore
+  exercise R4, not R2 as originally labeled here — confirmed by re-reading
+  the full R1–R17 table (`grep -n '^| R' docs/plans/...`), which shows all
+  seventeen rows present with no gaps. Reclassified accordingly; no
+  apparatus change, write-up only.
 - **Negative controls, run and reverted, not merged**: to prove the
   "answers empty" probes actually falsify (rather than passing vacuously),
   two separate registrations were each temporarily edited to leak, the
@@ -228,11 +240,11 @@ cargo test -p autumn-edge --features host --test host_wasi_deny_probes
 | Probe | Threat class | Pre-registered? | Expected | Result |
 |---|---|---|---|---|
 | `filesystem_import_is_refused_at_load` | R1 — ambient filesystem | yes | refused at instantiation | **refused** (`"...could not be instantiated..."`) |
-| `socket_connect_import_is_refused_at_load` | R2 — closed world, real fn (`sock_connect`) | yes (the pre-registration's own named example) | refused at instantiation | **refused** |
-| `invented_namespace_import_is_refused_at_load` | R2 — closed world, invented namespace | yes | refused at instantiation | **refused** |
+| `socket_connect_import_is_refused_at_load` | R4 — network egress via `sock_*` (`sock_connect`) | yes (the pre-registration's own named example) | refused at instantiation | **refused** |
+| `invented_namespace_import_is_refused_at_load` | R2 — permissive linker / unknown import | yes | refused at instantiation | **refused** |
 | `environ_is_actually_empty_not_just_documented` | R3 — environment (size + value calls, sentinel-seeded, errno-checked) | yes | clean exit, no trap | **clean exit** (`"the capsule exited without answering"`) |
 | `args_are_actually_empty_not_just_documented` | R3 — argv (size + value calls, sentinel-seeded, errno-checked) | yes | clean exit, no trap | **clean exit** |
-| `socket_send_import_is_refused_at_load` | R2 — closed world, real fn (`sock_send`) | **no — supplemental, added during review** | refused at instantiation | **refused** |
+| `socket_send_import_is_refused_at_load` | R4 — network egress via `sock_*` (`sock_send`) | **no — supplemental, added during review** | refused at instantiation | **refused** |
 
 **5/5 pre-registered criteria hold, against the pre-set pursue line, plus
 1/1 supplemental probe also passing.** A Codex review on this PR correctly

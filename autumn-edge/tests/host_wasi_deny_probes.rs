@@ -50,15 +50,18 @@ fn filesystem_import_is_refused_at_load() {
 "#));
 }
 
-/// R2 (real function, never implemented): a guest that imports the exact
-/// socket call the pre-registration names (`sock_connect`) must fail to
-/// link — the shim's closed world excludes the network the same way it
-/// excludes the filesystem. A Codex review on this PR correctly flagged
-/// that an earlier version of this probe imported `sock_send` instead,
-/// which never exercised the pre-registered `sock_connect` criterion at
-/// all: had the host implemented one but not the other, this suite would
-/// have stayed green while still claiming the `sock_connect` line was
-/// checked. Both are now probed independently.
+/// R4 (network egress via `sock_*`): a guest that imports the exact socket
+/// call the pre-registration names (`sock_connect`) must fail to link — the
+/// shim's closed world excludes the network the same way it excludes the
+/// filesystem. A Codex review on this PR correctly flagged that an earlier
+/// version of this probe imported `sock_send` instead, which never
+/// exercised the pre-registered `sock_connect` criterion at all: had the
+/// host implemented one but not the other, this suite would have stayed
+/// green while still claiming the `sock_connect` line was checked. Both are
+/// now probed independently. (A later review round also caught that this
+/// doc comment originally mislabeled the threat as R2 — R2 is the linker's
+/// general unknown-import behavior, exercised below by the invented-namespace
+/// probe; R4 is the plan doc's own row for `sock_*` specifically.)
 #[test]
 fn socket_connect_import_is_refused_at_load() {
     assert_denied_at_load(&run(r#"(module
@@ -69,7 +72,7 @@ fn socket_connect_import_is_refused_at_load() {
 "#));
 }
 
-/// R2 (real function, never implemented), second representative: the same
+/// R4 (network egress via `sock_*`), second representative: the same
 /// closed-world claim for `sock_send`, kept as an independent probe rather
 /// than folded into the one above so a failure names the specific import
 /// that regressed.
