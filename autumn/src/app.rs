@@ -9014,6 +9014,13 @@ struct CustomDomainBindState {
 /// returned [`AcmeBindState`] carries everything the renewal task and challenge
 /// listener need.
 #[cfg(feature = "acme")]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one bind-time assembly of the ACME listener, its store, its \
+              placeholder and the custom-domain registry; splitting it would \
+              only scatter the ordering these steps depend on"
+)]
 async fn build_acme_tls_listener(
     tcp: tokio::net::TcpListener,
     tls_cfg: &crate::config::TlsConfig,

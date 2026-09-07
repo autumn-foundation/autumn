@@ -1710,6 +1710,7 @@ mod tests {
             renew_before_days: 30,
             ca_root_path: None,
             dns: None,
+            custom_domains: None,
         };
         let task = AcmeRenewalTask {
             resolver,
@@ -1815,6 +1816,7 @@ mod tests {
             renew_before_days: 30,
             ca_root_path: None,
             dns: None,
+            custom_domains: None,
         };
         let task = AcmeRenewalTask {
             resolver,

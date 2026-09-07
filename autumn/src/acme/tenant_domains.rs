@@ -211,7 +211,7 @@ impl CustomDomainTask {
             // The tick is inside the `select!`: a pass over a thousand domains
             // is long, and shutdown must not wait for it.
             tokio::select! {
-                () = self.tick(now_unix()) => {}
+                () = self.tick(crate::custom_domain::now_unix()) => {}
                 () = shutdown.cancelled() => break,
             }
             tokio::select! {
@@ -662,11 +662,11 @@ impl CustomDomainTask {
 }
 
 impl crate::custom_domain::CustomDomainPruner for CustomDomainTask {
-    fn prune<'a>(
-        &'a self,
+    fn prune(
+        &self,
         cutoff_unix: i64,
         dry_run: bool,
-    ) -> futures::future::BoxFuture<'a, Result<u64, String>> {
+    ) -> futures::future::BoxFuture<'_, Result<u64, String>> {
         Box::pin(async move {
             // An index that failed to hydrate knows nothing, so EVERY tenant
             // certificate would read as an orphan and be deleted. One transient
@@ -804,13 +804,6 @@ impl crate::custom_domain::SniCertSource for FsSniCertSource {
             }
         }
     }
-}
-
-/// Current UNIX time in seconds.
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

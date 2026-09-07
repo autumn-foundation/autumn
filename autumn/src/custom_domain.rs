@@ -148,7 +148,7 @@ pub struct ExpectedIngress {
 impl ExpectedIngress {
     /// Is there anything a tenant could be told to point at?
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.hostname.is_none() && self.ipv4.is_empty() && self.ipv6.is_empty()
     }
 
@@ -223,12 +223,12 @@ impl DnsInstructions {
         match self {
             Self::Cname { name, value } => format!("{name}\tCNAME\t{value}"),
             Self::Address { name, ipv4, ipv6 } => {
+                use std::fmt::Write as _;
                 let mut out = String::new();
-                for addr in ipv4 {
-                    out.push_str(&format!("{name}\tA\t{addr}\n"));
-                }
-                for addr in ipv6 {
-                    out.push_str(&format!("{name}\tAAAA\t{addr}\n"));
+                for (kind, addrs) in [("A", ipv4), ("AAAA", ipv6)] {
+                    for addr in addrs {
+                        let _ = writeln!(out, "{name}\t{kind}\t{addr}");
+                    }
                 }
                 out.trim_end().to_owned()
             }
@@ -440,7 +440,7 @@ pub struct CustomDomain {
 impl CustomDomain {
     /// A freshly registered domain, awaiting DNS.
     #[must_use]
-    fn new(hostname: String, tenant: String, now_unix: i64) -> Self {
+    const fn new(hostname: String, tenant: String, now_unix: i64) -> Self {
         Self {
             hostname,
             tenant,
@@ -568,16 +568,6 @@ fn file_stem(hostname: &str) -> String {
     out
 }
 
-/// Run a blocking `std::fs` operation on tokio's blocking pool.
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> io::Result<T> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(result) => result,
-        Err(join_error) => Err(io::Error::other(join_error)),
-    }
-}
-
 impl CustomDomainStore for FsCustomDomainStore {
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>> {
         Box::pin(async move {
@@ -614,7 +604,7 @@ impl CustomDomainStore for FsCustomDomainStore {
         Box::pin(async move {
             let bytes = serde_json::to_vec_pretty(domain)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            blocking(move || {
+            crate::fs_atomic::blocking(move || {
                 crate::fs_atomic::ensure_owner_only_dir(&dir)?;
                 crate::fs_atomic::write_owner_only(&path, &bytes)
             })
@@ -1112,7 +1102,9 @@ impl CustomDomainRegistry {
                 return Ok(());
             };
             f(record);
-            record.clone()
+            let updated = record.clone();
+            drop(index);
+            updated
         };
         self.store.save(&updated).await
     }
@@ -1261,9 +1253,9 @@ impl IssuanceLimiter {
     /// Deliberately says nothing about failure backoff: the retry deadline
     /// lives on the domain record ([`CustomDomain::next_attempt_unix`], set
     /// from [`Self::backoff_for`]) and is enforced by
-    /// [`CustomDomain::is_due`]. Two places holding that deadline would
-    /// disagree — an earlier draft refused every retry here forever, because
-    /// the failure count alone can never say the wait is over.
+    /// [`CustomDomain::is_due`]. A failure count alone cannot say the wait is
+    /// over, so a second copy of the deadline here would refuse every retry
+    /// forever.
     ///
     /// The domain's own budget is checked before the deployment's, so the
     /// reason reported is the most specific one.
@@ -1299,6 +1291,7 @@ impl IssuanceLimiter {
         let mut kept = within(hits, now_unix, PER_DOMAIN_WINDOW_SECS);
         kept.push(now_unix);
         *hits = kept;
+        drop(attempts);
     }
 
     /// Drop a domain's attempt history — called when it is offboarded, so a
@@ -1409,10 +1402,7 @@ impl CustomDomainHealthIndicator {
     /// An indicator over `registry`.
     #[must_use]
     pub fn new(registry: Arc<CustomDomainRegistry>) -> Self {
-        Self {
-            registry,
-            now_unix: default_now_unix,
-        }
+        Self { registry, now_unix }
     }
 
     /// Grade the registry at `now_unix` (pure; used by `check` and tests).
@@ -1472,7 +1462,11 @@ impl crate::actuator::HealthIndicator for CustomDomainHealthIndicator {
 }
 
 /// Wall-clock seconds since the epoch.
-fn default_now_unix() -> i64 {
+///
+/// The one reading in the custom-domain path; the orchestrator ticks from it
+/// too, so a status and the decision that produced it never disagree by a
+/// second.
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -1493,11 +1487,11 @@ pub trait CustomDomainPruner: Send + Sync {
     /// `cutoff_unix` — a tenant who was handed instructions and never followed
     /// them — and stored certificates for hostnames no longer registered,
     /// which nothing would otherwise ever delete.
-    fn prune<'a>(
-        &'a self,
+    fn prune(
+        &self,
         cutoff_unix: i64,
         dry_run: bool,
-    ) -> futures::future::BoxFuture<'a, Result<u64, String>>;
+    ) -> futures::future::BoxFuture<'_, Result<u64, String>>;
 
     /// Offboard one hostname completely: stop routing and serving, halt
     /// renewal, and delete the stored certificate and its private key.
@@ -1587,6 +1581,7 @@ mod sni {
                     inner.certs.remove(&oldest);
                 }
             }
+            drop(inner);
         }
 
         /// Drop `hostname`'s certificate — called on offboarding, so a removed
