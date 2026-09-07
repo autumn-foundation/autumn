@@ -224,7 +224,7 @@ jobs:
       # Pinned toolchain for cargo-semver-checks — must stay in sync with
       # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh
       # (1.94.1: aws-smithy MSRV floor; 1.96.0 ICEs — see script comment).
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # protoc is required by telemetry-otlp (prost/tonic) in the broadened
       # feature set check-semver.sh enables; it is not in the standard
