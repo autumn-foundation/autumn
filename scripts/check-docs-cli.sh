@@ -3159,6 +3159,25 @@ def _short_cluster(tok, options):
 _PROSE_IN_FLAG = re.compile(r'''[/<>{}$`|\\"'()\[\]]''')
 
 
+def _reportable_name(name):
+    """Could the detector ever REPORT this spelling as an option name?
+
+    The waiver validator's question, and deliberately not the detector's. An
+    author waiving a defect writes the name the report showed them, so the set
+    that must be waivable is exactly the set that can be reported — which,
+    since `--=value` became a defect, includes `--`. Reporting a spelling a
+    marker cannot name is a defect with no way to waive it, which is finding 7
+    in this PR's own table.
+
+    A bare `-` is still not one of them: only the long path shortens a name and
+    it can only shorten to something starting `--`, so `-` alone is never
+    emitted, and a marker containing one is a command waiver for the command
+    pattern to read.
+    """
+    return (name.startswith('-') and name != '-'
+            and not _PROSE_IN_FLAG.search(name))
+
+
 def _reportable_flag(name, tok=None):
     """Is this dashed token a flag spelling a reader could copy, or prose?
 
@@ -3167,12 +3186,10 @@ def _reportable_flag(name, tok=None):
     long option is split on `=`: `--=debug` normalizes to the name `--` and was
     waved through as the end-of-options marker, though clap rejects it (`error:
     unexpected argument '--' found`, exit 2) while a bare `--` it accepts.
-    Callers that hold the token pass it; the waiver validator, where the name
-    IS what was written, does not need to.
+    Callers that hold the token pass it.
     """
     tok = name if tok is None else tok
-    return (name.startswith('-') and tok not in ('-', '--')
-            and not _PROSE_IN_FLAG.search(name))
+    return tok not in ('-', '--') and _reportable_name(name)
 
 
 def _missing_value(kind, eaten, i, tokens, runnable):
@@ -3617,9 +3634,13 @@ def scan(root, surface, files):
         flag_allowed = collections.defaultdict(set)
         flag_spans = []
         for m in FLAG_WAIVER.finditer(text):
-            if not _reportable_flag(m.group(2)):
+            if not _reportable_name(m.group(2)):
                 # Not a spelling the detector would ever report, so this is not
-                # a flag waiver; leave it to the command pattern.
+                # a flag waiver; leave it to the command pattern. Asked as
+                # "could this be reported?" rather than "is this token a flag?"
+                # — the author writes the name the REPORT showed them, and
+                # since `--=debug` is reported as `--`, `--` has to be sayable
+                # here or that defect is unwaivable.
                 continue
             marker_line = text.count('\n', 0, m.start()) + 1
             marker_block = line_block[marker_line]
@@ -5321,13 +5342,26 @@ def self_test():
     # The waiver grammar must cover EVERY spelling the detector reports, or a
     # page can be told about a defect it has no way to waive. These are the two
     # the widened detector added.
-    for spelling in ('--show_config', '-zz'):
+    # `--` joined them when `--=value` became a defect: it is REPORTED as `--`
+    # (that is what clap calls the unexpected argument), so `--` is what an
+    # author has to be able to write here. It was rejected as the bare
+    # end-of-options marker, leaving that defect unwaivable — finding 7's shape
+    # a second time, which is why the invariant is asserted as a loop rather
+    # than case by case.
+    for spelling in ('--show_config', '-zz', '--'):
         m = FLAG_WAIVER.search(
             f'<!-- cli-surface-allow: autumn dev {spelling} — why -->')
         expect(m and m.group(2) == spelling and m.group(1) == 'dev',
                f'{spelling} is reportable, so it must be waivable: {m and m.groups()}')
-        expect(_reportable_flag(spelling),
+        expect(_reportable_name(spelling),
                f'{spelling} must be reportable for that waiver to be needed')
+    # The two predicates answer different questions and must keep disagreeing
+    # exactly here: `--` can be REPORTED (from `--=debug`) but a bare `--`
+    # TOKEN on a command line is the end-of-options marker, not a defect.
+    expect(_reportable_name('--') and not _reportable_flag('--'),
+           '`--` is waivable as a name while exempt as a token')
+    expect(not _reportable_name('-') and not _reportable_flag('-'),
+           'a bare `-` is neither, so its marker stays a command waiver')
     # A root option is waived with no command before it.
     m = FLAG_WAIVER.search('<!-- cli-surface-allow: autumn --helpp — why -->')
     expect(m and m.group(1) is None and m.group(2) == '--helpp',
