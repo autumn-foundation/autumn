@@ -2071,6 +2071,23 @@ _DISPLAY_DECL = re.compile(r'\s*display' + _TWS + r'*:([^;]*)', re.I)
 # keeps its BOX — a hidden anchor is still 30x17 — but paints nothing and
 # hit-tests through to whatever is behind it, so it is not a route.
 _VISIBILITY_DECL = re.compile(r'\s*visibility' + _TWS + r'*:([^;]*)', re.I)
+# The values that actually restore a hidden ancestor's visibility — an
+# ALLOWLIST, because everything else leaves it hidden and the blocklist this
+# replaces got that backwards. Measured on a `visibility:hidden` anchor, each
+# value set on a span inside it and hit-tested:
+#
+#   visible   visible   initial   visible      <- these two, and only these
+#   hidden    hidden    collapse  hidden
+#   inherit   hidden    unset     hidden       <- CSS-wide, and `visibility`
+#   revert    hidden    revert-layer hidden       inherits, so they stay hidden
+#   bogus     hidden                           <- invalid, declaration dropped
+#
+# `initial` is in because `visibility`'s initial value IS `visible`, which is
+# the one place the CSS-wide keywords part company. Allowlisting is also the
+# safe direction: an unrecognised value keeps the anchor rejected, which is a
+# false orphan — loud, and fixed the moment someone reads the failure — where
+# the blocklist made it a silently recorded route.
+_VISIBILITY_SHOWN = ('visible', 'initial')
 _IMPORTANT = re.compile(r'!' + _TWS + r'*important' + _TWS + r'*$', re.I)
 _CSS_COMMENT = re.compile(r'/\*.*?\*/|/\*.*', re.S)
 
@@ -2214,8 +2231,7 @@ def _invisible_anchor(tag_src, content_src):
         return False
     for m in STYLE_ATTR_OPEN.finditer(content_src):
         value = _style_value(m)
-        if value and _effective(value, _VISIBILITY_DECL) not in (
-                None, 'hidden', 'collapse'):
+        if value and _effective(value, _VISIBILITY_DECL) in _VISIBILITY_SHOWN:
             return False
     return True
 
@@ -6279,6 +6295,34 @@ self_test() {
     > "$c9lc/README.md"
   git -C "$c9lc" add -A && git -C "$c9lc" commit -qm root-inside-the-guide-tree
   check "a root inside the guide tree is reachable" pass "$c9lc"
+
+  # `visibility` INHERITS, so a descendant spelling `inherit` inherits the
+  # anchor's `hidden` and paints nothing. `unset`, `revert` and `revert-layer`
+  # all land the same way; testing that a value is merely NOT `hidden`
+  # restored a route the reader does not have.
+  local c9ld="$tmp/c9ld"; make_corpus "$c9ld"
+  printf '# Jobs\n\n<a style="visibility:hidden" href="mail.md"><span style="visibility:inherit">Mail</span></a>\n' \
+    > "$c9ld/docs/guide/jobs.md"
+  git -C "$c9ld" add -A && git -C "$c9ld" commit -qm visibility-inherit-descendant
+  check "an inheriting descendant stays hidden" fail "$c9ld"
+
+  # ...and so does an INVALID one: the declaration is dropped, leaving the
+  # inherited `hidden`. Only values that compute to visible may restore it,
+  # which is why the test is an allowlist.
+  local c9le="$tmp/c9le"; make_corpus "$c9le"
+  printf '# Jobs\n\n<a style="visibility:hidden" href="mail.md"><span style="visibility:bogus">Mail</span></a>\n' \
+    > "$c9le/docs/guide/jobs.md"
+  git -C "$c9le" add -A && git -C "$c9le" commit -qm visibility-invalid-descendant
+  check "an invalid visibility stays hidden" fail "$c9le"
+
+  # ...but `initial` DOES restore it, because `visibility`'s initial value is
+  # `visible`. That is the one place the CSS-wide keywords part company, and an
+  # allowlist of `visible` alone would strand this page.
+  local c9lf="$tmp/c9lf"; make_corpus "$c9lf"
+  printf '# Jobs\n\n<a style="visibility:hidden" href="mail.md"><span style="visibility:initial">Mail</span></a>\n' \
+    > "$c9lf/docs/guide/jobs.md"
+  git -C "$c9lf" add -A && git -C "$c9lf" commit -qm visibility-initial-descendant
+  check "an initial visibility restores the route" pass "$c9lf"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
