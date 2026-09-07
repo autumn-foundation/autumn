@@ -3585,7 +3585,7 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
 /// child tables and the columns joining them.
 ///
 /// Each drift figure is one aggregate over a parent table, so this is an
-/// operator endpoint rather than a monitoring one — do not scrape it.
+/// operator endpoint rather than a monitoring one. Do not scrape it.
 ///
 /// A process with no database pool answers `503` rather than `404`, so an
 /// operator can tell "this build has no such endpoint" apart from "this process

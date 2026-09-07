@@ -93,7 +93,7 @@ diesel::table! {
 
 /// Two derivations off one child: a filtered count and a filtered weighted sum.
 /// One insert has to move both, and each filter has to be honoured
-/// independently — a published comment with a negative score counts towards the
+/// independently: a published comment with a negative score counts towards the
 /// first and not the second.
 #[autumn_web::model(table = "dv_comments")]
 #[belongs_to(DvPost, fk = post_id)]
@@ -515,8 +515,8 @@ async fn state_of(conn: &mut AsyncPgConnection, name: &str) -> StateRow {
 // ── Non-ignored: the generated surface exists without a live database ───────
 
 /// The compile-time metadata is exactly what every statement is built from, so
-/// pinning it here pins the SQL — the non-ignored guard for the Docker tests
-/// below.
+/// pinning it here pins the SQL. This is the non-ignored guard for the Docker
+/// tests below.
 #[test]
 fn derivation_defs_are_generated_from_the_declarations() {
     // Two derivations off one child, in declaration order, each carrying the
@@ -749,7 +749,7 @@ async fn ac1_a_soft_deleted_row_stops_counting_and_a_restore_resumes() {
 
 /// AC2: the derivation update and the row insert commit or roll back
 /// **together**. The parent's column is `CHECK (capped_count <= 3)`, so the
-/// fourth published insert's *derivation update* fails — and the child row must
+/// fourth published insert's *derivation update* fails, and the child row must
 /// not survive it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -767,7 +767,7 @@ async fn ac2_a_failing_derived_update_rolls_the_child_insert_back() {
         .await
         .expect("published insert under the cap");
     }
-    // An unpublished comment contributes nothing, so the cap does not see it —
+    // An unpublished comment contributes nothing, so the cap does not see it:
     // the filter is enforced by the same statement the CHECK guards.
     repo.save(&NewDvCappedComment {
         post_id: post,
@@ -795,7 +795,7 @@ async fn ac2_a_failing_derived_update_rolls_the_child_insert_back() {
         )
         .await,
         3,
-        "the child insert must roll back with the failed derivation update — a \
+        "the child insert must roll back with the failed derivation update. A \
          fourth published row here means the two statements were not in one \
          transaction"
     );
@@ -808,8 +808,8 @@ async fn ac2_a_failing_derived_update_rolls_the_child_insert_back() {
 /// AC2, the explicit form: an aborted transaction leaves the derived value
 /// exactly as it was, even though the derivation update ran inside it.
 ///
-/// Drives the documented escape hatch — a hand-written insert plus
-/// `counter_cache_after_insert_by_id` — because that is the path an application
+/// Drives the documented escape hatch, a hand-written insert plus
+/// `counter_cache_after_insert_by_id`, because that is the path an application
 /// can reach without the generated repository, and it is where a maintenance
 /// write outside the caller's transaction would show up.
 #[tokio::test]
@@ -1114,7 +1114,7 @@ async fn ac4_deleting_an_unqualified_row_moves_nothing() {
     );
 
     // The bulk path computes its delta with one aggregate, so it has to filter
-    // too — otherwise a batch of drafts would drive the value negative.
+    // too, or a batch of drafts would drive the value negative.
     repo.delete_many(&[second_draft.id])
         .await
         .expect("delete_many the drafts");
@@ -1576,12 +1576,12 @@ async fn ac7_a_failing_drift_scan_is_reported_per_derivation() {
 // ── AC8: reading a derivation is one query ─────────────────────────────────
 
 /// AC8: a derived value is a plain column, so listing N parents with their
-/// derived columns costs exactly one query — for N = 1 and N = 40 alike.
+/// derived columns costs exactly one query, for N = 1 and N = 40 alike.
 #[cfg(feature = "test-support")]
 mod query_count {
     use autumn_web::prelude::*;
     use autumn_web::test::TestApp;
-    // `diesel::QueryDsl` only — `diesel::prelude::*` would also bring the
+    // `diesel::QueryDsl` only. `diesel::prelude::*` would also bring the
     // *synchronous* `RunQueryDsl` into scope and make `load` ambiguous.
     use diesel::QueryDsl as _;
     use diesel_async::RunQueryDsl as _;
@@ -1590,7 +1590,7 @@ mod query_count {
         DB_LOCK, create_schema, dv_posts, reseed_posts_through_the_repository, start_postgres,
     };
 
-    /// One `SELECT` over the parent table, derived columns included — no join
+    /// One `SELECT` over the parent table, derived columns included. No join
     /// to the child table and no per-row query.
     #[get("/dv-posts")]
     async fn list_dv_posts(mut db: Db) -> AutumnResult<Json<Vec<(i64, i64, i64)>>> {

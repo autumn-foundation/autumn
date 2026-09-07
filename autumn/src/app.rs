@@ -11388,7 +11388,7 @@ fn migrations_with_repository_framework_migrations(
     }
     // The derivation state table follows the same rule as the two above: it is a
     // shard-applied set, it is appended only when the binary actually links a
-    // `#[derivation]`, and never during a static build — which renders assets
+    // `#[derivation]`, and never during a static build, which renders assets
     // and must not touch the database.
     if derivations_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
@@ -14805,7 +14805,7 @@ mod tests {
     #[test]
     fn apps_without_a_derivation_do_not_get_the_state_table() {
         // The whole feature is gated on a linked descriptor, so an app that
-        // declares none pays for none of it — not even an empty table.
+        // declares none pays for none of it, not even an empty table.
         let migrations = migrations_with_repository_framework_migrations(
             vec![("app", APP_TEST_MIGRATIONS)],
             false,

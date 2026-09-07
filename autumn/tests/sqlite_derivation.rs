@@ -297,7 +297,7 @@ async fn deleting_a_rejected_row_moves_nothing_and_a_qualifying_one_moves_both()
     assert_eq!(derived(&pool, "visible_score", post).await, 5);
 
     // The bulk path computes its delta with one aggregate, so it has to filter
-    // too — otherwise a batch of drafts would drive the value negative.
+    // too, or a batch of drafts would drive the value negative.
     repo.delete_many(&[second_draft.id])
         .await
         .expect("delete_many");

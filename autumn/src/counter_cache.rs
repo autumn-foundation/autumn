@@ -192,8 +192,8 @@ pub struct CounterCacheSpec<M: 'static> {
     /// The derivation's row filter, lowered to SQL and already prefixed with
     /// ` AND ` so any builder can concatenate it.
     ///
-    /// `""` for a counter cache — which is what keeps a counter cache's
-    /// generated SQL byte-identical — else ` AND (<pred>)`, using the same `{c}`
+    /// `""` for a counter cache, which is what keeps a counter cache's
+    /// generated SQL byte-identical. Else ` AND (<pred>)`, using the same `{c}`
     /// child-alias placeholder as [`Self::contrib_sql`].
     pub filter_sql: &'static str,
     /// The `#[derivation]` this spec maintains, or `None` for a plain counter
@@ -316,7 +316,7 @@ pub fn quote_ident(ident: &str) -> String {
 /// Everything the statement builders need from a spec, with no model type.
 ///
 /// [`CounterCacheSpec`] is generic over the child model, but no SQL in this
-/// module depends on that type — and the derivation repair paths
+/// module depends on that type, and the derivation repair paths
 /// ([`crate::derivation`]) have only a [`crate::derivation::DerivationDef`],
 /// never an `M`. Both therefore build their statements from this view, so one
 /// set of builders serves both and the two can never emit different SQL.
@@ -415,7 +415,7 @@ fn contrib_expr(view: &SqlView, alias: &str) -> String {
 
 /// The aggregate that folds a set of child rows into the maintained value.
 ///
-/// `COUNT(*)` for a count — the filter is in the surrounding `WHERE`, so every
+/// `COUNT(*)` for a count: the filter is in the surrounding `WHERE`, so every
 /// counted row already qualifies. `COALESCE(SUM(...), 0)` for a weighted sum,
 /// because `SUM` over an empty set is NULL and the maintained column is not.
 fn aggregate_expr(view: &SqlView, alias: &str) -> String {
@@ -600,7 +600,7 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
         ChildState::SoftDeleted => live_predicate(&view, false),
     };
     // The parent is resolved by a sub-select on the child row, so the tenant
-    // check is a correlated comparison in the outer `WHERE` — it names the child
+    // check is a correlated comparison in the outer `WHERE`. It names the child
     // alias, which is only in scope for a sub-select the outer statement
     // correlates with, so the whole predicate moves into a second sub-select.
     let tenant = tenant_predicate(&view, child_id);
@@ -650,12 +650,12 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
 /// `child_id` is inlined rather than bound, so the two occurrences stay one
 /// statement on both backends (`SQLite`'s `?` is positional, so a second bind
 /// would be required there and not on Postgres). It is an `i64`, so its decimal
-/// rendering cannot contain SQL syntax — the same type-level guarantee
+/// rendering cannot contain SQL syntax, the same type-level guarantee
 /// [`id_list`] rests on.
 ///
 /// `COALESCE` is belt-and-braces: the outer `WHERE` already restricts the
 /// statement to parents whose child row qualifies, so the sub-select cannot be
-/// empty — but a NULL in the summed column would still poison the column, and a
+/// empty. But a NULL in the summed column would still poison the column, and a
 /// NULL maintained value is the one outcome no repair can distinguish from
 /// legitimate drift.
 fn weighted_delta_by_child_id_sql(
@@ -738,7 +738,7 @@ pub async fn counter_cache_after_insert<M: Send + Sync + 'static>(
             continue;
         }
         // A row the derivation's filter rejects contributes 0, and a 0 delta is
-        // no statement at all — not a `+ 0` write to the parent row.
+        // no statement at all, not even a `+ 0` write to the parent row.
         let contrib = (spec.contrib_of)(record);
         if contrib == 0 {
             continue;
@@ -792,7 +792,7 @@ type Contribution = (usize, i64, i64, i64);
 ///
 /// `None` when the row contributes to no parent at all: it does not exist, its
 /// foreign key is NULL, or it is soft-deleted. A row the derivation's filter
-/// rejects is `Some((parent, 0))` — it *has* a parent, and it weighs nothing,
+/// rejects is `Some((parent, 0))`: it *has* a parent, and it weighs nothing,
 /// which is what makes a filter flip on an unchanged parent visible as a delta.
 pub type CapturedContribution = Option<(i64, i64)>;
 
@@ -1052,7 +1052,7 @@ pub async fn counter_cache_before_detach_many<M: 'static>(
 /// The maintained value drops by the aggregate of the batch's qualifying child
 /// rows, computed by the database in one statement. Both sub-selects carry the
 /// derivation filter, so a batch of rows the filter rejects matches no parent
-/// and writes nothing — which is also what keeps NULL arithmetic out of reach.
+/// and writes nothing, which is also what keeps NULL arithmetic out of reach.
 fn bulk_decrement_sql(view: &SqlView, id_list: &str) -> String {
     let Quoted {
         child_table,
@@ -1071,7 +1071,7 @@ fn bulk_decrement_sql(view: &SqlView, id_list: &str) -> String {
     let filter = filter_predicate(view, CHILD_ALIAS);
     let aggregate = aggregate_expr(view, CHILD_ALIAS);
     // Both sub-selects correlate on the parent, so the tenant check is a
-    // plain column comparison inside each — no extra round trip, and a
+    // plain column comparison inside each: no extra round trip, and a
     // cross-tenant child contributes to neither the count nor the row set.
     let tenant = tenant_predicate_joined(view);
     let accumulator = accumulator(view, &counter_column);
@@ -1506,7 +1506,7 @@ const RECOMPUTE_BATCH: i64 = 1_000;
 ///
 /// The ground truth has to agree with what the deltas maintain: an ordinary
 /// delta skips a cross-tenant child and a filtered-out row, so a repair that
-/// counted either would undo the isolation — or the filter — on the very next
+/// counted either would undo the isolation, or the filter, on the very next
 /// sweep.
 pub fn ground_truth_sql(view: &SqlView) -> String {
     let Quoted {
@@ -1641,10 +1641,16 @@ pub async fn recompute_batch_statements(
 
 /// One page of parent primary keys after `cursor`, in ascending order.
 ///
-/// Read **outside** any repair transaction, so no lock is held while
-/// enumerating. A parent inserted after its page was read is simply not in this
-/// sweep, which is harmless: it starts at the column default and its children
-/// are counted by the delta paths.
+/// A parent inserted after its page was read is simply not in this sweep, which
+/// is harmless: it starts at the column default and its children are counted by
+/// the delta paths.
+///
+/// [`recompute_view`] reads pages outside its repair transactions, so no lock is
+/// held while enumerating. The derivation backfill
+/// ([`crate::derivation::run_backfill`]) reads its page **inside** the batch
+/// transaction instead, because the cursor it pages from is the checkpoint on
+/// the state row that transaction holds the lock on. Reading it outside would
+/// mean paging from a cursor another replica had already moved.
 pub async fn parent_id_page(
     conn: &mut RuntimeConnection,
     view: &SqlView,

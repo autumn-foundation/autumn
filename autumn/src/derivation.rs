@@ -1,8 +1,8 @@
-//! Maintained derived read models — `#[derivation]` (issue #1769).
+//! Maintained derived read models: `#[derivation]` (issue #1769).
 //!
 //! A derivation is a denormalised value on a parent row that the framework
 //! keeps correct by construction: `posts.published_comment_count`,
-//! `posts.visible_score`. Declaring it on the child —
+//! `posts.visible_score`. Declaring it on the child:
 //!
 //! ```rust,ignore
 //! #[autumn_web::model(table = "comments")]
@@ -12,7 +12,7 @@
 //! pub struct Comment { /* … */ }
 //! ```
 //!
-//! — makes every generated mutation path maintain both columns inside the same
+//! Every generated mutation path then maintains both columns inside the same
 //! transaction as the row mutation.
 //!
 //! # Why this is the counter cache
@@ -147,7 +147,7 @@ pub struct DerivationDef {
     /// The aggregate as declared: `"count"` or `"sum(<field>)"`.
     pub transform: &'static str,
     /// The filter's source text, `""` when there is none. Reported, never
-    /// executed — [`Self::filter_sql`] is what runs.
+    /// executed. [`Self::filter_sql`] is what runs.
     pub filter: &'static str,
     /// The filter lowered to SQL: `""`, or ` AND (<pred>)` using `{c}` for the
     /// child alias.
@@ -172,8 +172,8 @@ impl DerivationDef {
     /// lowered filter, contribution and tenant column. Deliberately **not** the
     /// name, model, module path, file, line or filter source, so renaming a
     /// derivation or reformatting its filter does not enqueue a backfill of an
-    /// unchanged value — while changing the filter, the transform or the column
-    /// always does.
+    /// unchanged value. Changing the filter, the transform or the column always
+    /// does.
     #[must_use]
     pub fn definition_hash(&self) -> String {
         use sha2::Digest as _;
@@ -204,7 +204,7 @@ impl DerivationDef {
     /// The derivation as the SQL builders in [`crate::counter_cache`] see it.
     ///
     /// The repair paths (recompute, backfill, drift) are set-based and need no
-    /// model type, so they run the *same* builders the delta paths do — one
+    /// model type, so they run the *same* builders the delta paths do. One
     /// definition of the ground truth, not two that can disagree.
     pub(crate) const fn sql_view(&self) -> SqlView {
         SqlView {
@@ -528,8 +528,8 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 ///
 /// A derivation with no row, or with a stored hash different from the one this
 /// binary computes, is enqueued as `pending` with its checkpoint cleared. A
-/// derivation whose hash matches is left exactly as it is — which is what keeps
-/// a boot from re-backfilling everything it already backfilled.
+/// derivation whose hash matches is left exactly as it is, which is what keeps a
+/// boot from re-backfilling everything it already backfilled.
 ///
 /// Returns the names enqueued, in name order.
 ///
@@ -694,6 +694,10 @@ enum Batch {
 /// Steps 4 and 5 guard their writes by name and hash, so a definition that
 /// changed under this process cannot be marked complete or advanced with values
 /// the previous definition produced.
+///
+/// Lock order is state row, then parents in ascending id order. The delta paths
+/// take parent locks and never the state row, so the two cannot deadlock
+/// against each other.
 async fn run_one_batch(
     conn: &mut RuntimeConnection,
     def: &'static DerivationDef,
@@ -835,8 +839,7 @@ pub async fn run_backfill(
 ///
 /// The same batched, lock-then-assign sweep `recompute_counter_caches` runs, so
 /// it is idempotent and safe against live traffic. Returns the number of parent
-/// rows actually repaired — `0` for a healthy derivation, which also writes
-/// nothing.
+/// rows actually repaired. A healthy derivation returns `0` and writes nothing.
 ///
 /// # Errors
 ///
@@ -1148,7 +1151,10 @@ mod tests {
         let err = check_unique_columns(&[&first, &second])
             .expect_err("one column cannot carry two derivations");
         let message = err.to_string();
-        assert!(message.contains("dv_posts.published_comment_count"), "{message}");
+        assert!(
+            message.contains("dv_posts.published_comment_count"),
+            "{message}"
+        );
         assert!(message.contains("other::module"), "{message}");
         assert!(message.contains("count twice"), "{message}");
 
@@ -1263,7 +1269,10 @@ mod tests {
         let err = check_unique_columns(&[&first, &second])
             .expect_err("one column cannot carry two derivations");
         let message = err.to_string();
-        assert!(message.contains("dv_posts.published_comment_count"), "{message}");
+        assert!(
+            message.contains("dv_posts.published_comment_count"),
+            "{message}"
+        );
         assert!(message.contains("other::module"), "{message}");
         assert!(message.contains("count twice"), "{message}");
 
