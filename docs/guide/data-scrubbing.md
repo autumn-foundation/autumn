@@ -215,6 +215,151 @@ scrub should do behind a one-word config key. Schema bookkeeping
 
 ---
 
+## Sampling: a laptop-sized subset
+
+A scrubbed copy of a 400 GB production database is still 400 GB. `--sample`
+emits a **referentially-intact subset** in the same pass, so what you carry away
+is small *and* anonymized:
+
+```sh
+# 1% of users, plus everything those users relate to, scrubbed.
+autumn db scrub --sample users=1%
+
+# An absolute count instead, and two roots in one run.
+autumn db scrub --sample users=500 --sample orders=2000
+```
+
+The amount applies **per target**: with shards configured, `--sample orders=500`
+selects up to 500 rows from each database, not 500 across the topology.
+
+Sampling is a phase of the scrub, never a command of its own: the subset and the
+rewrites commit in one transaction, so there is no flag combination that emits
+sampled-but-unscrubbed rows.
+
+### How rows are chosen
+
+You name the **roots**. Everything else follows the foreign key graph the
+database itself reports:
+
+- **Descend** — rows that reference a selected row are selected too, and they
+  carry their own children in turn. That is what "1% of users plus all their
+  data" means.
+- **Ascend** — rows a selected row references are selected, so every foreign key
+  resolves. Those rows are *not* descended from, which is what stops one shared
+  parent (an org, a plan) from dragging its whole subtree back in. The other
+  children of that org are therefore unreachable, and the run says so rather
+  than emptying them.
+
+### Per-table rules
+
+Two rules live alongside the PII declaration, in the same `scrub.toml`:
+
+```toml
+[sample]
+# Reference data: copied whole, and never descended from.
+always_include = ["countries", "currencies", "plans"]
+# Excluded entirely — the subset is not the place for an audit trail.
+never_include = ["audit_logs", "request_logs"]
+```
+
+### Deterministic
+
+Row selection is ordered by a hash of `--seed` and the row's primary key — not
+by physical order, and not by `random()`. The same seed against the same source
+data selects the identical rows, so a teammate can rebuild the exact subset that
+exhibits a bug:
+
+```sh
+autumn db scrub --sample users=1% --seed 20260101
+```
+
+The seed defaults to `0`, so a run is reproducible whether or not you pass one.
+
+### Fail-closed, same as the classification
+
+Sampling refuses before it deletes anything when it cannot prove the result:
+
+- a table **no root can reach** through the graph (it would be emptied without
+  saying so) — name it as a root, or declare it `always_include` /
+  `never_include`. Being connected to a root is not enough: the walk descends
+  only out of a root and out of the tables it descended into, so a table hanging
+  off one it merely *ascended* into (that shared org), or off an
+  `always_include` lookup table, is not reachable;
+- a foreign key pointing **into** a `never_include` table, which would dangle;
+- a table with **no primary key**, which has no row identity to select on;
+- a **reference cycle** between tables the sample removes rows from, where those
+  removals have no order that keeps every constraint satisfied (copying one of
+  them whole with `always_include` takes it out of the removals and breaks the
+  cycle);
+- a **framework-owned table referencing a sampled one** — those rows are outside
+  the sample, so empty them in the same run with `[framework] purge`;
+- a **retained table referencing a purged one** — the mirror image. A purge of a
+  framework table normally runs before the sample, so that the case above holds;
+  when a table the sample *empties* references it, the purge waits until after
+  the sample instead. But when a table whose rows the sample *keeps* references
+  it, no order works and the run refuses: stop purging that table, or drop the
+  referencing one with `never_include`;
+- a **purge needed both before and after the sample**: one framework table that
+  references a subsetted table (so its purge must run first) *and* is referenced
+  by a table the sample empties (so its purge must run last). The only valid
+  order interleaves the sample's own deletes around the purge, which one atomic
+  sample between two purge passes cannot express;
+- a **foreign key declared on a partition** rather than on its partitioned
+  parent. The sample plays a partition's rows through that parent, whose rows
+  span every partition, so it cannot honour a key binding one partition alone.
+  Declare the key on the partitioned parent — Postgres then clones it to each
+  partition, and the clone is followed through the parent as usual.
+
+`autumn db scrub --check --sample users=1%` proves the plan is complete and
+writes nothing — run it in CI next to the classification check. The foreign key
+re-count below is an apply-time check, so `--check` does not run it.
+
+### What it reports
+
+Every run prints per-table row counts, the total against the source, and the
+size after the subsetted tables are compacted:
+
+```text
+  ℹ Sampling control from users 1%, seed 0 — the same seed against the same source selects the identical rows.
+  ── control: sampled rows ──
+    users: 1000000 → 10000 row(s) (1.0%, root)
+    comments: 4820113 → 48221 row(s) (1.0%, related)
+    countries: 249 → 249 row(s) (100.0%, always-include)
+    audit_logs: 91002881 → 0 row(s) (0.0%, never-include)
+    Total: 96823243 → 58470 row(s) (0.1% of the source), settled in 3 pass(es).
+  ✓ 14 foreign key(s) re-verified — every reference in the subset resolves.
+    Table size: 402.1 GB → 1.4 GB (0.3% of the source).
+```
+
+`[framework] purge` empties its tables **again after the column rewrites**, and
+that final pass is the one the guarantee rests on. Earlier passes exist only to
+make the sample's deletes possible; a trigger on a scrubbed table — an audit or
+history trigger copying `OLD` values — can write fresh rows carrying the original
+PII into a purged table while the rewrites run, long after those. (The scrub
+still warns when a table it writes to carries user-defined triggers: emptying the
+destination cannot help a trigger that writes somewhere the purge list does not
+name.)
+
+The foreign key re-check runs **inside** the scrub's transaction, so a violation
+rolls the whole run back rather than handing you a broken copy. It counts orphans
+per constraint under that constraint's own NULL rule: a partly-NULL composite
+reference satisfies the default `MATCH SIMPLE` and is skipped, but violates
+`MATCH FULL` and is counted — which matters because the one thing this re-check
+adds over Postgres itself is catching a constraint a migration left `NOT VALID`,
+where the server never revisits the rows that predate it. Afterwards each
+subsetted table is rewritten with `VACUUM (FULL, ANALYZE)` — deleting rows on its
+own frees no disk, and the point of a sample is the disk.
+
+Pair it with `--output` to hand a teammate a small, scrubbed artifact:
+
+```sh
+AUTUMN_ENV=staging autumn db scrub \
+    --artifact backups/prod/20260101T020000Z \
+    --sample users=1% --output backups/laptop --force
+```
+
+---
+
 ## Replacement strategies
 
 | Strategy | Produces | Unique-safe |
@@ -333,8 +478,9 @@ apply-time error.
   (`patients(ssn PRIMARY KEY)`) cannot be anonymized in place without rewriting
   every row that references it, which this command does not do — so it is kept
   verbatim and listed in the report. Restructure the schema or scrub it by hand.
-- **Full-copy only.** Row subsetting/sampling for very large databases is not
-  supported — scrub the whole copy.
+- **A sample is valid, not representative.** `--sample` guarantees the subset is
+  referentially intact and PII-free; it does not preserve distributions, and it
+  never fabricates rows to pad a small table (that is `autumn seed`'s job).
 - **Values are fake, not statistically faithful.** Replacements only need to be
   constraint-valid; there is no synthetic-data modelling or differential
   privacy.

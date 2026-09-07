@@ -52,6 +52,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn db scrub --sample <table>=<count|percent%>` emits a
+  **referentially-intact subset** instead of the whole scrubbed copy (issue
+  #1636), so a production copy fits on a laptop. The subset is anchored on
+  developer-chosen roots (`--sample users=1%`, `--sample orders=500`,
+  repeatable) and follows the database's own foreign key graph: rows that
+  reference a selected row are carried along with it, and rows a selected row
+  references are carried too, so every foreign key still resolves. The walk
+  deliberately never descends out of an `always_include` table, or one lookup
+  row would drag the whole database back in. Two per-table rules live alongside
+  the PII declaration in `scrub.toml` — `[sample] always_include` copies
+  reference data whole, `never_include` excludes a table entirely.
+  Selection is deterministic: rows are ordered by a hash of `--seed` (default
+  `0`) and the row key, so the same seed against the same source reproduces the
+  identical subset. Sampling is a phase of the scrub's own transaction, never a
+  command of its own, so no flag combination emits sampled-but-unscrubbed rows.
+  It is fail-closed like the classification: a table no root can reach, a
+  foreign key into a `never_include` table, a table with no primary key, a
+  reference cycle between tables, and a framework-owned table referencing a
+  sampled one all abort with a non-zero exit that names the offenders — before a
+  row is removed. Each run reports per-table row counts, the total against the
+  source, and the size after the subsetted tables are compacted, and re-verifies
+  every foreign key inside the transaction so a violation rolls the run back.
+  `--check` and `--dry-run` cover the sample too and still write nothing.
+  One ordering change reaches every scrub, sampled or not: `[framework] purge`
+  now empties its tables at the START of the transaction rather than after the
+  column rewrites, so a framework-owned table that references a sampled one is
+  already empty when the sample removes the rows it points at — except a purge
+  the sample's own emptied rows reference, which waits until after it instead,
+  and the shape no order satisfies (rows the sample KEEPS referencing a purged
+  table) is refused up front, as is a purge one edge needs before the sample and
+  another needs after it; a deferred purge also carries the purges it references
+  into the same phase, so the split never separates two framework tables that
+  reference each other. The purge also runs a final pass AFTER the column
+  rewrites, which is the pass the guarantee rests on: an audit trigger on a
+  scrubbed table can copy `OLD` values — the original PII — into a purged table
+  while the rewrites run, so a purge that ran only beforehand would report the
+  table emptied while it held real data. A foreign key declared on a partition rather than
+  cloned onto it from its partitioned parent is likewise refused, rather than
+  dropped from the walk and the integrity re-check as if it were a clone. The
+  re-check honours each constraint's own NULL rule, so a partly-NULL composite
+  reference is skipped under `MATCH SIMPLE` but counted under `MATCH FULL`,
+  where it is itself a violation.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite
