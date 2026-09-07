@@ -487,8 +487,12 @@ _ROOT_VERSION = re.compile(
     r'#\[command\([^)]*\bversion\b[^)]*\)\]\s*(?:pub\s+)?struct\s+Cli\b')
 
 _ARG_OPEN = re.compile(r'#\[arg\(')
+# The trailing comma is OPTIONAL: a struct's last field may legally omit it, and
+# requiring it made that field — and only that one — invisible to the option
+# map, which is a false-positive drift report waiting on whoever writes one.
+# `_positionals` has always accepted it; the two now agree.
 _ARG_TAIL = re.compile(
-    r'\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*,')
+    r'\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*(?:,|\}|$)')
 
 # `#[command(flatten)] args: GraphArgs` — the flattened struct's options belong
 # to every command that flattens it. Without this, `autumn graph impact --json`
@@ -3112,6 +3116,44 @@ def _reportable_flag(name):
             and not _PROSE_IN_FLAG.search(name))
 
 
+def _scan_options_only(tokens, i, node, path, flags):
+    """Judge the OPTIONS in `tokens[i:]`, resolving no further commands.
+
+    Reached once a positional has been met on a node that also has subcommands,
+    where a bare token can no longer be told from a subcommand name. Options
+    still can be, so they are still checked; everything else is stepped over.
+
+    Always returns None: a command defect cannot be proven from here, and
+    guessing one is how a gate reports a page that is correct.
+    """
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == '--':                         # end of options; only operands left
+            return None
+        if not (tok.startswith('-') and len(tok) > 1):
+            i += 1                              # a value, or another positional
+            continue
+        if node['trailing']:
+            # Everything from the first positional onward belongs to the
+            # forwarded command, so none of it is this CLI's to judge.
+            return None
+        name = tok.split('=', 1)[0]
+        if name in node['options']:
+            i += 1 if '=' in tok else (2 if node['options'][name] else 1)
+            continue
+        eaten = _short_cluster(tok, node['options'])
+        if eaten is not None:
+            i += eaten
+            continue
+        if flags is not None and _reportable_flag(name):
+            flags.append((path, name))
+        if '=' in tok:                          # arity known; keep judging
+            i += 1
+            continue
+        return None                             # arity unknown: stop here
+    return None
+
+
 def resolve(tokens, surface, runnable=False, flags=None):
     """Return the drifted command path, or None when the command resolves.
 
@@ -3270,13 +3312,30 @@ def resolve(tokens, surface, runnable=False, flags=None):
         if eaten:                               # shell plumbing, not the command
             i += eaten
             continue
-        if not TOKEN.match(tok):
-            return None
-        if tok in node['children']:
+        if tok in node['children']:             # always TOKEN-shaped, so first
             path = path + ' ' + tok
             i += 1
             continue
-        if node['positionals']:                 # unjudgeable: a value, not a name
+        # The positional check comes BEFORE the `TOKEN` bail, because the
+        # positional VALUES this corpus writes are mostly not token-shaped:
+        # `/admin` in `autumn routes /admin --method POST` is a path. Judged
+        # after the bail, that line stopped at `/admin` and its options went
+        # unchecked — the very case this branch exists to keep judging.
+        if node['positionals']:
+            # This token is unjudgeable as a COMMAND — `/admin` in `autumn
+            # routes /admin` is the `prefix` positional, not a subcommand name,
+            # and nothing here can prove otherwise. But the OPTIONS after it are
+            # still this node's to check: `routes` carries a positional, four
+            # options and two subcommands at once, and the guide writes `autumn
+            # routes /admin --method POST`. Returning outright stopped at the
+            # positional and left every option after it unjudged, so `--methd`
+            # on that line read exactly like the `--method` it misspells.
+            #
+            # Only option-shaped tokens are judged from here. Anything else may
+            # be another positional value, or the value of an option, and no
+            # further subcommand resolution is attempted.
+            return _scan_options_only(tokens, i, node, path, flags)
+        if not TOKEN.match(tok):
             return None
         return 'autumn ' + path + ' ' + tok
 
@@ -3440,6 +3499,19 @@ def self_test():
             #[command(flatten)]
             args: GraphArgs,
         },
+        // A positional, options AND subcommands on the same command, as the
+        // real `routes` has. The options after the positional are still this
+        // command's to judge, even though the token itself is not.
+        Routes {
+            #[arg(value_name = "PREFIX")]
+            prefix: Option<String>,
+            #[arg(long, value_name = "METHOD")]
+            method: Vec<String>,
+            #[arg(long)]
+            user_only: bool,
+            #[command(subcommand)]
+            command: Option<RoutesSubcommands>,
+        },
         #[command(subcommand, name = "config")]
         Config(ConfigCommands),
         Controller {
@@ -3471,6 +3543,12 @@ def self_test():
         path: String,
     }
     enum UpgradeCommands { Apply }
+    enum RoutesSubcommands {
+        Audit {
+            #[arg(long)]
+            strict: bool,
+        },
+    }
     // A positional that accepts a hyphen-leading value, as the real
     // `ConfigCommands::Set.value` does.
     enum ConfigCommands {
@@ -3645,6 +3723,27 @@ def self_test():
     expect(opts_of('console -1') == [('console', '-1')],
            'a command with no such positional still reports a hyphen token')
 
+    # --- a positional does not end the option scan on a command that also has
+    # subcommands. `routes` has all three at once and the guide writes `autumn
+    # routes /admin --method POST`; stopping at `/admin` left `--methd` on that
+    # line reading exactly like the `--method` it misspells.
+    expect(surface['routes']['positionals'] and surface['routes']['children'],
+           'the synthetic `routes` must have both a positional and subcommands')
+    expect(opts_of('routes /admin --method POST') == [],
+           'a declared option after a positional resolves')
+    expect(opts_of('routes /admin --methd POST') == [('routes', '--methd')],
+           'an UNDECLARED option after a positional must still be reported')
+    expect(opts_of('routes /admin --user-only') == [],
+           'a boolean option after a positional resolves')
+    expect(resolve(tk('routes /admin --methd POST'), surface) is None,
+           'no COMMAND defect may be invented from a position past a positional')
+    # A subcommand written BEFORE any positional still resolves normally, and
+    # its own options are judged against it rather than against the parent.
+    expect(opts_of('routes audit --strict') == [],
+           'a subcommand reached before a positional keeps its own options')
+    expect(opts_of('routes audit --nope') == [('routes audit', '--nope')],
+           "…and reports against the SUBCOMMAND's path, not the parent's")
+
     # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
     # used to read these stopped at the list's first `]`, so the field vanished
     # and its flag became a false positive.
@@ -3658,6 +3757,22 @@ def self_test():
     # `#[command(flatten)]`
     expect(surface['graph']['options'].get('--json') is False,
            'a flattened args struct contributes its options')
+
+    # A last field may legally omit its trailing comma. Requiring one made that
+    # field invisible to the option map while `_positionals` still saw it — an
+    # option missing from the map is reported as drift against a flag that is
+    # really there.
+    nocomma = build_surface(['''
+        enum Commands {
+            Only {
+                #[arg(long)]
+                last_one: bool
+            },
+        }
+    '''])
+    expect('--last-one' in nocomma['only']['options'],
+           f"a field with no trailing comma is still an option: "
+           f"{sorted(nocomma['only']['options'])}")
     expect(opts_of('graph --json') == [], 'a flattened option is not drift')
 
     # `trailing_var_arg` — the CLI's own flags before the positional are still
