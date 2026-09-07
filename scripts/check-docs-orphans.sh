@@ -386,22 +386,12 @@ def _find_key(table, path):
     own `readme = false`. Reading the nested line as a package key seeded a
     file no registry publishes, which is the direction that hides an orphan.
     """
-    pos = 0
-    ml = None
-    depth = 0
-    for line in table.split('\n'):
-        if ml is not None:
-            if _ml_close(line, ml) >= 0:
-                ml = None
-            pos += len(line) + 1
+    for line, pos, live, depth, _rest in _toml_rows(table):
+        if not live or depth > 0:
             continue
-        if depth <= 0:
-            k = _line_key(line)
-            if k is not None and k[0] == path:
-                return table[pos + len(line) - len(k[1]):]
-        _at, ml, delta = _scan_toml_line(line)
-        depth += delta
-        pos += len(line) + 1
+        k = _line_key(line)
+        if k is not None and k[0] == path:
+            return table[pos + len(line) - len(k[1]):]
     return None
 
 
@@ -817,6 +807,45 @@ def _strip_toml_comments(text):
     return '\n'.join(out)
 
 
+def _toml_rows(text):
+    """Yield `(line, pos, live, depth, rest)` for each line of `text`.
+
+    `live` is False for a multi-line string's content and for its CLOSING
+    line, whose text completes a value and so must never be read as a key.
+    `depth` is the inline-table/array nesting open BEFORE the line. `rest` is
+    the part of the line that is live TOML: the whole line when `live`, the
+    text after the closing delimiter on a closing line, and '' inside a string.
+
+    One walker, for the same reason the character-level scanners became one.
+    `_toml_lines` and `_find_key` each tracked multi-line strings and one of
+    them processed the remainder of a closing line while the other did not — so
+    a `}` sitting after a string's close never reduced the depth and every
+    later package key was skipped, reading an unpublishable package as
+    publishable. That is a divergence between two copies of a rule, which is
+    the defect this file keeps producing, not a missing case.
+    """
+    pos = 0
+    ml = None
+    depth = 0
+    for line in text.split('\n'):
+        if ml is not None:
+            close = _ml_close(line, ml)
+            if close < 0:
+                yield line, pos, False, depth, ''
+                pos += len(line) + 1
+                continue
+            rest = line[close + 3:]
+            yield line, pos, False, depth, rest
+            _at, ml, delta = _scan_toml_line(rest)
+            depth += delta
+            pos += len(line) + 1
+            continue
+        yield line, pos, True, depth, line
+        _at, ml, delta = _scan_toml_line(line)
+        depth += delta
+        pos += len(line) + 1
+
+
 def _toml_lines(manifest):
     """Yield `(table, line, live)` for each line of TOML.
 
@@ -837,35 +866,18 @@ def _toml_lines(manifest):
     still never be read as a key. Interior lines are dropped: they can carry
     neither a key nor the end of a value, so keeping them decides nothing.
 
-    In-table protection does not rest on `live`; `_find_key` tracks multi-line
-    strings itself. The flag exists for root-level lines, which `_toml_table`
-    reads as dotted keys before any header has been seen.
+    The flag exists for root-level lines, which `_toml_table` reads as dotted
+    keys before any header has been seen; `_find_key` uses the same rows.
     """
     table = None
-    ml = None
-    for line in manifest.split('\n'):
-        if ml is not None:
-            close = _ml_close(line, ml)
-            if close < 0:
-                continue
-            # The remainder of the closing line is live TOML again.
-            rest = line[close + 3:]
-            ml = None
+    for line, _pos, live, _depth, rest in _toml_rows(manifest):
+        if rest:
             name = _header_name(rest)
             if name is not None:
                 table = _toml_key_path(name)
                 yield table, '', True
                 continue
-            _at, ml, _d = _scan_toml_line(rest)
-            yield table, line, False
-            continue
-        name = _header_name(line)
-        if name is not None:
-            table = _toml_key_path(name)
-            yield table, '', True
-            continue
-        _at, ml, _d = _scan_toml_line(line)
-        yield table, line, True
+        yield table, line, live
 
 
 def _toml_table(manifest, name):
@@ -8088,6 +8100,18 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9nb/pkg/README.md"
   git -C "$c9nb" add -A && git -C "$c9nb" commit -qm triple-quote-inline-table
   check "a triple-quoted value inside an inline table is one value" fail "$c9nb"
+
+  # The text AFTER a multi-line string closes is live again, so the `}` here
+  # ends the inline value and the keys below it are the package's. Clearing the
+  # string state without rescanning that remainder left the nesting open and
+  # skipped every later key; Cargo reports `publish: []` for this manifest.
+  local c9nc="$tmp/c9nc"; make_corpus "$c9nc"
+  mkdir -p "$c9nc/pkg"
+  printf '[package]\nname = "pkg"\nmetadata = { description = """a\n""", }\npublish = false\nreadme = "README.md"\n' \
+    > "$c9nc/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9nc/pkg/README.md"
+  git -C "$c9nc" add -A && git -C "$c9nc" commit -qm closing-line-remainder
+  check "text after a multi-line string closes is live again" fail "$c9nc"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
