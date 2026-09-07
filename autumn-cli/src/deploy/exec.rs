@@ -1795,9 +1795,18 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
          {shared} to survive a deploy, and moving it while the app runs is not safe, so \
          this deploy stopped."
     );
+    // The recovery line is a command the operator PASTES AND RUNS, so its own
+    // operands must be shell-quoted too. Quoting only the outer `echo` makes the
+    // text safe to print, not safe to run: a path holding `$(…)` would execute on
+    // paste, and one holding a space would split into two `mv` arguments. The
+    // trailing `*` stays OUTSIDE the quotes so it still globs the sidecars.
     let recovery = format!(
         "Run this on the host once, then deploy again: systemctl stop \
-         {service}-blue.service {service}-green.service; mv {current}* {shared_parent}/"
+         {blue_q} {green_q}; mv {current_q}* {shared_parent_q}/",
+        blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
+        green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
+        current_q = shell_quote(&current),
+        shared_parent_q = shell_quote(&shared_parent),
     );
     let occupied =
         format!("autumn deploy: refusing to move {in_release} aside: {superseded} already exists");
@@ -7370,17 +7379,18 @@ mod tests {
             "it must stop the deploy: {}",
             op.shell
         );
-        // The message must name the fix, including the units to stop and the move.
+        // The message must name the fix, including the units to stop and the
+        // move. Its operands are shell-quoted so the line is safe to paste, and
+        // the whole line is one `echo` word, so those quotes appear escaped.
         assert!(
             op.shell
-                .contains("systemctl stop myapp-blue.service myapp-green.service"),
+                .contains(r"systemctl stop '\''myapp-blue.service'\'' '\''myapp-green.service'\''"),
             "the message must name the units to stop: {}",
             op.shell
         );
         assert!(
             op.shell.contains(
-                "mv /srv/autumn/myapp/current/app.db* \
-                 /srv/autumn/myapp/shared/data/"
+                r"mv '\''/srv/autumn/myapp/current/app.db'\''* '\''/srv/autumn/myapp/shared/data'\''/"
             ),
             "the message must name the move, sidecars included: {}",
             op.shell
@@ -7409,16 +7419,71 @@ mod tests {
         );
         // The substitution survives only inside single quotes, where it is inert.
         for (index, _) in op.shell.match_indices("$(touch pwned)") {
-            let before = op.shell.get(..index).unwrap_or_default();
-            assert_eq!(
-                before.matches('\'').count() % 2,
-                1,
+            assert!(
+                inside_single_quotes(&op.shell, index),
                 "every occurrence must sit inside a single-quoted word: {}",
                 op.shell
             );
         }
         // `$s`, our own loop variable, is the only thing left expandable.
         assert!(op.shell.contains("for s in -wal -shm -journal"));
+    }
+
+    /// Is byte `index` inside a single-quoted word?
+    ///
+    /// The generated script uses single quotes only (asserted separately), so
+    /// POSIX rules reduce to two: outside quotes a backslash escapes the next
+    /// character, and inside them nothing escapes. That is why a naive quote
+    /// count is wrong: the escape idiom that puts a literal quote inside a quoted
+    /// word closes, emits an escaped quote, then reopens, and that middle quote
+    /// must not toggle.
+    fn inside_single_quotes(shell: &str, index: usize) -> bool {
+        let mut quoted = false;
+        let mut chars = shell.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if i >= index {
+                break;
+            }
+            if quoted {
+                if c == '\'' {
+                    quoted = false;
+                }
+            } else if c == '\\' {
+                chars.next();
+            } else if c == '\'' {
+                quoted = true;
+            }
+        }
+        quoted
+    }
+
+    /// The recovery line is a command the operator pastes and runs, so quoting
+    /// the `echo` around it is not enough: its own operands must be quoted, or
+    /// the substitution runs on paste and a path with a space splits the `mv`.
+    ///
+    /// The whole line is one `echo` word, so the operand quoting appears here in
+    /// its escaped form, which is what the outer quote turns it into.
+    #[test]
+    fn the_data_link_op_prints_a_recovery_command_that_is_safe_to_paste() {
+        let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
+        let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell
+                .contains(r"mv '\''/srv/autumn/myapp/current/$(touch pwned).db'\''*"),
+            "the pasted `mv` must carry the path as a quoted word: {}",
+            op.shell
+        );
+
+        // A path holding a space must reach `mv` as ONE argument. The `*` stays
+        // outside the quotes so it still globs the sidecars.
+        let spaced = resolved().with_sqlite_data_file(Some("app data.db".to_owned()));
+        let op = sqlite_data_link_op(&spaced, RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell
+                .contains(r"mv '\''/srv/autumn/myapp/current/app data.db'\''*"),
+            "the source must be one quoted word: {}",
+            op.shell
+        );
     }
 
     /// The op must never delete a database file. A rollback target deployed
