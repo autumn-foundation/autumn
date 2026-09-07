@@ -75,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source, and the size after the subsetted tables are compacted, and re-verifies
   every foreign key inside the transaction so a violation rolls the run back.
   `--check` and `--dry-run` cover the sample too and still write nothing.
+  One ordering change reaches every scrub, sampled or not: `[framework] purge`
+  now empties its tables at the START of the transaction rather than after the
+  column rewrites, so a framework-owned table that references a sampled one is
+  already empty when the sample removes the rows it points at.
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded

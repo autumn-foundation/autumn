@@ -2343,6 +2343,15 @@ fn classify_and_apply(
             facts: &facts,
         })?;
 
+        // Resolved in the same pass as the classification, and before ANY
+        // target is written, so a graph gap on one shard cannot leave the rest
+        // of the topology sampled.
+        let sampling = if sources.roots.is_empty() {
+            None
+        } else {
+            Some(build_sample_plan_for(args, sources, &tables, &facts)?)
+        };
+
         // RLS makes an `UPDATE` silently apply to policy-visible rows only,
         // which is a fail-OPEN in a fail-closed tool — refuse rather than
         // report a partial scrub as complete.
@@ -2350,6 +2359,12 @@ fn classify_and_apply(
         // `plan.tables` — so without them an RLS-protected job/token/sync table
         // would have its `DELETE` silently apply to policy-visible rows only,
         // and still be reported emptied.
+        // The sample's tables are the third class of write, and the one a
+        // column-level plan can never cover: a pure join table has no PII
+        // column (PII on a key is refused outright), so it is absent from
+        // `plan.tables` — yet the sample deletes from it, and reads it to
+        // decide what to keep. Under RLS both would see policy-visible rows
+        // only, and the run would report a table emptied that is not.
         let mut rls: Vec<String> = plan
             .tables
             .iter()
@@ -2358,6 +2373,12 @@ fn classify_and_apply(
                 purge_statements(&facts.framework_tables, &sources.config)
                     .into_iter()
                     .map(|(table, _)| table),
+            )
+            .chain(
+                sampling
+                    .iter()
+                    .flat_map(sample::SamplePlan::locked_tables)
+                    .map(str::to_owned),
             )
             .filter(|t| facts.rls_tables.contains(t))
             .collect();
@@ -2369,16 +2390,7 @@ fn classify_and_apply(
 
         report_plan(label, &plan);
         report_framework_tables(&facts.framework_tables, &sources.config);
-        report_triggers(&plan, &facts);
-
-        // Resolved in the same pass as the classification, and before ANY
-        // target is written, so a graph gap on one shard cannot leave the rest
-        // of the topology sampled.
-        let sampling = if sources.roots.is_empty() {
-            None
-        } else {
-            Some(build_sample_plan_for(args, sources, &tables, &facts)?)
-        };
+        report_triggers(&plan, sampling.as_ref(), &facts);
         if let Some(sampling) = &sampling {
             report_sample_plan(label, sampling);
         }
@@ -2392,13 +2404,20 @@ fn classify_and_apply(
         if !sources.roots.is_empty() {
             eprintln!(
                 "\u{2713} Every table is covered by the sample \u{2014} no table would be \
-                 emptied unannounced, and every foreign key resolves."
+                 emptied unannounced."
             );
         }
         return Ok(());
     }
     if args.dry_run {
+        // Printed in the order `execute` runs them: purges, then the sample,
+        // then the rewrites. The order is load-bearing — a framework-owned
+        // table is emptied before the sample removes the rows it points at —
+        // so a reader auditing the dry run must see the real sequence.
         for (label, url, plan, facts, sampling) in &plans {
+            for (_, statement) in purge_statements(&facts.framework_tables, &sources.config) {
+                eprintln!("  {statement};");
+            }
             if let Some(sampling) = sampling {
                 report_sample_sql(url, label, sampling)?;
             }
@@ -2418,9 +2437,6 @@ fn classify_and_apply(
                         }
                     );
                 }
-            }
-            for (_, statement) in purge_statements(&facts.framework_tables, &sources.config) {
-                eprintln!("  {statement};");
             }
             if sampling.is_some() {
                 eprintln!(
@@ -2444,7 +2460,21 @@ fn classify_and_apply(
     }
 
     // ── Pass 2: apply ───────────────────────────────────────────────────────
+    //
+    // Every failure from here on says which databases are already scrubbed and
+    // which still hold real data — including the post-commit compaction, which
+    // runs after this target has committed.
     let mut committed: Vec<&str> = Vec::new();
+    let warn_committed = |committed: &[&str]| {
+        if !committed.is_empty() {
+            eprintln!(
+                "\n\u{26A0}\u{FE0F}  Already committed before this failure: {}. \
+                 Those databases ARE scrubbed; every later target is untouched and still \
+                 holds real data.",
+                committed.join(", ")
+            );
+        }
+    };
     for (label, url, plan, facts, sampling) in &plans {
         let purges = purge_statements(&facts.framework_tables, &sources.config);
         let (applied, sampled) = execute(
@@ -2455,16 +2485,9 @@ fn classify_and_apply(
             sampling.as_ref(),
             label,
         )
-        .inspect_err(|_| {
-            if !committed.is_empty() {
-                eprintln!(
-                    "\n\u{26A0}\u{FE0F}  Already committed before this failure: {}. \
-                     Those databases ARE scrubbed; every later target is untouched and still \
-                     holds real data.",
-                    committed.join(", ")
-                );
-            }
-        })?;
+        .inspect_err(|_| warn_committed(&committed))?;
+        // This target is committed from here on, so a later failure must say so.
+        committed.push(label);
         for (table, rows) in applied {
             eprintln!("  \u{2713} {table}: {rows} row(s) scrubbed.");
         }
@@ -2476,9 +2499,9 @@ fn classify_and_apply(
             // subset actually laptop-sized, and it can only run after the
             // commit: VACUUM FULL rewrites each table and cannot join a
             // transaction.
-            report_reclaimed_size(url, label, sampling, sampled.size_before)?;
+            report_reclaimed_size(url, label, sampling, sampled.size_before)
+                .inspect_err(|_| warn_committed(&committed))?;
         }
-        committed.push(label);
     }
 
     if let Some(dir) = &args.output {
@@ -2518,7 +2541,7 @@ fn build_sample_plan_for(
         .into_iter()
         .map(|(table, _)| table)
         .collect();
-    Ok(sample::build_sample_plan(&sample::SampleInputs {
+    Ok(sample::build_plan(&sample::SampleInputs {
         roots: &sources.roots,
         seed: args.seed,
         rules: &sources.config.sample,
@@ -2617,8 +2640,9 @@ fn report_reclaimed_size(
     before: i64,
 ) -> Result<(), ScrubError> {
     let mut conn = probe_connection(url, label, "compact the sampled tables")?;
-    // Exactly the tables `data_size` measures, so the reported before/after
-    // describes the same set of files this rewrites.
+    // A full-copy table is never deleted from, so it has nothing to reclaim.
+    // `data_size` still measures it on both sides, which keeps the ratio
+    // comparable.
     for table in plan.subsetted_tables() {
         // Not in a transaction, and deliberately: VACUUM FULL takes an
         // exclusive lock and rewrites the table, neither of which a transaction
@@ -2668,21 +2692,32 @@ fn human_bytes(bytes: i64) -> String {
 /// An audit/history trigger copies the pre-scrub `OLD` row into another table as
 /// the `UPDATE` runs — so a table scrubbed earlier in the same transaction can be
 /// re-populated with real values behind the scrub's back.
-fn report_triggers(plan: &ScrubPlan, facts: &DatabaseFacts) {
-    let triggered: Vec<&str> = plan
+fn report_triggers(plan: &ScrubPlan, sampling: Option<&sample::SamplePlan>, facts: &DatabaseFacts) {
+    // A sample DELETEs from tables the column plan never names — a pure join
+    // table has no PII column at all — and an `AFTER DELETE` audit trigger
+    // copies the row it removed somewhere else, which is the same hazard from
+    // the other side.
+    let mut triggered: Vec<&str> = plan
         .tables
         .iter()
-        .filter(|t| facts.triggered_tables.contains(&t.table))
         .map(|t| t.table.as_str())
+        .chain(
+            sampling
+                .into_iter()
+                .flat_map(sample::SamplePlan::subsetted_tables),
+        )
+        .filter(|t| facts.triggered_tables.contains(*t))
         .collect();
+    triggered.sort_unstable();
+    triggered.dedup();
     if triggered.is_empty() {
         return;
     }
     eprintln!(
-        "  \u{26A0}\u{FE0F}  {} rewritten table(s) carry user-defined triggers: {}.\n    \
+        "  \u{26A0}\u{FE0F}  {} table(s) this run writes to carry user-defined triggers: {}.\n    \
          An audit or history trigger copies the PRE-scrub row into another table as the \
-         rewrite runs, which can re-introduce real values. Check those triggers, or disable \
-         them on the copy before scrubbing.",
+         rewrite or the sample's removals run, which can re-introduce real values. Check \
+         those triggers, or disable them on the copy before scrubbing.",
         triggered.len(),
         triggered.join(", ")
     );
@@ -2777,7 +2812,7 @@ pub struct DatabaseFacts {
     /// Every foreign key in `public`, whole constraints rather than the loose
     /// columns above: `--sample` walks this graph to decide which rows a subset
     /// must carry for every reference to resolve.
-    pub foreign_keys: Vec<sample::ForeignKeyRef>,
+    pub foreign_keys: Vec<sample::ForeignKeyConstraint>,
 }
 
 /// A single `name` column.
@@ -2915,9 +2950,9 @@ fn probe_database_facts(
     ))
     .load(&mut conn)
     .map_err(|e| ScrubError::Sql(e.to_string()))?;
-    let foreign_keys: Vec<sample::ForeignKeyRef> = constraint_rows
+    let foreign_keys: Vec<sample::ForeignKeyConstraint> = constraint_rows
         .into_iter()
-        .map(|row| sample::ForeignKeyRef {
+        .map(|row| sample::ForeignKeyConstraint {
             name: row.name,
             child_table: row.child,
             child_columns: row
@@ -3367,12 +3402,12 @@ fn rewrite_encrypted_column(
     Ok(updated)
 }
 
-/// Run every statement for one database inside a single transaction, so a
-/// failure can never leave a half-scrubbed database behind.
 /// What one database's scrub wrote: `(table, rows)` per rewrite, plus the
 /// sample's own outcome when `--sample` was given.
 type Applied = (Vec<(String, usize)>, Option<sample::SampleOutcome>);
 
+/// Run every statement for one database inside a single transaction, so a
+/// failure can never leave a half-scrubbed database behind.
 fn execute(
     url: &str,
     plan: &ScrubPlan,
@@ -3391,11 +3426,9 @@ fn execute(
     let mut conn = probe_connection(url, label, "apply the scrub")?;
     let mut counts = Vec::with_capacity(plan.tables.len());
     let mut outcome = None;
-    // A sample refusal has to abort the transaction, and the only error a
-    // transaction closure can carry is diesel's — so the reason travels beside
-    // it and is re-raised once the rollback has happened.
-    let mut refusal: Option<sample::SampleError> = None;
-    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+    // The transaction's error type carries BOTH channels, so a sample refusal
+    // rolls back as itself rather than as an opaque database error.
+    conn.transaction::<_, sample::SampleFailure, _>(|conn| {
         // Pin the resolution of every unqualified name and the meaning of every
         // string literal for the whole transaction, so a role- or
         // database-level `search_path` (tenant schemas) cannot redirect a write
@@ -3446,7 +3479,7 @@ fn execute(
         // survive it — and so no combination of flags can commit a row that was
         // sampled but not scrubbed: both happen in this one transaction.
         if let Some(sampling) = sampling {
-            outcome = Some(sample::apply(conn, sampling, &mut refusal)?);
+            outcome = Some(sample::apply(conn, sampling)?);
         }
         for table in &plan.tables {
             if let Some(sql) = &table.sql {
@@ -3471,10 +3504,9 @@ fn execute(
         }
         Ok(())
     })
-    .map_err(|e| {
-        refusal
-            .take()
-            .map_or_else(|| ScrubError::Sql(e.to_string()), ScrubError::from)
+    .map_err(|e| match e {
+        sample::SampleFailure::Refused(refusal) => ScrubError::from(refusal),
+        sample::SampleFailure::Db(error) => ScrubError::Sql(error.to_string()),
     })?;
     Ok((counts, outcome))
 }

@@ -87,7 +87,7 @@ pub struct SampleRules {
 
 /// One foreign key constraint, composite keys included.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForeignKeyRef {
+pub struct ForeignKeyConstraint {
     /// The constraint name, for error messages.
     pub name: String,
     /// The referencing table.
@@ -110,7 +110,7 @@ pub enum SampleRole {
     /// Emptied (`[sample] never_include`).
     NeverInclude,
     /// Selected only by the graph walk.
-    Derived,
+    Related,
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -138,6 +138,11 @@ pub enum SampleError {
     },
     /// A root table is also declared `never_include`.
     RootNeverIncluded {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// A root table is also declared `always_include`.
+    RootAlwaysIncluded {
         /// The table names, sorted.
         tables: Vec<String>,
     },
@@ -209,9 +214,11 @@ impl std::fmt::Display for SampleError {
             ),
             Self::UnknownRoot { tables } => write!(
                 f,
-                "--sample names {} table(s) this database does not have:\n{}\n  \
-                 A root must be one of the app's own tables (framework-owned tables are \
-                 handled by `[framework] purge`).",
+                "--sample names {} table(s) that are not part of the sampled \
+                 universe:\n{}\n  \
+                 A root must be one of the app's own tables. Framework-owned tables are \
+                 emptied with `[framework] purge` instead, and a partition is sampled \
+                 through its parent table.",
                 tables.len(),
                 bullets(tables),
             ),
@@ -225,6 +232,15 @@ impl std::fmt::Display for SampleError {
                 "--sample names {} table(s) that {SAMPLE_SECTION} excludes:\n{}\n  \
                  A root is what the sample is built from, so it cannot also be dropped. \
                  Remove it from `never_include`, or sample a different root.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::RootAlwaysIncluded { tables } => write!(
+                f,
+                "--sample names {} table(s) that {SAMPLE_SECTION} copies whole:\n{}\n  \
+                 A size and \"every row\" are two different answers. Remove it from \
+                 `always_include` to subset it, or drop the --sample root to keep it \
+                 whole.",
                 tables.len(),
                 bullets(tables),
             ),
@@ -261,8 +277,8 @@ impl std::fmt::Display for SampleError {
                  Being connected to a root is not enough: the walk descends only out of a \
                  root and out of the tables it descended into. A table hanging off one it \
                  merely ASCENDED into \u{2014} a shared org a kept user points at \u{2014} or off \
-                 an `always_include` lookup table, is not reachable, or that one shared row \
-                 would drag the whole database back in.",
+                 an `always_include` lookup table, is not reachable: descending from one \
+                 such row would drag the whole database back in.",
                 tables.len(),
                 bullets(tables),
             ),
@@ -286,9 +302,9 @@ impl std::fmt::Display for SampleError {
             Self::NoRowKey { tables } => write!(
                 f,
                 "{} table(s) in the sample have no primary key:\n{}\n  \
-                 Without one the sampler has no row identity to select on. Add a primary \
-                 key, or declare the table in {SAMPLE_SECTION} (`always_include` to copy \
-                 it whole, `never_include` to drop it).",
+                 Without one the sampler has no row identity to select on, and a \
+                 full-copy table still needs one to join its parents. Add a primary key, \
+                 or drop the table with `never_include` in {SAMPLE_SECTION}.",
                 tables.len(),
                 bullets(tables),
             ),
@@ -296,8 +312,9 @@ impl std::fmt::Display for SampleError {
                 f,
                 "{} table(s) reference each other in a cycle:\n{}\n  \
                  The row removals then have no order that keeps every foreign key \
-                 satisfied at each step. Declare one of them `always_include` so its rows \
-                 are never removed, or break the cycle on the copy before sampling.",
+                 satisfied at each step. Copy one of them whole (`[sample] \
+                 always_include`), which takes it out of the removals altogether, or \
+                 break the cycle on the copy before sampling.",
                 tables.len(),
                 bullets(tables),
             ),
@@ -355,9 +372,9 @@ pub struct SamplePlan {
     /// Every table in the sampled universe, in DELETE order (children first).
     pub tables: Vec<SampleTable>,
     /// Foreign keys the closure walk follows.
-    pub walk_edges: Vec<ForeignKeyRef>,
+    pub walk_edges: Vec<ForeignKeyConstraint>,
     /// Every foreign key inside the universe, for the integrity re-check.
-    pub verify_edges: Vec<ForeignKeyRef>,
+    pub verify_edges: Vec<ForeignKeyConstraint>,
 }
 
 /// Everything the planner needs, gathered by the caller.
@@ -372,7 +389,7 @@ pub struct SampleInputs<'a> {
     /// `(name, primary-key columns)`.
     pub tables: &'a [(String, Vec<String>)],
     /// Every foreign key in `public`.
-    pub foreign_keys: &'a [ForeignKeyRef],
+    pub foreign_keys: &'a [ForeignKeyConstraint],
     /// Framework-owned tables present in the database.
     pub framework_tables: &'a BTreeSet<String>,
     /// Framework-owned tables `[framework] purge` empties.
@@ -453,7 +470,7 @@ impl SampleAmount {
 impl SampleRole {
     /// Whether rows of this table are removed at all.
     const fn is_subsetted(self) -> bool {
-        matches!(self, Self::Root(_) | Self::Derived | Self::NeverInclude)
+        matches!(self, Self::Root(_) | Self::Related | Self::NeverInclude)
     }
 
     /// Whether the walk may descend from this table into its children *at all*.
@@ -463,7 +480,7 @@ impl SampleRole {
     /// being a sample. Whether a given table actually HAS descend-eligible rows
     /// is a second question — see [`Self::descends_from_seed`].
     const fn descends(self) -> bool {
-        matches!(self, Self::Root(_) | Self::Derived)
+        matches!(self, Self::Root(_) | Self::Related)
     }
 
     /// Whether this table starts out with descend-eligible rows, before the
@@ -479,7 +496,7 @@ impl SampleRole {
             Self::Root(_) => "root",
             Self::AlwaysInclude => "always-include",
             Self::NeverInclude => "never-include",
-            Self::Derived => "related",
+            Self::Related => "related",
         }
     }
 }
@@ -489,7 +506,7 @@ impl SampleRole {
 /// # Errors
 ///
 /// Returns the [`SampleError`] describing the first refusal.
-pub fn build_sample_plan(inputs: &SampleInputs<'_>) -> Result<SamplePlan, SampleError> {
+pub fn build_plan(inputs: &SampleInputs<'_>) -> Result<SamplePlan, SampleError> {
     let keys: BTreeMap<&str, &Vec<String>> = inputs
         .tables
         .iter()
@@ -613,6 +630,23 @@ fn resolve_roles(
     }
 
     let always: BTreeSet<&String> = inputs.rules.always_include.iter().collect();
+    // A root silently overriding `always_include` would subset a table declared
+    // full-copy AND make it a descend source, which is the blow-up that rule
+    // exists to prevent. Refuse it, exactly as a `never_include` root is
+    // refused.
+    let copied_whole = sorted_unique(
+        inputs
+            .roots
+            .iter()
+            .filter(|s| always.contains(&s.table))
+            .map(|s| s.table.clone()),
+    );
+    if !copied_whole.is_empty() {
+        return Err(SampleError::RootAlwaysIncluded {
+            tables: copied_whole,
+        });
+    }
+
     let mut roles: BTreeMap<String, SampleRole> = keys
         .keys()
         .map(|name| {
@@ -622,7 +656,7 @@ fn resolve_roles(
             } else if always.contains(&owned) {
                 SampleRole::AlwaysInclude
             } else {
-                SampleRole::Derived
+                SampleRole::Related
             };
             (owned, role)
         })
@@ -638,8 +672,8 @@ fn resolve_roles(
 fn classify_edges(
     inputs: &SampleInputs<'_>,
     roles: &BTreeMap<String, SampleRole>,
-) -> Result<(Vec<ForeignKeyRef>, Vec<ForeignKeyRef>), SampleError> {
-    let describe = |edge: &ForeignKeyRef| {
+) -> Result<(Vec<ForeignKeyConstraint>, Vec<ForeignKeyConstraint>), SampleError> {
+    let describe = |edge: &ForeignKeyConstraint| {
         format!(
             "{} -> {} ({})",
             edge.child_table, edge.parent_table, edge.name
@@ -719,7 +753,7 @@ fn classify_edges(
 ///   a child of a descend source, or the parent of a covered table.
 fn check_coverage(
     roles: &BTreeMap<String, SampleRole>,
-    walk: &[ForeignKeyRef],
+    walk: &[ForeignKeyConstraint],
 ) -> Result<(), SampleError> {
     let mut descend: BTreeSet<&str> = roles
         .iter()
@@ -753,7 +787,7 @@ fn check_coverage(
         roles
             .iter()
             .filter(|(name, role)| {
-                **role == SampleRole::Derived && !covered.contains(name.as_str())
+                **role == SampleRole::Related && !covered.contains(name.as_str())
             })
             .map(|(name, _)| name.clone()),
     );
@@ -792,19 +826,23 @@ fn check_row_keys(
 /// a cycle between distinct tables has no such order and is refused.
 fn delete_order(
     roles: &BTreeMap<String, SampleRole>,
-    edges: &[ForeignKeyRef],
+    edges: &[ForeignKeyConstraint],
 ) -> Result<Vec<String>, SampleError> {
-    let mut parents: BTreeMap<&str, BTreeSet<&str>> = roles
-        .keys()
-        .map(|n| (n.as_str(), BTreeSet::new()))
+    // Only the tables rows are removed from need an order. A full-copy table
+    // keeps every row, so nothing can dangle through it — which is also why
+    // declaring one `always_include` is a real way out of a cycle.
+    let removed: BTreeSet<&str> = roles
+        .iter()
+        .filter(|(_, role)| role.is_subsetted())
+        .map(|(name, _)| name.as_str())
         .collect();
-    let mut incoming: BTreeMap<&str, BTreeSet<&str>> = roles
-        .keys()
-        .map(|n| (n.as_str(), BTreeSet::new()))
-        .collect();
+    let mut parents: BTreeMap<&str, BTreeSet<&str>> =
+        removed.iter().map(|n| (*n, BTreeSet::new())).collect();
+    let mut incoming: BTreeMap<&str, BTreeSet<&str>> =
+        removed.iter().map(|n| (*n, BTreeSet::new())).collect();
     for edge in edges {
         let (child, parent) = (edge.child_table.as_str(), edge.parent_table.as_str());
-        if child == parent {
+        if child == parent || !removed.contains(child) || !removed.contains(parent) {
             continue;
         }
         parents.entry(child).or_default().insert(parent);
@@ -833,7 +871,16 @@ fn delete_order(
         remaining.remove(next);
     }
 
-    if ordered.len() == roles.len() {
+    if ordered.len() == removed.len() {
+        // The full-copy tables are never deleted from, so they carry no ordering
+        // constraint — but the plan still needs an entry for each (their
+        // keep-sets are what the walk ascends from).
+        ordered.extend(
+            roles
+                .iter()
+                .filter(|(_, role)| !role.is_subsetted())
+                .map(|(name, _)| name.clone()),
+        );
         return Ok(ordered);
     }
 
@@ -885,7 +932,7 @@ fn key_expr(alias: &str, key: &[String]) -> String {
 }
 
 /// The `ON` clause joining a child to its parent across every key component.
-fn join_on(edge: &ForeignKeyRef, child: &str, parent: &str) -> String {
+fn join_on(edge: &ForeignKeyConstraint, child: &str, parent: &str) -> String {
     edge.child_columns
         .iter()
         .zip(&edge.parent_columns)
@@ -961,7 +1008,7 @@ impl SamplePlan {
                     quote_ident(&table.keep),
                     qualified(&table.table),
                 )),
-                SampleRole::NeverInclude | SampleRole::Derived => {}
+                SampleRole::NeverInclude | SampleRole::Related => {}
             }
         }
         out
@@ -998,8 +1045,10 @@ impl SamplePlan {
             }
 
             // Descend: keep every child of a descend-eligible parent, and make
-            // those children descend-eligible in turn.
-            if parent.role.descends() {
+            // those children descend-eligible in turn. A full-copy child already
+            // holds every row, and nothing ever descends out of it, so neither
+            // of its sets is worth filling.
+            if parent.role.descends() && child.role.descends() {
                 for set in [&child.keep, &child.descend] {
                     out.push(format!(
                         "{tag}INSERT INTO {set} (k) SELECT DISTINCT {child_key} \
@@ -1029,7 +1078,7 @@ impl SamplePlan {
                 SampleRole::NeverInclude => {
                     Some(format!("DELETE FROM {}", qualified(&table.table)))
                 }
-                SampleRole::Root(_) | SampleRole::Derived => Some(format!(
+                SampleRole::Root(_) | SampleRole::Related => Some(format!(
                     "DELETE FROM {} AS t WHERE NOT EXISTS \
                      (SELECT 1 FROM {} AS k WHERE k.k = {})",
                     qualified(&table.table),
@@ -1128,7 +1177,7 @@ pub struct SampleOutcome {
     pub passes: usize,
     /// Foreign keys re-verified after the deletes.
     pub verified: usize,
-    /// `pg_database_size` before the deletes, in bytes.
+    /// Total relation size of the sampled tables before the deletes, in bytes.
     pub size_before: i64,
 }
 
@@ -1187,22 +1236,37 @@ fn count_rows(conn: &mut PgConnection, table: &str) -> Result<i64, diesel::resul
     Ok(rows.first().map_or(0, |r| r.n))
 }
 
+/// Why a sample run inside the scrub's transaction ended.
+///
+/// The two channels are separate so a refusal cannot be mistaken for a database
+/// failure: `diesel` insists a transaction closure's error type be built from
+/// its own, which would otherwise flatten a `SampleError` into an opaque
+/// rollback.
+#[derive(Debug)]
+pub enum SampleFailure {
+    /// The sample itself was refused; the transaction rolls back.
+    Refused(SampleError),
+    /// The database rejected a statement.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for SampleFailure {
+    fn from(e: diesel::result::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
 /// Run the sample inside the scrub's own transaction.
 ///
-/// A refusal is reported through `failure` and rolls the transaction back, so
-/// nothing is ever left half-sampled — and, because this runs before the scrub's
-/// own rewrites in the same transaction, no rows can be committed sampled but
-/// unscrubbed.
+/// A refusal rolls the transaction back, so nothing is ever left half-sampled —
+/// and, because this runs before the scrub's own rewrites in the same
+/// transaction, no rows can be committed sampled but unscrubbed.
 ///
 /// # Errors
 ///
-/// Returns the database error, or [`diesel::result::Error::RollbackTransaction`]
-/// with `failure` set when the sample itself is refused.
-pub fn apply(
-    conn: &mut PgConnection,
-    plan: &SamplePlan,
-    failure: &mut Option<SampleError>,
-) -> Result<SampleOutcome, diesel::result::Error> {
+/// Returns [`SampleFailure::Refused`] when the sample is refused, or
+/// [`SampleFailure::Db`] when a statement fails.
+pub fn apply(conn: &mut PgConnection, plan: &SamplePlan) -> Result<SampleOutcome, SampleFailure> {
     let size_before = data_size(conn, plan)?;
 
     let before = source_counts(conn, plan)?;
@@ -1226,8 +1290,7 @@ pub fn apply(
             break;
         }
         if passes >= MAX_PASSES {
-            *failure = Some(SampleError::IterationLimit);
-            return Err(diesel::result::Error::RollbackTransaction);
+            return Err(SampleFailure::Refused(SampleError::IterationLimit));
         }
     }
 
@@ -1248,8 +1311,9 @@ pub fn apply(
     }
     if !violations.is_empty() {
         violations.sort();
-        *failure = Some(SampleError::IntegrityViolation { violations });
-        return Err(diesel::result::Error::RollbackTransaction);
+        return Err(SampleFailure::Refused(SampleError::IntegrityViolation {
+            violations,
+        }));
     }
 
     let mut counts = Vec::with_capacity(plan.tables.len());
@@ -1289,8 +1353,8 @@ mod tests {
         child_col: &str,
         parent: &str,
         parent_col: &str,
-    ) -> ForeignKeyRef {
-        ForeignKeyRef {
+    ) -> ForeignKeyConstraint {
+        ForeignKeyConstraint {
             name: name.to_owned(),
             child_table: child.to_owned(),
             child_columns: vec![child_col.to_owned()],
@@ -1308,7 +1372,7 @@ mod tests {
 
     /// `users(id) ← comments(user_id)`, plus a `countries` lookup `users`
     /// references and an unrelated `audit_logs`.
-    fn schema() -> (Vec<(String, Vec<String>)>, Vec<ForeignKeyRef>) {
+    fn schema() -> (Vec<(String, Vec<String>)>, Vec<ForeignKeyConstraint>) {
         (
             vec![
                 table("users", &["id"]),
@@ -1327,9 +1391,9 @@ mod tests {
         roots: &[SampleSpec],
         rules: &SampleRules,
         tables: &[(String, Vec<String>)],
-        foreign_keys: &[ForeignKeyRef],
+        foreign_keys: &[ForeignKeyConstraint],
     ) -> Result<SamplePlan, SampleError> {
-        build_sample_plan(&SampleInputs {
+        build_plan(&SampleInputs {
             roots,
             seed: 7,
             rules,
@@ -1437,7 +1501,7 @@ mod tests {
             role_of(&plan, "users"),
             SampleRole::Root(SampleAmount::Percent(1.0))
         );
-        assert_eq!(role_of(&plan, "comments"), SampleRole::Derived);
+        assert_eq!(role_of(&plan, "comments"), SampleRole::Related);
         assert_eq!(role_of(&plan, "countries"), SampleRole::AlwaysInclude);
         assert_eq!(role_of(&plan, "audit_logs"), SampleRole::NeverInclude);
     }
@@ -1486,7 +1550,7 @@ mod tests {
             &keys,
         )
         .unwrap();
-        assert_eq!(role_of(&plan, "regions"), SampleRole::Derived);
+        assert_eq!(role_of(&plan, "regions"), SampleRole::Related);
     }
 
     #[test]
@@ -1541,7 +1605,7 @@ mod tests {
             &keys,
         )
         .unwrap();
-        assert_eq!(role_of(&plan, "comment_votes"), SampleRole::Derived);
+        assert_eq!(role_of(&plan, "comment_votes"), SampleRole::Related);
     }
 
     #[test]
@@ -1632,6 +1696,26 @@ mod tests {
     }
 
     #[test]
+    fn plan_refuses_a_root_that_is_also_copied_whole() {
+        // A size and "every row" are two different answers, and letting the
+        // root win would quietly make a lookup table a descend source.
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root("countries", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::RootAlwaysIncluded {
+                tables: vec!["countries".to_owned()]
+            }
+        );
+    }
+
+    #[test]
     fn plan_refuses_a_table_declared_both_always_and_never() {
         let (tables, keys) = schema();
         let err = plan_of(
@@ -1676,7 +1760,7 @@ mod tests {
     #[test]
     fn plan_refuses_a_framework_table_in_the_sample_rules() {
         let (tables, keys) = schema();
-        let err = build_sample_plan(&SampleInputs {
+        let err = build_plan(&SampleInputs {
             roots: &[root("users", SampleAmount::Count(10))],
             seed: 0,
             rules: &SampleRules {
@@ -1758,6 +1842,32 @@ mod tests {
     }
 
     #[test]
+    fn a_cycle_is_broken_by_copying_one_of_its_tables_whole() {
+        // `always_include` takes a table out of the removals entirely, so the
+        // remaining deletes have an order again — which is exactly what the
+        // cycle diagnostic tells the reader to do.
+        let (mut tables, mut keys) = schema();
+        tables.push(table("orgs", &["id"]));
+        keys.push(fk("users_org_fk", "users", "org_id", "orgs", "id"));
+        keys.push(fk("orgs_owner_fk", "orgs", "owner_id", "users", "id"));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned(), "orgs".to_owned()],
+                never_include: vec!["audit_logs".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(role_of(&plan, "orgs"), SampleRole::AlwaysInclude);
+        assert!(
+            !joined(&plan.delete_statements()).contains("\"orgs\""),
+            "a full-copy table keeps every row, so it is never deleted from"
+        );
+    }
+
+    #[test]
     fn plan_allows_a_self_referencing_table() {
         // A row and the row it points at are removed by the same statement, so
         // the constraint is satisfied when the statement ends.
@@ -1780,7 +1890,7 @@ mod tests {
     fn plan_refuses_a_table_outside_the_sample_that_references_a_sampled_one() {
         let (tables, mut keys) = schema();
         keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
-        let err = build_sample_plan(&SampleInputs {
+        let err = build_plan(&SampleInputs {
             roots: &[root("users", SampleAmount::Count(10))],
             seed: 0,
             rules: &fixture_rules(),
@@ -1805,7 +1915,7 @@ mod tests {
         // is left to dangle.
         let (tables, mut keys) = schema();
         keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
-        let plan = build_sample_plan(&SampleInputs {
+        let plan = build_plan(&SampleInputs {
             roots: &[root("users", SampleAmount::Count(10))],
             seed: 0,
             rules: &fixture_rules(),
@@ -1888,7 +1998,7 @@ mod tests {
         let (tables, keys) = schema();
         let counts = BTreeMap::from([("users".to_owned(), 100_i64), ("countries".to_owned(), 1)]);
         let with_seed = |seed: u64| {
-            build_sample_plan(&SampleInputs {
+            build_plan(&SampleInputs {
                 roots: &[root("users", SampleAmount::Count(5))],
                 seed,
                 rules: &fixture_rules(),
@@ -2051,7 +2161,7 @@ mod tests {
             table("orders", &["tenant_id", "id"]),
             table("order_lines", &["id"]),
         ];
-        let keys = vec![ForeignKeyRef {
+        let keys = vec![ForeignKeyConstraint {
             name: "order_lines_order_fk".to_owned(),
             child_table: "order_lines".to_owned(),
             child_columns: vec!["tenant_id".to_owned(), "order_id".to_owned()],

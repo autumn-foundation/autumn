@@ -229,6 +229,9 @@ autumn db scrub --sample users=1%
 autumn db scrub --sample users=500 --sample orders=2000
 ```
 
+The amount applies **per target**: with shards configured, `--sample orders=500`
+selects up to 500 rows from each database, not 500 across the topology.
+
 Sampling is a phase of the scrub, never a command of its own: the subset and the
 rewrites commit in one transaction, so there is no flag combination that emits
 sampled-but-unscrubbed rows.
@@ -238,10 +241,10 @@ sampled-but-unscrubbed rows.
 You name the **roots**. Everything else follows the foreign key graph the
 database itself reports:
 
-- **Down** — rows that reference a selected row are selected too, and they carry
-  their own children in turn. That is what "1% of users plus all their data"
-  means.
-- **Up** — rows a selected row references are selected, so every foreign key
+- **Descend** — rows that reference a selected row are selected too, and they
+  carry their own children in turn. That is what "1% of users plus all their
+  data" means.
+- **Ascend** — rows a selected row references are selected, so every foreign key
   resolves. Those rows are *not* descended from, which is what stops one shared
   parent (an org, a plan) from dragging its whole subtree back in. The other
   children of that org are therefore unreachable, and the run says so rather
@@ -284,13 +287,16 @@ Sampling refuses before it deletes anything when it cannot prove the result:
   `always_include` lookup table, is not reachable;
 - a foreign key pointing **into** a `never_include` table, which would dangle;
 - a table with **no primary key**, which has no row identity to select on;
-- a **reference cycle** between tables, where the row removals have no order
-  that keeps every constraint satisfied;
+- a **reference cycle** between tables the sample removes rows from, where those
+  removals have no order that keeps every constraint satisfied (copying one of
+  them whole with `always_include` takes it out of the removals and breaks the
+  cycle);
 - a **framework-owned table referencing a sampled one** — those rows are outside
   the sample, so empty them in the same run with `[framework] purge`.
 
-`autumn db scrub --check --sample users=1%` proves all of that and writes
-nothing — run it in CI next to the classification check.
+`autumn db scrub --check --sample users=1%` proves the plan is complete and
+writes nothing — run it in CI next to the classification check. The foreign key
+re-count below is an apply-time check, so `--check` does not run it.
 
 ### What it reports
 
@@ -298,6 +304,8 @@ Every run prints per-table row counts, the total against the source, and the
 size after the subsetted tables are compacted:
 
 ```text
+  ℹ Sampling control from users 1%, seed 0 — the same seed against the same source selects the identical rows.
+  ── control: sampled rows ──
     users: 1000000 → 10000 row(s) (1.0%, root)
     comments: 4820113 → 48221 row(s) (1.0%, related)
     countries: 249 → 249 row(s) (100.0%, always-include)

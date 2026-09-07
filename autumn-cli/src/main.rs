@@ -2459,12 +2459,20 @@ enum DbCommands {
         /// staging drill always passes.
         #[arg(long)]
         allow_source_overwrite: bool,
-        /// Emit a referentially-intact SUBSET instead of the whole copy, rooted
-        /// on this many rows of TABLE: `--sample users=1%` or
-        /// `--sample users=500`. Repeatable. Every row the selected roots
-        /// relate to is carried along, so every foreign key still resolves; the
-        /// subset is scrubbed in the same pass. Per-table `always_include` /
-        /// `never_include` rules live in `[sample]` in `scrub.toml`.
+        /// Emit a referentially-intact SUBSET instead of the whole copy.
+        ///
+        /// Roots the subset on this many rows of TABLE — `--sample users=1%` or
+        /// `--sample users=500` — and repeats for more than one root. Every row
+        /// the selected roots relate to is carried along, so every foreign key
+        /// still resolves, and the subset is scrubbed in the same pass.
+        /// Per-table `always_include` / `never_include` rules live in
+        /// `[sample]` in `scrub.toml`.
+        ///
+        /// The amount applies PER TARGET: with shards configured,
+        /// `--sample users=500` selects up to 500 rows from each database.
+        /// After a successful run every subsetted table is rewritten with
+        /// `VACUUM (FULL, ANALYZE)`, which takes an exclusive lock and needs
+        /// room for a second copy of the table while it runs.
         #[arg(long, value_name = "TABLE=COUNT|PERCENT%")]
         sample: Vec<String>,
         /// The seed `--sample` derives its row selection from. The same seed
