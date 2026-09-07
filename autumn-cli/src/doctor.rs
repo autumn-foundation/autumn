@@ -3443,18 +3443,20 @@ fn check_pg_client_tools_with(tools: &crate::db::backup::PgTools) -> CheckResult
 /// `SQLite`-target variant of the pg-client-tools check (`SQLite` foundation,
 /// issue #1614). `pg_dump`/`pg_restore` are Postgres-only, so their absence is
 /// not a problem for a `SQLite` app — warning about them would be misleading.
-/// `SQLite` backup/restore is not yet wired (tracked in #1909), so this is an
-/// honest informational Pass rather than a claim that backups work today.
+///
+/// Since #1909 this is a Pass on the merits, not a deferral. `autumn db backup`
+/// snapshots the data file with `VACUUM INTO`; `restore` replaces the file. Both
+/// run in-process, so a `SQLite` app needs no external tools.
 fn check_pg_client_tools_sqlite() -> CheckResult {
     CheckResult {
         name: "pg_client_tools",
         status: CheckStatus::Pass,
         detail: Some(
-            "SQLite app: PostgreSQL client tools (pg_dump/pg_restore) are not required".into(),
+            "SQLite app: `autumn db backup` / `restore` work on the data file in-process; \
+             no PostgreSQL client tools required"
+                .into(),
         ),
-        hint: Some(
-            "SQLite backup/restore is tracked in https://github.com/autumn-foundation/autumn/issues/1909",
-        ),
+        hint: None,
     }
 }
 
@@ -8112,10 +8114,9 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(check_tailwind_binary));
     }
 
-    // 7b. PostgreSQL client tools behind `autumn db backup` / `db restore`. On
-    // a SQLite app (issue #1614) these Postgres-only tools don't apply, so a
-    // missing `pg_dump`/`pg_restore` is not a problem — SQLite backup/restore
-    // is tracked in #1909; don't emit a misleading Postgres-only warning.
+    // 7b. PostgreSQL client tools behind `autumn db backup` / `db restore`. On a
+    // SQLite app these Postgres-only tools do not apply; see
+    // `check_pg_client_tools_sqlite`.
     if db_topology
         .primary_url
         .as_deref()
@@ -17102,14 +17103,21 @@ foo = "bar"
         assert!(detail.contains("shards"), "detail={detail}");
     }
 
-    /// `SQLite` foundation (issue #1614): the pg-client-tools check must not warn
-    /// about missing `pg_dump`/`pg_restore` on a `SQLite` app; it Passes and
-    /// points at #1909 (`SQLite` backup/restore is not yet wired).
+    /// The pg-client-tools check must not warn about missing
+    /// `pg_dump`/`pg_restore` on a `SQLite` app (#1614), and since #1909 it must
+    /// not defer either: backup/restore are wired, in-process, so the Pass says
+    /// the tools are not needed and offers no follow-up hint.
     #[test]
-    fn pg_client_tools_sqlite_variant_passes_and_cites_1909() {
+    fn pg_client_tools_sqlite_variant_passes_on_the_merits() {
         let r = check_pg_client_tools_sqlite();
         assert_eq!(r.status, CheckStatus::Pass);
-        assert!(r.hint.unwrap_or_default().contains("1909"));
+        assert_eq!(r.hint, None, "a working path needs no tracking-issue hint");
+        let detail = r.detail.unwrap_or_default();
+        assert!(
+            detail.contains("in-process") && !detail.contains("1909"),
+            "the detail must state the working mechanism, not a deferral: {detail}"
+        );
+        assert!(!detail.contains("not required for"), "{detail}");
     }
 
     /// `SQLite` foundation (issue #1614), finding F20: the pending-migration

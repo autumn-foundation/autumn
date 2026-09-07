@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
+  `autumn db restore` now support a `sqlite://` target with no external tools.
+  The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the
+  snapshot is a consistent point in time even while the app writes, and in WAL
+  mode it does not block the writer. The artifact is a real `control.sqlite`
+  database beside the usual `manifest.json`, which now records a per-target
+  `backend` field; an absent field means `postgres`, so every artifact written
+  before this release restores exactly as it did. `restore` verifies the artifact,
+  stages a verified copy beside the target, clears the target's `-wal`, `-shm`
+  and `-journal`, and renames the copy into place keeping the target's mode and
+  owner. Stop the app before restoring: a running process keeps open handles to
+  the old file. `--keep`, `--upload` and offsite restore are unchanged.
+  An artifact whose recorded backend disagrees with the configured database is
+  now refused up front instead of failing inside a driver. A `file:` database URL
+  is percent-decoded the way SQLite decodes a URI filename, so `file:app%20data.db`
+  resolves to the `app data.db` the app actually opens — this also corrects
+  `autumn db replica`, which shares the resolver. `pg_dump` is resolved
+  only when a Postgres target is in the run, so an all-SQLite app no longer needs
+  Postgres client tools to back up.
+  `autumn deploy` treats the SQLite data file as persistent state: a relative
+  `sqlite://app.db` is kept in `app_dir/shared/data` and linked into each release
+  — before the migration one-shot, and again on rollback — so a deploy, a
+  rollback and release retention can never lose or orphan it. An app deployed
+  before this lands keeps its file in the serving release; the next deploy stops
+  and prints the one-time move to make, rather than relocating a live database
+  (SQLite ties the `-wal` name to the resolved path, so a move under a running
+  app is not safe). The deploy never deletes a database file. A database
+  configured *inside*
+  the releases directory, an in-memory one, or a relative path that is not a
+  plain name is now refused at preflight by a new `sqlite_data_file` grader
+  rather than after the first cutover; the grader is emitted only for a SQLite
+  app, so a Postgres deploy's preflight report is unchanged. `autumn doctor`'s
+  `pg_client_tools` check on a SQLite app now passes on the merits instead of
+  deferring to a tracking issue.
+
 ### Changed
 
 - **cli:** `autumn destroy` no longer reports `Diverged` for an untouched file

@@ -123,13 +123,21 @@ Two build modes select where the Postgres binaries come from:
 
 ## Database backups
 
-`autumn db backup` and `autumn db restore` take logical dumps of the databases
-your app actually uses. They resolve the connection URL(s) through the **same**
+`autumn db backup` and `autumn db restore` capture the databases your app
+actually uses — on Postgres as logical dumps, on SQLite as a file
+snapshot. They resolve the connection URL(s) through the **same**
 path as `autumn migrate` and the other `autumn db` commands — control plus every
 configured shard, under the active profile/`.env` overlay — so a backup captures
 exactly what the running app reads. On a managed-Postgres daemon the bundled
 `pg_dump`/`pg_restore` are used automatically, so there are no external client
 tools to install.
+
+On the [SQLite tier](./sqlite-in-production.md) neither tool is involved at all:
+a `sqlite://` target is captured with SQLite's own `VACUUM INTO` (one
+transactional statement, safe against a live app) and the artifact is a
+`control.sqlite` database file. Everything below — the run directory, `--keep`,
+`--upload`, `restore` — works the same; only `--format`, which grades Postgres
+artifacts, does not apply.
 
 ```sh
 # Back up control + every shard into ./backups/<profile>/<timestamp>/

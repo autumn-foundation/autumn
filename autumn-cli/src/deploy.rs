@@ -307,6 +307,22 @@ pub struct ResolvedDeployConfig {
     /// Whether this deploy may install the reverse-proxy binary on a host that has
     /// none (`[deploy] install_proxy`, default `true`; issue #1607, AC-1).
     pub install_proxy: bool,
+    /// Release-relative path of the `SQLite` data file, when the app is on the
+    /// `SQLite` tier and its `[database]` URL names a RELATIVE file (issue
+    /// #1909).
+    ///
+    /// A slot unit's `WorkingDirectory` is the release dir, so a relative
+    /// `sqlite://./app.db` resolves INSIDE the release — a new release would
+    /// start against an empty database and the old release's file would be
+    /// pruned away with its directory. When this is `Some`, the deploy keeps the
+    /// real file in [`Self::shared_data_dir`] and links each release at this
+    /// path (see [`crate::deploy::exec::sqlite_data_link_op`]).
+    ///
+    /// `None` for a Postgres app, and for a `SQLite` app whose URL is already an
+    /// absolute path outside the releases dir — there is nothing to relocate.
+    /// Set by [`Self::with_sqlite_data_file`]; [`Self::resolve`] leaves it
+    /// `None`, since it grades `[deploy]` and never reads `[database]`.
+    pub sqlite_data_file: Option<String>,
 }
 
 /// Canonicalize a deploy profile string to the value the app's runtime resolver
@@ -426,7 +442,16 @@ impl ResolvedDeployConfig {
             tls_enabled: cfg.tls.enabled,
             tls_host,
             install_proxy: cfg.install_proxy,
+            sqlite_data_file: None,
         })
+    }
+
+    /// Attach the release-relative `SQLite` data-file path this deploy must keep
+    /// persistent (issue #1909). See [`Self::sqlite_data_file`].
+    #[must_use]
+    pub fn with_sqlite_data_file(mut self, relative: Option<String>) -> Self {
+        self.sqlite_data_file = relative;
+        self
     }
 
     /// Persistent per-app dir shared across releases (holds the secret env
@@ -479,6 +504,27 @@ impl ResolvedDeployConfig {
             self.shared_dir(),
             autumn_web::maintenance::MAINTENANCE_FLAG_BASENAME
         )
+    }
+
+    /// Persistent directory holding the `SQLite` data file across releases
+    /// (issue #1909).
+    ///
+    /// It sits under `shared/` for the reason the maintenance flag does: `shared/`
+    /// survives cutovers, rollbacks and pruning, and both slots see it. A release
+    /// dir is the opposite — replaced on every deploy, deleted by retention. The
+    /// directory itself is created by the data-link op, not by `prepare-dirs`.
+    #[must_use]
+    pub fn shared_data_dir(&self) -> String {
+        format!("{}/data", self.shared_dir())
+    }
+
+    /// Absolute path of the persistent `SQLite` data file, or `None` when this
+    /// app has none to keep (Postgres, or an already-absolute `SQLite` path).
+    #[must_use]
+    pub fn shared_sqlite_data_file(&self) -> Option<String> {
+        self.sqlite_data_file
+            .as_ref()
+            .map(|rel| format!("{}/{rel}", self.shared_data_dir()))
     }
 }
 
@@ -2138,6 +2184,218 @@ fn resolve_writable_db_url(db: &autumn_web::config::DatabaseConfig) -> Option<&s
         .or_else(|| db.shards.first().map(|shard| shard.primary_url.as_str()))
 }
 
+/// The release-relative `SQLite` data-file path this deploy must keep persistent,
+/// or `None` when there is none (issue #1909).
+///
+/// Only the [`SqliteDataFile::Relative`] case needs relocating; an absolute path
+/// already survives, and a refused configuration is caught by
+/// [`grade_sqlite_data_persistence`] before any remote command runs.
+fn sqlite_relative_data_file(
+    config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+) -> Option<String> {
+    match classify_sqlite_data_file(resolve_writable_db_url(&config.database), resolved) {
+        SqliteDataFile::Relative(rel) => Some(rel),
+        SqliteDataFile::NotSqlite | SqliteDataFile::Persistent(_) | SqliteDataFile::Refused(_) => {
+            None
+        }
+    }
+}
+
+/// How a `SQLite` app's configured data file relates to the deploy layout
+/// (issue #1909).
+///
+/// See [`classify_sqlite_data_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteDataFile {
+    /// Not a `SQLite` app — nothing to persist.
+    NotSqlite,
+    /// A relative path, which resolves inside the release dir. The deploy keeps
+    /// the real file under `shared/data` and links each release at this path.
+    Relative(String),
+    /// An absolute path the deploy does not manage — outside the app dir, or in
+    /// its persistent `shared/`. Already release-independent, so the deploy
+    /// leaves it exactly where the operator put it.
+    Persistent(String),
+    /// A configuration a deploy cannot make durable. Carries the operator-facing
+    /// reason.
+    Refused(String),
+}
+
+/// Classify the writable database URL a deploy would ship (issue #1909).
+///
+/// Each refusal names a configuration whose data cannot survive a deploy.
+/// Preflight catches it before any remote command runs, not after the first
+/// cutover.
+#[must_use]
+pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) -> SqliteDataFile {
+    let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return SqliteDataFile::NotSqlite;
+    };
+    if autumn_web::config::DatabaseBackend::detect(url)
+        != Some(autumn_web::config::DatabaseBackend::Sqlite)
+    {
+        return SqliteDataFile::NotSqlite;
+    }
+    let Some(path) = autumn_web::replication::database_file(url) else {
+        return SqliteDataFile::Refused(
+            "the configured SQLite database is IN-MEMORY, so it cannot survive a deploy \
+             (or a restart). Point `[database] url` at a file, e.g. \
+             sqlite:///srv/autumn/<app>/shared/data/app.db"
+                .to_owned(),
+        );
+    };
+    // A deploy addresses paths as text — in a systemd unit, in a shell line — so
+    // one it cannot render is one it cannot ship. `file:app%FF.db` decodes to such
+    // a name.
+    let Some(raw) = path.to_str().map(str::to_owned) else {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database path ({}) is not valid UTF-8, so a deploy \
+             cannot address it. Rename the file.",
+            path.display()
+        ));
+    };
+    // Normalize BEFORE any containment check: a lexical prefix compare on
+    // `/srv/app/shared/../releases/r1/app.db` would call it durable, while the
+    // kernel resolves it into `releases/`, where retention deletes it.
+    let Some(text) = lexically_normalized(&raw) else {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database path {raw} climbs above the filesystem root."
+        ));
+    };
+    if text.starts_with('/') {
+        // Anything the deploy itself manages is transient — `releases/` is
+        // replaced every deploy and pruned by retention, and `current` is just a
+        // symlink into it. Only `shared/` survives, so only `shared/` is a
+        // durable place inside the app dir. A path outside the app dir is the
+        // operator's own and is left alone.
+        //
+        // `app_dir` is normalized too, not just the database path: `[deploy]
+        // app_dir = "/srv/autumn/tmp/../myapp"` names the same directory as
+        // `/srv/autumn/myapp`, and comparing the raw spelling would miss a
+        // database sitting in the releases dir it resolves to.
+        let app_dir = lexically_normalized(&cfg.app_dir).unwrap_or_default();
+        let shared = lexically_normalized(&cfg.shared_dir()).unwrap_or_default();
+        // An app dir that is not an absolute path grades nothing — `within` on an
+        // empty root would swallow every absolute path.
+        if app_dir.starts_with('/') && within(&text, &app_dir) && !within(&text, &shared) {
+            return SqliteDataFile::Refused(format!(
+                "the configured SQLite database {text} lives inside the deploy's own app \
+                 directory ({app_dir}), where only `shared/` survives: `releases/` is \
+                 replaced on every deploy and deleted by release retention, and `current` \
+                 is a symlink into it. Move the file to {}, or outside {app_dir} \
+                 altogether.",
+                cfg.shared_data_dir()
+            ));
+        }
+        return SqliteDataFile::Persistent(text);
+    }
+    // A relative path is resolved against the slot unit's `WorkingDirectory`,
+    // which is the release dir. Normalization above already removed `.` and
+    // resolved `..`; what is left must still name a file INSIDE the release dir,
+    // so a leading `..` (which normalization keeps, having nothing to cancel it
+    // against) and an empty path are both refused.
+    if text.is_empty() || text == ".." || text.starts_with("../") {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database path {text:?} does not name a file inside the \
+             release directory it is resolved against, so a deploy cannot keep it durable. \
+             Use a plain relative name (sqlite://app.db) or an absolute path."
+        ));
+    }
+    SqliteDataFile::Relative(text)
+}
+
+/// Collapse `.` and `..` lexically, and normalize separators.
+///
+/// Deliberately a STRING walk, not `std::path`: the path names a file on the
+/// deploy TARGET, which is always a POSIX host, while `std::path` follows the
+/// host this CLI runs on. On Windows `Path::new("/var/lib/app.db").is_absolute()`
+/// is false, so every containment rule below would grade a Linux absolute path as
+/// a relative one — `autumn deploy check` from a Windows workstation would
+/// misjudge the target it is about to deploy to.
+///
+/// Lexical, not `canonicalize`: this process cannot stat the target. That is
+/// enough for the containment rules — it closes the `shared/../releases` hole —
+/// and a symlink on the host that defeats it would defeat any check made here.
+///
+/// Collapsing `..` is safe here because `SQLite` collapses it too, in its own
+/// VFS, BEFORE calling `open(2)`. The deploy therefore links only the collapsed
+/// path — `data/nested/../app.db` creates `data`, not `data/nested` — and the app
+/// still opens the file the deploy linked. Raw `open(2)` would NOT: POSIX
+/// resolution needs `data/nested` to exist. So this is load-bearing on `SQLite`'s
+/// behaviour, not the kernel's. Re-check it before supporting a VFS that does not
+/// normalize lexically.
+///
+/// Returns `None` when the path climbs above the filesystem root.
+fn lexically_normalized(path: &str) -> Option<String> {
+    let absolute = path.starts_with('/');
+    let mut names: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            // An empty segment is a repeated or trailing `/`.
+            "" | "." => {}
+            ".." => {
+                // A leading `..` on a RELATIVE path has nothing to cancel and is
+                // kept, so the caller can refuse it; on an absolute path it would
+                // climb above the root.
+                if names.last().is_some_and(|name| *name != "..") {
+                    names.pop();
+                } else if absolute {
+                    return None;
+                } else {
+                    names.push("..");
+                }
+            }
+            name => names.push(name),
+        }
+    }
+    let joined = names.join("/");
+    Some(if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    })
+}
+
+/// Whether `path` is `root` itself or sits under it. Compares whole path
+/// components, so `/srv/app/releases-archive` is not "under" `/srv/app/releases`.
+fn within(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+/// Preflight grader for `SQLite` data-file durability (issue #1909).
+///
+/// Only emitted for a `SQLite` app, so a Postgres deploy's preflight report is
+/// unchanged.
+#[must_use]
+pub fn grade_sqlite_data_persistence(
+    url: Option<&str>,
+    cfg: &ResolvedDeployConfig,
+) -> Option<PreflightCheck> {
+    match classify_sqlite_data_file(url, cfg) {
+        SqliteDataFile::NotSqlite => None,
+        SqliteDataFile::Relative(rel) => Some(PreflightCheck::pass(
+            "sqlite_data_file",
+            format!(
+                "SQLite data file kept in {}/{rel} across releases",
+                cfg.shared_data_dir()
+            ),
+        )),
+        SqliteDataFile::Persistent(path) => Some(PreflightCheck::pass(
+            "sqlite_data_file",
+            format!("SQLite data file {path} is outside the releases directory"),
+        )),
+        SqliteDataFile::Refused(detail) => Some(PreflightCheck::fail(
+            "sqlite_data_file",
+            detail,
+            "Set `[database] url` to a path a deploy can keep: a plain relative name \
+             (sqlite://app.db, kept under the app's shared/data dir) or an absolute path \
+             outside the releases directory",
+        )),
+    }
+}
+
 /// Collect all preflight graders for the resolved config against the loaded
 /// runtime configuration.
 ///
@@ -2176,7 +2434,7 @@ fn collect_project_preflight(
         || config.database.primary_url.is_some()
         || config.database.replica_url.is_some()
         || config.database.has_shards();
-    vec![
+    let mut checks = vec![
         // Grade the signing secret against the SAME profile that will be written
         // to the host env file (`AUTUMN_ENV=<resolved.profile>`, default `prod`),
         // not the local CLI runtime profile (`config.profile`, dev/None on a dev
@@ -2201,7 +2459,14 @@ fn collect_project_preflight(
             requires_database_pool(config),
         ),
         grade_migrate_check(Path::new(MIGRATIONS_DIR)),
-    ]
+    ];
+    // Only a SQLite app gets this row, so a Postgres deploy's report is
+    // byte-identical to pre-#1909.
+    checks.extend(grade_sqlite_data_persistence(
+        resolve_writable_db_url(&config.database),
+        resolved,
+    ));
+    checks
 }
 
 /// Preflight for a whole fleet: `ssh_reachability` **per host**, then the three
@@ -3114,6 +3379,13 @@ fn run_up(
     options: &DeployOptions,
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy up\n");
+
+    // Attach the SQLite data-file contract (#1909) BEFORE the fleet is built, so
+    // every host's config carries it and every host links the same path. A
+    // Postgres app resolves `None` and nothing below changes.
+    let resolved = &resolved
+        .clone()
+        .with_sqlite_data_file(sqlite_relative_data_file(config, resolved));
 
     // The rollout targets, in declaration order. A single-host config resolves to
     // a one-host fleet whose only element IS today's `resolved`, so everything
@@ -4085,6 +4357,14 @@ fn run_rollback(
     configured_host_count: usize,
 ) -> Result<(), DeployError> {
     eprintln!("\u{1F342} autumn deploy rollback\n");
+
+    // Same SQLite data-file contract as `up` (#1909): a rollback target deployed
+    // BEFORE the data file was adopted into `shared/` holds no file at that path
+    // any more, so the rolled-back release is re-linked at it rather than
+    // starting against a fresh, empty database.
+    let resolved = &resolved
+        .clone()
+        .with_sqlite_data_file(sqlite_relative_data_file(config, resolved));
 
     // The rollback targets, in declaration order. A single-host config (either
     // spelling) resolves to a one-host fleet whose only element IS today's
@@ -5442,6 +5722,279 @@ mod tests {
     /// results and the assertions below are about SCOPE, not grading.
     fn preflight_config() -> AutumnConfig {
         AutumnConfig::default()
+    }
+
+    // ── SQLite data-file persistence (issue #1909) ─────────────────────────
+
+    fn deploy_cfg() -> ResolvedDeployConfig {
+        ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("deploy config resolves")
+    }
+
+    #[test]
+    fn classify_sqlite_data_file_separates_relative_absolute_and_not_sqlite() {
+        let cfg = deploy_cfg();
+        // A relative path resolves against the slot unit's WorkingDirectory (the
+        // release dir), so it is the case the deploy has to relocate.
+        for relative in ["sqlite://app.db", "sqlite://./app.db", "sqlite:data/app.db"] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(relative), &cfg),
+                    SqliteDataFile::Relative(_)
+                ),
+                "{relative}"
+            );
+        }
+        // Spellings that name the same file normalize to one `ln -s` target.
+        for spelling in ["sqlite://./app.db", "sqlite://app.db"] {
+            assert_eq!(
+                classify_sqlite_data_file(Some(spelling), &cfg),
+                SqliteDataFile::Relative("app.db".to_owned()),
+                "{spelling}"
+            );
+        }
+        for spelling in [
+            "sqlite://data/app.db",
+            "sqlite://data//app.db",
+            "sqlite://data/./app.db",
+            "sqlite://data/nested/../app.db",
+        ] {
+            assert_eq!(
+                classify_sqlite_data_file(Some(spelling), &cfg),
+                SqliteDataFile::Relative("data/app.db".to_owned()),
+                "{spelling}"
+            );
+        }
+        // A `file:` URI is percent-decoded, because that is what SQLite opens.
+        assert_eq!(
+            classify_sqlite_data_file(Some("file:app%20data.db?mode=rwc"), &cfg),
+            SqliteDataFile::Relative("app data.db".to_owned())
+        );
+        // An absolute path outside the app dir already survives a deploy.
+        assert_eq!(
+            classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &cfg),
+            SqliteDataFile::Persistent("/var/lib/myapp/app.db".to_owned())
+        );
+        // …as does one the operator put in the deploy's own persistent dir.
+        assert_eq!(
+            classify_sqlite_data_file(Some("sqlite:///srv/autumn/myapp/shared/data/app.db"), &cfg),
+            SqliteDataFile::Persistent("/srv/autumn/myapp/shared/data/app.db".to_owned())
+        );
+        // Postgres and an unconfigured URL are not this grader's business.
+        for other in [Some("postgres://u:p@h/app"), Some("   "), None] {
+            assert_eq!(
+                classify_sqlite_data_file(other, &cfg),
+                SqliteDataFile::NotSqlite,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// The deploy target is always a POSIX host, so path grading must not follow
+    /// the host this CLI runs on. `std::path` would: on Windows
+    /// `Path::new("/srv/app.db").is_absolute()` is false, so every absolute
+    /// target would be graded as a relative one and `autumn deploy check` from a
+    /// Windows workstation would misjudge the Linux host it deploys to.
+    #[test]
+    fn path_grading_uses_posix_rules_on_every_host() {
+        assert_eq!(
+            lexically_normalized("/srv/autumn/myapp/shared/../releases/r1/app.db"),
+            Some("/srv/autumn/myapp/releases/r1/app.db".to_owned())
+        );
+        assert_eq!(
+            lexically_normalized("./data//nested/../app.db"),
+            Some("data/app.db".to_owned())
+        );
+        assert_eq!(lexically_normalized("/a/../.."), None, "climbs above root");
+        assert_eq!(
+            lexically_normalized("../app.db"),
+            Some("../app.db".to_owned())
+        );
+        assert_eq!(lexically_normalized("."), Some(String::new()));
+        // A leading `/` means absolute here, whatever the host says.
+        assert!(
+            lexically_normalized("/var/lib/app.db").is_some_and(|text| text.starts_with('/')),
+            "a POSIX absolute path must stay absolute"
+        );
+    }
+
+    #[test]
+    fn classify_sqlite_data_file_refuses_what_a_deploy_cannot_keep() {
+        let cfg = deploy_cfg();
+        // In-memory: gone at the next restart, deploy or no deploy.
+        let memory = classify_sqlite_data_file(Some("sqlite::memory:"), &cfg);
+        let SqliteDataFile::Refused(detail) = memory else {
+            panic!("an in-memory database must be refused, got {memory:?}");
+        };
+        assert!(detail.contains("IN-MEMORY"), "{detail}");
+
+        // Anything the deploy manages is transient: `releases/` is pruned by
+        // retention, and `current` is only a symlink into it — a path through
+        // `current` is inside the live release dir, whatever it looks like.
+        for inside in [
+            "sqlite:///srv/autumn/myapp/releases/20260714T120000Z/app.db",
+            "sqlite:///srv/autumn/myapp/current/app.db",
+            "sqlite:///srv/autumn/myapp/app.db",
+        ] {
+            let got = classify_sqlite_data_file(Some(inside), &cfg);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("{inside} must be refused, got {got:?}");
+            };
+            assert!(
+                detail.contains("/srv/autumn/myapp") && detail.contains("shared/data"),
+                "the refusal must name the problem and the fix: {detail}"
+            );
+        }
+        // …but a sibling path that merely SHARES the prefix is fine.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///srv/autumn/myapp-staging/app.db"), &cfg),
+            SqliteDataFile::Persistent(_)
+        ));
+
+        // `..` must be resolved BEFORE the containment check: this one reads as
+        // `shared/` lexically but the kernel resolves it into `releases/`.
+        let sneaky = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/shared/../releases/r1/app.db"),
+            &cfg,
+        );
+        let SqliteDataFile::Refused(detail) = sneaky else {
+            panic!("a path that resolves into releases/ must be refused, got {sneaky:?}");
+        };
+        assert!(
+            detail.contains("/srv/autumn/myapp/releases/r1/app.db"),
+            "the refusal must name the RESOLVED path: {detail}"
+        );
+        // The mirror image: a `..` that resolves back OUT of the app dir is fine,
+        // and the normalized text is what the deploy uses.
+        assert_eq!(
+            classify_sqlite_data_file(
+                Some("sqlite:///srv/autumn/myapp/../shared-data/app.db"),
+                &cfg
+            ),
+            SqliteDataFile::Persistent("/srv/autumn/shared-data/app.db".to_owned())
+        );
+        // A path that climbs above the root is not a path.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///../../app.db"), &cfg),
+            SqliteDataFile::Refused(_)
+        ));
+
+        // A run of spaces mid-sentence means a `\\` continuation was dropped when
+        // the message was written (same guard as `DeployError`'s own).
+        for refused in [
+            "sqlite::memory:",
+            "sqlite:///srv/autumn/myapp/current/app.db",
+            "sqlite://..",
+        ] {
+            if let SqliteDataFile::Refused(detail) = classify_sqlite_data_file(Some(refused), &cfg)
+            {
+                assert!(!detail.contains("   "), "{refused}: {detail}");
+            }
+        }
+
+        // A relative path must name a FILE inside the release dir: `..` climbs out
+        // of it, and a `.`-only path names the directory itself, which the link op
+        // would then try to replace.
+        for bad in [
+            "sqlite://../../app.db",
+            "sqlite://.",
+            "sqlite://./",
+            "sqlite://data/../..",
+        ] {
+            let got = classify_sqlite_data_file(Some(bad), &cfg);
+            assert!(
+                matches!(got, SqliteDataFile::Refused(_)),
+                "{bad} must be refused, got {got:?}"
+            );
+        }
+    }
+
+    /// `[deploy] app_dir` can carry lexical aliases too. Comparing the raw
+    /// spelling would let a database sitting in the releases dir it resolves to
+    /// pass as durable, and release retention would then delete it.
+    #[test]
+    fn classify_sqlite_data_file_normalizes_the_app_dir_as_well() {
+        let aliased = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("/srv/autumn/tmp/../myapp/".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+
+        let inside = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
+            &aliased,
+        );
+        let SqliteDataFile::Refused(detail) = inside else {
+            panic!("a database in the resolved releases dir must be refused, got {inside:?}");
+        };
+        assert!(
+            detail.contains("/srv/autumn/myapp"),
+            "the refusal must name the RESOLVED app dir: {detail}"
+        );
+        // The deploy's own persistent dir still passes, aliased spelling or not.
+        assert!(matches!(
+            classify_sqlite_data_file(
+                Some("sqlite:///srv/autumn/myapp/shared/data/app.db"),
+                &aliased
+            ),
+            SqliteDataFile::Persistent(_)
+        ));
+        // …and a path genuinely outside it is still the operator's own.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &aliased),
+            SqliteDataFile::Persistent(_)
+        ));
+    }
+
+    /// A deploy addresses paths as text, so one it cannot render it cannot ship.
+    /// `file:app%FF.db` decodes to exactly such a name.
+    #[cfg(unix)]
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_non_utf8_path() {
+        let got = classify_sqlite_data_file(Some("file:app%FF.db"), &deploy_cfg());
+        let SqliteDataFile::Refused(detail) = got else {
+            panic!("a non-UTF-8 path must be refused, got {got:?}");
+        };
+        assert!(detail.contains("not valid UTF-8"), "{detail}");
+    }
+
+    #[test]
+    fn sqlite_data_persistence_grader_is_emitted_only_for_a_sqlite_app() {
+        let cfg = deploy_cfg();
+
+        // A Postgres deploy's preflight report must be byte-identical to
+        // pre-#1909: no extra row at all.
+        assert!(grade_sqlite_data_persistence(Some("postgres://h/app"), &cfg).is_none());
+        assert!(grade_sqlite_data_persistence(None, &cfg).is_none());
+
+        let pass = grade_sqlite_data_persistence(Some("sqlite://app.db"), &cfg)
+            .expect("a SQLite app is graded");
+        assert_eq!(pass.name, "sqlite_data_file");
+        assert!(pass.passed, "a relative path is kept, not refused");
+        assert!(
+            pass.detail.contains("/srv/autumn/myapp/shared/data/app.db"),
+            "the pass must name where the file is kept: {}",
+            pass.detail
+        );
+
+        for refused in [
+            "sqlite::memory:",
+            "sqlite:///srv/autumn/myapp/current/app.db",
+        ] {
+            let fail =
+                grade_sqlite_data_persistence(Some(refused), &cfg).expect("a SQLite app is graded");
+            assert!(!fail.passed, "{refused} must fail preflight");
+        }
     }
 
     #[test]

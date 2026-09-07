@@ -55,7 +55,7 @@ pub mod status;
 pub mod wal;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,21 +204,143 @@ pub fn database_file(url: &str) -> Option<PathBuf> {
     if target == ":memory:"
         || target == "file::memory:"
         || target.starts_with("file::memory:?")
-        || target.contains("mode=memory")
+        || uri_asks_for_memory(&target)
     {
         return None;
     }
-    // Reduce a `file:` URI to its path component; SQLite's URI query string
-    // carries options, not path.
-    let path = target
-        .strip_prefix("file:")
-        .map_or(target.as_str(), |rest| rest);
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    if path.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(path))
+    // A `file:` target is a URI, and `SQLite` reads it as one: the query string
+    // carries options rather than path, an empty or `localhost` authority is
+    // dropped, and the filename is percent-decoded. diesel opens with
+    // `SQLITE_OPEN_URI`, so `file:app%20data.db` really does name `app data.db` —
+    // returning the raw text would point every caller at a file that does not
+    // exist. Every other spelling is handed to `sqlite3_open` as a literal path
+    // and is returned verbatim.
+    let Some(uri) = target.strip_prefix("file:") else {
+        return Some(PathBuf::from(target));
+    };
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    // `file://<authority>/path`: SQLite accepts only an empty or `localhost`
+    // authority, and the path starts at the `/` that ends it.
+    let path = path.strip_prefix("//").map_or(path, |rest| {
+        rest.find('/')
+            .map_or("", |slash| rest.get(slash..).unwrap_or_default())
+    });
+    let decoded = percent_decode(path);
+    // `SQLite` hands the decoded name to a NUL-terminated C API, so an encoded NUL
+    // ends the filename: `file:app%00ignored.db` opens `app`. Keeping the tail
+    // would name a path the OS rejects outright — a backup would report the live
+    // database missing, and a deploy would carry a NUL into a remote command.
+    let decoded = decoded
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default()
+        .to_vec();
+    // Re-check for the in-memory token AFTER decoding: the checks above see the
+    // raw target, so `file:%3Amemory%3A` and `file::memory:#fragment` both reach
+    // here as `:memory:`. Returning that as a path would have the deploy link a
+    // persistence file the app never opens.
+    if decoded.is_empty() || decoded == b":memory:" {
+        return None;
     }
+    decoded_path(decoded)
+}
+
+/// Turn decoded `SQLite` URI bytes into a path.
+///
+/// `SQLite` percent-decodes to BYTES and hands them to `open(2)`, so
+/// `file:app%FF.db` names `app\xFF.db` — a real filename on a POSIX host and not
+/// valid UTF-8. A lossy conversion would name `app\u{FFFD}.db` instead: a
+/// different file, which is how a backup comes to report a live database missing.
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the non-unix sibling genuinely refuses; one signature keeps the caller single"
+)]
+fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+/// Non-POSIX hosts name files in UTF-16, so a non-UTF-8 byte sequence names no
+/// file at all. Refuse it rather than guess with a replacement character.
+#[cfg(not(unix))]
+fn decoded_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
+/// Whether a `file:` URI asks for an in-memory database through its QUERY.
+///
+/// A substring test would refuse a durable file that merely happens to be named
+/// `mode=memory.db`, which `SQLite` opens as an ordinary file. Only `mode=memory`
+/// standing alone as a query parameter means in-memory.
+fn uri_asks_for_memory(target: &str) -> bool {
+    let Some(uri) = target.strip_prefix("file:") else {
+        return false;
+    };
+    // A fragment ends the query.
+    let uri = uri.split('#').next().unwrap_or(uri);
+    let Some((_, query)) = uri.split_once('?') else {
+        return false;
+    };
+    // `&` only: SQLite does not treat `;` as a separator, so in
+    // `file:app.db?x=1;mode=memory` the semicolon is part of `x`'s value and the
+    // target is the durable `app.db`.
+    query.split('&').any(|parameter| parameter == "mode=memory")
+}
+
+/// The string to hand `sqlite3_open` for an already-resolved database FILE.
+///
+/// diesel opens with `SQLITE_OPEN_URI`, so a filename that itself begins with
+/// `file:` is re-read as a URI and names a DIFFERENT database — which
+/// `sqlite3_open` then creates, empty. A real file named `file:prod.db` (spelled
+/// `file:file%3Aprod.db` in config) would otherwise be backed up as a fresh empty
+/// `prod.db`, reported as a success. A `./` prefix makes it an unambiguous
+/// relative path; an absolute path cannot begin with `file:` and is untouched.
+///
+/// Returns `None` for a path no `&str` connection string can carry.
+#[must_use]
+pub fn connection_string(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    Some(if text.starts_with("file:") {
+        format!("./{text}")
+    } else {
+        text.to_owned()
+    })
+}
+
+/// Percent-decode a `SQLite` URI path the way `sqlite3_open` does.
+///
+/// `%HH` with two hex digits becomes that byte; anything else — a stray `%`, a
+/// truncated or non-hex escape — is left alone, matching `SQLite`'s own lenient
+/// parser. Returns BYTES, not a `String`: the result is a filename, and a
+/// filename need not be valid UTF-8.
+fn percent_decode(path: &str) -> Vec<u8> {
+    let bytes = path.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        let decoded = if byte == b'%' {
+            bytes
+                .get(index.saturating_add(1))
+                .zip(bytes.get(index.saturating_add(2)))
+                .and_then(|(high, low)| {
+                    let high = char::from(*high).to_digit(16)?;
+                    let low = char::from(*low).to_digit(16)?;
+                    u8::try_from(high.saturating_mul(16).saturating_add(low)).ok()
+                })
+        } else {
+            None
+        };
+        if let Some(value) = decoded {
+            out.push(value);
+            index = index.saturating_add(3);
+        } else {
+            out.push(byte);
+            index = index.saturating_add(1);
+        }
+    }
+    out
 }
 
 /// Strip `scheme://user:pass@` userinfo out of every URL embedded in `detail`.
@@ -482,6 +604,139 @@ mod tests {
         assert_eq!(
             database_file("file:/srv/app.db?mode=rwc"),
             Some(PathBuf::from("/srv/app.db"))
+        );
+    }
+
+    /// A `file:` target is a URI. diesel opens with `SQLITE_OPEN_URI`, so the
+    /// filename is percent-decoded and the authority is dropped — the resolver
+    /// must name the file `SQLite` really opens, not the raw text.
+    #[test]
+    fn database_file_decodes_a_file_uri_the_way_sqlite_does() {
+        for (url, expected) in [
+            ("file:app%20data.db", "app data.db"),
+            (
+                "file:/srv/my%20app/db%2Efile?mode=rwc",
+                "/srv/my app/db.file",
+            ),
+            // An empty or `localhost` authority is dropped; the path starts at
+            // the `/` that ends it.
+            ("file:///srv/app.db", "/srv/app.db"),
+            ("file://localhost/srv/app.db", "/srv/app.db"),
+            // A multi-byte UTF-8 escape reassembles.
+            ("file:caf%C3%A9.db", "café.db"),
+            // A stray or truncated escape is left alone, like SQLite's own parser.
+            ("file:100%.db", "100%.db"),
+            ("file:a%2Fb.db", "a/b.db"),
+            ("file:a%zz.db", "a%zz.db"),
+            ("file:trailing%", "trailing%"),
+            // An encoded NUL ends the filename, as it does for SQLite's own
+            // NUL-terminated open.
+            ("file:app%00ignored.db", "app"),
+            ("file:/srv/app%00.db?mode=rwc", "/srv/app"),
+        ] {
+            assert_eq!(database_file(url), Some(PathBuf::from(expected)), "{url}");
+        }
+        // Every other spelling is a literal path handed to `sqlite3_open`, so a
+        // `%` in it stays a `%`.
+        assert_eq!(
+            database_file("sqlite://app%20data.db"),
+            Some(PathBuf::from("app%20data.db"))
+        );
+    }
+
+    /// `SQLite` decodes a URI filename to BYTES and hands them to `open(2)`, so
+    /// `file:app%FF.db` names a real POSIX file whose name is not valid UTF-8.
+    /// A lossy conversion would name a DIFFERENT file (`app\u{FFFD}.db`), which
+    /// is how a backup comes to report a live database missing.
+    #[cfg(unix)]
+    #[test]
+    fn database_file_keeps_non_utf8_bytes_a_file_uri_decodes_to() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let resolved = database_file("file:app%FF.db").expect("names a file");
+        assert_eq!(
+            resolved.as_os_str().as_bytes(),
+            b"app\xFF.db",
+            "the decoded bytes must survive, not become a replacement character"
+        );
+        assert!(
+            resolved.to_str().is_none(),
+            "this path is deliberately not valid UTF-8"
+        );
+    }
+
+    /// A filename that merely CONTAINS `mode=memory` is a durable file. Only the
+    /// URI query parameter asks for an in-memory database.
+    #[test]
+    fn database_file_reads_mode_memory_from_the_query_not_the_filename() {
+        for durable in [
+            "sqlite://mode=memory.db",
+            "sqlite:///var/lib/mode=memory.db",
+            "file:mode=memory.db",
+        ] {
+            assert!(
+                database_file(durable).is_some(),
+                "{durable} names a durable file"
+            );
+        }
+        for memory in [
+            "file:app?mode=memory",
+            "file:app?cache=shared&mode=memory",
+            "file:app?mode=memory#frag",
+        ] {
+            assert_eq!(database_file(memory), None, "{memory} is in-memory");
+        }
+        // A name that is nothing but a NUL names no file at all.
+        assert_eq!(database_file("file:%00"), None);
+        // The in-memory token can hide behind percent-encoding or a fragment; a
+        // raw-text check runs before decoding, so re-check after it.
+        for memory in [
+            "file:%3Amemory%3A",
+            "file::memory:#fragment",
+            "file:%3amemory%3a",
+        ] {
+            assert_eq!(database_file(memory), None, "{memory} is in-memory");
+        }
+        // A parameter that merely starts with it is a different parameter.
+        assert!(database_file("file:app?mode=memoryx").is_some());
+        // `&` is SQLite's only query separator, so a `;` stays part of a value.
+        assert!(
+            database_file("file:app.db?x=1;mode=memory").is_some(),
+            "a semicolon does not separate parameters, so this names the durable app.db"
+        );
+    }
+
+    /// diesel opens with `SQLITE_OPEN_URI`, so a filename that itself begins with
+    /// `file:` would be re-read as a URI — naming, and CREATING, a different
+    /// database. A backup would then snapshot an empty file and report success.
+    #[test]
+    fn connection_string_keeps_a_file_prefixed_name_from_becoming_a_uri() {
+        assert_eq!(
+            connection_string(Path::new("file:prod.db")).as_deref(),
+            Some("./file:prod.db")
+        );
+        // An absolute path cannot begin with `file:`, so it is untouched.
+        assert_eq!(
+            connection_string(Path::new("/srv/file:prod.db")).as_deref(),
+            Some("/srv/file:prod.db")
+        );
+        assert_eq!(
+            connection_string(Path::new("app.db")).as_deref(),
+            Some("app.db")
+        );
+    }
+
+    /// End to end: the config spelling for a file literally named `file:prod.db`
+    /// must reach THAT file, not a fresh empty `prod.db`.
+    #[test]
+    fn a_file_named_like_a_uri_round_trips_through_the_resolver() {
+        let resolved = database_file("file:file%3Aprod.db?mode=rwc").expect("names a file");
+        assert_eq!(resolved, PathBuf::from("file:prod.db"));
+        assert_eq!(
+            connection_string(&resolved).as_deref(),
+            Some("./file:prod.db"),
+            "handing the decoded name straight back to sqlite3_open would create \
+             a different, empty database"
         );
     }
 

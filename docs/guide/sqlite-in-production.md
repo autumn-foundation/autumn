@@ -144,10 +144,10 @@ buckets on SQLite:
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
 | Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ / ⛔ | Single-host mutual exclusion within the process; a multi-replica configuration is refused at boot. | ⛔ **Planned — #1905** (multi-replica boot-refuse ships now) |
 | Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
-| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
-| `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
-| Retention sweeps | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
-| `autumn deploy` data-file persistence | ✅ | ✅ | SQLite data file treated as **persistent state**; deploy/rollback never clobbers it. | ⛔ **Planned — #1909** |
+| `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file with SQLite's own `VACUUM INTO` — one transactional statement, safe against a live app, and **no external tools**. `restore` verifies the artifact with `PRAGMA integrity_check` before replacing the file, and clears the stale `-wal`/`-shm`. Retention (`--keep`) and offsite upload (`--upload`) work unchanged. | ✅ **Available now** (#1909) |
+| `autumn db scrub` | ✅ | ✅ | Will run against the SQLite file; today it connects with a Postgres driver and introspects Postgres catalogs, so a `sqlite://` target has no path through it. | ⛔ **Planned — #2553** |
+| Retention sweeps | ✅ | ✅ | Will run against the SQLite file. The `autumn db retention` verb is already backend-neutral (it runs your app binary); the runtime sweeps are not yet verified on SQLite. | ⛔ **Planned — #2553** |
+| `autumn deploy` data-file persistence | ✅ | ✅ | The data file is **persistent state**: it lives in `app_dir/shared/data` and each release is linked at it, so deploy, rollback and release retention never clobber or orphan it. See [where a SQLite data file lives](./deployment.md#where-a-sqlite-data-file-lives). | ✅ **Available now** (#1909) |
 | Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | ✅ **Available now — boot-refuse** |
 | Sharding / shard directory | ✅ | ⛔ | **Boot-refuse.** Native sharding is Postgres-only. | ✅ **Available now — boot-refuse** |
 | Full-text search (`--searchable` / `#[searchable]`) | ✅ `tsvector` + GIN | ✅ FTS5 | **Available now on both backends.** Postgres uses a `tsvector` generated column + GIN index; SQLite uses an external-content **FTS5** virtual table with `unicode61` tokenization and `bm25` ranking (weights from `#[searchable(weight=…)]`). The `--searchable` / `#[searchable]` scaffold generates on both (#1910 / #2047). | ✅ **Available now** |
@@ -205,6 +205,9 @@ published support contract**. Available **today**:
   of Postgres-only `NOW() - INTERVAL` / `BIGSERIAL`.
 - **`autumn doctor` SQLite awareness** — a SQLite app is no longer nagged about a
   missing `pg_dump` or a non-`postgres://` URL.
+- **Backup, restore and deploy data-file persistence (#1909)** — see
+  [backup, restore, scrub, retention](#backup-restore-scrub-retention) and
+  [deploy: the data file is persistent state](#deploy-the-data-file-is-persistent-state).
 
 **Not in this slice — scaffold smoke tests on SQLite.** A scaffolded app still
 carries the **Postgres-shaped** (`#[ignore]`d) smoke test. A SQLite-native
@@ -214,9 +217,10 @@ SQLite-dialect smoke SQL against, so the generated smoke test remains
 Postgres-shaped. Tracked under the runtime slice #1905.
 
 The support-matrix rows still marked **Planned** name follow-on subsystem slices
-whose SQLite support has not landed yet (durable jobs and
-`#[scheduled]` tasks #1907, backup/restore/scrub/retention/deploy persistence
-#1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
+whose SQLite support has not landed yet (durable jobs and `#[scheduled]` tasks
+#1907, scrub and retention sweeps #2553). Backup/restore and `autumn deploy`
+data-file persistence landed in #1909. A **Planned** row does **not** mean the
+app refuses to boot — the runtime
 boots and serves; those subsystems are simply not wired for SQLite until their
 tracking issue lands.
 
@@ -285,13 +289,58 @@ be durable. See [Jobs](./jobs.md).
 
 ### Backup, restore, scrub, retention
 
-`autumn db backup` takes an **online-safe snapshot** of the SQLite file — safe to
-run against a live app, and it neither corrupts nor blocks it. `restore`,
-[`db scrub`](./daemon.md) (#1602), and retention sweeps (#1605) all operate on
-the SQLite file through the same command surface as Postgres. Snapshots are the
-coarse-grained, cross-backend story; for second-granularity durability see
+`autumn db backup` takes an **online-safe snapshot** of the SQLite file with
+`VACUUM INTO` — one transactional statement, so the snapshot is a single
+consistent point in time even while the app writes, and in WAL mode it neither
+blocks the writer nor corrupts anything. It needs **no external tools**: there is
+no SQLite equivalent of installing `postgresql-client`.
+
+```bash
+autumn db backup --keep 7 --dir /var/backups/myapp
+```
+
+The run directory is the same one Postgres backups write — `manifest.json` plus
+one artifact per target — except the artifact is `control.sqlite`, a real SQLite
+database you can open with any tool, and the manifest records
+`"backend": "sqlite"`. `--keep`, `--upload` and `autumn db restore
+offsite:prod/latest` behave exactly as they do on Postgres; `--format` grades
+Postgres artifacts only and is ignored for a SQLite target (the completion line
+says `SQLite snapshot` so there is no ambiguity).
+
+`autumn db restore` verifies the artifact with `PRAGMA integrity_check` **before**
+touching the database, stages a copy beside the target, verifies that copy too,
+removes the target's `-wal`, `-shm` and `-journal` — a leftover journal describes
+pages of the file being replaced, and SQLite would replay it onto the restored one
+— and renames the copy into place, keeping the target's mode and owner. A restore
+refused at verification leaves the target byte-identical. The production guard is
+the same as Postgres: a non-dev/test profile needs `--force`.
+
+**Stop the app before restoring.** A running process keeps open handles to the
+old file, so after the rename it serves the pre-restore database and loses every
+write it makes. This differs from Postgres, where `pg_restore` goes through the
+server.
+
+An **in-memory** database is refused by both: there is no file to snapshot.
+
+[`db scrub`](./data-scrubbing.md) (#1602) and the runtime retention sweeps
+(#1605) are not yet wired for SQLite (#2553). Snapshots are the coarse-grained,
+cross-backend story; for second-granularity durability see
 [Durability: continuous replication](#durability-continuous-replication-and-point-in-time-restore)
 below, which composes with them rather than replacing them.
+
+### Deploy: the data file is persistent state
+
+`autumn deploy` never puts your database where a deploy can delete it. A relative
+`sqlite://app.db` would otherwise resolve inside the per-release directory — new
+on every deploy, deleted by release retention — so the deploy keeps the real file
+in `app_dir/shared/data` and links each release at the configured path. An
+absolute path the deploy does not manage is left alone; one inside the app
+directory but outside `shared/`, or an in-memory URL, is refused at preflight
+rather than after the first cutover. An app
+deployed before this contract existed keeps its file in the serving release; the
+next deploy stops and prints the one-time move to make, rather than relocating a
+live database. The full contract is in
+[where a SQLite data file lives](./deployment.md#where-a-sqlite-data-file-lives).
 
 ---
 

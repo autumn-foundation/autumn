@@ -116,7 +116,15 @@ struct DataVersionRow {
 ///
 /// Returns [`SqliteError::Open`] or [`SqliteError::Query`].
 pub fn open(path: &Path) -> Result<SqliteConnection, SqliteError> {
-    let target = path.to_string_lossy().into_owned();
+    // Through `connection_string`, not the raw path: diesel opens with
+    // `SQLITE_OPEN_URI`, so a filename beginning with `file:` would be re-read as
+    // a URI and name a different database.
+    let Some(target) = super::connection_string(path) else {
+        return Err(SqliteError::Open {
+            path: path.display().to_string(),
+            detail: "the path is not valid UTF-8".to_owned(),
+        });
+    };
     let mut conn = SqliteConnection::establish(&target).map_err(|e| SqliteError::Open {
         path: target.clone(),
         detail: e.to_string(),

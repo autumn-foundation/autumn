@@ -274,8 +274,8 @@ non-zero on drift. See `docs/guide/fleet-deploys.md`.
 
 For an app whose resolved primary database is `sqlite://…`, `autumn doctor`
 adapts Postgres-specific checks: the `pg_dump`/`pg_restore` client-tools check
-reports informationally (those tools are not required for a SQLite app;
-SQLite backup/restore is tracked in #1909) rather than warning misleadingly. A
+reports informationally: those tools are not required for a SQLite app, whose
+`autumn db backup` / `restore` work on the data file in-process. A
 `sqlite://` URL is only accepted as the lone primary in a single-role,
 single-host topology (SQLite is single-writer / no read-replica role).
 

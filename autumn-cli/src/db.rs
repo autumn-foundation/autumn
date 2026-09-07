@@ -38,6 +38,11 @@ pub mod scrub;
 /// production guard ([`guard_destructive`]) verbatim.
 pub mod replica;
 
+/// Online-safe `SQLite` snapshot/restore behind `autumn db backup` /
+/// `autumn db restore` on the `SQLite` tier (issue #1909). A submodule so it
+/// sits beside the Postgres [`backup`] path it dispatches from.
+pub mod sqlite_snapshot;
+
 /// `autumn db retention` — report, dry-run, and on-demand purge of the
 /// unified data-retention policy for framework-owned data (issue #1605).
 /// A submodule for namespacing only: it drives the app binary rather than

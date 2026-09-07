@@ -821,6 +821,10 @@ pub fn first_deploy_ops(
             shell_quote(&shared_dir)
         ),
     )));
+    // Keep the SQLite data file out of the release dir (#1909). Immediately after
+    // `prepare-dirs` and before the migrate one-shot, so the migration and the app
+    // open the same file.
+    ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
         local: binary_local.to_path_buf(),
@@ -1015,6 +1019,9 @@ pub fn cutover_ops(
             shell_quote(&shared_dir)
         ),
     )));
+    // Keep the SQLite data file out of the release dir (#1909) — same position as
+    // on the first-deploy path, and still before the migrate one-shot.
+    ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
         local: binary_local.to_path_buf(),
@@ -1368,7 +1375,13 @@ pub fn rollback_ops(
         .port
         .saturating_sub(if target.slot == SLOT_GREEN { 2 } else { 1 });
     let former_live_fallback_port = slot_app_port(public_port, other_slot(target.slot));
-    vec![
+    let mut ops = Vec::new();
+    // Re-link the rollback target at the shared SQLite data file (#1909) before its
+    // unit is written or started. A release deployed BEFORE the file was adopted
+    // into `shared/` no longer holds one at that path, so without this the
+    // rolled-back release would boot against a fresh, empty database.
+    ops.extend(sqlite_data_link_op(cfg, &target.release_dir).map(DeployOp::Run));
+    ops.extend([
         // Re-render the target slot's unit BEFORE bringing it up, so rollback can
         // never restart a slot unit that an earlier failed redeploy clobbered (see
         // the `target_unit` comment above). The unit is rendered from the target's
@@ -1437,7 +1450,8 @@ pub fn rollback_ops(
             "drain-rolled-back-slot",
             format!("systemctl disable --now {rolled_back_unit}.service"),
         )),
-    ]
+    ]);
+    ops
 }
 
 /// Teardown for an on-demand rollback that fails AT OR BEFORE the health-gated
@@ -1650,6 +1664,8 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     "proxy-install",
     "proxy-restart-if-changed",
     "prepare-dirs",
+    // #1909: the SQLite data-file link, emitted only for a SQLite app.
+    "link-data",
     "upload-binary",
     "upload-config",
     "write-env",
@@ -1721,6 +1737,145 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
             bin = shell_quote(&bin),
         ),
     )
+}
+
+/// The op that makes a `SQLite` data file survive a deploy (issue #1909), or
+/// `None` when there is nothing to keep (a Postgres app, or an absolute path
+/// the deploy does not manage).
+///
+/// A slot unit's `WorkingDirectory` is the release dir, so a relative
+/// `sqlite://app.db` resolves inside a directory that is replaced on every
+/// deploy and deleted by retention. So the real file lives under `shared/data`,
+/// and the release is linked at the path the app resolves. This op creates that
+/// directory; `shared/` is never pruned and both slots see it. `SQLite` follows
+/// the symlink when it names the `-wal`/`-shm`/`-journal` sidecars, so they land
+/// beside the shared file too.
+///
+/// It runs immediately after `prepare-dirs`, and so BEFORE the migrate one-shot.
+/// A migration that ran first would apply to a file in the release dir that the
+/// app never opens.
+///
+/// Three steps, in order:
+///
+/// 1. **Refuse to relocate a live database.** An app deployed before this
+///    contract holds a real file in the release that is still serving. Moving it
+///    is not safe while that app runs: `SQLite` derives the `-wal` name from the
+///    path it resolved, so a connection opened before the move and one opened
+///    after would use two different write-ahead logs for one database. There is
+///    also no atomic move — between the `mv` and the link, a new pooled
+///    connection creates an empty database at the old path. So the deploy stops
+///    and tells the operator to stop the app and move the file once, by hand.
+///
+///    A `current` that is a **symlink** is refused on the same terms. It is not
+///    tested for, because it cannot be anything else: the shared file is absent
+///    in this branch, so a link pointing AT it dangles and fails `-e`. Any link
+///    that gets here points at a database the operator keeps elsewhere, and
+///    linking past it would serve an empty one and orphan theirs.
+/// 2. **Set aside a stale real file.** A rollback target from before that
+///    migration still holds its own database. It is moved beside the shared file
+///    as `<file>.superseded`, under `shared/`, where retention never reaches it.
+///    The op refuses rather than overwrite an existing one, so it can never
+///    destroy a database.
+/// 3. **Link this release.**
+///
+/// Every interpolated path is shell-quoted. Each `mv` carries `|| exit 1`: a
+/// silently failed one leaves a dangling link, and the app then creates an empty
+/// database.
+#[must_use]
+pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Option<RemoteCommand> {
+    let relative = cfg.sqlite_data_file.as_ref()?;
+    let shared = cfg.shared_sqlite_data_file()?;
+    let superseded = format!("{shared}.superseded");
+    let shared_parent = parent_dir(&shared);
+    let in_release = format!("{release_dir}/{relative}");
+    let release_parent = parent_dir(&in_release);
+    let current = format!("{}/{relative}", cfg.current_symlink());
+    let service = &cfg.service_name;
+
+    // Diagnostics are built HERE, from raw paths, and shell-quoted ONCE as whole
+    // words. Interpolating already-quoted paths inside a double-quoted `echo`
+    // would leave them expandable — single quotes are literal there — so a
+    // database path containing `$(…)` would run a command on the deploy host.
+    let refusal = format!(
+        "autumn deploy: {current} is a live SQLite database. The data file must live at \
+         {shared} to survive a deploy, and moving it while the app runs is not safe, so \
+         this deploy stopped."
+    );
+    // The recovery line is a command the operator PASTES AND RUNS, so its own
+    // operands must be shell-quoted too. Quoting only the outer `echo` makes the
+    // text safe to print, not safe to run: a path holding `$(…)` would execute on
+    // paste, and one holding a space would split into two `mv` arguments. The
+    // trailing `*` stays OUTSIDE the quotes so it still globs the sidecars.
+    let recovery = format!(
+        "Run this on the host once, then deploy again: systemctl stop \
+         {blue_q} {green_q}; mv {current_q}* {shared_parent_q}/",
+        blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
+        green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
+        current_q = shell_quote(&current),
+        shared_parent_q = shell_quote(&shared_parent),
+    );
+    // A `current` that is a SYMLINK is refused too, and needs its own message:
+    // it points at a database the operator manages elsewhere, and `mv` on the
+    // link would move the link, not that database.
+    let linked_refusal = format!(
+        "autumn deploy: {current} is a symlink to a SQLite database outside \
+         {shared}. The data file must live there to survive a deploy, so this \
+         deploy stopped rather than link past it and serve an empty database."
+    );
+    // Each file moves to its EXACT shared name, not merely into the shared
+    // directory: the link target may carry a different basename, and landing the
+    // database next to the name the deploy expects rather than at it leaves the
+    // next deploy creating an empty one — the very loss this refusal prevents.
+    let linked_recovery = format!(
+        "Run this on the host once, then deploy again: systemctl stop \
+         {blue_q} {green_q}; src=$(readlink -f {current_q}); mv \"$src\" {shared_q}; \
+         for s in -wal -shm -journal; do [ -e \"$src$s\" ] && mv \"$src$s\" {shared_q}$s; \
+         done; rm -f {current_q}",
+        blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
+        green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
+        current_q = shell_quote(&current),
+        shared_q = shell_quote(&shared),
+    );
+    let occupied =
+        format!("autumn deploy: refusing to move {in_release} aside: {superseded} already exists");
+
+    Some(RemoteCommand::new(
+        "link-data",
+        format!(
+            "mkdir -p {shared_parent_q} {release_parent_q} && \
+             if [ ! -e {shared_q} ] && [ -e {current_q} ]; then \
+             if [ -L {current_q} ]; then \
+             echo {linked_refusal_q} >&2; echo {linked_recovery_q} >&2; \
+             else echo {refusal_q} >&2; echo {recovery_q} >&2; fi; exit 1; \
+             fi && \
+             if [ -e {in_release_q} ] && [ ! -L {in_release_q} ]; then \
+             if [ -e {superseded_q} ]; then echo {occupied_q} >&2; exit 1; fi; \
+             mv -f {in_release_q} {superseded_q} || exit 1; \
+             for s in -wal -shm -journal; do \
+             if [ -e {in_release_q}$s ]; then \
+             mv -f {in_release_q}$s {superseded_q}$s || exit 1; fi; \
+             done; \
+             fi && \
+             rm -f {in_release_q} && ln -s {shared_q} {in_release_q}",
+            shared_parent_q = shell_quote(&shared_parent),
+            release_parent_q = shell_quote(&release_parent),
+            shared_q = shell_quote(&shared),
+            superseded_q = shell_quote(&superseded),
+            current_q = shell_quote(&current),
+            in_release_q = shell_quote(&in_release),
+            refusal_q = shell_quote(&refusal),
+            recovery_q = shell_quote(&recovery),
+            linked_refusal_q = shell_quote(&linked_refusal),
+            linked_recovery_q = shell_quote(&linked_recovery),
+            occupied_q = shell_quote(&occupied),
+        ),
+    ))
+}
+
+/// The parent directory of a remote path, or `.` when it has none.
+fn parent_dir(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or_else(|| ".".to_owned(), |(head, _)| head.to_owned())
 }
 
 /// Prune shell: keep the newest `keep` release dirs, delete the rest — but NEVER
@@ -3503,6 +3658,12 @@ mod tests {
             "myapp",
         )
         .expect("deploy config resolves")
+    }
+
+    /// [`resolved`] plus the #1909 `SQLite` data-file contract: a relative
+    /// `sqlite://app.db`, which is the shape that needs relocating.
+    fn resolved_sqlite() -> ResolvedDeployConfig {
+        resolved().with_sqlite_data_file(Some("app.db".to_owned()))
     }
 
     const RELEASE_ID: &str = "20260714T120000Z";
@@ -7177,5 +7338,425 @@ mod tests {
             !exec.run_labels().contains(&"proxy-route"),
             "proxy must not be routed after a failed readiness gate"
         );
+    }
+
+    // ── SQLite data-file persistence (issue #1909) ─────────────────────────
+
+    /// A Postgres app emits no data-link op at all, so its op sequence is
+    /// byte-identical to pre-#1909.
+    #[test]
+    fn no_data_link_op_without_a_sqlite_data_file() {
+        assert!(sqlite_data_link_op(&resolved(), RELEASE_DIR).is_none());
+        let labels: Vec<&str> = sample_ops(Secret::new("X=1\n"))
+            .iter()
+            .map(DeployOp::label)
+            .collect();
+        assert!(!labels.contains(&"link-data"), "{labels:?}");
+    }
+
+    /// The link op is what makes the data file outlive the release: the real file
+    /// sits in `shared/data`, the release dir only holds a symlink at the path the
+    /// app resolves.
+    #[test]
+    fn the_data_link_op_points_the_release_at_the_shared_file() {
+        let cfg = resolved_sqlite();
+        let op = sqlite_data_link_op(&cfg, RELEASE_DIR).expect("a SQLite app links its data file");
+        assert_eq!(op.label, "link-data");
+        assert!(
+            op.shell.contains(
+                "ln -s '/srv/autumn/myapp/shared/data/app.db' \
+                    '/srv/autumn/myapp/releases/20260714T120000Z/app.db'"
+            ),
+            "the release path must be a link to the shared file: {}",
+            op.shell
+        );
+        // The shared dir must exist before the link is made, and a stale entry at
+        // the release path must be cleared or `ln` would link INSIDE a directory.
+        assert!(
+            op.shell
+                .contains("mkdir -p '/srv/autumn/myapp/shared/data'"),
+            "{}",
+            op.shell
+        );
+        assert!(
+            op.shell
+                .contains("rm -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db'"),
+            "{}",
+            op.shell
+        );
+    }
+
+    /// An app deployed before this contract holds a real file in the release that
+    /// is still serving. Moving it while that app runs is not safe — `SQLite`
+    /// derives the `-wal` name from the path it resolved, and there is no atomic
+    /// move — so the deploy stops and names the one-time manual step.
+    #[test]
+    fn the_data_link_op_refuses_to_relocate_a_live_database() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // The refusal fires when the shared file is absent and `current`
+        // resolves to something. `-L` then only picks WHICH message — it must
+        // not gate the refusal, or a legacy symlinked database is linked past.
+        assert!(
+            op.shell
+                .contains("[ ! -e '/srv/autumn/myapp/shared/data/app.db' ]")
+                && op
+                    .shell
+                    .contains("[ -e '/srv/autumn/myapp/current/app.db' ]"),
+            "the refusal must fire when the shared file is absent and the current \
+             release still holds a database: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains("exit 1"),
+            "it must stop the deploy: {}",
+            op.shell
+        );
+        // The message must name the fix, including the units to stop and the
+        // move. Its operands are shell-quoted so the line is safe to paste, and
+        // the whole line is one `echo` word, so those quotes appear escaped.
+        assert!(
+            op.shell
+                .contains(r"systemctl stop '\''myapp-blue.service'\'' '\''myapp-green.service'\''"),
+            "the message must name the units to stop: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                r"mv '\''/srv/autumn/myapp/current/app.db'\''* '\''/srv/autumn/myapp/shared/data'\''/"
+            ),
+            "the message must name the move, sidecars included: {}",
+            op.shell
+        );
+        // Nothing in the op moves a live database itself.
+        assert!(
+            !op.shell
+                .contains("mv '/srv/autumn/myapp/current/app.db' '/srv/autumn/myapp/shared"),
+            "the op must never relocate the live database itself: {}",
+            op.shell
+        );
+    }
+
+    /// Every interpolated value is a shell-quoted WORD. A quoted path nested
+    /// inside a double-quoted `echo` would still expand — single quotes are
+    /// literal there — so a database path holding `$(…)` would run a command on
+    /// the deploy host.
+    #[test]
+    fn the_data_link_op_never_expands_a_configured_path() {
+        let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
+        let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
+        // A double quote may appear only INSIDE a single-quoted word. The
+        // hazard is a shell-quoted path sitting in an expandable position, not
+        // the character itself — the symlink recovery prints a deliberate
+        // `"$(readlink -f '…')"` for the operator, inert until they paste it.
+        for (index, _) in op.shell.match_indices('"') {
+            assert!(
+                inside_single_quotes(&op.shell, index),
+                "a double quote outside single quotes makes paths expandable: {}",
+                op.shell
+            );
+        }
+        // The substitution survives only inside single quotes, where it is inert.
+        for (index, _) in op.shell.match_indices("$(touch pwned)") {
+            assert!(
+                inside_single_quotes(&op.shell, index),
+                "every occurrence must sit inside a single-quoted word: {}",
+                op.shell
+            );
+        }
+        // `$s`, our own loop variable, is the only thing left expandable.
+        assert!(op.shell.contains("for s in -wal -shm -journal"));
+    }
+
+    /// Is byte `index` inside a single-quoted word?
+    ///
+    /// The generated script uses single quotes only (asserted separately), so
+    /// POSIX rules reduce to two: outside quotes a backslash escapes the next
+    /// character, and inside them nothing escapes. That is why a naive quote
+    /// count is wrong: the escape idiom that puts a literal quote inside a quoted
+    /// word closes, emits an escaped quote, then reopens, and that middle quote
+    /// must not toggle.
+    fn inside_single_quotes(shell: &str, index: usize) -> bool {
+        let mut quoted = false;
+        let mut chars = shell.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if i >= index {
+                break;
+            }
+            if quoted {
+                if c == '\'' {
+                    quoted = false;
+                }
+            } else if c == '\\' {
+                chars.next();
+            } else if c == '\'' {
+                quoted = true;
+            }
+        }
+        quoted
+    }
+
+    /// The recovery line is a command the operator pastes and runs, so quoting
+    /// the `echo` around it is not enough: its own operands must be quoted, or
+    /// the substitution runs on paste and a path with a space splits the `mv`.
+    ///
+    /// The whole line is one `echo` word, so the operand quoting appears here in
+    /// its escaped form, which is what the outer quote turns it into.
+    #[test]
+    fn the_data_link_op_prints_a_recovery_command_that_is_safe_to_paste() {
+        let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
+        let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell
+                .contains(r"mv '\''/srv/autumn/myapp/current/$(touch pwned).db'\''*"),
+            "the pasted `mv` must carry the path as a quoted word: {}",
+            op.shell
+        );
+
+        // A path holding a space must reach `mv` as ONE argument. The `*` stays
+        // outside the quotes so it still globs the sidecars.
+        let spaced = resolved().with_sqlite_data_file(Some("app data.db".to_owned()));
+        let op = sqlite_data_link_op(&spaced, RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell
+                .contains(r"mv '\''/srv/autumn/myapp/current/app data.db'\''*"),
+            "the source must be one quoted word: {}",
+            op.shell
+        );
+    }
+
+    /// A `current` that is a SYMLINK to an operator-managed database must be
+    /// refused too. Linking past it points the release at a shared file that
+    /// does not exist; the migration then creates an empty one and cutover
+    /// serves it while the real database is orphaned.
+    #[test]
+    fn the_data_link_op_refuses_a_legacy_symlinked_database() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // The guard turns only on the shared file being absent and `current`
+        // resolving to something. A link pointing at the shared file dangles
+        // here, so it fails `-e` and never reaches the refusal.
+        assert!(
+            op.shell.contains(
+                "if [ ! -e '/srv/autumn/myapp/shared/data/app.db' ] && \
+                 [ -e '/srv/autumn/myapp/current/app.db' ]; then"
+            ),
+            "an existing `current` must be refused whether or not it is a link: {}",
+            op.shell
+        );
+        assert!(
+            !op.shell
+                .contains("[ ! -L '/srv/autumn/myapp/current/app.db' ]; then"),
+            "the symlink case must not be excluded from the refusal: {}",
+            op.shell
+        );
+        // It gets its own message: `mv` on a link moves the link, not the
+        // database, so the real-file recovery would be wrong here.
+        assert!(
+            op.shell
+                .contains("is a symlink to a SQLite database outside"),
+            "the symlink case needs its own refusal: {}",
+            op.shell
+        );
+        // The target moves to the EXACT shared name. Moving it merely INTO the
+        // shared directory keeps a differently-named target's basename, and the
+        // next deploy then creates an empty database at the name it does expect.
+        assert!(
+            op.shell.contains(
+                r#"src=$(readlink -f '\''/srv/autumn/myapp/current/app.db'\''); mv "$src" '\''/srv/autumn/myapp/shared/data/app.db'\''"#
+            ),
+            "the symlink recovery must move the target to the exact shared path: {}",
+            op.shell
+        );
+        // Sidecars follow it, each to the matching shared name.
+        assert!(
+            op.shell.contains(
+                r#"do [ -e "$src$s" ] && mv "$src$s" '\''/srv/autumn/myapp/shared/data/app.db'\''$s"#
+            ),
+            "each sidecar must move to the matching shared name: {}",
+            op.shell
+        );
+    }
+
+    /// The op must never delete a database file. A rollback target deployed
+    /// before the migration still holds a real one at that path; it is moved
+    /// aside, not removed.
+    #[test]
+    fn the_data_link_op_never_deletes_a_real_database_file() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert!(
+            !op.shell.contains("rm -rf"),
+            "no recursive delete may touch a database path: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                "if [ -e '/srv/autumn/myapp/releases/20260714T120000Z/app.db' ] && \
+                 [ ! -L '/srv/autumn/myapp/releases/20260714T120000Z/app.db' ]"
+            ),
+            "a real file must be distinguished from a stale link: {}",
+            op.shell
+        );
+        // It is moved beside the SHARED file, under `shared/`, where release
+        // retention never reaches it.
+        assert!(
+            op.shell.contains(
+                "mv -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db' \
+                 '/srv/autumn/myapp/shared/data/app.db.superseded'"
+            ),
+            "a real file must be moved aside into shared/: {}",
+            op.shell
+        );
+        // …and never over an existing one.
+        assert!(
+            op.shell
+                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db.superseded' ]"),
+            "an existing superseded copy must be refused, not overwritten: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains("already exists"),
+            "and it must say so: {}",
+            op.shell
+        );
+    }
+
+    /// Both journal modes leave sidecars. WAL leaves `-wal`/`-shm`; the default
+    /// rollback journal leaves `-journal`, and `VACUUM INTO` writes its output in
+    /// that mode whatever the source used. All three must move with the database.
+    #[test]
+    fn the_data_link_op_moves_every_sidecar_kind() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        assert!(
+            op.shell.contains("for s in -wal -shm -journal"),
+            "the move-aside step must cover every sidecar: {}",
+            op.shell
+        );
+    }
+
+    /// The link must exist before the migrate one-shot runs, on BOTH deploy paths:
+    /// a migration applied to a file in the release dir is a migration the app
+    /// never sees.
+    #[test]
+    fn the_data_link_precedes_the_migration_on_both_deploy_paths() {
+        let cfg = resolved_sqlite();
+        let plan = SlotPlan {
+            live_slot: SLOT_GREEN,
+            live_port: 3002,
+            candidate_slot: SLOT_BLUE,
+            candidate_port: 3001,
+            public_port: 3000,
+        };
+        let unit = super::super::render_app_unit(&cfg, RELEASE_DIR, 3001, SLOT_BLUE);
+        for (path, ops) in [
+            (
+                "first deploy",
+                first_deploy_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    MigrateStep::Run,
+                ),
+            ),
+            (
+                "redeploy",
+                cutover_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    &ProxyServiceOptions {
+                        tls: false,
+                        host: None,
+                    },
+                    MigrateStep::Run,
+                ),
+            ),
+        ] {
+            let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            let link = labels
+                .iter()
+                .position(|l| *l == "link-data")
+                .unwrap_or_else(|| panic!("{path}: no link-data op in {labels:?}"));
+            let prepare = labels
+                .iter()
+                .position(|l| *l == "prepare-dirs")
+                .expect("prepare-dirs");
+            let migrate = labels
+                .iter()
+                .position(|l| *l == "migrate")
+                .expect("migrate");
+            assert!(
+                prepare < link && link < migrate,
+                "{path}: the link must sit between prepare-dirs and migrate: {labels:?}"
+            );
+        }
+    }
+
+    /// A rollback target deployed before adoption no longer holds the file at that
+    /// path, so the rolled-back release must be re-linked before it is started.
+    #[test]
+    fn rollback_relinks_the_target_release_before_starting_it() {
+        let target = RollbackTarget {
+            release_dir: "/srv/autumn/myapp/releases/20260713T120000Z".to_owned(),
+            slot: SLOT_GREEN,
+            port: 3002,
+        };
+        let ops = rollback_ops(&resolved_sqlite(), &proxy(), &target);
+        let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+        let link = labels
+            .iter()
+            .position(|l| *l == "link-data")
+            .unwrap_or_else(|| panic!("no link-data op in {labels:?}"));
+        let start = labels
+            .iter()
+            .position(|l| *l == "restart-previous")
+            .expect("restart-previous");
+        assert!(
+            link < start,
+            "the link must precede the restart: {labels:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                DeployOp::Run(c)
+                    if c.shell
+                        .contains("'/srv/autumn/myapp/releases/20260713T120000Z/app.db'")
+            )),
+            "the rollback must link the TARGET release dir, not the current one"
+        );
+        // A Postgres rollback is unchanged.
+        let plain: Vec<&str> = rollback_ops(&resolved(), &proxy(), &target)
+            .iter()
+            .map(DeployOp::label)
+            .collect();
+        assert!(!plain.contains(&"link-data"), "{plain:?}");
+    }
+
+    /// Release retention removes release DIRS. `rm -rf` unlinks a symlink rather
+    /// than following it, so pruning a release can never reach the shared data
+    /// file — but only as long as the prune shell never opts into following.
+    #[test]
+    fn pruning_a_release_never_follows_the_data_symlink() {
+        let shell = prune_releases_shell(
+            "/srv/autumn/myapp/releases",
+            "/srv/autumn/myapp/current",
+            "/srv/autumn/myapp/shared/previous-release",
+            3,
+        );
+        assert!(shell.contains("rm -rf"), "{shell}");
+        for follows in ["-follow", "-L ", "--dereference", "cp -L"] {
+            assert!(
+                !shell.contains(follows),
+                "the prune must not follow symlinks ({follows}): {shell}"
+            );
+        }
     }
 }
