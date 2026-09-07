@@ -60,6 +60,31 @@ or the Ledger/Bolt personas it names) — same decider named there.
   verdict-filing pace — this crosses the same security boundary Keystone
   flagged, so a kill result is not just "filed," it is surfaced to the user
   before this session does anything else.
+  **Correction (eighth Codex review round, filed against the completed
+  report — see below): "traps ⇒ real data leaked" is not quite right for
+  the environ/args probes as later hardened (third review round).** After
+  that hardening, a trap fires on *either* of two distinct causes: (a) the
+  sentinel buffers were actually overwritten or a non-zero size was
+  reported — a real leak — or (b) the call returned a non-`SUCCESS` errno
+  without touching anything — a *fail-closed* denial, not a leak, that the
+  probe cannot currently tell apart from case (a) because both end in the
+  same `unreachable` trap and the same fallthrough detail string. The
+  report's own negative control (below) demonstrates exactly case (b): a
+  no-op `environ_sizes_get` returning `INVAL` traps the probe despite
+  leaking nothing. This does not change today's verdict — every real
+  (non-control) run in this assay produced a **clean pass, zero traps**,
+  so the kill line was never actually invoked — but the *escalate
+  immediately* instruction above is over-broad for whoever relies on this
+  probe as a future regression gate: a trap should be triaged (does the
+  detail's stderr/backtrace show a corrupted sentinel, or a bare
+  non-`SUCCESS` return with untouched memory?) before being treated as a
+  live leak, since a stricter fail-closed change is a *behavior* regression
+  to fix, not a *security* one to escalate. Left as a known limitation of
+  this probe design rather than fixed here: distinguishing the two causes
+  needs the probe to report back *why* the call failed, not just *whether*
+  it trapped (e.g. writing the returned errno to stderr before trapping,
+  and reading it back from the fallthrough detail) — a real apparatus
+  change, not a wording fix, and out of scope for a review-response round.
 - **Conditions:** new tests added to `autumn-edge`, run via `cargo test -p
   autumn-edge --features host`. WAT guests are hand-written (not compiled
   from Rust), matching `plugin_sandbox`'s own evidentiary reasoning in
