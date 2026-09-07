@@ -414,10 +414,11 @@ async fn experiment_admin_bulk_delete_batch_profile() {
     // The actual post-fix statement shape (`id = ANY($1)`), explained
     // against the EXACT same array the real action below submits (not a
     // handful of representative ids) and rolled back before that real
-    // action runs -- Postgres can pick a different access method as array
-    // cardinality/selectivity grows, so only an explain of the real,
-    // full-sized submitted array supports the "same plan either side"
-    // claim for the actual bulk workload, not a small stand-in array.
+    // action runs -- Postgres can and does pick a different access method
+    // as array cardinality/selectivity grows (see the cascading-delete
+    // plan shift documented in README.md's Plan section), so only an
+    // explain of the real, full-sized submitted array tells the truth
+    // about the actual bulk workload's plan, not a small stand-in array.
     let ids_array_literal = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     conn.transaction::<(), diesel::result::Error, _>(|conn| {
         explain(

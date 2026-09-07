@@ -103,11 +103,6 @@ dominant."
 
 ## 🧭 Plan
 
-Same access method either side — a primary-key point/array lookup via
-`autumn_experiments_pkey`, cascading through an index scan on
-`idx_autumn_exp_assignments_experiment`/`idx_autumn_exp_overrides_experiment`,
-no seq scan, no sort:
-
 **Before** (`baseline/output.txt`, `calls=615`):
 ```
 WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = $1 RETURNING name ), _del_assignments AS ( DELETE FROM autumn_experiment_assignments WHERE experiment IN (SELECT name FROM deleted) ), _del_overrides AS ( DELETE FROM autumn_experiment_overrides WHERE experiment IN (SELECT name FROM deleted) ), _audit AS ( INSERT INTO autumn_experiment_changes (experiment, mutation, actor) SELECT name, $2, $3 FROM deleted ) SELECT COUNT(*) AS count FROM deleted
@@ -118,20 +113,42 @@ WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = $1 RETURNING name ),
 WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = ANY($1) RETURNING name ), _del_assignments AS ( DELETE FROM autumn_experiment_assignments WHERE experiment IN (SELECT name FROM deleted) ), _del_overrides AS ( DELETE FROM autumn_experiment_overrides WHERE experiment IN (SELECT name FROM deleted) ), _audit AS ( INSERT INTO autumn_experiment_changes (experiment, mutation, actor) SELECT name, $2, $3 FROM deleted ) SELECT COUNT(*) AS count FROM deleted
 ```
 
-Every id-scoped delete CTE, its cascading assignment/override deletes, the
-audit `INSERT` they trigger, and the loop's own `pool.get()` call collapse
-into one round trip carrying one bound `bigint[]` array instead of 615
-separately-prepared, separately-executed statements. Each dump carries two
-diagnostic `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` runs, both
-rolled back: the pre-fix single-id shape (`id = 2`), and — run against the
-exact `ids` array the real action below submits, all 615 elements, not a
-small stand-in array, since Postgres can pick a different access method as
-array cardinality/selectivity grows — the real post-fix batched shape
-(`id = ANY(ARRAY[...615 ids...])`). Both show the identical per-row plan
-(index scan on `autumn_experiments_pkey`, bitmap-index-scan-driven cascade
-deletes on both child tables, CTE-scan-driven audit insert, the
-`autumn_experiment_change_notify` trigger firing once per deleted row) —
-this is a round-trip-count change, not a plan-shape change.
+Each dump carries two diagnostic `EXPLAIN (ANALYZE, BUFFERS, VERBOSE,
+SETTINGS)` runs, both rolled back: the pre-fix single-id shape (`id = 2`),
+and — run against the exact `ids` array the real action below submits,
+all 615 elements, not a small stand-in array — the real post-fix batched
+shape (`id = ANY(ARRAY[...615 ids...])`).
+
+**This is a plan-shape change on the two child-table cascade deletes, not
+just a round-trip-count change** — correcting an earlier draft of this
+report, which claimed "same plan either side, no seq scan" from an
+under-sized 5-element `EXPLAIN` array (caught by review). The parent
+delete on `autumn_experiments` itself keeps the same shape either way
+(`Index Scan using autumn_experiments_pkey`, single id or `= ANY(...)`).
+But the cascading deletes on `autumn_experiment_assignments`/
+`autumn_experiment_overrides` genuinely change plan with the real
+615-element array:
+
+- **Single id** (baseline diagnostic): `Bitmap Index Scan` on
+  `idx_autumn_exp_assignments_experiment`/`idx_autumn_exp_overrides_experiment`
+  — one experiment name, so an index probe per cascade.
+- **Real 615-id array** (after diagnostic): `Seq Scan` on both child
+  tables feeding a `Hash Join` against the 555 distinct deleted names —
+  the planner estimates matching 555 names is cheap enough, relative to a
+  269,720-row `autumn_experiment_assignments`, that one sequential pass
+  building a hash probe beats 555 separate index probes.
+
+That Seq Scan is real, measured work (`Buffers: shared hit=2633` on the
+scan itself, `shared hit=52,553` on the enclosing `Delete` node once the
+matched 49,920 assignment rows are actually located and removed) — it is
+not free, and it is *not* what the impact-floor claim in this report rests
+on. The floor is cleared by the N+1 statement-count elimination alone
+(615 → 1 calls), which needs no plan-shape argument; this plan-shape
+change is reported here because it happened, not because it is the win.
+Per the Ledger process, a plan-shape change is only admissible as its own
+floor-clearing claim when demonstrated at ≥3 data sizes — this report
+demonstrates it at one size, so it is descriptive here, not a second
+independent claim.
 
 ## 💡 Hypothesis
 
@@ -189,16 +206,19 @@ reset before the run. Full statement dumps in `baseline/output.txt`
 Statement count drops from **one per id to one per bulk action** — the
 admissible-on-its-own N+1 floor ("statement count per request drops from
 O(n) to O(1)... needs no other justification"). Buffers touched also drop
-**5.5%** (62,012 → 58,616): the dominant cost here is the cascading
-assignment/override deletes themselves (each of the 555 existing
-experiments carries 10–170 sticky-assignment rows to delete), which cost
-the same total work batched or not; batching only removes the *redundant*
-per-statement planning/CTE-setup overhead and the 60 wasted (pre-deleted +
-nonexistent) point-lookups-that-find-nothing, a small slice of a buffer
-total this large. The N+1 elimination alone clears the impact floor; the
-buffer reduction, while real, falls well short of the explicit ≥20% floor
-on its own — reported here for completeness, not as an independent
-floor-clearing claim.
+**5.5%** (62,012 → 58,616), but not because the cascade work is identical
+either way — see 🧭 Plan above: the batched array flips the cascading
+assignment/override deletes from 555 separate `Bitmap Index Scan` probes
+to one `Seq Scan` + `Hash Join` per child table. That trades 615
+statements' worth of repeated planning/CTE-setup overhead and the 60
+wasted (pre-deleted + nonexistent) point-lookups-that-find-nothing for two
+sequential passes over the child tables — cheaper here (`autumn_experiment_assignments`
+is a 269,720-row table, small enough that one seq scan undercuts hundreds
+of index probes), but the two are genuinely different plans, not the same
+work counted once instead of 615 times. The N+1 elimination alone clears
+the impact floor; the buffer reduction, while real, falls well short of
+the explicit ≥20% floor on its own — reported here for completeness, not
+as an independent floor-clearing claim.
 
 No `temp_blks_written` at any point (no spill, either side, confirmed in
 both `output.txt` dumps). No index was added or dropped, so there is no
