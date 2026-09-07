@@ -384,7 +384,7 @@ def _find_key(table, path):
     ml = None
     for line in table.split('\n'):
         if ml is not None:
-            if ml in line:
+            if _ml_close(line, ml) >= 0:
                 ml = None
             pos += len(line) + 1
             continue
@@ -648,6 +648,37 @@ def _toml_key_path(text):
     return tuple(parts)
 
 
+def _ml_close(text, tok, start=0):
+    """Index of the delimiter that CLOSES a multi-line string, or -1.
+
+    A multi-line basic string takes escapes, so `\"\"\"hello \\\\\"\"\" world\"\"\"`
+    closes at the third delimiter and not the second — Cargo reads that
+    description as `hello \"\"\" world` and honours the keys after it. A raw
+    `find` took the escaped one for the close and then read the REAL one as a
+    fresh opener, swallowing every following key: a `publish = false` lost that
+    way reads as publishable and seeds the package's README.
+
+    A literal `'''` takes no escapes, so it closes at the first one — the same
+    distinction the value parsing makes.
+
+    An escape spanning a line break is not tracked; each line is scanned from
+    its own start. Nothing here measures that case either way, so it is stated
+    rather than claimed safe.
+    """
+    if tok == "'''":
+        return text.find(tok, start)
+    j = start
+    n = len(text)
+    while j < n:
+        if text[j] == '\\':
+            j += 2
+            continue
+        if text.startswith(tok, j):
+            return j
+        j += 1
+    return -1
+
+
 def _scan_toml_line(line):
     """`(comment_start, open_delimiter)` for one line of TOML.
 
@@ -673,7 +704,7 @@ def _scan_toml_line(line):
         # starts it, or every one of them opens a single-line string instead.
         if line.startswith('"""', i) or line.startswith("'''", i):
             tok = line[i:i + 3]
-            close = line.find(tok, i + 3)
+            close = _ml_close(line, tok, i + 3)
             if close < 0:
                 return None, tok
             i = close + 3
@@ -713,11 +744,12 @@ def _strip_toml_comments(text):
     ml = None
     for line in text.split('\n'):
         if ml is not None:
-            if ml not in line:
+            close = _ml_close(line, ml)
+            if close < 0:
                 out.append(line)
                 continue
-            out.append(line.split(ml, 1)[0] + ml)
-            line = line.split(ml, 1)[1]
+            out.append(line[:close + 3])
+            line = line[close + 3:]
             ml = None
             at, ml = _scan_toml_line(line)
             out[-1] += line if at is None else line[:at]
@@ -755,10 +787,11 @@ def _toml_lines(manifest):
     ml = None
     for line in manifest.split('\n'):
         if ml is not None:
-            if ml not in line:
+            close = _ml_close(line, ml)
+            if close < 0:
                 continue
             # The remainder of the closing line is live TOML again.
-            rest = line.split(ml, 1)[1]
+            rest = line[close + 3:]
             ml = None
             m = _TOML_HEADER.match(rest)
             if m is not None:
@@ -7929,6 +7962,29 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n5/pkg/README.md"
   git -C "$c9n5" add -A && git -C "$c9n5" commit -qm multiline-inline-table
   check "a multi-line inline table is read whole" fail "$c9n5"
+
+  # An ESCAPED triple quote inside a multi-line basic string does not close it:
+  # Cargo reads this description as `hello """ world` and honours the keys
+  # after. A raw search took the escaped delimiter for the close and then the
+  # real one for a fresh opener, swallowing `publish = false`.
+  local c9n6="$tmp/c9n6"; make_corpus "$c9n6"
+  mkdir -p "$c9n6/pkg"
+  printf '[package]\nname = "pkg"\ndescription = """hello \\""" world"""\npublish = false\nreadme = "README.md"\n' \
+    > "$c9n6/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n6/pkg/README.md"
+  git -C "$c9n6" add -A && git -C "$c9n6" commit -qm escaped-triple-quote
+  check "an escaped triple quote does not close the string" fail "$c9n6"
+
+  # ...but a LITERAL triple takes no escapes, so a backslash before one is part
+  # of the text and the string closes there. Decoding both alike would keep
+  # this string open and swallow the keys after it instead.
+  local c9n7="$tmp/c9n7"; make_corpus "$c9n7"
+  mkdir -p "$c9n7/pkg"
+  printf "[package]\nname = \"pkg\"\ndescription = '''hello \\\\'''\npublish = false\nreadme = \"README.md\"\n" \
+    > "$c9n7/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9n7/pkg/README.md"
+  git -C "$c9n7" add -A && git -C "$c9n7" commit -qm literal-triple-no-escape
+  check "a literal triple quote closes despite a backslash" fail "$c9n7"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
