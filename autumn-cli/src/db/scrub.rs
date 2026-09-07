@@ -2499,8 +2499,7 @@ fn classify_and_apply(
             // subset actually laptop-sized, and it can only run after the
             // commit: VACUUM FULL rewrites each table and cannot join a
             // transaction.
-            report_reclaimed_size(url, label, sampling, sampled.size_before)
-                .inspect_err(|_| warn_committed(&committed))?;
+            report_reclaimed_size(url, label, sampling, sampled.size_before);
         }
     }
 
@@ -2580,9 +2579,10 @@ fn report_sample_plan(label: &str, plan: &sample::SamplePlan) {
 /// statements are shown once with that noted rather than unrolled: how many
 /// passes a schema needs is a property of the data, not of the plan.
 fn report_sample_sql(url: &str, label: &str, plan: &sample::SamplePlan) -> Result<(), ScrubError> {
-    // Read the live row counts rather than printing a placeholder: `--dry-run`
-    // promises the EXACT statements, and a root's `LIMIT` is the one number a
-    // reader checks.
+    // Read the live row counts rather than printing a placeholder: a root's
+    // `LIMIT` is the one number a reader checks. Read outside the scrub's own
+    // transaction, so a concurrent write can move it between this print and a
+    // later real run — as it can for any dry run against a live database.
     let mut conn = probe_connection(url, label, "size the sample")?;
     let counts =
         sample::source_counts(&mut conn, plan).map_err(|e| ScrubError::Sql(e.to_string()))?;
@@ -2590,6 +2590,9 @@ fn report_sample_sql(url: &str, label: &str, plan: &sample::SamplePlan) -> Resul
         eprintln!("  {statement};");
     }
     for statement in plan.seed_statements(&counts) {
+        eprintln!("  {statement};");
+    }
+    for statement in plan.index_statements() {
         eprintln!("  {statement};");
     }
     eprintln!("  -- then, repeated until no new related rows are found:");
@@ -2633,13 +2636,25 @@ fn report_sample_outcome(label: &str, outcome: &sample::SampleOutcome) {
 
 /// Rewrite every subsetted table so the freed space is really freed, then
 /// report the size the sample actually costs.
-fn report_reclaimed_size(
-    url: &str,
-    label: &str,
-    plan: &sample::SamplePlan,
-    before: i64,
-) -> Result<(), ScrubError> {
-    let mut conn = probe_connection(url, label, "compact the sampled tables")?;
+///
+/// This runs AFTER the commit, so the subset is already correct and durable —
+/// compaction only decides whether the files match it. A failure here is
+/// therefore a warning, not a refusal: the alternative would be to fail a run
+/// whose data is already right, and to do it on the one step that waits for an
+/// `ACCESS EXCLUSIVE` lock. The wait is bounded for the same reason; an idle
+/// connection left open against the target would otherwise block it forever.
+fn report_reclaimed_size(url: &str, label: &str, plan: &sample::SamplePlan, before: i64) {
+    let Ok(mut conn) = probe_connection(url, label, "compact the sampled tables") else {
+        warn_not_compacted(before, "could not connect to compact the sampled tables");
+        return;
+    };
+    if let Err(e) = sql_query(format!("SET lock_timeout = '{COMPACT_LOCK_TIMEOUT}'"))
+        .execute(&mut conn)
+        .map_err(|e| e.to_string())
+    {
+        warn_not_compacted(before, &e);
+        return;
+    }
     // A full-copy table is never deleted from, so it has nothing to reclaim.
     // `data_size` still measures it on both sides, which keeps the ratio
     // comparable.
@@ -2647,18 +2662,38 @@ fn report_reclaimed_size(
         // Not in a transaction, and deliberately: VACUUM FULL takes an
         // exclusive lock and rewrites the table, neither of which a transaction
         // block permits.
-        sql_query(format!("VACUUM (FULL, ANALYZE) {}", qualified_ident(table)))
+        if let Err(e) = sql_query(format!("VACUUM (FULL, ANALYZE) {}", qualified_ident(table)))
             .execute(&mut conn)
-            .map_err(|e| ScrubError::Sql(e.to_string()))?;
+        {
+            warn_not_compacted(before, &format!("{table}: {e}"));
+            return;
+        }
     }
-    let after = sample::data_size(&mut conn, plan).map_err(|e| ScrubError::Sql(e.to_string()))?;
+    let Ok(after) = sample::data_size(&mut conn, plan) else {
+        warn_not_compacted(before, "could not measure the compacted size");
+        return;
+    };
     eprintln!(
         "    Table size: {} \u{2192} {} ({} of the source).",
         human_bytes(before),
         human_bytes(after),
         percent_of(after, before),
     );
-    Ok(())
+}
+
+/// How long the compaction waits for the exclusive lock it needs.
+const COMPACT_LOCK_TIMEOUT: &str = "30s";
+
+/// Say that the subset is committed but its files were not rewritten, and how
+/// to finish the job by hand.
+fn warn_not_compacted(before: i64, detail: &str) {
+    eprintln!(
+        "    \u{26A0}\u{FE0F}  The subset is committed, but the tables were NOT compacted \
+         ({detail}).\n    \
+         Deleting rows frees no disk on its own, so they still occupy {} \u{2014} close any \
+         other connection to this database and run `VACUUM (FULL, ANALYZE)` to reclaim it.",
+        human_bytes(before),
+    );
 }
 
 /// `part` as a percentage of `whole`, one decimal place.
@@ -3109,7 +3144,7 @@ fn probe_database_facts(
         names(
             "SELECT rel.relname AS name FROM pg_class rel \
              JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             WHERE rel.relispartition",
+             WHERE rel.relispartition AND rel.relkind IN ('r', 'p', 'f')",
             &mut conn,
         )?
         .into_iter()
@@ -3612,6 +3647,51 @@ mod tests {
     }
 
     // ── Config parsing ──────────────────────────────────────────────────────
+
+    #[test]
+    fn config_parses_the_sample_rules() {
+        let config = parse_config_str(
+            r#"
+            [sample]
+            always_include = ["countries"]
+            never_include = ["audit_logs"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.sample.always_include, vec!["countries".to_owned()]);
+        assert_eq!(config.sample.never_include, vec!["audit_logs".to_owned()]);
+        assert!(sources_declare_sampling(&config));
+        assert!(!sources_declare_sampling(&ScrubConfig::default()));
+    }
+
+    #[test]
+    fn an_unknown_sample_key_is_refused_rather_than_ignored() {
+        // A typo that silently did nothing would leave a table subsetted the
+        // operator believed was excluded.
+        let err = parse_config_str(
+            r#"
+            [sample]
+            allways_include = ["countries"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ScrubError::Config { .. }));
+    }
+
+    #[test]
+    fn percentages_report_n_a_rather_than_dividing_by_zero() {
+        assert_eq!(percent_of(0, 0), "n/a");
+        assert_eq!(percent_of(2, 200), "1.0%");
+        assert_eq!(percent_of(200, 200), "100.0%");
+    }
+
+    #[test]
+    fn byte_sizes_read_at_human_scale() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 kB");
+        assert_eq!(human_bytes(1024 * 1024 * 3), "3.0 MB");
+    }
 
     #[test]
     fn config_parses_defaults_safe_and_pii() {

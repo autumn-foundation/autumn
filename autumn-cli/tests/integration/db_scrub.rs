@@ -718,6 +718,24 @@ async fn scrub_refuses_a_production_profile_without_force() {
         "a refused scrub must not have written anything"
     );
 
+    // A sample is refused by the same guard, on the same terms — the guard runs
+    // before anything reads the schema, so no flag can slip past it.
+    let (_o, sample_refusal) =
+        run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &prod_envs);
+    assert!(
+        sample_refusal.contains("Refusing to scrub") && sample_refusal.contains("prod"),
+        "a sampled scrub must be refused on prod too: {sample_refusal}"
+    );
+    let survivors: i64 = client
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        survivors, 2,
+        "a refused sample must not have deleted anything"
+    );
+
     // With --force it proceeds (the operator has said they mean it).
     run_autumn_ok(dir, &["db", "scrub", "--force"], &prod_envs);
     assert_no_secrets_survive(&client).await;
@@ -813,6 +831,19 @@ impl ServerGuard {
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
+        // The server is a GRANDCHILD (spawned through `cargo run`), so killing
+        // the child leaves it running — and, since #1636, still connected to
+        // the database the next leg of this test compacts with a `VACUUM FULL`.
+        // That takes an ACCESS EXCLUSIVE lock, so an orphan holding an open
+        // transaction would stall it. The child is spawned into its own process
+        // group, so the whole group goes down together.
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("--")
+                .arg(format!("-{}", self.child.id()))
+                .status();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -937,6 +968,16 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
         .unwrap()
         .get(0);
     assert_eq!(orphans, 0, "every foreign key must resolve in the subset");
+    let kept_comments: i64 = client
+        .query_one("SELECT count(*) FROM comments", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        kept_comments, 1,
+        "the kept user's comment must come with it \u{2014} a zero here would satisfy \
+         the orphan check vacuously"
+    );
 
     let (_o, sampled_migrate) = run_autumn_ok(&project, &["migrate"], &envs);
     assert!(
@@ -969,7 +1010,15 @@ async fn assert_app_serves_health(project: &Path, url: &str) {
     };
     let stdout_path = project.join(format!("app-stdout-{app_port}.log"));
     let stderr_path = project.join(format!("app-stderr-{app_port}.log"));
-    let child = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    // Its own process group, so `ServerGuard` can take the whole tree down —
+    // `cargo run`'s grandchild server outlives a plain kill of `cargo`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let child = command
         .args(["run"])
         .current_dir(project)
         .env("AUTUMN_SERVER__PORT", app_port.to_string())
@@ -1042,6 +1091,22 @@ const SAMPLE_SCHEMA: &str = "\
         id BIGSERIAL PRIMARY KEY, \
         actor_email TEXT NOT NULL, \
         action TEXT NOT NULL \
+    ); \
+    CREATE TABLE tags ( \
+        id BIGSERIAL PRIMARY KEY, \
+        label TEXT NOT NULL \
+    ); \
+    CREATE TABLE user_tags ( \
+        user_id BIGINT NOT NULL REFERENCES users (id), \
+        tag_id BIGINT NOT NULL REFERENCES tags (id), \
+        PRIMARY KEY (user_id, tag_id) \
+    ); \
+    CREATE TABLE user_tag_notes ( \
+        id BIGSERIAL PRIMARY KEY, \
+        user_id BIGINT NOT NULL, \
+        tag_id BIGINT NOT NULL, \
+        note TEXT NOT NULL, \
+        FOREIGN KEY (user_id, tag_id) REFERENCES user_tags (user_id, tag_id) \
     );";
 
 /// 3 countries, 200 users, 400 comments, 500 audit rows — enough volume that a
@@ -1059,7 +1124,12 @@ const SAMPLE_ROWS: &str = "\
         UNION ALL SELECT id, 'second secret note ' || id FROM users; \
     INSERT INTO audit_logs (actor_email, action) \
         SELECT 'admin' || i || '@real-corp.example', 'login' \
-        FROM generate_series(1, 500) AS i;";
+        FROM generate_series(1, 500) AS i; \
+    INSERT INTO tags (label) SELECT 'tag ' || i FROM generate_series(1, 5) AS i; \
+    INSERT INTO user_tags (user_id, tag_id) \
+        SELECT id, 1 + (id % 5) FROM users; \
+    INSERT INTO user_tag_notes (user_id, tag_id, note) \
+        SELECT user_id, tag_id, 'secret note about ' || user_id FROM user_tags;";
 
 /// The sampling fixture's declaration. `comments` is absent on purpose: it is
 /// registered with the GDPR anonymize strategy by `write_project_sources`, so
@@ -1083,6 +1153,20 @@ safe = ["action"]
 
 [tables.audit_logs.pii]
 actor_email = "email"
+
+[tables.tags]
+safe = ["label"]
+
+# A composite primary key, and a composite foreign key onto it: the row key and
+# the walk's join both have to carry every component.
+[tables.user_tags]
+safe = ["user_id", "tag_id"]
+
+[tables.user_tag_notes]
+safe = ["user_id", "tag_id"]
+
+[tables.user_tag_notes.pii]
+note = "redact"
 
 # Reference data is copied whole; the audit trail is not copied at all.
 [sample]
@@ -1197,26 +1281,55 @@ async fn sampled_scrub_is_smaller_referentially_intact_and_pii_free() {
         "no user may point at a country the sample dropped"
     );
 
+    // ── Composite keys: a two-column primary key, and a two-column foreign
+    //    key onto it. Both the row key and the walk's join must carry every
+    //    component, in key order.
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM user_tags").await,
+        2,
+        "each kept user brings its one tag row, keyed on the composite key"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM user_tag_notes").await,
+        2,
+        "and the rows hanging off that composite key follow it"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM user_tag_notes n \
+             LEFT JOIN user_tags t \
+             ON t.user_id = n.user_id AND t.tag_id = n.tag_id \
+             WHERE t.user_id IS NULL"
+        )
+        .await,
+        0,
+        "a composite reference must still resolve"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM user_tags t \
+             LEFT JOIN tags g ON g.id = t.tag_id WHERE g.id IS NULL"
+        )
+        .await,
+        0,
+        "the tags a kept row points at must be kept"
+    );
+
     // ── AC #1/#8: sampled AND scrubbed, in one pass ─────────────────────────
-    assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM users WHERE email LIKE '%@real-corp.example' \
-             OR full_name LIKE 'Real Person%'"
-        )
-        .await,
-        0,
-        "the rows the sample kept must still be scrubbed"
-    );
-    assert_eq!(
-        count(
-            &client,
-            "SELECT count(*) FROM comments WHERE body LIKE '%secret note%'"
-        )
-        .await,
-        0,
-        "a kept comment must be scrubbed too"
-    );
+    //
+    // Swept across every character column of every table rather than by a
+    // hand-written column list, so a value that landed somewhere unexpected is
+    // caught too.
+    for secret in ["@real-corp.example", "Real Person", "secret note"] {
+        let hits = occurrences(&client, secret).await;
+        assert!(
+            hits.is_empty(),
+            "the sampled copy still contains {secret:?} in: {}",
+            hits.join(", ")
+        );
+    }
 
     // ── AC #6: the run reports what it produced ─────────────────────────────
     assert!(
@@ -1326,6 +1439,91 @@ async fn sampling_refuses_a_table_no_root_can_reach() {
     assert!(
         check_err.contains("audit_logs"),
         "--check must catch the gap before any restore: {check_err}"
+    );
+}
+
+/// AC #5's other refusal shape, end to end: a reference INTO an excluded table
+/// would dangle, so the run aborts non-zero naming the edge.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_a_reference_into_an_excluded_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_dangling").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // `users` references `countries`, so excluding the lookup table entirely
+    // would leave every kept user pointing at nothing.
+    std::fs::write(
+        dir.join("scrub.toml"),
+        SAMPLE_SCRUB_TOML
+            .replace("always_include = [\"countries\"]", "always_include = []")
+            .replace(
+                "never_include = [\"audit_logs\"]",
+                "never_include = [\"audit_logs\", \"countries\"]",
+            ),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_dangling");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("users -> countries"),
+        "the refusal must name the offending reference: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused sample must not have deleted anything"
+    );
+}
+
+/// AC #1's other half: the sample's row removals are part of the scrub's
+/// transaction, so a failure AFTER they run takes them with it.
+///
+/// A trigger that raises on `UPDATE users` fails the rewrite that follows the
+/// removals — the only way to reach that window from outside the command.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failure_after_the_sample_rolls_its_removals_back() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_rollback").await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION refuse_update() RETURNS trigger AS $$ \
+             BEGIN RAISE EXCEPTION 'no rewrites here'; END; $$ LANGUAGE plpgsql; \
+             CREATE TRIGGER users_refuse_update BEFORE UPDATE ON users \
+             FOR EACH ROW EXECUTE FUNCTION refuse_update();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_rollback");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("no rewrites here"),
+        "the rewrite must be what failed: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "the sample's removals must roll back with the rewrite that failed"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        500,
+        "and so must the excluded table's removal"
     );
 }
 

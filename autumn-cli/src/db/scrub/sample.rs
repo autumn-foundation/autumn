@@ -931,6 +931,24 @@ fn key_expr(alias: &str, key: &[String]) -> String {
     format!("({})", parts.join(" || ',' || "))
 }
 
+/// A constraint name rendered safe for a SQL block comment.
+///
+/// The name comes from `pg_constraint`, which is catalog text rather than a
+/// literal: `*/` inside it would close the comment and let whatever follows
+/// run as part of the statement. It is a label, so anything outside a plain
+/// identifier alphabet becomes `_`.
+fn comment_safe(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// The `ON` clause joining a child to its parent across every key component.
 fn join_on(edge: &ForeignKeyConstraint, child: &str, parent: &str) -> String {
     edge.child_columns
@@ -950,6 +968,18 @@ impl SamplePlan {
             .expect("every edge names a table in the plan")
     }
 
+    /// The tables that need a keep-set at all.
+    ///
+    /// An excluded table is emptied by a bare `DELETE`, so it needs no row
+    /// identity — which is why it is also the one table allowed to have no
+    /// primary key. Building it a set anyway would render an empty key
+    /// expression and emit invalid SQL.
+    fn keyed_tables(&self) -> impl Iterator<Item = &SampleTable> {
+        self.tables
+            .iter()
+            .filter(|t| t.role != SampleRole::NeverInclude)
+    }
+
     /// `CREATE TEMP TABLE` for every keep- and descend-set.
     ///
     /// `AS SELECT … WITH NO DATA` copies the key's own type rather than casting
@@ -958,20 +988,48 @@ impl SamplePlan {
     /// transaction: a rollback leaves nothing behind.
     #[must_use]
     pub fn setup_statements(&self) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.tables.len() * 4);
-        for table in &self.tables {
+        self.keyed_tables()
+            .flat_map(|table| {
+                [&table.keep, &table.descend].map(|set| {
+                    format!(
+                        "CREATE TEMPORARY TABLE {} ON COMMIT DROP AS \
+                         SELECT {} AS k FROM {} AS t WITH NO DATA",
+                        quote_ident(set),
+                        key_expr("t", &table.key),
+                        qualified(&table.table),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Index and analyse every set, run AFTER the roots are seeded.
+    ///
+    /// Order matters twice over: an index built on an empty table is built for
+    /// nothing, and autovacuum never touches a temporary table — so without an
+    /// explicit `ANALYZE` the planner sizes every set at its 10-page default
+    /// and picks a hash join over the index path for the whole first pass.
+    #[must_use]
+    pub fn index_statements(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for table in self.keyed_tables() {
             for set in [&table.keep, &table.descend] {
-                out.push(format!(
-                    "CREATE TEMPORARY TABLE {} ON COMMIT DROP AS \
-                     SELECT {} AS k FROM {} AS t WITH NO DATA",
-                    quote_ident(set),
-                    key_expr("t", &table.key),
-                    qualified(&table.table),
-                ));
-                out.push(format!("CREATE INDEX ON {} (k)", quote_ident(set)));
+                out.push(format!("CREATE INDEX ON {}(k)", quote_ident(set)));
+                out.push(format!("ANALYZE {}", quote_ident(set)));
             }
         }
         out
+    }
+
+    /// Re-analyse every set, run after each closure pass so the next pass plans
+    /// against the sizes it will actually see.
+    #[must_use]
+    pub fn analyze_statements(&self) -> Vec<String> {
+        self.keyed_tables()
+            .flat_map(|table| {
+                [&table.keep, &table.descend].map(|set| format!("ANALYZE {}", quote_ident(set)))
+            })
+            .collect()
     }
 
     /// Seed the roots (deterministically) and the always-include tables.
@@ -1025,7 +1083,7 @@ impl SamplePlan {
             let child_key = key_expr("c", &child.key);
             let parent_key = key_expr("p", &parent.key);
             let on = join_on(edge, "c", "p");
-            let tag = format!("/* {} */ ", edge.name);
+            let tag = format!("/* {} */ ", comment_safe(&edge.name));
 
             // Ascend: keep the parent of every kept child, so the reference
             // resolves. A full-copy parent already holds every row.
@@ -1100,8 +1158,10 @@ impl SamplePlan {
             .collect()
     }
 
-    /// Every table the sample writes to, which the scrub locks for the duration
-    /// so a row inserted mid-run cannot escape the subset.
+    /// Every table the sample reads or writes, which the scrub locks for the
+    /// duration so a row inserted mid-run cannot escape the subset — a
+    /// full-copy table included, because the walk reads it to decide which
+    /// parents to keep.
     #[must_use]
     pub fn locked_tables(&self) -> Vec<&str> {
         self.tables.iter().map(|t| t.table.as_str()).collect()
@@ -1202,11 +1262,20 @@ pub fn data_size(conn: &mut PgConnection, plan: &SamplePlan) -> Result<i64, dies
     if names.is_empty() {
         return Ok(0);
     }
+    // Walked through `pg_inherits` rather than measured directly: a
+    // partitioned parent holds no rows of its own, so `pg_total_relation_size`
+    // on it is zero and a partitioned schema would report a size of nothing.
     let rows: Vec<CountRow> = sql_query(format!(
-        "SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0)::bigint AS n \
-         FROM pg_class c \
-         JOIN pg_namespace ns ON ns.oid = c.relnamespace AND ns.nspname = 'public' \
-         WHERE c.relname IN ({names})"
+        "WITH RECURSIVE named AS ( \
+           SELECT c.oid FROM pg_class c \
+           JOIN pg_namespace ns ON ns.oid = c.relnamespace AND ns.nspname = 'public' \
+           WHERE c.relname IN ({names}) \
+         ), tree AS ( \
+           SELECT oid FROM named \
+           UNION \
+           SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON t.oid = i.inhparent \
+         ) \
+         SELECT coalesce(sum(pg_total_relation_size(oid)), 0)::bigint AS n FROM tree"
     ))
     .load(conn)?;
     Ok(rows.first().map_or(0, |r| r.n))
@@ -1277,13 +1346,20 @@ pub fn apply(conn: &mut PgConnection, plan: &SamplePlan) -> Result<SampleOutcome
     for statement in plan.seed_statements(&before) {
         sql_query(statement).execute(conn)?;
     }
+    for statement in plan.index_statements() {
+        sql_query(statement).execute(conn)?;
+    }
 
     let walk = plan.walk_statements();
+    let analyze = plan.analyze_statements();
     let mut passes = 0;
     loop {
         let mut selected = 0;
         for statement in &walk {
             selected += sql_query(statement).execute(conn)?;
+        }
+        for statement in &analyze {
+            sql_query(statement).execute(conn)?;
         }
         passes += 1;
         if selected == 0 {
@@ -1935,10 +2011,57 @@ mod tests {
     }
 
     #[test]
-    fn plan_requires_at_least_one_root() {
+    fn without_a_root_the_app_tables_are_uncovered() {
+        // Nothing descends out of a full-copy table, so an `always_include`
+        // declaration alone reaches nothing. The CLI never gets here (no
+        // `--sample` means no sampling at all); the planner still refuses
+        // rather than emptying every table it was not told about.
         let (tables, keys) = schema();
         let err = plan_of(&[], &fixture_rules(), &tables, &keys).unwrap_err();
-        assert!(matches!(err, SampleError::UncoveredTables { .. }));
+        assert_eq!(
+            err,
+            SampleError::UncoveredTables {
+                tables: vec!["comments".to_owned(), "users".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_partition_is_sampled_through_its_parent_table() {
+        // A partition's rows are removed through the parent, and its foreign
+        // keys are clones of the parent's, so an edge naming one must not
+        // reach the plan at all.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "comments_2026_user_fk",
+            "comments_2026",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::from(["comments_2026".to_owned()]),
+        })
+        .unwrap();
+        assert!(
+            plan.walk_edges
+                .iter()
+                .all(|e| e.child_table != "comments_2026"),
+            "a partition's cloned constraint must not be walked"
+        );
+        assert!(
+            plan.verify_edges
+                .iter()
+                .all(|e| e.child_table != "comments_2026"),
+            "nor verified twice"
+        );
     }
 
     // ── Delete order ────────────────────────────────────────────────────────
@@ -2071,14 +2194,19 @@ mod tests {
         );
         // A tenant `search_path` must not be able to redirect a DELETE to a
         // table nothing classified — the same rule the scrub's own writes keep.
-        assert!(
-            !all.contains(" \"users\"") && !all.contains("FROM \"users\""),
-            "every table reference must be public-qualified: {all}"
-        );
+        // Checked for EVERY table: one unqualified name is one redirected write.
+        for (name, _) in &tables {
+            let quoted = quote_ident(name);
+            assert_eq!(
+                all.matches(&quoted).count(),
+                all.matches(&format!("\"public\".{quoted}")).count(),
+                "every reference to {name} must be public-qualified: {all}"
+            );
+        }
     }
 
     #[test]
-    fn the_walk_ascends_and_descends_across_a_foreign_key() {
+    fn the_walk_ascends_into_the_parent_and_descends_into_the_child() {
         let (tables, keys) = schema();
         let plan = plan_of(
             &[root("users", SampleAmount::Count(10))],
@@ -2087,17 +2215,42 @@ mod tests {
             &keys,
         )
         .unwrap();
-        let sql = joined(&plan.walk_statements());
-        // Ascend: the users a kept comment points at are kept.
+        let set_of = |table: &str| {
+            let t = plan.tables.iter().find(|t| t.table == table).unwrap();
+            (t.keep.clone(), t.descend.clone())
+        };
+        let (users_keep, users_descend) = set_of("users");
+        let (comments_keep, comments_descend) = set_of("comments");
+        let walk = plan.walk_statements();
+
+        // Ascend fills the PARENT's keep set from the child's. Transposing the
+        // two sets would still produce plausible-looking SQL, so the assertion
+        // names both ends.
         assert!(
-            sql.contains("INSERT INTO \"_autumn_sample_keep_") && sql.contains("comments_user_fk"),
-            "{sql}"
+            walk.iter().any(|s| s.starts_with(&format!(
+                "/* comments_user_fk */ INSERT INTO {}",
+                quote_ident(&users_keep)
+            )) && s.contains(&quote_ident(&comments_keep))),
+            "the ascend must fill users' keep set from comments': {walk:?}"
         );
-        // Descend: the comments of a descend-eligible user are kept AND become
-        // descend-eligible themselves.
+        // Descend fills the CHILD's keep AND descend sets, from the parent's
+        // descend set — never from its keep set, or an ascended-only row would
+        // pull its whole subtree in.
+        for target in [&comments_keep, &comments_descend] {
+            assert!(
+                walk.iter().any(|s| s.starts_with(&format!(
+                    "/* comments_user_fk */ INSERT INTO {}",
+                    quote_ident(target)
+                )) && s.contains(&quote_ident(&users_descend))),
+                "the descend must fill {target} from users' descend set: {walk:?}"
+            );
+        }
         assert!(
-            sql.contains("_autumn_sample_desc_"),
-            "the descend set must be filled too: {sql}"
+            !walk.iter().any(|s| s.contains(&format!(
+                "INSERT INTO {} (k) SELECT DISTINCT c.",
+                quote_ident(&users_descend)
+            ))),
+            "ascent must never make a row descend-eligible: {walk:?}"
         );
     }
 
@@ -2176,9 +2329,11 @@ mod tests {
         )
         .unwrap();
         let sql = joined(&plan.walk_statements());
+        // The pairing is what matters, not the mere presence of both names:
+        // `tenant_id` also appears in the parent's own row key.
         assert!(
-            sql.contains("\"tenant_id\"") && sql.contains("\"order_id\""),
-            "every component of a composite key must be joined: {sql}"
+            sql.contains("p.\"tenant_id\" = c.\"tenant_id\" AND p.\"id\" = c.\"order_id\""),
+            "the join must pair every component in key order: {sql}"
         );
     }
 
@@ -2204,6 +2359,108 @@ mod tests {
     }
 
     #[test]
+    fn an_excluded_table_without_a_primary_key_builds_no_set() {
+        // It is emptied by a bare DELETE, so it needs no row identity — and
+        // building it one would render an empty key expression, which is not
+        // SQL at all. The `never_include` remedy `NoRowKey` prescribes has to
+        // actually work.
+        let (mut tables, keys) = schema();
+        tables.push(table("request_logs", &[]));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned()],
+                never_include: vec!["audit_logs".to_owned(), "request_logs".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let setup = joined(&plan.setup_statements());
+        assert!(
+            !setup.contains("request_logs") && !setup.contains("audit_logs"),
+            "an excluded table gets no keep set: {setup}"
+        );
+        assert!(
+            !setup.contains("SELECT  AS k") && !setup.contains("SELECT () AS k"),
+            "no statement may carry an empty row key: {setup}"
+        );
+        assert!(
+            joined(&plan.delete_statements()).contains("DELETE FROM \"public\".\"request_logs\""),
+            "it is still emptied"
+        );
+    }
+
+    #[test]
+    fn a_constraint_name_cannot_escape_its_sql_comment() {
+        // `conname` is catalog text. A name carrying `*/` would close the
+        // comment and let whatever follows run as part of the statement.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "*/WITH z AS(INSERT INTO loot SELECT 1 RETURNING 1)/*",
+            "comments",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        for statement in plan.walk_statements() {
+            let Some((tag, _)) = statement
+                .strip_prefix("/* ")
+                .and_then(|rest| rest.split_once(" */ "))
+            else {
+                panic!("every walk statement opens with a tag: {statement}");
+            };
+            assert!(
+                !tag.contains('*') && !tag.contains('/'),
+                "the tag can only be closed by the one that follows it: {tag:?}"
+            );
+        }
+        // Only `*/` closes a block comment, so a surviving `--` is inert; the
+        // characters that could close it are the ones that must go.
+        assert_eq!(
+            comment_safe("*/DROP TABLE users;--"),
+            "__DROP TABLE users_--"
+        );
+    }
+
+    #[test]
+    fn sets_are_indexed_and_analysed_after_the_roots_are_seeded() {
+        // An index built on an empty table is built for nothing, and a
+        // temporary table autovacuum never sees plans at its 10-page default
+        // until something analyses it.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let index = joined(&plan.index_statements());
+        assert!(
+            index.contains("CREATE INDEX ON") && index.contains("ANALYZE "),
+            "{index}"
+        );
+        assert!(
+            !joined(&plan.setup_statements()).contains("CREATE INDEX"),
+            "the index must not be built before the rows arrive"
+        );
+        assert!(
+            plan.analyze_statements()
+                .iter()
+                .all(|s| s.starts_with("ANALYZE ")),
+            "each pass re-analyses the sets it just grew"
+        );
+    }
+
+    #[test]
     fn setup_creates_a_keep_and_descend_set_per_table() {
         let (tables, keys) = schema();
         let plan = plan_of(
@@ -2214,9 +2471,14 @@ mod tests {
         )
         .unwrap();
         let sql = joined(&plan.setup_statements());
+        let keyed = plan
+            .tables
+            .iter()
+            .filter(|t| t.role != SampleRole::NeverInclude)
+            .count();
         assert_eq!(
             sql.matches("CREATE TEMPORARY TABLE").count(),
-            plan.tables.len() * 2,
+            keyed * 2,
             "{sql}"
         );
         assert!(sql.contains("ON COMMIT DROP"), "{sql}");
