@@ -52,6 +52,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves
+  every **option** a documented `autumn …` line passes, not only its command.
+  A flag the command does not declare is the same dead end as a phantom
+  subcommand — `autumn build --release` is `error: unexpected argument
+  '--release' found`, exit 2, because the flag is `--debug` and release is the
+  default — and until now the walk stopped at such an option in silence. The
+  baseline found five, all fixed here: `autumn build --release` in
+  `docs/guide/wasm-islands.md` and `examples/blog/README.md`; `autumn dev
+  --profile demo` in `docs/guide/console.md` (`dev` reads the profile from the
+  environment: `AUTUMN_ENV=demo autumn dev`); `autumn setup --tailwind` in
+  `docs/guide/deployment.md` (`autumn setup` *is* the Tailwind install and
+  takes only `--force`); and, inside a copyable fence commented "explicit
+  project path", `autumn lifecycle check --path .` in `docs/guide/lifecycle.md`,
+  where `path` is a positional. Gating flags needed four clap forms the command
+  walk did not: `#[command(flatten)]`, `trailing_var_arg` (so the task
+  arguments the guide documents are seen as forwarded, not judged), clap's own
+  `--help`/`--version`, and a bracket-balanced read of `#[arg(…)]`. That last
+  one was also a latent bug in the shipped gate: the attribute body was matched
+  with a character class that cannot cross a `]`, so every option whose
+  attribute carries a list — `sbom --binary`, `upgrade --accept`, `db scrub
+  --check`, `db scrub --dry-run`, `generate admin --select` — was missing from
+  the option map, and the walk silently stopped at each of them. A token that
+  merely starts with `-` is judged only when spelled like a flag, so prose
+  arrows and slash-joined shorthand are not reported. Corpus-wide noise: zero.
+  `--list-options` prints the parsed option surface.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite

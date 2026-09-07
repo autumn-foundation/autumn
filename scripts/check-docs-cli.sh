@@ -49,6 +49,37 @@
 #      `default_value` is not required, and reading it as required reported 28
 #      correct pages as broken (`autumn upgrade` defaults its `path` to "." and
 #      the guide runs it bare 20 times) before that was caught by measuring.
+#   5. Every OPTION the line passes is one that command declares. `autumn build
+#      --release` is `error: unexpected argument '--release' found`, exit 2 —
+#      the same dead end as a phantom subcommand, reached by the same reader
+#      copying the same line. This was left out of the first version on the
+#      grounds that a source-parsed flag set would be too noisy to gate; it was
+#      then built and measured, and with four clap forms understood (below) the
+#      corpus-wide noise was ZERO. The baseline found five real defects:
+#      `autumn build --release` twice (the flag is `--debug`; release is the
+#      default), `autumn dev --profile` (only `console`, `seed` and `task` have
+#      it), `autumn setup --tailwind` (`setup` IS the Tailwind install, and
+#      takes only `--force`), and — inside a copyable fence, commented
+#      "explicit project path" — `autumn lifecycle check --path .`, where
+#      `path` is a POSITIONAL and the line clap accepts is `autumn lifecycle
+#      check .`.
+#
+#      Gating flags needs four clap forms that gating commands did not, each of
+#      which is a false positive if missed:
+#        - `#[command(flatten)]`, so `graph impact` inherits `GraphArgs`'s
+#          `--json` along with the other three `graph` subcommands;
+#        - `trailing_var_arg`, so the six task arguments the guide documents
+#          (`autumn task cleanup-posts --confirm`) are seen as forwarded to the
+#          task rather than judged against the CLI;
+#        - clap's own `--help`/`-h`/`--version`/`-V`, declared nowhere in the
+#          derive input and present on every command;
+#        - a bracket-BALANCED read of `#[arg(…)]` (see `_arg_fields`), without
+#          which every option whose attribute carries a list — five of them,
+#          including `sbom --binary` and `upgrade --accept` — is invisible.
+#      A token that merely starts with `-` is not judged unless it is spelled
+#      like a flag: the corpus writes prose arrows (`0.5.0 -> 0.6.0`) and
+#      slash-joined shorthand (`autumn token issue --name/--scope/--expires-at`)
+#      in command position, and neither is a line anyone can copy.
 #
 # Both `requires_sub` and the required-positional COUNT were validated against
 # the built binary's `--help` usage strings across all 173 command paths: exact
@@ -66,12 +97,14 @@
 # `visible_alias`/`alias` (without which the real `autumn c` reads as drift).
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
-#   - Whether a flag EXISTS. Options are parsed — the walk has to know their
-#     value arity to find the subcommands written after them — but an option a
-#     command does not declare is not reported, only walked away from: clap's
-#     `conflicts_with`/`value_enum` forms make a source-parsed flag set far
-#     noisier than a command set, and a wrong flag at least fails against a
-#     command that exists. Commands first.
+#   - Whether an option's VALUE is one the command accepts. `--format yaml`
+#     against a `value_enum` of `text|json` is a real defect and is not gated:
+#     the accepted set lives in a separate enum per option, and unlike a flag
+#     name there is no single derive site to read it from. Names first.
+#   - Anything after an option the command does not declare. The walk stops
+#     there — reporting the flag, but not guessing whether it ate the next
+#     token — so a subcommand written after a bad flag goes unjudged. It is one
+#     defect per line either way, and the line has to be fixed regardless.
 #   - Tokens past the point where the resolved command has no subcommands.
 #     `autumn db pull posts` is a positional table name, not a subcommand, and
 #     the parser records which commands take positionals so those tokens are
@@ -161,6 +194,16 @@
 #
 #     <!-- cli-surface-allow: autumn generate island — planned, see #493 -->
 #
+# The same marker waives one FLAG of a command, by naming it after the command:
+#
+#     <!-- cli-surface-allow: autumn build --release — release is the default -->
+#
+# That form is matched by its own pattern, and first (see `FLAG_WAIVER`): the
+# command pattern's separator alternatives include `--`, so it reads the line
+# above as the command `build` with the reason `release — …`, waiving a whole
+# command where one flag was meant. Separate a flag waiver's reason with `—` or
+# `:`, never `--`.
+#
 # The marker sits in the page beside the claim, so when the sentence is deleted
 # or the command ships, the waiver goes with it. A central allowlist would
 # outlive both. Every waiver must carry a reason after the command.
@@ -178,6 +221,7 @@
 # USAGE:
 #   scripts/check-docs-cli.sh              # gate the corpus
 #   scripts/check-docs-cli.sh --list       # print the parsed command surface
+#   scripts/check-docs-cli.sh --list-options  # …with each command's options
 #   scripts/check-docs-cli.sh --self-test  # synthetic-corpus tests
 
 set -euo pipefail
@@ -381,15 +425,65 @@ def _positionals(payload):
 # either direction is a false positive: skip too little and `json` in
 # `autumn routes --format json` reads as a bad subcommand; skip too much and a
 # real subcommand after a boolean flag goes unchecked.
-_ARG_FIELD = re.compile(
-    r'#\[arg\(([^\]]*)\)\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*,')
+#
+# The attribute body is BRACKET-BALANCED rather than regexed. It was regexed
+# (`#\[arg\(([^\]]*)\)\]`), and a character class that cannot cross a `]` cannot
+# cross `conflicts_with_all = ["manifest_path", "locked"]` either: the match
+# died at the list's first `]` and the whole field went missing from the option
+# map. Five real options were invisible that way — `sbom --binary`,
+# `upgrade --accept`, `db scrub --check`, `db scrub --dry-run` and
+# `generate admin --select` — every one of them a flag the guide tells readers
+# to run. An option missing from the map is not a quiet inaccuracy in a table
+# nobody reads: `resolve()` stops the walk at an option it does not recognise,
+# so those five spellings silently switched the gate OFF for the rest of their
+# line, and (once flags are gated) each would be reported as drift against a
+# flag that is actually there. Multi-line `#[arg(…)]` forms failed identically.
+# Flags clap supplies itself, on every command, taking no value.
+BUILTIN_OPTIONS = {'--help': False, '-h': False,
+                   '--version': False, '-V': False}
+
+_ARG_OPEN = re.compile(r'#\[arg\(')
+_ARG_TAIL = re.compile(
+    r'\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*,')
+
+# `#[command(flatten)] args: GraphArgs` — the flattened struct's options belong
+# to every command that flattens it. Without this, `autumn graph impact --json`
+# reads as drift against a `--json` that GraphArgs declares for all four `graph`
+# subcommands.
+_FLATTEN = re.compile(
+    r'#\[command\(flatten\)\]\s*(?:pub\s+)?[a-z_0-9]+\s*:\s*([A-Za-z0-9_:]+)\s*,')
 
 
-def _options(payload):
-    """Map every option spelling on a variant to whether it takes a value."""
+def _arg_fields(payload):
+    """Yield `(attrs, field, type)` for every `#[arg(…)]` field in a body."""
+    i = 0
+    while True:
+        m = _ARG_OPEN.search(payload, i)
+        if not m:
+            return
+        j, depth = m.end(), 1
+        while j < len(payload) and depth:
+            c = payload[j]
+            if c in '([{':
+                depth += 1
+            elif c in ')]}':
+                depth -= 1
+            j += 1
+        attrs = payload[m.end():j - 1]
+        i = j
+        tail = _ARG_TAIL.match(payload, j)
+        if tail:
+            yield attrs, tail.group(1), tail.group(2)
+
+
+def _options(payload, structs=None, seen=()):
+    """Map every option spelling on a variant to whether it takes a value.
+
+    `structs` resolves `#[command(flatten)]`; passing None skips that (the
+    surface builder always passes it, the self-test's simplest cases do not).
+    """
     opts = {}
-    for m in _ARG_FIELD.finditer(payload):
-        attrs, field, ftype = m.group(1), m.group(2), m.group(3)
+    for attrs, field, ftype in _arg_fields(payload):
         if not re.search(r'\b(long|short)\b', attrs):
             continue                            # positional, not an option
         takes_value = ftype.strip() != 'bool'
@@ -400,12 +494,31 @@ def _options(payload):
             opts['--' + field.replace('_', '-')] = takes_value
         for alias in re.findall(r'\balias\s*=\s*"([^"]+)"', attrs):
             opts['--' + alias] = takes_value
+        for group in re.findall(r'\baliases\s*=\s*\[([^\]]*)\]', attrs):
+            for alias in re.findall(r'"([^"]+)"', group):
+                opts['--' + alias] = takes_value
         short = re.search(r"\bshort\s*=\s*'(.)'", attrs)
         if short:
             opts['-' + short.group(1)] = takes_value
         elif re.search(r'\bshort\b', attrs):
             opts['-' + field[0]] = takes_value
+    for m in _FLATTEN.finditer(payload):
+        inner = _last(m.group(1))
+        if structs and inner in structs and inner not in seen:
+            opts.update(_options(structs[inner], structs, seen + (inner,)))
     return opts
+
+
+def _trailing(payload):
+    """Does this command forward everything after its positional, untouched?
+
+    `autumn task cleanup-posts --confirm` passes `--confirm` to the TASK, not to
+    the CLI: the `args: Vec<String>` field is `trailing_var_arg`, so clap stops
+    interpreting at the first positional. Gating flags without knowing that
+    would report every documented task argument as drift.
+    """
+    return any(re.search(r'\btrailing_var_arg\s*=\s*true', attrs)
+               for attrs, _f, _t in _arg_fields(payload))
 
 
 def build_surface(sources):
@@ -429,7 +542,8 @@ def build_surface(sources):
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
                 node = {'children': {}, 'positionals': False, 'options': {},
-                        'requires_sub': False, 'required_args': 0}
+                        'requires_sub': False, 'required_args': 0,
+                        'trailing': False}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -448,14 +562,16 @@ def build_surface(sources):
                                 node['children'] = build(st, seen)
                                 node['requires_sub'] = required and bool(node['children'])
                             node['positionals'], node['required_args'] = _positionals(structs[it])
-                            node['options'] = _options(structs[it])
+                            node['options'] = _options(structs[it], structs)
+                            node['trailing'] = _trailing(structs[it])
                 elif kind == 'struct':
                     st, required = _subcommand_type(payload)
                     if st:
                         node['children'] = build(st, seen)
                         node['requires_sub'] = required and bool(node['children'])
                     node['positionals'], node['required_args'] = _positionals(payload)
-                    node['options'] = _options(payload)
+                    node['options'] = _options(payload, structs)
+                    node['trailing'] = _trailing(payload)
                 for spelling in spellings:
                     tree[spelling] = node
             return tree
@@ -470,11 +586,17 @@ def build_surface(sources):
         flat = {}
         for k, v in t.items():
             key = (prefix + ' ' + k).strip()
+            # clap gives every command `--help`/`-h`, and the root's
+            # `#[command(version)]` gives `--version`/`-V`. They are declared
+            # nowhere in the derive input, so without this they read as drift.
+            opts = dict(BUILTIN_OPTIONS)
+            opts.update(v['options'])
             flat[key] = {'children': set(v['children']),
                          'positionals': v['positionals'],
-                         'options': v['options'],
+                         'options': opts,
                          'requires_sub': v['requires_sub'],
-                         'required_args': v['required_args']}
+                         'required_args': v['required_args'],
+                         'trailing': v['trailing']}
             flat.update(flatten(v['children'], key))
         return flat
 
@@ -2128,6 +2250,25 @@ def _redirect(tok):
 
 WAIVER = re.compile(r'<!--\s*cli-surface-allow:\s*autumn\s+([a-z0-9 -]+?)\s*(?:—|--|:)\s*(\S.*?)-->')
 
+# The same marker, naming an OPTION as well as a command. It has to be matched
+# separately and FIRST, because `WAIVER` cannot read one: its command capture is
+# non-greedy and its separator alternatives include `--`, so
+# `cli-surface-allow: autumn build --release — why` matches there as the command
+# `build` with the reason `release — why`. That silently waives a whole command
+# instead of one of its flags. Matching this pattern first and skipping the
+# `WAIVER` matches it overlaps keeps each marker read exactly once, as whichever
+# kind it is. `—` or `:` separate the reason here; `--` cannot, since the thing
+# to its left is itself spelled with dashes.
+# The option is spelled exactly as `_FLAG_SHAPE` allows — a long `--name`, or a
+# short of ONE letter — and must be followed by whitespace. Both halves matter:
+# accepting `-name` split the existing `autumn system-test` waiver into the
+# command `system` and an option `-test`, which quietly turned a real command
+# waiver into a flag waiver for a flag nothing reports, re-admitting the very
+# defect that waiver was holding back.
+FLAG_WAIVER = re.compile(
+    r'<!--\s*cli-surface-allow:\s*autumn\s+([a-z0-9 -]*?)\s*'
+    r'(--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z])(?=\s)\s*(?:—|:)\s*(\S.*?)-->')
+
 INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
 # `docs/plugins.md` is a live product guide sitting at the `docs/` root rather
 # than under `docs/guide/`, linked from seven corpus pages as *the* plugin
@@ -2840,8 +2981,24 @@ def _short_cluster(tok, options):
     return 1
 
 
-def resolve(tokens, surface, runnable=False):
+# A token that starts with `-` is only judged as a flag when it is SPELLED like
+# one. The corpus writes plenty of things in a command position that begin with
+# a dash and are not options a reader can copy: `->` in a prose arrow
+# (`autumn upgrade - app-code migrations 0.5.0 -> 0.6.0`) and slash-joined
+# shorthand naming several flags at once (`autumn token issue
+# --name/--scope/--expires-at`, `autumn seed --count/--model`). Those are not
+# drift and never were — reporting them would be reporting prose. They still
+# stop the walk, exactly as they do today, because their arity is unknown.
+_FLAG_SHAPE = re.compile(r'^(?:--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z])$')
+
+
+def resolve(tokens, surface, runnable=False, flags=None):
     """Return the drifted command path, or None when the command resolves.
+
+    `flags`, when given, collects `(command path, option)` for every option a
+    line names that the command does not declare — the flag half of the same
+    defect, kept out of the return value so a caller that only wants commands
+    is unaffected.
 
     Takes SHELL TOKENS, not a string to be split on whitespace: a quoted option
     value is one token however many spaces are inside it. Splitting on
@@ -2893,10 +3050,12 @@ def resolve(tokens, surface, runnable=False):
                     i += eaten
                     continue
             if name not in node['options']:
-                # An option this command does not declare. Flags are out of
-                # scope, so this is not reported — but it also cannot be walked
-                # past safely, since whether it consumes the next token is
-                # unknown. Stop rather than risk a false positive.
+                # An option this command does not declare. Reported when it is
+                # spelled like a flag, and in either case the walk stops here:
+                # whether it consumes the next token is unknown, so anything
+                # after it cannot be judged without risking a false positive.
+                if flags is not None and _FLAG_SHAPE.match(name):
+                    flags.append((path, name))
                 return None
             i += 2 if node['options'][name] else 1
             continue
@@ -2907,17 +3066,32 @@ def resolve(tokens, surface, runnable=False):
             # than abandoned. `autumn generate controller pages` supplies
             # `name` and stops, but `actions` is `required = true` too.
             supplied = 0
+            operands_only = False
             while i < len(tokens):
                 t2 = tokens[i]
                 if t2 == '--':
+                    # POSIX end-of-options. Everything after it is an operand,
+                    # so nothing after it is a flag of this command's to judge:
+                    # `autumn task <name> -- --arg value` hands `--arg` to the
+                    # task. It still counts toward the positionals.
+                    operands_only = True
                     i += 1
                     continue
-                if t2.startswith('-') and len(t2) > 1:
+                if not operands_only and t2.startswith('-') and len(t2) > 1:
+                    # `trailing_var_arg`: once this command's own positional has
+                    # been supplied, clap stops interpreting and forwards the
+                    # rest verbatim. `autumn task cleanup-posts --confirm` sends
+                    # `--confirm` to the task, and the guide documents six such
+                    # arguments that the CLI itself has never declared.
+                    if node['trailing'] and supplied:
+                        return None
                     o = t2.split('=', 1)[0]
                     if '=' in t2:
                         i += 1
                         continue
                     if o not in node['options']:
+                        if flags is not None and _FLAG_SHAPE.match(o):
+                            flags.append((path, o))
                         return None             # unknown arity: cannot count on
                     i += 2 if node['options'][o] else 1
                     continue
@@ -2966,7 +3140,7 @@ def resolve(tokens, surface, runnable=False):
 
 
 def scan(root, surface, files):
-    defects, waived = [], 0
+    defects, flag_defects, waived = [], [], 0
     for f in files:
         text = (root / f).read_text(errors='replace')
         line_block = blocks(text)
@@ -2979,13 +3153,38 @@ def scan(root, surface, files):
         # runnable block on the same page — re-admitting, unnoticed, the exact
         # defect this gate was written to remove.
         allowed = collections.defaultdict(set)
+        flag_allowed = collections.defaultdict(set)
+        flag_spans = []
+        for m in FLAG_WAIVER.finditer(text):
+            marker_line = text.count('\n', 0, m.start()) + 1
+            marker_block = line_block[marker_line]
+            key = (m.group(1).strip() + ' ' + m.group(2)).strip()
+            flag_allowed[key].update({marker_block, marker_block - 1})
+            flag_spans.append(m.span())
         for m in WAIVER.finditer(text):
+            # …unless this marker was already read as a flag waiver, which the
+            # command pattern would otherwise misread as a bare command.
+            if any(s <= m.start() < e for s, e in flag_spans):
+                continue
             marker_line = text.count('\n', 0, m.start()) + 1
             marker_block = line_block[marker_line]
             allowed[m.group(1).strip()].update({marker_block, marker_block - 1})
 
         for lineno, display, argv, where in invocations(text):
-            bad = resolve(argv, surface, runnable=where == FENCED_COMMAND)
+            hits = []
+            bad = resolve(argv, surface, runnable=where == FENCED_COMMAND,
+                          flags=hits)
+            for cmd_path, opt in hits:
+                # Waived by the command-and-flag pair, and — exactly as for a
+                # command — never inside a fence. The reason is the same one:
+                # a fenced line is handed over to be run, so a page may NAME a
+                # flag that does not exist ("there is no `--release`; release is
+                # the default") but never hand one over.
+                key = (cmd_path + ' ' + opt).strip()
+                if where == PROSE_SPAN and line_block[lineno] in flag_allowed.get(key, ()):
+                    waived += 1
+                    continue
+                flag_defects.append((f, lineno, cmd_path, opt, display))
             if bad is None:
                 continue
             command = bad[len('autumn '):]
@@ -2997,7 +3196,7 @@ def scan(root, surface, files):
                 waived += 1
                 continue
             defects.append((f, lineno, bad, display))
-    return defects, waived
+    return defects, flag_defects, waived
 
 
 # ------------------------------------------------------------------- modes
@@ -3046,6 +3245,35 @@ def self_test():
             #[arg(short, long)]
             package: Option<String>,
         },
+        // A multi-line `#[arg]` carrying a bracketed list. Both forms defeated
+        // the regex this parser used to use, and an option missing from the map
+        // is a flag the gate reports as drift against a flag that is there.
+        Sbom {
+            #[arg(
+                long,
+                value_name = "FILE",
+                conflicts_with_all = ["locked", "verify"]
+            )]
+            binary: Option<String>,
+            #[arg(long, conflicts_with_all = ["binary"])]
+            locked: bool,
+        },
+        // `trailing_var_arg`: everything after the positional goes to the task,
+        // so the CLI never sees those flags and must not judge them.
+        Task {
+            #[arg(long)]
+            list: bool,
+            name: Option<String>,
+            #[arg(value_name = "ARGS", trailing_var_arg = true,
+                  allow_hyphen_values = true)]
+            args: Vec<String>,
+        },
+        // `#[command(flatten)]`: the flattened struct's options are this
+        // command's options too.
+        Graph {
+            #[command(flatten)]
+            args: GraphArgs,
+        },
         Controller {
             name: String,
             #[arg(required = true)]
@@ -3075,6 +3303,10 @@ def self_test():
         path: String,
     }
     enum UpgradeCommands { Apply }
+    struct GraphArgs {
+        #[arg(long)]
+        json: bool,
+    }
     '''
     surface = build_surface([fake])
     failures = []
@@ -3126,9 +3358,10 @@ def self_test():
     # --- options are walked through, not treated as the end of the command.
     # Regression test for a version that stopped at the first `-` and left every
     # subcommand written after an option unchecked.
-    expect(surface['migrate']['options'] == {'--with-maintenance': False, '--shard': True,
-                                             '-p': True, '--package': True,
-                                             '-v': False, '--verbose': False},
+    expect(surface['migrate']['options'] == dict(BUILTIN_OPTIONS,
+                                                 **{'--with-maintenance': False, '--shard': True,
+                                                    '-p': True, '--package': True,
+                                                    '-v': False, '--verbose': False}),
            f"option value-taking must come from the field type, got {surface['migrate']['options']}")
     expect(resolve(tk('migrate --with-maintenance status'), surface) is None,
            'a boolean option must not hide the subcommand after it')
@@ -3142,6 +3375,55 @@ def self_test():
            'an undeclared option stops the walk rather than risking a false positive')
     expect(resolve(tk('migrate -- nope'), surface) is None,
            'everything after `--` is arguments')
+
+    # --- the flag half of the same defect. An option a command does not declare
+    # is `unexpected argument … exit 2` for whoever copies the line, and until
+    # #2498 it was walked away from in silence. It is collected through an
+    # out-parameter so that a caller asking only about commands is unaffected.
+    def opts_of(argv, runnable=False):
+        hits = []
+        resolve(tk(argv), surface, runnable=runnable, flags=hits)
+        return hits
+
+    expect(opts_of('migrate --unknown-option nope') == [('migrate', '--unknown-option')],
+           'an undeclared option must be reported when a collector is passed')
+    expect(opts_of('migrate --shard eu status') == [],
+           'a declared option is not drift')
+    expect(opts_of('console --nope') == [('console', '--nope')],
+           'an undeclared option on a LEAF command must be reported too')
+    expect(opts_of('migrate --help') == [] and opts_of('console -h') == [],
+           "clap's own --help is on every command and is not drift")
+
+    # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
+    # used to read these stopped at the list's first `]`, so the field vanished
+    # and its flag became a false positive.
+    expect(surface['sbom']['options'].get('--binary') is True,
+           'a multi-line #[arg] with a bracketed list must still be parsed')
+    expect(surface['sbom']['options'].get('--locked') is False,
+           'a single-line #[arg] with a bracketed list must still be parsed')
+    expect(opts_of('sbom --binary /tmp/app') == [],
+           'an option only visible through balanced parsing must not read as drift')
+
+    # `#[command(flatten)]`
+    expect(surface['graph']['options'].get('--json') is False,
+           'a flattened args struct contributes its options')
+    expect(opts_of('graph --json') == [], 'a flattened option is not drift')
+
+    # `trailing_var_arg` — the CLI's own flags before the positional are still
+    # judged; everything after it belongs to the task.
+    expect(surface['task']['trailing'], 'trailing_var_arg not detected')
+    expect(opts_of('task cleanup --confirm') == [],
+           'a flag after the positional of a trailing_var_arg command is forwarded')
+    expect(opts_of('task --nope') == [('task', '--nope')],
+           "a trailing_var_arg command's OWN flag position is still judged")
+    expect(opts_of('task name -- --arg value') == [],
+           'nothing after `--` is a flag of this command to judge')
+
+    # Not every dashed token is a flag: the corpus writes prose arrows and
+    # slash-joined shorthand in command position, and neither is copyable.
+    for prose in ('-> 0.6.0', '--name/--scope', '--<PLACEHOLDER>'):
+        expect(opts_of('migrate ' + prose) == [],
+               f'{prose!r} is prose, not a flag spelling')
 
     # --- a redirection is shell plumbing, not part of the command. `<` and `>`
     # are deliberately not split on (the docs write `--shard <new>`), so a
@@ -4134,11 +4416,66 @@ def self_test():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir) / 'waiver-selftest.md'
         tmp.write_text(waived_page)
-        found_defects, n_waived = scan(tmp.parent, surface, [tmp.name])
+        found_defects, _flag, n_waived = scan(tmp.parent, surface, [tmp.name])
     reported = sorted(lineno for _, lineno, _, _ in found_defects)
     expect(n_waived == 1, f'the sentence above the marker must be waived, got {n_waived}')
     expect(reported == [6, 9],
            f'a fenced block and a distant paragraph must both still report, got {reported}')
+
+    # A FLAG waiver, end to end. Written first because both halves of it were
+    # wrong when the flag gate was built: the lookup key carried an `autumn `
+    # prefix that the waiver map does not store, so no flag waiver could ever
+    # match; and the command pattern read `autumn build --release — why` as the
+    # command `build`, waiving every use of a whole command instead of one flag
+    # of it. Neither shows up in a corpus that has no flag waivers yet, which is
+    # exactly why it is asserted here.
+    flag_page = '\n'.join([
+        'There is no `autumn migrate --nope`.',
+        '',
+        '<!-- cli-surface-allow: autumn migrate --nope — named only to say so -->',
+        '',
+        '```bash',
+        'autumn migrate --nope',
+        '```',
+        '',
+        'A later paragraph passing `autumn migrate --alsonope` by mistake.',
+    ])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir) / 'flag-waiver-selftest.md'
+        tmp.write_text(flag_page)
+        f_cmd, f_flags, f_waived = scan(tmp.parent, surface, [tmp.name])
+    expect(f_waived == 1, f'the waived flag must be waived, got {f_waived}')
+    expect(sorted(l for _f, l, _c, _o, _d in f_flags) == [6, 9],
+           f'a fence and a distant paragraph must both still report: {f_flags}')
+    expect(f_cmd == [],
+           f'a flag waiver must not register as a COMMAND waiver: {f_cmd}')
+    # …and the reverse, which is the one that actually broke the corpus: a
+    # HYPHENATED command name is not a command plus a short option. Reading
+    # `autumn system-test` as `system` + `-test` turned that page's real command
+    # waiver into a flag waiver for a flag nothing reports, and the command it
+    # was holding back came straight back as a defect.
+    expect(not FLAG_WAIVER.search(
+        '<!-- cli-surface-allow: autumn system-test — planned, not shipped -->'),
+        'a hyphenated command name must not read as a command plus a short option')
+    expect(WAIVER.search(
+        '<!-- cli-surface-allow: autumn system-test — planned, not shipped -->'),
+        'a hyphenated command name is still an ordinary command waiver')
+    expect(FLAG_WAIVER.search(
+        '<!-- cli-surface-allow: autumn console -p — why -->').group(2) == '-p',
+        'a one-letter short option is a flag waiver')
+    # …and the command waiver it would have been misread as is not created, so
+    # real command drift on the waived command still reports.
+    cmd_still = '\n'.join([
+        '`autumn migrate phantom`',
+        '',
+        '<!-- cli-surface-allow: autumn migrate --nope — named only to say so -->',
+    ])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir) / 'flag-waiver-scope.md'
+        tmp.write_text(cmd_still)
+        c_defects, _cf, _cw = scan(tmp.parent, surface, [tmp.name])
+    expect([b for _f, _l, b, _d in c_defects] == ['autumn migrate phantom'],
+           f'a flag waiver must not silence command drift: {c_defects}')
 
     # A backticked span INSIDE a fence is not a command line, but it is fenced.
     # The two facts were one boolean, so it was waivable — a marker could
@@ -4154,7 +4491,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir) / 'subst-selftest.md'
         tmp.write_text(subst_page)
-        subst_defects, subst_waived = scan(tmp.parent, surface, [tmp.name])
+        subst_defects, _flag2, subst_waived = scan(tmp.parent, surface, [tmp.name])
     expect(subst_waived == 0 and len(subst_defects) == 1,
            f'a waiver must not reach a backtick substitution in a fence: '
            f'{subst_defects}, {subst_waived} waived')
@@ -5198,18 +5535,46 @@ def main():
               file=sys.stderr)
         return 1
 
-    if MODE == '--list':
+    if MODE in ('--list', '--list-options'):
+        show_opts = MODE == '--list-options'
         for path in sorted(surface):
-            print(path)
+            if show_opts:
+                # Everything but clap's own, which are on every command and
+                # would treble the output without telling anyone anything.
+                own = sorted(o for o in surface[path]['options']
+                             if o not in BUILTIN_OPTIONS)
+                print(f'{path}    {" ".join(own)}' if own else path)
+            else:
+                print(path)
         print(f'\n{len([p for p in surface if " " not in p])} top-level commands, '
-              f'{len(surface)} command paths')
+              f'{len(surface)} command paths, '
+              f'{sum(len(v["options"]) for v in surface.values())} option spellings')
         return 0
 
     files = corpus(ROOT)
-    defects, waived = scan(ROOT, surface, files)
+    defects, flag_defects, waived = scan(ROOT, surface, files)
+    options = sum(len(v['options']) for v in surface.values())
     print(f'corpus: {len(files)} reader-facing markdown files')
-    print(f'surface: {len(surface)} command paths parsed from autumn-cli/src')
-    print(f'defects: {len(defects)}' + (f' ({waived} waived)' if waived else ''))
+    print(f'surface: {len(surface)} command paths, {options} option spellings '
+          f'parsed from autumn-cli/src')
+    print(f'defects: {len(defects)} command, {len(flag_defects)} flag'
+          + (f' ({waived} waived)' if waived else ''))
+    if flag_defects:
+        print()
+        for f, lineno, cmd_path, opt, argv in flag_defects:
+            line = ('autumn ' + argv).strip()
+            print(f'{f}:{lineno}: `autumn {cmd_path}` has no `{opt}`  '
+                  f'(line: {line})')
+        print()
+        print('Each line above tells a reader to pass an option the command '
+              'does not declare; clap answers with "unexpected argument" and '
+              'exits 2. Fix the page, or — if a SENTENCE is deliberately naming '
+              'an option that does not exist — waive it, quoting the command '
+              'and the option EXACTLY as reported above (a fenced block is '
+              'handed over to be run, so nothing waives one):')
+        print('    <!-- cli-surface-allow: autumn <command> <--option> — why -->')
+        print('Run `scripts/check-docs-cli.sh --list-options` to see the real '
+              'options of a command.')
     if defects:
         print()
         for f, lineno, bad, argv in defects:
@@ -5232,6 +5597,7 @@ def main():
               'part that failed to resolve, which may be shorter than the line):')
         print('    <!-- cli-surface-allow: autumn <command> — why -->')
         print('Run `scripts/check-docs-cli.sh --list` to see the real surface.')
+    if defects or flag_defects:
         return 1
     print('CLI drift gate OK.')
     return 0
@@ -5243,9 +5609,10 @@ PYEOF
 
 mode="${1:-}"
 case "$mode" in
-  --self-test) run_py --self-test "$root" ;;
-  --list)      run_py --list "$root" ;;
-  "")          echo "Checking CLI invocations across the reader-facing docs..."
-               run_py --check "$root" ;;
-  *)           echo "usage: $0 [--list|--self-test]" >&2; exit 2 ;;
+  --self-test)    run_py --self-test "$root" ;;
+  --list)         run_py --list "$root" ;;
+  --list-options) run_py --list-options "$root" ;;
+  "")             echo "Checking CLI invocations across the reader-facing docs..."
+                  run_py --check "$root" ;;
+  *)              echo "usage: $0 [--list|--list-options|--self-test]" >&2; exit 2 ;;
 esac
