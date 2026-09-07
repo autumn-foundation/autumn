@@ -3085,25 +3085,34 @@ def blocks(text):
 
 
 def _short_cluster(tok, options):
-    """Tokens consumed by a compact short-option group, or None if unknown.
+    """`(tokens consumed, is terminal)` for a compact short group, or None.
 
-    Returns 1 when the group is self-contained — every letter is a boolean
+    Consumes 1 when the group is self-contained — every letter is a boolean
     (`-rd`), or the letter that takes a value carries it attached (`-pfoo`) —
     and 2 when the group ends on a value-taking option whose value is the next
     token (`-rp foo`).
+
+    TERMINAL when any letter is one of clap's print-and-exit actions. A cluster
+    is not a lesser kind of option: `autumn replay -hpapi` is `-h` plus
+    `-p api`, and clap prints help and exits 0 without ever checking that
+    `<CAPSULE>` was supplied. Collapsing it to an ordinary group dropped that,
+    and the walk went on to report the line as incomplete — a correct line.
 
     Returns None the moment a letter is not declared, so an unrecognised group
     is still not walked past: whether it eats the following token is exactly
     what is unknown there, and guessing is how a gate invents a defect on a
     correct page.
     """
+    terminal = False
     for pos, ch in enumerate(tok[1:], start=1):
         name = '-' + ch
         if name not in options:
             return None
+        if name in TERMINAL_OPTIONS:
+            terminal = True
         if options[name]:                       # this letter takes a value
-            return 1 if pos < len(tok) - 1 else 2
-    return 1
+            return (1 if pos < len(tok) - 1 else 2), terminal
+    return 1, terminal
 
 
 # A token that starts with `-` is judged as a flag unless it carries a character
@@ -3189,9 +3198,10 @@ def _classify_option(tok, node):
             return 'known', 1
         return 'known', 2 if node['options'][name] else 1
     if not attached:
-        eaten = _short_cluster(tok, node['options'])
-        if eaten is not None:
-            return 'cluster', eaten
+        cluster = _short_cluster(tok, node['options'])
+        if cluster is not None:
+            eaten, terminal = cluster
+            return ('terminal', 0) if terminal else ('cluster', eaten)
     return 'unknown', 1 if attached else 0
 
 
@@ -3959,6 +3969,17 @@ def self_test():
            'an attached value is self-contained')
     expect(_classify_option('-papi', surface['replay']) == ('cluster', 1),
            'a compact short group is one token')
+    # A cluster carrying a terminal letter IS terminal: `-hpapi` is `-h` plus
+    # `-p api`, and clap prints help and exits 0 without checking <CAPSULE>.
+    # Collapsing it to an ordinary group reported that correct line incomplete.
+    expect(_classify_option('-hpapi', surface['replay']) == ('terminal', 0),
+           'a cluster containing -h is terminal, not an ordinary group')
+    expect(resolve(tk('replay -hpapi'), surface, runnable=True) is None,
+           '…so <CAPSULE> is not reported missing')
+    expect(resolve(tk('replay -papi'), surface, runnable=True) == 'autumn replay',
+           'the same cluster WITHOUT -h still needs its positional')
+    expect(opts_of('replay -zz') == [('replay', '-zz')],
+           'an undeclared cluster is still reported')
     expect(_classify_option('--nope', routes) == ('unknown', 0),
            'an undeclared detached option has unknown arity')
     expect(_classify_option('--nope=x', routes) == ('unknown', 1),
