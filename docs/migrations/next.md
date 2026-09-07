@@ -448,6 +448,46 @@ addition. Direct struct-literal construction of all three types is rare outside
 the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
 normally deserialized from `autumn.toml`.
 
+### Scrub: a `DELETE` trigger on a table `autumn db scrub` empties is refused
+
+`[framework] purge` and `[sample] never_include` both promise a table ends up
+empty, and both are enforced by a pass that runs **after** the column rewrites —
+it has to, or an audit trigger firing during those rewrites re-fills the table
+with the very PII being removed.
+
+The cost is that this pass's own `DELETE`s are the run's last write. An archive
+trigger on one of those tables therefore fires after every rewrite, and can copy
+the rows it is removing into an ordinary classified table that has already been
+scrubbed — leaving real values in a table the run reports as clean, and in any
+`--output` artifact taken from it.
+
+No ordering avoids this: the trigger graph decides where each write lands, and
+it can be cyclic. No postcondition catches it either, because a trigger body can
+write anywhere the scrub never looks. So the run refuses before writing
+anything, `--check` and `--dry-run` included:
+
+```text
+✗ 1 table(s) this run empties carry a user-defined trigger that fires on `DELETE`:
+    - audit_logs
+```
+
+**Who is affected.** Only a target whose purged or `never_include` tables carry
+a user-defined `DELETE` trigger. `INSERT`/`UPDATE`-only triggers are unaffected
+and still merely warn, and a target with no such triggers behaves exactly as
+before. This reaches an unsampled `autumn db scrub` too, wherever
+`[framework] purge` names a table with one.
+
+**The fix.** Drop or disable the trigger on the copy before scrubbing — which is
+already the advice the scrub's trigger warning gives:
+
+```sql
+ALTER TABLE audit_logs DISABLE TRIGGER audit_archive;
+```
+
+Scrub a restored copy rather than a live database, and this costs nothing: the
+trigger exists for the production system's audit trail, which the copy does not
+need.
+
 ### ACME: `AcmeRenewalTask` gains `dns` and `recovery`, `AcmeConfig` gains `dns`
 
 Wildcard certificates over the DNS-01 challenge

@@ -248,6 +248,14 @@ pub enum ScrubError {
         /// `child (inherits parent)` descriptions, sorted.
         tables: Vec<String>,
     },
+    /// A table this run promises to empty carries a user-defined trigger that
+    /// fires on `DELETE`. That emptying pass is the run's LAST write, so
+    /// anything the trigger writes lands after every rewrite and is never
+    /// verified.
+    EmptyingTriggerLeak {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
     /// The target has row-level security on a table the scrub would rewrite.
     RowLevelSecurity {
         /// The table names, sorted.
@@ -488,6 +496,20 @@ impl std::fmt::Display for ScrubError {
                  delete each other's, and the run would report a success it cannot stand \
                  behind. Sample a copy without the inheritance, or drop the child tables \
                  from it.",
+                tables.len(),
+                bullet_list(tables),
+            ),
+            Self::EmptyingTriggerLeak { tables } => write!(
+                f,
+                "{} table(s) this run empties carry a user-defined trigger that fires on \
+                 `DELETE`:\n{}\n  \
+                 Emptying them is the LAST thing the run writes \u{2014} it has to be, because a \
+                 trigger on a scrubbed table can otherwise re-fill them with the very PII \
+                 being removed. A `DELETE` trigger on one of them therefore runs after every \
+                 column rewrite, and can copy the rows it is removing into an ordinary \
+                 table that has already been scrubbed. Nothing downstream can catch that: \
+                 the run verifies these tables are empty, not where their triggers wrote. \
+                 Drop or disable the trigger on the copy before scrubbing.",
                 tables.len(),
                 bullet_list(tables),
             ),
@@ -2419,6 +2441,37 @@ fn classify_and_apply(
             return Err(ScrubError::RowLevelSecurity { tables: rls });
         }
 
+        // The emptying pass runs LAST — after every column rewrite — because
+        // that is the only order in which "this table ends up empty" survives a
+        // rewrite trigger re-filling it. The cost is that its own `DELETE`
+        // triggers fire after everything else: an archive trigger on a purged
+        // or `never_include` table can copy the rows it is removing into an
+        // ordinary classified table whose rewrite has already run, and the
+        // verification that follows counts these tables rather than tracing
+        // where their triggers wrote. There is no order that satisfies both —
+        // the trigger graph can be cyclic — and no postcondition to check
+        // instead, because a trigger body can write anywhere. So it is refused
+        // before anything is written.
+        let mut emptying_triggers: Vec<String> =
+            purge_statements(&facts.framework_tables, &sources.config)
+                .into_iter()
+                .map(|(table, _)| table)
+                .chain(
+                    sampling
+                        .iter()
+                        .flat_map(|s| s.emptied_tables())
+                        .map(|(table, _)| table.to_owned()),
+                )
+                .filter(|t| facts.delete_triggered_tables.contains(t))
+                .collect();
+        emptying_triggers.sort();
+        emptying_triggers.dedup();
+        if !emptying_triggers.is_empty() {
+            return Err(ScrubError::EmptyingTriggerLeak {
+                tables: emptying_triggers,
+            });
+        }
+
         report_plan(label, &plan);
         report_framework_tables(&facts.framework_tables, &sources.config);
         report_triggers(&plan, sampling.as_ref(), &facts);
@@ -2937,6 +2990,10 @@ pub struct DatabaseFacts {
     /// Tables carrying user-defined triggers, which can copy pre-scrub values
     /// into another table mid-scrub.
     pub triggered_tables: BTreeSet<String>,
+    /// The subset of those whose triggers fire on `DELETE`. The run's emptying
+    /// pass is its last write, so a trigger here fires after every rewrite and
+    /// can put pre-scrub values into a table already scrubbed.
+    pub delete_triggered_tables: BTreeSet<String>,
     /// Materialized views, in dependency order (sources before dependents), so
     /// refreshing them in sequence never re-derives from stale data.
     pub materialized_views: Vec<String>,
@@ -3339,6 +3396,20 @@ fn probe_database_facts(
     .into_iter()
     .collect();
 
+    // The `DELETE`-firing subset, separately: `tgtype` bit 3 is the DELETE
+    // event. These are the ones that matter for the run's last write, so the
+    // refusal can name exactly the tables that carry one rather than every
+    // table carrying any trigger at all.
+    let delete_triggered_tables = names(
+        "SELECT DISTINCT rel.relname AS name FROM pg_trigger t \
+         JOIN pg_class rel ON rel.oid = t.tgrelid \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE NOT t.tgisinternal AND (t.tgtype & 8) <> 0",
+        &mut conn,
+    )?
+    .into_iter()
+    .collect();
+
     // `m` (materialized views) belongs here as much as the table relkinds do: a
     // schema holding only `analytics.user_emails AS SELECT … FROM public.users`
     // keeps its own copy of the PII, and the refresh pass only reaches `public`.
@@ -3431,6 +3502,7 @@ fn probe_database_facts(
         rls_tables,
         legacy_inheritance,
         triggered_tables,
+        delete_triggered_tables,
         materialized_views,
         other_schemas,
         framework_tables,

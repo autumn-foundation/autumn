@@ -354,6 +354,16 @@ still warns when a table it writes to carries user-defined triggers: emptying th
 destination cannot help a trigger that writes somewhere the purge list does not
 name.)
 
+Running that pass last has a cost, and it is a **refusal** rather than a
+warning. Its own `DELETE`s fire after every column rewrite, so an archive
+trigger on a purged or `never_include` table can copy the rows it is removing
+into an ordinary classified table that has already been scrubbed — putting real
+values into a table the run reports as clean, and into any `--output` artifact.
+No ordering avoids it (the trigger graph decides, and can be cyclic) and no
+postcondition catches it (a trigger body can write anywhere), so a `DELETE`
+trigger on a table the run empties is refused before anything is written, by
+`--check` and `--dry-run` too. Drop or disable the trigger on the copy.
+
 After that pass, every promised-empty table is **counted**, and a run that finds
 rows in one aborts. Ordering the removals cannot rule this out: each `DELETE`
 fires triggers, and one of those can insert into a table an earlier `DELETE`

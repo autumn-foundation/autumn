@@ -1504,17 +1504,23 @@ async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
     );
 }
 
-/// A trigger chain between two promised-empty tables is caught, not committed.
+/// A `DELETE` trigger on a table the run empties is refused before any write.
 ///
-/// `audit_logs` is `never_include` and `autumn_jobs` is purged, so both are
-/// promised empty. An `ON DELETE` trigger on `audit_logs` archives into
-/// `autumn_jobs`: whichever the final pass empties first, emptying the other can
-/// put rows back. Ordering cannot fix that in general — the trigger graph
-/// decides, and it can be cyclic — so the run verifies both are empty after
-/// every write and rolls back if either is not.
+/// The emptying pass has to run LAST — that is what makes "this table ends up
+/// empty" survive a rewrite trigger re-filling it. The cost is that its own
+/// `DELETE` triggers fire after every column rewrite, so an archive trigger on
+/// a purged or `never_include` table can copy the rows it removes into an
+/// ordinary classified table that has already been scrubbed. Nothing downstream
+/// catches it: the run verifies these tables are EMPTY, not where their
+/// triggers wrote, and `--output` would then capture the result.
+///
+/// No ordering fixes it (the trigger graph decides, and can be cyclic) and no
+/// postcondition covers it (a trigger body can write anywhere), so it is
+/// refused up front. Here the chain ends in `comments` — a classified app
+/// table — which is the shape that actually leaks.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn a_trigger_chain_between_emptied_tables_rolls_the_run_back() {
+async fn a_delete_trigger_on_an_emptied_table_is_refused_before_any_write() {
     let (_pg, host, port) = start_postgres().await;
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let admin = connect(&format!("{base}/postgres")).await;
@@ -1528,6 +1534,8 @@ async fn a_trigger_chain_between_emptied_tables_rolls_the_run_back() {
             CREATE FUNCTION archive_audit() RETURNS TRIGGER AS $$ \
             BEGIN \
                 INSERT INTO autumn_jobs (args) VALUES (OLD.actor_email); \
+                INSERT INTO comments (user_id, body) \
+                    SELECT id, OLD.actor_email FROM users LIMIT 1; \
                 RETURN OLD; \
             END; \
             $$ LANGUAGE plpgsql; \
@@ -1550,13 +1558,13 @@ async fn a_trigger_chain_between_emptied_tables_rolls_the_run_back() {
 
     let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
     assert!(
-        stderr.contains("autumn_jobs") && stderr.contains("promised"),
-        "the refusal must name the table that came back: {stderr}"
+        stderr.contains("audit_logs") && stderr.contains("DELETE"),
+        "the refusal must name the emptied table carrying the trigger: {stderr}"
     );
     assert_eq!(
         count(&client, "SELECT count(*) FROM users").await,
         200,
-        "the whole run must roll back, leaving the source untouched"
+        "a refusal before any write must leave the source untouched"
     );
     assert_eq!(
         count(
@@ -1567,6 +1575,25 @@ async fn a_trigger_chain_between_emptied_tables_rolls_the_run_back() {
         200,
         "and no PII may be left half-scrubbed"
     );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM comments WHERE body LIKE '%@example.com'",
+        )
+        .await,
+        0,
+        "and nothing may have spilled into the scrubbed app table"
+    );
+    // `--check` and `--dry-run` reach it too: an operator must find this out
+    // before restoring a copy, not while running the scrub on one.
+    for extra in ["--check", "--dry-run"] {
+        let (_o, stderr) =
+            run_autumn_fail(dir, &["db", "scrub", extra, "--sample", "users=50%"], &envs);
+        assert!(
+            stderr.contains("audit_logs"),
+            "{extra} must refuse for the same reason: {stderr}"
+        );
+    }
 }
 
 /// Legacy `INHERITS` is refused rather than sampled wrong.

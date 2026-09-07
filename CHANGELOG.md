@@ -92,7 +92,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the rewrites run, so a purge that ran only beforehand would report the
   table emptied while it held real data. That final pass covers `[sample]
   never_include` tables too — both settings promise a table ends up empty, and
-  both are now enforced after every write rather than only before. Legacy
+  both are now enforced after every write rather than only before. **Breaking:**
+  running that pass last means its own `DELETE`s fire after every column
+  rewrite, so an archive trigger on a purged or `never_include` table can copy
+  the rows it removes into an ordinary classified table that has already been
+  scrubbed. No ordering avoids it and no postcondition catches it — a trigger
+  body can write anywhere — so a `DELETE` trigger on a table the run empties is
+  now refused before anything is written, `--check` and `--dry-run` included.
+  Drop or disable it on the copy. See the
+  [migration guide](docs/migrations/next.md#scrub-a-delete-trigger-on-a-table-autumn-db-scrub-empties-is-refused). Legacy
   `INHERITS` inheritance is refused for a sampled run (a statement naming the
   parent reaches the child, which the plan models separately); an exact `100%`
   root counts as removing no rows, so it no longer trips the outside-reference
