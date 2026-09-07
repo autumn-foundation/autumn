@@ -3130,6 +3130,39 @@ def _reportable_flag(name):
             and not _PROSE_IN_FLAG.search(name))
 
 
+def _classify_option(tok, node):
+    """What IS this option token, to `node`? `(kind, eaten)`.
+
+    The single definition of an option, shared by all three walkers — the outer
+    walk, the leaf loop and the options-only scan. Each of the three grew its
+    own copy, and each time one of them learned something the others did not,
+    that gap was a review finding: the leaf loop could not read a compact short
+    (`-papi`), and the options-only scan did not know help was terminal. Policy
+    on an UNKNOWN option still belongs to the caller — the leaf loop must offer
+    it to an `allow_hyphen_values` slot first — so this reports nothing and
+    decides nothing; it only says what the token is.
+
+      'terminal'  clap prints and exits 0 without checking requirements
+      'known'     declared here; `eaten` tokens belong to it
+      'cluster'   a compact short group; `eaten` tokens belong to it
+      'unknown'   not declared; `eaten` is 1 when the value is attached
+                  (so the name alone was wrong) and 0 when its arity is a guess
+    """
+    name = tok.split('=', 1)[0]
+    attached = '=' in tok
+    if name in node['options']:
+        if name in TERMINAL_OPTIONS:
+            return 'terminal', 0
+        if attached:                            # `--name=value`, self-contained
+            return 'known', 1
+        return 'known', 2 if node['options'][name] else 1
+    if not attached:
+        eaten = _short_cluster(tok, node['options'])
+        if eaten is not None:
+            return 'cluster', eaten
+    return 'unknown', 1 if attached else 0
+
+
 def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
     """Judge the OPTIONS in `tokens[i:]`, resolving no NEW command defects.
 
@@ -3169,17 +3202,16 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
             # forwarded command, so none of it is this CLI's to judge.
             return None
         name = tok.split('=', 1)[0]
-        if name in node['options']:
-            i += 1 if '=' in tok else (2 if node['options'][name] else 1)
-            continue
-        eaten = _short_cluster(tok, node['options'])
-        if eaten is not None:
+        kind, eaten = _classify_option(tok, node)
+        if kind == 'terminal':
+            return None
+        if kind in ('known', 'cluster'):
             i += eaten
             continue
         if flags is not None and _reportable_flag(name):
             flags.append((path, name))
-        if '=' in tok:                          # arity known; keep judging
-            i += 1
+        if eaten:                               # attached value: arity is known
+            i += eaten
             continue
         return None                             # arity unknown: stop here
     return None
@@ -3258,38 +3290,22 @@ def _walk(tokens, i, path, surface, runnable, flags):
             # `=` alone let `autumn build --definitely-not-real=value` through
             # without ever reaching the membership check below, which is the
             # attached spelling of the very defect this gate reports.
-            attached = '=' in tok
-            if attached:
-                if name not in node['options']:
-                    if flags is not None and _reportable_flag(name):
-                        flags.append((path, name))
-                    # Unlike the detached form, this one can be walked past: the
-                    # value is inside the token, so the next token is still the
-                    # command's to judge.
-                i += 1
-                continue
-            if not tok.startswith('--') and len(tok) > 2:
-                # A compact short-option group. POSIX lets shorts bundle and
-                # lets the last one carry its value attached, so `-pfoo` is
-                # `--package foo` and `-rd` is two booleans — both of which
-                # read as one unrecognised token and stopped the walk, leaving
-                # every subcommand written after them unchecked.
-                eaten = _short_cluster(tok, node['options'])
-                if eaten is not None:
-                    i += eaten
-                    continue
-            if name in node['options'] and name in TERMINAL_OPTIONS:
-                return None                     # help/version: prints and exits 0
-            if name not in node['options']:
-                # An option this command does not declare. Reported when it is
-                # spelled like a flag, and in either case the walk stops here:
-                # whether it consumes the next token is unknown, so anything
-                # after it cannot be judged without risking a false positive.
-                if flags is not None and _reportable_flag(name):
-                    flags.append((path, name))
+            kind, eaten = _classify_option(tok, node)
+            if kind == 'terminal':
                 return None
-            i += 2 if node['options'][name] else 1
-            continue
+            if kind in ('known', 'cluster'):
+                i += eaten
+                continue
+            # Not declared here. Reported when it is spelled like a flag; then
+            # an attached value can be walked PAST (its arity is inside the
+            # token) while a detached one stops the walk, since whether it eats
+            # the next token is a guess and guessing invents defects.
+            if flags is not None and _reportable_flag(name):
+                flags.append((path, name))
+            if eaten:
+                i += eaten
+                continue
+            return None
         if not node['children']:
             # A leaf: everything left is arguments, and here the ambiguity
             # between "value" and "subcommand name" is gone, so the remaining
@@ -3323,39 +3339,26 @@ def _walk(tokens, i, path, surface, runnable, flags):
                     if node['trailing'] and supplied:
                         return None
                     o = t2.split('=', 1)[0]
-                    if o in node['options'] and o in TERMINAL_OPTIONS:
-                        return None             # help/version: prints and exits 0
-                    if o not in node['options'] and '=' not in t2:
-                        # A compact short group: `-papi` is `--package api`, and
-                        # `autumn replay <capsule> -papi` is a correct line. The
-                        # outer walk has always resolved these; this loop did
-                        # not, so once a leaf had begun taking positionals every
-                        # bundled short read as an undeclared flag.
-                        eaten = _short_cluster(t2, node['options'])
-                        if eaten is not None:
-                            i += eaten
-                            continue
-                    if (o not in node['options']
-                            and supplied < len(hyphen_slots)
-                            and hyphen_slots[supplied]):
-                        # The value of an `allow_hyphen_values` positional, not
-                        # a flag. Filling the slot is what spends the allowance,
-                        # so a later unknown flag is still reported.
+                    kind, eaten = _classify_option(t2, node)
+                    if kind == 'terminal':
+                        return None
+                    if kind in ('known', 'cluster'):
+                        i += eaten
+                        continue
+                    if supplied < len(hyphen_slots) and hyphen_slots[supplied]:
+                        # Not a flag at all: the value of an
+                        # `allow_hyphen_values` positional. Filling the slot
+                        # spends the allowance, so a later unknown flag is
+                        # still reported.
                         supplied += 1
                         i += 1
                         continue
-                    if '=' in t2:               # value attached; name still checked
-                        if o not in node['options']:
-                            if flags is not None and _reportable_flag(o):
-                                flags.append((path, o))
-                        i += 1
+                    if flags is not None and _reportable_flag(o):
+                        flags.append((path, o))
+                    if eaten:                   # attached value: arity is known
+                        i += eaten
                         continue
-                    if o not in node['options']:
-                        if flags is not None and _reportable_flag(o):
-                            flags.append((path, o))
-                        return None             # unknown arity: cannot count on
-                    i += 2 if node['options'][o] else 1
-                    continue
+                    return None                 # unknown arity: cannot count on
                 eaten = _redirect(t2)
                 if eaten:                       # a redirection is not an argument
                     i += eaten
@@ -3859,6 +3862,36 @@ def self_test():
            '--version on a subcommand is drift, not a terminal action')
     expect(resolve(tk('replay --version'), surface, runnable=True) is None,
            "…and an undeclared option still stops the walk, not reporting the args")
+    # …in the options-only scan too. The terminal rule landed in two of the
+    # three option loops, so `autumn routes /admin --help posture` — where the
+    # positional routes resolution into that scan — carried on into `posture`
+    # and reported its required subcommand missing.
+    expect(resolve(tk('routes /admin --help posture'), surface, runnable=True) is None,
+           'help is terminal in the options-only scan as well')
+    expect(resolve(tk('routes /admin --help'), surface, runnable=True) is None,
+           '…and at the end of such a line')
+
+    # --- one definition of what an option IS, for all three walkers. Each grew
+    # its own copy, and every time one learned something the others did not,
+    # the gap was a review finding. `_classify_option` decides nothing and
+    # reports nothing; policy on an unknown stays with the caller.
+    routes = surface['routes']
+    expect(_classify_option('--help', routes) == ('terminal', 0),
+           'a declared help flag is terminal')
+    expect(_classify_option('--method', routes) == ('known', 2),
+           'a value-taking option eats the next token')
+    expect(_classify_option('--user-only', routes) == ('known', 1),
+           'a boolean option eats nothing')
+    expect(_classify_option('--method=GET', routes) == ('known', 1),
+           'an attached value is self-contained')
+    expect(_classify_option('-papi', surface['replay']) == ('cluster', 1),
+           'a compact short group is one token')
+    expect(_classify_option('--nope', routes) == ('unknown', 0),
+           'an undeclared detached option has unknown arity')
+    expect(_classify_option('--nope=x', routes) == ('unknown', 1),
+           '…but an attached one does not')
+    expect(_classify_option('--version', routes) == ('unknown', 0),
+           'terminal only where DECLARED: --version is the root\'s alone')
 
     # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
     # used to read these stopped at the list's first `]`, so the field vanished
