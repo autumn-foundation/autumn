@@ -27,6 +27,77 @@ separate, deliberate step the user asks for by name.
 
 ---
 
+## CI test sharding
+
+`.github/workflows/ci.yml` runs the suite as four sibling job families rather
+than one job per OS. Which one a test lands in follows from how it is written,
+so it is usually automatic:
+
+| Job | OS | What it runs |
+| --- | --- | --- |
+| `test` | all 3 | `cargo test --workspace -- --skip compile_fail:: --skip sim_` — the default lane, plus a second step running `sim_` at `--test-threads=1` |
+| `trybuild` | Linux | `compile_fail::*` only, split into four shards |
+| `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
+| `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
+
+Only `test` runs on all three OSes. `trybuild` and `test-features` are Linux
+only: a trybuild golden is pinned to the rustc *version*, not the OS (the same
+`.stderr` file served all three legs), and a feature lane asks whether a
+feature's own suite passes rather than whether a platform works. Cross-platform
+behaviour is covered by `test` on all three, plus `Windows Tier 1 journey`.
+
+`coverage` is sharded too, into four lanes split by feature set — the thing
+that forces an instrumented rebuild. Each lane reports its own lcov and uploads
+under its own Codecov flag; Codecov merges them per commit. Adding a lane means
+adding a `flags:` value, not just a matrix entry.
+
+Rules that matter when editing tests:
+
+- **`compile_fail.rs` is partitioned by test-function name.** A new `#[test]`
+  in that module runs in the `rest` shard automatically. A **renamed** one does
+  not: `fail`, `pass_a` and `pass_b` name their functions explicitly and assert
+  a non-zero pass count, so a rename fails that shard loudly rather than
+  silently skipping it. Rename the shard filter in `ci.yml` alongside.
+- **Branch protection should require `Test suite`** (the `test-gate` job), not
+  the individual shards — it is the one check name that survives adding or
+  removing a shard.
+- **A new `sim_*` module is single-threaded automatically.** The `test` job
+  skips `sim_` and a second step re-runs exactly that set with
+  `--test-threads=1`. These are determinism tests — each builds a
+  `start_paused(true)` current-thread runtime and asserts a seed replays
+  byte-identically — and they fail under CPU oversubscription. Sharding made
+  that *worse*: pulling trybuild out of the binary freed the libtest thread
+  pool, so the remaining ~1880 tests went from trickling through trybuild's
+  gaps (863s) to full parallelism (61s), and on the 4-vCPU `ubuntu-latest`
+  runner that flipped them. Name a new simulation module `sim_*` and it lands
+  in the quiet lane; name it something else and it will not.
+- **A sim wall-clock budget must start after `sim.build`.** The `sim_` lane is
+  a short, freshly-started process, so whichever test mounts the first app in
+  it pays the one-time warm-up for every lazy static behind that app —
+  measured at 2.25s on `macos-latest`. A `let wall_start = Instant::now()`
+  placed above `sim.build(...)` charges that warm-up to the virtual-time
+  budget and fails on the slow runners only. Start the clock immediately
+  before the `advance`/`run_to_idle` under test, as
+  `sim_strict_wall_clock`, `sim_advance_to` and `sim_clock_drain` all do.
+- **Process-global state needs its own binary, and sharding enforces that.**
+  The `test` lane now runs its ~1880 tests at full parallelism instead of
+  trickling through trybuild's gaps, so a test that mutates a process-wide
+  singleton and depends on it across several `await`s no longer survives on
+  luck. `TestApp::build` clears the global cache unconditionally, so
+  `capsule_cache_effect` — which installs one and reads it back over two
+  requests — had to move to its own `[[test]]` binary, joining
+  `cache_global_integration` and `cached_global_backend`. If a test only passes
+  because nothing else happened to run at that moment, it belongs in the
+  isolated list below, not the consolidated one.
+
+The split is not cosmetic: on the 2026-08-26 trunk run, `compile_fail::` alone
+was 37 of the 47 minutes the consolidated `integration_tests` binary spent
+running on Windows, and it was the tail everything else waited on. Its cases
+each shell out a nested `cargo` build and trybuild serialises them behind a
+project-dir lock, so the only thing that makes it faster is more runners.
+
+---
+
 ## Integration Test Layout Guidelines
 
 To minimize Cargo compilation and linking overhead (avoiding 100+ separate binaries), the workspace uses a consolidated test binary structure for both the `autumn` and `autumn-cli` packages.
@@ -54,8 +125,9 @@ The default approach for new tests is to add them to the consolidated binary so 
 ##### Docker / testcontainer DB tests run automatically in CI
 
 The CI "Run Docker-dependent tests" step — since #1747 a step of the Linux-only
-`Test (Docker)` job rather than the last step of `Test (ubuntu-latest)`, so it
-gets a runner whose disk it is the only claimant of — sweeps every `#[ignore]`d
+`Test (Docker)` job (`test-docker`) rather than the last step of
+`Test (ubuntu-latest)`, so it gets a runner whose disk it is the only claimant
+of — sweeps every `#[ignore]`d
 test that compiles into the `autumn` consolidated `integration_tests` binary with
 `--features "test-support,offline-sync"` (a bare `--ignored` run), so a new
 house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontainers)"]` in a `db`-gated (or ungated) module — executes in CI with
