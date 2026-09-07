@@ -2493,6 +2493,13 @@ fn classify_and_apply(
             for (_, statement) in &phases.final_pass {
                 eprintln!("  {statement};");
             }
+            // The emptying statements above fire triggers, and one can refill a
+            // table an earlier one emptied. `execute` counts them all and rolls
+            // back; the printed sequence has to do the same, or an operator who
+            // runs it commits exactly the rows the real command refuses.
+            for (table, _) in &phases.final_pass {
+                eprintln!("  {};", emptiness_assertion(table));
+            }
             eprintln!("  COMMIT;");
             if sampling.is_some() {
                 // Deliberately outside the envelope, as in `execute`: VACUUM
@@ -3489,6 +3496,23 @@ fn emptying_phases<'a>(
             .collect(),
         final_pass,
     }
+}
+
+/// The SQL that asserts a promised-empty table really is empty.
+///
+/// `execute` runs the equivalent as a counted query so it can name the row
+/// count; the dry run prints this, because a printed sequence that commits where
+/// the real command aborts is worse than no sequence at all. Emitted as a `DO`
+/// block so pasting it actually fails the transaction rather than quietly
+/// returning a row. The table name appears only as an identifier — already
+/// quoted — so nothing has to be escaped into a string literal.
+fn emptiness_assertion(table: &str) -> String {
+    format!(
+        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM {}) THEN \
+         RAISE EXCEPTION 'a table this run promised would be empty still holds rows'; \
+         END IF; END $$",
+        qualified_ident(table)
+    )
 }
 
 /// The emptying passes `emptying_phases` returns, as `(table, statement)`.

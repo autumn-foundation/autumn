@@ -875,7 +875,12 @@ fn classify_edges(
             // keeping the parent whole does not repair it, so without this the
             // run would report that every checked reference resolves while one
             // does not.
-            (Some(child_role), None) if child_role.is_subsetted() => {
+            // Keyed on "keeps any rows", NOT on `is_subsetted`: a full-copy
+            // table and an exact-100% root keep EVERY row, so they are the most
+            // likely to still hold a pre-existing orphan, and `is_subsetted` is
+            // false for both. Only a `never_include` child is exempt, because
+            // the run empties it and an absent row cannot dangle.
+            (Some(child_role), None) if *child_role != SampleRole::NeverInclude => {
                 verify_only.push(edge.clone());
             }
             // Two purged framework tables referencing each other. Neither is in
@@ -3011,6 +3016,71 @@ mod tests {
                 "an orphan is a missing parent: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn a_full_copy_child_of_an_outside_parent_is_still_verified() {
+        // `countries` is always_include, so `is_subsetted` is false for it — but
+        // it keeps every row, including any that already dangled. The re-count
+        // has to cover its reference into a framework table nothing empties.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "countries_job_fk",
+            "countries",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges
+                .iter()
+                .any(|e| e.name == "countries_job_fk"),
+            "a full-copy child's outside reference must still be re-counted"
+        );
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "countries_job_fk"),
+            "but it must not enter the walk"
+        );
+    }
+
+    #[test]
+    fn an_emptied_child_of_an_outside_parent_needs_no_verification() {
+        // The one exemption: `audit_logs` is never_include, so the run empties
+        // it, and a row that does not exist cannot dangle.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeSet::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges.iter().all(|e| e.name != "audit_job_fk"),
+            "an emptied table's references need no re-count"
+        );
     }
 
     #[test]
