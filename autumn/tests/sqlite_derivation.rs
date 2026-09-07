@@ -1,12 +1,11 @@
 //! Maintained derived read models on the `SQLite` runtime backend (#1769).
 //!
 //! The Postgres behaviour suite (`tests/integration/model_derivation.rs`) needs
-//! a Postgres and is `#[ignore]`d, so nothing there ever compiles — let alone
-//! runs — the `sqlite` arms of the statements a derivation adds: the `IS NOT`
-//! spelling of NULL-safe inequality, the positional `?` binds, the
-//! `BEGIN IMMEDIATE` the backfill's per-batch transaction takes, and the
-//! `CAST(updated_at AS TEXT)` the status read uses against a `TEXT` column.
-//! This file is the CI-backed evidence that all of them work.
+//! a Postgres and is `#[ignore]`d. Nothing there compiles the `sqlite` arms of
+//! the statements a derivation adds, let alone runs them: the `IS NOT` spelling
+//! of NULL-safe inequality, the positional `?` binds, the `BEGIN IMMEDIATE` each
+//! backfill batch takes, and the `CAST(updated_at AS TEXT)` status read against
+//! a `TEXT` column. This file is the CI-backed evidence that all of them work.
 //!
 //! What it pins:
 //!
@@ -15,16 +14,18 @@
 //! * **Delete and reparent.** The set-based decrement filters too, so deleting
 //!   a rejected row moves nothing.
 //! * **Filter flip.** Publishing a row already attached to its parent is `+1`
-//!   with no foreign-key change at all — the case a plain key diff cannot see.
+//!   with no foreign-key change. A plain key diff cannot see that case.
 //! * **Resumable backfill.** `max_batches` stops a sweep mid-table, the
-//!   checkpoint survives, and resuming finishes without double counting.
+//!   checkpoint survives, and resuming finishes without double counting. The
+//!   budget also reports the derivations it never reached.
 //! * **Status and drift.** The state row round-trips through the `SQLite` state
-//!   table and the drift aggregate reaches 0 after a recompute.
+//!   table, a stale row is reported as unregistered, and the drift aggregate
+//!   reaches 0 after a recompute.
 //!
-//! Uses an in-memory shared-cache `SQLite` database — no Docker.
+//! Uses an in-memory shared-cache `SQLite` database, so it needs no Docker.
 //!
-//! Only meaningful under `--features sqlite`; the file is
-//! `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to an
+//! Only meaningful under `--features sqlite`. The file is
+//! `#![cfg(feature = "sqlite")]`, so a default `cargo test` compiles it to an
 //! empty (passing) binary. Run explicitly:
 //! `cargo test -p autumn-web --features sqlite --test sqlite_derivation`.
 #![cfg(feature = "sqlite")]
@@ -439,8 +440,8 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
     let pool = boot_pool("sd_backfill").await;
     let mut conn = pool.get().await.expect("conn");
 
-    // Five parents with one published comment each that nobody counted — the
-    // shape of a table adopting a derivation it did not have before.
+    // Five parents with one published comment each that nobody counted. This is
+    // the shape of a table adopting a derivation it did not have before.
     let mut posts = Vec::new();
     for i in 0..5 {
         let post = seed_post(&pool, &format!("p{i}")).await;
@@ -460,7 +461,7 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
         5
     );
 
-    // One batch of two, then stop — the kill.
+    // One batch of two, then stop: the kill.
     let first = run_backfill(
         &mut conn,
         &BackfillOptions {
@@ -470,26 +471,55 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
     )
     .await
     .expect("first pass");
-    assert_eq!(first.rows_repaired, 2);
-    assert_eq!(first.in_progress.len(), 1, "{first:?}");
+    assert_eq!(first.rows_repaired, 2, "{first:?}");
+    assert!(first.completed.is_empty(), "{first:?}");
+    // The budget stops the call, not the report: the derivation the batch ran
+    // for AND the one it never reached are both still pending, so both are
+    // named. A `return` here would have hidden the second.
+    assert_eq!(
+        first.in_progress,
+        vec![COUNT_DERIVATION.to_owned(), SUM_DERIVATION.to_owned()],
+        "{first:?}"
+    );
 
-    let stopped = state_of(&pool, first.in_progress[0].as_str()).await;
+    let stopped = state_of(&pool, COUNT_DERIVATION).await;
     assert_eq!(stopped.backfill_state, "running");
     assert_eq!(stopped.checkpoint, Some(posts[1]));
     assert_eq!(stopped.backfilled_rows, 2);
+
+    // The same three facts, read back through the reported surface an operator
+    // actually sees.
+    let mid = derivation_status(&mut conn).await.expect("status");
+    let reported = mid
+        .iter()
+        .find(|entry| entry.name == COUNT_DERIVATION)
+        .expect("the stopped derivation is reported");
+    assert_eq!(reported.backfill_state, Some(BackfillState::Running));
+    assert_eq!(reported.checkpoint, Some(posts[1]));
+    assert_eq!(reported.backfilled_rows, 2);
 
     // Resume to completion: both derivations end up complete and correct.
     let second = run_backfill(&mut conn, &BackfillOptions::default())
         .await
         .expect("resumed pass");
-    assert!(second.rows_repaired > 0, "{second:?}");
+    assert_eq!(
+        second.rows_repaired, 8,
+        "three parents left for the count plus five for the sum, each repaired \
+         once: {second:?}"
+    );
+    assert_eq!(
+        second.completed,
+        vec![COUNT_DERIVATION.to_owned(), SUM_DERIVATION.to_owned()],
+        "{second:?}"
+    );
+    assert!(second.in_progress.is_empty(), "{second:?}");
     for name in [COUNT_DERIVATION, SUM_DERIVATION] {
         let done = state_of(&pool, name).await;
         assert_eq!(done.backfill_state, "complete", "{name}");
         assert_eq!(
             done.backfilled_rows, 5,
-            "five parents, counted once each — no double counting across the \
-             resume ({name})"
+            "five parents, visited once each, with no double counting across \
+             the resume ({name})"
         );
     }
     for post in &posts {
@@ -538,16 +568,19 @@ async fn status_reports_state_and_recompute_clears_the_drift() {
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)
         .expect("the count is reported");
-    assert_eq!(
-        count.stored_hash.as_deref(),
-        Some(count.definition_hash.as_str())
-    );
+    assert_eq!(count.stored_hash, count.definition_hash);
     assert_eq!(count.backfill_state, Some(BackfillState::Complete));
     assert!(
         count.updated_at.is_some(),
         "the SQLite TEXT timestamp must still round-trip"
     );
-    assert_eq!(count.drift, 1);
+    assert_eq!(count.drift, Some(1));
+    assert_eq!(count.drift_error, None, "the scan ran");
+    assert_eq!(
+        count.definition_hash.as_deref().map(str::len),
+        Some(64),
+        "sha256 renders as 64 hex characters"
+    );
 
     for name in [COUNT_DERIVATION, SUM_DERIVATION] {
         assert_eq!(
@@ -560,7 +593,7 @@ async fn status_reports_state_and_recompute_clears_the_drift() {
     assert_eq!(derived(&pool, "visible_score", post).await, 7);
 
     for entry in derivation_status(&mut conn).await.expect("status") {
-        assert_eq!(entry.drift, 0, "{entry:?}");
+        assert_eq!(entry.drift, Some(0), "{entry:?}");
     }
     // Idempotent: a healthy derivation is repaired zero times.
     assert_eq!(

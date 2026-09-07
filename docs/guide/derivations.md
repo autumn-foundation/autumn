@@ -42,9 +42,9 @@ argument is the parent model type. Every other key follows in any order.
 | `column` | **required** | the maintained column on the parent. A plain identifier |
 | `transform` | `count` | `count`, or `sum(<field>)` over a child field |
 | `filter` | none | the predicate deciding which child rows contribute |
-| `fk` | the `#[belongs_to]` leg to that parent, else `{snake(Parent)}_id` | the child column naming the parent |
+| `fk` | the one `#[belongs_to]` leg to that parent, else `{snake(Parent)}_id` | the child column naming the parent. Required when two legs point at one parent |
 | `parent_table` | inferred from the parent type (`Post` gives `posts`) | the parent's table, for a parent that overrides its own |
-| `tenant` | none | tenant-discriminator column, as `counter_cache_tenant` |
+| `tenant` | none | tenant-discriminator column, as `counter_cache_tenant`. Must name a field of the child |
 | `name` | `{parent_table}.{column}` | the registry name, used by the state table and the actuator |
 
 Each key may appear once. A repeated key is a compile error rather than a
@@ -99,7 +99,9 @@ different things in the two lowerings. Compare a string with `==` or `!=`.
 
 Everything else is a compile error whose message lists the grammar: `||`,
 arithmetic, any method call other than the two NULL probes, float literals, a
-name that is not a field, and a field of an unsupported type.
+name that is not a field, and a field of an unsupported type. A field renamed by
+`#[diesel(column_name = "...")]` is rejected as well, because the lowered SQL
+names the column after the Rust field.
 
 ## The required migration
 
