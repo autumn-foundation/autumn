@@ -45,56 +45,34 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
     let schema_body = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(named) => {
-                // A non-`Option` field with `#[serde(skip_serializing_if)]` is
-                // direction-dependent in a way one schema cannot express:
-                // responses may omit it, requests must still carry it. Marking
-                // it required breaks a client READING a response; marking it
-                // optional breaks a client SENDING one. Refuse, as with the
-                // other directional attributes. On an `Option<T>` field --
-                // `skip_serializing_if = "Option::is_none"`, the common case --
-                // there is no conflict: it is already not required.
-                if let Some(field) = named.named.iter().find(|f| {
-                    crate::schema::field_has_skip_serializing_if(f)
-                        && !crate::schema::is_option_type(&f.ty)
-                }) {
-                    return syn::Error::new_spanned(
-                        field,
-                        "#[derive(OpenApiSchema)] cannot describe a non-`Option` field with \
-                         `#[serde(skip_serializing_if = ...)]`: one schema covers both requests \
-                         and responses, but that attribute governs serialization only -- a \
-                         response may omit the field while serde still rejects a request that \
-                         does. Make the field `Option<T>` (where the attribute costs nothing, \
-                         since it is already optional), or write the `OpenApiSchema` impl by \
-                         hand and register it with `OpenApiConfig::register_schema`.",
-                    )
-                    .to_compile_error()
-                    .into();
+                if let Err(e) = reject_undescribable_struct(&input, named) {
+                    return e.to_compile_error().into();
                 }
-                // The emitters expect `&[&&Field]` (they were written
-                // against the `Vec<&&Field>` the model macro collects); build
-                // that shape here.
-                let field_refs: Vec<&syn::Field> = named.named.iter().collect();
+                // The emitters expect `&[&&Field]` (they were written against
+                // the `Vec<&&Field>` the model macro collects); build that
+                // shape here, minus the fields serde never puts on the wire.
+                let field_refs: Vec<&syn::Field> = named
+                    .named
+                    .iter()
+                    .filter(|f| crate::schema::serde_bare_word(&f.attrs, &["skip"]).is_none())
+                    .collect();
                 let field_ref_refs: Vec<&&syn::Field> = field_refs.iter().collect();
-                // Honor a container `#[serde(rename_all = "...")]` on the
-                // derived struct so the advertised property names + `required`
-                // entries match the serialized wire names — same
-                // helper/precedence `#[model]` and `FormModel` use.
+                // Honor a container `#[serde(rename_all = "...")]` — the split
+                // form is refused above, so this side is the only side.
                 let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
-                // NOT the `#[model]` read-schema rule. That schema describes a
-                // response only -- the generated API takes `New*` / `Update*`
-                // as request bodies -- so dropping a `skip_serializing_if`
-                // field from `required` is right there. This derive is applied
-                // to types used as `Json<T>` REQUESTS as well, and
-                // `skip_serializing_if` governs serialization alone: serde
-                // still rejects a request that omits the field. One schema
-                // cannot say both, so the ambiguous shape is refused above and
-                // everything reaching here is symmetric.
                 crate::schema::emit_schema_fn_body_full(
                     &field_ref_refs,
                     false,
                     &[],
                     rename_all_rule.as_deref(),
-                    &|_| false,
+                    // A `#[serde(default)]` field may be omitted from a request
+                    // and is always present in a response, so "not required" is
+                    // true of both directions — no conflict, unlike the
+                    // directional attributes refused above.
+                    &|f: &syn::Field| {
+                        crate::schema::serde_bare_word(&f.attrs, &["default"]).is_some()
+                            || crate::schema::serde_valued_key(&f.attrs, &["default"]).is_some()
+                    },
                 )
             }
             _ => {
@@ -192,6 +170,126 @@ fn enum_schema_body(
             "enum": [#(#values),*],
         })
     })
+}
+
+/// Refuse every struct shape whose real wire form the derive cannot describe.
+///
+/// Written as one audit of serde's attribute surface rather than a rule per
+/// report. Seven review rounds on issue #802 landed fixes scoped to whichever
+/// attribute was named, and each time an adjacent one was still wrong; the
+/// generalisation is that an object schema is only the truth when every field
+/// appears under a single symmetric name and the container is not re-shaped.
+///
+/// | Attribute | What serde does | Why an object schema is wrong |
+/// |---|---|---|
+/// | `transparent` | writes the inner value | there is no object at all |
+/// | `into` / `from` / `try_from` | routes through another type | shape is that type's |
+/// | `tag` / `untagged` | re-tags the container | adds or removes an object level |
+/// | `flatten` (field) | merges the field's keys upward | the field is not a nested property |
+/// | `skip_serializing` / `skip_deserializing` (field) | one direction only | one schema serves both |
+/// | split `rename_all` / `rename` | two different names | one schema advertises one |
+///
+/// Accepted and handled by the caller rather than refused: `skip` (absent both
+/// ways, so the field is dropped), `default` (omissible on input, present on
+/// output — "not required" is true either way), and a symmetric `rename_all` /
+/// `rename`.
+///
+/// KNOWN RESIDUAL: `with` / `serialize_with` / `deserialize_with` can put an
+/// arbitrary shape on the wire, and the schema still describes the Rust type.
+/// Not refused, because the attribute is common and usually only reformats a
+/// value of the same JSON type — but a converter that changes the type is
+/// misdescribed. Register such a type's schema by hand.
+fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) -> syn::Result<()> {
+    // ── Container ────────────────────────────────────────────────────
+    if let Some(word) = crate::schema::serde_bare_word(&input.attrs, &["transparent", "untagged"]) {
+        return Err(syn::Error::new_spanned(
+            input,
+            format!(
+                "#[derive(OpenApiSchema)] cannot describe `#[serde({word})]`: serde does not \
+                 put an object with these fields on the wire, so the derived schema would \
+                 advertise a shape the handler neither accepts nor returns. Write the \
+                 `OpenApiSchema` impl by hand and register it with \
+                 `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+    if let Some(key) =
+        crate::schema::serde_valued_key(&input.attrs, &["into", "from", "try_from", "tag"])
+    {
+        return Err(syn::Error::new_spanned(
+            input,
+            format!(
+                "#[derive(OpenApiSchema)] cannot describe `#[serde({key} = ...)]`: it re-shapes \
+                 what reaches the wire, so an object schema built from these fields would be \
+                 wrong. Write the `OpenApiSchema` impl by hand and register it with \
+                 `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+    if let Some(key) = crate::schema::serde_split_rename(&input.attrs, "rename_all") {
+        return Err(syn::Error::new_spanned(input, split_rename_message(key)));
+    }
+
+    // ── Fields ───────────────────────────────────────────────────────
+    for field in &named.named {
+        if let Some(word) = crate::schema::serde_bare_word(&field.attrs, &["flatten"]) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "#[derive(OpenApiSchema)] cannot describe `#[serde({word})]`: serde merges \
+                     this field's keys into the containing object, while the derived schema \
+                     would publish it as a nested property — a generated client would send a \
+                     nesting the handler does not accept and expect one the server never \
+                     emits. Write the `OpenApiSchema` impl by hand and register it with \
+                     `OpenApiConfig::register_schema`."
+                ),
+            ));
+        }
+        if let Some(word) = crate::schema::variant_directional_skip_on_field(field) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "#[derive(OpenApiSchema)] cannot describe a field skipped in only one serde \
+                     direction (`#[serde({word})]`): one schema covers both requests and \
+                     responses. Use `#[serde(skip)]` if the field should not appear at all, or \
+                     write the `OpenApiSchema` impl by hand and register it with \
+                     `OpenApiConfig::register_schema`."
+                ),
+            ));
+        }
+        // Direction-dependent for the same reason, but only when the type does
+        // not already make it optional.
+        if crate::schema::field_has_skip_serializing_if(field)
+            && !crate::schema::is_option_type(&field.ty)
+        {
+            return Err(syn::Error::new_spanned(
+                field,
+                "#[derive(OpenApiSchema)] cannot describe a non-`Option` field with \
+                 `#[serde(skip_serializing_if = ...)]`: that attribute governs serialization \
+                 only, so a response may omit the field while serde still rejects a request \
+                 that does. Make the field `Option<T>` (where it costs nothing, being optional \
+                 already), or write the `OpenApiSchema` impl by hand and register it with \
+                 `OpenApiConfig::register_schema`.",
+            ));
+        }
+        if let Some(key) = crate::schema::serde_split_rename(&field.attrs, "rename") {
+            return Err(syn::Error::new_spanned(field, split_rename_message(key)));
+        }
+    }
+
+    Ok(())
+}
+
+/// The shared diagnostic for a split `rename_all` / `rename` whose sides differ.
+fn split_rename_message(key: &str) -> String {
+    format!(
+        "#[derive(OpenApiSchema)] cannot describe a split `#[serde({key}(serialize = ..., \
+         deserialize = ...))]` whose two sides differ: one schema is advertised for both \
+         requests and responses, so a client generated from the serialize spelling would send \
+         a value the handler's `Deserialize` rejects. Use a symmetric `{key} = \"...\"`, or \
+         write the `OpenApiSchema` impl by hand and register it with \
+         `OpenApiConfig::register_schema`."
+    )
 }
 
 /// Refuse every enum shape whose real wire form the derive cannot describe.

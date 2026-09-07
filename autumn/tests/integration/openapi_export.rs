@@ -288,6 +288,86 @@ fn skip_serializing_if_on_an_option_is_accepted_and_already_optional() {
     );
 }
 
+// ── The struct-path serde audit (issue #802, round eight) ──────────
+
+// `#[serde(skip)]` is absent from the wire in BOTH directions, so the field is
+// dropped from the schema entirely rather than advertised and required.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
+struct WithSkippedField {
+    kept: String,
+    #[serde(skip)]
+    internal: Vec<u8>,
+}
+
+#[test]
+fn an_unconditionally_skipped_field_is_not_in_the_schema_at_all() {
+    let schema = <WithSkippedField as OpenApiSchema>::schema();
+    let props = schema["properties"].as_object().expect("properties");
+
+    assert!(props.contains_key("kept"), "{schema}");
+    assert!(
+        !props.contains_key("internal"),
+        "serde never writes it and ignores it on input: {schema}"
+    );
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(
+        !required.contains(&"internal"),
+        "a required property the server never sends would break every response: {required:?}"
+    );
+}
+
+// `#[serde(default)]` may be omitted from a request and is always present in a
+// response, so "not required" is true of both directions — no conflict.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[allow(dead_code)]
+struct WithDefaultedField {
+    needed: String,
+    #[serde(default)]
+    optional_on_input: bool,
+}
+
+#[test]
+fn a_defaulted_field_is_present_but_not_required() {
+    let schema = <WithDefaultedField as OpenApiSchema>::schema();
+    assert!(
+        schema["properties"]["optional_on_input"].is_object(),
+        "{schema}"
+    );
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    assert!(required.contains(&"needed"), "{schema}");
+    assert!(
+        !required.contains(&"optional_on_input"),
+        "serde fills it in when a request omits it: {schema}"
+    );
+}
+
+// Refused shapes, audited as one family rather than one per review round.
+// trybuild owns the compile-fail cases; listed so the contract reads in one
+// place:
+//
+//   #[serde(transparent)]                        // no object on the wire
+//   #[serde(untagged)] / #[serde(tag = "t")]     // re-tags the container
+//   #[serde(into = "…")] / from / try_from       // routes through another type
+//   #[serde(rename_all(serialize = …, deserialize = …))]  // when sides differ
+//   field: #[serde(flatten)]                     // merges keys upward
+//   field: #[serde(skip_serializing)] / skip_deserializing   // one direction
+//   field: #[serde(rename(serialize = …, deserialize = …))]  // when sides differ
+//   non-Option field: #[serde(skip_serializing_if = "…")]    // one direction
+//
+// KNOWN RESIDUAL, deliberately not refused: `with` / `serialize_with` /
+// `deserialize_with` can put an arbitrary shape on the wire while the schema
+// still describes the Rust type. Common, and usually only reformats a value of
+// the same JSON type — but a converter that changes the type is misdescribed.
+
 // ── Scalar field types that are not Rust primitives ────────────────
 
 // Only `OpenApiSchema` — the derive under test needs no serde impls, and this

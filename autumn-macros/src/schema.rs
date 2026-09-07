@@ -135,6 +135,46 @@ pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
     }
 }
 
+/// Whether a `#[serde(...)]` attribute list carries a bare word from `words`.
+///
+/// For the marker attributes that take no value — `transparent`, `flatten`,
+/// `skip`, `skip_serializing`, `skip_deserializing`, `untagged`, `default` in
+/// its bare form. Returns the first match, so callers can name it in a
+/// diagnostic.
+pub fn serde_bare_word(attrs: &[syn::Attribute], words: &[&'static str]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(word) = words.iter().find(|w| meta.path.is_ident(w)) {
+                found = Some(*word);
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a `#[serde(...)]` attribute list carries `key = "..."` for any key in
+/// `keys`, returning the first match.
+///
+/// For the value-taking attributes that change the wire shape: `into`, `from`,
+/// `try_from`, `tag`, `content`, and the field-level `default = "path"`.
+pub fn serde_valued_key(attrs: &[syn::Attribute], keys: &[&'static str]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(key) = keys.iter().find(|k| meta.path.is_ident(k)) {
+                found = Some(*key);
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    found
+}
+
 /// Whether a field carries `#[serde(skip_serializing_if = "...")]`, so a
 /// response omits it whenever the predicate matches.
 ///
@@ -385,6 +425,13 @@ pub fn variant_directional_skip(variant: &syn::Variant) -> Option<&'static str> 
         });
     }
     found
+}
+
+/// The field-level twin of [`variant_directional_skip`], with the same reasoning:
+/// a field present in only one serde direction has no correct rendering in a
+/// schema that describes both.
+pub fn variant_directional_skip_on_field(field: &syn::Field) -> Option<&'static str> {
+    serde_bare_word(&field.attrs, &["skip_serializing", "skip_deserializing"])
 }
 
 /// Whether a variant carries `#[serde(skip)]`, in which case it never appears
