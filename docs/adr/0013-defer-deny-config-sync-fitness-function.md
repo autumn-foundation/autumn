@@ -44,11 +44,11 @@ moving on.
    No other test, script, or CI step (`.github/workflows/ci.yml`,
    `scripts/check-advisories.sh`) diffs or cross-checks them either.
 3. **The invariant has a 51-day track record, not just a snapshot.** Both
-   files were added together on 2026-07-18 (`ec4f3ef8`, #2050). Since then,
-   three commits changed the shared waiver list and correctly touched both
-   files (`ec4f3ef8`'s initial three entries; `3ffdc62e`, adding the
-   `RUSTSEC-2026-0253` ignore to both; `f01bb5df`, dropping the stale
-   `RUSTSEC-2026-0173` ignore from both), while three more commits
+   files were created together, with matching initial waiver entries, on
+   2026-07-18 (`ec4f3ef8`, #2050). Since then, two further commits changed
+   the shared waiver list and correctly touched both files (`3ffdc62e`,
+   adding the `RUSTSEC-2026-0253` ignore to both; `f01bb5df`, dropping the
+   stale `RUSTSEC-2026-0173` ignore from both), while three more commits
    (`29edfb8a`, `041f58c7`, `f29d4b4a`) correctly touched *only* `deny.toml`
    — each added one feature to `[graph].features`, which is
    `deny.toml`-only surface the invariant explicitly excludes. Today, checked
@@ -75,8 +75,9 @@ moving on.
 ## Do nothing / decide later — 12-month baseline
 
 No incident has ever been caused by this gap — the invariant has held for the
-full 51 days since `deny-sqlite.toml` was added alongside `deny.toml`
-(2026-07-18), across three separate hand-synced edits. The honest cost of
+full 51 days since `deny-sqlite.toml` was created alongside `deny.toml`
+(2026-07-18), through an initial synchronized creation and two subsequent
+hand-synced edits. The honest cost of
 leaving it alone is not zero, though, and it is not indefinite either: on or
 before 2026-10-01, whoever triages the three review-by waivers has to touch
 both files by hand again, and nothing catches a partial edit. If both files
