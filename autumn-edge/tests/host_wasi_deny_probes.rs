@@ -181,9 +181,13 @@ fn environ_is_actually_empty_not_just_documented() {
     assert_eq!(*reason, FallthroughReason::CapsuleError);
     assert_eq!(
         detail, "the capsule exited without answering",
-        "a trapped detail here means environ_sizes_get reported a non-zero \
-         count, or environ_get wrote through the sentinel buffers -- a real \
-         leak, not the documented empty environment: {detail}"
+        "a trapped detail here means either a real leak (environ_sizes_get \
+         reported a non-zero count, or environ_get wrote through the \
+         sentinel buffers) or a fail-closed non-SUCCESS return from either \
+         call that touched nothing -- this probe cannot yet tell the two \
+         apart (see the report's eighth-review-round correction); either \
+         way the documented empty-environment contract did not hold as \
+         tested: {detail}"
     );
 }
 
@@ -221,8 +225,11 @@ fn args_are_actually_empty_not_just_documented() {
     assert_eq!(*reason, FallthroughReason::CapsuleError);
     assert_eq!(
         detail, "the capsule exited without answering",
-        "a trapped detail here means args_sizes_get reported a non-zero \
-         count, or args_get wrote through the sentinel buffers -- a real \
-         leak, not the documented empty argv: {detail}"
+        "a trapped detail here means either a real leak (args_sizes_get \
+         reported a non-zero count, or args_get wrote through the sentinel \
+         buffers) or a fail-closed non-SUCCESS return from either call that \
+         touched nothing -- this probe cannot yet tell the two apart (see \
+         the report's eighth-review-round correction); either way the \
+         documented empty-argv contract did not hold as tested: {detail}"
     );
 }
