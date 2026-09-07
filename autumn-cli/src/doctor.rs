@@ -8846,7 +8846,8 @@ pub fn run(opts: DoctorOptions) {
                     cd_error.as_deref(),
                     registered_count,
                 )
-                .unwrap_or(CheckResult {
+                .unwrap_or_else(|| {
+                    CheckResult {
                     name: "custom_domains",
                     status: CheckStatus::Pass,
                     detail: Some(
@@ -8855,6 +8856,7 @@ pub fn run(opts: DoctorOptions) {
                             .to_owned(),
                     ),
                     hint: None,
+                }
                 })
             }));
 
