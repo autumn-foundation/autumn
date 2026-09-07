@@ -3573,6 +3573,56 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
 }
 
+/// `GET <actuator-prefix>/graph` -- the application's architecture graph
+/// (issue #1747).
+///
+/// This is the "retrievable from the running binary" surface: the graph is
+/// assembled from the binary's own link-time registrations at startup, so there
+/// is no side file to fetch and nothing that can be stale relative to the code
+/// that is actually running.
+///
+/// Sensitive-gated, like `/env` and `/configprops`. The document names every
+/// route, its auth requirement, and which table each one touches -- a map of
+/// exactly where an attacker would look first, so it is not a public surface.
+///
+/// A build that never installed a graph answers `503` with an explanation
+/// rather than `404`, so an operator can tell "this process has not published
+/// one" apart from "this build has no such endpoint".
+pub(crate) async fn graph_endpoint() -> axum::response::Response {
+    graph_response(crate::graph::served_json())
+}
+
+/// Render the `/actuator/graph` response for a given installed graph.
+///
+/// Split from the handler because the installed graph is a process-wide
+/// `OnceLock`: a test that installed one to exercise the "present" branch would
+/// decide the answer for every other test in the process. The branch is the
+/// behaviour worth testing, and it is testable here without that coupling.
+fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
+    graph.map_or_else(
+        || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "no architecture graph is installed in this process",
+                    "hint": "the graph is published when the application router is built; a \
+                             process that serves requests without building one (a bare \
+                             `axum::Router` in a test, say) has none to report",
+                })),
+            )
+                .into_response()
+        },
+        |json| {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json,
+            )
+                .into_response()
+        },
+    )
+}
+
 /// `GET <actuator-prefix>/shadow` -- shadow-mirroring counters and the most
 /// recent primary-vs-shadow divergences (issue #1653).
 ///
@@ -3954,6 +4004,7 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
+        paths.push(actuator_route_path(prefix, "/graph"));
         #[cfg(feature = "system-info")]
         {
             paths.push(actuator_route_path(prefix, "/system"));
@@ -4102,6 +4153,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/shadow"),
                 axum::routing::get(shadow_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/graph"),
+                axum::routing::get(graph_endpoint),
             );
         #[cfg(feature = "http-client")]
         {
@@ -5508,6 +5563,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_graph_hidden_in_nonsensitive_mode() {
+        // The graph names every route, its auth requirement and the table it
+        // touches — a map of where to look first. It is sensitive-gated like
+        // `/env`, not public like `/health`.
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn actuator_graph_path_is_listed_only_in_sensitive_mode() {
+        assert!(
+            actuator_endpoint_paths("/actuator", true, true)
+                .contains(&"/actuator/graph".to_owned())
+        );
+        assert!(
+            !actuator_endpoint_paths("/actuator", false, true)
+                .contains(&"/actuator/graph".to_owned()),
+            "the listing must match the mounts, or the startup barrier seeds a path \
+             that is not served"
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph_over_http() {
+        // The one test that proves the endpoint works end to end: install a
+        // graph, mount the real sensitive actuator router, and GET it. The
+        // `graph_response` unit tests below cannot catch a missing or misplaced
+        // `crate::graph::install` call — Codex round 1 found exactly that, with
+        // every unit test passing while a running app answered 503 forever.
+        //
+        // Sole installer in this test binary, on purpose: the installed graph
+        // is a process-wide `OnceLock`, so a second test installing its own
+        // would decide this one's answer. The install-site guard lives in
+        // `app::tests::graph_installed_before_every_router_build`.
+        crate::graph::install(crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]));
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let decoded: crate::graph::manifest::ArchitectureGraph =
+            serde_json::from_slice(&body).expect("the endpoint must serve the graph document");
+        assert_eq!(
+            decoded.schema_version,
+            crate::graph::manifest::MANIFEST_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph() {
+        let graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
+        let json = serde_json::to_vec(&graph).expect("serialize");
+        let resp = graph_response(Some(json.leak()));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let decoded: crate::graph::manifest::ArchitectureGraph =
+            serde_json::from_slice(&body).expect("the endpoint must serve the graph document");
+        assert_eq!(decoded, graph);
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_explains_itself_when_none_is_installed() {
+        let resp = graph_response(None);
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a process with no graph must say so rather than 404, which would read as \
+             'this build has no such endpoint'"
+        );
+    }
+
+    #[tokio::test]
     async fn actuator_circuitbreakers_hidden_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
@@ -5575,6 +5729,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    // Postgres-only: the fixture gives one shard a DISTINCT replica_url, and
+    // both layers refuse that on SQLite — `database_backend_consistency` at
+    // config time, `reject_unusable_sqlite_replica` at topology build. The
+    // replica is the blocker: native sharding is Postgres-only too, but it is
+    // refused at BOOT rather than by the topology builder, so the shards alone
+    // would not fail here. Same treatment `db::`'s replica tests got, rather
+    // than a fixture swap that would assert a configuration production refuses.
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     #[cfg(feature = "db")]
     async fn actuator_metrics_returns_per_shard_stats_when_sharded() {
@@ -5642,11 +5804,14 @@ mod tests {
         let mut state = test_state();
 
         // `RuntimeConnection` is `AsyncPgConnection` in the default build and a
-        // SQLite connection under `--features sqlite`; using the alias keeps this
-        // test compiling on both (it only exercises pool metrics, and is not run
-        // under the sqlite feature).
+        // SQLite connection under `--features sqlite`, and this test RUNS on
+        // both. It builds the manager directly rather than through
+        // `create_pool`, so nothing would refuse a target meant for the other
+        // backend — hence the target comes from `test_urls`, not a literal.
+        // Only pool metrics are exercised; deadpool is lazy, so no connection
+        // is opened.
         let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
-            "postgres://postgres:postgres@localhost:5432/postgres",
+            crate::test_urls::primary("actuator_metrics"),
         );
         let pool = Pool::builder(manager).build().unwrap();
 

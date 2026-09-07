@@ -131,8 +131,26 @@ pub fn scheduled_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── Architecture-graph node (#1747) ─────────────────────────
+    // The schedule is carried as the literal the author wrote (`every = "15m"`
+    // or the cron expression), not the parsed `Schedule`: the graph reports the
+    // declaration, and a parsed value would need the runtime type to render.
+    let graph_schedule = attrs
+        .every
+        .clone()
+        .or_else(|| attrs.cron.clone())
+        .unwrap_or_default();
+    let graph_descriptor = crate::graph::emit_job_descriptor(
+        &input_fn,
+        &quote! { #task_name_str },
+        "Scheduled",
+        &quote! { #graph_schedule },
+    );
+
     quote! {
         #input_fn
+
+        #graph_descriptor
 
         #[doc(hidden)]
         pub fn #companion_name() -> ::autumn_web::task::TaskInfo {

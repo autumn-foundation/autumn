@@ -17,7 +17,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{ItemFn, LitStr, parse_quote};
+use syn::LitStr;
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -191,14 +191,18 @@ fn type_contains_impl_trait(ty: &syn::Type) -> bool {
 
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let max_age_opt = match parse_step_up_args(attr) {
         Ok(v) => v,
         Err(err) => return err.to_compile_error(),
     };
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
     if input_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
@@ -206,6 +210,15 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "#[step_up] can only be applied to async functions",
         )
         .to_compile_error();
+    }
+
+    // `#[step_up]` written below `#[static_get]`/`#[ws]` — including under an
+    // alias those macros' own by-name attribute scan cannot see — is caught
+    // here instead, once this guard's own macro is the one running (Codex
+    // review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
     }
 
     let max_age_tokens = max_age_opt.map_or_else(
@@ -216,6 +229,22 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
     let check_call = build_check_call(&max_age_tokens);
+    // Inert copy of `check_call`'s own `__AUTUMN_STEP_UP_MAX_AGE` const,
+    // spliced into the handler body below (mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split): #1668 moved the step-up check
+    // itself into the gate below, so `check_call`'s copy of this const never
+    // reaches the handler's own body any more, but
+    // `api_doc::infer_response_body`'s guard recovery
+    // (`RESPONSE_REWRITING_GUARD_MARKERS`) requires exactly this const IN the
+    // body to tell a real guard's `__autumn_inner` wrapper apart from
+    // unrelated code with the same shape (issue #2516), so
+    // `api_doc::recover_guarded_return_type` can still recover the
+    // pre-rewrite return type for OpenAPI when #[step_up] expands before the
+    // route macro (#1677).
+    let max_age_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_STEP_UP_MAX_AGE: ::core::option::Option<u64> = #max_age_tokens;
+    };
     let fn_name = input_fn.sig.ident.clone();
     let gate_ident = format_ident!("__AutumnStepUpGate_{}", fn_name);
 
@@ -258,44 +287,27 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // reaches a `FromRequest` body extractor (`Json` / `Form` / `Multipart`)
     // and short-circuits on the first rejection, so a stale/missing step-up
     // session never causes the body to be parsed.
-    let gate_item = quote! {
-        #[doc(hidden)]
-        #[allow(non_camel_case_types)]
-        pub struct #gate_ident;
-
-        #[doc(hidden)]
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>
-            for #gate_ident
-        {
-            type Rejection = ::autumn_web::reexports::axum::response::Response;
-
-            fn from_request_parts(
-                parts: &mut ::autumn_web::reexports::axum::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
-                + Send {
-                async move {
-                    // A real `Session` extraction (not a raw extensions
-                    // lookup) so a missing `SessionLayer` still fails loudly,
-                    // exactly as the hidden `__autumn_session: Session`
-                    // handler parameter this replaces did.
-                    let __autumn_session: ::autumn_web::session::Session = match
-                        <::autumn_web::session::Session as ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>>
-                            ::from_request_parts(parts, state).await
-                    {
-                        ::core::result::Result::Ok(__session) => __session,
-                        ::core::result::Result::Err(__never) => match __never {},
-                    };
-                    let __autumn_step_up_headers = parts.headers.clone();
-                    let __autumn_step_up_uri = parts.uri.clone();
-                    let __autumn_step_up_method = parts.method.clone();
-                    #replay_check
-                    #check_call
-                    ::core::result::Result::Ok(#gate_ident)
-                }
-            }
-        }
-    };
+    let gate_item = crate::request_gate::wrap_gate(
+        &gate_ident,
+        &quote! {
+            // A real `Session` extraction (not a raw extensions
+            // lookup) so a missing `SessionLayer` still fails loudly,
+            // exactly as the hidden `__autumn_session: Session`
+            // handler parameter this replaces did.
+            let __autumn_session: ::autumn_web::session::Session = match
+                <::autumn_web::session::Session as ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>>
+                    ::from_request_parts(parts, state).await
+            {
+                ::core::result::Result::Ok(__session) => __session,
+                ::core::result::Result::Err(__never) => match __never {},
+            };
+            let __autumn_step_up_headers = parts.headers.clone();
+            let __autumn_step_up_uri = parts.uri.clone();
+            let __autumn_step_up_method = parts.method.clone();
+            #replay_check
+            #check_call
+        },
+    );
 
     let original_body = input_fn.block.clone();
     let original_response = match &input_fn.sig.output {
@@ -320,22 +332,17 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Insert the gate as the FIRST parameter — ahead of every other
     // extractor, including any earlier-inserted guard gate (which then
     // correctly runs AFTER this one; see `should_own_replay`'s doc comment).
-    let gate_param: syn::FnArg = parse_quote! { _: #gate_ident };
-    input_fn.sig.inputs.insert(0, gate_param);
+    crate::request_gate::insert_gate_param(&mut input_fn, &gate_ident);
 
-    input_fn
-        .attrs
-        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
-    input_fn.sig.output = parse_quote! {
-        -> ::autumn_web::reexports::axum::response::Response
-    };
     input_fn.block = syn::parse_quote! {
         {
+            #max_age_marker
             #original_response
         }
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }
@@ -348,6 +355,55 @@ mod tests {
     use quote::quote;
 
     use super::step_up_macro;
+    use crate::static_route::static_get_macro;
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `secured`/`throttle`):
+    /// pins `#[step_up(max_age = "5m")]`'s exact expansion — exercising the
+    /// session extraction, the freshness check, and (as the only guard on
+    /// this handler) the replay lookup all at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn step_up_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = step_up_macro(
+            quote! { max_age = "5m" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            generated,
+            include_str!("../testdata/step_up_golden.txt").trim_end()
+        );
+    }
+
+    #[test]
+    fn step_up_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated = step_up_macro(quote! {}, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "step_up_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn step_up_bare_generates_check_call() {

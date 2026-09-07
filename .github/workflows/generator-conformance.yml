@@ -38,6 +38,33 @@ on:
       - "autumn-cli/src/db/**"
       - "autumn-cli/src/schema/**"
       - "autumn-cli/tests/integration/db_scrub.rs"
+      # cli_tests per-test triage (#1945): each of these gates a specific
+      # test file compile-and-serve's own job now invokes explicitly (see
+      # that job's "cli_tests per-test triage" step block), so a change to
+      # only the test file or its non-`generate/`-covered implementation
+      # would otherwise never trigger this workflow. `autumn routes audit`
+      # (routes_audit.rs) and `autumn serve --daemon` (serve.rs) are not
+      # under any glob above; the rest are covered by `src/generate/**` but
+      # listed anyway to match this file's per-test-file convention.
+      - "autumn-cli/src/routes_audit.rs"
+      - "autumn-cli/src/serve.rs"
+      # serve.rs's daemon lifecycle test also directly exercises these three
+      # (RuntimePaths, PID-file/process liveness checks, and the
+      # build/find-binary helpers `autumn serve` shells out to).
+      - "autumn-cli/src/paths.rs"
+      - "autumn-cli/src/process.rs"
+      - "autumn-cli/src/dev.rs"
+      - "autumn-cli/tests/integration/api_scaffold.rs"
+      - "autumn-cli/tests/integration/cloud_native_scaffold.rs"
+      - "autumn-cli/tests/integration/generate_position_scaffold.rs"
+      - "autumn-cli/tests/integration/scaffold_belongs_to.rs"
+      - "autumn-cli/tests/integration/scaffold_bulk_delete.rs"
+      - "autumn-cli/tests/integration/scaffold_form_for.rs"
+      - "autumn-cli/tests/integration/scaffold_rich_text.rs"
+      - "autumn-cli/tests/integration/scaffold_search.rs"
+      - "autumn-cli/tests/integration/scaffold_trash.rs"
+      - "autumn-cli/tests/integration/seed_model_linking.rs"
+      - "autumn-cli/tests/integration/serve.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -75,6 +102,33 @@ on:
       - "autumn-cli/src/db/**"
       - "autumn-cli/src/schema/**"
       - "autumn-cli/tests/integration/db_scrub.rs"
+      # cli_tests per-test triage (#1945): each of these gates a specific
+      # test file compile-and-serve's own job now invokes explicitly (see
+      # that job's "cli_tests per-test triage" step block), so a change to
+      # only the test file or its non-`generate/`-covered implementation
+      # would otherwise never trigger this workflow. `autumn routes audit`
+      # (routes_audit.rs) and `autumn serve --daemon` (serve.rs) are not
+      # under any glob above; the rest are covered by `src/generate/**` but
+      # listed anyway to match this file's per-test-file convention.
+      - "autumn-cli/src/routes_audit.rs"
+      - "autumn-cli/src/serve.rs"
+      # serve.rs's daemon lifecycle test also directly exercises these three
+      # (RuntimePaths, PID-file/process liveness checks, and the
+      # build/find-binary helpers `autumn serve` shells out to).
+      - "autumn-cli/src/paths.rs"
+      - "autumn-cli/src/process.rs"
+      - "autumn-cli/src/dev.rs"
+      - "autumn-cli/tests/integration/api_scaffold.rs"
+      - "autumn-cli/tests/integration/cloud_native_scaffold.rs"
+      - "autumn-cli/tests/integration/generate_position_scaffold.rs"
+      - "autumn-cli/tests/integration/scaffold_belongs_to.rs"
+      - "autumn-cli/tests/integration/scaffold_bulk_delete.rs"
+      - "autumn-cli/tests/integration/scaffold_form_for.rs"
+      - "autumn-cli/tests/integration/scaffold_rich_text.rs"
+      - "autumn-cli/tests/integration/scaffold_search.rs"
+      - "autumn-cli/tests/integration/scaffold_trash.rs"
+      - "autumn-cli/tests/integration/seed_model_linking.rs"
+      - "autumn-cli/tests/integration/serve.rs"
       - "autumn/src/**"
       - "autumn/Cargo.toml"
       - "autumn-macros/**"
@@ -139,7 +193,13 @@ jobs:
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     # Fail fast instead of burning GitHub's 360-minute default if a
     # generated app wedges on boot (these jobs compile AND run one).
-    timeout-minutes: 90
+    # 90 -> 150 (#1945): 15 more scaffold-and-cargo-check/build/run steps
+    # landed in the "cli_tests per-test triage" block below. The 1.88.0 leg's
+    # existing ~31 steps already ran ~78-81 min against the old 90-minute
+    # budget (per recent run history), and these new steps average ~2 min
+    # each, so the old budget would have started failing on timeout rather
+    # than on a real regression.
+    timeout-minutes: 150
     strategy:
       matrix:
         toolchain: [stable, "1.88.0"]
@@ -395,6 +455,106 @@ jobs:
         run: |
           cargo test -p autumn-cli --test cli_tests \
             integration::scaffold_validation::constrained_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      # ── cli_tests per-test triage (#1945) ───────────────────────────────
+      #
+      # These `#[ignore]`d tests each scaffold a fresh project and cargo-check
+      # (or build/run) it, same as the blocks above — they are NOT Docker
+      # tests, so ci.yml's Docker-dependent sweep explicitly `--skip`s their
+      # modules. Before this, none of them ran anywhere: issue #1945 flagged
+      # the `cli_tests` binary's heterogeneous ignored set as needing
+      # per-test triage, and PR #1985 folded in the Docker-gated tests but
+      # left this generator-shaped half unrouted. Named explicitly here, same
+      # as the blocks above, or they never run.
+      - name: api_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::api_scaffold::api_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: scaffolded_app_passes_routes_audit_gate
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate \
+            -- --ignored --exact
+
+      - name: scaffolded_api_app_passes_routes_audit_gate
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::cloud_native_scaffold::scaffolded_api_app_passes_routes_audit_gate \
+            -- --ignored --exact
+
+      - name: unscoped_position_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_position_scaffold::unscoped_position_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: scoped_position_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_position_scaffold::scoped_position_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: soft_delete_position_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::generate_position_scaffold::soft_delete_position_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: belongs_to_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_belongs_to::belongs_to_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: bulk_delete_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: richtext_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_rich_text::richtext_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: searchable_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_search::searchable_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: trash_generated_project_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_trash::trash_generated_project_cargo_checks \
+            -- --ignored --exact
+
+      - name: linked_seed_binary_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::seed_model_linking::linked_seed_binary_cargo_checks \
+            -- --ignored --exact
+
+      - name: serve_daemon_start_status_stop_over_unix_socket
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::serve::serve_daemon_start_status_stop_over_unix_socket \
+            -- --ignored --exact
+
+      - name: generated_form_for_scaffold_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks \
+            -- --ignored --exact
+
+      - name: generated_scaffold_with_missing_reference_target_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test cli_tests \
+            integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks \
             -- --ignored --exact
 
   # ── Generated-app variant conformance matrix ────────────────────────────────

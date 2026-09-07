@@ -1019,18 +1019,16 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // A `RateLimitExempt` request is a genuine full bypass of *every*
-        // limiter (framework-default and user path-override alike), matching the
-        // marker's documented contract, so it is honored here unconditionally —
-        // regardless of `honors_mcp_exempt`.
+        // A `RateLimitExempt` request is a genuine full bypass of every limiter,
+        // framework-default and user path-override alike, matching the marker's documented
+        // contract, so it is honored unconditionally, whatever `honors_mcp_exempt` says.
         //
-        // A `RateLimitEnvelopeCounted` request is the narrower MCP-replay marker:
-        // it was already counted at the `/mcp` envelope, so only this framework
-        // default limiter — which shares the envelope's bucket (`honors_mcp_exempt`
-        // true) — skips it to avoid double-counting. A user-installed limiter
-        // (e.g. a per-path override added via `AppBuilder::layer`) leaves
-        // `honors_mcp_exempt` false so the replay still consumes its
-        // route-specific bucket, exactly as a direct call.
+        // A `RateLimitEnvelopeCounted` request is the narrower MCP-replay marker: it was
+        // already counted at the `/mcp` envelope, so only this framework default limiter,
+        // which shares the envelope's bucket with `honors_mcp_exempt` true, skips it to
+        // avoid double-counting. A user-installed limiter, such as a per-path override
+        // added via `AppBuilder::layer`, leaves `honors_mcp_exempt` false, so the replay
+        // still consumes its route-specific bucket exactly as a direct call would.
         if req.extensions().get::<RateLimitExempt>().is_some()
             || (self.limiter.honors_mcp_exempt
                 && req.extensions().get::<RateLimitEnvelopeCounted>().is_some())
@@ -1090,20 +1088,19 @@ where
                     reset_at_unix,
                 }) => {
                     let mut response = inner.call(req).await?;
-                    // The global limiter allowed this request (consuming a
-                    // token), so its informational `x-ratelimit-*` quota
-                    // headers belong on the response. But the inner service may
-                    // have set its own rate-limit headers — most notably a
-                    // per-route `#[throttle]` guard, whose 429 carries
-                    // route-specific `x-ratelimit-*`/`retry-after` values
-                    // (remaining: 0, the route's limit). Overwriting those with
-                    // the global bucket's numbers would mislead clients into
-                    // thinking quota remains. So insert each global header only
-                    // when the inner response does not already carry it: a
-                    // throttle 429 (which sets all three) keeps its own values,
-                    // while a plain user-handler response — including a user
-                    // 429 that consumed a global token but set no rate-limit
-                    // headers — still receives the global quota metadata.
+                    // The global limiter allowed this request, consuming a token,
+                    // so its informational `x-ratelimit-*` quota headers belong on
+                    // the response. But the inner service may have set its own —
+                    // most notably a per-route `#[throttle]` guard, whose 429
+                    // carries route-specific `x-ratelimit-*` and `retry-after`
+                    // values with remaining 0 and the route's limit. Overwriting
+                    // those with the global bucket's numbers would mislead clients
+                    // into thinking quota remains. So insert each global header only
+                    // when the inner response does not already carry it: a throttle
+                    // 429, which sets all three, keeps its own values, while a plain
+                    // user-handler response — including a user 429 that consumed a
+                    // global token but set no rate-limit headers — still receives the
+                    // global quota metadata.
                     let headers = response.headers_mut();
                     if !headers.contains_key(X_RATELIMIT_LIMIT) {
                         headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
@@ -1370,19 +1367,18 @@ fn resolve_throttle_params(
             key,
         } => {
             let key = key.unwrap_or(config.key_strategy);
-            // INLINE throttles isolate PER MOUNTED ROUTE PATH. The compile-time
-            // `route_id` (`module_path!()::fn_name`) is identical for a single
-            // handler mounted at more than one path — e.g. the same `routes![…]`
-            // reused under two `AppBuilder::scoped` prefixes, or versioned mounts
-            // — so keying on `route_id` alone would let traffic to one mounted
-            // path drain the other's bucket. Fold the RUNTIME matched path into
-            // the registry namespace so each mount gets its own bucket. When no
-            // `MatchedPath` is available (fallbacks / unnested routes) fall back
-            // to the bare `route_id`, preserving prior behavior.
+            // Inline throttles isolate per mounted route path. The compile-time
+            // `route_id` (`module_path!()::fn_name`) is identical for a single handler
+            // mounted at more than one path — the same `routes![…]` reused under two
+            // `AppBuilder::scoped` prefixes, or versioned mounts — so keying on
+            // `route_id` alone would let traffic to one mounted path drain the other's
+            // bucket. Fold the runtime matched path into the registry namespace so each
+            // mount gets its own bucket. With no `MatchedPath` available, for fallbacks
+            // and unnested routes, fall back to the bare `route_id`.
             //
-            // NAMED throttles do the OPPOSITE (see the `Named` arm below): a named
-            // limiter is a deliberately shared, centrally-named bucket, so it is
-            // keyed by name only and multiple routes referencing it share it.
+            // Named throttles do the opposite (see the `Named` arm below): a named
+            // limiter is a deliberately shared, centrally-named bucket, so it is keyed by
+            // name only and several routes referencing it share it.
             let registry_key = matched_path.map_or_else(
                 || format!("route:{route_id}"),
                 |path| format!("route:{route_id}@{path}"),

@@ -35,4 +35,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = __fuzz::parse_sandbox_manifest(&text);
     // One NDJSON frame, as a guest writes it to stdout.
     let _ = __fuzz::parse_sandbox_guest_frame(&text);
+    // The fragment tree a render hook answers with, which the host turns into
+    // markup for a host page (#1632).
+    let _ = __fuzz::render_sandbox_fragment(&text);
 });

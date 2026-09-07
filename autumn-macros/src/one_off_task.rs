@@ -88,8 +88,18 @@ pub fn task_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         call_args.push(arg_ident);
     }
 
+    // ── Architecture-graph node (#1747) ─────────────────────────
+    let graph_descriptor = crate::graph::emit_job_descriptor(
+        &input_fn,
+        &quote! { #task_name },
+        "Task",
+        &quote! { "" },
+    );
+
     quote! {
         #input_fn
+
+        #graph_descriptor
 
         #[doc(hidden)]
         pub fn #companion_name() -> ::autumn_web::task::OneOffTaskInfo {

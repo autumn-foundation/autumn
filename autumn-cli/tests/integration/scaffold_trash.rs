@@ -17,6 +17,12 @@ const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
 }
 
+/// A slug column token. Held in a const so the `{from:title}` braces never sit
+/// inside a macro or array literal, where clippy reads them as a format
+/// argument (same reason `scaffold_csv_import.rs`/`scaffold_lock_version.rs`
+/// each hold one).
+const SLUG_COL: &str = "slug:slug{from:title}";
+
 fn run_autumn_ok(dir: &Path, args: &[&str]) {
     let output = Command::new(autumn_bin())
         .args(args)
@@ -321,6 +327,6 @@ fn trash_generated_project_cargo_checks() {
     assert_project_cargo_checks(&project);
 
     let (_tmp_slug, project_slug) =
-        scaffold_project("trash-check-slug", &["slug:slug"], &["--soft-delete"]);
+        scaffold_project("trash-check-slug", &[SLUG_COL], &["--soft-delete"]);
     assert_project_cargo_checks(&project_slug);
 }

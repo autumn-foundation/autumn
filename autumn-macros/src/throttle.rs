@@ -21,7 +21,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{Expr, ItemFn, Lit, LitInt, LitStr, parse_quote};
+use syn::{Expr, Lit, LitInt, LitStr};
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -245,15 +245,19 @@ fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
 
 /// Expand the `#[throttle(...)]` attribute.
 #[allow(clippy::too_many_lines)]
+// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
+// but keeps the owned `TokenStream` signature every macro entry point in
+// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+#[allow(clippy::needless_pass_by_value)]
 pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_throttle_args(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
 
-    let mut input_fn: ItemFn = match syn::parse2(item) {
-        Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
+        Ok(v) => v,
+        Err(err) => return err,
     };
 
     if input_fn.sig.asyncness.is_none() {
@@ -262,6 +266,15 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "#[throttle] can only be applied to async functions",
         )
         .to_compile_error();
+    }
+
+    // `#[throttle]` written below `#[static_get]`/`#[ws]` — including under
+    // an alias those macros' own by-name attribute scan cannot see — is
+    // caught here instead, once this guard's own macro is the one running
+    // (Codex review on #2513, tenth finding). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
     }
 
     let fn_name = input_fn.sig.ident.clone();
@@ -305,89 +318,87 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `FromRequest` body extractor (`Json` / `Form` / `Multipart`) and
     // short-circuits on the first rejection, so an over-limit or replayed
     // request never causes the body to be parsed or buffered.
-    let gate_item = quote! {
-        #[doc(hidden)]
-        #[allow(non_camel_case_types)]
-        pub struct #gate_ident;
-
-        #[doc(hidden)]
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>
-            for #gate_ident
-        {
-            type Rejection = ::autumn_web::reexports::axum::response::Response;
-
-            fn from_request_parts(
-                parts: &mut ::autumn_web::reexports::axum::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
-                + Send {
-                async move {
-                    // Stable per-handler bucket namespace. Two routes pointing
-                    // at the same named limiter share their bucket via the
-                    // runtime registry — the route_id here is only used for
-                    // inline limiters and for uniqueness when a named entry is
-                    // missing from config.
-                    const __AUTUMN_THROTTLE_ROUTE_ID: &str =
-                        ::core::concat!(::core::module_path!(), "::", #fn_name_str);
-                    let __autumn_throttle_headers = parts.headers.clone();
-                    // Optional because `MatchedPath` is absent for some routes
-                    // (fallbacks, unnested handlers). When present, the
-                    // runtime matched route pattern isolates an INLINE
-                    // throttle's bucket per mounted path — a handler reused
-                    // under two `scoped` prefixes maps to the same
-                    // compile-time `route_id`, so folding the matched path in
-                    // gives each mount its own bucket. `__check_throttle`
-                    // consults it only for inline throttles.
-                    let __autumn_throttle_matched_path = parts
-                        .extensions
-                        .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
-                        .cloned();
-                    let __autumn_throttle_peer = parts
-                        .extensions
-                        .get::<::autumn_web::reexports::axum::extract::ConnectInfo<::std::net::SocketAddr>>()
-                        .copied();
-                    let __autumn_throttle_principal = parts
-                        .extensions
-                        .get::<::autumn_web::security::RateLimitPrincipal>()
-                        .cloned();
-                    // Optional so throttled routes without session middleware
-                    // (or a per-route throttle that doesn't key on the
-                    // principal) still compile and run. `__check_throttle`
-                    // only consults it for `key = "principal"` when no
-                    // `RateLimitPrincipal` extension was installed, deriving
-                    // the principal from the same verified session
-                    // `populate_rate_limit_principal` reads. Read directly
-                    // from extensions (not the `Session` extractor) so a
-                    // route with no `SessionLayer` installed does not panic.
-                    let __autumn_throttle_session = parts
-                        .extensions
-                        .get::<::autumn_web::session::Session>()
-                        .cloned();
-                    let __autumn_throttle_exempt = parts
-                        .extensions
-                        .get::<::autumn_web::security::RateLimitExempt>()
-                        .is_some();
-                    if let ::core::result::Result::Err(__autumn_throttle_response) =
-                        ::autumn_web::security::__check_throttle(
-                            state,
-                            __AUTUMN_THROTTLE_ROUTE_ID,
-                            __autumn_throttle_matched_path.as_ref().map(|__mp| __mp.as_str()),
-                            #spec_tokens,
-                            &__autumn_throttle_headers,
-                            __autumn_throttle_peer.map(|c| c.0),
-                            __autumn_throttle_principal.as_ref(),
-                            __autumn_throttle_session.as_ref(),
-                            __autumn_throttle_exempt,
-                        ).await
-                    {
-                        return ::core::result::Result::Err(__autumn_throttle_response);
-                    }
-                    #replay_check
-                    ::core::result::Result::Ok(#gate_ident)
-                }
-            }
-        }
+    // Stable per-handler bucket namespace. Two routes pointing at the same
+    // named limiter share their bucket via the runtime registry — the
+    // route_id here is only used for inline limiters and for uniqueness when
+    // a named entry is missing from config.
+    //
+    // Emitted from one shared `TokenStream` (cheaply `Clone`) so it can be
+    // declared TWICE — once inside the gate below for the actual runtime
+    // check, and once (inert) into the handler body via `route_id_marker`
+    // near the bottom of this function — mirroring `secured_macro`'s
+    // `role_scope_consts`/`markers` split. `api_doc::infer_response_body`'s
+    // guard recovery (`RESPONSE_REWRITING_GUARD_MARKERS`) requires this const
+    // in the handler's OWN body to tell a real guard's `__autumn_inner`
+    // wrapper apart from unrelated code with the same shape; since #1668
+    // moved the throttle check itself into this gate, this is the only
+    // reason a copy still needs to live in the body at all (issue #2516).
+    let route_id_marker = quote! {
+        #[allow(dead_code)]
+        const __AUTUMN_THROTTLE_ROUTE_ID: &str =
+            ::core::concat!(::core::module_path!(), "::", #fn_name_str);
     };
+
+    let gate_item = crate::request_gate::wrap_gate(
+        &gate_ident,
+        &quote! {
+            #route_id_marker
+            let __autumn_throttle_headers = parts.headers.clone();
+            // Optional because `MatchedPath` is absent for some routes
+            // (fallbacks, unnested handlers). When present, the
+            // runtime matched route pattern isolates an INLINE
+            // throttle's bucket per mounted path — a handler reused
+            // under two `scoped` prefixes maps to the same
+            // compile-time `route_id`, so folding the matched path in
+            // gives each mount its own bucket. `__check_throttle`
+            // consults it only for inline throttles.
+            let __autumn_throttle_matched_path = parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
+                .cloned();
+            let __autumn_throttle_peer = parts
+                .extensions
+                .get::<::autumn_web::reexports::axum::extract::ConnectInfo<::std::net::SocketAddr>>()
+                .copied();
+            let __autumn_throttle_principal = parts
+                .extensions
+                .get::<::autumn_web::security::RateLimitPrincipal>()
+                .cloned();
+            // Optional so throttled routes without session middleware
+            // (or a per-route throttle that doesn't key on the
+            // principal) still compile and run. `__check_throttle`
+            // only consults it for `key = "principal"` when no
+            // `RateLimitPrincipal` extension was installed, deriving
+            // the principal from the same verified session
+            // `populate_rate_limit_principal` reads. Read directly
+            // from extensions (not the `Session` extractor) so a
+            // route with no `SessionLayer` installed does not panic.
+            let __autumn_throttle_session = parts
+                .extensions
+                .get::<::autumn_web::session::Session>()
+                .cloned();
+            let __autumn_throttle_exempt = parts
+                .extensions
+                .get::<::autumn_web::security::RateLimitExempt>()
+                .is_some();
+            if let ::core::result::Result::Err(__autumn_throttle_response) =
+                ::autumn_web::security::__check_throttle(
+                    state,
+                    __AUTUMN_THROTTLE_ROUTE_ID,
+                    __autumn_throttle_matched_path.as_ref().map(|__mp| __mp.as_str()),
+                    #spec_tokens,
+                    &__autumn_throttle_headers,
+                    __autumn_throttle_peer.map(|c| c.0),
+                    __autumn_throttle_principal.as_ref(),
+                    __autumn_throttle_session.as_ref(),
+                    __autumn_throttle_exempt,
+                ).await
+            {
+                return ::core::result::Result::Err(__autumn_throttle_response);
+            }
+            #replay_check
+        },
+    );
 
     let original_body = input_fn.block.clone();
     let original_response = match &input_fn.sig.output {
@@ -428,22 +439,17 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // guard is applied to a still-unguarded function owns replay, and
     // "unguarded" is judged at each macro's OWN expansion time, before later
     // macros insert their gates further left).
-    let gate_param: syn::FnArg = parse_quote! { _: #gate_ident };
-    input_fn.sig.inputs.insert(0, gate_param);
+    crate::request_gate::insert_gate_param(&mut input_fn, &gate_ident);
 
-    input_fn
-        .attrs
-        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
-    input_fn.sig.output = parse_quote! {
-        -> ::autumn_web::reexports::axum::response::Response
-    };
     input_fn.block = syn::parse_quote! {
         {
+            #route_id_marker
             #original_response
         }
     };
 
     quote! {
+        #leading_items
         #gate_item
         #input_fn
     }
@@ -456,6 +462,56 @@ mod tests {
     use quote::quote;
 
     use super::throttle_macro;
+    use crate::static_route::static_get_macro;
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `secured`/`step_up`):
+    /// pins `#[throttle(limit = 5, per = "1m", key = "principal")]`'s exact
+    /// expansion — exercising the rate-limit check and (as the only guard on
+    /// this handler) the replay lookup at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn throttle_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m", key = "principal" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            generated,
+            include_str!("../testdata/throttle_golden.txt").trim_end()
+        );
+    }
+
+    #[test]
+    fn throttle_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
+        // See `secured::tests::secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias`
+        // for the full rationale (Codex review on #2513, tenth finding).
+        let accepted = static_get_macro(
+            quote! { "/private" },
+            quote! {
+                #[auth]
+                async fn private() -> &'static str { "private" }
+            },
+        );
+        assert!(
+            !accepted.to_string().contains("compile_error"),
+            "static_get_macro cannot recognize an aliased guard attribute by name: {accepted}"
+        );
+
+        let accepted_fn = crate::param_helpers::extract_fn_item(accepted, "private");
+        let generated =
+            throttle_macro(quote! { limit = 5, per = "1m" }, quote! { #accepted_fn }).to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "throttle_macro must reject a handler already marked as a #[static_get] route, \
+             regardless of what alias attribute name the source used to invoke it: {generated}"
+        );
+    }
 
     #[test]
     fn inline_form_generates_check_call() {

@@ -1,0 +1,17 @@
+error: `worker_threads` has no effect with `flavor = "current_thread"`. Drop it, or use the default `flavor = "multi_thread"`.
+ --> tests/compile-fail/main_worker_threads_current_thread.rs:4:64
+  |
+4 | #[autumn_web::main(flavor = "current_thread", worker_threads = 4)]
+  |                                                                ^
+
+error: `flavor = "current_thread"` declared here
+ --> tests/compile-fail/main_worker_threads_current_thread.rs:4:29
+  |
+4 | #[autumn_web::main(flavor = "current_thread", worker_threads = 4)]
+  |                             ^^^^^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/compile-fail/main_worker_threads_current_thread.rs:5:19
+  |
+5 | async fn main() {}
+  |                   ^ consider adding a `main` function to `$DIR/tests/compile-fail/main_worker_threads_current_thread.rs`

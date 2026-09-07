@@ -23,7 +23,8 @@
 #![cfg(feature = "plugin-sandbox")]
 
 use autumn_web::plugin_sandbox::{
-    DeclaredRoute, ResourceLimits, SandboxCapability, SandboxHost, SandboxManifest, SandboxRequest,
+    CapabilityGrants, CapabilityQuotas, DeclaredRoute, ResourceLimits, SandboxCapability,
+    SandboxHost, SandboxManifest, SandboxRequest,
 };
 
 /// Big enough that one copy of it cannot hide inside the noise of the rest of
@@ -44,6 +45,8 @@ fn manifest() -> SandboxManifest {
             path: "/hello/greet".to_owned(),
         }],
         limits: ResourceLimits::default(),
+        grants: CapabilityGrants::default(),
+        quotas: CapabilityQuotas::default(),
     }
 }
 

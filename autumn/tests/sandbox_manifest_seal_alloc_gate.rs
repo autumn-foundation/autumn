@@ -20,7 +20,8 @@
 #![cfg(feature = "plugin-sandbox")]
 
 use autumn_web::plugin_sandbox::{
-    DeclaredRoute, ResourceLimits, SandboxArtifact, SandboxCapability, SandboxManifest,
+    CapabilityGrants, CapabilityQuotas, DeclaredRoute, ResourceLimits, SandboxArtifact,
+    SandboxCapability, SandboxManifest,
 };
 
 /// Far past `MAX_ROUTES` (256), so the route-count check refuses it before the
@@ -47,6 +48,8 @@ fn manifest(routes: usize) -> SandboxManifest {
             })
             .collect(),
         limits: ResourceLimits::default(),
+        grants: CapabilityGrants::default(),
+        quotas: CapabilityQuotas::default(),
     }
 }
 

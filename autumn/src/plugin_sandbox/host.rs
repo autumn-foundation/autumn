@@ -358,9 +358,68 @@ const DENIAL_RECORD_BYTES: usize = DETAIL_EXCERPT * 10 + 256;
 pub const FIXED_HOST_BUFFER_BYTES: usize = STDERR_BUDGET_BYTES
     .saturating_add(HOST_IO_CHUNK_BYTES)
     .saturating_add(MAX_DENIALS.saturating_mul(DENIAL_RECORD_BYTES))
+    // Capability replies the guest has queued and not yet read, and the ledger
+    // of what it asked for. Both are bounded by their own constants below and
+    // both are held for the whole request, so they belong in the same term as
+    // the stderr budget rather than in the manifest's scaling ones.
+    .saturating_add(MAX_QUEUED_REPLY_BYTES)
+    .saturating_add(
+        crate::plugin_sandbox::capability::MAX_EVENTS.saturating_mul(CAPABILITY_EVENT_BYTES),
+    )
     // Slack for the bookkeeping around them — the frame's own scalars, the
     // outcome struct, the excerpt built from the stderr budget when it is read.
     .saturating_add(4096);
+
+/// Host bytes one capability call's reply may hold, unread, in the guest's
+/// stdin queue.
+///
+/// A guest is free to write a call frame and never read the answer — nothing
+/// obliges it to, and a buggy one will. Every unread reply stays in the queue,
+/// so without a ceiling the `calls` quota (128 by default) multiplied by the
+/// largest reply (an outbound response, up to that quota's own byte ceiling)
+/// would be tens of megabytes of host memory per in-flight request, at a
+/// concurrency the footprint validator approved on other grounds.
+///
+/// Crossing it ends the request rather than dropping the reply: a guest that is
+/// not reading its answers is one that will not notice a dropped one either,
+/// and quietly losing a reply is how a plugin comes to believe a write happened.
+///
+/// It bounds what is **resident**, not what has been sent: `take_stdin` gives
+/// the budget back as the guest drains it, so a guest that reads each answer
+/// before making the next call never approaches it however many calls it makes.
+/// Counting cumulatively instead killed a well-behaved plugin at its 63rd
+/// `kv-get` — inside the quotas its own operator had approved — and told it it
+/// had a bug it did not have.
+///
+/// One MiB rather than four: the resident set is one reply at a time for any
+/// honest guest, the largest single reply is bounded by the
+/// `outbound_response_bytes` quota, and every byte here is charged against
+/// [`FIXED_HOST_BUFFER_BYTES`] for *every* plugin — including one granted no
+/// capability that can produce a reply. Four MiB moved the largest admissible
+/// `max_concurrency` for an otherwise-default manifest from 16 to 15, which is a
+/// load-time break for a manifest that used to be fine.
+pub const MAX_QUEUED_REPLY_BYTES: usize = 1024 * 1024;
+
+/// Host bytes one capability-ledger entry may hold, for the footprint term.
+///
+/// An event carries a capability, a `&'static str` operation, its outcome, and a
+/// target the guest chose. The target is the term that has to be priced
+/// carefully, and at the right rate: it is bounded at
+/// [`MAX_TARGET_CHARS`](crate::plugin_sandbox::capability::MAX_TARGET_CHARS)
+/// *characters*, and `guest_text` escapes a hostile character to as many as ten
+/// bytes — the same `× 10` [`DENIAL_RECORD_BYTES`] already applies for the same
+/// reason. Pricing it at the character count understated the ledger eightfold.
+const CAPABILITY_EVENT_BYTES: usize =
+    crate::plugin_sandbox::capability::MAX_TARGET_CHARS * 10 + 256;
+
+/// Fuel one capability call costs before its reply is priced by the byte.
+///
+/// A call is host work the guest chose to cause: a lock, a lookup, a frame
+/// encoded and queued. Priced like an imported call rather than like a copy,
+/// because that is what it is, and priced at all because a plugin with a
+/// generous fuel budget would otherwise get its quota's worth of host work for
+/// the cost of writing a few hundred bytes to stdout.
+const CAPABILITY_CALL_FUEL: u64 = 2_000;
 
 /// Refuse a request whose body is over the manifest's declared ceiling.
 ///
@@ -479,15 +538,13 @@ fn refuse_oversized_request(
         ));
     }
     // The body ceiling is the manifest's; this one is the host's, because no
-    // manifest declares a query or header budget. `run` is public and the
-    // adapter's own limits do not reach it, so an embedder building a
-    // `SandboxRequest` by hand could otherwise hand over a gigabyte of query
-    // string: cloned into the frame and serialised into the NDJSON line before
-    // the guest starts, against a footprint that budgets for the *body* alone.
-    //
-    // The encoding charge prices those bytes, but pricing is not a bound — at
-    // the manifest's maximum fuel it permits more than a terabyte of them — so
-    // the ceiling is what keeps `request_footprint_bytes` honest.
+    // manifest declares a query or header budget. `run` is public and the adapter's
+    // own limits do not reach it, so an embedder building a `SandboxRequest` by hand
+    // could hand over a gigabyte of query string — cloned into the frame and
+    // serialised into the NDJSON line before the guest starts, against a footprint
+    // that budgets for the body alone. The encoding charge prices those bytes, but
+    // pricing is not a bound: at the manifest's maximum fuel it permits more than a
+    // terabyte. The ceiling is what keeps `request_footprint_bytes` honest.
     let metadata = request_metadata_bytes(request);
     (metadata > MAX_REQUEST_METADATA_BYTES).then(|| {
         SandboxOutcome::refused(
@@ -1029,6 +1086,14 @@ pub struct SandboxOutcome {
     pub peak_memory_bytes: usize,
     /// What the guest wrote to stderr, truncated.
     pub stderr: String,
+    /// Every capability call this request made, allowed or refused (#1632).
+    ///
+    /// The operator audit surface is built from these; see
+    /// [`capability::audit`](crate::plugin_sandbox::capability::audit).
+    pub activity: Vec<crate::plugin_sandbox::capability::CapabilityEvent>,
+    /// Capability calls this request made that the bounded ledger could not
+    /// hold, so `activity` is a floor rather than a count.
+    pub dropped_activity: u64,
 }
 
 impl SandboxOutcome {
@@ -1045,8 +1110,37 @@ impl SandboxOutcome {
             fuel_used,
             peak_memory_bytes: 0,
             stderr: String::new(),
+            activity: Vec::new(),
+            dropped_activity: 0,
         }
     }
+}
+
+/// Everything one render-slot call produced (#1632).
+///
+/// Separate from [`SandboxOutcome`] rather than a variant of it: the two carry
+/// different answers, and a caller filling a slot on a page has a different
+/// failure posture — it omits the fragment and serves the page — from one
+/// serving a request, which returns a status.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SandboxRenderOutcome {
+    /// The rendered HTML fragment, or why there is none.
+    ///
+    /// Every `Err` here means the same thing to a caller: leave the slot empty.
+    pub fragment: Result<String, SandboxFailure>,
+    /// Everything the guest reached for and did not get.
+    pub denials: Vec<CapabilityDenial>,
+    /// Fuel the guest consumed.
+    pub fuel_used: u64,
+    /// What the guest wrote to stderr, truncated.
+    pub stderr: String,
+    /// The high-water mark of the guest's linear memory, in bytes.
+    pub peak_memory_bytes: usize,
+    /// Every capability call the hook made.
+    pub activity: Vec<crate::plugin_sandbox::capability::CapabilityEvent>,
+    /// Calls the bounded ledger could not hold.
+    pub dropped_events: u64,
 }
 
 // ── The host ─────────────────────────────────────────────────────────────
@@ -1094,6 +1188,53 @@ impl fmt::Debug for SandboxHost {
             .field("prefix", &self.manifest.prefix)
             .finish_non_exhaustive()
     }
+}
+
+/// What one context entry costs beyond its bytes: two `String` headers, a
+/// tuple, and the JSON punctuation it becomes on the wire.
+///
+/// Counted in both the ceiling and the fuel charge, so a thousand empty pairs
+/// are neither free to hold nor free to encode.
+pub const RENDER_CONTEXT_ENTRY_OVERHEAD: usize = 64;
+
+/// The most context entries one render hook is handed.
+///
+/// A slot's context is a handful of values a panel needs — an id, a locale, a
+/// count. Far above that, and far below anything that could matter.
+pub const MAX_RENDER_CONTEXT_ENTRIES: usize = 32;
+
+/// The most bytes one render hook's context may carry across all its entries.
+pub const MAX_RENDER_CONTEXT_BYTES: usize = 16 * 1024;
+
+/// Take as much of `context` as the ceilings above allow.
+///
+/// Applied by [`SandboxHost::render`] itself, not only by the wrapper: the
+/// entry point is public, an embedder may call it with context built from a
+/// row or a query string, and a ceiling that only one of two callers reaches is
+/// a ceiling the other does not have.
+///
+/// Per-entry overhead is counted, not just the strings: a thousand empty pairs
+/// cost real allocation and real serialization, and a budget measured only in
+/// string length prices them at nothing.
+#[must_use]
+pub fn bounded_context(context: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(context.len().min(MAX_RENDER_CONTEXT_ENTRIES));
+    let mut total = 0_usize;
+    for (name, value) in context {
+        if out.len() >= MAX_RENDER_CONTEXT_ENTRIES {
+            break;
+        }
+        let weight = name
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(RENDER_CONTEXT_ENTRY_OVERHEAD);
+        if total.saturating_add(weight) > MAX_RENDER_CONTEXT_BYTES {
+            break;
+        }
+        total = total.saturating_add(weight);
+        out.push((name.clone(), value.clone()));
+    }
+    out
 }
 
 impl SandboxHost {
@@ -1184,17 +1325,15 @@ impl SandboxHost {
         // Both ceilings are enforced by `refuse_unbounded_shape` above, before
         // `Module::new` rather than after it.
         let (segments, init_bytes) = (shape.segments, shape.init_bytes);
-        // A budget that cannot cover instantiation is a manifest whose every
-        // route is already broken: the charge is unavoidable and paid before
-        // `_start`, so the guest never executes an instruction. Refusing at
-        // load is what makes `autumn plugin inspect` mean something — a passing
-        // verdict on an artifact that can only ever answer 504 is worse than no
-        // verdict, because an operator installs on the strength of it.
-        //
-        // Compared against instantiation alone rather than the whole per-request
-        // cost: the frame encoding varies with the request, so there is no
-        // single number to check it against here, while this charge is fixed by
-        // the module and known now.
+        // A budget that cannot cover instantiation is a manifest whose every route is
+        // already broken: the charge is unavoidable and paid before `_start`, so the
+        // guest never executes an instruction. Refusing at load is what makes `autumn
+        // plugin inspect` mean something — a passing verdict on an artifact that can
+        // only answer 504 is worse than no verdict, because an operator installs on
+        // the strength of it. Compared against instantiation alone rather than the
+        // whole per-request cost: the frame encoding varies with the request, so there
+        // is no single number to check it against, while this charge is fixed by the
+        // module and known now.
         let instantiation = instantiation_fuel(
             segments,
             init_bytes,
@@ -1283,7 +1422,7 @@ impl SandboxHost {
         reported_imports(self.module.imports())
     }
 
-    /// Serve one request.
+    /// Serve one request, with no capability backends wired.
     ///
     /// This is synchronous and CPU-bound by design — it is an interpreter loop.
     /// Callers on an async runtime must dispatch it to a blocking worker; the
@@ -1291,13 +1430,31 @@ impl SandboxHost {
     ///
     /// Never panics and never fails: a plugin that misbehaves in any way
     /// produces an [`SandboxOutcome`] whose `result` is `Err`.
+    ///
+    /// A plugin granted `kv`, `db`, `http-outbound` or `jobs` still *runs* here
+    /// — its calls are answered [`unavailable`](crate::plugin_sandbox::DenialReason::Unavailable)
+    /// and recorded. Wire the backends with [`run_with`](Self::run_with).
     #[must_use]
     pub fn run(&self, request: &SandboxRequest) -> SandboxOutcome {
+        self.run_with(request, crate::plugin_sandbox::CapabilityServices::none())
+    }
+
+    /// Serve one request against `services` (issue #1632).
+    ///
+    /// The services are per-call rather than per-host because the tenant is:
+    /// one compiled plugin serves every tenant's requests, and the scoping that
+    /// makes that safe comes from `services.tenant` being the *request's*
+    /// tenant. A host that held the services would hold one tenant.
+    #[must_use]
+    pub fn run_with(
+        &self,
+        request: &SandboxRequest,
+        services: crate::plugin_sandbox::CapabilityServices,
+    ) -> SandboxOutcome {
         let limits = self.manifest.limits;
         // Bounds where the response may redirect a client; see `sanitize`.
-        let prefix = self.manifest.prefix.as_str();
         let rules = ResponseRules {
-            prefix,
+            prefix: self.manifest.prefix.as_str(),
             owned: &self.owned_routes,
             requested: &request.method,
         };
@@ -1306,17 +1463,188 @@ impl SandboxHost {
             return refusal;
         }
 
+        // Borrowed, not cloned: `HostFrame::request` reads the grants to decide
+        // what the guest is told it may do and never keeps them, so copying the
+        // vector on every request bought nothing. Validation refuses a repeated
+        // grant, so this list is at most one entry per capability this build
+        // understands.
+        // The frame is *built* inside `execute`, not here. Encoding it clones
+        // the body and base64-expands it, which is the host work
+        // `encoding_fuel` exists to price and `max_concurrency` exists to
+        // bound — so doing it before admission and before the charge undid
+        // both: a manifest with a 64 MiB body ceiling and almost no fuel would
+        // expand every request in full and only then answer `FuelExhausted`,
+        // once per request, for as long as a client cared to ask.
+        let capabilities = &self.manifest.capabilities;
+        match self.execute(
+            || HostFrame::request(request, capabilities),
+            encoding_fuel(request),
+            Exchange::Request,
+            services,
+        ) {
+            Execution::Refused(failure, fuel_used) => SandboxOutcome::refused(failure, fuel_used),
+            Execution::Ran(store, permit, result) => {
+                // The permit is still held, and dropped only once `finish` has
+                // drained the store: sanitising and size-checking the response
+                // clones up to `max_response_bytes`, which is the term
+                // `request_footprint_bytes` charges to `max_concurrency`.
+                let outcome = finish(store, limits, &rules, result);
+                drop(permit);
+                outcome
+            }
+        }
+    }
+
+    /// Fill one render slot (issue #1632).
+    ///
+    /// `context` is whatever the host chose to tell the plugin about the page —
+    /// an order id, a locale. It is the host's to decide and the plugin's to
+    /// read; nothing about the request, the session or the user crosses unless
+    /// the host put it here.
+    ///
+    /// Every failure produces an `Err` fragment and nothing else: a slow hook, a
+    /// trapping one, a fragment carrying a tag this build will not emit, one
+    /// over the `render_bytes` quota. A caller omits the fragment and serves the
+    /// page — see [`SandboxRenderOutcome`].
+    #[must_use]
+    pub fn render(
+        &self,
+        slot: &str,
+        context: &[(String, String)],
+        services: crate::plugin_sandbox::CapabilityServices,
+    ) -> SandboxRenderOutcome {
+        let limits = self.manifest.limits;
+        let refused = |failure, fuel_used| SandboxRenderOutcome {
+            fragment: Err(failure),
+            denials: Vec::new(),
+            fuel_used,
+            peak_memory_bytes: 0,
+            stderr: String::new(),
+            activity: Vec::new(),
+            dropped_events: 0,
+        };
+
+        // Checked here rather than left to the guest: a plugin that was not
+        // granted the slot must not run at all for it, because running is what
+        // costs the page its latency.
+        if !self
+            .manifest
+            .is_granted(super::manifest::SandboxCapability::Render)
+            || !self
+                .manifest
+                .grants
+                .allows(super::manifest::SandboxCapability::Render, slot)
+        {
+            return refused(
+                SandboxFailure::GuestError(format!(
+                    "this plugin was not granted the render slot {slot:?}",
+                    slot = super::manifest::rejected(slot)
+                )),
+                0,
+            );
+        }
+
+        // Bounded here, at the public entry point, rather than only in
+        // `SandboxedPlugin::render_slot`. An embedder may call this directly
+        // with context built from a row or a query string, and a ceiling only
+        // one of two callers reaches is a ceiling the other does not have.
+        let context = &bounded_context(context);
+
+        // The context is the host's own text rather than a client's body, so it
+        // is priced by its length the same way an encoded request is. Measured
+        // from the parts rather than from the encoded frame, because encoding
+        // it is the work being priced. Per-entry overhead is included, so a
+        // context of many empty pairs is not charged nothing for allocation and
+        // serialization it really costs.
+        let encoding = context
+            .iter()
+            .map(|(name, value)| {
+                u64::try_from(
+                    name.len()
+                        .saturating_add(value.len())
+                        .saturating_add(RENDER_CONTEXT_ENTRY_OVERHEAD),
+                )
+                .unwrap_or(u64::MAX)
+            })
+            .fold(
+                u64::try_from(slot.len()).unwrap_or(u64::MAX),
+                u64::saturating_add,
+            )
+            / BYTES_PER_FUEL;
+
+        let capabilities = &self.manifest.capabilities;
+        match self.execute(
+            || HostFrame::render(slot, context, capabilities),
+            encoding,
+            Exchange::Render,
+            services,
+        ) {
+            Execution::Refused(failure, fuel_used) => refused(failure, fuel_used),
+            Execution::Ran(store, permit, result) => {
+                let fuel_used = store
+                    .get_fuel()
+                    .map_or(limits.fuel, |left| limits.fuel.saturating_sub(left));
+                let mut state = store.into_data();
+                // The same drain `finish` performs, and for the same reason: a
+                // hook that kept hitting its memory ceiling is the likeliest
+                // cause of an omitted fragment, and an operator reading an empty
+                // denial list would be reading silence rather than evidence.
+                let peak_memory_bytes = record_limiter_refusals(&mut state, limits);
+                let activity = state.runtime.take_events();
+                let dropped_events = state.runtime.dropped_events();
+                let max_bytes = state.runtime.quotas().render_bytes as usize;
+                let fragment = match result {
+                    Ok(GuestAnswer::Fragment(nodes)) => {
+                        super::capability::render::render(&nodes, max_bytes).map_err(|err| {
+                            SandboxFailure::ResponseRefused(guest_text(&err.to_string()))
+                        })
+                    }
+                    Ok(GuestAnswer::Response(_)) => Err(SandboxFailure::MalformedFrame(
+                        "a render slot is answered with a `fragment` frame, not a `response`"
+                            .to_owned(),
+                    )),
+                    Err(failure) => Err(failure),
+                };
+                let stderr = state.stderr_excerpt();
+                drop(permit);
+                SandboxRenderOutcome {
+                    fragment,
+                    denials: state.denials,
+                    fuel_used,
+                    peak_memory_bytes,
+                    stderr,
+                    activity,
+                    dropped_events,
+                }
+            }
+        }
+    }
+
+    /// Instantiate the module and run it to its first terminal frame.
+    ///
+    /// The half `run_with` and `render` share: everything from admission to the
+    /// `_start` call is identical between them, and a second copy of it would be
+    /// a second place for one of these ceilings to go missing.
+    fn execute(
+        &self,
+        frame: impl FnOnce() -> HostFrame,
+        encoding: u64,
+        exchange: Exchange,
+        services: crate::plugin_sandbox::CapabilityServices,
+    ) -> Execution<'_> {
+        let limits = self.manifest.limits;
+
         // Admission, before a single buffer is built. `serve` holds a permit of
         // its own across the whole request, so this is never what stops an
-        // ordinary HTTP request — it is here for the embedder who calls this
-        // public method directly and would otherwise start as many instances
-        // as it liked, against a footprint the manifest validator accepted on
-        // the premise that `max_concurrency` bounds them.
+        // ordinary HTTP request — it is here for the embedder who calls the
+        // public entry points directly and would otherwise start as many
+        // instances as it liked, against a footprint the manifest validator
+        // accepted on the premise that `max_concurrency` bounds them.
         //
         // Held for the body of the run: dropping the guard on the way out is
         // what makes the permit mean "executing now".
-        let Ok(_permit) = self.permits.try_acquire() else {
-            return SandboxOutcome::refused(
+        let Ok(permit) = self.permits.try_acquire() else {
+            return Execution::Refused(
                 SandboxFailure::AtCapacity {
                     max: limits.max_concurrency,
                 },
@@ -1324,20 +1652,19 @@ impl SandboxHost {
             );
         };
 
-        // Building the guest's stdin is host work proportional to the request:
-        // the body is cloned into the frame and base64-expanded into the NDJSON
-        // line, all of it before a single guest instruction runs. Unpriced,
-        // that is megabytes of host CPU per request for a manifest that
-        // declares a large body ceiling and almost no fuel — and a client can
-        // repeat it for as long as it likes.
+        // Building the guest's stdin is host work proportional to the frame:
+        // the body is cloned into it and base64-expanded into the NDJSON line,
+        // all of it before a single guest instruction runs. Unpriced, that is
+        // megabytes of host CPU per request for a manifest that declares a
+        // large body ceiling and almost no fuel — and a client can repeat it
+        // for as long as it likes.
         //
         // So it is charged at the same rate as every other host-side copy, and
         // charged *before* the copies happen: a budget that cannot cover the
         // encoding refuses without doing it. The guest then starts on what is
         // left, which is the same arrangement instantiation already has.
-        let encoding = encoding_fuel(request);
         let Some(after_encoding) = limits.fuel.checked_sub(encoding) else {
-            return SandboxOutcome::refused(
+            return Execution::Refused(
                 SandboxFailure::FuelExhausted {
                     budget: limits.fuel,
                 },
@@ -1345,31 +1672,32 @@ impl SandboxHost {
             );
         };
 
-        // Borrowed, not cloned: `HostFrame::request` reads the grants to decide
-        // what the guest is told it may do and never keeps them, so copying the
-        // vector on every request bought nothing. Validation refuses a repeated
-        // grant, so this list is at most one entry per capability this build
-        // understands.
-        let frame = HostFrame::request(request, &self.manifest.capabilities);
-
-        let line = match to_line(&frame) {
+        // Built and encoded here, after admission and after the charge above —
+        // see the note in `run_with`. The frame's bytes are then *moved* into
+        // the queue rather than copied into it: `VecDeque::from(Vec<u8>)`
+        // reuses the allocation, and the `String` is gone afterwards. For a
+        // plugin with a large body ceiling that is a whole base64-expanded copy
+        // of the request that no longer exists at the same time as the others.
+        let line = match to_line(&frame()) {
             Ok(line) => line,
             Err(err) => {
-                // The host could not encode its own request. Report it as a
+                // The host could not encode its own frame. Reported as a
                 // plugin-prefix failure rather than propagating: the rest of
                 // the application is unaffected either way.
-                return SandboxOutcome::refused(
+                return Execution::Refused(
                     SandboxFailure::Instantiation(guest_text(&err.to_string())),
                     0,
                 );
             }
         };
-        // The frame's bytes are *moved* into the queue rather than copied into
-        // it: `VecDeque::from(Vec<u8>)` reuses the allocation, and the `String`
-        // is gone afterwards. For a plugin with a large body ceiling that is a
-        // whole base64-expanded copy of the request that no longer exists at the
-        // same time as the others.
-        let mut state = HostState::new(self.manifest.name.clone(), limits, line.as_bytes());
+
+        let mut state = HostState::new(
+            self.manifest.name.clone(),
+            limits,
+            line.as_bytes(),
+            exchange,
+            crate::plugin_sandbox::capability::CapabilityRuntime::new(&self.manifest, services),
+        );
         state.stdin = VecDeque::from(line.into_bytes());
 
         let mut store = Store::new(&self.engine, state);
@@ -1377,7 +1705,7 @@ impl SandboxHost {
         // Set before instantiation, so the budget is in place the moment the
         // first guest instruction runs.
         if let Err(err) = store.set_fuel(after_encoding) {
-            return SandboxOutcome::refused(
+            return Execution::Refused(
                 SandboxFailure::Instantiation(guest_text(&err.to_string())),
                 0,
             );
@@ -1391,13 +1719,16 @@ impl SandboxHost {
         // here, so the work that is admitted still comes out of the budget the
         // manifest declared rather than being free.
         let Some(left) = after_encoding.checked_sub(self.instantiation_fuel) else {
-            let failure = SandboxFailure::FuelExhausted {
-                budget: limits.fuel,
-            };
-            return finish(store, limits, &rules, Err(failure));
+            return Execution::Ran(
+                store,
+                permit,
+                Err(SandboxFailure::FuelExhausted {
+                    budget: limits.fuel,
+                }),
+            );
         };
         if let Err(err) = store.set_fuel(left) {
-            return SandboxOutcome::refused(
+            return Execution::Refused(
                 SandboxFailure::Instantiation(guest_text(&err.to_string())),
                 0,
             );
@@ -1405,7 +1736,7 @@ impl SandboxHost {
 
         let mut linker = <Linker<HostState>>::new(&self.engine);
         if let Err(err) = define_wasi_shim(&mut linker) {
-            return SandboxOutcome::refused(
+            return Execution::Refused(
                 SandboxFailure::Instantiation(guest_text(&err.to_string())),
                 0,
             );
@@ -1417,12 +1748,7 @@ impl SandboxHost {
         let instance = match started {
             Ok(instance) => instance,
             Err(err) => {
-                return finish(
-                    store,
-                    limits,
-                    &rules,
-                    Err(instantiation_failure(&err, limits)),
-                );
+                return Execution::Ran(store, permit, Err(instantiation_failure(&err, limits)));
             }
         };
 
@@ -1430,7 +1756,7 @@ impl SandboxHost {
             // `from_module` already refused a module without `_start`; reaching
             // here would mean the export changed shape, which is still the
             // plugin's problem and not the host's.
-            return finish(store, limits, &rules, Err(SandboxFailure::NoAnswer));
+            return Execution::Ran(store, permit, Err(SandboxFailure::NoAnswer));
         };
 
         let trap = start.call(&mut store, ()).err();
@@ -1444,8 +1770,38 @@ impl SandboxHost {
             (None, None) if partial => Err(SandboxFailure::PartialFrame),
             (None, None) => Err(SandboxFailure::NoAnswer),
         };
-        finish(store, limits, &rules, result)
+        Execution::Ran(store, permit, result)
     }
+}
+
+/// What one instantiation-and-run produced.
+///
+/// `Refused` is a request that never reached a guest instruction — at capacity,
+/// or a budget that could not cover its own fixed charges — and carries no
+/// store, because there is none. `Ran` carries the store so the caller can drain
+/// the evidence: fuel, memory peak, denials, stderr and the capability ledger.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`Ran` carries the wasmi `Store` itself, which is large by construction and is the \
+              common path; boxing it would add an allocation per request without shrinking the \
+              store, and this value is a return value moved once, never held in a collection"
+)]
+enum Execution<'a> {
+    /// Turned away before a store existed.
+    Refused(SandboxFailure, u64),
+    /// Ran to a terminal frame, or failed trying.
+    ///
+    /// The permit comes back out with the store rather than being dropped at
+    /// the end of `execute`: draining the store is where the response is
+    /// sanitised, size-checked and cloned, which is the `5 ×
+    /// max_response_bytes` term `max_concurrency` is validated against. A
+    /// permit released before that work happens bounds the interpreter and not
+    /// the request.
+    Ran(
+        Store<HostState>,
+        tokio::sync::SemaphorePermit<'a>,
+        Result<GuestAnswer, SandboxFailure>,
+    ),
 }
 
 /// Drain the store into an outcome, applying the response sanitation and the
@@ -1467,35 +1823,21 @@ fn finish(
     store: Store<HostState>,
     limits: ResourceLimits,
     rules: &ResponseRules<'_>,
-    result: Result<SandboxResponse, SandboxFailure>,
+    result: Result<GuestAnswer, SandboxFailure>,
 ) -> SandboxOutcome {
     let fuel_used = store
         .get_fuel()
         .map_or(limits.fuel, |left| limits.fuel.saturating_sub(left));
     let mut state = store.into_data();
-    let peak_memory_bytes = state.limiter.peak;
-    let (memory_refusals, table_refusals) =
-        (state.limiter.memory_refusals, state.limiter.table_refusals);
-    if memory_refusals > 0 {
-        let detail = format!(
-            "{memory_refusals} allocation(s) over the plugin's {max}-byte memory ceiling were refused",
-            max = limits.memory_bytes,
-        );
-        state.deny(DeniedCapability::Memory, "memory.grow", &detail);
-    }
-    // Its own operation and its own ceiling. `deny` deduplicates by
-    // `(capability, operation)`, so this is a second entry beside the byte
-    // one rather than a collision with it, and a guest that hit both is
-    // recorded as having hit both.
-    if table_refusals > 0 {
-        let detail = format!(
-            "{table_refusals} table growth(s) over the sandbox's {MAX_TABLE_ELEMENTS}-element table ceiling were refused",
-        );
-        state.deny(DeniedCapability::Memory, "table.grow", &detail);
-    }
+    let peak_memory_bytes = record_limiter_refusals(&mut state, limits);
 
+    let activity = state.runtime.take_events();
+    let dropped_activity = state.runtime.dropped_events();
     let result = match result {
-        Ok(response) => {
+        Ok(GuestAnswer::Fragment(_)) => Err(SandboxFailure::MalformedFrame(
+            "a request is answered with a `response` frame, not a `fragment`".to_owned(),
+        )),
+        Ok(GuestAnswer::Response(response)) => {
             let (response, denied) = response.sanitize(rules.prefix, rules.owned, rules.requested);
             for name in denied {
                 // The name is the guest's, so it is as long and as hostile as
@@ -1527,14 +1869,13 @@ fn finish(
                 },
                 |essence| {
                     // `refused_content_type` returns everything before the
-                    // first `;`, so a guest that writes no parameter at all
-                    // hands back its whole header value — bounded whether it
-                    // likes it or not by the stdout ceiling, which is
-                    // megabytes. Both strings built here are logged (the
-                    // denial by `deny`, the failure by `serve`), so the
-                    // guest's text gets the same cap and control-escaping
-                    // every other guest-influenced string gets. The branch
-                    // beside this one already did; this one did not.
+                    // first `;`, so a guest that writes no parameter hands back
+                    // its whole header value — bounded only by the stdout
+                    // ceiling, which is megabytes. Both strings built here are
+                    // logged, the denial by `deny` and the failure by `serve`,
+                    // so the guest's text gets the same cap and control-escaping
+                    // every other guest-influenced string gets. The branch beside
+                    // this one already did; this one did not.
                     let essence = guest_text(&essence);
                     let detail = format!(
                         "a sandboxed plugin may not serve `{essence}`: a document or a script \
@@ -1557,7 +1898,39 @@ fn finish(
         fuel_used,
         peak_memory_bytes,
         stderr,
+        activity,
+        dropped_activity,
     }
+}
+
+/// Turn the memory limiter's refusal counts into denials, and report the peak.
+///
+/// Shared by `finish` and by the render path. Two exits that both drain a store
+/// are two places for one of these to be forgotten — and the render path did
+/// forget them, so a hook that died against its memory ceiling reported an empty
+/// denial list, which reads as "nothing was refused" rather than as the answer.
+fn record_limiter_refusals(state: &mut HostState, limits: ResourceLimits) -> usize {
+    let peak_memory_bytes = state.limiter.peak;
+    let (memory_refusals, table_refusals) =
+        (state.limiter.memory_refusals, state.limiter.table_refusals);
+    if memory_refusals > 0 {
+        let detail = format!(
+            "{memory_refusals} allocation(s) over the plugin's {max}-byte memory ceiling were refused",
+            max = limits.memory_bytes,
+        );
+        state.deny(DeniedCapability::Memory, "memory.grow", &detail);
+    }
+    // Its own operation and its own ceiling. `deny` deduplicates by
+    // `(capability, operation)`, so this is a second entry beside the byte one
+    // rather than a collision with it, and a guest that hit both is recorded as
+    // having hit both.
+    if table_refusals > 0 {
+        let detail = format!(
+            "{table_refusals} table growth(s) over the sandbox's {MAX_TABLE_ELEMENTS}-element table ceiling were refused",
+        );
+        state.deny(DeniedCapability::Memory, "table.grow", &detail);
+    }
+    peak_memory_bytes
 }
 
 fn instantiation_failure(err: &wasmi::Error, limits: ResourceLimits) -> SandboxFailure {
@@ -1703,18 +2076,15 @@ fn element_section_shape(
         }
         let (items, next) = leb128(wasm, at)?;
         at = next;
-        // The segment's own count, before a single item is read. Nothing else
-        // sees it: `declared_entries` sums each *section's* leading count, so
-        // one segment holding millions of indices adds one, and
-        // `MAX_TABLE_ELEMENTS` bounds only what a table starts with, which a
-        // passive segment never touches. So the ceiling that exists to bound
-        // declarations before anything allocates per declaration was blind to
-        // the one place a declaration is nested.
-        //
-        // Returning here rather than walking on is the point. Past the ceiling
-        // the module is refused whatever the remaining segments hold, so
-        // reading them is work an artifact chose for this process — the same
-        // rule the section-count walk follows, one level down.
+        // The segment's own count, before a single item is read. Nothing else sees it:
+        // `declared_entries` sums each section's leading count, so one segment holding
+        // millions of indices adds one, and `MAX_TABLE_ELEMENTS` bounds only what a
+        // table starts with, which a passive segment never touches. The ceiling that
+        // exists to bound declarations before anything allocates per declaration was
+        // therefore blind to the one place a declaration is nested. Return here rather
+        // than walk on: past the ceiling the module is refused whatever the remaining
+        // segments hold, so reading them is work an artifact chose for this process —
+        // the same rule the section-count walk follows, one level down.
         declared = declared.saturating_add(items);
         if declared > MAX_DECLARED_ENTRIES {
             return Some(ElementSectionShape {
@@ -2213,23 +2583,19 @@ fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
             segments = segments.saturating_add(count);
             bytes = bytes.saturating_add(size);
         }
-        // Past the ceiling the module is refused on this count alone, whatever
-        // the per-segment walks below would find — so the walking is pure cost,
-        // and the cost is the attack: a near-64 MiB module of two-byte passive
-        // segments is tens of millions of iterations spent reaching the refusal
-        // whose entire purpose is to bound that work.
+        // Past the ceiling the module is refused on this count alone, whatever the
+        // per-segment walks below would find, so the walking is pure cost — and the
+        // cost is the attack: a near-64 MiB module of two-byte passive segments is tens
+        // of millions of iterations spent reaching the refusal whose purpose is to
+        // bound that work.
         //
-        // Skipping is safe *because* `refuse_unbounded_shape` rejects on
-        // `segments` by itself. That is the whole difference from a walk that
-        // gives up and silently takes its bounds check with it: here the
-        // refusal is unconditional and the walk's findings cannot matter.
-        //
-        // It rejects on `init_bytes` by itself too, and that is the other half:
-        // a single element segment holding tens of millions of function
-        // indices keeps `segments` at one and clears the count ceiling, so the
-        // count alone let the walk run over every item on the way to a refusal
-        // the byte ceiling had already decided. Both counters gate the walk
-        // because either one alone refuses the module.
+        // Skipping is safe because `refuse_unbounded_shape` rejects on `segments` by
+        // itself: the refusal is unconditional and the walk's findings cannot matter.
+        // It rejects on `init_bytes` by itself too, which is the other half — a single
+        // element segment holding tens of millions of function indices keeps `segments`
+        // at one and clears the count ceiling, so the count alone let the walk run over
+        // every item on the way to a refusal the byte ceiling had already decided. Both
+        // counters gate the walk because either one alone refuses the module.
         let within_segment_ceiling =
             segments <= MAX_INIT_SEGMENTS && bytes <= MAX_INIT_SECTION_BYTES;
         if id == ELEMENT_SECTION && within_segment_ceiling {
@@ -2394,19 +2760,16 @@ fn refuse_unbounded_shape(wasm: &[u8]) -> Result<ModuleShape, SandboxLoadError> 
             max: MAX_GLOBALS,
         });
     }
-    // The per-instance stores the limiter guards. These say the module can be
-    // built at all, so they read as runnability rules — but they are also cost
-    // ceilings, and that is what decides where they live. A module declaring
-    // hundreds of thousands of empty memories or tables sits under
-    // `MAX_DECLARED_ENTRIES` and is refused by these anyway, so compiling it
-    // first buys a representation of every declaration on the way to a verdict
-    // that never depended on one. Checked after that compile, they were the
-    // right answer at the wrong time.
-    //
-    // All three move together. `table_elements` is the same argument as the
-    // other two — tables already over the ceiling at rest are refused whatever
-    // `Module::new` would say — and leaving it behind would be the half-fix
-    // this file warns about elsewhere.
+    // The per-instance stores the limiter guards. These say the module can be built at
+    // all, so they read as runnability rules, but they are also cost ceilings, and that
+    // is what decides where they live. A module declaring hundreds of thousands of empty
+    // memories or tables sits under `MAX_DECLARED_ENTRIES` and is refused by these
+    // anyway, so compiling it first buys a representation of every declaration on the
+    // way to a verdict that never depended on one. Checked after that compile, they were
+    // the right answer at the wrong time. All three move together: `table_elements` is
+    // the same argument as the other two — tables already over the ceiling at rest are
+    // refused whatever `Module::new` would say — and leaving it behind would be the
+    // half-fix this file warns about elsewhere.
     if shape.memory_count > MAX_MEMORIES {
         return Err(SandboxLoadError::InstantiationTooExpensive {
             what: "linear memories",
@@ -2510,6 +2873,30 @@ impl wasmi::core::HostError for OutputBudgetExhausted {}
 
 // ── Host state ───────────────────────────────────────────────────────────
 
+/// Which dialogue a store is running.
+///
+/// The two differ only in which host frame goes in and which guest frame is a
+/// legal answer, which is exactly why they are one enum rather than two code
+/// paths: everything else — the shim, the fuel, the capability channel, the
+/// ledger — is shared, and a second path would be a second place for a bound to
+/// be missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exchange {
+    /// A `request` frame in, a `response` frame out.
+    Request,
+    /// A `render` frame in, a `fragment` frame out.
+    Render,
+}
+
+/// The terminal frame a guest produced.
+#[derive(Debug, Clone)]
+enum GuestAnswer {
+    /// The answer to a request.
+    Response(SandboxResponse),
+    /// The answer to a render slot.
+    Fragment(Vec<super::capability::FragmentNode>),
+}
+
 /// The guest's memory ceiling, and the evidence that it was applied.
 #[derive(Debug)]
 struct MemoryLimiter {
@@ -2593,7 +2980,45 @@ struct HostState {
     /// Everything the guest wrote to stderr, bounded.
     stderr: Vec<u8>,
     /// The first terminal frame the guest produced.
-    answer: Option<Result<SandboxResponse, SandboxFailure>>,
+    answer: Option<Result<GuestAnswer, SandboxFailure>>,
+    /// Which dialogue this store is running: a request, or a render slot.
+    ///
+    /// Carried in the state rather than inferred from the frame, because it
+    /// decides which *answer* is legal. A guest that answers a render with an
+    /// HTTP response is not producing a page fragment, and without this the
+    /// host would have to decide what it meant.
+    exchange: Exchange,
+    /// Capabilities, grants, quotas and the ledger for this request.
+    runtime: crate::plugin_sandbox::capability::CapabilityRuntime,
+    /// Fuel owed for capability work done while the guest was inside a
+    /// `fd_write`, where the `Caller` needed to charge it is not in scope.
+    pending_charge: u64,
+    /// Calls parsed out of a completed stdout line and **not yet dispatched**.
+    ///
+    /// Queued rather than serviced where they are parsed, so the shim can take
+    /// each call's fixed fuel charge *before* it reaches a backend. Charging
+    /// afterwards let a budget that could pay for the `fd_write` copy but not
+    /// for the call itself perform a KV write, a job enqueue or an outbound
+    /// POST and *then* end the request as `FuelExhausted` — an effect that
+    /// happened, on a request whose caller was told it did not, which a retry
+    /// then does again.
+    ///
+    /// Bounded by the chunk that produced it: one `fd_write` copies at most
+    /// `HOST_IO_CHUNK_BYTES`, and every queued call was parsed out of those
+    /// bytes.
+    pending_calls: VecDeque<super::capability::CapabilityCall>,
+    /// Bytes of capability replies **currently resident** in `stdin`.
+    ///
+    /// Counted apart from `stdin.len()`, which also holds the unread tail of
+    /// the *request* frame. A manifest may declare a 64 MiB body ceiling, so a
+    /// guest that makes its first call before reading its request would sit
+    /// over any reply ceiling measured against the whole queue — every
+    /// capability call refused, for a reason that has nothing to do with
+    /// replies. The request frame is budgeted separately, at
+    /// `4 × max_request_body_bytes` in `request_footprint_bytes`; this counts
+    /// only what the capability channel added, and only while it is still
+    /// there: `take_stdin` gives it back as the guest reads.
+    queued_replies: usize,
     /// Everything the guest reached for and did not get.
     denials: Vec<CapabilityDenial>,
     /// Request-seeded PRNG state, so `random_get` is deterministic without
@@ -2627,13 +3052,24 @@ impl HostState {
         seed
     }
 
-    fn new(plugin: String, limits: ResourceLimits, frame: &[u8]) -> Self {
+    fn new(
+        plugin: String,
+        limits: ResourceLimits,
+        frame: &[u8],
+        exchange: Exchange,
+        runtime: crate::plugin_sandbox::capability::CapabilityRuntime,
+    ) -> Self {
         Self {
             plugin,
             stdin: VecDeque::new(),
             stdout_line: Vec::new(),
             stderr: Vec::new(),
             answer: None,
+            exchange,
+            runtime,
+            pending_charge: 0,
+            pending_calls: VecDeque::new(),
+            queued_replies: 0,
             denials: Vec::new(),
             random_state: Self::seed_from(frame),
             limiter: MemoryLimiter {
@@ -2676,6 +3112,11 @@ impl HostState {
     }
 
     /// Handle one complete line the guest wrote to stdout.
+    ///
+    /// Most frames end the exchange. A `call` frame does not: it is serviced
+    /// and answered in the guest's stdin, and the guest carries on. That is the
+    /// whole of the capability channel — see
+    /// [`GuestFrame::Call`](super::wire::GuestFrame::Call).
     fn on_guest_line(&mut self, line: &str) {
         if self.answer.is_some() {
             // Already answered. Anything after is a guest that does not respect
@@ -2684,12 +3125,93 @@ impl HostState {
             return;
         }
         self.answer = Some(match from_line::<GuestFrame>(line) {
-            Ok(GuestFrame::Response(response)) => Ok(response),
+            Ok(GuestFrame::Call(call)) => {
+                // Queued, not serviced: the fixed charge is the shim's to take
+                // first. See `pending_calls`.
+                self.pending_calls.push_back(call);
+                return;
+            }
+            Ok(GuestFrame::Response(response)) => match self.exchange {
+                Exchange::Request => Ok(GuestAnswer::Response(response)),
+                Exchange::Render => Err(SandboxFailure::MalformedFrame(
+                    "a render slot is answered with a `fragment` frame, not a `response`"
+                        .to_owned(),
+                )),
+            },
+            Ok(GuestFrame::Fragment { nodes }) => match self.exchange {
+                Exchange::Render => Ok(GuestAnswer::Fragment(nodes)),
+                Exchange::Request => Err(SandboxFailure::MalformedFrame(
+                    "a request is answered with a `response` frame, not a `fragment`".to_owned(),
+                )),
+            },
             Ok(GuestFrame::Error { detail }) => {
                 Err(SandboxFailure::GuestError(guest_text(&detail)))
             }
             Err(err) => Err(SandboxFailure::MalformedFrame(guest_text(&err.to_string()))),
         });
+    }
+
+    /// Answer one capability call by appending its result to the guest's stdin.
+    ///
+    /// Never fails the request over the *content* of a call: everything a guest
+    /// can get wrong comes back as a denial it can read. The two exits that do
+    /// end the request are the host's own encoder failing, and a guest that has
+    /// stopped reading its replies — see [`MAX_QUEUED_REPLY_BYTES`].
+    fn service(&mut self, call: &super::capability::CapabilityCall) {
+        let result = self.runtime.dispatch(call);
+        let line = match to_line(&HostFrame::CallResult(result)) {
+            Ok(line) => line,
+            Err(err) => {
+                // The host could not encode its own answer. Reported as a
+                // plugin-prefix failure rather than propagating, exactly as
+                // `run` treats the same failure on the request frame.
+                self.answer = Some(Err(SandboxFailure::Instantiation(guest_text(
+                    &err.to_string(),
+                ))));
+                return;
+            }
+        };
+        if self.queued_replies.saturating_add(line.len()) > MAX_QUEUED_REPLY_BYTES {
+            self.answer = Some(Err(SandboxFailure::MalformedFrame(format!(
+                "the guest has left over {MAX_QUEUED_REPLY_BYTES} bytes of capability replies \
+                 unread; it must read each answer before making the next call"
+            ))));
+            return;
+        }
+        // Only the per-byte part. The fixed part — which prices the dispatch: a
+        // lock, a lookup, a frame built — is taken by the shim *before* this
+        // runs, so a budget that cannot cover it never reaches a backend. What
+        // is left is the reply the host has just materialised, priced at the
+        // same rate every other host-side copy pays; it cannot be charged
+        // earlier because it cannot be measured before the call is answered.
+        self.pending_charge = self
+            .pending_charge
+            .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX) / BYTES_PER_FUEL);
+        self.queued_replies = self.queued_replies.saturating_add(line.len());
+        self.stdin.extend(line.as_bytes());
+    }
+
+    /// Dispatch the next queued call, if any.
+    ///
+    /// Returns `false` when the queue is empty. The caller charges
+    /// [`CAPABILITY_CALL_FUEL`] before each `true` step, which is the whole
+    /// point of the queue: see [`pending_calls`](Self::pending_calls).
+    fn service_next(&mut self) -> bool {
+        let Some(call) = self.pending_calls.pop_front() else {
+            return false;
+        };
+        self.service(&call);
+        true
+    }
+
+    /// Whether a parsed call is waiting for its fixed charge.
+    fn has_pending_call(&self) -> bool {
+        !self.pending_calls.is_empty()
+    }
+
+    /// Take the fuel owed for capability work, leaving nothing owed.
+    const fn take_pending_charge(&mut self) -> u64 {
+        std::mem::replace(&mut self.pending_charge, 0)
     }
 
     /// Buffer stdout bytes, consuming each completed NDJSON line.
@@ -2729,21 +3251,19 @@ impl HostState {
                     return false;
                 }
                 // Grow geometrically, but never past the budget. Left to
-                // itself `Vec::push` doubles, which takes a buffer whose
-                // *length* stops at `budget` to a *capacity* of the next power
-                // of two above it — for the default ceiling, 16 MiB of
-                // allocation behind an 8 MiB bound. `request_footprint_bytes`
-                // reserves `2 × max_response_bytes` for this line and validates
-                // the concurrency product against that reservation, so the
-                // slack `Vec` takes for its own amortisation is host memory
-                // nothing accounted for, at every concurrent request at once.
-                //
-                // Clamping the reservation keeps the doubling — and the
-                // amortised push that comes with it — right up to the point
-                // where the next one would overrun the bound, and stops there
-                // rather than at twice it. The 64-byte floor is below the
-                // smallest budget this can compute (`saturating_add(4096)`), so
-                // it only covers the first few pushes.
+                // itself `Vec::push` doubles, taking a buffer whose length
+                // stops at `budget` to a capacity of the next power of two
+                // above it — for the default ceiling, 16 MiB of allocation
+                // behind an 8 MiB bound. `request_footprint_bytes` reserves
+                // `2 × max_response_bytes` for this line and validates the
+                // concurrency product against that reservation, so the slack
+                // `Vec` takes for its own amortisation is host memory nothing
+                // accounted for, at every concurrent request at once. Clamping
+                // the reservation keeps the doubling, and the amortised push
+                // with it, right up to the point where the next one would
+                // overrun the bound. The 64-byte floor is below the smallest
+                // budget this can compute (`saturating_add(4096)`), so it
+                // covers only the first few pushes.
                 if self.stdout_line.len() == self.stdout_line.capacity() {
                     let want = self
                         .stdout_line
@@ -2774,18 +3294,17 @@ impl HostState {
     }
 
     fn stderr_excerpt(&self) -> String {
-        // Bounded *and* neutralised: truncation stops a flood, but a forged
-        // record fits comfortably inside 512 characters.
+        // Bounded and neutralised: truncation stops a flood, but a forged record fits
+        // comfortably inside 512 characters.
         //
-        // Decoded a chunk at a time rather than through `String::from_utf8_lossy`
-        // — the same reason the stdout frame is decoded strictly, one function
-        // up, and the sibling that argument was not applied to. Lossy decoding
-        // writes a three-byte replacement character per invalid subpart, so a
-        // guest that fills its 64 KiB stderr budget with invalid bytes
-        // materialises 192 KiB beside the still-live buffer, all to keep 512
-        // characters of it. The manifest footprint budgets the buffer, not that
-        // expansion, so it was 128 KiB per concurrent request outside the
-        // ceiling. Streaming keeps the peak at the excerpt itself.
+        // Decoded a chunk at a time rather than through `String::from_utf8_lossy`, for
+        // the same reason the stdout frame is decoded strictly one function up. Lossy
+        // decoding writes a three-byte replacement character per invalid subpart, so a
+        // guest that fills its 64 KiB stderr budget with invalid bytes materialises
+        // 192 KiB beside the still-live buffer, all to keep 512 characters of it. The
+        // manifest footprint budgets the buffer, not that expansion, so it was 128 KiB
+        // per concurrent request outside the ceiling. Streaming keeps the peak at the
+        // excerpt itself.
         let mut chars = lossy_chars(&self.stderr).skip_while(|ch| ch.is_whitespace());
         let mut kept: String = chars.by_ref().take(STDERR_EXCERPT).collect();
         let cut = chars.next().is_some();
@@ -2848,6 +3367,12 @@ impl HostState {
     /// broken.
     fn take_stdin(&mut self, len: usize) -> Vec<u8> {
         let len = len.min(HOST_IO_CHUNK_BYTES);
+        // The queue is the request frame followed by whatever capability
+        // replies have been appended, drained front to back — so bytes come out
+        // of the request frame until it is exhausted and only then out of the
+        // replies. Computing the boundary before the drain is what lets the
+        // reply budget be given back exactly as it is consumed.
+        let head = self.stdin.len().saturating_sub(self.queued_replies);
         let mut out = Vec::with_capacity(len.min(self.stdin.len()));
         while out.len() < len {
             match self.stdin.pop_front() {
@@ -2855,6 +3380,8 @@ impl HostState {
                 None => break,
             }
         }
+        let from_replies = out.len().saturating_sub(head);
+        self.queued_replies = self.queued_replies.saturating_sub(from_replies);
         out
     }
 }
@@ -3147,15 +3674,14 @@ fn instantiation_fuel(
     let segments = u64::try_from(segments).unwrap_or(u64::MAX);
     let imports = u64::try_from(imports).unwrap_or(u64::MAX);
     let globals = u64::try_from(globals).unwrap_or(u64::MAX);
-    // The instance's linear memory, at the same rate as every other host-side
-    // byte. A module can declare its initial size and no data segments at all,
-    // so the init-section terms above price none of it — and yet the host
-    // allocates and zero-fills the whole thing on every request, before the
-    // guest runs an instruction. Near the manifest's ceiling that is hundreds
-    // of megabytes of memset a client can ask for repeatedly, for one fuel
-    // unit, which is the same "buy host CPU with no fuel" the copying charge
-    // exists to stop. The limiter bounds how *much* memory; only this bounds
-    // how often it can be paid for.
+    // The instance's linear memory, at the same rate as every other host-side byte. A
+    // module can declare its initial size and no data segments at all, so the
+    // init-section terms above price none of it — yet the host allocates and zero-fills
+    // the whole thing on every request, before the guest runs an instruction. Near the
+    // manifest's ceiling that is hundreds of megabytes of memset a client can ask for
+    // repeatedly, for one fuel unit: the same "buy host CPU with no fuel" the copying
+    // charge exists to stop. The limiter bounds how much memory; only this bounds how
+    // often it can be paid for.
     let memory = initial_memory_bytes
         .checked_div(BYTES_PER_FUEL)
         .unwrap_or(u64::MAX);
@@ -3204,6 +3730,29 @@ fn charge_units(caller: &mut Caller<'_, HostState>, units: u64) -> Result<(), wa
         .checked_sub(units)
         .ok_or_else(|| wasmi::Error::from(wasmi::core::TrapCode::OutOfFuel))?;
     caller.set_fuel(remaining)
+}
+
+/// Charge `units`, taking the budget to zero rather than trapping when it does
+/// not cover them.
+///
+/// For the one charge that necessarily *follows* a committed side effect: a
+/// reply can only be measured once the call has been answered, and by then a KV
+/// write, a job enqueue or an outbound POST has happened. Trapping there ends
+/// the request over work already done — and a retry does that work again, which
+/// for a POST is the difference between one order and two.
+///
+/// Taking the budget to zero instead is bounded and terminal in the same
+/// breath: the overshoot is one reply's worth, the next dispatch cannot start
+/// because [`CAPABILITY_CALL_FUEL`] is charged before it with [`charge_units`],
+/// which does trap, and the guest's own instructions run out on the next one.
+/// The request still ends here — it ends after the effect is accounted for
+/// rather than after it is disowned.
+fn charge_units_saturating(
+    caller: &mut Caller<'_, HostState>,
+    units: u64,
+) -> Result<(), wasmi::Error> {
+    let left = caller.get_fuel()?;
+    caller.set_fuel(left.saturating_sub(units))
 }
 
 /// Register the guest-visible WASI surface.
@@ -3260,13 +3809,13 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                     }
                     // Charged for what is actually copied, not for what was
                     // asked: `take_stdin` bounds the copy at
-                    // `HOST_IO_CHUNK_BYTES` and by what is left, and pricing
-                    // the whole iovec would bill the guest for bytes it did not
-                    // get. The queue's remaining length belongs in the minimum
-                    // for the same reason the chunk ceiling does — a guest
-                    // reading the tail of its frame through an ordinary large
-                    // buffer would otherwise pay a full chunk for a few bytes,
-                    // and a tight but sufficient budget could fail on it.
+                    // `HOST_IO_CHUNK_BYTES` and by what is left, so pricing the
+                    // whole iovec would bill the guest for bytes it did not get.
+                    // The queue's remaining length belongs in the minimum for the
+                    // same reason the chunk ceiling does — a guest reading the
+                    // tail of its frame through a large buffer would otherwise pay
+                    // a full chunk for a few bytes, and a tight but sufficient
+                    // budget could fail on it.
                     let take = HOST_IO_CHUNK_BYTES
                         .min(length)
                         .min(caller.data().stdin.len());
@@ -3327,20 +3876,18 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                 for index in 0..iovs_len {
                     // Per descriptor inspected, not per byte copied. Reading an
                     // iovec out of guest memory and bounds-checking it is host
-                    // work whatever the length says, and the only other charge
-                    // in this function lives inside `while offset < length` —
-                    // which a zero-length iovec skips outright, and which breaks
-                    // before charging once stderr is past its budget. Sixty-four
-                    // free descriptor walks per imported call, against a budget
-                    // that limits only how many calls, is host CPU on a blocking
-                    // worker no ceiling sees.
+                    // work whatever the length says, and the only other charge in
+                    // this function lives inside `while offset < length`, which a
+                    // zero-length iovec skips and which breaks once stderr is past
+                    // its budget. Sixty-four free descriptor walks per imported
+                    // call, against a budget that limits only how many calls, is
+                    // host CPU on a blocking worker no ceiling sees.
                     //
                     // `charge_units` rather than `charge_bytes`, for the reason
-                    // `random_get` uses it: this is per-item work, not a bulk
-                    // move. `fd_read` needs no such line — its `charge_bytes`
-                    // sits unconditionally in the loop body, and that helper
-                    // floors at one unit, so a drained queue there already costs
-                    // a descriptor's worth of fuel.
+                    // `random_get` uses it: this is per-item work, not a bulk move.
+                    // `fd_read` needs no such line — its `charge_bytes` sits
+                    // unconditionally in the loop body and floors at one unit, so a
+                    // drained queue already costs a descriptor's worth of fuel.
                     charge_units(&mut caller, 1)?;
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
                         return Ok(errno::INVAL);
@@ -3381,7 +3928,61 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                             return Ok(errno::INVAL);
                         }
                         if fd == 1 {
-                            if !caller.data_mut().write_stdout(&scratch) {
+                            let accepted = caller.data_mut().write_stdout(&scratch);
+                            // Fixed charge, dispatch, byte charge — in that
+                            // order, once per call the chunk completed. The
+                            // fixed charge is taken *before* the call reaches a
+                            // backend, so a budget too small to pay for it
+                            // cannot leave a KV write, a job enqueue or an
+                            // outbound POST behind on a request that then ends
+                            // as `FuelExhausted`. A trap here leaves the rest of
+                            // the queue undispatched, which is the same
+                            // property one level up.
+                            //
+                            // The loop stops on a terminal answer as well as on
+                            // an empty queue. One chunk may carry several call
+                            // frames, and servicing an early one can end the
+                            // request — a reply the guest never read pushing the
+                            // queue over `MAX_QUEUED_REPLY_BYTES`, or the host
+                            // failing to encode its own answer. Draining the
+                            // rest afterwards would perform a job enqueue, a DB
+                            // write or an outbound POST on a request that is
+                            // already going to fail, which is the property the
+                            // charge-before-dispatch order exists to establish.
+                            //
+                            // And only when the write was accepted. A chunk can
+                            // carry a complete call frame followed by a line that
+                            // overruns the stdout budget: `write_stdout` parses
+                            // and queues the first, then refuses at the second and
+                            // answers `false`. Servicing the queue anyway would
+                            // commit that call's side effect on a request the
+                            // `!accepted` branch below is about to end as
+                            // `OutputBudget` — the guest is told the write failed
+                            // and may retry it, so the enqueue or the POST happens
+                            // twice. It is the same property the
+                            // charge-before-dispatch order establishes for fuel,
+                            // reached through the output ceiling instead.
+                            if accepted {
+                                while caller.data().has_pending_call()
+                                    && caller.data().answer.is_none()
+                                {
+                                    charge_units(&mut caller, CAPABILITY_CALL_FUEL)?;
+                                    let _ = caller.data_mut().service_next();
+                                    // Saturating, because this charge follows a
+                                    // call that has already run: see
+                                    // `charge_units_saturating`. The pre-charge
+                                    // above is the trapping one, and it is what
+                                    // stops the next call.
+                                    let owed = caller.data_mut().take_pending_charge();
+                                    charge_units_saturating(&mut caller, owed)?;
+                                }
+                            }
+                            // Charged whether the write was accepted or not, and
+                            // drained before the branch below, so no exit from
+                            // this arm can leave fuel owed.
+                            let owed = caller.data_mut().take_pending_charge();
+                            charge_units(&mut caller, owed)?;
+                            if !accepted {
                                 // The response ceiling is a hard stop, not an
                                 // errno the guest can ignore and retry: trap so
                                 // the request ends here.
@@ -3730,6 +4331,22 @@ path = "/hello/greet"
         manifest
     }
 
+    /// A bare `HostState` for the shim unit tests: an ordinary request
+    /// exchange, and a capability runtime with no grants and no backends, which
+    /// is what a first-slice plugin has.
+    fn bare_state(limits: ResourceLimits, frame: &[u8]) -> HostState {
+        HostState::new(
+            "hello".to_owned(),
+            limits,
+            frame,
+            Exchange::Request,
+            crate::plugin_sandbox::capability::CapabilityRuntime::new(
+                &manifest_with(limits),
+                crate::plugin_sandbox::CapabilityServices::none(),
+            ),
+        )
+    }
+
     fn try_host(wat: &str) -> Result<SandboxHost, SandboxLoadError> {
         try_host_with(wat, ResourceLimits::default())
     }
@@ -3901,17 +4518,14 @@ path = "/hello/greet"
 
     #[test]
     fn walking_an_iovec_vector_is_charged_even_when_it_moves_no_bytes() {
-        // `fd_write`'s only byte charge lives inside `while offset < length`,
-        // which a zero-length descriptor skips outright. Reading that descriptor
-        // out of guest memory and bounds-checking it is host work all the same,
-        // and a guest may present `MAX_IOVECS` of them per imported call — a
-        // budget that prices only the *calls* buys sixty-four times the host CPU
-        // it charged for, on a blocking worker no ceiling sees.
-        //
-        // The control is the same module with one descriptor instead of
-        // sixty-four: identical guest instructions, so the whole gap between
-        // them is host work priced per descriptor. A per-call charge cannot
-        // satisfy this; only a per-descriptor one can.
+        // `fd_write`'s only byte charge lives inside `while offset < length`, which a
+        // zero-length descriptor skips outright. Reading that descriptor out of guest
+        // memory and bounds-checking it is host work all the same, and a guest may
+        // present `MAX_IOVECS` of them per imported call: a budget that prices only the
+        // calls buys sixty-four times the host CPU it charged for, on a blocking worker
+        // no ceiling sees. The control is the same module with one descriptor instead
+        // of sixty-four — identical guest instructions, so the whole gap between them is
+        // host work priced per descriptor. Only a per-descriptor charge can satisfy this.
         const CALLS: u32 = 8192;
         const WIDE: u32 = MAX_IOVECS as u32;
 
@@ -4322,15 +4936,13 @@ path = "/hello/greet"
     rusty_fork_test! {
         #[test]
         fn a_denial_reaches_the_log_and_not_only_the_ledger() {
-            // The ledger is what tests read; the log is what an operator reads.
-            // If the two could drift, "each denial observable in logs" would be
-            // a claim about a field nobody sees.
-            //
-            // Forked: `tracing`'s callsite-interest cache and max-level hint are
-            // process-global, so a sibling test that installs a global
-            // subscriber can filter this event out before any thread-local
-            // subscriber is consulted — which makes an in-process version of
-            // this test pass or fail on test ordering.
+            // The ledger is what tests read; the log is what an operator reads. If the
+            // two could drift, "each denial observable in logs" would be a claim about
+            // a field nobody sees. Forked, because `tracing`'s callsite-interest cache
+            // and max-level hint are process-global: a sibling test that installs a
+            // global subscriber can filter this event out before any thread-local
+            // subscriber is consulted, which would make an in-process version of this
+            // test pass or fail on test ordering.
             let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             tracing::subscriber::with_default(
                 DenialLog(std::sync::Arc::clone(&recorded)),
@@ -4703,16 +5315,14 @@ path = "/hello/greet"
 
     #[test]
     fn deciding_a_header_does_not_cross_costs_nothing_to_decide() {
-        // The value clone was the obvious half. The name is the same trap one
-        // step smaller: looking a header up in the allowlist by lower-casing it
-        // first allocates a copy of a string the caller chose the length of, in
-        // order to conclude it is not wanted. And a dropped header is no longer
-        // charged against the metadata ceiling — rightly, it never crosses —
-        // so nothing bounds how large that name may be.
-        //
-        // The predicate now compares in place. Asserted by behaviour rather
-        // than by allocation here (`tests/sandbox_header_alloc_gate.rs` does
-        // the measuring): a name that cannot be an allowlisted header must be
+        // The value clone was the obvious half. The name is the same trap one step
+        // smaller: looking a header up in the allowlist by lower-casing it first
+        // allocates a copy of a string the caller chose the length of, only to conclude
+        // it is not wanted. And a dropped header is no longer charged against the
+        // metadata ceiling — rightly, it never crosses — so nothing bounds how large
+        // that name may be. The predicate now compares in place. Asserted by behaviour
+        // rather than by allocation here, since `tests/sandbox_header_alloc_gate.rs`
+        // does the measuring: a name that cannot be an allowlisted header must be
         // rejected without the length ever mattering.
         let enormous = "x".repeat(4 * 1024 * 1024);
         assert!(!super::super::wire::request_header_allowed(&enormous));
@@ -4738,15 +5348,12 @@ path = "/hello/greet"
 
     #[test]
     fn encoding_fuel_prices_the_line_that_is_written_not_the_bytes_handed_in() {
-        // A flat multiplier over the raw input under-charged, because most of
-        // the walks are over the *expanded* form: base64 grows the body by 4/3
-        // and every pass after the encode is over that, while `serde_json`
-        // writes a control character as six bytes and `seed_from` then reads
-        // the whole finished line. A request could buy host work the ceiling
-        // never saw.
-        //
-        // Measured against what the serialiser actually writes, so the factors
-        // cannot drift from the encoding they claim to cover.
+        // A flat multiplier over the raw input under-charged, because most of the walks
+        // are over the expanded form: base64 grows the body by 4/3 and every pass after
+        // the encode is over that, while `serde_json` writes a control character as six
+        // bytes and `seed_from` then reads the whole finished line. A request could buy
+        // host work the ceiling never saw. Measured against what the serialiser actually
+        // writes, so the factors cannot drift from the encoding they claim to cover.
         let granted = [SandboxCapability::HttpRequest];
 
         let mut request = get("/hello/greet");
@@ -4946,15 +5553,13 @@ path = "/hello/greet"
 
     #[test]
     fn a_long_import_name_is_not_copied_whole_in_order_to_refuse_it() {
-        // `MAX_IMPORTS` bounds how many names a module may declare; nothing on
-        // this side bounded how long one may be. wasmparser caps a single name
-        // at 100 KB, so this is not module-sized — but `MAX_DENIALS` is 64, and
-        // the denial copied the whole name, `Display` cloned it again, and the
-        // join built a third copy. That is megabytes of host memory to refuse
-        // one artifact, repeatable, in the process trying to reject it.
-        //
-        // Observable in what comes out: a bounded operation cannot be longer
-        // than the bound, however long the name was.
+        // `MAX_IMPORTS` bounds how many names a module may declare; nothing on this
+        // side bounded how long one may be. wasmparser caps a single name at 100 KB, so
+        // this is not module-sized — but `MAX_DENIALS` is 64, and the denial copied the
+        // whole name, `Display` cloned it again, and the join built a third copy. That
+        // is megabytes of host memory to refuse one artifact, repeatable, in the process
+        // of trying to reject it. Observable in what comes out: a bounded operation
+        // cannot be longer than the bound, however long the name was.
         let huge = "z".repeat(99_000);
         let wat = format!(
             r#"(module
@@ -5078,16 +5683,14 @@ path = "/hello/greet"
 
     #[test]
     fn one_oversized_element_section_is_not_walked_before_it_is_refused() {
-        // The count ceiling and the byte ceiling each refuse a module on their
-        // own, so the walk should be skipped when *either* is exceeded. Only
-        // the count gated it — and a single segment keeps the count at one, so
-        // the walk ran over the section on the way to a refusal the byte
-        // ceiling had already decided.
-        //
-        // Observable through what the walk reports. The segment here overflows
-        // its table, so a walk that runs finds `Some(..)`; a walk that is
-        // skipped leaves `None`. The module is refused either way, which is
-        // exactly why the verdict cannot be the thing this test looks at.
+        // The count ceiling and the byte ceiling each refuse a module on their own, so
+        // the walk should be skipped when either is exceeded. Only the count gated it,
+        // and a single segment keeps the count at one, so the walk ran over the section
+        // on the way to a refusal the byte ceiling had already decided. Observable
+        // through what the walk reports: the segment here overflows its table, so a walk
+        // that runs finds `Some(..)` and a walk that is skipped leaves `None`. The
+        // module is refused either way, which is why the verdict cannot be what this
+        // test looks at.
         let mut wasm = Vec::from(b"\0asm\x01\0\0\0".as_slice());
         // One table, funcref, minimum 1 — so five elements written at offset 0
         // is an overflow the walk would report.
@@ -5141,20 +5744,18 @@ path = "/hello/greet"
 
     #[test]
     fn one_segment_cannot_declare_more_entries_than_the_ceiling_allows() {
-        // `declared_entries` sums each *section's* leading count, which is one
-        // LEB128 per section and is what makes reading the shape cheap. The
-        // element section is the one place that undercounts: its leading count
-        // is the number of *segments*, and a segment carries its own count of
-        // items. So one passive segment holding millions of function indices
-        // added exactly one to the ceiling that exists to bound declarations
-        // before anything allocates per declaration.
+        // `declared_entries` sums each section's leading count, one LEB128 per section,
+        // which is what makes reading the shape cheap. The element section is the one
+        // place that undercounts: its leading count is the number of segments, and a
+        // segment carries its own count of items. So one passive segment holding
+        // millions of function indices added exactly one to the ceiling that exists to
+        // bound declarations before anything allocates per declaration.
         //
-        // Nothing else caught it. `MAX_TABLE_ELEMENTS` bounds what a table
-        // starts with, and a passive segment is never written to a table;
-        // `MAX_INIT_SEGMENTS` counts segments, and there is one; and the byte
-        // ceiling admits a 16 MiB section, which is millions of one-byte
-        // indices. The walk then read every one of them, and `Module::new`
-        // expanded the whole initializer list after it.
+        // Nothing else caught it. `MAX_TABLE_ELEMENTS` bounds what a table starts with,
+        // and a passive segment is never written to a table; `MAX_INIT_SEGMENTS` counts
+        // segments, and there is one; and the byte ceiling admits a 16 MiB section,
+        // which is millions of one-byte indices. The walk then read every one of them,
+        // and `Module::new` expanded the whole initializer list after it.
         fn uleb(mut value: usize, out: &mut Vec<u8>) {
             while value >= 0x80 {
                 let low = u8::try_from(value & 0x7f).expect("masked to seven bits");
@@ -5245,16 +5846,13 @@ path = "/hello/greet"
 
     #[test]
     fn the_engine_refuses_a_heap_type_this_walk_would_have_to_guess_at() {
-        // `skip_const_expr` reads `ref.null`'s heap type as a signed LEB rather
-        // than a byte. Today that is the same one byte for every heap type the
-        // engine accepts — this test is what says so, and what would notice if
-        // it stopped being true.
-        //
-        // A non-minimal encoding of `funcref` (0xf0 0x7f decodes to -16, the
-        // same value as 0x70) is the case a byte-wide read would desynchronise
-        // on. wasmi refuses it outright, so no such module ever reaches
-        // instantiation: the walk cannot be led out of step by it, and the
-        // load-time bounds check cannot be skipped through it.
+        // `skip_const_expr` reads `ref.null`'s heap type as a signed LEB rather than a
+        // byte. Today that is the same one byte for every heap type the engine accepts
+        // — this test is what says so, and what would notice if it stopped being true.
+        // A non-minimal encoding of `funcref` (0xf0 0x7f decodes to -16, the same value
+        // as 0x70) is the case a byte-wide read would desynchronise on. wasmi refuses it
+        // outright, so no such module reaches instantiation: the walk cannot be led out
+        // of step by it, and the load-time bounds check cannot be skipped through it.
         let mut module = Vec::from(b"\0asm\x01\0\0\0".as_slice());
         module.extend_from_slice(&[0x01, 0x04, 0x01, 0x60, 0x00, 0x00]); // type () -> ()
         module.extend_from_slice(&[0x03, 0x02, 0x01, 0x00]); // one function
@@ -5351,14 +5949,12 @@ path = "/hello/greet"
 
     #[test]
     fn the_metadata_walk_stops_at_the_ceiling_instead_of_finishing_the_list() {
-        // Charging every entry made an oversized list fail. It did not bound
-        // the work of discovering that it fails — the fold visited every pair
-        // first, before the permit was taken and before the guest spent any
-        // fuel — so an unbounded list still bought an unbounded scan per
-        // concurrent caller. Fixing the verdict is not fixing the cost.
-        //
-        // Observable because a stopped walk returns a floor: run to the end and
-        // the answer is the whole sum, stop at the ceiling and it is barely
+        // Charging every entry made an oversized list fail. It did not bound the work of
+        // discovering that it fails — the fold visited every pair first, before the
+        // permit was taken and before the guest spent any fuel — so an unbounded list
+        // still bought an unbounded scan per concurrent caller. Fixing the verdict is
+        // not fixing the cost. Observable because a stopped walk returns a floor: run to
+        // the end and the answer is the whole sum, stop at the ceiling and it is barely
         // past it. Same instrument as the section walk.
         let over = MAX_REQUEST_METADATA_BYTES / DROPPED_PAIR_BYTES * 16;
         let mut swarm = get("/hello/greet");
@@ -5447,16 +6043,14 @@ path = "/hello/greet"
 
     #[test]
     fn an_active_offset_this_cannot_evaluate_is_refused_rather_than_skipped() {
-        // The extended-const fix closed the door where the *walk* failed. This
-        // is the other door: the walk succeeds, and an active segment's offset
-        // cannot be evaluated. The old code reported that as "no active write
-        // to measure" — indistinguishable from a passive-only section — so the
-        // segment was copied in at instantiation with nothing having checked
-        // where it lands.
-        //
-        // The expression below is flat rather than folded: every operand is
-        // pushed before any add runs, so it is the *stack* that is exceeded,
-        // not the parser. wasmi compiles it happily.
+        // The extended-const fix closed the door where the walk failed. This is the
+        // other door: the walk succeeds and an active segment's offset cannot be
+        // evaluated. The old code reported that as "no active write to measure",
+        // indistinguishable from a passive-only section, so the segment was copied in
+        // at instantiation with nothing having checked where it lands. The expression
+        // below is flat rather than folded: every operand is pushed before any add
+        // runs, so it is the stack that is exceeded, not the parser. wasmi compiles it
+        // happily.
         let mut operands = String::new();
         for _ in 0..24 {
             operands.push_str("i32.const 0 ");
@@ -5509,15 +6103,13 @@ path = "/hello/greet"
 
     #[test]
     fn a_passive_only_data_section_is_not_a_walk_that_failed() {
-        // `data_section_end` has two ways of saying nothing: the walk failed,
-        // or the walk succeeded and there was no active write to measure. The
-        // fail-closed fallback added for extended-const offsets read both as
-        // the first and refused a module that was perfectly runnable — a
-        // passive segment is copied only by an explicit `memory.init`, never at
-        // instantiation, so it cannot be out of bounds there.
-        //
-        // The three outcomes are pinned together here because the bug was
-        // exactly their collapse into two.
+        // `data_section_end` has two ways of saying nothing: the walk failed, or the
+        // walk succeeded and there was no active write to measure. The fail-closed
+        // fallback added for extended-const offsets read both as the first and refused
+        // a perfectly runnable module — a passive segment is copied only by an explicit
+        // `memory.init`, never at instantiation, so it cannot be out of bounds there.
+        // The three outcomes are pinned together here because the bug was exactly their
+        // collapse into two.
         let passive_only = wat::parse_str(
             r#"(module
   (memory (export "memory") 1)
@@ -5630,15 +6222,13 @@ path = "/hello/greet"
     #[test]
     fn a_bidi_override_cannot_reorder_the_record_it_appears_in() {
         // `is_control` covers the C0/C1 codes and stops there, so the Unicode
-        // formatting characters went into the log verbatim. They do the same job
-        // as an ESC by other means: U+202E reverses everything after it, so a
-        // guest can write a detail that *reads* as a different record than the
-        // one the host wrote — including reading as though the denial were an
-        // allow. The operator reads that line to decide what happened.
-        //
-        // The consent screen already refuses these in a route path. A detail is
-        // evidence rather than a mount, so here they are escaped instead: the
-        // attempt survives, legibly, as an attempt.
+        // formatting characters went into the log verbatim. They do an ESC's job by
+        // other means: U+202E reverses everything after it, so a guest can write a
+        // detail that reads as a different record than the one the host wrote —
+        // including reading as though the denial were an allow. The operator reads that
+        // line to decide what happened. The consent screen already refuses these in a
+        // route path; a detail is evidence rather than a mount, so here they are
+        // escaped instead, and the attempt survives legibly as an attempt.
         let forged = guest_text("denied \u{202E}dewolla\u{202D} by policy");
         assert!(
             !forged.contains('\u{202E}') && !forged.contains('\u{202D}'),
@@ -5706,17 +6296,14 @@ path = "/hello/greet"
 
     #[test]
     fn generating_a_random_byte_costs_more_than_copying_one() {
-        // `BYTES_PER_FUEL` is a bulk-copy rate — a memcpy moves 64 bytes for
-        // about what one instruction costs, so charging them to a unit is
-        // honest. `random_get` does not copy: every byte is a whole SplitMix64
-        // step, an add, two multiplies and four shift-XOR pairs. Billing that
-        // at the copy rate sold the mixer's work at a memcpy's price while the
-        // guest held a blocking worker for it.
-        //
-        // Measured through the fuel the host actually charges, because that is
-        // the thing that was wrong. An earlier version of this test compared
-        // two constants it computed itself and passed against its own revert —
-        // it never ran `random_get` at all.
+        // `BYTES_PER_FUEL` is a bulk-copy rate: a memcpy moves 64 bytes for about what
+        // one instruction costs, so charging them to a unit is honest. `random_get` does
+        // not copy — every byte is a whole SplitMix64 step, an add, two multiplies, and
+        // four shift-XOR pairs. Billing that at the copy rate sold the mixer's work at a
+        // memcpy's price while the guest held a blocking worker for it. Measured through
+        // the fuel the host actually charges, because that is the thing that was wrong:
+        // an earlier version of this test compared two constants it computed itself,
+        // passed against its own revert, and never ran `random_get` at all.
         fn drawing(bytes: u32) -> u64 {
             let wat = format!(
                 r#"(module
@@ -5763,7 +6350,7 @@ path = "/hello/greet"
             ..ResourceLimits::default()
         };
         let budget = limits.max_response_bytes * 2 + 4096;
-        let mut state = HostState::new("hello".to_owned(), limits, b"");
+        let mut state = bare_state(limits, b"");
 
         // One byte at a time, because that is the growth pattern that doubles:
         // a guest writing its frame through a byte-at-a-time formatter is
@@ -5788,20 +6375,17 @@ path = "/hello/greet"
 
     #[test]
     fn one_read_cannot_copy_the_whole_frame_out_of_the_queue() {
-        // `fd_write` and `random_get` both bound their scratch to
-        // `HOST_IO_CHUNK_BYTES`, and `FIXED_HOST_BUFFER_BYTES` budgets exactly
-        // one such buffer. The read path did not: the iovec length is the
-        // guest's to choose, so one iovec spanning the whole frame made a
-        // second copy of it — live beside the queue it was copied out of, which
-        // keeps its allocation as it drains. A frame is metadata plus a base64
-        // body with JSON escaping over both, so that copy is several times the
-        // raw request, and none of it was in the footprint the concurrency
-        // product is validated against.
-        //
-        // Returning less than was asked for is what the call already promises:
-        // the queue running dry short-reads today, so a guest that does not
+        // `fd_write` and `random_get` both bound their scratch to `HOST_IO_CHUNK_BYTES`,
+        // and `FIXED_HOST_BUFFER_BYTES` budgets exactly one such buffer. The read path
+        // did not: the iovec length is the guest's to choose, so one iovec spanning the
+        // whole frame made a second copy of it, live beside the queue it was copied out
+        // of, which keeps its allocation as it drains. A frame is metadata plus a base64
+        // body with JSON escaping over both, so that copy is several times the raw
+        // request, and none of it was in the footprint the concurrency product is
+        // validated against. Returning less than was asked for is what the call already
+        // promises: the queue running dry short-reads today, so a guest that does not
         // loop is already broken.
-        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        let mut state = bare_state(ResourceLimits::default(), b"");
         state.stdin = VecDeque::from(vec![b'x'; HOST_IO_CHUNK_BYTES * 4]);
 
         let chunk = state.take_stdin(HOST_IO_CHUNK_BYTES * 4);
@@ -5830,7 +6414,7 @@ path = "/hello/greet"
 
         // A read smaller than the bound is unaffected — the cap is a ceiling,
         // not a quantum.
-        let mut small = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        let mut small = bare_state(ResourceLimits::default(), b"");
         small.stdin = VecDeque::from(b"{\"op\":\"request\"}".to_vec());
         assert_eq!(small.take_stdin(4).len(), 4, "a short read must stay short");
     }
@@ -5842,7 +6426,7 @@ path = "/hello/greet"
         // path the marker could never fire, and a flood that lost its most
         // recent output read as though the guest had simply stopped there. The
         // suffix is usually the interesting part of a failure.
-        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        let mut state = bare_state(ResourceLimits::default(), b"");
         state.write_stderr("a".repeat(STDERR_EXCERPT * 2).as_bytes());
         let excerpt = state.stderr_excerpt();
         assert!(
@@ -5853,7 +6437,7 @@ path = "/hello/greet"
 
         // And an excerpt that fits says nothing of the kind — the marker has to
         // mean something.
-        let mut short = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        let mut short = bare_state(ResourceLimits::default(), b"");
         short.write_stderr(b"panicked at the disco");
         let whole = short.stderr_excerpt();
         assert_eq!(
@@ -5901,7 +6485,7 @@ path = "/hello/greet"
         // The flood the streaming exists for: a full budget of bytes that are
         // each their own invalid subpart, so the lossy form is three times the
         // buffer. What is kept is still one excerpt.
-        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        let mut state = bare_state(ResourceLimits::default(), b"");
         state.write_stderr(&vec![0xff; STDERR_BUDGET_BYTES * 2]);
         assert_eq!(
             state.stderr.len(),
@@ -5928,7 +6512,7 @@ path = "/hello/greet"
     fn stderr_is_escaped_as_well_as_bounded() {
         // Same hazard, same answer: stderr was truncated but not neutralised,
         // so a guest could forge a record inside its 512-character excerpt.
-        let mut state = HostState::new("hello".to_owned(), ResourceLimits::default(), b"");
+        let mut state = bare_state(ResourceLimits::default(), b"");
         state.write_stderr(b"panicked\n2026-01-01  INFO forged\x1b[2K");
         let excerpt = state.stderr_excerpt();
         assert!(
@@ -6200,15 +6784,13 @@ path = "/hello/greet"
 
     #[test]
     fn a_module_pays_instantiation_fuel_for_the_memory_it_starts_with() {
-        // A module can declare a large *initial* linear memory and no data
-        // segments at all, so every init-section term prices none of it — and
-        // the host still allocates and zero-fills the whole thing on each
-        // request, before the guest runs an instruction. That is host work
-        // proportional to a guest-declared quantity, which is exactly what the
-        // copying charge exists to make cost something.
-        //
-        // The limiter already bounds how much memory. It cannot bound how often
-        // a client asks for it to be zeroed.
+        // A module can declare a large initial linear memory and no data segments at
+        // all, so every init-section term prices none of it — and the host still
+        // allocates and zero-fills the whole thing on each request, before the guest
+        // runs an instruction. That is host work proportional to a guest-declared
+        // quantity, exactly what the copying charge exists to make cost something. The
+        // limiter already bounds how much memory; it cannot bound how often a client
+        // asks for it to be zeroed.
         let limits = ResourceLimits {
             memory_bytes: 64 * 1024 * 1024,
             ..ResourceLimits::default()
@@ -6407,20 +6989,16 @@ path = "/hello/greet"
 
     #[test]
     fn the_segment_ceiling_is_enforced_by_the_pre_compilation_gate() {
-        // Not merely "the module is refused" — *where* it is refused is the
-        // whole point. `from_module` calls `refuse_unbounded_shape` before
-        // `Module::new` precisely because compiling is what builds a
-        // representation of every declaration; a ceiling checked after it is a
-        // ceiling checked too late. These two ceilings were checked after it,
-        // under a comment saying they must not be.
-        //
-        // A module can sit over `MAX_INIT_SEGMENTS` (4,096) and still be far
-        // under `MAX_DECLARED_ENTRIES` (1,000,000), so nothing else refused it
-        // first and wasmi expanded every segment before the answer came back.
-        //
-        // Asserting through `refuse_unbounded_shape` directly is what makes
-        // this about ordering: the gate that runs first has to be the one that
-        // says no.
+        // Not merely "the module is refused" — where it is refused is the point.
+        // `from_module` calls `refuse_unbounded_shape` before `Module::new` precisely
+        // because compiling is what builds a representation of every declaration, so a
+        // ceiling checked after it is checked too late. These two ceilings were checked
+        // after it, under a comment saying they must not be. A module can sit over
+        // `MAX_INIT_SEGMENTS` (4,096) and still be far under `MAX_DECLARED_ENTRIES`
+        // (1,000,000), so nothing else refused it first and wasmi expanded every segment
+        // before the answer came back. Asserting through `refuse_unbounded_shape`
+        // directly is what makes this about ordering: the gate that runs first has to be
+        // the one that says no.
         use std::fmt::Write as _;
 
         let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");
@@ -6453,16 +7031,14 @@ path = "/hello/greet"
 
     #[test]
     fn a_module_past_the_segment_ceiling_is_refused_without_walking_its_segments() {
-        // The count check runs before the per-segment walks now, because the
-        // walk was work an artifact could buy at two bytes a segment purely to
-        // reach the refusal that exists to bound it.
-        //
-        // The risk in skipping a walk is that the walk was also doing a bounds
-        // check — the fail-open shape this file has already been bitten by
-        // twice. So the case that matters is a module that is over the ceiling
-        // *and* carries a segment past the end of its memory: it must still be
-        // refused. The sibling tests above cover the other side, that a module
-        // under the ceiling is still walked and still caught.
+        // The count check runs before the per-segment walks now, because the walk was
+        // work an artifact could buy at two bytes a segment purely to reach the refusal
+        // that exists to bound it. The risk in skipping a walk is that the walk was also
+        // doing a bounds check — the fail-open shape this file has been bitten by twice.
+        // So the case that matters is a module over the ceiling that also carries a
+        // segment past the end of its memory: it must still be refused. The sibling
+        // tests above cover the other side, that a module under the ceiling is still
+        // walked and still caught.
         use std::fmt::Write as _;
 
         let mut wat = String::from("(module\n  (memory (export \"memory\") 1)\n");

@@ -45,7 +45,6 @@
     )
 )]
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -456,62 +455,16 @@ fn sanitize_id(id: &str) -> String {
 /// Write owner-only, through a temp file, so a reader never sees a partial
 /// capsule and the contents are never group- or world-readable.
 ///
-/// The same shape as [`acme::store`](crate::acme) uses for private keys, and
-/// for the same reason — the bytes are secret:
-///
-/// * the directory is created (and, on unix, *re-set*) `0o700`, because
-///   `create_dir_all` applies the process umask and a permissive umask would
-///   leave a world-readable directory of production request data;
-/// * the temp file is opened `create_new` under a random name, so the write
-///   can never follow a symlink an attacker planted at a predictable path, and
-///   never truncates a file it did not create;
-/// * its mode is set explicitly after the open, because `OpenOptions::mode` is
-///   also umask-masked.
+/// Delegates to the shared [`crate::fs_atomic`] helper (issue #1864), which
+/// carries this same shape — the directory is created (and, on unix,
+/// *re-set*) `0o700`, the temp file is opened `create_new` under a random
+/// name so the write can never follow a planted symlink, and its mode is set
+/// explicitly after the open since `OpenOptions::mode` is umask-masked. This
+/// is the same discipline [`acme::store`](crate::acme) uses for private keys,
+/// and for the same reason — the bytes are secret.
 fn write_atomically(dir: &Path, path: &Path, json: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let temp = temp_path(path);
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-
-    {
-        let mut file = options.open(&temp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(json)?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(error)
-        }
-    }
-}
-
-/// An unpredictable sibling path for the temp file.
-///
-/// `<capsule>.json.tmp` is guessable, and `create_new` on a guessable path
-/// fails outright once something already sits there — a denial of capture, and
-/// on a shared `tmp/` a way to point the write somewhere else. The suffix comes
-/// from the same entropy the framework uses elsewhere.
-fn temp_path(path: &Path) -> PathBuf {
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    path.with_extension(format!("json.{nonce}.tmp"))
+    crate::fs_atomic::ensure_owner_only_dir(dir)?;
+    crate::fs_atomic::write_owner_only(path, json)
 }
 
 /// How many existing capsules may remain when a new one is about to be
@@ -1205,24 +1158,6 @@ mod tests {
             .exists(),
             "the temp file must not be left behind"
         );
-    }
-
-    #[test]
-    fn a_temp_path_is_unpredictable_and_ends_in_tmp() {
-        let path = Path::new("tmp/capsules/20250101T000000-000000-req.json");
-        let first = temp_path(path);
-        let second = temp_path(path);
-        assert_ne!(
-            first, second,
-            "a predictable temp path can be pre-created or symlinked by anyone \
-             who can write the directory"
-        );
-        for candidate in [&first, &second] {
-            assert!(
-                candidate.to_string_lossy().ends_with(".tmp"),
-                "the temp file must not look like a capsule to the pruner: {candidate:?}"
-            );
-        }
     }
 
     #[test]

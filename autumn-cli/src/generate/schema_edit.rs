@@ -493,20 +493,17 @@ pub fn position_triggers_up_sql_for(
                 } else {
                     scope_cond_new.clone()
                 };
-                // A transaction-scoped advisory lock, keyed by table+scope
-                // (a constant second key when unscoped, so every insert into
-                // the table serializes against every other). Without it,
-                // two concurrent `BEFORE INSERT`s under READ COMMITTED can
-                // both read the same `MAX(position)` before either commits
-                // and be assigned the same value — there is no UNIQUE
-                // constraint on `(scope, position)` to catch it (positions
-                // are only ever *maintained* uniquely, by these triggers and
-                // `move_to`'s own locking; nothing at the schema level
-                // enforces it, matching how `move_to` itself achieves
-                // exclusivity through locking rather than a constraint).
-                // `pg_advisory_xact_lock` auto-releases at commit/rollback,
-                // so it composes with the rest of the inserting transaction
-                // with no separate unlock statement.
+                // A transaction-scoped advisory lock keyed by table and scope, with
+                // a constant second key when unscoped so every insert into the table
+                // serializes against every other. Without it, two concurrent `BEFORE
+                // INSERT`s under READ COMMITTED can both read the same
+                // `MAX(position)` before either commits and be assigned the same
+                // value. There is no UNIQUE constraint on `(scope, position)` to
+                // catch it: positions are only ever maintained uniquely, by these
+                // triggers and `move_to`'s own locking, and nothing at the schema
+                // level enforces it. `pg_advisory_xact_lock` auto-releases at commit
+                // or rollback, so it composes with the rest of the inserting
+                // transaction with no separate unlock statement.
                 let lock_key2 = scope.map_or_else(
                     || "0".to_owned(),
                     |s| format!("hashtext(NEW.\"{s}\"::text)"),
@@ -526,30 +523,28 @@ pub fn position_triggers_up_sql_for(
                     "CREATE TRIGGER {table}_{position}_assign_trg BEFORE INSERT ON \"{table}\" \
                      FOR EACH ROW EXECUTE FUNCTION {table}_{position}_assign();"
                 );
-                // Same advisory lock key as the assign trigger, keyed by
-                // `OLD`'s scope value (unchanged from `NEW`'s for a row that
-                // isn't itself being re-scoped): without it, a concurrent
-                // insert's `SELECT MAX(position)` (a plain read, not
-                // row-locked) can run against a snapshot taken before this
-                // compaction's shift commits, computing a next-position that
-                // leaves a gap where the compacted range used to end. Taking
-                // the same lock here makes insert and delete-compaction on
-                // the same scope fully serialize, closing that window.
+                // The same advisory lock key as the assign trigger, keyed by
+                // `OLD`'s scope value, unchanged from `NEW`'s for a row that is
+                // not itself being re-scoped. Without it, a concurrent insert's
+                // `SELECT MAX(position)` — a plain read, not row-locked — can run
+                // against a snapshot taken before this compaction's shift commits,
+                // computing a next-position that leaves a gap where the compacted
+                // range used to end. The shared lock makes insert and
+                // delete-compaction on one scope serialize fully.
                 let lock_key2_old = scope.map_or_else(
                     || "0".to_owned(),
                     |s| format!("hashtext(OLD.\"{s}\"::text)"),
                 );
-                // On a `--soft-delete` model this trigger only ever fires
-                // from `purge` — every row it hard-deletes was *already*
-                // soft-deleted (the scaffold's purge handler only reaches
-                // rows filtered to `deleted_at IS NOT NULL`), whose position
-                // was already excluded from the live sequence by
-                // `compact_soft` at the time it was soft-deleted. Running
-                // this compaction unconditionally would shift the live rows
-                // a SECOND time for the same removal, producing a duplicate
-                // live position. Skip entirely when `OLD.deleted_at` is set;
-                // on a non-soft-delete model there is no such column and
-                // this trigger is the only compaction path, so it always runs.
+                // On a `--soft-delete` model this trigger fires only from `purge`,
+                // and every row it hard-deletes was already soft-deleted — the
+                // scaffold's purge handler reaches only rows filtered to
+                // `deleted_at IS NOT NULL`, whose position `compact_soft` already
+                // excluded from the live sequence at soft-delete time. Running this
+                // compaction unconditionally would shift the live rows a second time
+                // for the same removal, producing a duplicate live position. Skip
+                // entirely when `OLD.deleted_at` is set. On a non-soft-delete model
+                // there is no such column and this is the only compaction path, so
+                // it always runs.
                 let (compact_guard_open, compact_guard_close) = if has_soft_delete {
                     ("IF OLD.deleted_at IS NULL THEN\n    ", "\n  END IF;")
                 } else {
@@ -588,21 +583,18 @@ pub fn position_triggers_up_sql_for(
                         "CREATE TRIGGER {table}_{position}_compact_soft_trg AFTER UPDATE OF deleted_at ON \"{table}\" \
                          FOR EACH ROW EXECUTE FUNCTION {table}_{position}_compact_soft();"
                     );
-                    // Codex review: `compact_soft` only ever handles the
-                    // soft-delete transition (`deleted_at` NULL -> non-NULL).
-                    // The generated repository's `restore()` — reachable from
-                    // the scaffold's Trash page — performs the OPPOSITE
-                    // transition, and without a trigger of its own the
-                    // restored row re-enters the live set still carrying
-                    // whatever stale position it had when it was soft-deleted
-                    // — a position some other, still-live row may since have
-                    // taken, producing a duplicate. Mirrors the insert-assign
-                    // trigger exactly (same advisory lock key, same
-                    // append-at-the-end `MAX(position) + 1` read, now keyed
-                    // off `NEW`'s scope since a restore never itself changes
-                    // scope) rather than trying to recreate the row's old
-                    // position, which this slice does not attempt to
-                    // preserve across a soft-delete/restore round trip.
+                    // `compact_soft` handles only the soft-delete transition,
+                    // `deleted_at` NULL to non-NULL. The generated repository's
+                    // `restore()`, reachable from the scaffold's Trash page, performs
+                    // the opposite transition, and without a trigger of its own the
+                    // restored row re-enters the live set still carrying whatever
+                    // stale position it had when soft-deleted — a position some other
+                    // still-live row may since have taken, producing a duplicate.
+                    // This mirrors the insert-assign trigger exactly: same advisory
+                    // lock key, same append-at-the-end `MAX(position) + 1` read, now
+                    // keyed off `NEW`'s scope since a restore never changes scope. It
+                    // does not try to recreate the row's old position, which this
+                    // slice does not preserve across a soft-delete and restore.
                     let _ = writeln!(
                         out,
                         "CREATE FUNCTION {table}_{position}_restore() RETURNS TRIGGER AS $$\n\
@@ -620,27 +612,25 @@ pub fn position_triggers_up_sql_for(
                          EXECUTE FUNCTION {table}_{position}_restore();"
                     );
                 }
-                // Issue #1358 review: an ordinary `UPDATE` can reassign a
-                // scoped row's scope FK (e.g. dragging a Kanban card to a
-                // different board via `board_id`) — nothing about `position`
-                // makes that column immutable. Without this trigger the row
-                // keeps its old position, leaving a gap in the old scope and
-                // usually a duplicate in the new one. `BEFORE UPDATE` (not
-                // `AFTER`) because only a `BEFORE` trigger can set `NEW`'s
-                // position; the compaction UPDATE and the append-to-new-scope
-                // assignment both run inside the same function/statement, so
-                // a hard crash mid-trigger can't leave one done without the
-                // other. Locks BOTH the old and new scope's advisory key —
-                // always in ascending-hash order, mirroring `move_to`'s
-                // fixed id-ascending row-lock order — so two rows swapping
-                // scopes concurrently can't deadlock each other; a rescope
-                // racing a plain insert/delete/move_to on either scope is
-                // still safe (same lock key, Postgres's deadlock detector
-                // aborts one side of any residual cycle rather than
-                // corrupting data). Skipped for soft-deleted rows on either
-                // side of the change (`compact_soft`/restore already own
-                // that transition) and for unscoped position fields (no
-                // scope column exists to reassign).
+                // #1358 review: an ordinary `UPDATE` can reassign a scoped row's
+                // scope FK — dragging a Kanban card to a different board via
+                // `board_id` — since nothing about `position` makes that column
+                // immutable. Without this trigger the row keeps its old position,
+                // leaving a gap in the old scope and usually a duplicate in the new
+                // one. `BEFORE UPDATE`, not `AFTER`, because only a `BEFORE` trigger
+                // can set `NEW`'s position; the compaction UPDATE and the
+                // append-to-new-scope assignment both run inside the same function
+                // and statement, so a hard crash mid-trigger cannot leave one done
+                // without the other. It locks both the old and new scope's advisory
+                // key, always in ascending-hash order, mirroring `move_to`'s fixed
+                // id-ascending row-lock order, so two rows swapping scopes
+                // concurrently cannot deadlock. A rescope racing a plain insert,
+                // delete, or move_to on either scope is still safe: same lock key,
+                // and Postgres's deadlock detector aborts one side of any residual
+                // cycle rather than corrupting data. Skipped for soft-deleted rows on
+                // either side of the change, where `compact_soft` and restore own the
+                // transition, and for unscoped position fields, which have no scope
+                // column to reassign.
                 if let Some(scope_col) = scope {
                     let rescope_when = if has_soft_delete {
                         format!(
@@ -733,19 +723,17 @@ pub fn position_triggers_up_sql_for(
                          END;"
                     );
                 }
-                // Same reasoning as the Postgres `rescope` trigger above: an
-                // ordinary `UPDATE` reassigning a scoped row's scope FK must
-                // compact the old scope's gap and append the row to the end
-                // of the new scope, or the contiguous invariant breaks on a
-                // common "move card to another board" operation. `SQLite`
-                // can't mutate `NEW` in a `BEFORE` trigger, so this runs
-                // `AFTER UPDATE` and corrects the already-written row with a
-                // follow-up `UPDATE ... WHERE id = new.id`, mirroring the
-                // `_assign` trigger's own after-the-fact correction. No
-                // locking needed — `SQLite` has none, and write-write
-                // correctness rests on `scoped_immediate_transaction`'s
-                // `BEGIN IMMEDIATE` the same way every other position
-                // trigger here does.
+                // Same reasoning as the Postgres `rescope` trigger above: an ordinary
+                // `UPDATE` reassigning a scoped row's scope FK must compact the old
+                // scope's gap and append the row to the end of the new scope, or the
+                // contiguous invariant breaks on a common "move card to another
+                // board" operation. SQLite cannot mutate `NEW` in a `BEFORE` trigger,
+                // so this runs `AFTER UPDATE` and corrects the already-written row
+                // with a follow-up `UPDATE ... WHERE id = new.id`, mirroring the
+                // `_assign` trigger's own after-the-fact correction. No locking is
+                // needed: SQLite has none, and write-write correctness rests on
+                // `scoped_immediate_transaction`'s `BEGIN IMMEDIATE`, as it does for
+                // every other position trigger here.
                 if let Some(scope_col) = scope {
                     let rescope_when = if has_soft_delete {
                         format!(
@@ -1172,27 +1160,26 @@ pub fn add_columns_up_sql_for(
                 f.name
             )));
         }
-        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
-        // DEFAULT (issue #1614 AC #4). This path carries no per-field default,
-        // so any NOT NULL added column is rejected at generate time rather than
-        // emitting DDL that breaks on SQLite. Postgres is unaffected (its
-        // output stays byte-for-byte identical), and a NOT NULL column inside
-        // CREATE TABLE (the `generate model` path) is likewise fine on SQLite.
-        // Issue #1318: `lock_version` is the one column this path can default
-        // on its own. `#[lock_version]` makes it DB-managed — the generated
-        // `New{Model}` never names it — so a bare `NOT NULL` add would leave
-        // every subsequent INSERT failing, and the retrofit ("add optimistic
-        // locking to a resource I already shipped") is the *normal* way this
-        // column arrives. `DEFAULT 0` also backfills existing rows in one
-        // statement, which is why this add needs neither the blocking-safety
-        // banner nor the SQLite refusal below.
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT (#1614
+        // AC #4). This path carries no per-field default, so any NOT NULL added column is
+        // rejected at generate time rather than emitting DDL that breaks on SQLite.
+        // Postgres is unaffected — its output stays byte for byte identical — and a NOT
+        // NULL column inside CREATE TABLE, the `generate model` path, is likewise fine on
+        // SQLite.
         //
-        // Issue #1384: a `{translatable}` column is the same shape of retrofit
-        // — the container column is `NOT NULL` and defaults to the empty JSON
-        // object `'{}'`, a constant that backfills every existing row in one
-        // statement. So, like `lock_version`, it needs neither the blocking
-        // banner nor the SQLite refusal, and `autumn migrate check` classifies
-        // the result as plain `ADD COLUMN NOT NULL DEFAULT <constant>` — safe.
+        // #1318: `lock_version` is the one column this path can default on its own.
+        // `#[lock_version]` makes it DB-managed, so the generated `New{Model}` never names
+        // it and a bare `NOT NULL` add would leave every subsequent INSERT failing — and
+        // the retrofit, "add optimistic locking to a resource I already shipped", is the
+        // normal way this column arrives. `DEFAULT 0` also backfills existing rows in one
+        // statement, which is why this add needs neither the blocking-safety banner nor
+        // the SQLite refusal below.
+        //
+        // #1384: a `{translatable}` column is the same shape of retrofit — the container
+        // column is `NOT NULL` and defaults to the empty JSON object `'{}'`, a constant
+        // that backfills every existing row in one statement. Like `lock_version` it needs
+        // neither the banner nor the refusal, and `autumn migrate check` classifies the
+        // result as a plain, safe `ADD COLUMN NOT NULL DEFAULT <constant>`.
         let lock_version_default = super::model::is_lock_version_column(f);
         let inherent_default = f.sql_default();
         let has_default = lock_version_default || inherent_default.is_some();
@@ -1516,16 +1503,15 @@ pub fn remove_columns_up_sql_for(
              -- old replicas that reference this column will fail until restarted; \
              use expand/contract"
         );
-        // SQLite: drop the generator's index for this field first (see doc
-        // comment). SQLite refuses `DROP COLUMN` while any index references the
-        // column. The generator names a plain `--index` field's index and a
-        // `references` field's auto-index identically (`idx_<table>_<col>`), and
-        // the DSL/schema can't tell after the fact whether a column carried a
-        // plain index — so emit `DROP INDEX IF EXISTS idx_<table>_<col>;`
-        // unconditionally (a safe no-op via `IF EXISTS` for a non-indexed
-        // column), plus the `unique` field's uniquely-named index. Names are
-        // derived with the same helpers the ADD/CREATE paths use so the DROP
-        // matches the existing CREATE INDEX.
+        // SQLite: drop the generator's index for this field first (see doc comment).
+        // SQLite refuses `DROP COLUMN` while any index references the column. The
+        // generator names a plain `--index` field's index and a `references` field's
+        // auto-index identically (`idx_<table>_<col>`), and the DSL and schema cannot
+        // tell after the fact whether a column carried a plain index, so emit `DROP
+        // INDEX IF EXISTS idx_<table>_<col>;` unconditionally — a safe no-op for a
+        // non-indexed column — plus the `unique` field's uniquely-named index. Names
+        // come from the same helpers the ADD and CREATE paths use, so the DROP matches
+        // the existing CREATE INDEX.
         if backend == DatabaseBackend::Sqlite {
             let _ = writeln!(out, "DROP INDEX IF EXISTS idx_{table}_{};", f.name);
             if f.unique {
@@ -1585,16 +1571,14 @@ pub fn remove_columns_down_sql_for(
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
     for f in fields.iter().rev() {
-        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a
-        // DEFAULT (issue #1614 AC #4). The rollback re-adds the dropped column
-        // with the same `ADD COLUMN` DDL and carries no per-field default, so a
-        // NOT NULL re-added column is rejected at generate time — mirroring the
-        // forward path (`add_columns_up_sql_for`) for a consistent generate
-        // contract. Postgres is unaffected (its output stays byte-for-byte
-        // identical), and a NOT NULL column inside CREATE TABLE is likewise
-        // fine on SQLite.
-        // Issue #1384: a `{translatable}` column carries its own constant
-        // default (`'{}'`), so the rollback's re-add is valid on SQLite too.
+        // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT
+        // (#1614 AC #4). The rollback re-adds the dropped column with the same `ADD
+        // COLUMN` DDL and carries no per-field default, so a NOT NULL re-added column
+        // is rejected at generate time, mirroring the forward path
+        // (`add_columns_up_sql_for`) for a consistent generate contract. Postgres is
+        // unaffected, and a NOT NULL column inside CREATE TABLE is likewise fine on
+        // SQLite. A `{translatable}` column (#1384) carries its own constant default
+        // (`'{}'`), so its rollback re-add is valid on SQLite too.
         let inherent_default = f.sql_default();
         if backend == DatabaseBackend::Sqlite && !f.nullable && inherent_default.is_none() {
             return Err(super::sqlite_add_not_null_without_default_error(
@@ -6546,15 +6530,13 @@ mod tests {
 
     #[test]
     fn unique_index_name_disambiguates_coincidental_collision_with_plain_index() {
-        // Regression guard (issue #1032 review follow-up): a plain index
-        // always names itself after its own column (`idx_<table>_<name>`),
-        // with no `_unique` suffix. If some *other* field in the same table
-        // happens to be literally named `<field>_unique`, that field's own
-        // plain index collides with `field`'s unique index name even though
-        // the two fields are otherwise unrelated (`email:unique` +
-        // `email_unique:String --index email_unique` both want
-        // `idx_users_email_unique`) -- the generated migration would fail
-        // with "relation already exists" before the table was ever usable.
+        // Regression guard (#1032 review follow-up): a plain index always names itself
+        // after its own column (`idx_<table>_<name>`), with no `_unique` suffix. If some
+        // other field in the same table happens to be named literally `<field>_unique`,
+        // that field's plain index collides with `field`'s unique index name even though
+        // the two are unrelated: `email:unique` and `email_unique:String --index
+        // email_unique` both want `idx_users_email_unique`, and the generated migration
+        // would fail with "relation already exists" before the table was ever usable.
         let colliding_field = fields(&["email_unique:String"]);
         let name = unique_index_name("users", "email", &colliding_field);
         assert_ne!(
@@ -6632,15 +6614,13 @@ mod tests {
 
     #[test]
     fn add_columns_up_sql_avoids_name_collision_with_earlier_migrations_columns() {
-        // Regression guard (issue #1032 review follow-up): `add_columns_up_sql`
-        // only ever sees the columns being added in *this* `AddXToY`
-        // migration -- not a table's other, already-existing columns from an
-        // earlier, separately-run migration. A field named `email_unique`
-        // added back when the table was first created would otherwise still
-        // collide with a `unique` field named `email` added later, with no
-        // way for this call alone to know `email_unique` already exists.
-        // `src/schema.rs` (kept in sync by every model/scaffold generator) is
-        // what lets this call see across that gap.
+        // Regression guard (#1032 review follow-up): `add_columns_up_sql` sees only the
+        // columns being added in this `AddXToY` migration, not a table's other,
+        // already-existing columns from an earlier, separately-run one. A field named
+        // `email_unique` added when the table was first created would otherwise still
+        // collide with a `unique` field named `email` added later, with no way for this
+        // call alone to know `email_unique` exists. `src/schema.rs`, kept in sync by
+        // every model and scaffold generator, is what lets this call see across that gap.
         let existing_schema = append_schema_table("", "users", &fields(&["email_unique:String"]));
         let sql = add_columns_up_sql("users", &fields(&["email:String:unique"]), &existing_schema);
         assert!(
@@ -9206,16 +9186,14 @@ pub struct Comment {
 
     #[test]
     fn dev_dependency_test_support_mirrors_aliased_path_source() {
-        // Regression test (Codex review, issue #1023): a renamed dep, e.g.
-        // `autumn_web = { package = "autumn-web", path = "../autumn" }`,
-        // wasn't recognized at all -- the detector only matched the literal
-        // `autumn-web` key, so it fell back to a mismatched crates.io
-        // version. Confirmed via `cargo metadata --offline` that Cargo
-        // unifies dependency sources by *package name* (here "autumn-web"),
-        // not by the local alias key, so an unaliased `autumn-web = { path
-        // = "../autumn", ... }` dev-dependency (mirroring just the source,
-        // not the alias) resolves to the identical node as the aliased
-        // `[dependencies]` entry.
+        // Regression test (Codex review, #1023): a renamed dep such as `autumn_web = {
+        // package = "autumn-web", path = "../autumn" }` was not recognized at all — the
+        // detector matched only the literal `autumn-web` key, so it fell back to a
+        // mismatched crates.io version. `cargo metadata --offline` confirms Cargo unifies
+        // dependency sources by package name, here "autumn-web", not by the local alias
+        // key, so an unaliased `autumn-web = { path = "../autumn", ... }` dev-dependency,
+        // mirroring the source rather than the alias, resolves to the identical node as
+        // the aliased `[dependencies]` entry.
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web = { package = \"autumn-web\", path = \"../autumn\" }\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
@@ -9282,15 +9260,13 @@ pub struct Comment {
 
     #[test]
     fn dev_dependency_test_support_mirrors_existing_pinned_version_not_cli_version() {
-        // Regression test (Codex review, issue #1023): the fallback used to
-        // insert `version = "<CLI's own CARGO_PKG_VERSION>"` unconditionally,
-        // ignoring whatever `[dependencies]` actually pins. When the two
-        // differ (e.g. a project pinned to an older `autumn-web = "0.5"`
-        // while the CLI itself is `0.6`), Cargo's resolver can reject the
-        // manifest outright if the two version requirements don't overlap
-        // (confirmed via `cargo metadata`: "failed to select a version").
-        // The dev-dependency entry must mirror the *existing* requirement,
-        // not the CLI's.
+        // Regression test (Codex review, #1023): the fallback used to insert `version =
+        // "<CLI's own CARGO_PKG_VERSION>"` unconditionally, ignoring whatever
+        // `[dependencies]` actually pins. When the two differ — a project pinned to an
+        // older `autumn-web = "0.5"` while the CLI is `0.6` — Cargo's resolver can reject
+        // the manifest outright if the requirements do not overlap; `cargo metadata`
+        // reports "failed to select a version". The dev-dependency entry must mirror the
+        // existing requirement, not the CLI's.
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5\"\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
@@ -9332,17 +9308,15 @@ pub struct Comment {
 
     #[test]
     fn dev_dependency_test_support_mirrors_dotted_aliased_path_source() {
-        // Regression test (Codex review, issue #1023): the renamed-dep fixes
-        // covered the inline-table (`autumn_web = { package = "autumn-web",
-        // ... }`) and subtable (`[dependencies.autumn_web]`) alias shapes,
-        // but not Cargo's dotted renamed-dependency form
-        // (`autumn_web.package = "autumn-web"` plus `autumn_web.path =
-        // "../autumn"` on separate lines). The alias-detection branch split
-        // on the key's dot and compared the whole `autumn_web.package`
-        // string against `autumn_web`, so it never matched and fell through
-        // to a mismatched crates.io version. Confirmed via `cargo metadata
-        // --offline` that two different paths for the same package name
-        // conflict, same as the other alias forms.
+        // Regression test (Codex review, #1023): the renamed-dep fixes covered the
+        // inline-table (`autumn_web = { package = "autumn-web", ... }`) and subtable
+        // (`[dependencies.autumn_web]`) alias shapes, but not Cargo's dotted
+        // renamed-dependency form — `autumn_web.package = "autumn-web"` plus
+        // `autumn_web.path = "../autumn"` on separate lines. The alias-detection branch
+        // split on the key's dot and compared the whole `autumn_web.package` string
+        // against `autumn_web`, so it never matched and fell through to a mismatched
+        // crates.io version. `cargo metadata --offline` confirms two different paths for
+        // the same package name conflict, as with the other alias forms.
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn_web.package = \"autumn-web\"\nautumn_web.path = \"../autumn\"\n";
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(
@@ -9543,14 +9517,12 @@ pub struct Comment {
 
     #[test]
     fn tokio_test_features_mirrors_path_source() {
-        // Regression test (Codex review, issue #1023): the same
-        // source-mismatch bug that motivated the whole autumn-web
-        // source-mirroring saga also applies to tokio -- if [dependencies]
-        // sources tokio from a path/workspace/git override (e.g. an
-        // internal fork), inserting a crates.io `version = "1"` dev entry
-        // makes Cargo reject the manifest ("Dependency 'tokio' has
-        // different source paths depending on the build target"; confirmed
-        // via a hand-built `cargo metadata --offline` reproduction). The
+        // Regression test (Codex review, #1023): the source-mismatch bug behind the whole
+        // autumn-web source-mirroring saga also applies to tokio. If `[dependencies]`
+        // sources tokio from a path, workspace, or git override — an internal fork —
+        // inserting a crates.io `version = "1"` dev entry makes Cargo reject the manifest
+        // with "Dependency 'tokio' has different source paths depending on the build
+        // target", confirmed via a hand-built `cargo metadata --offline` reproduction. The
         // new entry must mirror the existing path source instead.
         let cargo =
             "[package]\nname=\"x\"\n\n[dependencies]\ntokio = { path = \"../fake-tokio\" }\n";

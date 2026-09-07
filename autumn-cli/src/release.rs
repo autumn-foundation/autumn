@@ -639,16 +639,11 @@ fn render_for_cli(
     split_workers: bool,
     cli_version: &str,
 ) -> String {
-    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable
-    // build` on the default path, which needs only the cargo-auditable crate —
-    // it is subject to the same pin gate as `autumn sbom`. An older pinned CLI
-    // rejects the argument and the image fails to build.
-    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable
-    // build` on the default path, which needs only the cargo-auditable crate —
-    // it is subject to the same pin gate as `autumn sbom`: an older pinned CLI
-    // rejects the argument and the image fails to build. The explanatory
-    // comment is gated with it, so a generated Dockerfile never documents a
-    // flag it does not pass.
+    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable build`
+    // on the default path, which needs only the cargo-auditable crate — it is subject
+    // to the same pin gate as `autumn sbom`: an older pinned CLI rejects the argument
+    // and the image fails to build. The explanatory comment is gated with it, so a
+    // generated Dockerfile never documents a flag it does not pass.
     let (embed_auditable_note, embed_auditable) = if cli_supports_supply_chain_flags(cli_version) {
         (
             "# `--auditable` routes BOTH compile phases through `cargo auditable`, so the\n\
@@ -683,15 +678,13 @@ fn render_for_cli(
         )
     };
     // The in-image SBOM needs `autumn sbom`, which only a CLI at or past
-    // SUPPLY_CHAIN_MIN_CLI_VERSION has. Emitting these steps against an older pin
-    // would make `docker build` fail outright, so they are omitted instead —
-    // the image is merely SBOM-less, not broken.
-    //
-    // The SBOM must resolve the SAME features the binary above was compiled
-    // with. The embed build turns on `embed-assets`, which pulls in optional
-    // dependencies; resolving the default set instead would omit crates that
-    // are genuinely linked and make the documented sidecar-vs-binary
-    // cross-check report spurious binary-only entries.
+    // `SUPPLY_CHAIN_MIN_CLI_VERSION` has. Emitting these steps against an older pin
+    // would make `docker build` fail outright, so they are omitted instead: the image
+    // is merely SBOM-less, not broken. The SBOM must resolve the same features the
+    // binary above was compiled with. The embed build turns on `embed-assets`, which
+    // pulls in optional dependencies, so resolving the default set would omit crates
+    // that are genuinely linked and make the documented sidecar-vs-binary cross-check
+    // report spurious binary-only entries.
     let emits_sbom = cli_supports_supply_chain_flags(cli_version);
     let sbom_generate_step = if emits_sbom {
         SBOM_GENERATE_STEP.replace(
@@ -2579,16 +2572,15 @@ previous_secrets = []
 
     #[test]
     fn main_tf_sanitized_locals_fall_back_when_input_sanitizes_to_nothing_or_a_digit() {
-        // A Cargo package name made entirely of characters sanitization
-        // strips (e.g. the legal-but-unusual name "_") sanitizes to an
-        // empty string, which would otherwise produce a Postgres server
-        // name starting with "-" (the "${app_name_alnum}-pg-..." pattern),
-        // an empty Postgres database name, and violate resource types that
-        // require a letter-led name (Key Vault) rather than just
-        // alphanumeric (ACR). Both base locals must fall back to a fixed
-        // alphabetic prefix whenever sanitization leaves nothing, or
-        // leaves a value not starting with a letter (a leading digit
-        // survives sanitization but several consumers don't accept it).
+        // A Cargo package name made entirely of characters sanitization strips — the
+        // legal but unusual name "_" — sanitizes to an empty string. That would produce
+        // a Postgres server name starting with "-" (the `${app_name_alnum}-pg-...`
+        // pattern), an empty Postgres database name, and a violation of resource types
+        // requiring a letter-led name, such as Key Vault, rather than merely
+        // alphanumeric, such as ACR. Both base locals must fall back to a fixed
+        // alphabetic prefix whenever sanitization leaves nothing, or leaves a value not
+        // starting with a letter — a leading digit survives sanitization, and several
+        // consumers reject it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -3208,15 +3200,13 @@ previous_secrets = []
 
     #[test]
     fn azure_workflow_updates_migration_job_image_before_starting_it() {
-        // `az containerapp job start --image ...` sends an execution-TEMPLATE
-        // OVERRIDE, which Azure treats as a full replacement, not a merge —
-        // an override containing only --image drops the Terraform-configured
-        // `command` (autumn migrate) and the AUTUMN_DATABASE__PRIMARY_URL
-        // secret env, so the execution would run the container's default
-        // command with no DB URL instead of applying migrations. The image
-        // must instead be persisted onto the job's stored template via
-        // `job update --image` BEFORE a bare `job start` (no --image) runs
-        // that complete, up-to-date template.
+        // `az containerapp job start --image ...` sends an execution-template override,
+        // which Azure treats as a full replacement rather than a merge. An override
+        // containing only `--image` drops the Terraform-configured `command` (autumn
+        // migrate) and the `AUTUMN_DATABASE__PRIMARY_URL` secret env, so the execution
+        // would run the container's default command with no DB URL instead of applying
+        // migrations. The image must instead be persisted onto the job's stored template
+        // via `job update --image` before a bare `job start` runs that complete template.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -3455,19 +3445,17 @@ previous_secrets = []
 
     #[test]
     fn azure_workflow_image_tag_is_unique_per_execution() {
-        // Two workflow_dispatch runs on the same branch would otherwise
-        // compute the identical tag despite different commits — the commit
-        // SHA guards against that. But re-running workflow_dispatch on the
-        // same branch, or clicking "Re-run jobs" on an existing run, reuses
-        // the identical ref AND commit while still producing a genuinely
-        // different build (a fresh AUTUMN_BUILD_TIMESTAMP, possibly
-        // different base-image bytes) — so the tag must also include
-        // GITHUB_RUN_ID (unique per trigger) and GITHUB_RUN_ATTEMPT
-        // (disambiguates re-runs of that same trigger) to be unique per
-        // actual execution, not just per commit. Re-pushing bytes under a
-        // tag Azure already has configured on the Container App isn't
-        // guaranteed to register as a revision-scope change, so the old
-        // binary could keep serving against a newly migrated schema.
+        // Two workflow_dispatch runs on the same branch would otherwise compute the
+        // identical tag despite different commits, which the commit SHA guards against.
+        // But re-running workflow_dispatch on the same branch, or clicking "Re-run jobs"
+        // on an existing run, reuses the identical ref and commit while still producing a
+        // genuinely different build — a fresh `AUTUMN_BUILD_TIMESTAMP`, possibly
+        // different base-image bytes. So the tag must also include `GITHUB_RUN_ID`,
+        // unique per trigger, and `GITHUB_RUN_ATTEMPT`, which disambiguates re-runs of
+        // that trigger, to be unique per execution rather than per commit. Re-pushing
+        // bytes under a tag Azure already has configured on the Container App is not
+        // guaranteed to register as a revision-scope change, so the old binary could keep
+        // serving against a newly migrated schema.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -5432,15 +5420,13 @@ previous_secrets = []
 
     #[test]
     fn aws_workflow_strips_bootstrap_entrypoint_only_from_the_app_registration() {
-        // Terraform's bootstrap "app" task definition overrides
-        // entryPoint/command to make the placeholder nginx image satisfy
-        // the ALB health check (main.tf) — describe-task-definition would
-        // otherwise carry that override forward onto the REAL image, which
-        // has no nginx and runs as an unprivileged user, so the container
-        // would exit immediately instead of falling through to its own
-        // Dockerfile ENTRYPOINT/CMD. The "migrate" family's own `command`
-        // (autumn migrate) is intentional and permanent, so its
-        // registration step must NOT strip it.
+        // Terraform's bootstrap "app" task definition overrides entryPoint and command
+        // so the placeholder nginx image satisfies the ALB health check (main.tf).
+        // `describe-task-definition` would otherwise carry that override forward onto the
+        // real image, which has no nginx and runs as an unprivileged user, so the
+        // container would exit immediately instead of falling through to its own
+        // Dockerfile ENTRYPOINT/CMD. The "migrate" family's own `command` (autumn
+        // migrate) is intentional and permanent, so its registration step must not strip it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -5718,18 +5704,15 @@ previous_secrets = []
 
     #[test]
     fn gcp_vpc_connector_name_respects_the_weighted_21_char_limit() {
-        // Serverless VPC Access connector names must stay under 21
-        // characters where EACH HYPHEN COUNTS AS TWO characters toward that
-        // limit (confirmed against Google's own docs: "must be less than
-        // 21 characters long, and ... hyphens (-) count as two
-        // characters") — an undocumented-in-the-Terraform-provider quirk
-        // distinct from the usual RFC 1035 label rule every other resource
-        // here follows. A 10-letter, hyphen-free base ("abcdefghij") plus
-        // the fixed "-connector" suffix already sits at the weighted
-        // boundary (10 + 2 + 9 = 21, i.e. rejected), so a naive raw
-        // character cap (this scaffold's previous 15-character cap) is far
-        // too permissive, and any cap that doesn't first strip hyphens
-        // from the base can blow the budget on hyphens alone.
+        // Serverless VPC Access connector names must stay under 21 characters, where
+        // each hyphen counts as two toward that limit. Google's own docs: "must be less
+        // than 21 characters long, and ... hyphens (-) count as two characters" — an
+        // undocumented-in-the-provider quirk distinct from the RFC 1035 label rule every
+        // other resource here follows. A 10-letter, hyphen-free base ("abcdefghij") plus
+        // the fixed "-connector" suffix already sits at the weighted boundary (10 + 2 + 9
+        // = 21, rejected), so a naive raw character cap — this scaffold's previous
+        // 15-character cap — is far too permissive, and any cap that does not first strip
+        // hyphens from the base can blow the budget on hyphens alone.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -5879,18 +5862,15 @@ previous_secrets = []
 
     #[test]
     fn gcp_main_tf_secret_refs_pin_the_created_version_not_latest() {
-        // Cloud Run resolves a secret_key_ref's version once, when a NEW
-        // revision is created — an already-running revision's already-
-        // running instances never re-read "latest". If the env block kept
-        // the literal string "latest", rotating database_admin_password/
-        // signing_secret via Terraform (which creates a new
-        // google_secret_manager_secret_version) wouldn't change anything
-        // Terraform sees as a diff in the Cloud Run service/job spec, so no
-        // new revision would roll out at all — leaving the whole fleet
-        // pinned to the OLD secret value while Cloud SQL had already
-        // started requiring the NEW password. Referencing the version
-        // resource's own `.version` attribute means a rotation IS a diff,
-        // and rolls out as a new revision.
+        // Cloud Run resolves a `secret_key_ref`'s version once, when a new revision is
+        // created; an already-running revision's instances never re-read "latest". If the
+        // env block kept the literal string "latest", rotating `database_admin_password`
+        // or `signing_secret` via Terraform — which creates a new
+        // `google_secret_manager_secret_version` — would change nothing Terraform sees as
+        // a diff in the Cloud Run service or job spec, so no new revision would roll out.
+        // The whole fleet would stay pinned to the old secret value while Cloud SQL had
+        // already started requiring the new password. Referencing the version resource's
+        // own `.version` attribute makes a rotation a diff, and rolls out a new revision.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -5916,18 +5896,15 @@ previous_secrets = []
 
     #[test]
     fn gcp_database_url_secret_version_waits_for_sql_user_password_update() {
-        // Unlike AWS RDS (master password lives on the DB instance
-        // resource itself, so referencing its .address here already
-        // creates an implicit ordering edge), Cloud SQL splits the
-        // instance and its user credentials into two independent
-        // resources: google_sql_database_instance.this (referenced for
-        // the private IP) and google_sql_user.this (which actually owns
-        // `password`). Without an explicit dependency, rotating
-        // database_admin_password gives Terraform no reason to apply the
-        // google_sql_user.this password update before this secret
-        // version — the Cloud Run revision this secret version triggers
-        // (via the pinned .version) could then start using the NEW
-        // password before Cloud SQL has actually accepted it.
+        // Unlike AWS RDS, where the master password lives on the DB instance resource
+        // itself and referencing its `.address` already creates an implicit ordering
+        // edge, Cloud SQL splits the instance and its user credentials into two
+        // independent resources: `google_sql_database_instance.this`, referenced for the
+        // private IP, and `google_sql_user.this`, which owns `password`. Without an
+        // explicit dependency, rotating `database_admin_password` gives Terraform no
+        // reason to apply the `google_sql_user.this` password update before this secret
+        // version — so the Cloud Run revision that version triggers, via the pinned
+        // `.version`, could start using the new password before Cloud SQL accepts it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();

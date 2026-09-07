@@ -109,8 +109,16 @@ macro_rules! with_migration_connection {
             scope
                 .spawn(|| {
                     match crate::db::establish_migration_connection($url)
-                        .map_err(|e| MigrationError::Connection(e.to_string()))?
-                    {
+                        // Redacted: this is the RUNTIME's startup-migration
+                        // path (the `--wait` loop is the other one), and the
+                        // driver quotes the target it was handed straight back
+                        // into its message. It is logged with
+                        // `tracing::error!` at boot.
+                        .map_err(|e| {
+                            MigrationError::Connection(crate::db_url::redact_targets_in_message(
+                                &e.to_string(),
+                            ))
+                        })? {
                         crate::db::MigrationConnection::Native(mut native) => {
                             let $conn = &mut native;
                             $body
@@ -383,8 +391,9 @@ pub fn run_pending_sqlite(
     if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
         return Err(err);
     }
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let applied = with_sqlite_migration_lock(&mut conn, |conn| {
         let mut harness = HarnessWithOutput::write_to_stdout(conn);
         harness
@@ -482,8 +491,9 @@ fn pending_migrations_sqlite(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
 ) -> Result<Vec<String>, MigrationError> {
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let pending = conn
         .pending_migrations(migrations)
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
@@ -907,16 +917,14 @@ pub(crate) fn compute_migration_disambiguation(
         entries.sort();
         let kept_name = entries[0].clone();
         for full_name in entries.into_iter().skip(1) {
-            // The substitute hash is derived from the LOSING migration's own
-            // full name -- not from which source(s) currently register it.
-            // A migration's full name is fixed by its own directory naming
-            // and never changes across releases, whereas the *set* of
-            // sources registering a duplicate can grow or shrink over time
-            // (the same bundle folded into an additional plugin, say) —
-            // hashing on that set would silently reassign an
+            // The substitute hash derives from the losing migration's own full
+            // name, not from which sources currently register it. A migration's
+            // full name is fixed by its own directory naming and never changes
+            // across releases, whereas the set of sources registering a duplicate
+            // can grow or shrink — the same bundle folded into an additional
+            // plugin, say. Hashing on that set would silently reassign an
             // already-applied migration's tracked substitute the moment its
-            // registration footprint changed, even though the migration
-            // itself never did.
+            // registration footprint changed, though the migration itself did not.
             let mut tie_breaker = 1u32;
             let mut substitute = bounded_substitute_version(&version, &full_name, tie_breaker);
             while substitutes_in_use.contains(&substitute) {
@@ -2067,16 +2075,15 @@ where
                     .map_err(|e| MigrationError::Migration(e.to_string()))?;
                 let duration = started.elapsed();
 
-                // This version is no longer applied, so its recorded checksum
-                // row must go: reverting exactly this migration removes it from
-                // `__diesel_schema_migrations`, and `version` is the same key
-                // the row was recorded under. Deleting it restores the "row
-                // exists \u{21D4} version applied with matching bytes" invariant
-                // so a later re-apply of an edited `up.sql` records the NEW hash
-                // instead of leaving the stale one behind (issue #1203 review).
-                // Best-effort: the schema revert has already committed, so a
-                // failure to delete only warns — a subsequent `autumn migrate
-                // baseline` or re-apply reconciles it.
+                // This version is no longer applied, so its recorded checksum row
+                // must go: reverting exactly this migration removes it from
+                // `__diesel_schema_migrations`, and `version` is the key the row
+                // was recorded under. Deleting it restores the "row exists iff
+                // version applied with matching bytes" invariant, so a later
+                // re-apply of an edited `up.sql` records the new hash instead of
+                // leaving the stale one (#1203 review). Best-effort: the schema
+                // revert has already committed, so a failed delete only warns, and
+                // a later `autumn migrate baseline` or re-apply reconciles it.
                 if let Err(e) = delete_checksum(&mut *conn, version) {
                     tracing::warn!(
                         version = %version,
@@ -2166,8 +2173,9 @@ pub fn applied_user_migrations_sqlite(
     database_url: &str,
     migrations_dir: &Path,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError> {
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let source = FileBasedMigrations::from_path(migrations_dir)
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
     let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
@@ -2212,8 +2220,9 @@ where
     P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError> + Send,
     F: FnMut(&RevertedMigration) + Send,
 {
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
     let source = FileBasedMigrations::from_path(migrations_dir)
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
     let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
@@ -2307,54 +2316,13 @@ pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms.min(5_000))
 }
 
-/// Redact the password from any `postgres://` or `postgresql://` URL embedded
-/// in `msg`.
+/// Redact credentials in any database URL embedded in `msg`.
 ///
-/// Replaces the password component with `****`, mirroring the approach used
-/// by `mask_database_url` in `autumn/src/app.rs`.  When the URL token cannot
-/// be parsed, the entire token is replaced with `****` as a safe fallback so
-/// a malformed-but-credential-bearing string is never surfaced (also matches
-/// `mask_database_url`'s parse-failure behaviour).  Leaves the rest of the
-/// message unchanged.
+/// Thin alias for the shared redactor. The local implementation this replaced
+/// recognized `postgres://` / `postgresql://` tokens only, so a
+/// `mysql://user:pw@host` in a driver message went out whole.
 pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    loop {
-        // Find the leftmost postgres:// or postgresql:// occurrence.
-        let pg = rest.find("postgres://");
-        let pgl = rest.find("postgresql://");
-        let start = match (pg, pgl) {
-            (None, None) => {
-                out.push_str(rest);
-                break;
-            }
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (Some(a), Some(b)) => a.min(b),
-        };
-        // Push everything before the URL token unchanged.
-        out.push_str(&rest[..start]);
-        rest = &rest[start..];
-        // Extract the URL-shaped token (everything until first whitespace or EOS).
-        let token_end = rest
-            .find(|c: char| c.is_ascii_whitespace())
-            .unwrap_or(rest.len());
-        let token = &rest[..token_end];
-        if let Ok(mut parsed) = url::Url::parse(token) {
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("****"));
-                out.push_str(parsed.as_str());
-            } else {
-                out.push_str(token);
-            }
-        } else {
-            // Parse failed — mask the whole token rather than risk leaking a
-            // malformed credential-bearing URL.
-            out.push_str("****");
-        }
-        rest = &rest[token_end..];
-    }
-    out
+    crate::db_url::redact_targets_in_message(msg)
 }
 
 /// Inner (dependency-injected) startup wait loop.
@@ -2540,8 +2508,9 @@ pub fn hold_migration_lock(
     // (see `crate::db::establish_migration_connection`) — this lock is taken
     // before spawning the external diesel CLI, so it must reach TLS-only
     // servers too.
-    let mut conn = crate::db::establish_migration_connection(database_url)
-        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+    let mut conn = crate::db::establish_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
 
     match &mut conn {
         crate::db::MigrationConnection::Native(conn) => {
@@ -2662,28 +2631,27 @@ fn run_pending_locked_inner(
             };
 
             // (5) Post-apply re-validation — still under the lock, on the same
-            //     session. This deliberately does NOT record checksums for the
+            //     session. It deliberately does not record checksums for the
             //     freshly-applied versions.
             //
-            //     This path applies the EMBEDDED migration set compiled into the
+            //     This path applies the embedded migration set compiled into the
             //     binary, but `up_sql_by_version` is read from the on-disk
             //     `./migrations/` dir. When the dir is not byte-identical to the
-            //     embedded set (files edited or mounted after the binary was
-            //     built), recording the disk bytes here would store a hash for
-            //     content that was never applied — the DB actually holds the
-            //     embedded schema — silently making the edited file canonical and
-            //     defeating later drift checks. Diesel's `Migration` API does not
-            //     expose each embedded migration's raw `up.sql` bytes, so we
-            //     cannot hash what was actually applied. We therefore VALIDATE
-            //     only and defer authoritative recording to the CLI/baseline
-            //     paths (`autumn migrate run` / `autumn migrate baseline`), where
-            //     the applied bytes ARE the on-disk bytes (issue #1203 review).
+            //     embedded set — files edited or mounted after the binary was built
+            //     — recording the disk bytes would store a hash for content that
+            //     was never applied, since the DB holds the embedded schema,
+            //     silently making the edited file canonical and defeating later
+            //     drift checks. Diesel's `Migration` API does not expose each
+            //     embedded migration's raw `up.sql` bytes, so we cannot hash what
+            //     was applied. Validate only, and defer authoritative recording to
+            //     the CLI and baseline paths (`autumn migrate run`, `autumn migrate
+            //     baseline`), where the applied bytes are the on-disk bytes (#1203).
             //
             //     Re-validating catches the interleaving where a sibling replica
-            //     applied and recorded THIS version's *original* content between
-            //     our step 2 and our apply: that now-recorded hash is compared
-            //     against our edited on-disk `up.sql` so the mismatch still fails
-            //     fast before boot.
+            //     applied and recorded this version's original content between our
+            //     step 2 and our apply: that now-recorded hash is compared against
+            //     our edited on-disk `up.sql`, so the mismatch still fails fast
+            //     before boot.
             if let Some(up) = up_sql_by_version {
                 let applied_versions = load_applied_versions_lenient(conn)?;
                 let recorded = recorded_checksums(conn)?;
@@ -2870,28 +2838,26 @@ pub(crate) fn auto_migrate(
             );
         }
 
-        // Content-checksum drift guard (issue #1203). If the local
-        // `./migrations/` directory is present, read every migration's on-disk
-        // `up.sql` so the locked apply path can, under the advisory lock and on
-        // the same Postgres session, validate already-applied versions against
-        // their recorded checksums (fail fast on drift), then re-validate after
-        // applying. Running the compare *inside* the lock — rather than in a
-        // pre-lock check — is what makes the guard race-free under a concurrent
-        // rolling deploy (see [`run_pending_locked_inner`]).
+        // Content-checksum drift guard (#1203). When the local `./migrations/` directory
+        // is present, read every migration's on-disk `up.sql`, so the locked apply path
+        // can validate already-applied versions against their recorded checksums under
+        // the advisory lock and on the same Postgres session, fail fast on drift, then
+        // re-validate after applying. Running the compare inside the lock, rather than in
+        // a pre-lock check, is what makes the guard race-free under a concurrent rolling
+        // deploy (see [`run_pending_locked_inner`]).
         //
-        // This startup path VALIDATES only; it does NOT record new checksums.
-        // It applies the EMBEDDED migration set, which may not be byte-identical
-        // to the on-disk `up.sql` read here, so recording the disk bytes would
-        // store a hash for content that was never applied. Authoritative
-        // recording happens on the CLI/baseline paths (`autumn migrate run` /
-        // `autumn migrate baseline`), where applied bytes == on-disk bytes.
+        // This startup path validates only; it records no new checksums. It applies the
+        // embedded migration set, which may not be byte-identical to the on-disk `up.sql`
+        // read here, so recording the disk bytes would store a hash for content that was
+        // never applied. Authoritative recording happens on the CLI and baseline paths
+        // (`autumn migrate run`, `autumn migrate baseline`), where applied bytes are the
+        // on-disk bytes.
         //
-        // Best-effort read: production binaries typically ship without the
-        // source tree, so an absent `./migrations/` is not an error (the map is
-        // `None` and the checksum steps are skipped — the CLI `autumn migrate`
-        // is the canonical strict apply path in prod). A present-but-unreadable
-        // dir likewise degrades to `None` with a warning rather than blocking
-        // boot; genuine drift on a readable dir still hard-fails, under the lock.
+        // Best-effort read: production binaries typically ship without the source tree, so
+        // an absent `./migrations/` is not an error — the map is `None`, the checksum steps
+        // are skipped, and `autumn migrate` is the canonical strict apply path in prod. A
+        // present-but-unreadable dir likewise degrades to `None` with a warning rather than
+        // blocking boot; genuine drift on a readable dir still hard-fails, under the lock.
         let migrations_dir = std::path::Path::new("migrations");
         let up_by_version = if migrations_dir.is_dir() {
             match read_up_sql_by_version(migrations_dir) {
@@ -3145,16 +3111,14 @@ mod tests {
 
     #[test]
     fn duplicate_migrations_substitute_hash_is_independent_of_registration_order() {
-        // A migration folded into two bundles under different source names
-        // (the intentional, harmless "same set registered twice" case) that
-        // ALSO collides at its version with a third, differently-named
-        // migration: the duplicate is the one that must be substituted
-        // ("20260101000000_a_third_migration" < "20260101000000_create_gizmos"
-        // lexicographically). The substitute hash is derived from the
-        // duplicate's own full name, not from which source(s) register it,
-        // so it must be identical regardless of registration order --
-        // and, more importantly, regardless of whether it's EVER registered
-        // under a second name at all (see the next test).
+        // A migration folded into two bundles under different source names — the
+        // intentional, harmless "same set registered twice" case — that also collides at
+        // its version with a third, differently-named migration: the duplicate is the one
+        // that must be substituted, since "20260101000000_a_third_migration" sorts before
+        // "20260101000000_create_gizmos". The substitute hash derives from the duplicate's
+        // own full name, not from which sources register it, so it must be identical
+        // whatever the registration order — and whether or not it is ever registered under
+        // a second name at all (see the next test).
         const DUP: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
         const OTHER: EmbeddedMigrations =
@@ -3709,16 +3673,15 @@ mod tests {
         validate_checksums(&applied, &edited_by_version, &recorded)
             .expect("edited content must validate Ok after re-baseline");
 
-        // ── Step 8: the drift guard runs UNDER the advisory lock ────────────
-        // Prove `run_pending_locked_inner` performs the checksum comparison
-        // *inside* its locked critical section — not only in the pre-lock
-        // caller. At this point `version` is recorded as `actual_hash` (step 6
-        // re-baseline), but `up_by_version[version]` still holds the ORIGINAL
-        // `up_sql` (hashing to `recorded_hash`), so the on-disk content and the
-        // recorded checksum disagree. Feeding that map to the locked apply path
-        // must fail fast with a "checksum mismatch" before any migration is
-        // applied. The framework migrations passed here are already applied, so
-        // the only way this errors is the under-lock validation firing.
+        // Step 8: the drift guard runs under the advisory lock. Prove
+        // `run_pending_locked_inner` performs the checksum comparison inside its locked
+        // critical section, not only in the pre-lock caller. At this point `version` is
+        // recorded as `actual_hash` from step 6's re-baseline, but
+        // `up_by_version[version]` still holds the original `up_sql`, which hashes to
+        // `recorded_hash`, so the on-disk content and the recorded checksum disagree.
+        // Feeding that map to the locked apply path must fail fast with a "checksum
+        // mismatch" before any migration is applied. The framework migrations passed here
+        // are already applied, so the only way this errors is the under-lock validation.
         assert_ne!(
             migration_checksum(up_sql),
             actual_hash,

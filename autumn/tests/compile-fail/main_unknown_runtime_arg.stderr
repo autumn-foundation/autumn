@@ -1,0 +1,11 @@
+error: unsupported `#[autumn_web::main]` argument. Supported arguments: `flavor`, `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive`, `configure`.
+ --> tests/compile-fail/main_unknown_runtime_arg.rs:4:20
+  |
+4 | #[autumn_web::main(worker_thread = 4)]
+  |                    ^^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/compile-fail/main_unknown_runtime_arg.rs:5:19
+  |
+5 | async fn main() {}
+  |                   ^ consider adding a `main` function to `$DIR/tests/compile-fail/main_unknown_runtime_arg.rs`

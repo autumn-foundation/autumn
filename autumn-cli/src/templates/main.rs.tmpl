@@ -96,6 +96,7 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 // same-origin by `redirect_target_from_referer`) rather than always bouncing
 // to the homepage.
 #[post("/consent/accept")]
+#[public]
 async fn consent_accept(headers: autumn_web::reexports::http::HeaderMap) -> impl IntoResponse {
     let cookie = autumn_web::consent::accept_all_cookie(&["analytics"], CONSENT_POLICY_VERSION);
     let target = autumn_web::consent::redirect_target_from_referer(
@@ -110,6 +111,7 @@ async fn consent_accept(headers: autumn_web::reexports::http::HeaderMap) -> impl
 }
 
 #[post("/consent/reject")]
+#[public]
 async fn consent_reject(headers: autumn_web::reexports::http::HeaderMap) -> impl IntoResponse {
     let cookie = autumn_web::consent::reject_non_essential_cookie(CONSENT_POLICY_VERSION);
     let target = autumn_web::consent::redirect_target_from_referer(
@@ -132,6 +134,7 @@ async fn consent_reject(headers: autumn_web::reexports::http::HeaderMap) -> impl
 // The actual state change happens through the existing CSRF-protected
 // `POST /consent/accept` / `POST /consent/reject` above.
 #[get("/consent/manage")]
+#[public]
 async fn consent_manage(
     flash: Flash,
     path: CurrentPath,

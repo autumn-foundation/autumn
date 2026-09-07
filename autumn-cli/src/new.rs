@@ -2805,11 +2805,20 @@ mod tests {
 
     // --- issue #1593: the framework-owned file set `autumn upgrade` reconciles ---
 
+    /// The fixed `autumn_version` `owned()` renders its fixtures with —
+    /// deliberately independent of this crate's own `CARGO_PKG_VERSION`, so
+    /// this test module does not need touching on every release. Assertions
+    /// that check a rendered workflow does *not* pin to "this app's autumn
+    /// version" must check against this constant, not `CARGO_PKG_VERSION`:
+    /// the two happen to match today, but only this one is what `owned()`
+    /// actually renders with.
+    const FIXTURE_AUTUMN_VERSION: &str = "0.7.0";
+
     fn owned(opts: GenerateOptions) -> std::collections::BTreeMap<&'static str, String> {
         let vars = TemplateVars {
             project_name: "demo",
             crate_name: "demo",
-            autumn_version: "0.7.0",
+            autumn_version: FIXTURE_AUTUMN_VERSION,
             rust_version: "1.88.0",
         };
         framework_owned_files(&vars, opts)
@@ -2911,13 +2920,14 @@ mod tests {
         );
     }
 
-    /// The pinned CLI is whatever release this app's `autumn-web` tracks, and
-    /// `routes posture` did not exist in every one of them. The gate says which
-    /// release is missing rather than failing with an unknown-subcommand error
-    /// — and it fails rather than skipping, because a gate that waves a pull
-    /// request through when its own tooling is too old is worse than a red one.
+    /// `routes posture` did not exist in every release. The verdict job
+    /// tries the pinned CLI, falls back to the latest published release if
+    /// that lacks the command (#2495), and — even then — says which command
+    /// is missing rather than failing with an unknown-subcommand error, and
+    /// fails rather than skipping, because a gate that waves a pull request
+    /// through when its own tooling is too old is worse than a red one.
     #[test]
-    fn the_gate_names_the_release_when_the_pinned_cli_is_too_old() {
+    fn the_gate_names_the_release_when_the_latest_cli_is_too_old() {
         let files = owned(GenerateOptions::default());
         let workflow = files
             .get(".github/workflows/posture-gate.yml")
@@ -2938,6 +2948,55 @@ mod tests {
         assert!(
             probe.contains("::error::") && probe.contains("exit 1"),
             "and fail loudly rather than skipping: {probe}"
+        );
+    }
+
+    /// Issue #2495: `routes posture` can postdate the release pinned to this
+    /// app's own autumn-web version — but always installing "latest" instead
+    /// would run this security gate under a CLI this project's own
+    /// compatibility check (`doctor.rs::check_version_compat`) calls
+    /// incompatible the moment a minor release ships, and the gap would only
+    /// ever grow as later, unrelated releases ship. So the verdict job tries
+    /// the pinned, compatible CLI first and, only when it lacks the command,
+    /// probes forward through a bounded run of candidate releases — landing
+    /// on the closest one that has it, not a moving "latest" — for that run
+    /// alone. The `manifest` job — which compiles the pull request's own
+    /// code — gets no such fallback at all: nothing in it may run under a
+    /// CLI this project calls incompatible.
+    #[test]
+    fn the_posture_gate_prefers_the_pinned_compatible_cli_and_falls_back_only_when_needed() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let pinned = format!("v{FIXTURE_AUTUMN_VERSION}");
+        assert!(
+            workflow.contains(&pinned),
+            "posture-gate.yml must still install the CLI pinned to this \
+             app's autumn version as the default: {workflow}"
+        );
+
+        let (build_job, verdict_job) = workflow
+            .split_once("  posture:")
+            .expect("two jobs: the build and the verdict");
+        assert!(
+            !build_job.contains("for bump in"),
+            "the manifest job compiles the pull request's own code and must \
+             never fall back to a CLI this project's own compatibility \
+             check would call incompatible: {build_job}"
+        );
+        assert!(
+            verdict_job.contains("for bump in") && verdict_job.contains("::warning::"),
+            "the verdict job must probe forward for the closest compatible \
+             release, visibly, when the pinned CLI lacks routes posture: \
+             {verdict_job}"
+        );
+        assert!(
+            !verdict_job.contains("trunk-dev"),
+            "the fallback must land on a specific, bounded candidate \
+             release, not an unbounded, ever-drifting \"latest\": \
+             {verdict_job}"
         );
     }
 

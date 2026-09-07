@@ -556,6 +556,64 @@ fn a_workspace_member_is_not_seeded_with_files_the_workspace_root_owns() {
     assert!(root.join("Dockerfile").is_file());
 }
 
+/// Issue #2495: `posture-gate.yml`'s verdict job now probes forward through
+/// a bounded run of candidate releases, for one run, only when the release
+/// pinned to this app's own `autumn-web` version is missing a command it
+/// needs; `ci.yml` (which compiles and introspects the pull request's own
+/// code) never does. `autumn upgrade --apply` renders both through its own,
+/// independently constructed `TemplateVars`
+/// (`upgrade/scaffold.rs::current_files`), a different call site than
+/// `autumn new`'s (`new.rs::generate_inner`). Prove the fix reaches the
+/// upgrade path too, not just the one `autumn new` exercises.
+#[test]
+fn apply_writes_posture_gate_with_fallback_and_ci_without_it() {
+    let (_tmp, root) = new_project("upgrade-latest-cli", &[]);
+    age_to(
+        &root,
+        "0.5.0",
+        &[
+            ".github/workflows/posture-gate.yml",
+            ".github/workflows/ci.yml",
+        ],
+    );
+
+    let output = run(&root, &["--apply"]);
+    assert!(output.status.success(), "{}", report(&output));
+
+    let pinned = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let posture_gate = fs::read_to_string(root.join(".github/workflows/posture-gate.yml"))
+        .expect("posture-gate.yml must be written by --apply");
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("ci.yml must be written by --apply");
+
+    assert!(
+        posture_gate.contains(&pinned),
+        "posture-gate.yml must still install the CLI pinned to this app's \
+         autumn version as the default: {posture_gate}"
+    );
+    assert!(
+        posture_gate.contains("for bump in") && posture_gate.contains("::warning::"),
+        "posture-gate.yml's verdict job must probe forward for the closest \
+         compatible release, visibly, when the pinned CLI is missing \
+         `routes posture`: {posture_gate}"
+    );
+    assert!(
+        !posture_gate.contains("trunk-dev"),
+        "the fallback must land on a specific, bounded candidate release, \
+         not an unbounded, ever-drifting \"latest\": {posture_gate}"
+    );
+
+    assert!(
+        ci.contains(&pinned),
+        "ci.yml must install the CLI pinned to this app's autumn version: {ci}"
+    );
+    assert!(
+        !ci.contains("for bump in") && !ci.contains("trunk-dev"),
+        "ci.yml must never fall back to a CLI this project's own \
+         compatibility check would call incompatible: {ci}"
+    );
+}
+
 #[test]
 fn check_and_list_migrations_together_are_a_usage_error() {
     // `--list-migrations` exits before anything is checked, so accepting the

@@ -658,18 +658,15 @@ fn decode_child_row<C: NestedChild>(
         }
     }
 
-    // Rails `reject_if: :all_blank`: if every non-`_destroy` subfield value
-    // is blank (empty or whitespace-only after trimming), drop the row
-    // entirely. This is the auto-rendered blank template row `inputs_for`
-    // emits for the no-JS "add a child" path, not a real submitted child —
-    // treat it as if the index was never submitted: do not decode, do not
-    // validate, do not retain it, and do not count it toward the children.
-    // A row with at least one non-blank non-`_destroy` value is kept and
-    // validated as usual, so a partially filled row still surfaces its
-    // per-field errors. (`decode_pairs` already excludes `_destroy`, so an
-    // all-blank row that also carries `_destroy` is dropped here too — the
-    // same outcome as the destroy path.)
-    //
+    // Rails `reject_if: :all_blank`: when every non-`_destroy` subfield value is blank —
+    // empty or whitespace-only after trimming — drop the row entirely. This is the
+    // auto-rendered blank template row `inputs_for` emits for the no-JS "add a child"
+    // path, not a real submitted child, so treat it as if the index was never submitted:
+    // do not decode, validate, retain, or count it toward the children. A row with at
+    // least one non-blank, non-`_destroy` value is kept and validated as usual, so a
+    // partially filled row still surfaces its per-field errors. `decode_pairs` already
+    // excludes `_destroy`, so an all-blank row that also carries `_destroy` is dropped
+    // here too, the same outcome as the destroy path.
     let all_blank = decode_pairs.iter().all(|(_, val)| val.trim().is_empty());
 
     // A genuinely blank template row drops, destroyed or not — unchanged.
@@ -724,23 +721,22 @@ fn decode_child_row<C: NestedChild>(
             Err(ve) => errors = validation_errors_to_map(&ve),
         },
         Err(e) => {
-            // Row parse failure (deserialization failed before validation,
-            // e.g. `sku` filled but the required numeric `quantity` is
-            // malformed or present-but-blank). Key the message under the
+            // Row parse failure — deserialization failed before validation,
+            // as when `sku` is filled but the required numeric `quantity` is
+            // malformed or present-but-blank. Key the message under the
             // offending subfield so it surfaces as `items[i].{field}`,
-            // rendered by `errors_for("{field}")` next to the offending
-            // input rather than only under the row-level "" key.
+            // rendered by `errors_for("{field}")` next to the offending input
+            // rather than only under the row-level "" key.
             //
             // The blank-optional retry inside
-            // `decode_urlencoded_dropping_blank_optional_fields` can DROP a
-            // present-but-blank typed field (`quantity=`) before serde sees
-            // it, so the primary error is then `missing field \`quantity\``
-            // reported at the ROW ROOT with an empty path — losing the field
-            // name the row helpers need. `recover_child_error_field` recovers
-            // it by preferring the primary error's `missing field \`X\``
-            // message (with a raw non-dropping re-decode only as a last
-            // resort); see that helper. Only if all layers fail does it fall
-            // back to the row-level "" key, so the error is never silently
+            // `decode_urlencoded_dropping_blank_optional_fields` can drop a
+            // present-but-blank typed field (`quantity=`) before serde sees it,
+            // so the primary error is then a `missing field` report at the row
+            // root with an empty path, losing the field name the row helpers
+            // need. `recover_child_error_field` recovers it by preferring the
+            // primary error's `missing field` message, with a raw non-dropping
+            // re-decode only as a last resort. Only if every layer fails does it
+            // fall back to the row-level "" key, so the error is never silently
             // dropped.
             let field = recover_child_error_field::<C>(&e, &decode_pairs);
             errors.entry(field).or_default().push(e.to_string());

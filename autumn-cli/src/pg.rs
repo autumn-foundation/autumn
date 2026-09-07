@@ -628,15 +628,13 @@ fn fill_in_libpq_ssl_env_defaults(pairs: &mut Vec<(String, String)>) {
     {
         pairs.push(("sslmode".to_owned(), pgsslmode));
     }
-    // `PGREQUIRESSL` is the deprecated predecessor to `PGSSLMODE` — libpq's
-    // own docs: "This environment variable is deprecated in favor of the
-    // PGSSLMODE variable; setting both variables suppresses the effect of
-    // this one." Only fires when `sslmode` is *still* unset after the
-    // `PGSSLMODE` check above, so an explicit `PGSSLMODE` (or inline
-    // `sslmode=`) always wins outright, matching that suppression rule.
-    // Its `requiressl=1` is documented as "equivalent to sslmode require";
-    // `requiressl=0` is the default, already-`prefer`-equivalent behavior,
-    // so no translation is needed for it (or for any other value).
+    // `PGREQUIRESSL` is the deprecated predecessor to `PGSSLMODE`. libpq's docs: "This
+    // environment variable is deprecated in favor of the PGSSLMODE variable; setting
+    // both variables suppresses the effect of this one." This fires only when `sslmode`
+    // is still unset after the `PGSSLMODE` check above, so an explicit `PGSSLMODE` or
+    // inline `sslmode=` always wins, matching that suppression rule. `requiressl=1` is
+    // documented as equivalent to `sslmode require`; `requiressl=0` is the default,
+    // already `prefer`-equivalent, so it needs no translation.
     if find_pair(pairs, "sslmode").is_none() && std::env::var("PGREQUIRESSL").as_deref() == Ok("1")
     {
         pairs.push(("sslmode".to_owned(), "require".to_owned()));
@@ -1040,31 +1038,26 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     let mut pairs: Vec<(String, String)> = parse_raw_query_pairs(url.query().unwrap_or(""));
     translate_jdbc_ssl_param(&mut pairs);
 
-    // Capture what the URL's own structure (as opposed to its query
-    // string) already says explicitly, once, up front: `host`/`port`
-    // need this snapshot below to detect whether a later merge is safe
-    // to fold back into the query string at all (see the comment by
-    // `needs_keyword_form`). `username()`/`password()`/`path()` are
-    // percent-encoded as `url::Url` stores them, and so is `host_str()` for
-    // the "opaque host" case `tokio_postgres`'s Unix-socket-path URL form
-    // uses (e.g. `postgresql://%2Fvar%2Frun%2Fpostgresql/db`) — fine when we
-    // hand the whole URL back to `tokio_postgres` to reparse (it does its
-    // own percent-decoding), but [`keyword_value_token`] has no
-    // percent-encoding concept at all, so these must be decoded before any
-    // of them can end up as a keyword-form value (see `needs_keyword_form`
-    // below).
-    // `user`/`password`/`dbname` are each a single field `tokio_postgres`'s
-    // own URL parser *overwrites* — unlike `host`/`port`, which accumulate —
-    // so when a URL names one via userinfo/path *and* separately as a query
-    // parameter, the query parameter is what actually takes effect (parsed
-    // after, and last write wins). The query pair is therefore checked
-    // first here, not as a fallback — getting this backwards wouldn't break
-    // the connection itself (the unmodified URL still reparses correctly),
-    // but would make `.pgpass` lookup below match against the wrong,
-    // no-longer-effective identity. Uses `find_last_pair`, not `find_pair`,
+    // Capture, once and up front, what the URL's own structure says explicitly, as
+    // opposed to its query string. `host` and `port` need this snapshot below to detect
+    // whether a later merge can be folded back into the query string at all (see the
+    // comment by `needs_keyword_form`). `username()`, `password()`, and `path()` are
+    // percent-encoded as `url::Url` stores them, and so is `host_str()` for the opaque
+    // host case `tokio_postgres`'s Unix-socket-path URL form uses
+    // (`postgresql://%2Fvar%2Frun%2Fpostgresql/db`). That is fine when the whole URL
+    // goes back to `tokio_postgres`, which percent-decodes itself, but
+    // [`keyword_value_token`] has no percent-encoding concept, so these must be decoded
+    // before any of them can become a keyword-form value.
+    //
+    // `user`, `password`, and `dbname` are each a single field `tokio_postgres`'s URL
+    // parser overwrites — unlike `host` and `port`, which accumulate — so when a URL
+    // names one via userinfo or path and separately as a query parameter, the query
+    // parameter takes effect: it is parsed later, and last write wins. The query pair is
+    // therefore checked first, not as a fallback. Getting this backwards would not break
+    // the connection, since the unmodified URL still reparses, but it would make the
+    // `.pgpass` lookup below match the wrong identity. `find_last_pair`, not `find_pair`,
     // for the same reason: a query string repeating one of these keys
-    // (e.g. `?user=alice&user=bob`) also has its *last* occurrence take
-    // effect once `tokio_postgres` reparses it.
+    // (`?user=alice&user=bob`) also has its last occurrence take effect.
     let explicit_user = find_last_pair(&pairs, "user")
         .map(str::to_owned)
         .or_else(|| {
@@ -1075,19 +1068,16 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     let explicit_password = find_last_pair(&pairs, "password")
         .map(str::to_owned)
         .or_else(|| url.password().map(percent_decode));
-    // `host`/`port` get the same query-pair-first precedence as
-    // `user`/`password`/`dbname` above, for the same underlying reason —
-    // just via a different mechanism. `host`/`port` are `Vec`s that
-    // *accumulate* rather than overwrite in `tokio_postgres::Config`, so a
-    // query `host=`/`port=` alongside a non-empty authority host doesn't
-    // actually override it the way query `user=` overrides userinfo; that's
-    // exactly the bug `needs_keyword_form` (below) rebuilds the connection
-    // string to work around, so that the *only* host/port that survives
-    // into the final keyword-form output is the query one, matching
-    // `libpq`'s own `PQconninfoParse` semantics (the named parameter is the
-    // sole effective host/port). `.pgpass` lookup must use that same
-    // effective value, not the authority snapshot, or it matches an entry
-    // keyed to a host/port the connection doesn't actually use.
+    // `host` and `port` get the same query-pair-first precedence as `user`, `password`,
+    // and `dbname` above, for the same reason but by a different mechanism. They are
+    // `Vec`s that accumulate rather than overwrite in `tokio_postgres::Config`, so a
+    // query `host=`/`port=` alongside a non-empty authority host does not override it
+    // the way query `user=` overrides userinfo. That is the bug `needs_keyword_form`
+    // below rebuilds the connection string to work around, so that the only host and
+    // port surviving into the final keyword-form output are the query ones, matching
+    // libpq's own `PQconninfoParse` semantics. The `.pgpass` lookup must use that
+    // effective value, not the authority snapshot, or it matches an entry keyed to a
+    // host and port the connection does not use.
     let explicit_host = find_last_pair(&pairs, "host")
         .map(str::to_owned)
         .or_else(|| url.host_str().filter(|h| !h.is_empty()).map(percent_decode));
@@ -1118,29 +1108,24 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
         _ => find_pair(pairs, key).is_some(),
     };
 
-    // Whether the service merge below ends up filling in a `host` or
-    // `port` that wasn't already explicit — see the comment where this
-    // is used for why that specifically forces a keyword-form rebuild.
+    // Whether the service merge below fills in a `host` or `port` that was not already
+    // explicit — see the comment where this is used for why that forces a keyword-form
+    // rebuild.
     //
-    // A `port=` given as a query parameter (rather than as part of
-    // `host:port`) needs the exact same treatment as soon as the authority
-    // names any host at all: `tokio_postgres`'s URL parser bakes a port
-    // into the config for every authority host (its own explicit port if
-    // given, otherwise a default of 5432) and *separately* appends whatever
-    // the query string's own `port=` says, producing two port entries
-    // `tokio_postgres::connect` then rejects with "invalid number of
-    // ports" — even for an ordinary URL `psql` always accepted.
+    // A `port=` given as a query parameter, rather than as part of `host:port`, needs
+    // the same treatment as soon as the authority names any host: `tokio_postgres`'s URL
+    // parser bakes a port into the config for every authority host — its own explicit
+    // port, or a default of 5432 — and separately appends whatever the query string's
+    // `port=` says, producing two port entries `tokio_postgres::connect` then rejects
+    // with "invalid number of ports", even for an ordinary URL `psql` always accepted.
     //
-    // A query-string `host=` given alongside a non-empty authority host
-    // needs the same treatment for a related but distinct reason: `libpq`'s
-    // own `PQconninfoParse` makes the named `host=` the *sole* effective
-    // host (the authority host is entirely discarded), but
-    // `tokio_postgres`'s URL parser parses the authority host first, then
-    // *appends* the query host as an additional entry rather than replacing
-    // it — producing a two-host list (authority tried first) instead of the
-    // query host alone. Rebuilding as keyword form sidesteps this because
-    // its `pairs`-only output never carries the authority host at all — only
-    // whatever ended up in `pairs`, which is the query host.
+    // A query-string `host=` alongside a non-empty authority host needs the same
+    // treatment for a related but distinct reason: libpq's `PQconninfoParse` makes the
+    // named `host=` the sole effective host and discards the authority host entirely,
+    // while `tokio_postgres`'s URL parser parses the authority host first and then
+    // appends the query host as an extra entry, producing a two-host list with the
+    // authority tried first. Rebuilding as keyword form sidesteps this: its `pairs`-only
+    // output never carries the authority host, only what ended up in `pairs`.
     let mut needs_keyword_form = url.host_str().is_some_and(|h| !h.is_empty())
         && (find_pair(&pairs, "port").is_some() || find_pair(&pairs, "host").is_some());
 
@@ -1199,16 +1184,14 @@ fn sanitize_url_form(mut url: url::Url) -> Result<String, CommandError> {
     pairs = filter_ssl_params(pairs.into_iter())?;
 
     if needs_keyword_form {
-        // `tokio_postgres`'s URL-form parser bakes a default `port=5432`
-        // into the config as soon as the authority names *any* host —
-        // even with no port given — and both `host` and `port` are
-        // appended to a list rather than overwritten. So folding a
-        // service-provided host/port back in as a query parameter here
-        // wouldn't override that implicit default, it would sit
-        // alongside it as a second entry. Keyword form has no such
-        // authority-parsing special case — every key here is one we
-        // added ourselves — so falling back to it for exactly this case
-        // sidesteps the duplication entirely.
+        // `tokio_postgres`'s URL-form parser bakes a default `port=5432` into the
+        // config as soon as the authority names any host, even with no port given, and
+        // both `host` and `port` are appended to a list rather than overwritten. So
+        // folding a service-provided host or port back in as a query parameter here
+        // would not override that implicit default; it would sit alongside it as a
+        // second entry. Keyword form has no such authority-parsing special case — every
+        // key there is one we added ourselves — so falling back to it for this case
+        // sidesteps the duplication.
         for (key, value) in [
             ("user", explicit_user),
             ("password", explicit_password),
@@ -1548,18 +1531,16 @@ mod tests {
 
     #[test]
     fn sanitize_rejects_require_with_sslrootcert_when_an_earlier_sslmode_shadows_it() {
-        // `sslmode` is an overwrite-semantics field in `tokio_postgres::Config`
-        // (`Config::param`'s "sslmode" arm calls `self.ssl_mode(mode)`
-        // unconditionally each time it's invoked) — a later `sslmode=` in the
-        // same connection string wins over an earlier one, exactly like
-        // `user`/`password`/`dbname`. `find_pair`'s first-match semantics
-        // would instead see the *first* `sslmode=prefer` here, miss the
-        // require+sslrootcert combination entirely, and let `sslrootcert` get
-        // silently dropped by the unconditional `UNSUPPORTED_SSL_PARAMS` loop
-        // while both `sslmode` values survive — so the final string
-        // `tokio_postgres` reparses would connect under the *effective*
-        // `sslmode=require` with no certificate verification at all, exactly
-        // the silent downgrade this whole check exists to prevent.
+        // `sslmode` is an overwrite-semantics field in `tokio_postgres::Config`:
+        // `Config::param`'s "sslmode" arm calls `self.ssl_mode(mode)` unconditionally
+        // each time, so a later `sslmode=` in the same connection string wins, exactly
+        // like `user`, `password`, and `dbname`. `find_pair`'s first-match semantics
+        // would instead see the first `sslmode=prefer` here, miss the
+        // require-plus-sslrootcert combination, and let `sslrootcert` be dropped by the
+        // unconditional `UNSUPPORTED_SSL_PARAMS` loop while both `sslmode` values
+        // survive. The final string `tokio_postgres` reparses would then connect under
+        // the effective `sslmode=require` with no certificate verification at all —
+        // exactly the silent downgrade this check exists to prevent.
         let err = sanitize_db_url(
             "postgres://host/db?sslmode=prefer&sslrootcert=/etc/ca.pem&sslmode=require",
         )
@@ -1574,12 +1555,27 @@ mod tests {
         // `require` — `prefer` (and `allow`) never auto-upgrade even with a
         // CA file present, so this combination must still just drop the
         // unsupported `sslrootcert` param rather than erroring.
-        let sanitized =
-            sanitize_db_url("postgres://host/db?sslmode=prefer&sslrootcert=/etc/ca.pem").unwrap();
-        let config: tokio_postgres::Config = sanitized.parse().unwrap();
-        assert_eq!(
-            config.get_ssl_mode(),
-            tokio_postgres::config::SslMode::Prefer
+        //
+        // Scopes away PGSSLCERT/PGSSLKEY so an ambient/racing value can't trip
+        // the sslcert/sslkey rejection — see the comment on
+        // `sanitize_rejects_require_with_sslrootcert_in_url_form`. Without it
+        // `sanitize_rejects_pgsslcert_env_var_in_url_form` and
+        // `sanitize_does_not_override_explicit_sslcert_rejection_message_source`,
+        // which set PGSSLCERT to a value, make this `unwrap()` panic with
+        // "sslcert/sslkey (client-certificate authentication) is not
+        // supported" whenever they overlap it.
+        temp_env::with_vars(
+            [("PGSSLCERT", None::<&str>), ("PGSSLKEY", None::<&str>)],
+            || {
+                let sanitized =
+                    sanitize_db_url("postgres://host/db?sslmode=prefer&sslrootcert=/etc/ca.pem")
+                        .unwrap();
+                let config: tokio_postgres::Config = sanitized.parse().unwrap();
+                assert_eq!(
+                    config.get_ssl_mode(),
+                    tokio_postgres::config::SslMode::Prefer
+                );
+            },
         );
     }
 
