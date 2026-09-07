@@ -283,26 +283,100 @@ def read(f):
 # and reads the package as publishable with an auto-detected README: silent.
 
 
-def _quoted(name):
-    """A regex fragment matching one TOML key segment, quoted or bare.
+# Matching key SPELLINGS with a regex ran out here, and the case that proved it
+# is `"publ\\u0069sh" = false`: Cargo decodes the escape and honours the key, and
+# no literal-text alternation can express "any spelling that decodes to
+# publish". So the key half of every lookup below goes through `_line_key`,
+# which reads a key the way TOML defines one — bare, basic-quoted (escapes
+# decoded), or literal-quoted, in any dotted combination — and only the VALUE
+# half stays a regex. Ten findings on this rule were spellings of a key; this is
+# the one place they can all be answered at once.
+_BARE_KEY = re.compile(r'[A-Za-z0-9_-]+')
 
-    EVERY segment gets this, not just the first. `publish."workspace" = true`
-    is valid TOML that Cargo honours — it reports `publish: []` for a member
-    inheriting `publish = false` that way — and matching only a bare
-    `workspace` there dropped the inheritance and read the package as
-    publishable. Same silent direction as the leading key.
+
+def _line_key(line):
+    """`(segments, value_text)` for a TOML key/value line, else None.
+
+    Segments come back decoded, so `"publ\\u0069sh"`, `'publish'` and `publish`
+    are one answer. `value_text` is the rest of the line after `=`, which the
+    caller may extend into following lines for a value spread over several.
     """
-    q = re.escape(name)
-    return r'(?:' + q + r'|"' + q + r'"|\'' + q + r'\')'
+    i = 0
+    n = len(line)
+    segs = []
+    cur = None
+    while i < n:
+        c = line[i]
+        if c in ' \t':
+            i += 1
+        elif c == '"':
+            if cur is not None:
+                return None
+            j = i + 1
+            buf = ''
+            while j < n and line[j] != '"':
+                if line[j] == '\\':
+                    buf += line[j:j + 2]
+                    j += 2
+                else:
+                    buf += line[j]
+                    j += 1
+            if j >= n:
+                return None
+            cur = _decode_basic(buf)
+            i = j + 1
+        elif c == "'":
+            if cur is not None:
+                return None
+            j = line.find("'", i + 1)
+            if j < 0:
+                return None
+            cur = line[i + 1:j]
+            i = j + 1
+        elif c == '.':
+            if cur is None:
+                return None
+            segs.append(cur)
+            cur = None
+            i += 1
+        elif c == '=':
+            if cur is None:
+                return None
+            segs.append(cur)
+            return tuple(segs), line[i + 1:]
+        else:
+            if cur is not None:
+                return None
+            m = _BARE_KEY.match(line, i)
+            if m is None:
+                return None
+            cur = m.group(0)
+            i = m.end()
+    return None
 
 
-def _key(name):
-    """A regex fragment matching a TOML key at line start, quoted or bare."""
-    return r'^[ \t]*' + _quoted(name) + r'[ \t]*'
+def _find_key(table, path):
+    """Text from the value of the first line whose key is `path`, else None.
+
+    The REST of the table is returned, not just that line, so a value spread
+    over following lines — an allowlist with a comment in it, say — is still
+    whole for the value patterns.
+    """
+    pos = 0
+    for line in table.split('\n'):
+        k = _line_key(line)
+        if k is not None and k[0] == path:
+            return table[pos + len(line) - len(k[1]):]
+        pos += len(line) + 1
+    return None
 
 
-_README_STRING = re.compile(
-    _key('readme') + r'=[ \t]*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\')', re.M)
+# The value half. Anchored at the text `_find_key` hands back, so each asks
+# only "what is this value", never "which key was it".
+_VAL_BOOL = re.compile(r'[ \t]*(false|true)\b')
+_VAL_LIST = re.compile(r'[ \t]*(\[[^\]]*\])')
+_VAL_STRING = re.compile(
+    r'[ \t]*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\')')
 # A basic string carries ESCAPES, and Cargo decodes them before resolving the
 # path: `readme = "\\u0069ntro.md"` comes back out of `cargo metadata` as
 # `intro.md`. Returning the encoded source meant the tracked README was never
@@ -327,47 +401,98 @@ def _decode_basic(text):
     return _TOML_ESCAPE.sub(one, text)
 
 
+def _inline_table(value):
+    """An inline table's entries as `key = value` strings, else None.
+
+    `package = { name = "pkg", readme = "README.md" }` is a valid manifest and
+    `cargo metadata` resolves it to an ordinary package — recognising neither a
+    `[package]` header nor a `package.*` dotted key classified it as virtual,
+    dropping a real entry surface.
+    """
+    s = value.lstrip()
+    if not s.startswith('{'):
+        return None
+    entries = []
+    cur = ''
+    depth = 0
+    quote = None
+    for ch in s[1:]:
+        if quote is not None:
+            cur += ch
+            if ch == quote:
+                quote = None
+            continue
+        if ch in '"\'':
+            quote = ch
+            cur += ch
+        elif ch in '[{':
+            depth += 1
+            cur += ch
+        elif ch in ']':
+            depth -= 1
+            cur += ch
+        elif ch == '}':
+            if depth == 0:
+                break
+            depth -= 1
+            cur += ch
+        elif ch == ',' and depth == 0:
+            entries.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    entries.append(cur)
+    return [e.strip() for e in entries if e.strip()]
+
+
+def _inherits(value):
+    """Whether an inline-table value is `{ workspace = true }`."""
+    entries = _inline_table(value)
+    if entries is None:
+        return False
+    for entry in entries:
+        k = _line_key(entry)
+        if k is None or k[0] != ('workspace',):
+            continue
+        m = _VAL_BOOL.match(k[1])
+        if m is not None and m.group(1) == 'true':
+            return True
+    return False
+
+
+def _inherits_key(table, name):
+    """Whether `name` is inherited, in either spelling Cargo accepts."""
+    dotted = _find_key(table, (name, 'workspace'))
+    if dotted is not None:
+        m = _VAL_BOOL.match(dotted)
+        if m is not None and m.group(1) == 'true':
+            return True
+    value = _find_key(table, (name,))
+    return value is not None and _inherits(value)
+
+
 # Cargo auto-detects THREE filenames when `readme` is omitted, in this order,
 # taking the first that exists — confirmed against `cargo metadata`, which
 # reports `README.txt` for a package carrying only that. Hard-coding `README.md`
 # meant a crate whose landing page is one of the others contributed no root, so
 # a guide indexed only there was reported orphaned.
 _AUTO_README = ('README.md', 'README.txt', 'README')
-_README_BOOL = re.compile(_key('readme') + r'=[ \t]*(false|true)\b', re.M)
-# A fifth spelling, and the same silent failure: an INHERITED `readme` resolves
-# against the workspace root, not the member directory — `readme.workspace =
-# true` under a `[workspace.package] readme = "README.md"` comes back out of
-# `cargo metadata` as `"../README.md"`. So the member's own `README.md` is not
-# what gets published, and treating the key as absent seeded exactly that file.
-# Cargo also refuses `readme = false` in `[workspace.package]` ("was not
-# defined"), so an inherited value is always a path.
-_README_INHERITS = re.compile(
-    _key('readme') + r'\.[ \t]*' + _quoted('workspace') + r'[ \t]*=[ \t]*true'
-    r'|' + _key('readme') + r'=[ \t]*\{[^}]*' + _quoted('workspace')
-    + r'[ \t]*=[ \t]*true[^}]*\}',
-    re.M)
-# Publishability gates all of the above: nothing renders the README of a
-# package that is never published, so it stays an ordinary waypoint.
-# Cargo has TWO spellings for "never published", and `publish = false` is only
-# one of them: an EMPTY allowlist, `publish = []`, means the same thing —
-# `cargo publish` refuses because the key must be `true` or a NON-EMPTY list.
-# Matching only the boolean seeded the README of an unpublishable package as a
-# reader root, which is the silent direction: it can hide an orphan.
+# An INHERITED `readme` resolves against the owning workspace, not the member
+# directory — `readme.workspace = true` under a `[workspace.package] readme =
+# "README.md"` comes back out of `cargo metadata` as `"../README.md"`. So the
+# member's own `README.md` is not what gets published, and treating the key as
+# absent seeded exactly that file. Cargo also refuses `readme = false` in
+# `[workspace.package]` ("was not defined"), so an inherited value is a path.
 #
-# A non-empty list is the opposite — `publish = ["some-registry"]` IS
+# Publishability gates all of it: nothing renders the README of a package that
+# is never published, so it stays an ordinary waypoint. Cargo has TWO spellings
+# for "never published", and `publish = false` is only one of them: an EMPTY
+# allowlist, `publish = []`, means the same thing — `cargo publish` refuses
+# because the key must be `true` or a NON-EMPTY list. Matching only the boolean
+# seeded the README of an unpublishable package as a reader root, the silent
+# direction. A non-empty list is the opposite: `publish = ["some-registry"]` IS
 # published, just not to crates.io, and its README is still that crate's
 # landing page there.
-_PUBLISH_DECL = re.compile(
-    _key('publish') + r'=[ \t]*(false|true|\[[^\]]*\])', re.M)
-# ...and a package may inherit the setting instead of declaring it, in either
-# spelling Cargo accepts. Neither occurs in this repository today; both are
-# handled so the first one to appear is not a fresh defect, and because the
-# error this guards is the quiet one.
-_PUBLISH_INHERITS = re.compile(
-    _key('publish') + r'\.[ \t]*' + _quoted('workspace') + r'[ \t]*=[ \t]*true'
-    r'|' + _key('publish') + r'=[ \t]*\{[^}]*' + _quoted('workspace')
-    + r'[ \t]*=[ \t]*true[^}]*\}',
-    re.M)
 
 # Every pattern above reads a key Cargo reads from ONE table, so they have to be
 # applied to that table rather than to the whole document. `[package.metadata.*]`
@@ -385,7 +510,6 @@ _PUBLISH_INHERITS = re.compile(
 # orphan. Every approximation below is therefore measured against a scanner
 # that lacks it, not reasoned about.
 _TOML_HEADER = re.compile(r'^[ \t]*\[\[?[ \t]*([^\[\]]*?)[ \t]*\]\]?[ \t]*(?:#.*)?$')
-_DOTTED_CACHE = {}
 
 
 def _toml_key_path(text):
@@ -547,36 +671,42 @@ def _toml_table(manifest, name):
     waypoint. Reading its missing `[package]` as a table full of defaults
     seeded that README as a reader root, hiding anything indexed only there.
 
-    Root-level dotted keys are folded in with their prefix stripped: written
-    before any header, `package.publish = false` IS `[package]`'s `publish`,
-    and Cargo honours it — `cargo metadata` reports `publish: []`, the same
-    thing it reports for the plain spelling. TOML permits whitespace around the
-    dot, so the prefix is matched rather than compared.
+    Two root-level spellings fold in as the same table, both read through
+    `_line_key` so every quoting form is one answer:
+
+      - a DOTTED key. Written before any header, `package.publish = false` IS
+        `[package]`'s `publish`, and Cargo honours it — `cargo metadata`
+        reports `publish: []`, exactly as for the plain spelling.
+      - an INLINE table. `package = { name = "pkg", readme = "README.md" }` is
+        a whole package; recognising neither form classified the manifest as
+        virtual and dropped a real entry surface.
     """
-    dotted = _DOTTED_CACHE.get(name)
-    if dotted is None:
-        # Each segment may be quoted independently — `"package".publish` —
-        # so the prefix is built from the same alternation `_key` uses.
-        dotted = re.compile(
-            r'^[ \t]*' + r'[ \t]*\.[ \t]*'.join(
-                _quoted(p) for p in name.split('.')) + r'[ \t]*\.[ \t]*')
-        _DOTTED_CACHE[name] = dotted
+    want = tuple(name.split('.'))
     out = []
     seen = False
     for table, line in _toml_lines(manifest):
         if table == name:
             seen = True
             out.append(line)
-        elif table is None:
-            m = dotted.match(line)
-            if m is not None:
+            continue
+        if table is not None:
+            continue
+        k = _line_key(line)
+        if k is None:
+            continue
+        segs, value = k
+        if segs[:len(want)] == want and len(segs) > len(want):
+            seen = True
+            # Re-emitted quoted so the remaining segments survive whatever
+            # spelling they arrived in; `_line_key` decodes them back.
+            out.append('.'.join('"' + s.replace('\\', '\\\\').replace('"', '\\"')
+                                + '"' for s in segs[len(want):]) + ' =' + value)
+        elif segs == want:
+            entries = _inline_table(value)
+            if entries is not None:
                 seen = True
-                out.append(line[m.end():])
+                out.extend(entries)
     return '\n'.join(out) if seen else None
-
-
-_WORKSPACE_KEY = re.compile(
-    _key('workspace') + r'=[ \t]*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\')', re.M)
 
 
 def _owning_workspace(package, pkg):
@@ -589,41 +719,50 @@ def _owning_workspace(package, pkg):
     against `cargo metadata` reporting `publish: []` for exactly that layout.
 
     Cargo resolves the owner by an explicit `workspace = "path"` under
-    `[package]` if present, else by walking up to the nearest ancestor manifest
-    that declares a `[workspace]` table.
+    `[package]` if present, else by the nearest manifest declaring a
+    `[workspace]` table — starting with the package's OWN manifest, which can
+    carry both tables and have its member inherit from itself. Walking to the
+    parent first found an outer workspace instead, the same silent error one
+    directory up.
     """
-    m = _WORKSPACE_KEY.search(package)
-    if m is not None:
-        named = (_decode_basic(m.group(1)) if m.group(1) is not None
-                 else m.group(2))
-        base = posixpath.normpath(posixpath.join(pkg, named) if pkg else named)
-        cand = 'Cargo.toml' if base in ('', '.') else base + '/Cargo.toml'
-        if cand in tracked_set:
-            return cand
+    value = _find_key(package, ('workspace',))
+    if value is not None:
+        m = _VAL_STRING.match(value)
+        if m is not None:
+            named = (_decode_basic(m.group(1)) if m.group(1) is not None
+                     else m.group(2))
+            base = posixpath.normpath(
+                posixpath.join(pkg, named) if pkg else named)
+            cand = 'Cargo.toml' if base in ('', '.') else base + '/Cargo.toml'
+            if cand in tracked_set:
+                return cand
     d = pkg
     while True:
-        d = posixpath.dirname(d)
         cand = (d + '/Cargo.toml') if d else 'Cargo.toml'
         if cand in tracked_set and _toml_table(read(cand),
                                                'workspace') is not None:
             return cand
         if not d:
             return 'Cargo.toml'
+        d = posixpath.dirname(d)
 
 
 def _publishable(manifest, pkg):
     """Whether a package's `[package]` table allows publishing at all."""
-    m = _PUBLISH_DECL.search(manifest)
-    if m is None and _PUBLISH_INHERITS.search(manifest):
-        m = _PUBLISH_DECL.search(
+    value = _find_key(manifest, ('publish',))
+    if (value is None or _inherits(value)) and _inherits_key(manifest,
+                                                             'publish'):
+        value = _find_key(
             _toml_table(read(_owning_workspace(manifest, pkg)),
-                        'workspace.package') or '')
-    if m is None:
+                        'workspace.package') or '', ('publish',))
+    if value is None:
         return True
-    value = m.group(1)
-    if value == 'false':
-        return False
-    if value.startswith('['):
+    b = _VAL_BOOL.match(value)
+    if b is not None:
+        return b.group(1) == 'true'
+    lst = _VAL_LIST.match(value)
+    if lst is not None:
+        value = lst.group(1)
         # An empty allowlist publishes nowhere; a populated one publishes
         # somewhere, and that registry renders the README. Comments are
         # stripped first because a list spread over lines can carry one —
@@ -645,7 +784,7 @@ def _readme_paths(manifest, pkg):
     that is TRACKED, which differs from Cargo only when an untracked file would
     have won — and an untracked file carries no edges here anyway.
     """
-    if _README_INHERITS.search(manifest):
+    if _inherits_key(manifest, 'readme'):
         # Inherited values resolve against the OWNING workspace, so both the
         # manifest to read the key from AND the directory it is relative to
         # move there — which is not the repository root when the workspace is
@@ -656,14 +795,15 @@ def _readme_paths(manifest, pkg):
         owner = _owning_workspace(manifest, pkg)
         manifest = _toml_table(read(owner), 'workspace.package') or ''
         pkg = posixpath.dirname(owner)
-    m = _README_STRING.search(manifest)
+    value = _find_key(manifest, ('readme',))
+    m = _VAL_STRING.match(value) if value is not None else None
     if m is not None:
         # Only the BASIC form carries escapes; a literal string is its own
         # value, which is the whole difference between the two.
         named = ([_decode_basic(m.group(1))] if m.group(1) is not None
                  else [m.group(2)])
     else:
-        b = _README_BOOL.search(manifest)
+        b = _VAL_BOOL.match(value) if value is not None else None
         if b is not None and b.group(1) == 'false':
             # The explicit opt-out: the package is published with no README,
             # so no registry page renders one and nothing is an entry surface.
@@ -7522,6 +7662,52 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9ms/pkg/README.md"
   git -C "$c9ms" add -A && git -C "$c9ms" commit -qm quoted-inline-workspace
   check "a quoted workspace key in an inline table inherits" fail "$c9ms"
+
+  # A quoted key may carry ESCAPES, and Cargo decodes them: `"publish"`
+  # IS `publish`, reported as `publish: []`. No literal-text alternation can
+  # express "any spelling that decodes to publish", which is what moved key
+  # matching to a lexer rather than another pattern.
+  local c9mt="$tmp/c9mt"; make_corpus "$c9mt"
+  mkdir -p "$c9mt/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\n"publ\\u0069sh" = false\n' \
+    > "$c9mt/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mt/pkg/README.md"
+  git -C "$c9mt" add -A && git -C "$c9mt" commit -qm escaped-key
+  check "an escaped quoted key decodes to the same key" fail "$c9mt"
+
+  # A manifest carrying BOTH `[package]` and `[workspace]` inherits from
+  # itself: `cargo metadata` reports `publish: []` here. Walking to the parent
+  # before checking the package's own manifest found an outer workspace.
+  local c9mu="$tmp/c9mu"; make_corpus "$c9mu"
+  mkdir -p "$c9mu/pkg"
+  printf '[workspace]\nmembers = []\n' > "$c9mu/Cargo.toml"
+  printf '[workspace]\nmembers = []\n\n[workspace.package]\npublish = false\n\n[package]\nname = "pkg"\npublish.workspace = true\nreadme = "README.md"\n' \
+    > "$c9mu/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mu/pkg/README.md"
+  git -C "$c9mu" add -A && git -C "$c9mu" commit -qm self-owning-workspace
+  check "a manifest with both tables inherits from itself" fail "$c9mu"
+
+  # An INLINE package table is a whole package — `cargo metadata` resolves this
+  # one with `readme = README.md`. Recognising neither a `[package]` header nor
+  # a `package.*` dotted key classified the manifest as virtual and dropped a
+  # real entry surface.
+  local c9mv="$tmp/c9mv"; make_corpus "$c9mv"
+  mkdir -p "$c9mv/pkg"
+  printf '%s\n' 'package = { name = "pkg", version = "0.1.0", readme = "README.md" }' \
+    > "$c9mv/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mv/pkg/README.md"
+  git -C "$c9mv" add -A && git -C "$c9mv" commit -qm inline-package-table
+  check "an inline package table is a package" pass "$c9mv"
+
+  # ...and one that opts out inside the inline form still opts out, so the
+  # inline body is really being read rather than merely detected.
+  local c9mw="$tmp/c9mw"; make_corpus "$c9mw"
+  mkdir -p "$c9mw/pkg"
+  printf '%s\n' 'package = { name = "pkg", version = "0.1.0", publish = false }' \
+    > "$c9mw/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mw/pkg/README.md"
+  git -C "$c9mw" add -A && git -C "$c9mw" commit -qm inline-package-publish
+  check "an inline package table's publish key is read" fail "$c9mw"
 
   # There is deliberately NO companion test for a path climbing out of the
   # REPOSITORY. One was written and deleted with the check it guarded: it
