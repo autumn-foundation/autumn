@@ -81,6 +81,8 @@ pub struct SchedulerLease {
     release_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(feature = "db")]
     postgres: Option<PostgresAdvisoryLease>,
+    #[cfg(feature = "sqlite")]
+    sqlite: Option<SqliteTableLease>,
 }
 
 impl SchedulerLease {
@@ -92,6 +94,8 @@ impl SchedulerLease {
             release_count: None,
             #[cfg(feature = "db")]
             postgres: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
         }
     }
 
@@ -107,6 +111,8 @@ impl SchedulerLease {
             release_count: Some(release_count),
             #[cfg(feature = "db")]
             postgres: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
         }
     }
 
@@ -118,6 +124,21 @@ impl SchedulerLease {
             #[cfg(test)]
             release_count: None,
             postgres: Some(lease),
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
+        }
+    }
+
+    /// A lease granted by the `SQLite` lease-table coordinator.
+    #[cfg(feature = "sqlite")]
+    fn sqlite(leader_id: impl Into<String>, lease: SqliteTableLease) -> Self {
+        Self {
+            backend: "sqlite".to_owned(),
+            leader_id: leader_id.into(),
+            #[cfg(test)]
+            release_count: None,
+            postgres: None,
+            sqlite: Some(lease),
         }
     }
 
@@ -146,6 +167,11 @@ impl SchedulerLease {
 
         #[cfg(feature = "db")]
         if let Some(lease) = self.postgres {
+            return lease.release().await;
+        }
+
+        #[cfg(feature = "sqlite")]
+        if let Some(lease) = self.sqlite {
             return lease.release().await;
         }
 
@@ -293,6 +319,225 @@ impl PostgresAdvisoryLease {
     }
 }
 
+/// Single-host lease coordinator for the `SQLite` backend (issue #1907).
+///
+/// Leases each `(task, tick)` in a table in the app's own database file, so
+/// several processes on one host elect exactly one leader per tick.
+///
+/// A lease carries an expiry, not a session, so a leader that dies frees the
+/// tick after `scheduler.lease_ttl_secs` instead of wedging the task. Set the
+/// TTL above the longest a tick body can take. See
+/// `docs/guide/scheduled-multi-replica.md`.
+#[cfg(feature = "sqlite")]
+#[derive(Clone)]
+pub struct SqliteLeaseSchedulerCoordinator {
+    pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    replica_id: String,
+    key_prefix: String,
+    lease_ttl: Duration,
+    clock: Arc<dyn crate::time::ClockSource>,
+    ready: Arc<tokio::sync::OnceCell<()>>,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteLeaseSchedulerCoordinator {
+    /// Create a `SQLite` lease coordinator over the app's primary pool.
+    #[must_use]
+    pub fn new(
+        pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+        replica_id: impl Into<String>,
+        key_prefix: impl Into<String>,
+        lease_ttl: Duration,
+        clock: Arc<dyn crate::time::ClockSource>,
+    ) -> Self {
+        Self {
+            pool,
+            replica_id: replica_id.into(),
+            key_prefix: key_prefix.into(),
+            lease_ttl,
+            clock,
+            ready: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    /// Create the lease table on first use.
+    ///
+    /// Framework migrations are Postgres SQL and do not run on `SQLite`, so the
+    /// runtime owns this schema. A failed attempt leaves the cell empty, so the
+    /// next acquire retries.
+    async fn ensure_table(&self, conn: &mut crate::db::RuntimeConnection) -> AutumnResult<()> {
+        let ready = Arc::clone(&self.ready);
+        ready.get_or_try_init(|| Self::create_table(conn)).await?;
+        Ok(())
+    }
+
+    /// The DDL itself. Idempotent, and safe to run from several processes at
+    /// once: `SQLite` serializes writers and every statement is `IF NOT EXISTS`.
+    async fn create_table(conn: &mut crate::db::RuntimeConnection) -> AutumnResult<()> {
+        use diesel_async::RunQueryDsl as _;
+
+        for statement in [
+            "CREATE TABLE IF NOT EXISTS autumn_scheduler_leases ( \
+               lock_key    BIGINT PRIMARY KEY NOT NULL, \
+               task_name   TEXT   NOT NULL, \
+               tick_key    TEXT   NOT NULL, \
+               owner       TEXT   NOT NULL, \
+               acquired_at BIGINT NOT NULL, \
+               expires_at  BIGINT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_autumn_scheduler_leases_expiry \
+             ON autumn_scheduler_leases (expires_at)",
+        ] {
+            diesel::sql_query(statement)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| {
+                    AutumnError::internal_server_error_msg(format!(
+                        "sqlite scheduler lease table setup failed: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Current wall time in milliseconds, read from the injected clock.
+    fn now_ms(&self) -> i64 {
+        self.clock.now().timestamp_millis()
+    }
+}
+
+/// Owner token minted per acquire, recorded on the row so an operator reading
+/// the table can tell which process claimed a tick.
+#[cfg(feature = "sqlite")]
+fn next_lease_owner(replica_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{replica_id}#{}#{seq}", std::process::id())
+}
+
+#[cfg(feature = "sqlite")]
+impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
+    fn backend(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn replica_id(&self) -> &str {
+        &self.replica_id
+    }
+
+    /// The lease table is shared by every process on the host, so a fleet task
+    /// runs on exactly one of them.
+    fn is_fleet_distributed(&self) -> bool {
+        true
+    }
+
+    fn try_acquire<'a>(
+        &'a self,
+        task_name: &'a str,
+        tick_key: &'a str,
+        coordination: TaskCoordination,
+    ) -> SchedulerFuture<'a, AutumnResult<Option<SchedulerLease>>> {
+        Box::pin(async move {
+            use diesel_async::RunQueryDsl as _;
+
+            if coordination == TaskCoordination::PerReplica {
+                return Ok(Some(SchedulerLease::local(
+                    "per_replica",
+                    self.replica_id.clone(),
+                )));
+            }
+
+            let key = advisory_lock_key(&self.key_prefix, task_name, tick_key);
+            let mut conn = self.pool.get().await.map_err(|error| {
+                AutumnError::service_unavailable_msg(format!(
+                    "scheduler sqlite lease connection unavailable: {error}"
+                ))
+            })?;
+            self.ensure_table(&mut conn).await?;
+
+            let now_ms = self.now_ms();
+            let ttl_ms = i64::try_from(self.lease_ttl.as_millis()).unwrap_or(i64::MAX);
+            let expires_at = now_ms.saturating_add(ttl_ms);
+
+            // Reap expired leases first, so the insert below is the whole
+            // acquire: a live lease keeps its row and blocks the insert, while a
+            // lease whose holder died is already gone.
+            diesel::sql_query("DELETE FROM autumn_scheduler_leases WHERE expires_at <= ?")
+                .bind::<diesel::sql_types::BigInt, _>(now_ms)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| {
+                    AutumnError::internal_server_error_msg(format!(
+                        "sqlite scheduler lease reap failed: {error}"
+                    ))
+                })?;
+
+            let owner = next_lease_owner(&self.replica_id);
+            let inserted = diesel::sql_query(
+                "INSERT INTO autumn_scheduler_leases \
+                 (lock_key, task_name, tick_key, owner, acquired_at, expires_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(lock_key) DO NOTHING",
+            )
+            .bind::<diesel::sql_types::BigInt, _>(key)
+            .bind::<diesel::sql_types::Text, _>(task_name)
+            .bind::<diesel::sql_types::Text, _>(tick_key)
+            .bind::<diesel::sql_types::Text, _>(&owner)
+            .bind::<diesel::sql_types::BigInt, _>(now_ms)
+            .bind::<diesel::sql_types::BigInt, _>(expires_at)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "sqlite scheduler lease acquire failed: {error}"
+                ))
+            })?;
+
+            if inserted == 0 {
+                return Ok(None);
+            }
+            Ok(Some(SchedulerLease::sqlite(
+                self.replica_id.clone(),
+                SqliteTableLease { key },
+            )))
+        })
+    }
+}
+
+/// A held `SQLite` scheduler lease.
+///
+/// Release does **not** delete the row, and that is the point: the row is what
+/// makes the tick claimed. Deleting it would let a second process whose timer
+/// reaches the same tick a moment later insert the same key and run the tick a
+/// second time — duplicating whatever the task does. So a released lease simply
+/// stops being renewed, the tick stays reserved for the rest of
+/// `scheduler.lease_ttl_secs`, and the next acquire reaps the row once it
+/// expires. Set the TTL longer than the spread between the processes' timers.
+///
+/// This is stricter than the Postgres coordinator, whose `pg_advisory_unlock`
+/// frees the key the moment the leader finishes.
+#[cfg(feature = "sqlite")]
+struct SqliteTableLease {
+    key: i64,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteTableLease {
+    #[allow(
+        clippy::unused_async,
+        reason = "matches the fallible async release the Postgres lease has, so \
+                  `SchedulerLease::release` keeps one shape across backends"
+    )]
+    async fn release(self) -> AutumnResult<()> {
+        tracing::debug!(
+            lock_key = self.key,
+            "sqlite scheduler tick released; the row keeps the tick reserved until it expires"
+        );
+        Ok(())
+    }
+}
+
 /// Build the scheduler coordinator for the current application state.
 ///
 /// # Errors
@@ -306,6 +551,57 @@ pub fn coordinator_from_config(
     let replica_id = config.resolved_replica_id();
     match config.backend {
         SchedulerBackend::InProcess => Ok(Arc::new(InProcessSchedulerCoordinator::new(replica_id))),
+        SchedulerBackend::Sqlite => {
+            #[cfg(feature = "sqlite")]
+            {
+                let pool = state.pool().cloned().ok_or_else(|| {
+                    AutumnError::service_unavailable_msg(
+                        "scheduler.backend = \"sqlite\" requires a configured database pool",
+                    )
+                })?;
+                // The lease table coordinates processes only because they open
+                // the same FILE. On an in-memory target each has its own table,
+                // so every replica would win the same tick and run it — while
+                // `is_fleet_distributed()` reports the opposite. Refuse rather
+                // than promise coordination that cannot happen (issue #1907).
+                if state
+                    .extension::<crate::config::AutumnConfig>()
+                    .and_then(|config| {
+                        config
+                            .database
+                            .effective_primary_url()
+                            .map(crate::config::is_in_memory_sqlite_target)
+                    })
+                    .unwrap_or(false)
+                {
+                    return Err(AutumnError::service_unavailable_msg(
+                        "scheduler.backend = \"sqlite\" requires a FILE-backed database: an \
+                         in-memory SQLite target is private to each process, so every replica \
+                         would claim the same tick and run it. Point database.url at a \
+                         sqlite:// file, or use scheduler.backend = \"in_process\"",
+                    ));
+                }
+                Ok(Arc::new(SqliteLeaseSchedulerCoordinator::new(
+                    pool,
+                    replica_id,
+                    config.key_prefix.clone(),
+                    Duration::from_secs(config.lease_ttl_secs),
+                    state.clock_arc(),
+                )))
+            }
+
+            // The lease table lives in the app's SQLite file, so this backend
+            // needs a build that has one. On a Postgres build, advisory locks
+            // are the fleet-wide primitive.
+            #[cfg(not(feature = "sqlite"))]
+            {
+                let _ = (state, replica_id);
+                Err(AutumnError::service_unavailable_msg(
+                    "scheduler.backend = \"sqlite\" requires a build of autumn-web compiled \
+                     with --features sqlite; on Postgres use scheduler.backend = \"postgres\"",
+                ))
+            }
+        }
         SchedulerBackend::Postgres => {
             #[cfg(all(feature = "db", not(feature = "sqlite")))]
             {
@@ -324,14 +620,17 @@ pub fn coordinator_from_config(
             // The Postgres advisory-lock scheduler coordinator is Postgres-only
             // (it leases via `pg_advisory_lock`). Under the `sqlite` feature the
             // runtime pool is a SQLite pool with no such primitive, so refuse
-            // rather than mis-type. Single-node SQLite runs the in-process
-            // coordinator (`scheduler.backend = "in_process"`, the default).
+            // rather than mis-type. SQLite runs one of the two single-host
+            // coordinators instead: `in_process` (the default, one process) or
+            // `sqlite` (a lease table shared by the processes on the host).
             #[cfg(all(feature = "db", feature = "sqlite"))]
             {
                 let _ = (state, replica_id);
                 Err(AutumnError::service_unavailable_msg(
                     "scheduler.backend = \"postgres\" requires the Postgres backend and is \
-                     unsupported under the sqlite feature; use scheduler.backend = \"in_process\"",
+                     unsupported under the sqlite feature; use scheduler.backend = \"in_process\" \
+                     (the default) or scheduler.backend = \"sqlite\" to coordinate several \
+                     processes on the host",
                 ))
             }
 
@@ -499,6 +798,30 @@ mod tests {
     // `tests/integration/scheduled_coordination.rs` suite instead. This
     // exercises the same default-method derivation (`backend() == "postgres"`)
     // via a minimal double, without a database.
+    /// Issue #1907: `scheduler.backend = "sqlite"` is refused on a build with
+    /// no SQLite backend, and the refusal names the Postgres alternative.
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn sqlite_scheduler_backend_is_refused_without_the_sqlite_feature() {
+        let config = SchedulerConfig {
+            backend: SchedulerBackend::Sqlite,
+            ..SchedulerConfig::default()
+        };
+        let state = AppState::for_test();
+        let message = match coordinator_from_config(&config, &state) {
+            Ok(_) => panic!("the sqlite coordinator needs a build with the sqlite feature"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("--features sqlite"),
+            "the refusal names the missing feature; got: {message}"
+        );
+        assert!(
+            message.contains("scheduler.backend = \"postgres\""),
+            "the refusal names the Postgres alternative; got: {message}"
+        );
+    }
+
     #[test]
     fn a_coordinator_reporting_the_postgres_backend_string_is_fleet_distributed() {
         struct FakePostgresCoordinator;

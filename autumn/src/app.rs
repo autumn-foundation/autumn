@@ -3617,6 +3617,28 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        // The sqlite queue backs a split role only because both processes open
+        // the same file. Against an in-memory target each gets its own private
+        // database, so the web replica would enqueue where no worker can ever
+        // look — the same silent stranding, one step further in (issue #1907).
+        if crate::config::split_role_requires_file_backed_sqlite(
+            role,
+            &config.jobs.backend,
+            config.database.effective_primary_url(),
+        ) {
+            tracing::error!(
+                role = role.as_str(),
+                "process role '{}' with jobs.backend = \"sqlite\" requires a FILE-backed \
+                 database: an in-memory SQLite target is private to each process, so the web \
+                 replica would enqueue into a queue no worker process can see. Point \
+                 database.url at a sqlite:// file, or run the combined role.",
+                role.as_str(),
+            );
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "mail")]
         if mount_unsubscribe_endpoint {
             config.mail.mount_unsubscribe_endpoint = true;
@@ -5035,10 +5057,12 @@ impl AppBuilder {
                 };
             renewal_task.leadership_degraded = leadership_degraded;
 
-            // A distributed scheduler backend means a multi-replica deployment,
-            // where ACME is not fleet-safe: see `acme_fleet_warning` for the two
-            // hazards and why DNS-01 only retires one of them. Warn loudly
-            // rather than silently mis-serving (#1620).
+            // A distributed scheduler backend means several processes serve
+            // this app — a fleet on `postgres`, or processes on one host on
+            // `sqlite`. ACME is not safe across either without care: see
+            // `acme_fleet_warning` for the two hazards, which of them each
+            // backend actually carries, and why DNS-01 retires only one of them
+            // on a fleet. Warn loudly rather than silently mis-serving (#1620).
             if let Some(message) = acme_fleet_warning(config.scheduler.backend, dns01) {
                 tracing::warn!(scheduler_backend = coordinator.backend(), "{message}");
             }
@@ -9094,11 +9118,15 @@ async fn build_acme_tls_listener(
 /// not distribute certificates, so (2) still mis-serves TLS on every replica
 /// but the leader. Warn either way; only the text differs (issue #1620).
 ///
+/// The `sqlite` backend coordinates processes on **one** host (issue #1907), so
+/// hazard (2) does not apply: every process reads the same `cache_dir` on the
+/// same disk. Hazard (1) still does, because the token map is per-process — so
+/// it gets its own, narrower message, and DNS-01 clears it entirely.
+///
 /// Keyed off the *configured* backend (operator intent) rather than the built
 /// coordinator, so the warning still fires when `coordinator_from_config` fell
 /// back to in-process after a Postgres error — exactly the case where the fleet
-/// is multi-replica but this process degraded. The exhaustive `matches!` is
-/// compiler-enforced if a new distributed backend variant is added.
+/// is multi-replica but this process degraded.
 #[cfg(feature = "acme")]
 const fn acme_fleet_warning(
     backend: crate::config::SchedulerBackend,
@@ -9106,6 +9134,20 @@ const fn acme_fleet_warning(
 ) -> Option<&'static str> {
     if !backend.is_fleet_distributed() {
         return None;
+    }
+    if matches!(backend, crate::config::SchedulerBackend::Sqlite) {
+        if dns01 {
+            // DNS-01 needs no :80 challenge, and the store is already shared.
+            return None;
+        }
+        return Some(
+            "ACME HTTP-01 validation is not safe across the processes scheduler.backend = \
+             \"sqlite\" coordinates: the token store is per-process, so a proxy may route the \
+             CA's :80 challenge to a process without the token (404). The certificate store is \
+             not at risk — every process on the host reads the same [server.tls.acme] \
+             cache_dir. Serve ACME from one process, terminate TLS at the proxy, or use DNS-01 \
+             (#1620)",
+        );
     }
     Some(if dns01 {
         "ACME DNS-01 issuance is fleet-safe, but the on-disk certificate store is not: only \
@@ -12596,6 +12638,37 @@ mod tests {
         assert!(
             !dns01.contains("token") && !dns01.contains("404"),
             "DNS-01 warning must not blame the HTTP-01 token map: {dns01}"
+        );
+    }
+
+    /// Issue #1907: `scheduler.backend = "sqlite"` coordinates processes on one
+    /// host, so it carries the HTTP-01 token hazard but not the certificate
+    /// store one — every process reads the same `cache_dir`.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_fleet_warning_for_sqlite_names_only_the_token_hazard() {
+        use crate::config::SchedulerBackend;
+
+        let http01 = super::acme_fleet_warning(SchedulerBackend::Sqlite, false)
+            .expect("multi-process HTTP-01 must warn about the per-process token store");
+        assert!(
+            http01.contains("token"),
+            "the warning must name the token store: {http01}"
+        );
+        assert!(
+            !http01.contains("Run ACME on a single host"),
+            "a single-host deployment must not be told to move to a single host: {http01}"
+        );
+        assert!(
+            http01.contains("cache_dir"),
+            "the warning must say the certificate store is already shared: {http01}"
+        );
+
+        // DNS-01 needs no :80 challenge, and the store is already shared, so
+        // there is nothing left to warn about.
+        assert!(
+            super::acme_fleet_warning(SchedulerBackend::Sqlite, true).is_none(),
+            "DNS-01 on one host clears both hazards"
         );
     }
 

@@ -1285,6 +1285,11 @@ jobs:
           # the same rule the `sqlite-runtime` job follows.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          # The #1907 durable job queue and lease scheduler are a large slice of
+          # sqlite-only code; without this lane Codecov reports all of it
+          # uncovered.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_jobs_scheduler_e2e
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
@@ -1361,6 +1366,18 @@ jobs:
         run: cargo build -p autumn-web --features sqlite
       - name: Clippy (autumn-web lib, sqlite backend)
         run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
+      - name: Install protoc (required for telemetry-otlp)
+        # prost/tonic build scripts want it, and ubuntu-latest does not ship it.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - name: Clippy (autumn-web lib, sqlite + telemetry-otlp)
+        # The durable SQLite job backend persists a W3C trace context, so its
+        # `telemetry-otlp` arms only compile under this pair (#1907). Without
+        # this step nothing that blocks a merge builds them — the semver job
+        # does, but only at tag-push time. This is also the enforcing lane that
+        # retires the panic-gate exemption for `middleware/trace_context.rs`.
+        run: cargo clippy -p autumn-web --features "sqlite,telemetry-otlp" --lib -- -D warnings
       - name: Clippy (autumn-web lib, sim-testing op-driver)
         # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
         # dependency for `sim::op` — lint it here (alongside the sqlite lib
@@ -1389,10 +1406,17 @@ jobs:
         # module that carries SQLite-specific logic, so nothing sqlite-gated is
         # left unexecuted. The two `app::` tests are named individually because
         # the rest of `app::tests` is in that not-yet-parametric set.
+        #
+        # `job::` and `scheduler::` carry the #1907 durable-queue and lease
+        # backends, so a sqlite-gated unit test added to either now runs here.
+        # Their end-to-end coverage is the `sqlite_jobs_scheduler_e2e` target in
+        # the next step.
         run: |
           cargo test -p autumn-web --features sqlite --lib -- \
             db:: \
             config:: \
+            job:: \
+            scheduler:: \
             migrate:: \
             counter_cache:: \
             commentable:: \

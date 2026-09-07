@@ -1712,8 +1712,9 @@ fn build_sqlite_pool(
     // concurrency — during every pooled connection's setup, mirroring how the sync store
     // configures its own connection (`crate::sync::store`: `busy_timeout = 5000`,
     // `journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = ON`). `busy_timeout`
-    // is set first, so everything after it queues on the timeout instead of failing on a
-    // held lock; `journal_mode = WAL` is a harmless no-op for a pure `:memory:` database.
+    // is set first, so the statements it covers queue on the timeout instead of failing
+    // on a held lock; `journal_mode = WAL` is a harmless no-op for a pure `:memory:`
+    // database, and `apply_sqlite_pragmas` covers the one lock it does not.
     // A `custom_setup` callback runs once per newly-created connection, the same
     // per-connection hook the Postgres path uses to install TLS.
     //
@@ -1735,7 +1736,7 @@ fn build_sqlite_pool(
                 sqlite_target_is_read_only(&url),
                 sqlite_replication_active(),
             );
-            conn.batch_execute(pragmas)
+            apply_sqlite_pragmas(&mut conn, pragmas)
                 .await
                 .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
             // #1910 FTS5 capability probe. Searchable repositories emit FTS5 virtual
@@ -1779,6 +1780,52 @@ fn build_sqlite_pool(
         .create_timeout(Some(timeout))
         .runtime(deadpool::Runtime::Tokio1)
         .build()?)
+}
+
+/// Apply the per-connection pragmas, retrying while the database is locked.
+///
+/// `PRAGMA journal_mode = WAL` takes an exclusive lock, and `SQLite` does not run
+/// the busy handler for it, so the `busy_timeout` set one statement earlier does
+/// not cover it. Connections created at the same time against a brand-new file
+/// therefore race, and every loser fails setup with "database is locked" — a 5xx
+/// on any request that needed one (#1907).
+///
+/// The journal mode is a persistent property of the file, so one winner settles
+/// it and each retry is then a no-op. The whole retry budget is well inside the
+/// pool's `create_timeout`.
+#[cfg(feature = "sqlite")]
+async fn apply_sqlite_pragmas(
+    conn: &mut RuntimeConnection,
+    pragmas: &str,
+) -> Result<(), diesel::result::Error> {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    /// Attempts in total, the first one included.
+    const ATTEMPTS: u32 = 10;
+    /// Wait between attempts. The lock is held for one statement, not a query.
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut attempt = 1;
+    loop {
+        match conn.batch_execute(pragmas).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < ATTEMPTS && sqlite_error_is_locked(&error) => {
+                attempt += 1;
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether a `SQLite` error is the busy/locked one worth retrying.
+///
+/// `SQLITE_BUSY` and `SQLITE_LOCKED` both reach diesel as a message; there is no
+/// typed code to match on.
+#[cfg(feature = "sqlite")]
+fn sqlite_error_is_locked(error: &diesel::result::Error) -> bool {
+    let message = error.to_string();
+    message.contains("database is locked") || message.contains("database table is locked")
 }
 
 /// Create a connection pool from the database configuration.

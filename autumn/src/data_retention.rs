@@ -807,12 +807,16 @@ async fn apply_sweep(
     }
 }
 
-/// The sweep-enforced datasets are Postgres-only: `autumn_jobs`,
-/// `autumn_job_tracking` and `autumn_experiment_assignments` are created by
-/// Postgres-specific migrations (`TIMESTAMPTZ`, `BIGSERIAL`, a `plpgsql`
-/// notify trigger), and the Postgres job backend is itself unsupported under
-/// the `sqlite` feature. Report that rather than pretending a sweep ran —
-/// mirrors `job.rs`'s own `sqlite`-feature fallback.
+/// The sweep itself is Postgres-only. Its predicates and batching are written
+/// against Postgres types and `NOW()`, and `autumn_experiment_assignments` is
+/// created by a Postgres-specific migration, so there is nothing here to run on
+/// `SQLite`. Report that rather than pretending a sweep ran.
+///
+/// The durable `SQLite` job backend (issue #1907) does create `autumn_jobs` and
+/// `autumn_job_tracking` in the app's own file, and prunes them itself from its
+/// maintenance loop — expired tracking records always, and terminal job rows
+/// when `retention.job_history` is set. A `SQLite` sweep driven from
+/// `autumn db retention` is tracked under #1909.
 #[cfg(any(not(feature = "db"), feature = "sqlite"))]
 #[allow(clippy::unused_async)]
 async fn apply_sweep(
@@ -824,8 +828,8 @@ async fn apply_sweep(
 ) {
     report.skipped = Some(
         if cfg!(feature = "sqlite") {
-            "this dataset lives in a Postgres-only framework table, which the sqlite feature \
-             does not create"
+            "the retention sweep is Postgres-only; on SQLite the durable job runtime prunes \
+             its own tables (see retention.job_history) and a sweep for the rest is planned"
         } else {
             "this build has no database support (`db` feature off)"
         }

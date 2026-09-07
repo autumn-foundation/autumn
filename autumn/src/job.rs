@@ -61,6 +61,10 @@ pub use crate::job_tracking::{
 pub type JobHandler =
     fn(AppState, Value) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>>;
 
+/// Durable job queue for the `SQLite` backend (issue #1907).
+#[cfg(feature = "sqlite")]
+pub(crate) mod sqlite;
+
 const DEFAULT_JOB_ADMIN_HISTORY_LIMIT: usize = 1_000;
 const DEFAULT_JOB_ADMIN_PER_PAGE: u64 = 25;
 
@@ -640,6 +644,10 @@ pub struct JobClient {
     redis: Option<RedisClient>,
     #[cfg(feature = "db")]
     pg_pool: Option<PgPool>,
+    /// The durable `SQLite` queue's pool, when `jobs.backend = "sqlite"` is the
+    /// running backend (issue #1907).
+    #[cfg(feature = "sqlite")]
+    sqlite: Option<sqlite::SqliteJobQueue>,
     registry: crate::actuator::JobRegistry,
     job_admin: JobAdminMemoryBackend,
     default_max_attempts: u32,
@@ -2051,6 +2059,56 @@ pub fn global_job_runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
 // extract helpers use a plain `HashMap` as the carrier so no HTTP crate is
 // required here.
 
+/// Trace context to persist on a durable job row.
+///
+/// `(None, None)` unless OTLP telemetry is compiled in, so a durable backend
+/// needs no `cfg` of its own around the two columns.
+#[cfg(feature = "sqlite")]
+#[cfg_attr(
+    not(feature = "telemetry-otlp"),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "the OTLP arm is not const; only the no-op arm could be"
+    )
+)]
+fn capture_job_trace_context_for_backend() -> (Option<String>, Option<String>) {
+    #[cfg(feature = "telemetry-otlp")]
+    {
+        capture_job_trace_context()
+    }
+    #[cfg(not(feature = "telemetry-otlp"))]
+    {
+        (None, None)
+    }
+}
+
+/// Re-parent `span` on the trace context a durable row carried.
+///
+/// A no-op unless OTLP telemetry is compiled in.
+#[cfg(feature = "sqlite")]
+#[cfg_attr(
+    not(feature = "telemetry-otlp"),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "the OTLP arm is not const; only the no-op arm could be"
+    )
+)]
+fn restore_job_trace_context_for_backend(
+    span: &tracing::Span,
+    traceparent: Option<&str>,
+    tracestate: Option<&str>,
+) {
+    #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) = restore_job_trace_context(traceparent, tracestate) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let _ = span.set_parent(cx);
+    }
+    #[cfg(not(feature = "telemetry-otlp"))]
+    {
+        let _ = (span, traceparent, tracestate);
+    }
+}
+
 /// Serialize the current active span's W3C trace context into portable
 /// strings `(traceparent, tracestate)`.  Returns `(None, None)` when no
 /// global propagator is installed or no active span exists.
@@ -3100,6 +3158,8 @@ impl JobClient {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
@@ -3169,7 +3229,10 @@ impl JobClient {
     /// queue — is what will serve an enqueue on this client.
     ///
     /// Mirrors the branch order in `enqueue_with_outcome_due` (local first) and
-    /// `enqueue_durable_inner` (redis before Postgres). Split out so the
+    /// `enqueue_durable_inner` (redis, then `SQLite`, then Postgres). The durable
+    /// `SQLite` backend deliberately answers `false`: it compares `run_at`
+    /// against the app's own injected clock, never a database `NOW()`, so its
+    /// due instants must come from that same clock. Split out so the
     /// decision and the clock read can each be tested on their own; reaching
     /// the Postgres arm through this method needs a live pool.
     const fn durable_is_pg(&self) -> bool {
@@ -3825,6 +3888,22 @@ impl JobClient {
                 )
                 .await;
         }
+        #[cfg(feature = "sqlite")]
+        if let Some(sqlite_queue) = &self.sqlite {
+            return sqlite::enqueue_job_at(
+                sqlite_queue,
+                self.clock.as_ref(),
+                id,
+                name,
+                queue,
+                payload,
+                max_attempts,
+                backoff_ms,
+                due_at,
+                constraints,
+            )
+            .await;
+        }
         #[cfg(feature = "db")]
         if let Some(pool) = &self.pg_pool {
             return pg_enqueue_job_at(
@@ -4108,6 +4187,20 @@ pub fn start_runtime(
                 let _ = (jobs, state, shutdown, config, run_workers);
                 Err(AutumnError::internal_server_error(std::io::Error::other(
                     "jobs.backend=postgres requested but db feature is disabled",
+                )))
+            }
+        }
+        "sqlite" => {
+            #[cfg(feature = "sqlite")]
+            {
+                sqlite::start_runtime(jobs, state, shutdown, config, run_workers)
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
+                let _ = (jobs, state, shutdown, config, run_workers);
+                Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "jobs.backend=sqlite requires a build of autumn-web compiled with \
+                     --features sqlite; on Postgres use jobs.backend=postgres",
                 )))
             }
         }
@@ -4484,6 +4577,8 @@ pub(crate) fn start_local_runtime_inner(
         redis: None,
         #[cfg(feature = "db")]
         pg_pool: None,
+        #[cfg(feature = "sqlite")]
+        sqlite: None,
         registry: state.job_registry.clone(),
         job_admin: job_admin.clone(),
         default_max_attempts,
@@ -7765,6 +7860,8 @@ fn start_redis_runtime(
             }),
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: state.job_registry.clone(),
             job_admin: job_admin.clone(),
             default_max_attempts: config.max_attempts,
@@ -9817,8 +9914,9 @@ async fn pg_enqueued_and_scheduled_pages(
 /// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
 /// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
 /// `jobs.backend = "postgres"` configuration with a clear message instead of
-/// mis-typing; `SQLite` deployments use the in-process `local` job backend
-/// (the default).
+/// mis-typing. `SQLite` deployments use `jobs.backend = "sqlite"` for a durable
+/// queue in their own database file, or the in-process `local` backend (the
+/// default) when durability is not needed.
 #[cfg(all(feature = "db", feature = "sqlite"))]
 fn start_postgres_runtime(
     jobs: Vec<JobInfo>,
@@ -9830,7 +9928,9 @@ fn start_postgres_runtime(
     let _ = (jobs, state, shutdown, config, run_workers);
     Err(AutumnError::internal_server_error(std::io::Error::other(
         "jobs.backend=postgres is unsupported under the sqlite feature; SQLite has no \
-         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=local (the default).",
+         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=sqlite for a durable queue \
+         in your own SQLite file, or jobs.backend=local (the default) for the in-process \
+         queue.",
     )))
 }
 
@@ -9910,6 +10010,8 @@ fn start_postgres_runtime(
             #[cfg(feature = "redis")]
             redis: None,
             pg_pool: Some(pool.clone()),
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: state.job_registry.clone(),
             job_admin: job_admin.clone(),
             default_max_attempts: config.max_attempts,
@@ -10349,6 +10451,8 @@ mod tests {
                 redis: None,
                 #[cfg(feature = "db")]
                 pg_pool: None,
+                #[cfg(feature = "sqlite")]
+                sqlite: None,
                 registry: crate::actuator::JobRegistry::new(),
                 job_admin: JobAdminMemoryBackend::new_for_test(64),
                 default_max_attempts: 3,
@@ -10509,6 +10613,8 @@ mod tests {
                 redis: None,
                 #[cfg(feature = "db")]
                 pg_pool: None,
+                #[cfg(feature = "sqlite")]
+                sqlite: None,
                 registry: crate::actuator::JobRegistry::new(),
                 job_admin: JobAdminMemoryBackend::new_for_test(32),
                 default_max_attempts: 3,
@@ -10565,6 +10671,8 @@ mod tests {
                 redis: None,
                 #[cfg(feature = "db")]
                 pg_pool: None,
+                #[cfg(feature = "sqlite")]
+                sqlite: None,
                 registry: crate::actuator::JobRegistry::new(),
                 job_admin: JobAdminMemoryBackend::new_for_test(32),
                 default_max_attempts: 3,
@@ -10624,6 +10732,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: backend.clone(),
             default_max_attempts: 5,
@@ -10708,6 +10818,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: backend.clone(),
             default_max_attempts: 5,
@@ -10764,6 +10876,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: registry.clone(),
             job_admin: backend.clone(),
             default_max_attempts: 5,
@@ -10823,6 +10937,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: backend.clone(),
             default_max_attempts: 5,
@@ -11065,6 +11181,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
@@ -11127,6 +11245,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
@@ -14059,6 +14179,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
@@ -14990,7 +15112,11 @@ mod tests {
 
     // ── Postgres backend (RED → GREEN) ────────────────────────────────────────
 
-    #[cfg(feature = "db")]
+    // Not `not(sqlite)` by accident: under the backend flip the runtime pool is
+    // a SQLite pool, `start_postgres_runtime` is the refusal stub, and these
+    // tests build their fixtures on hard-coded `postgres://` URLs. The refusal
+    // itself is covered by `sqlite_jobs_scheduler_e2e`.
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
     mod pg {
         use super::*;
         use diesel_async::RunQueryDsl as _;
@@ -15954,6 +16080,8 @@ mod tests {
                 redis: None,
                 #[cfg(feature = "db")]
                 pg_pool: Some(pool.clone()),
+                #[cfg(feature = "sqlite")]
+                sqlite: None,
                 registry: crate::actuator::JobRegistry::new(),
                 job_admin: JobAdminMemoryBackend::new_for_test(32),
                 default_max_attempts: 1,
@@ -17134,6 +17262,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
@@ -17524,6 +17654,8 @@ mod tests {
                 redis: None,
                 #[cfg(feature = "db")]
                 pg_pool: None,
+                #[cfg(feature = "sqlite")]
+                sqlite: None,
                 registry: crate::actuator::JobRegistry::new(),
                 job_admin: JobAdminMemoryBackend::new_for_test(32),
                 default_max_attempts: 3,
@@ -17580,6 +17712,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 1,
@@ -17680,6 +17814,36 @@ mod tests {
             due_at_from(now, std::time::Duration::from_secs(60)),
             now + chrono::TimeDelta::seconds(60),
             "a positive delay must land exactly `delay` after the given instant"
+        );
+    }
+
+    /// Issue #1907: `jobs.backend = "sqlite"` is refused on a build with no
+    /// SQLite backend, rather than folding into the unknown-backend fallback to
+    /// the non-durable local queue.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn sqlite_jobs_backend_is_refused_without_the_sqlite_feature() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        let state = AppState::for_test();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            backend: "sqlite".to_owned(),
+            ..crate::config::JobConfig::default()
+        };
+        let message = start_runtime(Vec::new(), &state, &shutdown, &config, true)
+            .expect_err("the sqlite queue needs a build with the sqlite feature")
+            .to_string();
+        assert!(
+            message.contains("--features sqlite"),
+            "the refusal names the missing feature; got: {message}"
+        );
+        assert!(
+            message.contains("jobs.backend=postgres"),
+            "the refusal names the Postgres alternative; got: {message}"
+        );
+        assert!(
+            global_job_client().is_none(),
+            "a refused backend must not install an enqueue client"
         );
     }
 
@@ -18316,6 +18480,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
@@ -18358,6 +18524,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,
@@ -18510,6 +18678,8 @@ mod tests {
             redis: None,
             #[cfg(feature = "db")]
             pg_pool: None,
+            #[cfg(feature = "sqlite")]
+            sqlite: None,
             registry: crate::actuator::JobRegistry::new(),
             job_admin: JobAdminMemoryBackend::new_for_test(32),
             default_max_attempts: 3,

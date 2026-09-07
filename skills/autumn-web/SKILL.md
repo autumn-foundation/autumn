@@ -1948,8 +1948,9 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
 | `worker` | no (probe-only router) | yes |
 
 - Run a specific tier: `autumn serve --role web|worker|combined`.
-- A split (non-`combined`) role **requires a `postgres`/`redis` jobs backend** —
-  an in-memory queue can't cross processes.
+- A split (non-`combined`) role **requires a `postgres`/`redis`/`sqlite` jobs
+  backend** — an in-memory queue can't cross processes. `sqlite` qualifies only
+  within one host, since its queue is a table in one file (#1907).
 - `release init --split-workers` splices a dedicated `worker:` service into the
   generated **docker-compose** output and sets the web-tier role on the `app`
   service (#1613). See `docs/guide/cloud-native.md`.
@@ -3154,6 +3155,45 @@ on `/actuator/health` under the `sqlite-replication` indicator; the indicator go
 `[alerts]` pipeline escalates (see `AlertCondition::HealthIndicatorDown`).
 Verification is a **real restore** on an interval, not a checksum. See
 `docs/guide/sqlite-in-production.md`.
+
+### Durable jobs and a single-host scheduler on SQLite (0.7.0, issue #1907)
+
+On the **SQLite** tier, `#[job]` work is durable with no Redis and no Postgres.
+`jobs.backend = "sqlite"` puts the queue in an `autumn_jobs` table in the app's
+own file; a worker claims a row with one
+`UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …`, the single-host analog of
+`FOR UPDATE SKIP LOCKED`, because SQLite serializes writers. A claim a crashed
+worker left behind is re-enqueued once it outlives
+`jobs.sqlite.visibility_timeout_ms`. The runtime creates the table and its
+indexes itself — framework migrations are Postgres SQL.
+
+```toml
+[jobs]
+backend = "sqlite"
+
+[jobs.sqlite]
+visibility_timeout_ms = 30000   # reclaim a dead worker's claim after this
+poll_interval_ms = 250          # no LISTEN/NOTIFY, so an idle worker polls
+
+[scheduler]
+backend = "sqlite"              # or "in_process" (default) for one process
+```
+
+Semantics match Postgres: attempts, backoff, dead-lettering,
+`#[job(unique)]` windows, `#[job(concurrency = N)]`, named queues, `[jobs] pin`,
+tracked-job status, the actuator gauges, and the `/admin/jobs` dashboard, which
+reads the table so every process on the host sees one queue.
+
+`scheduler.backend = "sqlite"` leases each `(task, tick)` in
+`autumn_scheduler_leases`, so several processes on one host elect exactly one
+leader per tick; the lease expires after `scheduler.lease_ttl_secs` rather than
+wedging the task when a leader dies. `autumn_web::lock::Lock` works on the tier
+too, over a lease row rather than a `pg_advisory_lock` session.
+
+Because the queue is a table both processes open, a **split web/worker role is
+valid on SQLite** — but only within one host. Both backends need the non-default
+`sqlite` cargo feature and are refused with an actionable message without it. See
+`docs/guide/sqlite-in-production.md` and `docs/guide/jobs.md`.
 
 ### VPS deploys and fleets — `autumn deploy` (0.6.0; fleets 0.7.0, issues #1607/#1621)
 

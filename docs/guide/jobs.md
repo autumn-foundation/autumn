@@ -119,7 +119,7 @@ that has already become due / started running cannot be canceled.)
 
 ```toml
 [jobs]
-backend = "local"   # local | postgres | redis
+backend = "local"   # local | postgres | redis | sqlite
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 250
@@ -132,13 +132,19 @@ visibility_timeout_ms = 30000   # default: 30 000 ms
 url = "redis://127.0.0.1/"
 key_prefix = "autumn:jobs"
 visibility_timeout_ms = 30000
+
+[jobs.sqlite]
+# Reuses the configured [database] pool. No extra URL needed.
+visibility_timeout_ms = 30000   # default: 30 000 ms
+poll_interval_ms = 250          # default: 250 ms
 ```
 
-| Backend | Durable | Multi-replica safe | Extra infra |
+| Backend | Durable | Shared by | Extra infra |
 |---|---|---|---|
-| `local` | No | No (in-process) | None |
-| `postgres` | Yes | Yes (SKIP LOCKED) | DB only — no Redis |
-| `redis` | Yes | Yes | Redis |
+| `local` | No | Nothing (in-process) | None |
+| `postgres` | Yes | Every replica (SKIP LOCKED) | DB only — no Redis |
+| `redis` | Yes | Every replica | Redis |
+| `sqlite` | Yes | Every process on the host | DB only — no Redis |
 
 - `local`: in-process channel, zero configuration. Jobs are lost on restart. Fine
   for development or single-process demos.
@@ -148,6 +154,10 @@ visibility_timeout_ms = 30000
   `autumn migrate` run before the first worker starts.
 - `redis`: Durable, Redis-backed queue for multi-replica workers. Higher
   throughput ceiling than `postgres` but adds Redis as an infrastructure dependency.
+- `sqlite`: durable queue in the app's own SQLite file, for the single-host
+  SQLite tier. Requires the `sqlite` cargo feature. The runtime creates the
+  table itself, so no migration is needed. See
+  [SQLite delivery semantics](#sqlite-delivery-semantics).
 
 ## Web and worker process roles
 
@@ -242,9 +252,16 @@ names.
 ### Split roles require a durable backend
 
 A split web/worker topology **requires a durable jobs backend**
-(`jobs.backend = "postgres"` or `"redis"`). The default `local` backend is an
-in-process, in-memory queue: a `web` replica would enqueue into its own memory,
-where no separate `worker` replica can ever drain it.
+(`jobs.backend = "postgres"`, `"redis"`, or `"sqlite"`). The default `local`
+backend is an in-process, in-memory queue: a `web` replica would enqueue into
+its own memory, where no separate `worker` replica can ever drain it.
+
+`sqlite` qualifies because the queue is a table both processes open — but only
+while they run on the **same host**, which a SQLite deployment does by
+definition, and only against a **file-backed** database. An in-memory target
+(`sqlite::memory:`, `file::memory:`, `?mode=memory`) is private to each process,
+so a split role on one is refused at boot and flagged by
+`autumn doctor --strict`.
 
 Autumn rejects this combination at startup — a `web` or `worker` role on the
 `local` backend exits with a clear error rather than silently dropping work —
@@ -253,7 +270,7 @@ always fine, because one process both enqueues and drains.
 
 ```toml
 [jobs]
-backend = "postgres"   # or "redis"; required once role is "web" or "worker"
+backend = "postgres"   # or "redis" / "sqlite"; required once role is "web" or "worker"
 ```
 
 ### Graceful drain on workers
@@ -311,6 +328,39 @@ Because Redis uses at-least-once delivery, handlers must be idempotent. A worker
 that is slow beyond the visibility timeout can overlap with a recovered retry,
 so external side effects should use natural idempotency keys such as the job id,
 domain aggregate id, or provider idempotency token.
+
+## SQLite delivery semantics
+
+The SQLite backend provides **at-least-once delivery** with the same row
+lifecycle as Postgres. Each job is a row in an `autumn_jobs` table in the app's
+own database file, so work survives a restart with no Redis and no Postgres.
+
+SQLite serializes writers, so a worker claims a row with a single statement —
+`UPDATE … WHERE id = (SELECT … ORDER BY run_at LIMIT 1) RETURNING …` — which is
+the single-host analog of `FOR UPDATE SKIP LOCKED`. Two workers can never claim
+one row.
+
+A claimed row is `running` with a `claimed_at` timestamp and a `claimed_by`
+worker id. A maintenance loop re-enqueues rows whose `claimed_at` is older than
+`jobs.sqlite.visibility_timeout_ms`, at start and on an interval, so a crash
+mid-job loses nothing. A recovered claim consumes another attempt and records a
+`last_error`. A job that exhausts `max_attempts` becomes `failed` and is not
+retried.
+
+There is no `LISTEN`/`NOTIFY`. An enqueue in the same process wakes a worker
+directly; work another process enqueued is seen within
+`jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
+to cut idle wakeups.
+
+Terminal rows are pruned by the runtime, not by `autumn db retention`, whose
+sweep is Postgres-only. Set `retention.job_history` to bound the table; leave it
+unset and history is kept forever, exactly as on Postgres.
+
+The runtime creates the table and its indexes at start, because framework
+migrations are Postgres SQL. Nothing to run by hand.
+
+Because delivery is at-least-once, handlers must be idempotent — the same rule
+as every other durable backend.
 
 ## Retry/backoff and dead letters
 
@@ -752,14 +802,14 @@ Progress/result records expire `jobs.tracking.ttl_secs` after their last
 write (default `86400`, 24h). The record store follows whichever job
 backend is configured — `local` and `redis` use an in-memory or Redis-backed
 store respectively, `postgres` uses the `autumn_job_tracking` table (see
-[Migration notes](#migration-notes)) — so a tracked job's status composes
-with the backend an app already runs, with no extra setup. Expired records
-are invisible to reads/writes immediately on all three stores; each also
-actually frees the expired record so long-running processes don't
-accumulate one dead entry per tracked job forever: the in-memory store
-sweeps them out opportunistically (amortized across `create` calls), a
-Postgres background sweep runs every 5 minutes to `DELETE` expired rows,
-and Redis expires keys natively via `EX`.
+[Migration notes](#migration-notes)), and `sqlite` uses the same table in the
+app's own database file — so a tracked job's status composes with the backend
+an app already runs, with no extra setup. Expired records are invisible to
+reads/writes immediately on every store; each also actually frees the expired
+record so long-running processes don't accumulate one dead entry per tracked
+job forever: the in-memory store sweeps them out opportunistically (amortized
+across `create` calls), the Postgres and SQLite background sweeps run every 5
+minutes to `DELETE` expired rows, and Redis expires keys natively via `EX`.
 
 ### Async CSV export, end to end
 
@@ -922,6 +972,9 @@ in-flight, success, retry/failure, and dead-letter activity observed by the
 replica serving the actuator request.
 
 ## Migration notes
+
+When using `jobs.backend = "sqlite"`, the runtime creates its own `autumn_jobs`
+table at start; no migration step is needed.
 
 When using `jobs.backend = "local"` or `jobs.backend = "redis"`, no SQL migration
 is required.

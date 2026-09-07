@@ -52,6 +52,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sqlite:** durable background jobs and a single-host scheduler on the SQLite
+  tier (issue #1907). `jobs.backend = "sqlite"` puts the queue in an
+  `autumn_jobs` table in the app's own database file, so `#[job]` work is
+  durable and restart-safe with **no Redis and no Postgres**. SQLite serializes
+  writers, so a worker claims a row with one
+  `UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …` — the single-host analog
+  of `FOR UPDATE SKIP LOCKED` — and a claim left behind by a crashed worker is
+  re-enqueued once it outlives `jobs.sqlite.visibility_timeout_ms`. Attempt
+  counting, exponential backoff, dead-lettering, `#[job(unique)]` windows,
+  `#[job(concurrency = N)]` limits, named queues and `[jobs] pin` all behave as
+  they do on Postgres, and the `/admin/jobs` dashboard reads the table, so every
+  process on the host sees one queue. Workers poll (`jobs.sqlite.poll_interval_ms`,
+  default 250ms) because SQLite has no `LISTEN`/`NOTIFY`. The runtime creates
+  the table and its indexes itself — framework migrations are Postgres SQL — so
+  there is nothing to run by hand. Alongside it, `scheduler.backend = "sqlite"`
+  leases each `(task, tick)` in an `autumn_scheduler_leases` table, so several
+  processes on one host elect exactly one leader per tick; the lease expires
+  after `scheduler.lease_ttl_secs` rather than wedging the task when a leader
+  dies. A durable SQLite queue is shared by both processes of a web/worker
+  split, so that topology is now valid on the tier. Both backends need the
+  non-default `sqlite` cargo feature, and both are refused with an actionable
+  message on a build without it. Nothing on the Postgres path changes.
+  `autumn_web::lock::Lock` works on the tier too: the same API takes a lease row
+  in an `autumn_locks` table instead of a `pg_advisory_lock` session, so the
+  processes sharing the file contend, a live holder renews in the background,
+  and a dead one's lock frees at the lease expiry rather than wedging. It is
+  single-host in scope and not re-entrant; both are documented.
+  **Breaking:** `JobConfig` gains a public `sqlite` field and `SchedulerBackend`
+  gains a `Sqlite` variant, so a struct literal over `JobConfig` or an
+  exhaustive `match` on `SchedulerBackend` needs one line — see the
+  [migration guide](docs/migrations/next.md).
+
+- **sqlite:** connections opened at the same instant against a brand-new
+  database file no longer fail with "database is locked". `PRAGMA journal_mode
+  = WAL` takes an exclusive lock and SQLite does not run the busy handler for
+  it, so the `busy_timeout` set one pragma earlier never covered it: whichever
+  connection lost that race failed setup, and the request behind it got a 500.
+  The journal mode is a persistent property of the file, so the setup now
+  retries briefly and every retry after the winner is a no-op. Reachable
+  whenever several subsystems open the database at boot, which the durable
+  SQLite job runtime above does.
+
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded
   its query functions by `diesel::pg::Pg`, which rejects the SQLite
@@ -114,7 +156,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-upgrade), where automatic detection is ambiguous, every attribute macro
   additionally accepts an explicit `crate = "..."` override, e.g.
   `#[get("/x", crate = "autumn_web_05")]`.
-
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
   `http-outbound`, `db`, `jobs` and `render` beside `http-request`, and a new

@@ -96,6 +96,9 @@ REQUEST_PATH_MODULES=(
   autumn/src/inbound_mail.rs:inbound-mail
   autumn/src/channels.rs:ws
   autumn/src/job.rs:default
+  # The durable SQLite job backend (#1907): a submodule of the gated job.rs,
+  # listed on its own because its enforcing clippy lane is the sqlite one.
+  autumn/src/job/sqlite.rs:sqlite
   autumn/src/job_tracking.rs:default
   autumn/src/session.rs:default
   autumn/src/session_redis.rs:redis
@@ -160,7 +163,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=64
+MODULE_COUNT_FLOOR=65
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny
@@ -173,18 +176,10 @@ MODULE_COUNT_FLOOR=64
 # reachable. Adding an entry is a deliberate, reviewable act; the honest default
 # for a request-path module is to be linted.
 #
-#   middleware/trace_context.rs (#[cfg(feature = "telemetry-otlp")],
-#   autumn/src/middleware/mod.rs:32) — telemetry-otlp pulls prost/tonic, whose
-#   build scripts need `protoc`, which the `lint` runner does not install (see
-#   the docs.rs note at autumn/Cargo.toml:385 and the explicit protoc steps in
-#   feature-combinations.yml / publish-gate.yml). Adding the feature to the
-#   gated-features clippy step therefore also means adding a protoc install step
-#   to the `lint` job. Verified locally with protoc present that
-#   `cargo clippy -p autumn-web --features telemetry-otlp --lib -- -D warnings`
-#   is already clean, so the burn-down is a workflow change, not a code change.
-FEATURE_LINT_EXEMPT=(
-  autumn/src/middleware/trace_context.rs:telemetry-otlp
-)
+#   Empty. The last entry — middleware/trace_context.rs behind `telemetry-otlp`
+#   — was retired by the `sqlite,telemetry-otlp` clippy lane the sqlite-runtime
+#   job gained with issue #1907, which installs protoc and enforces the feature.
+FEATURE_LINT_EXEMPT=()
 
 # What the checks below actually read; the self-test points it at its own list.
 # Guarded expansion so an emptied list is safe under `set -u` on bash < 4.4.
