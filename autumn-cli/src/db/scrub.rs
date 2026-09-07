@@ -2958,10 +2958,12 @@ fn report_triggers(plan: &ScrubPlan, sampling: Option<&sample::SamplePlan>, fact
         return;
     }
     eprintln!(
-        "  \u{26A0}\u{FE0F}  {} table(s) this run writes to carry user-defined triggers: {}.\n    \
+        "  \u{26A0}\u{FE0F}  {} table(s) this run writes to carry user-defined triggers or \
+         rules: {}.\n    \
          An audit or history trigger copies the PRE-scrub row into another table as the \
-         rewrite or the sample's removals run, which can re-introduce real values. Check \
-         those triggers, or disable them on the copy before scrubbing.",
+         rewrite or the sample's removals run, which can re-introduce real values; an \
+         `ON DELETE ... DO INSTEAD` rule can stop the sample removing anything at all. \
+         Check them, or disable them on the copy before scrubbing.",
         triggered.len(),
         triggered.join(", ")
     );
@@ -2998,6 +3000,24 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
 /// says nothing about row-level security, triggers, partitions, materialized
 /// views, or schemas outside `public`. Every one of those decides whether an
 /// `UPDATE` this command emits succeeds, silently under-applies, or leaks — so
+/// Tables a statement naming them can fire a user-defined rewrite rule on.
+///
+/// Unlike triggers this needs no walk up `pg_inherits`: measured on
+/// `PostgreSQL` 16, a rule on a leaf partition or an inheritance child does not
+/// fire for a statement naming the parent, because rewriting happens against the
+/// relation the query names. `_RETURN` is the `SELECT` rule every view carries,
+/// and `ev_enabled` follows the same `O`/`A` rule as `tgenabled`.
+///
+/// `extra` is an additional `pg_rewrite` predicate, e.g. restricting the event.
+fn rules_reaching(extra: &str) -> String {
+    format!(
+        "SELECT DISTINCT rel.relname AS name FROM pg_rewrite r \
+         JOIN pg_class rel ON rel.oid = r.ev_class \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE r.rulename <> '_RETURN' AND r.ev_enabled IN ('O', 'A') {extra}"
+    )
+}
+
 /// Tables a statement naming them can fire a user-defined trigger on.
 ///
 /// Two catalog rules decide this, and both have bitten this command:
@@ -3178,13 +3198,26 @@ fn pair_set(rows: Vec<PairRow>) -> BTreeSet<(String, String)> {
 
 /// Open a connection for a probe, mapping failure to a credential-safe error.
 fn probe_connection(url: &str, label: &str, what: &str) -> Result<PgConnection, ScrubError> {
-    PgConnection::establish(url).map_err(|_| ScrubError::Introspect {
+    let mut conn = PgConnection::establish(url).map_err(|_| ScrubError::Introspect {
         label: label.to_owned(),
         detail: format!(
             "could not connect to database {:?} to {what}",
             parsed_db_name(url)
         ),
-    })
+    })?;
+    // Pinned here, not only inside the scrub's transaction: `pg_catalog` is
+    // searched implicitly ONLY when the path does not name it, so a target whose
+    // `search_path` is `public, pg_catalog` lets an application object shadow a
+    // built-in — and every question this command asks the catalog is asked over
+    // THIS connection, before any transaction opens. A `public.current_setting`
+    // returning `'origin'` was enough to walk straight past the replica-role
+    // refusal.
+    conn.batch_execute("SET search_path = pg_catalog, public")
+        .map_err(|e| ScrubError::Introspect {
+            label: label.to_owned(),
+            detail: format!("could not pin the search path to {what}: {e}"),
+        })?;
+    Ok(conn)
 }
 
 /// Whether a system catalog has a given column on this server.
@@ -3488,9 +3521,13 @@ fn probe_database_facts(
     // all (the warning), and which carry one that fires on `DELETE` (the
     // refusal). `triggers_reaching` builds both, so they cannot drift on the
     // catalog rules they share.
-    let triggered_tables = names(&triggers_reaching(""), &mut conn)?
+    // Triggers and rules alike: both run code on a write, and this warning exists
+    // to say "something here can copy a row somewhere this run does not look".
+    // A `DO INSTEAD` rule can also stop the sample's `DELETE` removing anything.
+    let mut triggered_tables: BTreeSet<String> = names(&triggers_reaching(""), &mut conn)?
         .into_iter()
         .collect();
+    triggered_tables.extend(names(&rules_reaching(""), &mut conn)?);
     // `tgtype` bit 3 is the DELETE event. These are the ones that matter for
     // the run's last write, so the refusal can name exactly the tables that
     // carry one rather than every table carrying any trigger at all.
@@ -3499,7 +3536,7 @@ fn probe_database_facts(
     // it even to its own default — so `SET LOCAL` would break every unprivileged
     // run to close a hazard only a privileged one can create.
     let replication_role = names(
-        "SELECT current_setting('session_replication_role') AS name",
+        "SELECT pg_catalog.current_setting('session_replication_role') AS name",
         &mut conn,
     )?
     .into_iter()
@@ -3515,14 +3552,7 @@ fn probe_database_facts(
         names(&triggers_reaching("AND (t.tgtype & 8) <> 0 "), &mut conn)?
             .into_iter()
             .collect();
-    delete_triggered_tables.extend(names(
-        "SELECT DISTINCT rel.relname AS name FROM pg_rewrite r \
-         JOIN pg_class rel ON rel.oid = r.ev_class \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE r.ev_type = '4' AND r.rulename <> '_RETURN' \
-         AND r.ev_enabled IN ('O', 'A')",
-        &mut conn,
-    )?);
+    delete_triggered_tables.extend(names(&rules_reaching("AND r.ev_type = '4' "), &mut conn)?);
 
     // `m` (materialized views) belongs here as much as the table relkinds do: a
     // schema holding only `analytics.user_emails AS SELECT … FROM public.users`
@@ -4226,7 +4256,7 @@ fn execute(
 
 #[cfg(test)]
 mod tests {
-    use super::{emptiness_assertion, integrity_assertion, triggers_reaching};
+    use super::{emptiness_assertion, integrity_assertion, rules_reaching, triggers_reaching};
 
     // ── The dry run's session and connection preamble ──────────────────────
 
@@ -4343,6 +4373,35 @@ mod tests {
     }
 
     // ── Which triggers a statement can actually fire ────────────────────────
+
+    #[test]
+    fn rules_are_asked_for_by_the_same_rules_but_without_the_walk() {
+        let sql = rules_reaching("AND r.ev_type = '4' ");
+        // Measured on PostgreSQL 16: a rule on a leaf partition or an
+        // inheritance child does NOT fire for a statement naming the parent,
+        // because rewriting happens against the relation the query names. So
+        // this must not grow the ancestry walk its trigger counterpart needs.
+        assert!(
+            !sql.contains("pg_inherits"),
+            "a rule fires only on the relation named, so no walk: {sql}"
+        );
+        assert!(
+            sql.contains("r.ev_enabled IN ('O', 'A')"),
+            "a disabled rule cannot fire either: {sql}"
+        );
+        assert!(
+            sql.contains("r.rulename <> '_RETURN'"),
+            "every view's own SELECT rule must be excluded: {sql}"
+        );
+        assert!(
+            sql.contains("AND r.ev_type = '4'"),
+            "the caller's event filter must reach the query: {sql}"
+        );
+        assert!(
+            !rules_reaching("").contains("ev_type"),
+            "and an empty filter must not smuggle one in"
+        );
+    }
 
     #[test]
     fn only_row_triggers_propagate_up_the_inheritance_tree() {
