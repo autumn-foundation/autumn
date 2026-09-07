@@ -4009,7 +4009,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child table — a different, net-cheaper plan, not the same work counted
   once — but the N+1 elimination on statement count, not that plan
   change, is what clears the impact floor here). See
-  `docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/`.
+  `docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/`,
+  including its "Known limitation" section: neither child table has an FK
+  to `autumn_experiments`, so a concurrent `record_assignment`/
+  `set_override` on a `running` experiment being bulk-deleted can still
+  orphan a row (a pre-existing race this change widens the window on, not
+  a new one — not fixed here, flagged for a follow-up decision).
 
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,

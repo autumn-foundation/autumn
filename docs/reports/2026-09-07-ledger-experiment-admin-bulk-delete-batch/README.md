@@ -287,6 +287,50 @@ No existing test's expectations were edited. The existing
 full non-Docker `cargo test -p autumn-admin-plugin` suite pass unchanged
 against the fix.
 
+## ⚠️ Known limitation (found by review, not fixed here)
+
+Neither `autumn_experiment_assignments` nor `autumn_experiment_overrides`
+has a foreign key to `autumn_experiments` (confirmed against the
+migration, `autumn/migrations/20260530300000_create_experiments/up.sql`)
+— the cascade is hand-written SQL in `delete()`/`execute_action`, not an
+`ON DELETE CASCADE` constraint. `PgExperimentStore::record_assignment`
+(`autumn/src/experiments.rs`) takes a `pg_advisory_xact_lock` keyed on the
+**actor**, not the experiment, before inserting a new assignment row; it
+does not coordinate with a concurrent delete on that experiment at all.
+So if an operator bulk-deletes a `running` experiment while live traffic
+is still calling `assign()`, a `record_assignment`/`set_override` insert
+that commits after this statement's `_del_assignments`/`_del_overrides`
+CTE has already scanned past that experiment's rows creates an orphaned
+assignment/override row the delete never saw — and if that experiment
+name is later reused, the new experiment silently inherits it.
+
+**This race pre-dates this PR** and is identical in kind for the
+single-id `delete()` this fix replaces — no FK, no shared lock, either
+way. What this PR changes is the exposure *window*: the old per-id loop
+ran 615 near-instantaneous single-row statements, each closing its own
+race window in well under a millisecond; the batched statement runs one
+`Seq Scan`-driven cascade that spends ~54ms deleting assignment rows
+(see 🧭 Plan), so a concurrent insert has a measurably longer wall-clock
+window to land an orphan for *any* of the 555 target experiments, not
+just the one instantaneous single-row window each previously had. Under
+sustained concurrent write load against a `running` experiment being
+deleted, that is a real increase in the probability of hitting the race,
+not merely a theoretical one.
+
+Closing it needs one of: an `ON DELETE CASCADE` foreign key (a schema/
+migration change — this repo's own contributing rules require a
+human-reviewed migration for any lock stronger than `SHARE UPDATE
+EXCLUSIVE`, and adding a validated FK to populated tables this size takes
+one), or a lock shared between the delete path and
+`record_assignment`/`set_override` keyed on the experiment name (a
+concurrency/transaction-boundary change). Both are outside "smallest
+change that moves the counter" and outside what an admin-model
+`execute_action` override can decide on its own — this report surfaces
+the finding rather than picking a fix, the same way the Ledger process
+already routes the structurally identical `WebhookOutboundManager`
+fan-out and `repository_commit_hooks` claim/ack findings to a human
+decision.
+
 ## 💸 Write cost
 
 No index added, dropped, or altered. No WAL/throughput measurement applies
