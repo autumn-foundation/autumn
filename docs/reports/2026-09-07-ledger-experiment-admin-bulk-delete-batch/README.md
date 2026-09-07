@@ -54,7 +54,9 @@ else one of 15 group names (cardinality skew).
 
 Each experiment carries a variable number of sticky assignments
 (`autumn_experiment_assignments`, 10–170 rows per experiment depending on
-how wide its rollout was, ~270k rows total) and 0–3 staff overrides
+how wide its rollout was, ~270k rows total, via a fanout modulus coprime to
+the bulk-delete selection's own stride so the selected experiments see the
+same skew as the fixture as a whole) and 0–3 staff overrides
 (`autumn_experiment_overrides`, ~4.5k rows total) — the two cascading child
 tables `delete()`'s CTE also has to touch, real cardinality skew rather
 than a uniform fixture. `autumn_experiment_changes` (the audit log the real
@@ -119,15 +121,15 @@ WITH deleted AS ( DELETE FROM autumn_experiments WHERE id = ANY($1) RETURNING na
 Every id-scoped delete CTE, its cascading assignment/override deletes, the
 audit `INSERT` they trigger, and the loop's own `pool.get()` call collapse
 into one round trip carrying one bound `bigint[]` array instead of 615
-separately-prepared, separately-executed statements. Both dumps end with
-two diagnostic `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` runs, each
-rolled back: the pre-fix single-id shape (`id = 2`) and — so the "same plan
-either side" claim rests on the statement `execute_action` actually issues
-post-fix, not just on analogy with the single-id case — the real post-fix
-batched shape (`id = ANY(ARRAY[2,3,4,6,7])`, a representative array of
-surviving ids). Both show the identical per-row plan (index scan on
-`autumn_experiments_pkey`, bitmap-index-scan-driven cascade deletes on both
-child tables, CTE-scan-driven audit insert, the
+separately-prepared, separately-executed statements. Each dump carries two
+diagnostic `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` runs, both
+rolled back: the pre-fix single-id shape (`id = 2`), and — run against the
+exact `ids` array the real action below submits, all 615 elements, not a
+small stand-in array, since Postgres can pick a different access method as
+array cardinality/selectivity grows — the real post-fix batched shape
+(`id = ANY(ARRAY[...615 ids...])`). Both show the identical per-row plan
+(index scan on `autumn_experiments_pkey`, bitmap-index-scan-driven cascade
+deletes on both child tables, CTE-scan-driven audit insert, the
 `autumn_experiment_change_notify` trigger firing once per deleted row) —
 this is a round-trip-count change, not a plan-shape change.
 
@@ -181,20 +183,22 @@ reset before the run. Full statement dumps in `baseline/output.txt`
 | | before | after |
 |---|---:|---:|
 | delete CTE statement calls | 615 | **1** |
-| delete CTE statement buffers | 17,287 | **14,247** |
+| delete CTE statement buffers | 62,012 | **58,616** |
 | ids submitted (for reference) | 615 | 615 |
 
 Statement count drops from **one per id to one per bulk action** — the
 admissible-on-its-own N+1 floor ("statement count per request drops from
 O(n) to O(1)... needs no other justification"). Buffers touched also drop
-**17.6%** (17,287 → 14,247): every one of the 615 per-id statements paid
-its own planning/CTE-setup overhead, its own bitmap-index-scan setup on
-both cascading child tables, and, for the 45 pre-deleted + 15 nonexistent
-ids, a wasted point-lookup-that-finds-nothing; batching removes 614 of
-those redundant setups outright. The N+1 elimination alone clears the
-impact floor; the buffer reduction, while real, falls short of the
-explicit ≥20% floor on its own — reported here for completeness, not as an
-independent floor-clearing claim.
+**5.5%** (62,012 → 58,616): the dominant cost here is the cascading
+assignment/override deletes themselves (each of the 555 existing
+experiments carries 10–170 sticky-assignment rows to delete), which cost
+the same total work batched or not; batching only removes the *redundant*
+per-statement planning/CTE-setup overhead and the 60 wasted (pre-deleted +
+nonexistent) point-lookups-that-find-nothing, a small slice of a buffer
+total this large. The N+1 elimination alone clears the impact floor; the
+buffer reduction, while real, falls well short of the explicit ≥20% floor
+on its own — reported here for completeness, not as an independent
+floor-clearing claim.
 
 No `temp_blks_written` at any point (no spill, either side, confirmed in
 both `output.txt` dumps). No index was added or dropped, so there is no

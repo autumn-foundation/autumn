@@ -143,7 +143,12 @@ fn seed_fixture(conn: &mut PgConnection) {
 
     // Variable-width sticky assignments per experiment (10-170 rows,
     // depending on how wide the experiment's rollout was) -- real
-    // cardinality skew, ~270k rows total.
+    // cardinality skew, ~270k rows total. `e.id % 17` (17 is coprime to
+    // `BULK_IDS_STEP` = 5): the bulk-delete selection below is every id
+    // divisible by 5, so a fanout modulus that shares a factor with 5
+    // (the original draft used `% 5`) collapses to a single residue for
+    // every selected id and silently measures only the cheapest cascade
+    // case -- caught by review, see git history.
     conn.batch_execute(
         "INSERT INTO autumn_experiment_assignments \
          (experiment, actor, variant, is_override, assigned_at) \
@@ -151,7 +156,7 @@ fn seed_fixture(conn: &mut PgConnection) {
                 (ARRAY['control','treatment'])[1 + (a_gs % 2)], FALSE, \
                 e.created_at + (a_gs || ' minutes')::interval \
          FROM autumn_experiments e \
-         CROSS JOIN LATERAL generate_series(1, 10 + (e.id % 5) * 40) AS a_gs",
+         CROSS JOIN LATERAL generate_series(1, 10 + (e.id % 17) * 10) AS a_gs",
     )
     .expect("seed autumn_experiment_assignments");
 
@@ -406,6 +411,43 @@ async fn experiment_admin_bulk_delete_batch_profile() {
          {PRE_DELETED_SELECTED} pre-deleted, {NONEXISTENT_SELECTED} nonexistent) --"
     );
 
+    // The actual post-fix statement shape (`id = ANY($1)`), explained
+    // against the EXACT same array the real action below submits (not a
+    // handful of representative ids) and rolled back before that real
+    // action runs -- Postgres can pick a different access method as array
+    // cardinality/selectivity grows, so only an explain of the real,
+    // full-sized submitted array supports the "same plan either side"
+    // claim for the actual bulk workload, not a small stand-in array.
+    let ids_array_literal = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    conn.transaction::<(), diesel::result::Error, _>(|conn| {
+        explain(
+            conn,
+            "batched DELETE by id = ANY($1) against the real, full-sized \
+             submitted array (the actual post-fix statement execute_action \
+             is about to issue), rolled back — diagnostic only",
+            &format!(
+                "WITH deleted AS ( \
+                     DELETE FROM autumn_experiments WHERE id = ANY(ARRAY[{ids_array_literal}]) RETURNING name \
+                 ), \
+                 _del_assignments AS ( \
+                     DELETE FROM autumn_experiment_assignments \
+                     WHERE experiment IN (SELECT name FROM deleted) \
+                 ), \
+                 _del_overrides AS ( \
+                     DELETE FROM autumn_experiment_overrides \
+                     WHERE experiment IN (SELECT name FROM deleted) \
+                 ), \
+                 _audit AS ( \
+                     INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                     SELECT name, 'deleted', NULL FROM deleted \
+                 ) \
+                 SELECT COUNT(*) AS count FROM deleted"
+            ),
+        );
+        Err(diesel::result::Error::RollbackTransaction)
+    })
+    .ok();
+
     // Watermarks: only rows written AFTER these points belong to the bulk
     // action being measured, not the fixture's own pre-seeded history.
     let audit_watermark =
@@ -526,38 +568,6 @@ async fn experiment_admin_bulk_delete_batch_profile() {
              rolled back — diagnostic only",
             "WITH deleted AS ( \
                  DELETE FROM autumn_experiments WHERE id = 2 RETURNING name \
-             ), \
-             _del_assignments AS ( \
-                 DELETE FROM autumn_experiment_assignments \
-                 WHERE experiment IN (SELECT name FROM deleted) \
-             ), \
-             _del_overrides AS ( \
-                 DELETE FROM autumn_experiment_overrides \
-                 WHERE experiment IN (SELECT name FROM deleted) \
-             ), \
-             _audit AS ( \
-                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
-                 SELECT name, 'deleted', NULL FROM deleted \
-             ) \
-             SELECT COUNT(*) AS count FROM deleted",
-        );
-        Err(diesel::result::Error::RollbackTransaction)
-    })
-    .ok();
-
-    // The actual post-fix statement shape (`id = ANY($1)`), run against a
-    // small representative array of ids that survived the bulk action
-    // (none are multiples of `BULK_IDS_STEP`, so none were in the
-    // submitted set) -- confirms the batched array-predicate plan is the
-    // same index-scan/bitmap-cascade shape as the single-id plan above,
-    // not just asserted from the single-id case by analogy.
-    conn.transaction::<(), diesel::result::Error, _>(|conn| {
-        explain(
-            conn,
-            "batched DELETE by id = ANY($1) (the actual post-fix statement \
-             shape execute_action now issues), rolled back — diagnostic only",
-            "WITH deleted AS ( \
-                 DELETE FROM autumn_experiments WHERE id = ANY(ARRAY[2,3,4,6,7]) RETURNING name \
              ), \
              _del_assignments AS ( \
                  DELETE FROM autumn_experiment_assignments \
