@@ -3198,11 +3198,22 @@ def _missing_value(kind, eaten, i, tokens, runnable):
     if i + eaten > len(tokens):
         return True                             # nothing there at all
     # …and a token being PRESENT is not the same as it being a value the
-    # option can take. The shell removes a redirection before the binary is
-    # launched, so `autumn build --package >/tmp/out` reaches clap as
-    # `build --package` and is "a value is required" (measured). Counting the
-    # token list alone accepted it, since `>` was sitting in the slot.
-    return bool(_redirect(tokens[i + 1]))
+    # option can take. Two kinds of token sit in that slot without being one:
+    #
+    #   - a REDIRECTION, which the shell removes before the binary is launched,
+    #     so `autumn build --package >/tmp/out` reaches clap as
+    #     `build --package`;
+    #   - another OPTION, or the `--` terminator, which clap reads as the next
+    #     argument rather than as a value.
+    #
+    # All measured: `--package --debug`, `--package -p` and `--package --` are
+    # each "a value is required for '--package <PACKAGE>'". No value-taking
+    # option in this CLI carries `allow_hyphen_values` — its three sites are all
+    # positionals — so a hyphen-led token is never a value here.
+    nxt = tokens[i + 1]
+    if _redirect(nxt):
+        return True
+    return nxt == '--' or (nxt.startswith('-') and len(nxt) > 1)
 
 
 def _starts_trailing(node, supplied):
@@ -4098,6 +4109,18 @@ def self_test():
                f'a redirection cannot serve as the value in {form!r}: {hits}')
     expect(raw_opts('migrate --shard eu >/tmp/out', runnable=True) == [],
            'a real value followed by a redirection resolves')
+    # …nor is another option, or the `--` terminator: clap reads those as the
+    # next argument, not as the value. All three measured as "a value is
+    # required for '--shard <NAME>'".
+    for form in ('migrate --shard --with-maintenance', 'migrate --shard -p',
+                 'migrate --shard --', 'migrate --shard --notanoption'):
+        hits = raw_opts(form, runnable=True)
+        expect([k for _p, _o, k in hits] == ['needsvalue'],
+               f'an option token cannot be the value in {form!r}: {hits}')
+    expect(raw_opts('migrate --with-maintenance --shard eu', runnable=True) == [],
+           'a boolean before a value-taking option is not its value')
+    expect(raw_opts('migrate --shard eu --with-maintenance', runnable=True) == [],
+           'a value followed by another option resolves')
     expect(resolve(tk('replay -hpapi'), surface, runnable=True) is None,
            '…so <CAPSULE> is not reported missing')
     expect(resolve(tk('replay -papi'), surface, runnable=True) == 'autumn replay',
