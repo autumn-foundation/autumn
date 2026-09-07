@@ -21,7 +21,8 @@ use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_co
 use crate::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
     field_has_skip_serializing_if, field_is_translatable, field_serde_serialize_rename, has_attr,
-    is_option_type, serde_rename_all_serialize_rule, type_name_str,
+    is_option_type, serde_bare_word, serde_rename_all_serialize_rule, serde_valued_key,
+    type_name_str,
 };
 
 /// Parsed `#[model(...)]` attribute arguments.
@@ -7506,6 +7507,45 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         schema_rename_all_rule,
         &|f: &Field| field_has_skip_serializing_if(f),
     );
+    // Whether a container `#[serde(...)]` re-shapes what the QUERY struct
+    // serializes to, in which case the field-by-field schema above describes a
+    // response the server never sends and must not be registered.
+    //
+    // Direction matters, and only the serialize side does: this schema describes
+    // a RESPONSE (the generated API takes `New*` / `Update*` as request bodies).
+    // So:
+    //   * `transparent`     — writes the inner value, not an object     → skip
+    //   * `into = "X"`      — Serialize converts to X and writes X's shape → skip
+    //   * `tag = "t"`       — adds a tag field to the output            → skip
+    //   * `from` / `try_from` — DESERIALIZE-side only; serialization is
+    //                         unaffected, so the response shape is still these
+    //                         fields                                    → keep
+    //   * split `rename_all` — the read schema already takes the serialize
+    //                         side, which is the side a response uses   → keep
+    //
+    // Declining registration rather than raising a compile error: `#[model]` is
+    // a core macro, and refusing to compile an app that legitimately uses
+    // `#[serde(into = ...)]` would be a breaking change out of proportion to the
+    // problem. Falling back to the opaque placeholder restores the pre-#802
+    // behaviour for exactly these models, which is honest rather than wrong —
+    // and `autumn openapi export` names every placeholder it emits, so the
+    // author is told rather than left guessing.
+    let query_struct_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
+        || serde_valued_key(outer_attrs, &["into", "tag"]).is_some();
+    let query_schema_descriptor = if query_struct_reshaped {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DerivedSchemaDescriptor {
+                    name: stringify!(#name),
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+                }
+            }
+        }
+    };
+
     // `NewModel` carries `#[serde(default)]` on every non-`Option` `bool` (see
     // the `bool_default` wiring in the struct emitter), so a POST body may omit
     // one and get `false`. Requiredness has to follow that, not the Rust type,
@@ -8555,13 +8595,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // generic `{"type":"object","title":"X"}` placeholder — an untyped blob
         // in every generated client — even though the real schema was compiled
         // in all along.
-        ::autumn_web::reexports::inventory::submit! {
-            ::autumn_web::openapi::DerivedSchemaDescriptor {
-                name: stringify!(#name),
-                identity: ::autumn_web::openapi::type_name_of::<#name>,
-                schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
-            }
-        }
+        #query_schema_descriptor
 
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::openapi::DerivedSchemaDescriptor {

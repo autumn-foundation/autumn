@@ -333,6 +333,70 @@ fn option_field_emits_nullable_schema() {
     );
 }
 
+// ── A re-shaped model declines automatic registration (issue #802) ─────
+
+mod schema_reshaped {
+    autumn_web::reexports::diesel::table! {
+        reshaped_rows (id) {
+            id -> Int8,
+            title -> Text,
+        }
+    }
+}
+
+use schema_reshaped::reshaped_rows;
+
+/// What `ReshapedRow` actually serializes to — a single string, not an object.
+#[derive(serde::Serialize)]
+pub struct WireReshaped(String);
+
+impl From<ReshapedRow> for WireReshaped {
+    fn from(row: ReshapedRow) -> Self {
+        Self(row.title)
+    }
+}
+
+#[autumn_web::model(table = "reshaped_rows")]
+#[serde(into = "WireReshaped")]
+pub struct ReshapedRow {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+/// A model whose container serde attribute re-shapes the response must NOT
+/// register its field-by-field schema, because that schema describes a payload
+/// the server never sends.
+///
+/// Declining registration rather than erroring: the model falls back to the
+/// opaque `{"type":"object"}` placeholder, which is the pre-#802 behaviour and
+/// is honest — `autumn openapi export` names every placeholder it emits, so the
+/// author is told. Publishing the wrong shape would be worse than publishing
+/// none, since a generated client acts on it.
+///
+/// Only the SERIALIZE side matters here: this schema describes a response, and
+/// the generated API takes `New*` / `Update*` as request bodies. `from` /
+/// `try_from` (deserialize-side) and a split `rename_all` (whose serialize side
+/// is the one a response uses) therefore still register normally.
+#[test]
+fn a_reshaped_model_does_not_register_its_field_schema() {
+    let registered =
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<ReshapedRow>());
+    assert!(
+        registered.is_none(),
+        "`#[serde(into = ...)]` makes the field-by-field schema wrong, so it must not be \
+         advertised: {registered:?}"
+    );
+
+    // The write companions do not inherit container attributes, so their
+    // schemas are still accurate and still register.
+    assert!(
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<NewReshapedRow>())
+            .is_some(),
+        "NewReshapedRow is unaffected by the model's container attribute"
+    );
+}
+
 // ── Conditional omission on the read schema (issue #802) ───────────────
 
 mod schema_conditional {
