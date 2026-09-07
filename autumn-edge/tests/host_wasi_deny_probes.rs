@@ -105,12 +105,18 @@ fn invented_namespace_import_is_refused_at_load() {
 /// version of this probe only called `environ_sizes_get`, leaving
 /// `environ_get` itself uncovered: a regression that writes real data
 /// through `environ_get` while the sizes call still reports zero would have
-/// passed unnoticed. This guest sentinel-fills both the pointer-array and
-/// string-buffer regions before calling `environ_get`, and traps if either
-/// the reported sizes or either buffer changed. "The capsule exited without
-/// answering" (clean fallthrough, no trap) is the only way to pass; a real
-/// leak in either function shows up as a distinctly different, trapped
-/// detail instead.
+/// passed unnoticed. A second Codex review then flagged that the sizes-get
+/// half of that fix was itself hollow: WASM linear memory starts
+/// zero-initialized, so reading zero back from an unseeded output slot
+/// proves nothing about whether `environ_sizes_get` actually wrote it — a
+/// no-op or a silently-failing call would read identically. This guest now
+/// seeds *every* output location (the two size slots, the pointer-array
+/// region, and the string-buffer region) with a non-zero sentinel first,
+/// and additionally checks each call's own returned errno is `SUCCESS`
+/// before trusting what it wrote. "The capsule exited without answering"
+/// (clean fallthrough, no trap) is the only way to pass; a real leak, a
+/// silent failure, or a no-op in any of the four checked locations shows up
+/// as a distinctly different, trapped detail instead.
 #[test]
 fn environ_is_actually_empty_not_just_documented() {
     let outcome = run(r#"(module
@@ -120,16 +126,20 @@ fn environ_is_actually_empty_not_just_documented() {
     (func $environ_get (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")
-    ;; Sentinel-fill the pointer-array region (100..108) and the string
-    ;; buffer region (200..208) before handing them to environ_get.
+    ;; Sentinel-fill the size-output slots (0, 4), the pointer-array region
+    ;; (100..108) and the string-buffer region (200..208) *before* any call,
+    ;; so a pass proves each function actually wrote what it claims rather
+    ;; than relying on WASM's zero-initialized memory to fake a pass.
+    (i32.store (i32.const 0) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 4) (i32.const 0xdeadbeef))
     (i32.store (i32.const 100) (i32.const 0xdeadbeef))
     (i32.store (i32.const 104) (i32.const 0xdeadbeef))
     (i32.store (i32.const 200) (i32.const 0xdeadbeef))
     (i32.store (i32.const 204) (i32.const 0xdeadbeef))
-    (drop (call $environ_sizes_get (i32.const 0) (i32.const 4)))
+    (if (i32.ne (call $environ_sizes_get (i32.const 0) (i32.const 4)) (i32.const 0)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 0)) (i32.const 0)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 4)) (i32.const 0)) (then (unreachable)))
-    (drop (call $environ_get (i32.const 100) (i32.const 200)))
+    (if (i32.ne (call $environ_get (i32.const 100) (i32.const 200)) (i32.const 0)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 100)) (i32.const 0xdeadbeef)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 104)) (i32.const 0xdeadbeef)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 200)) (i32.const 0xdeadbeef)) (then (unreachable)))
@@ -148,7 +158,9 @@ fn environ_is_actually_empty_not_just_documented() {
 }
 
 /// R3 (arguments): the same probe for `args_sizes_get`/`args_get`, same
-/// Codex-review gap closed the same way.
+/// two Codex-review gaps closed the same way — sentinel-seeded output
+/// locations (including the size slots, per the second review round) and a
+/// checked `SUCCESS` return from both calls.
 #[test]
 fn args_are_actually_empty_not_just_documented() {
     let outcome = run(r#"(module
@@ -158,14 +170,16 @@ fn args_are_actually_empty_not_just_documented() {
     (func $args_get (param i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "_start")
+    (i32.store (i32.const 0) (i32.const 0xdeadbeef))
+    (i32.store (i32.const 4) (i32.const 0xdeadbeef))
     (i32.store (i32.const 100) (i32.const 0xdeadbeef))
     (i32.store (i32.const 104) (i32.const 0xdeadbeef))
     (i32.store (i32.const 200) (i32.const 0xdeadbeef))
     (i32.store (i32.const 204) (i32.const 0xdeadbeef))
-    (drop (call $args_sizes_get (i32.const 0) (i32.const 4)))
+    (if (i32.ne (call $args_sizes_get (i32.const 0) (i32.const 4)) (i32.const 0)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 0)) (i32.const 0)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 4)) (i32.const 0)) (then (unreachable)))
-    (drop (call $args_get (i32.const 100) (i32.const 200)))
+    (if (i32.ne (call $args_get (i32.const 100) (i32.const 200)) (i32.const 0)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 100)) (i32.const 0xdeadbeef)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 104)) (i32.const 0xdeadbeef)) (then (unreachable)))
     (if (i32.ne (i32.load (i32.const 200)) (i32.const 0xdeadbeef)) (then (unreachable)))

@@ -198,6 +198,26 @@ named in the pre-registration.
   `sock_send` probe stays (it is real, additional evidence, and cheap to
   keep) but is now reported as **5/5 pre-registered, plus 1 supplemental**
   throughout, never blended into a single inflated count.
+- **Update (third Codex review round) — a real soundness gap in the R3
+  probes themselves, found and fixed.** The environ/args probes checked
+  offsets 0 and 4 for zero *without seeding them first*. WASM linear memory
+  starts zero-initialized, so that check could not distinguish "the shim
+  correctly computed and wrote zero" from "the shim did nothing at all, or
+  failed silently, and the slot was already zero" — a no-op or
+  silently-erroring `environ_sizes_get`/`args_sizes_get` would have passed
+  this probe exactly as cleanly as the real, correct implementation.
+  Verified with a negative control: `environ_sizes_get`'s registration was
+  temporarily replaced with a closure that writes nothing and returns
+  `errno::INVAL`, and the *pre-fix* probe passed regardless (not run as a
+  committed state, only to confirm the gap before fixing it). Fixed by
+  seeding the two size-output slots with the same non-zero sentinel used
+  for the pointer-array/buffer regions, and by checking each call's own
+  returned errno equals `SUCCESS` before trusting anything it wrote. Re-ran
+  the same negative control against the *post-fix* probe and confirmed it
+  now traps (the seeded sentinel survives an `INVAL`-returning no-op,
+  correctly read as a failure); reverted the control immediately after —
+  `git diff --stat autumn-edge/src/host.rs` again shows zero net change to
+  that file in this PR.
 
 ## 📊 Assay
 
@@ -210,8 +230,8 @@ cargo test -p autumn-edge --features host --test host_wasi_deny_probes
 | `filesystem_import_is_refused_at_load` | R1 — ambient filesystem | yes | refused at instantiation | **refused** (`"...could not be instantiated..."`) |
 | `socket_connect_import_is_refused_at_load` | R2 — closed world, real fn (`sock_connect`) | yes (the pre-registration's own named example) | refused at instantiation | **refused** |
 | `invented_namespace_import_is_refused_at_load` | R2 — closed world, invented namespace | yes | refused at instantiation | **refused** |
-| `environ_is_actually_empty_not_just_documented` | R3 — environment (size + value calls) | yes | clean exit, no trap | **clean exit** (`"the capsule exited without answering"`) |
-| `args_are_actually_empty_not_just_documented` | R3 — argv (size + value calls) | yes | clean exit, no trap | **clean exit** |
+| `environ_is_actually_empty_not_just_documented` | R3 — environment (size + value calls, sentinel-seeded, errno-checked) | yes | clean exit, no trap | **clean exit** (`"the capsule exited without answering"`) |
+| `args_are_actually_empty_not_just_documented` | R3 — argv (size + value calls, sentinel-seeded, errno-checked) | yes | clean exit, no trap | **clean exit** |
 | `socket_send_import_is_refused_at_load` | R2 — closed world, real fn (`sock_send`) | **no — supplemental, added during review** | refused at instantiation | **refused** |
 
 **5/5 pre-registered criteria hold, against the pre-set pursue line, plus
@@ -316,11 +336,17 @@ only): in `autumn-edge/src/host.rs`,
 1. replace the `.func_wrap(WASI, "environ_sizes_get", write_two_zeroes)`
    registration with a closure that writes a non-zero count, rerun
    `environ_is_actually_empty_not_just_documented`, observe the trap, then
-   revert; and, separately,
-2. replace the `"environ_get"` registration's closure body (currently
-   `|_caller, _environ, _buffer| errno::SUCCESS`) with one that writes a
-   real value through the `environ` pointer argument, rerun the same test,
-   observe the trap, then revert.
+   revert;
+2. separately, replace the `"environ_get"` registration's closure body
+   (currently `|_caller, _environ, _buffer| errno::SUCCESS`) with one that
+   writes a real value through the `environ` pointer argument, rerun the
+   same test, observe the trap, then revert; and
+3. separately again, replace `"environ_sizes_get"`'s registration with a
+   closure that writes nothing and returns `errno::INVAL` (a silent no-op
+   failure), rerun the same test, observe the trap (this is the case the
+   third Codex review round's sentinel-seeding fix exists to catch — a
+   pre-fix version of the probe would have passed here instead), then
+   revert.
 
 ## 🗄️ Dismantle
 
