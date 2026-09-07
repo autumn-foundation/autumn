@@ -2661,6 +2661,57 @@ def element_end(txt, m, name):
         pos = t.end()
 
 
+def _prose_only(txt):
+    """A copy with fences and inline code blanked, space for space.
+
+    For finding constructs that count only where Markdown renders them. A
+    `<div hidden>` shown inside a fence is a SAMPLE — its text is on screen,
+    and the path in it is a route by this gate's own rule.
+    """
+    out = []
+    for kind, seg in split_fences(txt):
+        if kind != 'prose':
+            out.append(' ' * len(seg))
+        else:
+            out.append(CODE_SPAN.sub(lambda m: ' ' * len(m.group(0)), seg))
+    return ''.join(out)
+
+
+def hidden_subtree_spans(view, src):
+    """Where every hidden element sits, found in PROSE only.
+
+    Returns spans rather than a masked string because two views need the same
+    cut, and because the finding and the blanking have to happen on different
+    text: the search runs over `_prose_only`, so a sample in a fence opens
+    nothing, while the element's END is measured on the real view, where its
+    tags are intact.
+
+    `sub_in_prose` says why this scoping exists — "every time a rule in this
+    file was applied document-wide instead, it deleted a visible path" — and
+    the first version of this pass did exactly that, blanking a `<div hidden>`
+    sample out of a fenced example and orphaning the page it named. The
+    warning was already written down; I applied the rule document-wide anyway.
+    """
+    finder, finder_src = _prose_only(view), _prose_only(src)
+    spans, pos = [], 0
+    while True:
+        m = hidden_open(finder, finder_src, pos)
+        if not m:
+            return spans
+        name = m.group(1)
+        # Only the ATTRIBUTE spares svg and math; `display:none` is CSS and
+        # hides them like anything else. Same split as `mask_hidden_subtrees`.
+        if name.lower() in FOREIGN_ROOTS and m.re is HIDDEN_OPEN:
+            pos = m.end()
+            continue
+        end = element_end(view, m, name)
+        spans.append((m.start(), end))
+        blank = ' ' * (end - m.start())
+        finder = finder[:m.start()] + blank + finder[end:]
+        finder_src = finder_src[:m.start()] + blank + finder_src[end:]
+        pos = end
+
+
 def mask_hidden_subtrees(txt, src=None):
     """Blank every `hidden` element, contents and all, space for space.
 
@@ -2915,8 +2966,9 @@ def edges_from(f):
     #    one case each, which is the signal that the answer is a real style
     #    resolver over a parsed tree rather than a third overlapping pass.
     #    Filed with the other two gaps rather than guessed at.
-    txt = mask_hidden_subtrees(txt, raw)
-    img_view = mask_hidden_subtrees(img_view, raw)
+    for _a, _b in hidden_subtree_spans(txt, raw):
+        txt = txt[:_a] + ' ' * (_b - _a) + txt[_b:]
+        img_view = img_view[:_a] + ' ' * (_b - _a) + img_view[_b:]
     out = set()
     base = posixpath.dirname(f)
 
@@ -6497,6 +6549,23 @@ self_test() {
     > "$c9lm/docs/guide/jobs.md"
   git -C "$c9lm" add -A && git -C "$c9lm" commit -qm visibility-alternating
   check "a re-hidden subtree inside a restored one stays hidden" fail "$c9lm"
+
+  # A hidden element shown inside a FENCE is a sample, not markup: its text is
+  # on screen and the path in it is a route. The document-wide masking pass was
+  # applied without the prose scoping `sub_in_prose` exists to provide, and it
+  # blanked the example.
+  local c9ln="$tmp/c9ln"; make_corpus "$c9ln"
+  printf '# Jobs\n\n```html\n<div hidden>See docs/guide/mail.md</div>\n```\n' \
+    > "$c9ln/docs/guide/jobs.md"
+  git -C "$c9ln" add -A && git -C "$c9ln" commit -qm hidden-sample-in-fence
+  check "a hidden element in a fence is a visible sample" pass "$c9ln"
+
+  # ...and the same inside an inline code span.
+  local c9lo="$tmp/c9lo"; make_corpus "$c9lo"
+  printf '# Jobs\n\nSample: `<div hidden>See docs/guide/mail.md</div>`\n' \
+    > "$c9lo/docs/guide/jobs.md"
+  git -C "$c9lo" add -A && git -C "$c9lo" commit -qm hidden-sample-in-code-span
+  check "a hidden element in a code span is a visible sample" pass "$c9lo"
 
   # An untracked file is not part of the corpus and cannot carry an edge.
   local c17="$tmp/c17"; make_corpus "$c17"
