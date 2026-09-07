@@ -1490,6 +1490,25 @@ async fn a_purge_an_emptied_table_references_runs_after_the_sample() {
     let url = format!("{base}/sample_purge_order");
     let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
 
+    // The dry run advertises itself as the exact SQL in execution order, so it
+    // has to hold the deferred purge back too — printing it first would show a
+    // sequence that fails if a reader actually ran it.
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &envs,
+    );
+    let purge_at = dry_err
+        .find(r#"DELETE FROM "public"."autumn_jobs""#)
+        .expect("the dry run must print the purge");
+    let sample_at = dry_err
+        .find(r#"DELETE FROM "public"."audit_logs""#)
+        .expect("the dry run must print the sample's own delete");
+    assert!(
+        sample_at < purge_at,
+        "the deferred purge must print AFTER the sample empties its child:\n{dry_err}"
+    );
+
     run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
 
     assert_eq!(

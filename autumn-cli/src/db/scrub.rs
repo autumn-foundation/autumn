@@ -2411,15 +2411,25 @@ fn classify_and_apply(
     }
     if args.dry_run {
         // Printed in the order `execute` runs them: purges, then the sample,
-        // then the rewrites. The order is load-bearing — a framework-owned
-        // table is emptied before the sample removes the rows it points at —
-        // so a reader auditing the dry run must see the real sequence.
+        // then the rewrites — and, like `execute`, holding back the purges the
+        // plan defers until after the sample. The order is load-bearing (a
+        // framework-owned table is emptied before the sample removes the rows
+        // it points at, except where the sample must empty its child first), so
+        // a reader auditing the dry run has to see the real sequence: printing
+        // a deferred purge early would show SQL that fails if it were run.
         for (label, url, plan, facts, sampling) in &plans {
-            for (_, statement) in purge_statements(&facts.framework_tables, &sources.config) {
+            let no_deferral = BTreeSet::new();
+            let deferred: &BTreeSet<String> =
+                sampling.as_ref().map_or(&no_deferral, |s| &s.purge_after);
+            let purges = purge_statements(&facts.framework_tables, &sources.config);
+            for (_, statement) in purges.iter().filter(|(t, _)| !deferred.contains(t)) {
                 eprintln!("  {statement};");
             }
             if let Some(sampling) = sampling {
                 report_sample_sql(url, label, sampling)?;
+            }
+            for (_, statement) in purges.iter().filter(|(t, _)| deferred.contains(t)) {
+                eprintln!("  {statement};");
             }
             for table in &plan.tables {
                 if let Some(sql) = &table.sql {
@@ -2880,6 +2890,10 @@ struct ConstraintRow {
     parent: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     parent_cols: String,
+    /// True for `MATCH FULL`, whose composite NULL rule differs from the
+    /// default `MATCH SIMPLE`.
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    match_full: bool,
     /// True when Postgres cloned this constraint onto a partition from its
     /// partitioned parent. The parent's own constraint covers the same rows, so
     /// a clone must not be walked or verified a second time — while a key
@@ -2987,7 +3001,8 @@ fn probe_database_facts(
           FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) \
           JOIN pg_attribute att ON att.attrelid = c.confrelid AND att.attnum = k.attnum) \
          AS parent_cols, \
-         {cloned} AS cloned \
+         {cloned} AS cloned, \
+         c.confmatchtype = 'f' AS match_full \
          FROM pg_constraint c \
          JOIN pg_class rel ON rel.oid = c.conrelid \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
@@ -3014,6 +3029,7 @@ fn probe_database_facts(
                 .split(KEY_SEPARATOR)
                 .map(str::to_owned)
                 .collect(),
+            match_full: row.match_full,
         })
         .collect();
 

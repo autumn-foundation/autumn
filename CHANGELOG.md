@@ -83,7 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the shape no order satisfies (rows the sample KEEPS referencing a purged
   table) is refused up front. A foreign key declared on a partition rather than
   cloned onto it from its partitioned parent is likewise refused, rather than
-  dropped from the walk and the integrity re-check as if it were a clone.
+  dropped from the walk and the integrity re-check as if it were a clone. The
+  re-check honours each constraint's own NULL rule, so a partly-NULL composite
+  reference is skipped under `MATCH SIMPLE` but counted under `MATCH FULL`,
+  where it is itself a violation.
 
 - **cli/generate + sqlite:** the **DB-backed sessions store now runs on SQLite**
   (#1908). The tracked-sessions store `autumn generate auth` scaffolds bounded

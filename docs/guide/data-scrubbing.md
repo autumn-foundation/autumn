@@ -327,7 +327,12 @@ size after the subsetted tables are compacted:
 ```
 
 The foreign key re-check runs **inside** the scrub's transaction, so a violation
-rolls the whole run back rather than handing you a broken copy. Afterwards each
+rolls the whole run back rather than handing you a broken copy. It counts orphans
+per constraint under that constraint's own NULL rule: a partly-NULL composite
+reference satisfies the default `MATCH SIMPLE` and is skipped, but violates
+`MATCH FULL` and is counted — which matters because the one thing this re-check
+adds over Postgres itself is catching a constraint a migration left `NOT VALID`,
+where the server never revisits the rows that predate it. Afterwards each
 subsetted table is rewritten with `VACUUM (FULL, ANALYZE)` — deleting rows on its
 own frees no disk, and the point of a sample is the disk.
 

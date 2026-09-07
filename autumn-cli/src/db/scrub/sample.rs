@@ -98,6 +98,10 @@ pub struct ForeignKeyConstraint {
     pub parent_table: String,
     /// The referenced columns, in key order.
     pub parent_columns: Vec<String>,
+    /// True for `MATCH FULL`, whose composite rule differs from the default
+    /// `MATCH SIMPLE`: a tuple must be entirely NULL or entirely populated, so
+    /// a partially-NULL one violates the constraint instead of satisfying it.
+    pub match_full: bool,
 }
 
 /// What decides a table's rows.
@@ -1261,9 +1265,9 @@ impl SamplePlan {
             .iter()
             .map(|edge| {
                 let on = join_on(edge, "c", "p");
-                // A composite reference with any NULL component is satisfied by
-                // definition (MATCH SIMPLE), so only fully-populated references
-                // are checked.
+                // Under the default MATCH SIMPLE a composite reference with any
+                // NULL component is satisfied by definition, so only
+                // fully-populated references are checked for a missing parent.
                 let populated = edge
                     .child_columns
                     .iter()
@@ -1271,6 +1275,29 @@ impl SamplePlan {
                     .collect::<Vec<_>>()
                     .join(" AND ");
                 let missing = format!("p.{} IS NULL", quote_ident(&edge.parent_columns[0]));
+                // MATCH FULL admits only all-NULL or all-populated tuples, so a
+                // partially-NULL one is itself a violation — and one Postgres
+                // will not re-check for us on a constraint a migration left
+                // `NOT VALID`, which is exactly what this recount is for.
+                let mixed_null = if edge.match_full && edge.child_columns.len() > 1 {
+                    let any_null = edge
+                        .child_columns
+                        .iter()
+                        .map(|c| format!("c.{} IS NULL", quote_ident(c)))
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    Some(format!(
+                        "({any_null}) AND ({populated_any})",
+                        populated_any = edge
+                            .child_columns
+                            .iter()
+                            .map(|c| format!("c.{} IS NOT NULL", quote_ident(c)))
+                            .collect::<Vec<_>>()
+                            .join(" OR ")
+                    ))
+                } else {
+                    None
+                };
                 (
                     format!(
                         "{} ({} -> {})",
@@ -1279,9 +1306,12 @@ impl SamplePlan {
                     format!(
                         "SELECT count(*) AS n FROM {} AS c \
                          LEFT JOIN {} AS p ON {on} \
-                         WHERE {populated} AND {missing}",
+                         WHERE ({populated} AND {missing}){extra}",
                         qualified(&edge.child_table),
                         qualified(&edge.parent_table),
+                        extra = mixed_null
+                            .as_ref()
+                            .map_or_else(String::new, |m| format!(" OR ({m})")),
                     ),
                 )
             })
@@ -1519,6 +1549,7 @@ mod tests {
             child_columns: vec![child_col.to_owned()],
             parent_table: parent.to_owned(),
             parent_columns: vec![parent_col.to_owned()],
+            match_full: false,
         }
     }
 
@@ -2511,6 +2542,7 @@ mod tests {
             child_columns: vec!["tenant_id".to_owned(), "order_id".to_owned()],
             parent_table: "orders".to_owned(),
             parent_columns: vec!["tenant_id".to_owned(), "id".to_owned()],
+            match_full: false,
         }];
         let plan = plan_of(
             &[root("orders", SampleAmount::Count(10))],
@@ -2547,6 +2579,64 @@ mod tests {
                 "an orphan is a missing parent: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn a_match_full_composite_key_also_counts_partially_null_tuples() {
+        // MATCH FULL admits only all-NULL or all-populated tuples. A
+        // MATCH SIMPLE predicate checks the populated ones alone, so a
+        // half-filled tuple — a violation Postgres will not re-check on a
+        // constraint left NOT VALID — would pass the recount silently.
+        let (tables, mut keys) = schema();
+        // Widen the existing comments -> users edge into a composite MATCH FULL
+        // one, so the plan is the ordinary fixture and only the key shape moves.
+        keys[0].child_columns = vec!["user_id".to_owned(), "tenant_id".to_owned()];
+        keys[0].parent_columns = vec!["id".to_owned(), "tenant_id".to_owned()];
+        keys[0].match_full = true;
+        keys[0].name = "comments_user_full_fk".to_owned();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (_, sql) = plan
+            .integrity_statements()
+            .into_iter()
+            .find(|(label, _)| label.starts_with("comments_user_full_fk"))
+            .expect("the composite key must be checked");
+        assert!(
+            sql.contains(r#""user_id" IS NULL"#) && sql.contains(r#""tenant_id" IS NULL"#),
+            "a partially-NULL tuple must be counted too: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_match_simple_composite_key_ignores_partially_null_tuples() {
+        // The default, unchanged: a NULL component satisfies the reference, so
+        // only fully-populated tuples are checked for a missing parent.
+        let (tables, mut keys) = schema();
+        // The same composite edge, left at the default MATCH SIMPLE.
+        keys[0].child_columns = vec!["user_id".to_owned(), "tenant_id".to_owned()];
+        keys[0].parent_columns = vec!["id".to_owned(), "tenant_id".to_owned()];
+        keys[0].name = "comments_user_simple_fk".to_owned();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (_, sql) = plan
+            .integrity_statements()
+            .into_iter()
+            .find(|(label, _)| label.starts_with("comments_user_simple_fk"))
+            .expect("the composite key must be checked");
+        assert!(
+            !sql.contains("IS NULL) AND ("),
+            "MATCH SIMPLE must not gain the mixed-NULL arm: {sql}"
+        );
     }
 
     #[test]
