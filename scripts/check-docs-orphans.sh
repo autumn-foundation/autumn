@@ -274,9 +274,24 @@ def read(f):
 # does. Matching only basic strings missed the configured path AND fell back to
 # auto-detect, so it could report a guide linked from the real README as
 # orphaned, or seed an unrelated adjacent `README.md` and hide one.
+#
+# A TOML key may also be QUOTED, in either string form, and Cargo honours all
+# three spellings identically — `cargo metadata` reports `publish: []` for
+# `publish`, `"publish"` and `'publish'` alike. So every key below is matched
+# through `_key` rather than written bare, which is one place to be right
+# instead of five. Getting this wrong on `publish` or `readme` drops the key
+# and reads the package as publishable with an auto-detected README: silent.
+
+
+def _key(name):
+    """A regex fragment matching a TOML key at line start, quoted or bare."""
+    q = re.escape(name)
+    return r'^[ \t]*(?:' + q + r'|"' + q + r'"|\'' + q + r'\')[ \t]*'
+
+
 _README_STRING = re.compile(
-    r'^[ \t]*readme[ \t]*=[ \t]*(?:"([^"]*)"|\'([^\']*)\')', re.M)
-_README_BOOL = re.compile(r'^[ \t]*readme[ \t]*=[ \t]*(false|true)\b', re.M)
+    _key('readme') + r'=[ \t]*(?:"([^"]*)"|\'([^\']*)\')', re.M)
+_README_BOOL = re.compile(_key('readme') + r'=[ \t]*(false|true)\b', re.M)
 # A fifth spelling, and the same silent failure: an INHERITED `readme` resolves
 # against the workspace root, not the member directory — `readme.workspace =
 # true` under a `[workspace.package] readme = "README.md"` comes back out of
@@ -285,8 +300,8 @@ _README_BOOL = re.compile(r'^[ \t]*readme[ \t]*=[ \t]*(false|true)\b', re.M)
 # Cargo also refuses `readme = false` in `[workspace.package]` ("was not
 # defined"), so an inherited value is always a path.
 _README_INHERITS = re.compile(
-    r'^[ \t]*readme[ \t]*\.[ \t]*workspace[ \t]*=[ \t]*true'
-    r'|^[ \t]*readme[ \t]*=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
+    _key('readme') + r'\.[ \t]*workspace[ \t]*=[ \t]*true'
+    r'|' + _key('readme') + r'=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
     re.M)
 # Publishability gates all of the above: nothing renders the README of a
 # package that is never published, so it stays an ordinary waypoint.
@@ -300,14 +315,14 @@ _README_INHERITS = re.compile(
 # published, just not to crates.io, and its README is still that crate's
 # landing page there.
 _PUBLISH_DECL = re.compile(
-    r'^[ \t]*publish[ \t]*=[ \t]*(false|true|\[[^\]]*\])', re.M)
+    _key('publish') + r'=[ \t]*(false|true|\[[^\]]*\])', re.M)
 # ...and a package may inherit the setting instead of declaring it, in either
 # spelling Cargo accepts. Neither occurs in this repository today; both are
 # handled so the first one to appear is not a fresh defect, and because the
 # error this guards is the quiet one.
 _PUBLISH_INHERITS = re.compile(
-    r'^[ \t]*publish[ \t]*\.[ \t]*workspace[ \t]*=[ \t]*true'
-    r'|^[ \t]*publish[ \t]*=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
+    _key('publish') + r'\.[ \t]*workspace[ \t]*=[ \t]*true'
+    r'|' + _key('publish') + r'=[ \t]*\{[^}]*workspace[ \t]*=[ \t]*true[^}]*\}',
     re.M)
 
 # Every pattern above reads a key Cargo reads from ONE table, so they have to be
@@ -327,6 +342,44 @@ _PUBLISH_INHERITS = re.compile(
 # that lacks it, not reasoned about.
 _TOML_HEADER = re.compile(r'^[ \t]*\[\[?[ \t]*([^\[\]]*?)[ \t]*\]\]?[ \t]*(?:#.*)?$')
 _DOTTED_CACHE = {}
+
+
+def _toml_key_path(text):
+    """A header's dotted name with quoting resolved: `["package"]` -> `package`.
+
+    A quoted table header is valid TOML and Cargo treats it as the same table —
+    `["package"] … publish = false` still reports `publish: []`. Comparing the
+    raw text meant `"package"` never matched `package`, so the manifest read as
+    virtual and its README stopped being an entry surface. That direction is
+    loud (a page reported orphaned that is not one), but the same normalization
+    is what lets the quoted spellings of the keys inside it be found at all.
+
+    Dots inside a quoted segment are part of the name, not separators — though
+    a segment that itself contains a dot then renders indistinguishable from
+    two segments, which is irrelevant for the two names this asks about.
+    """
+    parts = []
+    cur = ''
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in '"\'':
+            close = text.find(c, i + 1)
+            if close < 0:
+                cur += text[i + 1:]
+                break
+            cur += text[i + 1:close]
+            i = close + 1
+        elif c == '.':
+            parts.append(cur.strip())
+            cur = ''
+            i += 1
+        else:
+            cur += c
+            i += 1
+    parts.append(cur.strip())
+    return '.'.join(parts)
 
 
 def _scan_toml_line(line):
@@ -433,7 +486,7 @@ def _toml_lines(manifest):
             ml = None
         m = _TOML_HEADER.match(line)
         if m is not None:
-            table = m.group(1)
+            table = _toml_key_path(m.group(1))
             yield table, ''
             continue
         _at, ml = _scan_toml_line(line)
@@ -458,9 +511,14 @@ def _toml_table(manifest, name):
     """
     dotted = _DOTTED_CACHE.get(name)
     if dotted is None:
+        # Each segment may be quoted independently — `"package".publish` —
+        # so the prefix is built from the same alternation `_key` uses.
+        def _seg(p):
+            q = re.escape(p)
+            return r'(?:' + q + r'|"' + q + r'"|\'' + q + r'\')'
         dotted = re.compile(
             r'^[ \t]*' + r'[ \t]*\.[ \t]*'.join(
-                re.escape(p) for p in name.split('.')) + r'[ \t]*\.[ \t]*')
+                _seg(p) for p in name.split('.')) + r'[ \t]*\.[ \t]*')
         _DOTTED_CACHE[name] = dotted
     out = []
     seen = False
@@ -7240,6 +7298,38 @@ self_test() {
   printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9me/pkg/README.md"
   git -C "$c9me" add -A && git -C "$c9me" commit -qm literal-readme-not-adjacent
   check "a literal-string readme is not the adjacent README" fail "$c9me"
+
+  # A QUOTED table header names the same table — `cargo metadata` reports
+  # `publish: []` for this manifest — but comparing the raw header text meant
+  # `"package"` never matched `package`, so the manifest read as virtual and
+  # its README stopped being an entry surface. Loud direction, and the same
+  # normalization is what lets the quoted keys below be found at all.
+  local c9mf="$tmp/c9mf"; make_corpus "$c9mf"
+  mkdir -p "$c9mf/pkg"
+  printf '["package"]\nname = "pkg"\nreadme = "README.md"\n' > "$c9mf/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mf/pkg/README.md"
+  git -C "$c9mf" add -A && git -C "$c9mf" commit -qm quoted-table-header
+  check "a quoted table header names the same table" pass "$c9mf"
+
+  # ...and a quoted KEY is the same key. Cargo honours `publish`, `"publish"`
+  # and `'publish'` identically; matching only the bare form dropped the key
+  # and read an unpublishable package as publishable — silent.
+  local c9mg="$tmp/c9mg"; make_corpus "$c9mg"
+  mkdir -p "$c9mg/pkg"
+  printf '[package]\nname = "pkg"\nreadme = "README.md"\n"publish" = false\n' \
+    > "$c9mg/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mg/pkg/README.md"
+  git -C "$c9mg" add -A && git -C "$c9mg" commit -qm quoted-publish-key
+  check "a quoted publish key is still publish" fail "$c9mg"
+
+  # ...in the literal form too, and on `readme`, where dropping the key falls
+  # back to auto-detect and seeds a file Cargo does not publish.
+  local c9mh="$tmp/c9mh"; make_corpus "$c9mh"
+  mkdir -p "$c9mh/pkg"
+  printf "[package]\nname = \"pkg\"\n'readme' = false\n" > "$c9mh/pkg/Cargo.toml"
+  printf '# Pkg\n\n- [Mail](../docs/guide/mail.md)\n' > "$c9mh/pkg/README.md"
+  git -C "$c9mh" add -A && git -C "$c9mh" commit -qm quoted-readme-key
+  check "a literal-quoted readme key is still readme" fail "$c9mh"
 
   # There is deliberately NO test here for a `#` inside a quoted registry name
   # (`publish = ["reg#1"]`). One was written and deleted: it passed against a
