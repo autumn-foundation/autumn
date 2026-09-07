@@ -1094,12 +1094,18 @@ mod tests {
     fn drift_is_one_aggregate_over_the_parent_table() {
         let sql = crate::counter_cache::drift_sql(&sum_def().sql_view(), DRIFT_SCAN_LIMIT);
         assert!(
-            sql.starts_with("SELECT COUNT(*) AS count FROM \"dv_posts\""),
+            sql.starts_with(
+                "SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"dv_posts\""
+            ),
             "{sql}"
         );
         assert!(
             sql.contains(&format!("\"visible_score\" {IS_DISTINCT_FROM}")),
             "{sql}"
+        );
+        assert!(
+            sql.ends_with(&format!(" LIMIT {DRIFT_SCAN_LIMIT}) AS __autumn_cc_drift")),
+            "the scan is capped, so the actuator cannot hang on a huge table: {sql}"
         );
     }
 

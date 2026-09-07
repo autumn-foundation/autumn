@@ -432,6 +432,9 @@ async fn create_schema(conn: &mut AsyncPgConnection) {
 /// regression in that path.
 ///
 /// Ids restart at 1, so the expected rows are `(1..=total, 1, 5)`.
+///
+/// Only the query-count test needs it, and that test needs `test-support`.
+#[cfg(feature = "test-support")]
 async fn reseed_posts_through_the_repository(pool: &Pool<AsyncPgConnection>, total: usize) {
     let mut conn = pool.get().await.expect("conn");
     diesel::sql_query("TRUNCATE dv_comments, dv_posts RESTART IDENTITY CASCADE")
