@@ -216,9 +216,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under its attribute's name rather than its function's, a leading `::` naming
   the external crate over a local module of the same name, and hops into sibling
   workspace crates. Visibility is part of resolution, not an afterthought: only
-  bare `pub` counts, because a path through one of `lib.rs`'s 49
-  `pub(crate)`/`pub(super)` modules is E0603 for a reader however public the
-  item inside it is. Grouped imports are matched by counting braces over the
+  bare `pub` counts — for modules, items and re-exports alike — because a path
+  through one of `lib.rs`'s 49 `pub(crate)`/`pub(super)` modules is E0603 for a
+  reader however public the item inside it is, and a `pub(crate) use` (as
+  `cluster/mod.rs` does for `LEAVE_BUDGET`) republishes a name inside the crate
+  only. Declarations are read at module scope, tracked by counting braces with
+  string and comment contents masked out, so an indented `pub fn` inside an
+  `impl` block is a method on the type rather than an item in the module — a
+  line-anchored regex credited `AppBuilder::run` to the `app` module and made
+  `autumn_web::app::run` resolve. A `macro_rules!` without `#[macro_export]` is
+  textually scoped and joins no path. And where a module shares its name with a
+  value (`pub mod app` beside `pub use app::app`), the type namespace wins for
+  traversal, as Rust's own resolution does. Grouped imports are matched by counting braces over the
   whole document rather than per line, so the 14 groups that nest
   (`storage::{BlobStoreState, variant::{Transform, …}}`) or run across lines
   have their symbols audited instead of silently collapsing to the module
@@ -238,7 +247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `router` is private) is read as output. A brace group containing `(` is
   not a path claim at all — the skill's api-reference lists *signatures* that
   way — so its prefix is kept and the group dropped, rather than inventing
-  `autumn_web::widgets::current_locale` out of an argument name. 35 self-tests:
+  `autumn_web::widgets::current_locale` out of an argument name. 43 self-tests:
   `./scripts/check-docs-symbols.sh --self-test`.
 
 - **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves

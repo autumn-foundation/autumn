@@ -89,7 +89,7 @@
 #     `autumn_web::PreEscaped` (maud) and `autumn_web::db::Pool` (diesel) are
 #     real re-exports of crates whose source is not in this tree, so the gate
 #     records them as OPAQUE and says so rather than pretending to have checked
-#     them. 48 of the 1,495 occurrences land here; `--list` prints all of them,
+#     them. 57 of the 1,495 occurrences land here; `--list` prints all of them,
 #     because an opaque count that grows quietly is how a gate goes hollow.
 #   - Feature gates. The surface is read as a superset with every `#[cfg]`
 #     ignored, so a path that only exists under `--features ws` still resolves.
@@ -183,8 +183,11 @@ PUB_MOD_DECL = re.compile(
 # has to contain it or the re-export target cannot be followed.
 ANY_MOD_DECL = re.compile(
     r'^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([a-zA-Z_]\w*)\s*;', re.M)
+# Bare `pub` only, for the same reason as items and modules: a
+# `pub(crate) use node::LEAVE_BUDGET;` (autumn/src/cluster/mod.rs) republishes
+# the name inside the crate and nowhere else.
 PUB_USE = re.compile(
-    r'^[ \t]*pub(?:\s*\([^)]*\))?\s+use\s+(.+?);[ \t]*$', re.M | re.S)
+    r'^[ \t]*pub(?!\s*\()\s+use\s+(.+?);[ \t]*$', re.M | re.S)
 INLINE_MOD = re.compile(
     r'^([ \t]*)(pub(\s*\([^)]*\))?\s+)?mod\s+([a-zA-Z_]\w*)\s*\{', re.M)
 MACRO_RULES = re.compile(r'macro_rules!\s+([a-zA-Z_]\w*)')
@@ -200,37 +203,106 @@ MACRO_EXPORT = re.compile(
     r'[ \t]*macro_rules!\s+([a-zA-Z_]\w*)')
 
 
-def split_inline_mods(text):
-    """Split `mod x { … }` blocks out of `text`.
+def mask_literals(text):
+    """Blank string/char literals and comments, preserving length and newlines.
 
-    Returns (text_without_them, [(name, is_pub, body), …]) so the body is
-    scanned as its own module rather than having its items credited to the
-    parent — which is what put `Lock` at `autumn_web::lock` instead of
-    `autumn_web::lock::db_impl`.
+    Brace counting decides module scope, so a `{` inside a string or a doc
+    comment must not be counted. Length is preserved so an offset into the mask
+    is the same offset into the source.
     """
-    out, mods, pos = [], [], 0
-    while True:
-        m = INLINE_MOD.search(text, pos)
-        if not m:
-            break
-        brace = text.index('{', m.start())
-        depth, i = 0, brace
-        while i < len(text):
-            if text[i] == '{':
-                depth += 1
-            elif text[i] == '}':
-                depth -= 1
-                if depth == 0:
+    out, i, n = list(text), 0, len(text)
+
+    def blank(a, b):
+        for k in range(a, min(b, n)):
+            if out[k] != '\n':
+                out[k] = ' '
+
+    while i < n:
+        c = text[i]
+        if c == '/' and text[i + 1:i + 2] == '/':
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+            continue
+        if c == '/' and text[i + 1:i + 2] == '*':
+            depth, j = 1, i + 2
+            while j < n and depth:                 # Rust block comments nest
+                if text[j:j + 2] == '/*':
+                    depth += 1
+                    j += 2
+                elif text[j:j + 2] == '*/':
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+            continue
+        if c == 'r' and text[i + 1:i + 2] in ('#', '"'):
+            k, hashes = i + 1, 0
+            while k < n and text[k] == '#':
+                hashes += 1
+                k += 1
+            if k < n and text[k] == '"':
+                close = '"' + '#' * hashes
+                j = text.find(close, k + 1)
+                j = n if j < 0 else j + len(close)
+                blank(i, j)
+                i = j
+                continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
                     break
-            i += 1
-        out.append(text[pos:m.start()])
-        # Bare `pub` only: group(2) is the `pub…` prefix, group(3) its
-        # `(crate)`/`(super)` restriction when present.
-        is_pub = bool(m.group(2)) and not m.group(3)
-        mods.append((m.group(4), is_pub, text[brace + 1:i]))
-        pos = i + 1
-    out.append(text[pos:])
-    return ''.join(out), mods
+                j += 1
+            blank(i, j)
+            i = j
+            continue
+        if c == "'":
+            # A char literal closes within a couple of characters; anything
+            # else starting with `'` is a lifetime and must be left alone.
+            m = re.match(r"'(?:\\.|[^\\'])'", text[i:i + 4])
+            if m:
+                blank(i, i + m.end())
+                i += m.end()
+                continue
+        i += 1
+    return ''.join(out)
+
+
+def brace_depths(masked):
+    """Depth BEFORE each character, so a declaration's own offset reads 0."""
+    depths, cur = [], 0
+    for ch in masked:
+        depths.append(cur)
+        if ch == '{':
+            cur += 1
+        elif ch == '}':
+            cur = max(0, cur - 1)
+    return depths
+
+
+def matching_brace(masked, start):
+    """Offset of the `}` closing the first `{` at or after `start`."""
+    open_at = masked.find('{', start)
+    if open_at < 0:
+        return None, None
+    depth, i = 0, open_at
+    while i < len(masked):
+        if masked[i] == '{':
+            depth += 1
+        elif masked[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return open_at, i
+        i += 1
+    return open_at, None
 
 
 def expand_braces(spec):
@@ -313,33 +385,56 @@ class Crate:
             self._scan_text(key, fh.read(), file_mp=mp)
 
     def _scan_text(self, key, txt, file_mp=None):
+        """Register the externally-public surface declared at THIS module scope.
+
+        Everything is filtered to brace depth 0. A regex anchored with
+        `^[ \t]*pub` matches an indented method inside an `impl` block just as
+        happily as a free function, which credited `AppBuilder::run` to the
+        `app` MODULE and made the nonexistent `autumn_web::app::run` resolve.
+        Only a declaration at module scope is a module-level item.
+        """
         self.mods.setdefault(key, {})
         self.uses.setdefault(key, [])
-        for name in MACRO_EXPORT.findall(txt):
-            self.exported_macros.add(name)
-        body, inline = split_inline_mods(txt)
-        for name in PUB_ITEM.findall(body):
-            self.mods[key][name] = 'item'
-        for name in MACRO_RULES.findall(body):
-            # A `#[macro_export]` macro is addressable at the CRATE ROOT and
-            # nowhere else: `autumn_web::declassify` resolves,
-            # `autumn_web::classify::declassify` does not. Registering it in
-            # its defining module too would bless a path rustc rejects.
-            if name not in self.exported_macros:
-                self.mods[key][name] = 'item'
-        for name in PROC_MACRO_DERIVE.findall(body):
-            self.mods[key][name] = 'item'
-        for name in PUB_MOD_DECL.findall(body):
-            self.mods[key][name] = 'mod'
-        for raw in PUB_USE.findall(body):
-            self._parse_use(key, raw)
-        for (name, is_pub, sub) in inline:
-            if is_pub:
-                self.mods[key][name] = 'mod'
-            self._scan_text(key + (name,), sub)
+        masked = mask_literals(txt)
+        depths = brace_depths(masked)
+
+        def at_module_scope(m):
+            return m.start() < len(depths) and depths[m.start()] == 0
+
+        for m in MACRO_EXPORT.finditer(txt):
+            if at_module_scope(m):
+                self.exported_macros.add(m.group(1))
+        # A `macro_rules!` WITHOUT `#[macro_export]` is textually scoped: it is
+        # not addressable by any path, so it never joins the surface. Only the
+        # exported ones do, at the crate root (below), plus whatever a
+        # `pub use <name>;` republishes at a module path.
+        for m in PUB_ITEM.finditer(txt):
+            if at_module_scope(m):
+                self.mods[key][m.group(1)] = 'item'
+        for m in PROC_MACRO_DERIVE.finditer(txt):
+            if at_module_scope(m):
+                self.mods[key][m.group(1)] = 'item'
+        for m in PUB_MOD_DECL.finditer(txt):
+            if at_module_scope(m):
+                self.mods[key][m.group(1)] = 'mod'
+        for m in PUB_USE.finditer(txt):
+            if at_module_scope(m):
+                self._parse_use(key, m.group(1))
+        for m in INLINE_MOD.finditer(txt):
+            if not at_module_scope(m):
+                continue
+            open_at, close_at = matching_brace(masked, m.start())
+            if open_at is None or close_at is None:
+                continue
+            # Bare `pub` only: group(2) is the `pub…` prefix, group(3) its
+            # `(crate)`/`(super)` restriction when present.
+            if bool(m.group(2)) and not m.group(3):
+                self.mods[key][m.group(4)] = 'mod'
+            self._scan_text(key + (m.group(4),), txt[open_at + 1:close_at])
         if file_mp is not None:
-            for name in ANY_MOD_DECL.findall(body):
-                self._scan_file(list(file_mp) + [name])
+            for m in ANY_MOD_DECL.finditer(txt):
+                if at_module_scope(m):
+                    self._scan_file(list(file_mp) + [m.group(1)])
 
     def _parse_use(self, key, raw):
         # Collapse whitespace but KEEP the separator around `as`: stripping all
@@ -434,6 +529,14 @@ class Surface:
             # re-export win turned a resolvable trait into an opaque one.
             if out.get(alias) in ('unknown', 'opaque') and alias in local:
                 out[alias] = local[alias]
+            # Rust resolves a path segment in the TYPE namespace, and a module
+            # may share its name with a value: `lib.rs` declares `pub mod app`
+            # and then `pub use app::app;` to publish the `app()` builder
+            # function beside it. Both are real, but only the module can be
+            # walked THROUGH, and letting the function win made the nonexistent
+            # `autumn_web::app::run` resolve as an associated item.
+            if local.get(alias) == 'mod':
+                out[alias] = 'mod'
         self._memo[key] = out
         return out
 
@@ -765,6 +868,9 @@ pub mod lock;
 pub mod prelude;
 pub mod openapi;
 pub mod storage;
+pub mod extract;
+pub mod cluster;
+pub use app::app;
 pub(crate) mod route;
 pub use route::Route;
 pub use fake_macros::get;
@@ -776,9 +882,16 @@ pub mod include_dir {
     pub use ::include_dir::*;
 }
 ''')
+        # `run` is a METHOD inside an impl block, not a module-level item, and
+        # `app` is a module that also publishes a value of the same name.
         _write(tmp, 'fake/src/app.rs',
                'pub struct AppBuilder;\npub struct ApiVersion;\n'
-               'pub(crate) struct InternalOnly;\n')
+               'pub(crate) struct InternalOnly;\n'
+               'pub fn app() -> AppBuilder { AppBuilder }\n'
+               'impl AppBuilder {\n'
+               '    /// a doc comment with a stray { brace\n'
+               '    pub async fn run(self) { let s = "a } brace in a string"; }\n'
+               '}\n')
         _write(tmp, 'fake/src/route.rs', 'pub struct Route;\n')
         # A public facade re-exporting out of a PRIVATE module.
         _write(tmp, 'fake/src/ui/mod.rs',
@@ -804,6 +917,18 @@ mod db_impl {
 macro_rules! declassify { () => {} }
 ''')
         _write(tmp, 'fake/src/prelude.rs', 'pub use crate::error::AutumnError;\n')
+        # An unexported `macro_rules!` is textually scoped -- no path names it.
+        # A `pub(crate) use` republishes inside the crate only.
+        _write(tmp, 'fake/src/extract.rs',
+               'macro_rules! impl_extractor_deref { () => {} }\n'
+               'pub struct Path;\n')
+        _write(tmp, 'fake/src/cluster.rs',
+               'mod node {\n'
+               '    pub const LEAVE_BUDGET: u64 = 1;\n'
+               '    pub const OPEN: u64 = 2;\n'
+               '}\n'
+               'pub(crate) use node::LEAVE_BUDGET;\n'
+               'pub use node::OPEN;\n')
         # A trait and a derive macro of the SAME name, the derive re-exported
         # from the macros crate under the name in its attribute rather than the
         # name of the function carrying it.
@@ -873,6 +998,27 @@ macro_rules! declassify { () => {} }
               s.resolve('Route'), 'ok')
         check('pub(crate) item is not externally nameable',
               s.resolve('app::InternalOnly'), 'dead:app::InternalOnly')
+        # A method lives on the type, not in the module. `PUB_ITEM` anchored as
+        # `^[ \t]*pub` matched it anyway and made `autumn_web::app::run` resolve.
+        check('impl-block method is not a module item',
+              s.resolve('app::run'), 'dead:app::run')
+        check('module-scope fn still resolves', s.resolve('app::app'), 'ok')
+        # `pub mod app` + `pub use app::app` -- the type namespace must win, or
+        # the value shadows the module and anything under it resolves.
+        check('module wins over a same-named value for traversal',
+              s.resolve('app::AppBuilder'), 'ok')
+        check('unexported macro_rules! is not nameable',
+              s.resolve('extract::impl_extractor_deref'),
+              'dead:extract::impl_extractor_deref')
+        check('…while a real item beside it resolves',
+              s.resolve('extract::Path'), 'ok')
+        check('pub(crate) use is not a public re-export',
+              s.resolve('cluster::LEAVE_BUDGET'), 'dead:cluster::LEAVE_BUDGET')
+        check('…while a bare pub use beside it resolves',
+              s.resolve('cluster::OPEN'), 'ok')
+        # Braces inside strings and comments must not shift module scope.
+        check('literals and comments do not break scope tracking',
+              s.resolve('app::ApiVersion'), 'ok')
 
         # -- brace expansion, as the guide actually writes imports ------------
         check('brace group', sorted(expand_braces('a::{b,c}')), ['a::b', 'a::c'])
