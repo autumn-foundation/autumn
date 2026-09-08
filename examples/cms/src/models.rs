@@ -309,6 +309,24 @@ impl Post {
         conn: &mut AsyncPgConnection,
         summary: &str,
     ) -> AutumnResult<()> {
+        self.record_revision_by(conn, summary, self.author_id).await
+    }
+
+    /// Append a revision snapshot, attributed to the account that made the
+    /// change.
+    ///
+    /// `revisions.author_id` answers "who edited", not "who wrote the post" —
+    /// those differ on every collaborative edit, and recording the owner for an
+    /// Editor's change makes the history confidently wrong. [`record_revision`]
+    /// keeps the owner for the callers where the two are the same by
+    /// construction (an initial snapshot, a status transition made by a path
+    /// with no acting user to hand).
+    pub async fn record_revision_by(
+        &self,
+        conn: &mut AsyncPgConnection,
+        summary: &str,
+        editor_id: i64,
+    ) -> AutumnResult<()> {
         diesel::insert_into(revisions::table)
             .values(&NewRevision {
                 post_id: self.id,
@@ -316,7 +334,7 @@ impl Post {
                 excerpt: self.excerpt.clone(),
                 body: self.body.clone(),
                 status: self.status.clone(),
-                author_id: Some(self.author_id),
+                author_id: Some(editor_id),
                 summary: summary.to_owned(),
             })
             .execute(conn)

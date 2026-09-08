@@ -1063,6 +1063,20 @@ pub async fn revisions(
     let history = repos
         .with_conn(async |conn| content::revisions_for(conn, id).await)
         .await?;
+
+    // Who made each edit. The column was always there and always stored the
+    // post's owner, so on a collaborative site it was quietly wrong — and
+    // nothing rendered it, which is why nobody could notice. It records the
+    // acting editor now, and the history says so.
+    let mut names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    for author_id in history.iter().filter_map(|revision| revision.author_id) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(author_id)
+            && let Some(account) = repos.users.find_by_id(author_id).await.ok().flatten()
+        {
+            slot.insert(account.public_name().to_owned());
+        }
+    }
+
     let body = html! {
         p class="text-sm text-gray-500 mb-4" {
             "Every edit is snapshotted before it is applied, so restoring a revision returns \
@@ -1078,6 +1092,9 @@ pub async fn revisions(
                             (revision.created_at.format("%Y-%m-%d %H:%M").to_string())
                             " · " (revision.summary)
                             " · " (revision.status)
+                            @if let Some(name) = revision.author_id.and_then(|a| names.get(&a)) {
+                                " · by " (name)
+                            }
                         }
                         p class="text-sm text-gray-600 mt-2 line-clamp-3" {
                             (autumn_web::format::truncate(&revision.body, 240))

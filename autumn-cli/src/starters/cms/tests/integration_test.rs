@@ -2697,3 +2697,232 @@ async fn menu_items_can_be_nested_and_only_within_their_own_menu() {
         .await;
     assert_eq!(too_deep.status, 422, "body: {}", too_deep.text());
 }
+
+/// A published post cannot be edited into an untitled one.
+///
+/// The editor's save path applies the form to a locked row and writes the
+/// fields with plain Diesel — which is what makes the edit and its revision one
+/// transaction, and is also what bypasses `PostHooks::before_update`. The
+/// state-machine preflight only fires on a status *change*, so a crafted form
+/// keeping `status=publish` while clearing the title went live untitled.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_published_post_cannot_be_saved_without_a_title() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Has A Title", "Body.", "publish").await;
+
+    let refused = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", ""),
+            ("slug", "has-a-title"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "an untitled live post must be refused: {}",
+        refused.text()
+    );
+
+    // And the row is untouched.
+    let post: serde_json::Value = client
+        .get(&format!("/api/v1/posts/{id}"))
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(post["title"], serde_json::json!("Has A Title"));
+}
+
+/// A revision records who made the edit, not who owns the post.
+///
+/// `revisions.author_id` stored the post's owner, so every collaborative edit
+/// was credited to the wrong account — and nothing rendered the field, which is
+/// why it could stay wrong unnoticed. The history shows it now.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_revision_is_attributed_to_the_editor_who_made_it() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+    let id = create_post(&client, &owner, "Collaborative", "First draft.", "draft").await;
+
+    // A second account, promoted to Editor so it may edit somebody else's post.
+    sign_out(&client);
+    let editor = register(&client, "editor").await;
+    client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "editor"),
+            ("email", "editor@example.com"),
+            ("display_name", "Editor"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &editor)
+        .form(&form(&[
+            ("title", "Collaborative"),
+            ("slug", "collaborative"),
+            ("excerpt", ""),
+            ("body", "Edited by somebody else."),
+            ("status", "draft"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let history = client
+        .get(&format!("/admin/content/post/{id}/revisions"))
+        .header("cookie", &owner)
+        .send()
+        .await;
+    let html = history.assert_ok().text();
+    assert!(
+        html.contains("by Editor"),
+        "the revision must be credited to the account that made the edit:\n{html}"
+    );
+    assert!(
+        !html.contains("by Owner"),
+        "and not to the post's owner:\n{html}"
+    );
+}
+
+/// A reply to a comment that is no longer approved is refused.
+///
+/// A form rendered before the parent was moderated still posts. A signed-in
+/// reply then lands `approved` and bumps `comment_count`, but the thread query
+/// omits its parent — so it can never render and the count drifts up by a
+/// comment nobody can see.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_reply_to_a_hidden_parent_is_refused() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Stale Form", "Body.", "publish").await;
+
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "Parent comment")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    client
+        .post("/admin/comments/1/status?to=spam")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    let refused = client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "Late reply"), ("reply_to", "1")]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "a reply to a hidden parent must be refused: {}",
+        refused.text()
+    );
+
+    let page = client.get("/stale-form").send().await;
+    page.assert_ok();
+    assert!(
+        !page.text().contains("Late reply"),
+        "and nothing may have been stored"
+    );
+    assert!(
+        page.text().contains("No comments yet"),
+        "the count must not have drifted: {}",
+        page.text()
+    );
+}
+
+/// The public list endpoints are navigable, not merely bounded.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_posts_api_pages_through_the_corpus() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    for n in 1..=5 {
+        create_post(
+            &client,
+            &cookie,
+            &format!("Entry {n}"),
+            &format!("Body {n} about widgets."),
+            "publish",
+        )
+        .await;
+    }
+
+    sign_out(&client);
+    let titles = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .expect("array")
+            .iter()
+            .map(|p| p["title"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+
+    let page_one: serde_json::Value = client
+        .get("/api/v1/posts?per_page=2")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let page_two: serde_json::Value = client
+        .get("/api/v1/posts?per_page=2&page=2")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(titles(&page_one).len(), 2);
+    assert_eq!(titles(&page_two).len(), 2);
+    assert!(
+        titles(&page_one)
+            .iter()
+            .all(|t| !titles(&page_two).contains(t)),
+        "pages must not overlap: {:?} vs {:?}",
+        titles(&page_one),
+        titles(&page_two)
+    );
+
+    // The search branch takes the same offset.
+    let search_two: serde_json::Value = client
+        .get("/api/v1/posts?search=widgets&per_page=2&page=2")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(titles(&search_two).len(), 2);
+
+    let authors: serde_json::Value = client
+        .get("/api/v1/authors?per_page=1")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(authors.as_array().map(Vec::len), Some(1));
+}

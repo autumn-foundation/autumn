@@ -77,11 +77,28 @@ pub async fn update_post_with_revision(
 
         // `supports_revisions: false` on the registered type means exactly
         // that — no snapshot, rather than a flag the editor ignores.
+        //
+        // The snapshot is attributed to the account that *made* this edit, not
+        // to the post's author. On a collaborative site those differ every time
+        // an Editor touches somebody else's draft, and a history that credits
+        // the owner for every change is worse than no history: it is confidently
+        // wrong about who did what.
         if record_revision {
-            post.record_revision(conn, &summary).await?;
+            post.record_revision_by(conn, &summary, editor_id).await?;
         }
 
+        let before = post.clone();
         apply(&mut post);
+
+        // The same invariants `PostHooks::before_update` enforces. This path
+        // writes the fields with plain Diesel — which is what puts the edit and
+        // its revision in one transaction, and is also what bypasses the hook —
+        // so the rules have to be applied here explicitly rather than assumed.
+        // Without them an Author could submit an empty title on a post that is
+        // already `publish` and it would go live untitled: the state-machine
+        // check only fires on a status change.
+        crate::hooks::validate_post_update(&before, &mut post)?;
+
         post.updated_at = chrono::Utc::now().naive_utc();
         post.lock_version += 1;
 
@@ -107,7 +124,6 @@ pub async fn update_post_with_revision(
             .await?;
 
         prune_revisions(conn, post_id).await?;
-        let _ = editor_id;
         Ok::<_, AutumnError>(saved)
     })
     .await
@@ -511,6 +527,35 @@ pub async fn create_comment(
     new: crate::models::NewComment,
 ) -> AutumnResult<Comment> {
     conn.transaction(async move |conn| {
+        // A reply's parent has to still be approved, checked under a lock so a
+        // concurrent moderation cannot slip between the check and the insert.
+        //
+        // The handler's own check only asks whether the parent is on this post.
+        // That leaves the window a rendered page opens: a reply form drawn
+        // before its parent was spammed still posts, and a signed-in reply
+        // lands `approved` and bumps `comment_count` — while the thread query
+        // omits its parent, so it can never be rendered. The count drifts up by
+        // a comment nobody can see, permanently.
+        if let Some(parent_id) = new.parent_id {
+            let parent: Comment = comments::table
+                .find(parent_id)
+                .select(Comment::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .map_err(AutumnError::not_found)?;
+            if parent.post_id != new.post_id {
+                return Err(AutumnError::unprocessable_msg(
+                    "That comment is not on this post",
+                ));
+            }
+            if parent.status != "approved" {
+                return Err(AutumnError::unprocessable_msg(
+                    "The comment you are replying to is no longer visible",
+                ));
+            }
+        }
+
         let approved = new.status == "approved";
         let post_id = new.post_id;
         let saved: Comment = diesel::insert_into(comments::table)
@@ -1138,7 +1183,16 @@ pub async fn published_posts_by_author(
 /// One query rather than loading every post to deduplicate its `author_id` and
 /// then querying per author — the cost of listing bylines should scale with the
 /// number of authors, not with the size of the corpus.
-pub async fn published_authors(conn: &mut AsyncPgConnection) -> AutumnResult<Vec<User>> {
+pub async fn published_authors_page(
+    conn: &mut AsyncPgConnection,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<User>> {
+    // The bound is applied to the *users* query rather than after it. The
+    // distinct-author set is still computed in full — it is a projection of one
+    // indexed column, not a row load — but on a large multi-author site the
+    // page returned, and the rows materialized to build it, are bounded by the
+    // request instead of by the size of the author population.
     let author_ids: Vec<i64> = posts::table
         .filter(posts::status.eq("publish"))
         .filter(posts::post_type.eq_any(public_type_slugs()))
@@ -1152,7 +1206,9 @@ pub async fn published_authors(conn: &mut AsyncPgConnection) -> AutumnResult<Vec
     }
     Ok(users::table
         .filter(users::id.eq_any(&author_ids))
-        .order(users::username.asc())
+        .order((users::username.asc(), users::id.asc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
         .select(User::as_select())
         .load(conn)
         .await?)

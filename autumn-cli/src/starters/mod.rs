@@ -731,7 +731,7 @@ mod tests {
         let needle = format!("{starter_name}::");
         for file in &contents.files {
             let emitted = emit_rel_path(&file.rel_path);
-            if !emitted.ends_with(".rs") {
+            if std::path::Path::new(emitted).extension() != Some(std::ffi::OsStr::new("rs")) {
                 continue;
             }
             let rendered = fs::read_to_string(dest.join(emitted)).unwrap();

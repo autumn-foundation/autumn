@@ -167,50 +167,65 @@ impl MutationHooks for PostHooks {
         _ctx: &mut MutationContext,
         draft: &mut UpdateDraft<Post>,
     ) -> AutumnResult<()> {
-        // Normalise a slug the caller changed; regenerate one they cleared.
-        if draft.after.slug.trim().is_empty() || draft.after.slug != draft.before.slug {
-            draft.after.slug = normalize_slug(&draft.after.slug, &draft.after.title);
-        }
-
-        // Enforce the state machine on EVERY update path, not just the
-        // dedicated transition route: the REST API and the importer can both
-        // set `status` directly, and without this an API client could move a
-        // post from `trash` straight to `private` — an edge the graph does not
-        // have. Build the proposed row (new content, OLD status) so the
-        // `can_publish` guard evaluates the content actually being saved.
-        if draft.after.status != draft.before.status {
-            let mut proposed = draft.after.clone();
-            proposed.status.clone_from(&draft.before.status);
-            proposed.transition_status_to(&draft.after.status)?;
-        }
-
-        // A post that is live must keep a title, whether or not this edit is
-        // the one that changed the status.
-        if matches!(
-            draft.after.status.as_str(),
-            "publish" | "private" | "future"
-        ) && !draft.after.can_publish()
-        {
-            return Err(AutumnError::unprocessable_msg(
-                "A published post must have a title",
-            ));
-        }
-
-        // `published_at` is the timestamp the front end orders and dates by.
-        // Stamp it the first time a post goes live and never overwrite it
-        // afterwards — an edit to a two-year-old post must not reorder the blog
-        // index. A scheduled post carries the author's chosen future date, so
-        // an existing value always wins.
-        if draft.after.published_at.is_none()
-            && matches!(draft.after.status.as_str(), "publish" | "private")
-        {
-            draft.after.published_at = Some(chrono::Utc::now().naive_utc());
-        }
+        validate_post_update(&draft.before, &mut draft.after)?;
 
         draft.after.updated_at = chrono::Utc::now().naive_utc();
 
         Ok(())
     }
+}
+
+/// The invariants every edit to an existing post has to satisfy, whichever path
+/// makes it.
+///
+/// Extracted from `PostHooks::before_update` because it is not the only writer.
+/// `content::update_post_with_revision` applies the editor's changes to a
+/// row it holds a lock on and writes the fields back with plain Diesel — which
+/// is what makes the edit and its revision one transaction, and is also what
+/// bypasses the hook. Without this, an Author editing an already-published post
+/// could submit an empty title with `status=publish` unchanged: the
+/// state-machine check below only fires on a status *change*, so nothing
+/// rejected it and the row went live untitled, violating the heading-and-link
+/// invariant the public templates rely on.
+///
+/// `after` is taken by `&mut` because two of these are normalisations rather
+/// than refusals.
+pub fn validate_post_update(before: &Post, after: &mut Post) -> AutumnResult<()> {
+    // Normalise a slug the caller changed; regenerate one they cleared.
+    if after.slug.trim().is_empty() || after.slug != before.slug {
+        after.slug = normalize_slug(&after.slug, &after.title);
+    }
+
+    // Enforce the state machine on EVERY update path, not just the dedicated
+    // transition route: the REST API and the importer can both set `status`
+    // directly, and without this an API client could move a post from `trash`
+    // straight to `private` — an edge the graph does not have. Build the
+    // proposed row (new content, OLD status) so the `can_publish` guard
+    // evaluates the content actually being saved.
+    if after.status != before.status {
+        let mut proposed = after.clone();
+        proposed.status.clone_from(&before.status);
+        proposed.transition_status_to(&after.status)?;
+    }
+
+    // A post that is live must keep a title, whether or not this edit is the
+    // one that changed the status.
+    if matches!(after.status.as_str(), "publish" | "private" | "future") && !after.can_publish() {
+        return Err(AutumnError::unprocessable_msg(
+            "A published post must have a title",
+        ));
+    }
+
+    // `published_at` is the timestamp the front end orders and dates by. Stamp
+    // it the first time a post goes live and never overwrite it afterwards — an
+    // edit to a two-year-old post must not reorder the blog index. A scheduled
+    // post carries the author's chosen future date, so an existing value always
+    // wins.
+    if after.published_at.is_none() && matches!(after.status.as_str(), "publish" | "private") {
+        after.published_at = Some(chrono::Utc::now().naive_utc());
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Default)]

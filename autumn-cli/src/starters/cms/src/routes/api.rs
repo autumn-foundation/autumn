@@ -79,6 +79,8 @@ pub struct PostQuery {
     #[serde(default)]
     pub search: Option<String>,
     #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
     pub per_page: Option<usize>,
 }
 
@@ -103,6 +105,10 @@ pub async fn list_posts(
     // The page size is clamped before it reaches any query: an unbounded
     // `per_page` is a denial-of-service by query string.
     let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
+    // Both branches take the same offset. Without one, a site with more than
+    // `per_page` matches had no request that could reach the older rows at all
+    // — the endpoint was bounded but not navigable.
+    let offset = (query.page.unwrap_or(1).max(1) - 1) * per_page;
     let posts = match query.search.as_deref().map(str::trim) {
         Some(term) if !term.is_empty() => {
             // The same bounded, visibility-aware search the front end uses.
@@ -114,13 +120,18 @@ pub async fn list_posts(
                 &mut conn,
                 term,
                 std::slice::from_ref(&post_type),
-                0,
+                i64::try_from(offset).unwrap_or(0),
                 i64::try_from(per_page).unwrap_or(20),
             )
             .await?
             .0
         }
-        _ => repos.published_posts_page(&post_type, 0, per_page).await?.0,
+        _ => {
+            repos
+                .published_posts_page(&post_type, offset, per_page)
+                .await?
+                .0
+        }
     };
 
     let mut out = Vec::with_capacity(posts.len());
@@ -428,13 +439,18 @@ pub struct AuthorView {
 /// the site's membership, and the email column would be one careless
 /// serialization away from going with it.
 #[get("/api/v1/authors")]
-pub async fn list_authors(repos: Repos) -> AutumnResult<Json<Vec<AuthorView>>> {
+pub async fn list_authors(
+    repos: Repos,
+    Query(query): Query<PageQuery>,
+) -> AutumnResult<Json<Vec<AuthorView>>> {
     // One `SELECT DISTINCT` join rather than loading every published post to
     // deduplicate its author id and then querying once per author: the cost of
     // listing bylines should scale with the number of authors, not the size of
     // the corpus.
     let mut conn = repos.conn().await?;
-    let authors = crate::content::published_authors(&mut conn).await?;
+    let per_page = i64::try_from(query.per_page.unwrap_or(50).clamp(1, 100)).unwrap_or(50);
+    let offset = i64::try_from(query.page.unwrap_or(1).max(1) - 1).unwrap_or(0) * per_page;
+    let authors = crate::content::published_authors_page(&mut conn, offset, per_page).await?;
 
     Ok(Json(
         authors
