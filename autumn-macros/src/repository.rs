@@ -2579,6 +2579,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Issue #1358: `move_to`/`move_before`/`move_after`/`move_up`/`move_down`.
     // Empty when `position(...)` is not declared.
     let position_impl_methods_ts = position_impl_methods(&config, &table_ident);
+    // The ordering column a `position(...)` repository assigns and reorders is
+    // a framework-maintained column, so it is registered as a claim (#1769): a
+    // `#[derivation]` on another model naming the same `(table, column)` would
+    // adjust it arithmetically and replace it on backfill, breaking the
+    // ordered-list invariant, and the boot refuses the pair.
+    let position_claim_registration = config.position.as_ref().map_or_else(
+        || quote! {},
+        |spec| {
+            let column = spec.column.as_str();
+            let table = table_ident.to_string();
+            let model_name = &config.model_name;
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::derivation::CounterCacheClaim {
+                        model: ::core::stringify!(#model_name),
+                        child_table: #table,
+                        parent_table: #table,
+                        column: #column,
+                        module_path: ::core::module_path!(),
+                    }
+                }
+            }
+        },
+    );
 
     // ── #1325 counter caches ────────────────────────────────────────────────
     //
@@ -19951,6 +19975,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #hook_inventory_registration
         #versioned_inventory_registration
         #sharded_inventory_registration
+        #position_claim_registration
         #graph_inventory_registration
         #retention_inventory_registration
 

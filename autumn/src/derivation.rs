@@ -261,8 +261,9 @@ inventory::collect!(DerivationDescriptor);
 
 /// Link-time registration of a column something other than a `#[derivation]`
 /// maintains: a plain `counter_cache` (#1325), emitted by `#[model]` for every
-/// `#[belongs_to(..., counter_cache)]`, and the aggregate column a
-/// `#[votable]` model keeps from its reaction edges. (A
+/// `#[belongs_to(..., counter_cache)]`, the aggregate column a `#[votable]`
+/// model keeps from its reaction edges, and the ordering column a
+/// `#[repository(..., position(...))]` assigns and reorders. (A
 /// `#[commentable(counter_cache = ...)]` parent's column is read from its own
 /// descriptor instead.)
 ///
@@ -291,8 +292,8 @@ pub struct CounterCacheClaim {
 inventory::collect!(CounterCacheClaim);
 
 /// Every parent column something other than a `#[derivation]` maintains in
-/// this binary, in a stable order: the plain `counter_cache` and `#[votable]`
-/// aggregate claims, and the `comment_count`-style column a
+/// this binary, in a stable order: the plain `counter_cache`, `#[votable]`
+/// aggregate and `position(...)` ordering claims, and the `comment_count`-style column a
 /// `#[commentable(counter_cache = ...)]` parent keeps, which is registered
 /// through the commentable descriptor and builds its counter spec at run time
 /// rather than through `#[model]`.
