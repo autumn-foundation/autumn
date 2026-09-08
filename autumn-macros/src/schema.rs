@@ -591,6 +591,13 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         // two apart, so the choice is deferred to runtime — the same escape the
         // scalar table uses for its own last-segment collisions.
         if is_serde_json_value(&type_name_str(&inner)) {
+            // THREE outcomes, not two. The inventory check alone cannot tell the
+            // genuine `serde_json::Value` from an application `Value` that
+            // derives nothing — it answers `None` for both — so the identity is
+            // checked as well, exactly as `emit_identity_guarded` does for the
+            // non-optional path. Without it an underived colliding `Value` was
+            // published as arbitrary JSON: `--strict` passed while a client
+            // still received `unknown` for a field with a fixed wire shape.
             let inner_ty = &inner;
             return quote! {{
                 match ::autumn_web::openapi::registered_derived_schema(
@@ -603,12 +610,27 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
                             "oneOf": [__derived, { "type": "null" }]
                         })
                     }
-                    // Genuine `serde_json::Value`: already admits null.
                     ::core::option::Option::None => {
-                        ::autumn_web::reexports::serde_json::json!({
-                            "description": "Arbitrary JSON: an object, array, string, number, \
-                                            boolean or null.",
-                        })
+                        let __identity = ::core::any::type_name::<#inner_ty>();
+                        if __identity == "serde_json::value::Value" {
+                            // Genuine `serde_json::Value`: unconstrained already
+                            // admits null, and wrapping it in `oneOf` would
+                            // REJECT that null (it matches both branches).
+                            ::autumn_web::reexports::serde_json::json!({
+                                "description": "Arbitrary JSON: an object, array, string, \
+                                                number, boolean or null.",
+                            })
+                        } else {
+                            // An underived application `Value`: an ordinary
+                            // type, so it gets the ordinary nullable `$ref`.
+                            let __ref_path = ::std::format!(
+                                "#/components/schemas/{}",
+                                __identity
+                            );
+                            ::autumn_web::reexports::serde_json::json!({
+                                "oneOf": [{ "$ref": __ref_path }, { "type": "null" }]
+                            })
+                        }
                     }
                 }
             }};

@@ -542,6 +542,10 @@ mod collision {
     pub struct HoldsCollisions {
         pub id: Uuid,
         pub payload: Value,
+        /// The OPTIONAL form of the same collision — its own code path.
+        pub maybe_payload: Option<Value>,
+        /// Optional genuine `serde_json::Value`, for contrast.
+        pub maybe_json: Option<::serde_json::Value>,
         pub label: String,
         /// The genuine external scalar, for contrast.
         pub real: ::uuid::Uuid,
@@ -577,6 +581,42 @@ fn a_colliding_scalar_name_is_not_inlined_as_a_scalar() {
     let real = &schema["properties"]["real"];
     assert_eq!(real["type"], "string", "{real}");
     assert_eq!(real["format"], "uuid", "{real}");
+}
+
+/// `Option<T>` takes its OWN branch, which returns early before the shared
+/// guard runs — so it needed the identity check separately. Without it an
+/// underived application `Value` was published as arbitrary JSON, passing
+/// `--strict` while a client still got `unknown`.
+#[test]
+fn an_optional_colliding_value_is_a_nullable_ref_not_arbitrary_json() {
+    let schema = <collision::HoldsCollisions as autumn_web::openapi::OpenApiSchema>::schema();
+
+    let colliding = &schema["properties"]["maybe_payload"];
+    let branches = colliding["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an underived application `Value` is ordinary: {colliding}"));
+    assert!(
+        branches.iter().any(|b| b["type"] == "null"),
+        "it keeps its null branch: {colliding}"
+    );
+    assert!(
+        branches
+            .iter()
+            .any(|b| b["$ref"].as_str().is_some_and(|r| r.contains("Value"))),
+        "and refs its own component rather than becoming arbitrary JSON: {colliding}"
+    );
+
+    // The genuine `Option<serde_json::Value>` stays unconstrained and is NOT
+    // wrapped — null matches both branches, so `oneOf` would reject it.
+    let genuine = &schema["properties"]["maybe_json"];
+    assert!(
+        genuine.get("oneOf").is_none(),
+        "the real Option<Value> must not be wrapped: {genuine}"
+    );
+    assert!(
+        genuine.get("type").is_none(),
+        "and stays unconstrained: {genuine}"
+    );
 }
 
 /// Round 21 guarded the chrono/uuid scalar table and left the two SIBLING
