@@ -1323,13 +1323,12 @@ fn push_removal(
     witness: i64,
     out: &mut Vec<Contribution>,
 ) {
-    match contrib.checked_neg() {
-        Some(negated) => out.push((index, parent, negated, witness)),
-        None => {
-            let half = contrib / 2;
-            out.push((index, parent, -half, witness));
-            out.push((index, parent, -(contrib - half), witness));
-        }
+    if let Some(negated) = contrib.checked_neg() {
+        out.push((index, parent, negated, witness));
+    } else {
+        let half = contrib / 2;
+        out.push((index, parent, -half, witness));
+        out.push((index, parent, -(contrib - half), witness));
     }
 }
 
