@@ -63,49 +63,27 @@ const GUARD_GATE_TYPE_PREFIXES: &[&str] = &[
 
 /// Whether `func` already carries another guard's pre-body gate parameter.
 ///
-/// Used by each of `#[secured]`/`#[step_up]`/`#[throttle]` to decide whether
-/// ITS OWN gate should own idempotency-replay serving: whichever gate is
-/// applied to a still-unguarded function (no earlier gate parameter, and per
-/// [`crate::idempotency_guard::block_has_replay_guard`] no earlier in-body
-/// guard either) is the one whose check every other stacked guard's check is
-/// guaranteed to have already passed by the time it runs, so it — and only
-/// it — may serve a cached replay.
+/// Used two ways:
+/// - By each of `#[secured]`/`#[step_up]`/`#[throttle]` to decide whether ITS
+///   OWN gate should own idempotency-replay serving: whichever gate is
+///   applied to a still-unguarded function (no earlier gate parameter, and
+///   per [`crate::idempotency_guard::block_has_replay_guard`] no earlier
+///   in-body guard either) is the one whose check every other stacked
+///   guard's check is guaranteed to have already passed by the time it
+///   runs, so it — and only it — may serve a cached replay.
+/// - By `static_route.rs` to detect an already-expanded gate (of *any* of
+///   the four kinds, `#[feature_flag]` included) stacked above
+///   `#[static_get]`: none of these pre-body checks run on a cached
+///   SSG/ISR hit (served by the static-first middleware before the inner
+///   router, and the handler along with it, is ever reached), so all four
+///   are incompatible with a static route for the same reason, not just
+///   the three auth/rate ones (Codex review on #2628, tenth finding — an
+///   attempt to narrow this to an auth/rate-only prefix list for that
+///   check, in response to the eighth finding, missed that a disabled
+///   `#[feature_flag]` on a static route would then silently fail to hide
+///   the cached page).
 pub fn has_any_guard_gate_param(func: &ItemFn) -> bool {
     GUARD_GATE_TYPE_PREFIXES
-        .iter()
-        .any(|prefix| has_guard_gate_param_with_prefix(func, prefix))
-}
-
-/// Type-name prefixes of the pre-body `FromRequestParts` gate parameter each
-/// *auth/rate* guard macro inserts — deliberately excludes
-/// `__AutumnFlagGate_`. `#[feature_flag]` is not an auth/rate guard and
-/// carries no such incompatibility with a static route on its own; it is
-/// included in [`GUARD_GATE_TYPE_PREFIXES`] only because it is a *sibling*
-/// pre-body gate whose idempotency-replay ownership the other three need to
-/// see (Codex review on #2628, third finding).
-const AUTH_GUARD_GATE_TYPE_PREFIXES: &[&str] = &[
-    "__AutumnSecuredGate_",
-    "__AutumnStepUpGate_",
-    "__AutumnThrottleGate_",
-];
-
-/// Whether `func` already carries an *auth/rate* guard's pre-body gate
-/// parameter — `#[secured]`/`#[step_up]`/`#[throttle]`, but not
-/// `#[feature_flag]`.
-///
-/// For a "does this combination make sense" check (e.g. a static route
-/// macro refusing to combine with an auth/rate guard), use this instead of
-/// [`has_any_guard_gate_param`]: that function's broader prefix list also
-/// matches `#[feature_flag]`'s gate, which is unrelated to auth/rate
-/// incompatibility and was never meant to trip a check scoped to it. Codex
-/// review on #2628 (eighth finding) found `static_route.rs` doing exactly
-/// that — `__AutumnFlagGate_` joining [`GUARD_GATE_TYPE_PREFIXES`] for the
-/// idempotency-ownership use case above made `#[feature_flag]` written
-/// above `#[static_get]` an unintended, order-dependent compile break
-/// (the reverse order was, and remained, unaffected, since
-/// `feature_flag_macro` never checked the static-route marker either way).
-pub fn has_any_auth_guard_gate_param(func: &ItemFn) -> bool {
-    AUTH_GUARD_GATE_TYPE_PREFIXES
         .iter()
         .any(|prefix| has_guard_gate_param_with_prefix(func, prefix))
 }
@@ -340,28 +318,15 @@ mod tests {
 
     #[test]
     fn has_any_guard_gate_param_detects_feature_flag_too() {
+        // Codex review on #2628 (tenth finding): a feature-flag gate never
+        // runs on a cached SSG/ISR hit, the same reason the three auth/rate
+        // gates are incompatible with a static route -- so this function
+        // must keep matching it, for both its callers (idempotency-replay
+        // ownership in idempotency_guard.rs, and static-route incompatibility
+        // in static_route.rs).
         let flagged: ItemFn = parse_quote! {
             async fn h(_g: __AutumnFlagGate_h) {}
         };
         assert!(has_any_guard_gate_param(&flagged));
-    }
-
-    #[test]
-    fn has_any_auth_guard_gate_param_excludes_feature_flag() {
-        // Codex review on #2628 (eighth finding): a feature-flag gate is not
-        // an auth/rate guard, so a check scoped to "is there an
-        // auth/rate guard here" (e.g. static_route.rs's incompatibility
-        // check) must not match it, even though the broader
-        // `has_any_guard_gate_param` (used for idempotency-replay
-        // ownership) correctly does.
-        let flagged: ItemFn = parse_quote! {
-            async fn h(_g: __AutumnFlagGate_h) {}
-        };
-        assert!(!has_any_auth_guard_gate_param(&flagged));
-
-        let secured: ItemFn = parse_quote! {
-            async fn h(_g: __AutumnSecuredGate_h) {}
-        };
-        assert!(has_any_auth_guard_gate_param(&secured));
     }
 }

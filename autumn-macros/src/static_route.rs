@@ -19,15 +19,30 @@ use syn::{Ident, LitInt, LitStr, Token};
 /// Attribute names of the body-guard macros that cannot meaningfully gate a
 /// `#[static_get]` route. See `static_get_macro`'s rejection of the
 /// combination in either attribute order.
-const INCOMPATIBLE_GUARD_ATTRS: [&str; 4] = ["secured", "step_up", "throttle", "authorize"];
+///
+/// `#[feature_flag]` joined this list alongside the three auth/rate guards
+/// (Codex review on #2628, tenth finding): none of the four's pre-body
+/// `FromRequestParts` checks run on a cached SSG/ISR hit, served by the
+/// static-first middleware before the inner router — and the handler along
+/// with it — is ever reached, so a disabled flag would silently fail to
+/// hide the cached page, the same failure mode as an unenforced auth
+/// guard.
+const INCOMPATIBLE_GUARD_ATTRS: [&str; 5] = [
+    "secured",
+    "step_up",
+    "throttle",
+    "authorize",
+    "feature_flag",
+];
 
-/// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`
-/// combined with `#[static_get]`, in either attribute order.
-pub const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]` \
+/// Error message for `#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`/
+/// `#[feature_flag]` combined with `#[static_get]`, in either attribute
+/// order.
+pub const INCOMPATIBLE_GUARD_MSG: &str = "`#[secured]`/`#[step_up]`/`#[throttle]`/`#[authorize]`/`#[feature_flag]` \
      cannot be combined with `#[static_get]`: cached SSG/ISR responses are served by the \
-     static-first middleware before the inner router (session, auth) is ever reached, so this \
-     guard would not protect a cache hit. Use `AppBuilder::static_gate` to gate pre-rendered \
-     pages instead.";
+     static-first middleware before the inner router (session, auth, feature gate) is ever \
+     reached, so this guard would not protect a cache hit. Use `AppBuilder::static_gate` to \
+     gate pre-rendered pages instead.";
 
 /// Parsed attributes for `#[static_get("/path", params = fn, revalidate = N)]`.
 struct StaticGetAttrs {
@@ -234,7 +249,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // onto the surviving single function is the guard's own signature/body
     // rewrite: `#[secured]`/`#[step_up]`/`#[throttle]` each insert a
     // handler-unique pre-body gate parameter
-    // (`param_helpers::has_any_auth_guard_gate_param`), and `#[authorize]` —
+    // (`param_helpers::has_any_guard_gate_param`), and `#[authorize]` —
     // which inserts no such parameter — leaves its role/policy-check marker
     // directly in the body (`api_doc::extract_secured_info`, the same
     // recovery the `#[get]`/`#[post]` route macro already relies on for
@@ -242,7 +257,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
         crate::param_helpers::attr_or_cfg_attr_matches_any(attr, &INCOMPATIBLE_GUARD_ATTRS)
     });
-    let already_expanded_guard = crate::param_helpers::has_any_auth_guard_gate_param(&input_fn)
+    let already_expanded_guard = crate::param_helpers::has_any_guard_gate_param(&input_fn)
         || crate::api_doc::extract_secured_info(&input_fn).0;
     if !leading_guard_items.is_empty() || unexpanded_guard_attr.is_some() || already_expanded_guard
     {
@@ -523,17 +538,29 @@ mod tests {
     }
 
     #[test]
-    fn static_get_accepts_a_feature_flag_guard_expanded_above_it() {
-        // Codex review on #2628 (eighth finding): round 3 added
-        // `__AutumnFlagGate_` to `param_helpers::GUARD_GATE_TYPE_PREFIXES` so
+    fn static_get_rejects_a_feature_flag_guard_expanded_above_it() {
+        // Codex review on #2628, two rounds:
+        //
+        // Eighth finding: round 3 added `__AutumnFlagGate_` to
+        // `param_helpers::GUARD_GATE_TYPE_PREFIXES` so
         // `#[secured]`/`#[step_up]`/`#[throttle]` could see an earlier
         // `#[feature_flag]` gate for idempotency-replay-ownership purposes.
         // `static_get_macro` shared that same broad prefix list for an
-        // unrelated question -- "is there an auth/rate guard here that's
-        // incompatible with a static route" -- so `#[feature_flag]`
-        // expanded above `#[static_get]` was wrongly rejected too, even
-        // though `#[feature_flag]` is not an auth/rate guard and the
-        // reverse attribute order was never rejected. Must compile.
+        // unrelated question -- "is there a guard here that's incompatible
+        // with a static route" -- so `#[feature_flag]` expanded above
+        // `#[static_get]` became an order-dependent compile break (the
+        // reverse order was never rejected).
+        //
+        // Tenth finding: a first fix narrowed `static_get_macro`'s check to
+        // an auth/rate-only prefix list, making the combination compile.
+        // That was wrong in the other direction: none of the four gates'
+        // pre-body `FromRequestParts` checks run on a cached SSG/ISR hit
+        // (served by the static-first middleware before the handler is
+        // ever reached), so a disabled `#[feature_flag]` on a static route
+        // would silently fail to hide the cached page -- the same failure
+        // mode the three auth/rate guards are already rejected for. The
+        // combination must be a compile error in both attribute orders,
+        // same as the other three.
         let flagged = crate::feature_flag::feature_flag_macro(
             quote! { "my_flag" },
             quote! {
@@ -544,9 +571,31 @@ mod tests {
         let generated = static_get_macro(quote! { "/about" }, quote! { #flagged_fn }).to_string();
 
         assert!(
-            !generated.contains("compile_error"),
-            "a #[feature_flag] gate stacked above #[static_get] must not be rejected as an \
-             incompatible auth/rate guard: {generated}"
+            generated.contains("compile_error"),
+            "a #[feature_flag] gate stacked above #[static_get] must be a compile error, since \
+             it would not protect a cached SSG/ISR hit: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_rejects_a_live_unexpanded_feature_flag_attribute() {
+        // The *other* stacking order: `#[static_get]` outermost,
+        // `#[feature_flag]` still a live, unexpanded attribute below it --
+        // caught by name via `INCOMPATIBLE_GUARD_ATTRS`, mirroring how the
+        // other three guards are rejected in this order.
+        let generated = static_get_macro(
+            quote! { "/about" },
+            quote! {
+                #[feature_flag("my_flag")]
+                async fn about() -> &'static str { "about" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("compile_error"),
+            "a #[feature_flag] attribute stacked below #[static_get] must be a compile error: \
+             {generated}"
         );
     }
 
@@ -556,7 +605,7 @@ mod tests {
         // it leaves only a body marker/policy-check statement — so this
         // exercises the `api_doc::extract_secured_info` half of the
         // already-expanded-guard detection, not
-        // `param_helpers::has_any_auth_guard_gate_param`.
+        // `param_helpers::has_any_guard_gate_param`.
         let authorized = crate::authorize::authorize_macro(
             quote! { "view", resource = Room },
             quote! {

@@ -85,6 +85,21 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // `#[feature_flag]` written below `#[static_get]`/`#[ws]` — including
+    // under an alias those macros' own by-name attribute scan cannot see —
+    // is caught here instead, once this guard's own macro is the one
+    // running (Codex review on #2513, tenth finding, for the other four
+    // guards; Codex review on #2628, tenth finding, extended the same
+    // static-route incompatibility to `#[feature_flag]`: its pre-body gate
+    // never runs on a cached SSG/ISR hit, so an aliased `#[feature_flag]`
+    // slipping past `static_get_macro`'s literal-name scan and expanding
+    // anyway would silently produce a "gated" static route that doesn't
+    // actually protect a cache hit). See
+    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
+    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
+    }
+
     // An attribute sharing #[authorize]'s argument grammar under a different
     // name is refused rather than guessed at — see
     // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
