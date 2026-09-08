@@ -68,8 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   freed, with no visible connection to the request that built it.
   `RenderLimits::max_output_bytes` (4 MiB) is a separate budget from the node
   and iteration counts because those do not imply it: one text node can emit as
-  much as the whole document may be, so a ~480 KiB string rendered from a
-  5 000-iteration `each` is a few dozen nodes and ~2.4 GiB of markup. Component
+  much as `RenderContext::state` holds, so a large string rendered from a
+  5 000-iteration `each` is a few dozen nodes and gigabytes of markup. It spans
+  the body and every portal together, and also caps what a single expression may
+  *build* — `concat`/`array`/`obj`/`+` assemble a finished value inside the
+  evaluator before any of it reaches the output buffer. `max_depth` likewise
+  caps the shape of state on **every** mutation, not only `setPath`: state
+  persists between dispatches, so `set x = array(state x)` adds a level per
+  request until `serde_json::Value`'s recursive drop overflows the stack. Component
   cycle detection is iterative for the mirror-image reason — components are
   sibling map entries, so a chain thousands deep is shallow JSON that clears
   every parse bound, and a recursive walk would overflow during *validation*.

@@ -333,11 +333,20 @@ A 2 KB document that loops over a 100 000-element list is small and expensive:
 | `max_output_bytes` | 4 MiB |
 
 `max_output_bytes` is not implied by the node or iteration counts, which is why
-it is its own budget: a *single* text node can emit as much as the document is
-allowed to be. A 512 KiB document can put a ~480 KiB string in state and render
-that field from a 5 000-iteration `each` — a few dozen nodes, inside every other
-bound, and about 2.4 GiB of markup. Counting nodes does not see that; counting
-bytes does.
+it is its own budget: a *single* text node can emit as much as
+`RenderContext::state` holds, and the app owns that. A 5 000-iteration `each`
+over a large string is a few dozen nodes, inside every other bound, and
+gigabytes of markup. Counting nodes does not see that; counting bytes does. The
+budget spans the body **and** every portal together, and it also caps what a
+single expression may *build* — `concat`, `array`, `obj` and string `+` assemble
+a finished value inside the evaluator before any of it reaches the output
+buffer, so bounding only the output would leave the allocation unbounded.
+
+`max_depth` caps the shape of state as well as the depth of the view. Every
+state mutation is checked, not only `setPath`: state persists between
+dispatches, so an action as ordinary as `set x = array(state x)` adds a nesting
+level *per request*, and `serde_json::Value` drops recursively — an unbounded
+version overflows the stack eventually, on a request that did nothing unusual.
 
 `max_depth` also caps how deep a `setPath` step may write. That one is worth
 knowing about, because the reason is not the obvious one: the walk over a long
@@ -405,6 +414,10 @@ rendered here and the same document rendered by the upstream client runtime
 agree: `"a" + 1` is `"a1"`, `[1,2] + ""` is `"1,2"`, `==` is `===` (no type
 juggling), `&&` and `||` yield the *operand* rather than a boolean, `[]` and `{}`
 are truthy, and `<` on non-numbers compares stringified operands.
+
+Number formatting matches too, thresholds included: ECMAScript switches to
+exponential notation at `|x| >= 1e21` and again below `1e-6`, so `1e21` renders
+as `1e+21` and `1e-7` as `1e-7` rather than as long decimal expansions.
 
 Two things differ, both forced by JSON rather than chosen:
 
