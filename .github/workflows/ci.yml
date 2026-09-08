@@ -232,6 +232,15 @@ jobs:
         # checked-in snapshot, so a rename moves the gate with it in the same
         # commit and there is nothing to regenerate.
         #
+        # Since #2498 it also resolves every OPTION those lines pass, which is
+        # the same dead end reached by the same reader: `autumn build --release`
+        # is `error: unexpected argument '--release' found`, exit 2 (the flag is
+        # `--debug`; release is the default). That half was left out originally
+        # on the grounds that a source-parsed flag set would be too noisy to
+        # gate; measured, with clap's `flatten`, `trailing_var_arg` and builtin
+        # flags understood, corpus-wide noise was zero and the baseline found
+        # five real defects across five pages.
+        #
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-cli.sh --self-test && ./scripts/check-docs-cli.sh
@@ -298,6 +307,35 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-orphans.sh --self-test && ./scripts/check-docs-orphans.sh
+      - name: TOML config-key drift gate
+        # The env-var gate above covers the config a reader SETS. This covers
+        # the config they WRITE — a key in `autumn.toml` itself — which is the
+        # same silent-failure class one layer over. The two do not overlap: the
+        # env layer is written field by field, so a schema leaf can exist with
+        # no environment spelling at all (90 of 397 leaves have none), and a
+        # `[section] key` in a fence is never an `AUTUMN_*` name.
+        #
+        # `server.strict_config` and `autumn check --config` DO reject an
+        # unknown key in `autumn.toml` — but strict_config is off by default,
+        # so on a default app serde drops the key with no warning: the app
+        # boots, the setting the reader believed they changed keeps its
+        # default, and nothing anywhere says so.
+        #
+        # The baseline run found four live defects: `[session] ttl_seconds` in
+        # wizards.md (the key is `max_age_secs`, and the documented "increase"
+        # to 3600 was a 24x decrease against the 86400 default); an impossible
+        # `[app] profile` in dev-error-overlay.md, settable from no config file
+        # at all; a duplicate `read_your_writes` in cloud-native.md that makes
+        # the file fail to parse; and `[logging]` for `[log]` on the wiki
+        # example's rendered `/docs/configuration` page.
+        #
+        # Same truth set as the gate above — the CI-guarded
+        # `schema_keys.snapshot` — plus the workspace's `config_section()`
+        # calls and the CLI's own `[dev]` struct. Nothing to regenerate.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-toml.sh --self-test && ./scripts/check-docs-toml.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`

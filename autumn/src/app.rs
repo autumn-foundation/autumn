@@ -580,6 +580,14 @@ pub(crate) type ErasedAppLayer = tower::util::BoxCloneSyncServiceLayer<
 >;
 
 /// Metadata and the type-erased layer for a user-registered middleware.
+///
+/// `Clone` (the erased `layer` is a `BoxCloneSyncServiceLayer`, which is
+/// itself `Clone`) so a registration set can be applied to more than one
+/// router — see `try_build_router_with_static_inner`'s `mcp_dispatch_extra_layers`,
+/// which clones the SSG/ISG path's drained `custom_layers` onto the MCP
+/// dispatch clone without disturbing how the original set wraps the
+/// live-serving router.
+#[derive(Clone)]
 pub(crate) struct CustomLayerRegistration {
     /// Concrete type for the registered layer.
     pub(crate) type_id: TypeId,
