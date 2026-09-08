@@ -201,6 +201,7 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `openapi` | OpenAPI route metadata and spec generation |
 | `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
 | `markdown` | Markdown rendering with frontmatter and static-site support, plus the safe user-submitted rich-text path (`render_user_content`, `rich_text_area`) — see [rich text](../../docs/guide/rich-text.md) |
+| `constela` | Parse, validate and server-render [Constela](https://github.com/yuuichieguchi/constela) documents — the constrained JSON UI language — so an app can serve an interface a language model generated; implies `maud`, see [generated UI](../../docs/guide/constela.md) |
 | `telemetry-otlp` | OpenTelemetry OTLP export |
 | `test-support` | Testcontainers-backed `TestApp`, `TestClient`, and `TestDb` |
 | `i18n` | Locale extractor, compile-time checked translations, and opt-in locale-prefixed routing |
@@ -499,6 +500,47 @@ allowlist. For anything a request body carried in, use `render_user_content`
 (see [rich text](../../docs/guide/rich-text.md)). The framework ships no docs
 theme; compose `out.html`/`out.toc` into your own Maud layout. Worked example:
 `examples/wiki` (`src/routes/docs.rs` + `content/*.md`).
+
+### Generated UI (feature `constela`)
+
+To serve an interface a model wrote, do **not** ask it for HTML — that is RCE
+with extra steps. Ask it for a [Constela](https://github.com/yuuichieguchi/constela)
+document: a constrained JSON UI language with no way to spell a function call or
+an event handler. `autumn_web::constela` parses it, validates it, and renders it
+to `Markup`.
+
+```rust
+use autumn_web::constela::{Document, Limits, RenderContext};
+
+let document = Document::parse(&generated_json, &Limits::default())?;  // validates too
+let ctx = RenderContext { state: document.initial_state(), ..Default::default() };
+let ui = document.render(&ctx)?;   // ui.body is Markup; ui.portals/title/meta too
+```
+
+`Document::parse` is the only way in besides `from_program`, and both validate,
+so holding a `Document` proves the checks ran. Failure returns
+`ConstelaError`; `err.to_json()` is a `[{path, code, message}]` array naming
+**every** fault at once — feed it straight back to the generator as a repair
+prompt rather than retrying blind. A `ConstelaError` surfaces as **422**.
+
+Safety is an allowlist, not a denylist (`constela::policy`): tags, attributes
+(every `on*` rejected, `style` absent), and URL schemes, with computed URLs
+re-checked at render time and all output escaped by construction. Element ids
+are rewritten with `RenderContext::id_prefix` (`c-` by default) so a generated
+fragment cannot clobber the host page — give each fragment its own prefix when a
+page embeds several.
+
+There is **no client runtime and no generated JavaScript**. Interactivity is
+server-side over htmx: event bindings render as `data-constela-on-{event}`, and
+`document.dispatch(action, &mut state, &payload)?` runs the pure state steps
+(`set`, `update`, `setPath`, `if`) against state your app owns. Browser-side
+steps come back on `Dispatched::effects` rather than being performed — running a
+model-authored `fetch` server-side would be SSRF by construction, so your app
+decides against its own allowlist.
+
+Bound untrusted input with `Limits` (document: bytes/depth/nodes) and
+`RenderLimits` (expansion: depth/nodes/`max_each_items`, and how deep a
+`setPath` may write). See [generated UI](../../docs/guide/constela.md).
 
 ## Models and repositories
 
