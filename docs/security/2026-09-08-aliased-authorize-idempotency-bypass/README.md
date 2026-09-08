@@ -220,7 +220,7 @@ extract either way.
   `authorize`/`secured`/`step_up`/`throttle`/`route` and this PR's own new
   fixtures), consistent with a rustc/dependency version drift between this
   sandbox and whichever environment last generated those goldens.
-- `cargo test -p autumn-macros --lib`: 1182/1182 pass, including every
+- `cargo test -p autumn-macros --lib`: 1190/1190 pass, including every
   golden-expansion test pinning `#[secured]`/`#[step_up]`/`#[throttle]`/
   `#[authorize]`'s exact generated output (unaffected — the fix only adds an
   early rejection, never changes what a guard emits when it does compile)
@@ -301,6 +301,40 @@ confirmed these four gate macros (`secured`, `step_up`, `throttle`,
 extractors (a repository's own generated policy-check-then-replay sequence,
 already correctly ordered within one macro's own output; DI-only service
 extraction) with no cross-macro ordering ambiguity to exploit.
+
+## Round 4: `cfg_attr` hid an authorize-shaped payload from every check
+
+The final round-2/round-3 design still scanned each attribute's own
+`attr.meta` directly. `#[cfg_attr(pred, ...)]` is a compiler builtin, not a
+macro: it stays unexpanded (as `param_helpers.rs`'s pre-existing
+`attr_or_cfg_attr_matches_any` already documents) until every attribute
+*macro* has finished running, so its top-level path is `cfg_attr`, never the
+inner attribute's name. Both `attr_is_authorize_shaped` and
+`reject_if_ambiguous_authorize_shape` therefore missed anything written as
+`#[cfg_attr(feature = "auth", authz("update", resource = Note))]` —
+including a **literal** `#[cfg_attr(pred, authorize(...))]`, which should
+have been recognized as a real guard and wasn't. With the feature enabled at
+compile time, the ambiguous/aliased case reopened the original replay
+bypass (`IdempotencyReplayLayer` stays on the route since `has_authorize_guard`
+never saw a pending `#[authorize]`), and the literal case caused an earlier
+gate to wrongly claim replay ownership that `#[authorize]` should have kept.
+
+Fixed by adding `for_each_conditionally_applied_meta(attr, check)`, which
+mirrors `attr_or_cfg_attr_matches_any`'s existing pattern: when
+`attr.path().is_ident("cfg_attr")` it parses the nested
+`Punctuated<Meta, Token![,]>` and runs `check` over every entry after the
+first (the `cfg`/`cfg_attr` predicate); otherwise it runs `check` on
+`attr.meta` directly. Both `attr_is_authorize_shaped` (via
+`meta_is_literally_authorize`) and `reject_if_ambiguous_authorize_shape`
+(via `meta_is_ambiguous_authorize_shape`) now go through this helper, so a
+`cfg_attr`-wrapped alias or shape collision is refused at compile time and a
+`cfg_attr`-wrapped literal `#[authorize(...)]` is correctly recognized as a
+real guard.
+
+New tests: `rejects_an_aliased_authorize_shape_behind_cfg_attr`,
+`rejects_an_unrelated_shape_behind_cfg_attr`,
+`accepts_the_literal_name_behind_cfg_attr_without_ambiguity`,
+`attr_is_authorize_shaped_recognizes_the_literal_name_behind_cfg_attr`.
 
 ## 🗂 Ledger
 
