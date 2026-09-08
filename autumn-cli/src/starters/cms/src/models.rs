@@ -274,10 +274,20 @@ impl Post {
 
     /// The excerpt to show in a listing: the authored one when present, else
     /// the first 55 words of the body — WordPress's own default length.
+    ///
+    /// A password-protected post never derives one. An authored excerpt is
+    /// still shown, because the author wrote it knowing the listing is public;
+    /// deriving from the body is a different thing entirely, and doing it here
+    /// would hand out the first 55 words of the very content the password
+    /// withholds — through the blog index, the REST API and the syndication
+    /// feeds at once, since all three call this.
     #[must_use]
     pub fn display_excerpt(&self) -> String {
         if !self.excerpt.trim().is_empty() {
             return self.excerpt.clone();
+        }
+        if self.is_password_protected() {
+            return String::new();
         }
         let text = plain_text(&self.body);
         let mut words = text.split_whitespace();

@@ -51,9 +51,24 @@ pub struct ExportPost {
     #[serde(default)]
     pub body: String,
     pub status: String,
+    /// The post's password, empty when the post is not protected.
+    ///
+    /// Carried so a restore does not silently publish content that was
+    /// protected — WordPress's WXR carries `wp:post_password` for the same
+    /// reason. Adding it is what took the format to version 2: a version-1
+    /// file has no password field, and since `import` refuses any version it
+    /// does not recognise, there is no case where this is absent and has to be
+    /// guessed at.
+    pub password: String,
     /// The author's **username**, not their id: ids are meaningless across
     /// installations, and a username is what an importer can actually resolve.
     pub author: String,
+    /// The parent page's **slug**, for hierarchical types — same reasoning as
+    /// `author`. Without it a restore flattens the tree: a page reachable at
+    /// `/about/team` comes back as `/team`, so every inbound link and
+    /// canonical URL to it starts 404ing after a backup restore.
+    #[serde(default)]
+    pub parent: Option<String>,
     #[serde(default)]
     pub published_at: Option<chrono::NaiveDateTime>,
     /// Term slugs, qualified by taxonomy.
@@ -68,7 +83,13 @@ pub struct ExportTermRef {
 }
 
 /// The current export schema version.
-pub const EXPORT_VERSION: u32 = 1;
+///
+/// Bumped to 2 when `ExportPost` gained `password` and `parent`. The importer
+/// refuses a version it does not recognise rather than reading a file with
+/// fields missing, which is what makes the password's presence an invariant
+/// rather than something the restore path has to guess at — a version-1 file's
+/// protected posts would otherwise have been restored as public.
+pub const EXPORT_VERSION: u32 = 2;
 
 #[get("/admin/tools")]
 pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
@@ -97,7 +118,7 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                     (csrf.input())
                     label for="payload" class="sr-only" { "Export JSON" }
                     textarea #payload name="payload" rows="8" required
-                             placeholder="{\"version\": 1, …}"
+                             placeholder="{\"version\": 2, …}"
                              class="w-full border rounded px-3 py-2 font-mono text-xs" {}
                     button type="submit"
                            class="px-4 py-2 border rounded bg-white hover:bg-gray-50" {
@@ -152,6 +173,18 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 .flatten()
                 .map(|u| u.username)
                 .unwrap_or_default();
+            // The parent's slug, resolved now while the ids still mean
+            // something in this database.
+            let parent_slug = match post.parent_id {
+                Some(parent_id) => repos
+                    .posts
+                    .find_by_id(parent_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|parent| parent.slug),
+                None => None,
+            };
             let assigned = repos.post_terms(post.id).await?;
             posts.push(ExportPost {
                 post_type: post.post_type.clone(),
@@ -160,7 +193,9 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 excerpt: post.excerpt.clone(),
                 body: post.body.clone(),
                 status: post.status.clone(),
+                password: post.password.clone(),
                 author,
+                parent: parent_slug,
                 published_at: post.published_at,
                 terms: assigned
                     .iter()
@@ -241,6 +276,11 @@ pub async fn import(
 
     let mut imported = 0_usize;
     let mut skipped = 0_usize;
+    // (created id, post type, the slug AS WRITTEN IN THE FILE, parent slug).
+    // The written slug is the key the file's `parent` references use; the row
+    // may have been given a different one to avoid colliding with content
+    // already on this site.
+    let mut created_ids: Vec<(i64, String, String, Option<String>)> = Vec::new();
     for post in &payload.posts {
         // Idempotent on `(post_type, slug)` — the same pair the database's
         // unique index enforces — so re-running an import updates nothing and
@@ -284,7 +324,7 @@ pub async fn import(
                 featured_media_id: None,
                 menu_order: 0,
                 comment_status: "open".to_owned(),
-                password: String::new(),
+                password: post.password.clone(),
                 sticky: false,
                 published_at: post.published_at,
             })
@@ -309,7 +349,32 @@ pub async fn import(
         if post.status != "draft" {
             content::transition_status(&mut db, created.id, &post.status).await?;
         }
+        created_ids.push((
+            created.id,
+            post.post_type.clone(),
+            post.slug.clone(),
+            post.parent.clone(),
+        ));
         imported += 1;
+    }
+
+    // Re-link ancestry in a second pass: a child can appear in the file before
+    // its parent, so the parent's row may not exist during the first. Resolve
+    // through the file's own slugs rather than by re-querying, because a row
+    // may have been given a different slug on the way in.
+    let by_file_slug: std::collections::HashMap<(&str, &str), i64> = created_ids
+        .iter()
+        .map(|(id, post_type, file_slug, _)| ((post_type.as_str(), file_slug.as_str()), *id))
+        .collect();
+    for (child_id, post_type, _, parent_slug) in &created_ids {
+        let Some(parent_slug) = parent_slug else {
+            continue;
+        };
+        if let Some(parent_id) = by_file_slug.get(&(post_type.as_str(), parent_slug.as_str()))
+            && *parent_id != *child_id
+        {
+            content::set_post_parent(&mut db, *child_id, *parent_id).await?;
+        }
     }
 
     let body = html! {

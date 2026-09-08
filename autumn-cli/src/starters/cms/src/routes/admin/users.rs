@@ -7,10 +7,9 @@ use autumn_web::reexports::axum::response::Response;
 use serde::Deserialize;
 
 use crate::capabilities::{Capability, Role};
-use crate::models::{NewUser, UpdateUser};
+use crate::models::NewUser;
 use crate::repositories::UserRepository as _;
 use crate::require_capability;
-use autumn_web::hooks::Patch;
 
 use super::super::site::{Csrf, Repos};
 use super::{layout, role_options};
@@ -213,6 +212,7 @@ pub async fn update(
     repos: Repos,
     session: Session,
     csrf: Csrf,
+    mut db: autumn_web::Db,
     Path(id): Path<i64>,
     Form(form): Form<UpdateUserForm>,
 ) -> AutumnResult<Response> {
@@ -225,27 +225,24 @@ pub async fn update(
             "You cannot change your own role",
         ));
     }
-    guard_last_administrator(&repos, id, Role::parse(&form.role)).await?;
-
-    repos
-        .users
-        .update(
-            id,
-            // `Patch::Unchanged` on `password_hash` is what keeps this screen
-            // from being able to touch a credential at all: a role change and a
-            // password change are different operations, and conflating them is
-            // how an admin screen becomes an account-takeover primitive.
-            &UpdateUser {
-                email: Patch::Set(form.email.trim().to_lowercase()),
-                display_name: Patch::Set(form.display_name.trim().to_owned()),
-                role: Patch::Set(Role::parse(&form.role).slug().to_owned()),
-                bio: Patch::Set(form.bio.clone()),
-                website: Patch::Set(form.website.trim().to_owned()),
-                password_hash: Patch::Unchanged,
-                username: Patch::Unchanged,
-            },
-        )
-        .await?;
+    // The last-administrator check and the write share one transaction under an
+    // advisory lock — see `content::update_user`. Checking here and writing
+    // afterwards lets two administrators demote each other concurrently, each
+    // having seen the other still in post.
+    //
+    // Credentials are deliberately not reachable from this screen: a role
+    // change and a password change are different operations, and conflating
+    // them is how an admin screen becomes an account-takeover primitive.
+    crate::content::update_user(
+        &mut db,
+        id,
+        Role::parse(&form.role),
+        form.email.clone(),
+        form.display_name.trim().to_owned(),
+        form.bio.clone(),
+        form.website.trim().to_owned(),
+    )
+    .await?;
 
     Ok(Redirect::to("/admin/users").into_response())
 }
@@ -255,6 +252,7 @@ pub async fn delete(
     repos: Repos,
     session: Session,
     csrf: Csrf,
+    mut db: autumn_web::Db,
     Path(id): Path<i64>,
 ) -> AutumnResult<Response> {
     let actor = require_capability!(repos, session, csrf, Capability::EditUsers);
@@ -263,47 +261,19 @@ pub async fn delete(
             "You cannot delete your own account",
         ));
     }
-    guard_last_administrator(&repos, id, Role::Subscriber).await?;
-
     // `posts.author_id` is `ON DELETE CASCADE`, so deleting an account removes
     // its content too — the same choice WordPress offers as "delete all
     // content". WordPress also offers "attribute to another user"; that would
     // be a reassignment step here, and is deliberately left out rather than
     // implemented halfway.
-    repos.users.delete_by_id(id).await?;
-    Ok(Redirect::to("/admin/users").into_response())
-}
+    //
+    // The delete runs under the same administrator-set lock as a role change,
+    // and hands back the terms its cascaded posts were filed under: the cascade
+    // reaches `post_terms`, and nothing in it maintains `terms.post_count`, so
+    // without the rebuild every archive those posts appeared in keeps counting
+    // them forever.
+    let affected_terms = crate::content::delete_user(&mut db, id).await?;
+    crate::content::recount_terms(&mut db, &affected_terms).await?;
 
-/// Refuse a change that would leave the site with no administrator.
-///
-/// Without this, demoting or deleting the last administrator locks everyone out
-/// of Settings, Users and Appearance permanently — recoverable only with
-/// database access.
-async fn guard_last_administrator(
-    repos: &Repos,
-    target_id: i64,
-    new_role: Role,
-) -> AutumnResult<()> {
-    if new_role == Role::Administrator {
-        return Ok(());
-    }
-    let target = repos
-        .users
-        .find_by_id(target_id)
-        .await?
-        .ok_or_else(|| AutumnError::not_found_msg("No such user"))?;
-    if target.role() != Role::Administrator {
-        return Ok(());
-    }
-    let administrators = repos
-        .users
-        .find_by_role(Role::Administrator.slug().to_owned())
-        .await?
-        .len();
-    if administrators <= 1 {
-        return Err(AutumnError::unprocessable_msg(
-            "This is the only administrator account; promote another user first",
-        ));
-    }
-    Ok(())
+    Ok(Redirect::to("/admin/users").into_response())
 }

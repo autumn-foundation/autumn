@@ -18,6 +18,14 @@ use crate::repositories::{
 
 use super::site::Repos;
 
+/// Whether a post's registered type is reachable on the public front end.
+///
+/// `Post::is_public` answers for the row's status; this answers for its type.
+/// Both have to hold before anything about the row leaves this module.
+fn is_publicly_routable(post: &Post) -> bool {
+    content_types::find_post_type(&post.post_type).is_some_and(|registered| registered.public)
+}
+
 /// A post as the API returns it.
 ///
 /// A hand-written projection rather than the model itself: `Post` carries
@@ -83,9 +91,13 @@ pub async fn list_posts(
 ) -> AutumnResult<Json<Vec<PostView>>> {
     let settings = repos.settings().await?;
     let post_type = query.post_type.unwrap_or_else(|| "post".to_owned());
-    if content_types::find_post_type(&post_type).is_none() {
-        return Err(AutumnError::bad_request_msg(format!(
-            "Unknown post type `{post_type}`"
+    // `public: false` on a registered type means "no public route". Accepting
+    // it here would let a caller enumerate exactly the content the type
+    // declares should not be reachable — `Post::is_public` only answers for
+    // the row's *status*, which is a different question.
+    if !content_types::find_post_type(&post_type).is_some_and(|t| t.public) {
+        return Err(AutumnError::not_found_msg(format!(
+            "No public post type `{post_type}`"
         )));
     }
 
@@ -122,8 +134,10 @@ pub async fn get_post(repos: Repos, Path(id): Path<i64>) -> AutumnResult<Json<Po
         .find_by_id(id)
         .await?
         // Unpublished content is a 404 on the public API, not a 403: a 403
-        // would confirm that a draft exists at that id.
-        .filter(Post::is_public)
+        // would confirm that a draft exists at that id. A published row of a
+        // non-public *type* is equally out of bounds — status and type
+        // visibility are separate questions and both have to pass.
+        .filter(|post| post.is_public() && is_publicly_routable(post))
         .ok_or_else(|| AutumnError::not_found_msg("No such post"))?;
     let url = repos.permalink(&post, &settings).await?;
     Ok(Json(PostView::from(&post, url)))
@@ -175,10 +189,24 @@ pub async fn create_post(
     };
 
     let settings = repos.settings().await?;
+    let post_type = body.post_type.unwrap_or_else(|| "post".to_owned());
+    let registered = content_types::find_post_type(&post_type)
+        .ok_or_else(|| AutumnError::bad_request_msg(format!("Unknown post type `{post_type}`")))?;
+
+    // The site-wide default only applies to a type that has comments at all.
+    // A `page` registers `supports_comments: false`, and storing `open` on one
+    // would let a direct request add comments the editor never offered and the
+    // theme then renders.
+    let comment_status = if registered.supports_comments {
+        settings.default_comment_status.clone()
+    } else {
+        "closed".to_owned()
+    };
+
     let created = repos
         .posts
         .save(&NewPost {
-            post_type: body.post_type.unwrap_or_else(|| "post".to_owned()),
+            post_type: registered.slug.to_owned(),
             title: body.title,
             slug: body.slug,
             excerpt: body.excerpt,
@@ -188,7 +216,7 @@ pub async fn create_post(
             parent_id: None,
             featured_media_id: None,
             menu_order: 0,
-            comment_status: settings.default_comment_status.clone(),
+            comment_status,
             password: String::new(),
             sticky: false,
             published_at: None,
@@ -268,12 +296,20 @@ pub async fn list_comments(
 ) -> AutumnResult<Json<Vec<CommentView>>> {
     // Only for content the public can see — otherwise the comment endpoint
     // would leak the existence of, and the discussion on, an unpublished post.
-    repos
+    let post = repos
         .posts
         .find_by_id(id)
         .await?
-        .filter(Post::is_public)
+        .filter(|post| post.is_public() && is_publicly_routable(post))
         .ok_or_else(|| AutumnError::not_found_msg("No such post"))?;
+
+    // A password-protected post withholds its whole thread on the front end
+    // until the session unlocks it. Serving the same comments here without the
+    // password would make the protection decorative — the discussion is part
+    // of what the password gates.
+    if post.is_password_protected() {
+        return Err(AutumnError::not_found_msg("No such post"));
+    }
 
     let mut rows = repos.comments.find_by_post_id(id).await?;
     rows.retain(|c| c.status == "approved");

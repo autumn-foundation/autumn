@@ -261,19 +261,33 @@ done
 # migration still has to satisfy the shape, real-time and precision rules
 # above, because the scaffolded project inherits its version verbatim.
 is_starter_mirror_of() {
-  local a="$1" b="$2" a_name b_name
-  a_name="$(basename "$a")"
-  b_name="$(basename "$b")"
-  [[ "$a_name" == "$b_name" ]] || return 1
+  local a="$1" b="$2" starter example
+
   # Entries may or may not carry a `./` prefix depending on how the tree was
   # walked, so strip it before matching.
   a="${a#./}"
   b="${b#./}"
+
+  # Exactly one side must be a starter and the other its example.
   case "$a:$b" in
-    autumn-cli/src/starters/*:examples/*) return 0 ;;
-    examples/*:autumn-cli/src/starters/*) return 0 ;;
+    autumn-cli/src/starters/*:examples/*) starter="$a"; example="$b" ;;
+    examples/*:autumn-cli/src/starters/*) starter="$b"; example="$a" ;;
     *) return 1 ;;
   esac
+
+  # Same migration directory name...
+  [[ "$(basename "$starter")" == "$(basename "$example")" ]] || return 1
+
+  # ...and the same PROJECT. Without this, a collision between, say,
+  # `starters/foo/.../<version>_x` and `examples/bar/.../<version>_x` would be
+  # waved through even though those two really can coexist in one database and
+  # really are a collision. The pair is only "one migration in two copies" when
+  # the example is the starter's own rendered form.
+  local starter_project="${starter#autumn-cli/src/starters/}"
+  starter_project="${starter_project%%/*}"
+  local example_project="${example#examples/}"
+  example_project="${example_project%%/*}"
+  [[ "$starter_project" == "$example_project" ]]
 }
 
 collisions=()

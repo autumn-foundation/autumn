@@ -903,6 +903,264 @@ async fn a_password_protected_post_withholds_its_body_until_unlocked() {
     );
 }
 
+/// Password protection has to hold on every surface, not just the page body.
+///
+/// The derived excerpt was the leak: with a blank excerpt, `display_excerpt()`
+/// took the first 55 words straight from the body — and the blog index, the
+/// REST API and the syndication feeds all call it. The comment thread was the
+/// other one: the front end hides it until the session unlocks the post, but
+/// the API served it to anyone.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_protected_post_withholds_its_excerpt_and_comments_everywhere() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Sealed"),
+            ("slug", ""),
+            // Deliberately blank, which is what makes the excerpt derived.
+            ("excerpt", ""),
+            (
+                "body",
+                "THE-SECRET-SENTENCE should never appear in a listing.",
+            ),
+            ("status", "publish"),
+            ("password", "letmein"),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(resp.status, 303);
+    let post_id: i64 = resp
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .parse()
+        .expect("numeric id");
+
+    // A comment exists and is approved, so only the protection can hide it.
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "VISIBLE-ONLY-WHEN-UNLOCKED")]))
+        .send()
+        .await;
+
+    sign_out(&client);
+
+    for (label, path) in [
+        ("home", "/"),
+        ("atom feed", "/feed"),
+        ("rss feed", "/feed/rss"),
+        ("api list", "/api/v1/posts"),
+        ("single page", "/sealed"),
+    ] {
+        let body = client.get(path).send().await.text();
+        assert!(
+            !body.contains("THE-SECRET-SENTENCE"),
+            "{label} leaked the protected body: {path}"
+        );
+        assert!(
+            !body.contains("VISIBLE-ONLY-WHEN-UNLOCKED"),
+            "{label} leaked a protected post's comments: {path}"
+        );
+    }
+
+    // The comments endpoint refuses outright rather than returning an empty
+    // list, so it does not confirm the thread exists either.
+    assert_eq!(
+        client
+            .get(&format!("/api/v1/posts/{post_id}/comments"))
+            .send()
+            .await
+            .status,
+        404
+    );
+}
+
+/// A post and a page may both be slugged `about`; both mint `/about`, and only
+/// one can be served there. The loser is suffixed rather than left unreachable.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_post_and_a_page_cannot_take_the_same_bare_path() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    create_post(&client, &cookie, "About", "Post body.", "publish").await;
+    client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "About"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Page body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+
+    // The post keeps `/about`; the page is reachable at its de-duplicated slug.
+    client
+        .get("/about")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Post body.");
+    client
+        .get("/about-2")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Page body.");
+}
+
+/// Two editors on one post: the second save is refused rather than silently
+/// overwriting the first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_stale_editor_submission_is_refused() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Contested", "Original.", "publish").await;
+
+    // Both editors loaded the form at version 0.
+    let stale_version = "0";
+
+    let first = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Contested"),
+            ("slug", "contested"),
+            ("excerpt", ""),
+            ("body", "First editor's text."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+            ("lock_version", stale_version),
+        ]))
+        .send()
+        .await;
+    assert_eq!(first.status, 303, "the first save should succeed");
+
+    let second = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Contested"),
+            ("slug", "contested"),
+            ("excerpt", ""),
+            ("body", "Second editor's text."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+            ("lock_version", stale_version),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        second.status, 409,
+        "a save built on a stale version must be refused, not applied"
+    );
+
+    // The first editor's text survived.
+    sign_out(&client);
+    client
+        .get("/contested")
+        .send()
+        .await
+        .assert_body_contains("First editor's text.");
+}
+
+/// A backup restore must not publish content that was protected, nor flatten a
+/// page tree.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn export_preserves_password_protection_and_page_ancestry() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let parent = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Handbook"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Parent."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+        ]))
+        .send()
+        .await;
+    let parent_id = parent
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Chapter"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Child."),
+            ("status", "publish"),
+            ("password", "shh"),
+            ("tags", ""),
+            ("parent_id", parent_id.as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let payload = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+
+    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("export is valid JSON");
+    let chapter = parsed["posts"]
+        .as_array()
+        .expect("posts array")
+        .iter()
+        .find(|p| p["slug"] == serde_json::json!("chapter"))
+        .expect("the child page is exported");
+    assert_eq!(
+        chapter["password"],
+        serde_json::json!("shh"),
+        "the export must carry the password, or a restore publishes protected content"
+    );
+    assert_eq!(
+        chapter["parent"],
+        serde_json::json!("handbook"),
+        "the export must carry ancestry, or a restore flattens the page tree"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn changing_the_permalink_structure_does_not_break_existing_urls() {

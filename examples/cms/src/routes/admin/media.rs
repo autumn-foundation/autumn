@@ -214,12 +214,24 @@ pub async fn delete(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AutumnResult<Response> {
-    let _user = require_capability!(repos, session, csrf, Capability::UploadFiles);
+    let user = require_capability!(repos, session, csrf, Capability::UploadFiles);
     let attachment = repos
         .attachments
         .find_by_id(id)
         .await?
         .ok_or_else(|| AutumnError::not_found_msg("No such attachment"))?;
+
+    // `upload_files` is permission to *add* a file, not to remove anyone's.
+    // Without this an Author could delete a colleague's upload — the library
+    // lists every attachment — taking its blob with it and detaching it from
+    // every post using it as a featured image. Deleting someone else's upload
+    // needs the same capability as deleting their content.
+    let owns_it = attachment.uploader_id == Some(user.id);
+    if !owns_it && !user.role().can(Capability::DeleteOthersPosts) {
+        return Err(AutumnError::forbidden_msg(
+            "You can only delete files you uploaded",
+        ));
+    }
 
     // Remove the row first: posts referencing it as a featured image are
     // detached by `ON DELETE SET NULL`, so nothing is left pointing at bytes

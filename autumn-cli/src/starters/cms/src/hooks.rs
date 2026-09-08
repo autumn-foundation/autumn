@@ -22,6 +22,32 @@ use crate::models::{
     UpdateTerm, UpdateUser, User,
 };
 
+/// Normalize a submitted slug the one way every write path must.
+///
+/// An empty slug is derived from the title (the editor says so on the field);
+/// a supplied one is still slugified, so a hand-typed "My Post!" can never
+/// become a URL that needs escaping. A title of only punctuation slugifies to
+/// nothing, which would store `""` and render a permalink of `/` — so it falls
+/// back to a stable placeholder instead.
+///
+/// Public because the editor's update path writes through direct Diesel (to
+/// keep the edit and its revision in one transaction) and therefore never runs
+/// `PostHooks::before_update`. Both call this rather than each spelling the
+/// rule out.
+#[must_use]
+pub fn normalize_slug(slug: &str, title: &str) -> String {
+    let candidate = if slug.trim().is_empty() {
+        slugify(title)
+    } else {
+        slugify(slug)
+    };
+    if candidate.is_empty() {
+        "untitled".to_owned()
+    } else {
+        candidate
+    }
+}
+
 /// Statuses a post may be *created* in. `future`, `private` and `trash` are
 /// reachable only by transitioning from one of these, so the state machine sees
 /// every move into them.
@@ -29,6 +55,38 @@ const CREATABLE_STATUSES: &[&str] = &["draft", "pending", "publish"];
 
 /// Comment moderation states.
 pub const COMMENT_STATUSES: &[&str] = &["approved", "pending", "spam", "trash"];
+
+/// Normalize and validate a comment draft.
+///
+/// Public because [`crate::content::create_comment`] inserts through direct
+/// Diesel — it has to, so the row and the post's approved-comment counter move
+/// in one transaction — and therefore never runs `CommentHooks::before_create`.
+/// These are the *only* server-side checks on a comment body; the form's
+/// `required` attributes are a browser convenience a crafted request ignores,
+/// and a signed-in commenter's empty body would otherwise be inserted
+/// pre-approved and increment the counter.
+pub fn validate_comment(new: &mut NewComment) -> AutumnResult<()> {
+    new.body = new.body.trim().to_owned();
+    if new.body.is_empty() {
+        return Err(AutumnError::unprocessable_msg("Comment cannot be empty"));
+    }
+    if new.status.trim().is_empty() {
+        new.status = "pending".to_owned();
+    }
+    if !COMMENT_STATUSES.contains(&new.status.as_str()) {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Unknown comment status `{}`",
+            new.status
+        )));
+    }
+    // A comment with neither an account nor a name is unattributable. Guest
+    // comments are legitimate — anonymous ones are not.
+    new.author_name = new.author_name.trim().to_owned();
+    if new.author_id.is_none() && new.author_name.is_empty() {
+        return Err(AutumnError::unprocessable_msg("Name is required"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Default)]
 pub struct PostHooks;
@@ -53,19 +111,7 @@ impl MutationHooks for PostHooks {
             )));
         }
 
-        // An empty slug is derived from the title, as WordPress does. A
-        // supplied one is still normalised, so a hand-typed "My Post!" can
-        // never become a URL that needs escaping.
-        new.slug = if new.slug.trim().is_empty() {
-            slugify(&new.title)
-        } else {
-            slugify(&new.slug)
-        };
-        if new.slug.is_empty() {
-            // A title of only punctuation slugifies to nothing. Fall back to a
-            // stable placeholder rather than writing an unaddressable row.
-            new.slug = "untitled".to_owned();
-        }
+        new.slug = normalize_slug(&new.slug, &new.title);
 
         if new.status.trim().is_empty() {
             new.status = "draft".to_owned();
@@ -108,13 +154,8 @@ impl MutationHooks for PostHooks {
         draft: &mut UpdateDraft<Post>,
     ) -> AutumnResult<()> {
         // Normalise a slug the caller changed; regenerate one they cleared.
-        if draft.after.slug.trim().is_empty() {
-            draft.after.slug = slugify(&draft.after.title);
-            if draft.after.slug.is_empty() {
-                draft.after.slug = "untitled".to_owned();
-            }
-        } else if draft.after.slug != draft.before.slug {
-            draft.after.slug = slugify(&draft.after.slug);
+        if draft.after.slug.trim().is_empty() || draft.after.slug != draft.before.slug {
+            draft.after.slug = normalize_slug(&draft.after.slug, &draft.after.title);
         }
 
         // Enforce the state machine on EVERY update path, not just the
@@ -244,25 +285,7 @@ impl MutationHooks for CommentHooks {
         _ctx: &mut MutationContext,
         new: &mut NewComment,
     ) -> AutumnResult<()> {
-        new.body = new.body.trim().to_owned();
-        if new.body.is_empty() {
-            return Err(AutumnError::unprocessable_msg("Comment cannot be empty"));
-        }
-        if new.status.trim().is_empty() {
-            new.status = "pending".to_owned();
-        }
-        if !COMMENT_STATUSES.contains(&new.status.as_str()) {
-            return Err(AutumnError::bad_request_msg(format!(
-                "Unknown comment status `{}`",
-                new.status
-            )));
-        }
-        // A comment with neither an account nor a name is unattributable. Guest
-        // comments are legitimate — anonymous ones are not.
-        if new.author_id.is_none() && new.author_name.trim().is_empty() {
-            return Err(AutumnError::unprocessable_msg("Name is required"));
-        }
-        Ok(())
+        validate_comment(new)
     }
 
     async fn before_update(
@@ -278,6 +301,27 @@ impl MutationHooks for CommentHooks {
         }
         Ok(())
     }
+}
+
+/// Normalize and validate a new account.
+///
+/// Public for the same reason [`validate_comment`] is: account creation runs
+/// inside a transaction that also elects the first administrator (see
+/// [`crate::content::register_user`]), so it inserts through direct Diesel and
+/// never reaches `UserHooks::before_create`.
+pub fn normalize_new_user(new: &mut NewUser) -> AutumnResult<()> {
+    new.username = new.username.trim().to_lowercase();
+    new.email = new.email.trim().to_lowercase();
+    if new.username.is_empty() {
+        return Err(AutumnError::unprocessable_msg("Username is required"));
+    }
+    // An unrecognised role degrades to the least-privileged one rather than
+    // being stored verbatim, so `users.role` can only ever hold a value
+    // `Role::parse` round-trips.
+    new.role = crate::capabilities::Role::parse(&new.role)
+        .slug()
+        .to_owned();
+    Ok(())
 }
 
 /// Keeps `users.updated_at` honest.

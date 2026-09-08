@@ -36,11 +36,17 @@ pub const REVISION_LIMIT: i64 = 25;
 /// The revision snapshots the row **as it was before** the edit, which is what
 /// makes "restore this revision" mean something: the newest revision is the
 /// state you would return to by undoing the current content.
+/// `expected_lock_version` is the version the editor's form was rendered from.
+/// When it does not match the row read under the lock, someone else saved in
+/// between and this submission is built on content that no longer exists — the
+/// write is refused with `409 Conflict` rather than overwriting their work.
+/// `None` skips the check, for callers with no form behind them.
 pub async fn update_post_with_revision(
     db: &mut Db,
     post_id: i64,
     editor_id: i64,
     summary: &str,
+    expected_lock_version: Option<i32>,
     apply: impl for<'a> FnOnce(&'a mut Post) + Send + 'static,
 ) -> AutumnResult<Post> {
     let summary = summary.to_owned();
@@ -56,6 +62,19 @@ pub async fn update_post_with_revision(
                 .first(conn)
                 .await
                 .map_err(AutumnError::not_found)?;
+
+            // Stale-edit detection. The row lock above serializes concurrent
+            // saves but does not make the second one *correct*: without this,
+            // the later request applies its whole stale form snapshot over the
+            // row the first editor just wrote, silently losing their changes.
+            if let Some(expected) = expected_lock_version
+                && expected != post.lock_version
+            {
+                return Err(AutumnError::conflict_msg(
+                    "Somebody else saved this content while you were editing. \
+                     Reload the page to see their changes before saving again.",
+                ));
+            }
 
             post.record_revision(conn, &summary).await?;
 
@@ -291,6 +310,18 @@ pub async fn set_post_terms(db: &mut Db, post_id: i64, term_ids: Vec<i64>) -> Au
         .scope_boxed()
     })
     .await
+}
+
+/// Rebuild the counts of every term a post is filed under.
+///
+/// Public because the scheduled publish sweep changes `status` with its own
+/// guarded `UPDATE` (so two replicas cannot both claim a post) rather than
+/// through `transition_status`, and therefore has to recount explicitly.
+pub async fn recount_terms_for_post_public(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<()> {
+    recount_terms_for_post(conn, post_id).await
 }
 
 /// Rebuild one term's published-post count from ground truth.
@@ -573,4 +604,445 @@ pub async fn revisions_for(db: &mut Db, post_id: i64) -> AutumnResult<Vec<Revisi
         .select(Revision::as_select())
         .load(&mut **db)
         .await?)
+}
+
+/// The terms every post by `author_id` is filed under.
+///
+/// Collected *before* the author is deleted: `posts.author_id` cascades, which
+/// takes the `post_terms` rows with it, so afterwards there is nothing left to
+/// tell you which terms need rebuilding.
+pub async fn term_ids_for_author(db: &mut Db, author_id: i64) -> AutumnResult<Vec<i64>> {
+    let mut ids: Vec<i64> = post_terms::table
+        .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
+        .filter(posts::author_id.eq(author_id))
+        .select(post_terms::term_id)
+        .load(&mut **db)
+        .await?;
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Rebuild the published-post counts of the given terms.
+pub async fn recount_terms(db: &mut Db, term_ids: &[i64]) -> AutumnResult<()> {
+    for term_id in term_ids {
+        recount_term(db, *term_id).await?;
+    }
+    Ok(())
+}
+
+/// Whether making `candidate_parent_id` the parent of `post_id` would create a
+/// cycle — i.e. the candidate is the post itself or one of its descendants.
+///
+/// Walks up from the candidate rather than down from the post: the ancestor
+/// chain is bounded by the tree's depth, while the descendant set is not. A
+/// cycle already present in the data (only reachable by a direct write)
+/// terminates the walk at the depth bound rather than spinning.
+pub async fn would_create_cycle(
+    db: &mut Db,
+    post_id: i64,
+    candidate_parent_id: i64,
+) -> AutumnResult<bool> {
+    const MAX_DEPTH: usize = 64;
+    if candidate_parent_id == post_id {
+        return Ok(true);
+    }
+    let mut cursor = Some(candidate_parent_id);
+    let mut steps = 0usize;
+    while let Some(current) = cursor {
+        if current == post_id {
+            return Ok(true);
+        }
+        steps += 1;
+        if steps > MAX_DEPTH {
+            // A pre-existing cycle among other rows. Refusing is the safe
+            // answer: it cannot make the tree worse.
+            return Ok(true);
+        }
+        cursor = posts::table
+            .find(current)
+            .select(posts::parent_id)
+            .first::<Option<i64>>(&mut **db)
+            .await
+            .optional()?
+            .flatten();
+    }
+    Ok(false)
+}
+
+// ── Accounts ────────────────────────────────────────────────────────────────
+
+/// Advisory-lock key serializing every change to the site's administrator set.
+///
+/// Two questions in this app are read-then-write over the *whole* users table
+/// rather than over one row, so no row lock can serialize them: "is this the
+/// first account?" (which grants ownership) and "is this the last
+/// administrator?" (which refuses removal). Concurrent requests would each
+/// read a snapshot taken before the other wrote — electing two owners, or
+/// removing both remaining administrators and locking everyone out.
+///
+/// A transaction-scoped advisory lock is the right shape: it is released on
+/// commit or rollback, needs no row to exist, and costs one statement. The key
+/// is arbitrary but must be stable and unique within the database.
+const ADMIN_SET_LOCK_KEY: i64 = 7_717_260_231_001;
+
+/// Create an account, electing the first one created as the site owner —
+/// atomically.
+///
+/// The election and the insert share one transaction under
+/// [`ADMIN_SET_LOCK_KEY`]. Without it, two signups can both observe an empty
+/// table and both be persisted as administrators: the window is not
+/// theoretical, because password hashing (bcrypt, deliberately slow) happens
+/// between the check and the insert.
+pub async fn register_user(db: &mut Db, new: crate::models::NewUser) -> AutumnResult<User> {
+    let mut new = new;
+    crate::hooks::normalize_new_user(&mut new)?;
+    db.tx(move |conn| {
+        async move {
+            diesel::sql_query(format!(
+                "SELECT pg_advisory_xact_lock({ADMIN_SET_LOCK_KEY})"
+            ))
+            .execute(conn)
+            .await?;
+
+            let existing: i64 = users::table.count().get_result(conn).await?;
+            if existing == 0 {
+                new.role = crate::capabilities::Role::Administrator.slug().to_owned();
+            }
+
+            let created: User = diesel::insert_into(users::table)
+                .values(&new)
+                .returning(User::as_returning())
+                .get_result(conn)
+                .await?;
+            Ok::<_, AutumnError>(created)
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Refuse a change that would leave the site with no administrator, and apply
+/// it — atomically.
+///
+/// `mutate` runs inside the same transaction as the count, under
+/// [`ADMIN_SET_LOCK_KEY`], so two requests demoting each other cannot both see
+/// a spare administrator and both proceed.
+async fn with_administrator_guard<F>(
+    db: &mut Db,
+    target_id: i64,
+    new_role: crate::capabilities::Role,
+    mutate: F,
+) -> AutumnResult<()>
+where
+    F: for<'a> FnOnce(
+            &'a mut AsyncPgConnection,
+        ) -> scoped_futures::ScopedBoxFuture<'a, 'a, AutumnResult<()>>
+        + Send
+        + 'static,
+{
+    db.tx(move |conn| {
+        async move {
+            diesel::sql_query(format!(
+                "SELECT pg_advisory_xact_lock({ADMIN_SET_LOCK_KEY})"
+            ))
+            .execute(conn)
+            .await?;
+
+            let target: User = users::table
+                .find(target_id)
+                .select(User::as_select())
+                .first(conn)
+                .await
+                .map_err(AutumnError::not_found)?;
+
+            let administrator = crate::capabilities::Role::Administrator;
+            let losing_an_administrator =
+                target.role() == administrator && new_role != administrator;
+            if losing_an_administrator {
+                let remaining: i64 = users::table
+                    .filter(users::role.eq(administrator.slug()))
+                    .count()
+                    .get_result(conn)
+                    .await?;
+                if remaining <= 1 {
+                    return Err(AutumnError::unprocessable_msg(
+                        "This is the only administrator account; promote another user first",
+                    ));
+                }
+            }
+
+            mutate(conn).await?;
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Change an account's role and profile fields, guarding the last
+/// administrator.
+pub async fn update_user(
+    db: &mut Db,
+    target_id: i64,
+    role: crate::capabilities::Role,
+    email: String,
+    display_name: String,
+    bio: String,
+    website: String,
+) -> AutumnResult<()> {
+    with_administrator_guard(db, target_id, role, move |conn| {
+        async move {
+            diesel::update(users::table.find(target_id))
+                .set((
+                    users::role.eq(role.slug()),
+                    users::email.eq(email.trim().to_lowercase()),
+                    users::display_name.eq(display_name),
+                    users::bio.eq(bio),
+                    users::website.eq(website),
+                    users::updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)
+                .await?;
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Delete an account, guarding the last administrator.
+///
+/// Returns the terms its cascaded posts were filed under, so the caller can
+/// rebuild their counts — the cascade reaches `post_terms` and nothing in it
+/// maintains `terms.post_count`.
+pub async fn delete_user(db: &mut Db, target_id: i64) -> AutumnResult<Vec<i64>> {
+    let affected_terms = term_ids_for_author(db, target_id).await?;
+    // Deleting is a demotion to "no role at all", so it takes the same guard.
+    with_administrator_guard(
+        db,
+        target_id,
+        crate::capabilities::Role::Subscriber,
+        move |conn| {
+            async move {
+                diesel::delete(users::table.find(target_id))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            }
+            .scope_boxed()
+        },
+    )
+    .await?;
+    Ok(affected_terms)
+}
+
+// ── Set-based listing queries ───────────────────────────────────────────────
+//
+// Every public listing goes through these. They exist because the obvious
+// repository shape — load the rows, sort in Rust, `skip`/`take` — makes each
+// request cost the size of the whole corpus rather than the size of the page
+// being rendered, and the sidebar's Recent Posts widget runs on essentially
+// every public page. Ordering, filtering, counting and pagination all belong
+// in SQL; the repository codegen has no finder that can express them together,
+// so these are hand-written against a pooled connection.
+
+/// One page of published content of a type, newest first, with the total.
+///
+/// Sticky posts sort first, then by publish date — WordPress's blog-index
+/// ordering — and the whole ordering is done by the database so `LIMIT`/
+/// `OFFSET` mean what they say.
+pub async fn published_posts_page(
+    conn: &mut AsyncPgConnection,
+    post_type: &str,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<(Vec<Post>, i64)> {
+    let total: i64 = posts::table
+        .filter(posts::post_type.eq(post_type))
+        .filter(posts::status.eq("publish"))
+        .count()
+        .get_result(conn)
+        .await?;
+
+    let rows: Vec<Post> = posts::table
+        .filter(posts::post_type.eq(post_type))
+        .filter(posts::status.eq("publish"))
+        .order((
+            posts::sticky.desc(),
+            posts::published_at.desc(),
+            posts::id.desc(),
+        ))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+
+    Ok((rows, total))
+}
+
+/// The newest published posts of a type — the sidebar's Recent Posts.
+pub async fn recent_published_posts(
+    conn: &mut AsyncPgConnection,
+    post_type: &str,
+    limit: i64,
+) -> AutumnResult<Vec<Post>> {
+    Ok(posts::table
+        .filter(posts::post_type.eq(post_type))
+        .filter(posts::status.eq("publish"))
+        .order((posts::published_at.desc(), posts::id.desc()))
+        .limit(limit.max(0))
+        .select(Post::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// One page of the published posts filed under a term, with the total.
+///
+/// A single join with `LIMIT`/`OFFSET`, plus a count. The previous shape —
+/// read every filing, fetch each post by id, then paginate in memory — made a
+/// popular category URL an unauthenticated way to issue thousands of queries
+/// per request.
+pub async fn published_posts_in_term(
+    conn: &mut AsyncPgConnection,
+    term_id: i64,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<(Vec<Post>, i64)> {
+    let total: i64 = post_terms::table
+        .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
+        .filter(post_terms::term_id.eq(term_id))
+        .filter(posts::status.eq("publish"))
+        .count()
+        .get_result(conn)
+        .await?;
+
+    let rows: Vec<Post> = post_terms::table
+        .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
+        .filter(post_terms::term_id.eq(term_id))
+        .filter(posts::status.eq("publish"))
+        .order((posts::published_at.desc(), posts::id.desc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+
+    Ok((rows, total))
+}
+
+/// One page of a date archive.
+pub async fn published_posts_in_period(
+    conn: &mut AsyncPgConnection,
+    post_type: &str,
+    from: chrono::NaiveDateTime,
+    until: chrono::NaiveDateTime,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<(Vec<Post>, i64)> {
+    let total: i64 = posts::table
+        .filter(posts::post_type.eq(post_type))
+        .filter(posts::status.eq("publish"))
+        .filter(posts::published_at.ge(from))
+        .filter(posts::published_at.lt(until))
+        .count()
+        .get_result(conn)
+        .await?;
+
+    let rows: Vec<Post> = posts::table
+        .filter(posts::post_type.eq(post_type))
+        .filter(posts::status.eq("publish"))
+        .filter(posts::published_at.ge(from))
+        .filter(posts::published_at.lt(until))
+        .order((posts::published_at.desc(), posts::id.desc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+
+    Ok((rows, total))
+}
+
+/// One page of an author's published posts.
+pub async fn published_posts_by_author(
+    conn: &mut AsyncPgConnection,
+    author_id: i64,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<(Vec<Post>, i64)> {
+    let total: i64 = posts::table
+        .filter(posts::author_id.eq(author_id))
+        .filter(posts::status.eq("publish"))
+        .count()
+        .get_result(conn)
+        .await?;
+
+    let rows: Vec<Post> = posts::table
+        .filter(posts::author_id.eq(author_id))
+        .filter(posts::status.eq("publish"))
+        .order((posts::published_at.desc(), posts::id.desc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+
+    Ok((rows, total))
+}
+
+/// A slug that is free across every post type sharing the bare URL path.
+///
+/// `posts` is unique on `(post_type, slug)`, so a post and a page may both be
+/// slugged `about` — but both mint `/about`, and the front controller can only
+/// serve one of them, leaving the other unreachable at its own canonical URL.
+/// WordPress solves this by making the slug unique across the types that share
+/// the root, appending `-2`, `-3`, … ; this does the same.
+///
+/// Only `post` and `page` compete: a custom type is addressed under its own
+/// prefix (`/product/widget`), so it cannot collide with them.
+pub async fn ensure_unique_slug(
+    conn: &mut AsyncPgConnection,
+    post_type: &str,
+    desired: &str,
+    exclude_id: Option<i64>,
+) -> AutumnResult<String> {
+    const BARE_PATH_TYPES: &[&str] = &["post", "page"];
+    if !BARE_PATH_TYPES.contains(&post_type) {
+        return Ok(desired.to_owned());
+    }
+
+    let mut candidate = desired.to_owned();
+    for suffix in 2..=200u32 {
+        let mut query = posts::table
+            .filter(posts::slug.eq(candidate.clone()))
+            .filter(posts::post_type.eq_any(BARE_PATH_TYPES))
+            .into_boxed();
+        if let Some(id) = exclude_id {
+            query = query.filter(posts::id.ne(id));
+        }
+        let taken: i64 = query.count().get_result(conn).await?;
+        if taken == 0 {
+            return Ok(candidate);
+        }
+        candidate = format!("{desired}-{suffix}");
+    }
+    // 200 collisions on one slug is not a naming accident. Refuse rather than
+    // loop or silently overwrite.
+    Err(AutumnError::unprocessable_msg(
+        "Too many posts share this slug; choose a different one",
+    ))
+}
+
+/// Re-parent a post. Used by the importer's ancestry pass.
+pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> AutumnResult<()> {
+    if would_create_cycle(db, post_id, parent_id).await? {
+        return Ok(());
+    }
+    diesel::update(posts::table.find(post_id))
+        .set(posts::parent_id.eq(parent_id))
+        .execute(&mut **db)
+        .await?;
+    Ok(())
 }

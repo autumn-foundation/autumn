@@ -222,6 +222,7 @@ pub async fn register(
     // fresh one or the corrected resubmit would be rejected as a replay.
     submit_token: Submit,
     State(state): State<AppState>,
+    mut db: autumn_web::Db,
     Form(form): Form<RegisterForm>,
 ) -> AutumnResult<Response> {
     let password_cfg = state.config_arc().auth.password.clone();
@@ -295,29 +296,30 @@ pub async fn register(
         return Ok(page.into_response());
     }
 
+    let password_hash = hash_password(&form.password).await?;
+
     // The first account to exist owns the site. WordPress asks for this during
     // its five-minute install; doing it on first registration means a freshly
     // migrated database is usable with no seed step and no default credentials
     // committed anywhere.
-    let role = if repos.users.count().await? == 0 {
-        Role::Administrator
-    } else {
-        Role::Subscriber
-    };
-
-    let password_hash = hash_password(&form.password).await?;
-    let created = repos
-        .users
-        .save(&NewUser {
+    //
+    // The election happens inside `register_user`'s transaction rather than
+    // here: a `count() == 0` read followed by an insert lets two concurrent
+    // signups both see an empty table and both become administrators, and the
+    // bcrypt hash above sits right inside that window.
+    let created = crate::content::register_user(
+        &mut db,
+        NewUser {
             username: username.clone(),
             email,
             password_hash,
             display_name: form.username.trim().to_owned(),
-            role: role.slug().to_owned(),
+            role: Role::Subscriber.slug().to_owned(),
             bio: String::new(),
             website: String::new(),
-        })
-        .await;
+        },
+    )
+    .await;
 
     let user = match created {
         Ok(user) => user,
@@ -348,10 +350,12 @@ pub async fn register(
 
     session.rotate_id().await;
     session.insert("user_id", user.id.to_string()).await;
-    Ok(Redirect::to(if role.can_access_admin() {
+    // The role was decided inside `register_user`'s transaction, so read it
+    // back off the row rather than from anything submitted.
+    let destination = if user.role().can_access_admin() {
         "/admin"
     } else {
         "/"
-    })
-    .into_response())
+    };
+    Ok(Redirect::to(destination).into_response())
 }

@@ -74,6 +74,10 @@ pub struct PostForm {
     /// When scheduling: the local datetime the post goes live.
     #[serde(default)]
     pub publish_at: Option<String>,
+    /// The `lock_version` the form was rendered from, for stale-edit
+    /// detection. Absent on the create form, which has no row yet.
+    #[serde(default)]
+    pub lock_version: Option<String>,
 }
 
 /// Parse an optional numeric form field. An empty string means "not set",
@@ -82,6 +86,33 @@ fn optional_id(raw: Option<&String>) -> Option<i64> {
     raw.map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .and_then(|v| v.parse::<i64>().ok())
+}
+
+/// Every descendant of `root` within `all`, by id.
+///
+/// A breadth-first walk over the in-memory set the selector already loaded, so
+/// it costs no extra queries. Bounded by the set size, so a pre-existing cycle
+/// cannot spin.
+fn descendant_ids(all: &[Post], root: i64) -> std::collections::HashSet<i64> {
+    let mut found = std::collections::HashSet::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for post in all {
+            if post.parent_id == Some(parent) && found.insert(post.id) {
+                frontier.push(post.id);
+            }
+        }
+    }
+    found
+}
+
+/// The publish date the editor's `datetime-local` field carries, if any.
+fn scheduled_at(form: &PostForm) -> Option<chrono::NaiveDateTime> {
+    form.publish_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M").ok())
 }
 
 fn resolve_type(slug: &str) -> AutumnResult<PostType> {
@@ -344,16 +375,29 @@ impl EditorContext {
             None => (Vec::new(), String::new()),
         };
 
-        // A hierarchical type offers a parent selector, excluding the post
-        // itself — a page cannot be its own parent.
+        // A hierarchical type offers a parent selector. It excludes the post
+        // itself *and* every descendant of it: picking a descendant closes a
+        // cycle, and because page resolution walks down from a row whose
+        // parent is NULL, every page in that cycle becomes unreachable at its
+        // own permalink. The write path refuses it too (see `update`); this
+        // just keeps the impossible option off the screen.
         let parents = if registered.hierarchical {
-            repos
+            let all: Vec<Post> = repos
                 .posts
                 .find_by_post_type(registered.slug.to_owned())
                 .await?
                 .into_iter()
-                .filter(|p| post.is_none_or(|current| p.id != current.id) && p.status != "trash")
-                .collect()
+                .filter(|p| p.status != "trash")
+                .collect();
+            match post {
+                Some(current) => {
+                    let descendants = descendant_ids(&all, current.id);
+                    all.into_iter()
+                        .filter(|p| p.id != current.id && !descendants.contains(&p.id))
+                        .collect()
+                }
+                None => all,
+            }
         } else {
             Vec::new()
         };
@@ -391,6 +435,12 @@ fn editor(
     html! {
         form action=(action) method="post" class="grid grid-cols-1 lg:grid-cols-3 gap-6" {
             (csrf.input())
+            @if let Some(post) = post {
+                // Stale-edit detection: the server compares this against the
+                // row it locks, so a save built on content someone else has
+                // since changed is refused rather than silently overwriting.
+                input type="hidden" name="lock_version" value=(post.lock_version);
+            }
             div class="lg:col-span-2 space-y-4" {
                 div class="bg-white rounded-lg shadow p-5 space-y-4" {
                     div {
@@ -626,12 +676,33 @@ pub async fn create(
     // says — the dropdown hides the other options, and this is what enforces it.
     let status = requested_status(&form, &user);
 
+    // A scheduled post needs the date the author picked. Without it the row
+    // would carry `published_at = NULL`, and the publish sweep — which selects
+    // `status = 'future' AND published_at <= now()` — would never see it
+    // again: the post would sit in `future` forever.
+    let scheduled_for = scheduled_at(&form);
+    if status == "future" && scheduled_for.is_none() {
+        return Err(AutumnError::unprocessable_msg(
+            "Pick a publish date for a scheduled post",
+        ));
+    }
+
+    // A post and a page may both be slugged `about` — the unique index is on
+    // `(post_type, slug)` — but both mint `/about`, and only one can be served
+    // there. Suffix the loser, as WordPress does, so neither is unreachable at
+    // its own canonical URL.
+    let slug = {
+        let mut conn = repos.conn().await?;
+        let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
+        content::ensure_unique_slug(&mut conn, registered.slug, &desired, None).await?
+    };
+
     let created = repos
         .posts
         .save(&NewPost {
             post_type: registered.slug.to_owned(),
             title: form.title.trim().to_owned(),
-            slug: form.slug.trim().to_owned(),
+            slug,
             excerpt: form.excerpt.trim().to_owned(),
             body: form.body.clone(),
             status: if status == "future" || status == "private" {
@@ -653,7 +724,7 @@ pub async fn create(
                 .to_owned(),
             password: form.password.trim().to_owned(),
             sticky: form.sticky.is_some(),
-            published_at: None,
+            published_at: scheduled_for,
         })
         .await?;
 
@@ -699,15 +770,47 @@ pub async fn update(
     }
 
     let status = requested_status(&form, &user);
-    let scheduled_for = form
-        .publish_at
-        .as_deref()
-        .filter(|v| !v.trim().is_empty())
-        .and_then(|v| chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%dT%H:%M").ok());
+    let scheduled_for = scheduled_at(&form);
+    if status == "future" && scheduled_for.is_none() && existing.published_at.is_none() {
+        return Err(AutumnError::unprocessable_msg(
+            "Pick a publish date for a scheduled post",
+        ));
+    }
+
+    // Validate the status change BEFORE anything is written. The content edit
+    // and the term assignment each commit in their own transaction, so a
+    // transition rejected afterwards would leave the title, body, publish date
+    // and taxonomy already persisted while the response reported a failure.
+    // The state machine's validator is pure, so it can run up front: build the
+    // proposed row (new content, OLD status) so the `can_publish` guard
+    // evaluates what is about to be saved rather than what is there now.
+    if status != existing.status {
+        let mut proposed = existing.clone();
+        proposed.title = form.title.trim().to_owned();
+        proposed.status.clone_from(&existing.status);
+        proposed.transition_status_to(&status)?;
+    }
+
+    // A page cannot be parented to itself or to one of its own descendants:
+    // that closes a cycle, and page resolution walks down from a NULL parent,
+    // so every page in the cycle becomes unreachable at its own permalink.
+    if let Some(parent_id) = optional_id(form.parent_id.as_ref())
+        && content::would_create_cycle(&mut db, id, parent_id).await?
+    {
+        return Err(AutumnError::unprocessable_msg(
+            "A page cannot be placed under itself or one of its own children",
+        ));
+    }
+
+    let slug = {
+        let mut conn = repos.conn().await?;
+        let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
+        content::ensure_unique_slug(&mut conn, &post_type, &desired, Some(id)).await?
+    };
 
     let form_snapshot = (
         form.title.trim().to_owned(),
-        form.slug.trim().to_owned(),
+        slug,
         form.excerpt.trim().to_owned(),
         form.body.clone(),
         form.password.trim().to_owned(),
@@ -718,25 +821,53 @@ pub async fn update(
         optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
     );
 
+    // The `lock_version` the editor's form was rendered from. The server
+    // compares it against the row it locks, so a save built on content
+    // somebody else has since changed is refused rather than overwriting it.
+    let expected_lock_version = form
+        .lock_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<i32>().ok());
+
     // The content edit and its revision commit together.
-    let updated = content::update_post_with_revision(&mut db, id, user.id, "Edited", move |post| {
-        let (title, slug, excerpt, body, password, sticky, comments_open, parent, media, order) =
-            form_snapshot;
-        post.title = title;
-        post.slug = slug;
-        post.excerpt = excerpt;
-        post.body = body;
-        post.password = password;
-        post.sticky = sticky;
-        post.comment_status = if comments_open { "open" } else { "closed" }.to_owned();
-        post.parent_id = parent;
-        post.featured_media_id = media;
-        post.menu_order = order;
-        if let Some(when) = scheduled_for {
-            post.published_at = Some(when);
-        }
-    })
-    .await?;
+    let updated =
+        content::update_post_with_revision(
+            &mut db,
+            id,
+            user.id,
+            "Edited",
+            expected_lock_version,
+            move |post| {
+                let (
+                    title,
+                    slug,
+                    excerpt,
+                    body,
+                    password,
+                    sticky,
+                    comments_open,
+                    parent,
+                    media,
+                    order,
+                ) = form_snapshot;
+                post.title = title;
+                post.slug = slug;
+                post.excerpt = excerpt;
+                post.body = body;
+                post.password = password;
+                post.sticky = sticky;
+                post.comment_status = if comments_open { "open" } else { "closed" }.to_owned();
+                post.parent_id = parent;
+                post.featured_media_id = media;
+                post.menu_order = order;
+                if let Some(when) = scheduled_for {
+                    post.published_at = Some(when);
+                }
+            },
+        )
+        .await?;
 
     apply_terms(&repos, &mut db, &updated, &form).await?;
 

@@ -40,6 +40,14 @@ pub struct Repos {
     pub menu_items: PgMenuItemRepository,
     pub widgets: PgWidgetRepository,
     pub post_term_links: PgPostTermLinkRepository,
+    /// The pool the repositories were built from.
+    ///
+    /// Held so the listing screens can run a real set-based query — ordering,
+    /// filtering, counting and pagination in SQL — which the repository
+    /// codegen has no finder for. A connection is acquired for the duration of
+    /// that one query and returned, so this does not pin one for the request
+    /// the way a `Db` extractor would.
+    pool: Option<autumn_web::db::Pool<autumn_web::reexports::diesel_async::AsyncPgConnection>>,
 }
 
 impl FromRequestParts<AppState> for Repos {
@@ -61,11 +69,28 @@ impl FromRequestParts<AppState> for Repos {
             menu_items: PgMenuItemRepository::from_request_parts(parts, state).await?,
             widgets: PgWidgetRepository::from_request_parts(parts, state).await?,
             post_term_links: PgPostTermLinkRepository::from_request_parts(parts, state).await?,
+            pool: state.pool().cloned(),
         })
     }
 }
 
 impl Repos {
+    /// Borrow a pooled connection for one query.
+    pub async fn conn(
+        &self,
+    ) -> AutumnResult<
+        autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+            autumn_web::reexports::diesel_async::AsyncPgConnection,
+        >,
+    > {
+        self.pool
+            .as_ref()
+            .ok_or_else(|| AutumnError::service_unavailable_msg("No database pool configured"))?
+            .get()
+            .await
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
+    }
+
     /// The resolved site settings (memoized for 60 seconds).
     pub async fn settings(&self) -> AutumnResult<Settings> {
         cached_settings(SITE_SCOPE, &self.options).await
@@ -242,19 +267,27 @@ impl Repos {
     /// all excluded, so this is the one query every public listing is built
     /// from and no screen has to remember the filter.
     pub async fn published_posts(&self, post_type: &str, limit: i64) -> AutumnResult<Vec<Post>> {
-        let mut posts: Vec<Post> = self
-            .posts
-            .find_by_post_type_and_status(post_type.to_owned(), "publish".to_owned())
-            .await?;
-        // Sticky posts first, then newest — WordPress's blog-index ordering.
-        posts.sort_by(|a, b| {
-            b.sticky
-                .cmp(&a.sticky)
-                .then(b.published_at.cmp(&a.published_at))
-                .then(b.id.cmp(&a.id))
-        });
-        posts.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
-        Ok(posts)
+        let mut conn = self.conn().await?;
+        crate::content::recent_published_posts(&mut conn, post_type, limit).await
+    }
+
+    /// One page of published content of a type, plus the total, ordered and
+    /// paginated by the database.
+    pub async fn published_posts_page(
+        &self,
+        post_type: &str,
+        offset: usize,
+        limit: usize,
+    ) -> AutumnResult<(Vec<Post>, usize)> {
+        let mut conn = self.conn().await?;
+        let (rows, total) = crate::content::published_posts_page(
+            &mut conn,
+            post_type,
+            i64::try_from(offset).unwrap_or(0),
+            i64::try_from(limit).unwrap_or(10),
+        )
+        .await?;
+        Ok((rows, usize::try_from(total).unwrap_or(0)))
     }
 
     /// The terms a post is filed under, across every taxonomy.
@@ -288,18 +321,55 @@ impl Repos {
         offset: usize,
         limit: usize,
     ) -> AutumnResult<(Vec<Post>, usize)> {
-        let links = self.post_term_links.find_by_term_id(term_id).await?;
-        let mut posts = Vec::new();
-        for link in &links {
-            if let Some(post) = self.posts.find_by_id(link.post_id).await.ok().flatten()
-                && post.is_public()
-            {
-                posts.push(post);
-            }
-        }
-        posts.sort_by(|a, b| b.published_at.cmp(&a.published_at).then(b.id.cmp(&a.id)));
-        let total = posts.len();
-        Ok((posts.into_iter().skip(offset).take(limit).collect(), total))
+        let mut conn = self.conn().await?;
+        let (rows, total) = crate::content::published_posts_in_term(
+            &mut conn,
+            term_id,
+            i64::try_from(offset).unwrap_or(0),
+            i64::try_from(limit).unwrap_or(10),
+        )
+        .await?;
+        Ok((rows, usize::try_from(total).unwrap_or(0)))
+    }
+
+    /// One page of an author's published posts, plus the total.
+    pub async fn posts_by_author(
+        &self,
+        author_id: i64,
+        offset: usize,
+        limit: usize,
+    ) -> AutumnResult<(Vec<Post>, usize)> {
+        let mut conn = self.conn().await?;
+        let (rows, total) = crate::content::published_posts_by_author(
+            &mut conn,
+            author_id,
+            i64::try_from(offset).unwrap_or(0),
+            i64::try_from(limit).unwrap_or(10),
+        )
+        .await?;
+        Ok((rows, usize::try_from(total).unwrap_or(0)))
+    }
+
+    /// One page of a date archive, plus the total.
+    pub async fn posts_in_period(
+        &self,
+        post_type: &str,
+        from: chrono::NaiveDateTime,
+        until: chrono::NaiveDateTime,
+        offset: usize,
+        limit: usize,
+    ) -> AutumnResult<(Vec<Post>, usize)> {
+        let mut conn = self.conn().await?;
+        let (rows, total) = crate::content::published_posts_in_period(
+            &mut conn,
+            post_type,
+            from,
+            until,
+            i64::try_from(offset).unwrap_or(0),
+            i64::try_from(limit).unwrap_or(10),
+        )
+        .await?;
+        Ok((rows, usize::try_from(total).unwrap_or(0)))
     }
 }
 

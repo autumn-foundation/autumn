@@ -348,18 +348,10 @@ async fn author_archive(
     author: &User,
     params: &ListQueryParams,
 ) -> AutumnResult<Response> {
-    let mut posts = repos
-        .posts
-        .find_by_author_id_and_status(author.id, "publish".to_owned())
-        .await?;
-    posts.sort_by(|a, b| b.published_at.cmp(&a.published_at).then(b.id.cmp(&a.id)));
-    let total = posts.len();
     let per_page = usize::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
-    let page_posts: Vec<Post> = posts
-        .into_iter()
-        .skip(params.offset(settings.posts_per_page))
-        .take(per_page)
-        .collect();
+    let (page_posts, total) = repos
+        .posts_by_author(author.id, params.offset(settings.posts_per_page), per_page)
+        .await?;
 
     let heading = format!("Posts by {}", author.public_name());
     let base = format!("/author/{}", author.username);
@@ -385,14 +377,10 @@ async fn post_type_archive(
     let Some(registered) = content_types::find_post_type(post_type) else {
         return not_found(repos, session, csrf).await;
     };
-    let all = repos.published_posts(post_type, i64::MAX).await?;
-    let total = all.len();
     let per_page = usize::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
-    let page_posts: Vec<Post> = all
-        .into_iter()
-        .skip(params.offset(settings.posts_per_page))
-        .take(per_page)
-        .collect();
+    let (page_posts, total) = repos
+        .published_posts_page(post_type, params.offset(settings.posts_per_page), per_page)
+        .await?;
 
     let heading = registered.plural.to_owned();
     let base = format!("/{}", registered.archive_base);
@@ -423,29 +411,21 @@ async fn date_archive(
     day: Option<u32>,
     params: &ListQueryParams,
 ) -> AutumnResult<Response> {
-    use chrono::Datelike as _;
-
-    let matching: Vec<Post> = repos
-        .published_posts("post", i64::MAX)
-        .await?
-        .into_iter()
-        .filter(|post| {
-            let Some(published) = post.published_at else {
-                return false;
-            };
-            published.year() == year
-                && month.is_none_or(|m| published.month() == m)
-                && day.is_none_or(|d| published.day() == d)
-        })
-        .collect();
-
-    let total = matching.len();
+    // Half-open bounds, so the filter is a pair of index-usable comparisons on
+    // `published_at` rather than a per-row date decomposition.
+    let Some((from, until)) = archive_bounds(year, month, day) else {
+        return not_found(repos, session, csrf).await;
+    };
     let per_page = usize::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
-    let page_posts: Vec<Post> = matching
-        .into_iter()
-        .skip(params.offset(settings.posts_per_page))
-        .take(per_page)
-        .collect();
+    let (page_posts, total) = repos
+        .posts_in_period(
+            "post",
+            from,
+            until,
+            params.offset(settings.posts_per_page),
+            per_page,
+        )
+        .await?;
 
     let (heading, base) = match (month, day) {
         (Some(m), Some(d)) => (
@@ -694,6 +674,26 @@ async fn listing(
             }
         }
     })
+}
+
+/// The half-open `[from, until)` range a `/YYYY[/MM[/DD]]` archive covers.
+///
+/// `None` for a date that does not exist (the resolver already rejects an
+/// out-of-range month or day, so this is the belt to that braces).
+fn archive_bounds(
+    year: i32,
+    month: Option<u32>,
+    day: Option<u32>,
+) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    use chrono::{Days, Months, NaiveDate};
+
+    let start = NaiveDate::from_ymd_opt(year, month.unwrap_or(1), day.unwrap_or(1))?;
+    let end = match (month, day) {
+        (Some(_), Some(_)) => start.checked_add_days(Days::new(1))?,
+        (Some(_), None) => start.checked_add_months(Months::new(1))?,
+        _ => NaiveDate::from_ymd_opt(year.checked_add(1)?, 1, 1)?,
+    };
+    Some((start.and_hms_opt(0, 0, 0)?, end.and_hms_opt(0, 0, 0)?))
 }
 
 /// A listing's page link. Page 1 drops the parameter so the canonical URL of a

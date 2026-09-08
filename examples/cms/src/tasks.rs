@@ -73,6 +73,20 @@ pub async fn publish_scheduled(state: AppState) -> AutumnResult<()> {
         .await?;
 
         if updated > 0 {
+            // The post was `future` when its terms were last counted, so every
+            // term it is filed under excluded it. This is the moment it became
+            // public, and the guarded `UPDATE` above is deliberately not
+            // `transition_status` (which recounts), so recount here or every
+            // affected archive shows a count one short of what it lists.
+            if let Err(error) =
+                crate::content::recount_terms_for_post_public(&mut conn, post.id).await
+            {
+                autumn_web::reexports::tracing::warn!(
+                    post_id = post.id,
+                    %error,
+                    "published a scheduled post but could not rebuild its term counts"
+                );
+            }
             autumn_web::reexports::tracing::info!(
                 post_id = post.id,
                 slug = %post.slug,
