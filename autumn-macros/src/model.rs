@@ -1776,13 +1776,16 @@ fn lower_filter_comparison(
                 }
             };
             // `{bin}` resolves to the backend's bytewise collation (`COLLATE
-            // "C"`, `COLLATE BINARY`): Rust compares bytes, and a `NOCASE` or
-            // `citext`-style column would otherwise make SQL call `"PUB"` and
-            // `'pub'` equal where the Rust lowering of the same filter does
-            // not, so the record paths and the set-based paths would disagree.
+            // "C"`, `COLLATE BINARY`): Rust compares bytes, and a `NOCASE`
+            // column would otherwise make SQL call `"PUB"` and `'pub'` equal
+            // where the Rust lowering of the same filter does not, so the
+            // record paths and the set-based paths would disagree. The cast
+            // covers Postgres `citext`, whose own equality operator folds case
+            // whatever the collation says: as `TEXT` the comparison is the
+            // plain one the collation governs. On SQLite the cast is a no-op.
             Ok(LoweredFilter {
                 rust,
-                sql: format!("{{c}}.\"{column}\" {sql_op} {sql_literal} {{bin}}"),
+                sql: format!("CAST({{c}}.\"{column}\" AS TEXT) {sql_op} {sql_literal} {{bin}}"),
             })
         }
         (kind, literal) => {
@@ -2184,6 +2187,25 @@ fn emit_counter_caches_impl(
     // parent column (#1769): the two would double count, and the backfill
     // would then overwrite the counter cache's rows.
     let mut claim_items: Vec<TokenStream> = Vec::new();
+    // The `#[lock_version]` column is maintained too: every update increments
+    // it as the optimistic-concurrency token, so a derivation adjusting it as
+    // an aggregate would break the protocol and the backfill would erase it.
+    if let Some(field) = all_fields.iter().find(|f| has_attr(f, "lock_version"))
+        && let Some(ident) = field.ident.as_ref()
+    {
+        let column = unraw_ident(ident);
+        claim_items.push(quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::derivation::CounterCacheClaim {
+                    model: ::core::stringify!(#model_ident),
+                    child_table: #table_name,
+                    parent_table: #table_name,
+                    column: #column,
+                    module_path: ::core::module_path!(),
+                }
+            }
+        });
+    }
     for (index, assoc) in cached.iter().enumerate() {
         let decl = assoc
             .counter_cache
@@ -10260,7 +10282,7 @@ mod tests {
             lowered.rust.to_string(),
             quote! { __r.f == "pub" }.to_string()
         );
-        assert_eq!(lowered.sql, "{c}.\"f\" = 'pub' {bin}");
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'pub' {bin}");
     }
 
     #[test]
@@ -10271,7 +10293,7 @@ mod tests {
             lowered.rust.to_string(),
             quote! { __r.f.as_deref() == ::core::option::Option::Some("pub") }.to_string()
         );
-        assert_eq!(lowered.sql, "{c}.\"f\" = 'pub' {bin}");
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'pub' {bin}");
     }
 
     #[test]
@@ -10282,14 +10304,14 @@ mod tests {
             lowered.rust.to_string(),
             quote! { __r.f.as_deref().is_some_and(|__v| __v != "pub") }.to_string()
         );
-        assert_eq!(lowered.sql, "{c}.\"f\" <> 'pub' {bin}");
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) <> 'pub' {bin}");
     }
 
     #[test]
     fn filter_string_literal_quote_is_escaped_for_sql() {
         let lowered =
             lower_one(&quote!(String), &syn::parse_quote!(f == "o'brien")).expect("lower");
-        assert_eq!(lowered.sql, "{c}.\"f\" = 'o''brien' {bin}");
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'o''brien' {bin}");
     }
 
     #[test]
@@ -10584,7 +10606,7 @@ mod tests {
         let model: syn::Ident = syn::parse_quote!(C);
         let filter: syn::Expr = syn::parse_quote!(r#type == "post");
         let lowered = lower_filter(&filter, &model, &map).expect("lower");
-        assert_eq!(lowered.sql, "{c}.\"type\" = 'post' {bin}");
+        assert_eq!(lowered.sql, "CAST({c}.\"type\" AS TEXT) = 'post' {bin}");
     }
 
     #[test]

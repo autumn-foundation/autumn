@@ -97,12 +97,11 @@ rejected: a brace could forge the `{c}` placeholder, and the others have
 backend-specific escape rules. Ordering comparisons on a string field are
 rejected too: Rust compares bytes and SQL compares by collation, so
 `status > "b"` would mean two different things in the two lowerings. `==` and
-`!=` are lowered with the backend's bytewise collation (`COLLATE "C"` on
-Postgres, `COLLATE BINARY` on SQLite), so a column declared `NOCASE` or with a
-case-folding collation still compares the way Rust does: `"PUB"` is not
-`"pub"` on either side. A Postgres `citext` column is the one exception, since
-the type has no collation to override; a filter on one is rejected by Postgres
-at run time rather than silently disagreeing with the record path.
+`!=` are lowered as `CAST(col AS TEXT) = 'lit'` under the backend's bytewise
+collation (`COLLATE "C"` on Postgres, `COLLATE BINARY` on SQLite), so a column
+declared `NOCASE`, with a case-folding collation, or as Postgres `citext`
+(whose own equality operator folds case whatever the collation says) still
+compares the way Rust does: `"PUB"` is not `"pub"` on either side.
 
 Everything else is a compile error whose message lists the grammar: `||`,
 arithmetic, any method call other than the two NULL probes, float literals, a
@@ -182,9 +181,9 @@ A registry collision stops the boot, because double counting is data
 corruption: two derivations sharing a name, two maintaining one parent column,
 or a derivation maintaining a column that something else already maintains: a
 plain `counter_cache` on another model, a `#[votable]` model's aggregate
-column, a `#[repository(..., position(...))]` ordering column, or a
-`#[commentable(counter_cache = ...)]` parent's count (each registers the
-column it claims for exactly this check). A database failure does not: it is logged, the sweep for that target
+column, a `#[repository(..., position(...))]` ordering column, a model's
+`#[lock_version]` token, or a `#[commentable(counter_cache = ...)]` parent's
+count (each registers the column it claims for exactly this check). A database failure does not: it is logged, the sweep for that target
 is skipped, and a derivation whose backfill has not run yet is stale rather than
 broken, which the actuator reports exactly.
 

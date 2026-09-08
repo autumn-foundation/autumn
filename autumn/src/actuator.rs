@@ -3600,22 +3600,23 @@ pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync +
     // no database at all is a 503.
     let mut report = Vec::new();
     if let Some(pool) = state.pool() {
-        let mut conn = match pool.get().await {
-            Ok(conn) => conn,
-            Err(error) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": "could not acquire a database connection",
-                        "target": "control",
-                        "detail": error.to_string(),
-                    })),
-                )
-                    .into_response();
-            }
+        // The control target fails the same way a shard does: one error row,
+        // so a control pool that cannot be reached does not hide the shards
+        // that maintain the derivations. Only a process with no shards at all
+        // turns a control failure into the response's own status.
+        let statuses = match pool.get().await {
+            Ok(mut conn) => crate::derivation::derivation_status(&mut conn).await,
+            Err(error) => Err(crate::AutumnError::from(std::io::Error::other(
+                error.to_string(),
+            ))),
         };
-        match crate::derivation::derivation_status(&mut conn).await {
+        match statuses {
             Ok(statuses) => report.extend(derivation_report("control", statuses)),
+            Err(error) if state.shards().is_some() => report.push(serde_json::json!({
+                "target": "control",
+                "error": "could not read derivation state",
+                "detail": error.to_string(),
+            })),
             Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,

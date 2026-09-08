@@ -262,8 +262,9 @@ inventory::collect!(DerivationDescriptor);
 /// Link-time registration of a column something other than a `#[derivation]`
 /// maintains: a plain `counter_cache` (#1325), emitted by `#[model]` for every
 /// `#[belongs_to(..., counter_cache)]`, the aggregate column a `#[votable]`
-/// model keeps from its reaction edges, and the ordering column a
-/// `#[repository(..., position(...))]` assigns and reorders. (A
+/// model keeps from its reaction edges, the ordering column a
+/// `#[repository(..., position(...))]` assigns and reorders, and a model's
+/// `#[lock_version]` optimistic-concurrency token. (A
 /// `#[commentable(counter_cache = ...)]` parent's column is read from its own
 /// descriptor instead.)
 ///
