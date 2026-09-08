@@ -312,12 +312,18 @@ session expires, all step data is lost and the user must restart from step 1
 wizard data that outlives its session would be stale.
 
 For wizards where step data is expensive to re-enter, consider increasing the
-session TTL in `autumn.toml`:
+session TTL in `autumn.toml`. The key is `session.max_age_secs` — the maximum
+age of the session cookie in seconds, defaulting to `86400` (24 hours):
 
 ```toml
+# autumn.toml
 [session]
-ttl_seconds = 3600  # 1 hour
+max_age_secs = 259200  # 3 days, up from the 86400 default
 ```
+
+The full `[session]` table — backend, cookie name, `secure`, `same_site` — is
+documented under
+[Cookie and backend configuration](authentication.md#cookie-and-backend-configuration).
 
 ## Worked example
 

@@ -530,49 +530,28 @@ pub trait AdminModel: Send + Sync + 'static {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        // Default implementation: dispatch the built-in `"delete"`, `"restore"`,
-        // and `"purge"` actions. Any other action name returns an error so it
-        // doesn't silently no-op — overriders that declare custom actions must
-        // implement them here.
-        //
-        // We clone the pool (deadpool::Pool is Arc-backed, cheap) so the
-        // returned future only borrows from `&self` and avoids the
-        // lifetime mismatch between `&self` and `&pool` that would
-        // otherwise show up in the trait's elided `'_` return signature.
-        let action = action.to_owned();
-        let pool = pool.clone();
-        Box::pin(async move {
-            match action.as_str() {
-                "delete" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.delete(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
+        // Default implementation: dispatch the built-in `"delete"` action
+        // here; `"restore"`, `"purge"`, and anything else go through
+        // `dispatch_restore_purge_or_unhandled`, shared with models (e.g.
+        // `TokenAdminModel`, `FeatureFlagAdminModel`) that override this
+        // method to batch `"delete"` into one query but still need the same
+        // restore/purge/unhandled-action fallback.
+        if action == "delete" {
+            // Clone the pool (deadpool::Pool is Arc-backed, cheap) so the
+            // returned future only borrows from `&self` and avoids the
+            // lifetime mismatch between `&self` and `&pool` that would
+            // otherwise show up in the trait's elided `'_` return signature.
+            let pool = pool.clone();
+            return Box::pin(async move {
+                let mut count: u64 = 0;
+                for id in ids {
+                    self.delete(&pool, id).await?;
+                    count += 1;
                 }
-                "restore" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.restore(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                "purge" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.purge(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                other => Err(AdminError::Other(format!(
-                    "unhandled bulk action '{other}'; \
-                     override AdminModel::execute_action to support it"
-                ))),
-            }
-        })
+                Ok(count)
+            });
+        }
+        dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }
 
     /// Return a display string for a record (used in breadcrumbs, titles).
@@ -724,6 +703,45 @@ pub trait AdminModel: Send + Sync + 'static {
             ))
         })
     }
+}
+
+/// Dispatch the built-in `"restore"`/`"purge"` bulk actions (and the
+/// fallback error for anything else). Shared by `AdminModel::execute_action`'s
+/// default and by models that override it to special-case `"delete"` with a
+/// batched query — see `TokenAdminModel` and `FeatureFlagAdminModel` — so
+/// that fallthrough behaves identically without copying the loop.
+pub fn dispatch_restore_purge_or_unhandled<'a>(
+    model: &'a (impl AdminModel + ?Sized),
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+    action: &str,
+    ids: Vec<i64>,
+) -> AdminFuture<'a, u64> {
+    let action = action.to_owned();
+    let pool = pool.clone();
+    Box::pin(async move {
+        match action.as_str() {
+            "restore" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.restore(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            "purge" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.purge(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            other => Err(AdminError::Other(format!(
+                "unhandled bulk action '{other}'; \
+                 override AdminModel::execute_action to support it"
+            ))),
+        }
+    })
 }
 
 // ── VersionPage → AdminHistoryPage conversion ──────────────────────

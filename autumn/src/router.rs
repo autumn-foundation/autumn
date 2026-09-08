@@ -455,8 +455,17 @@ pub fn try_build_router_inner(
 ) -> Result<axum::Router, RouterBuildError> {
     // Fully-dynamic path: no outer SecurityHeadersLayer is applied after this
     // returns, so build_router_pre_state applies it (outermost, wrapping the
-    // gate).
-    let router = build_router_pre_state(route_list, config, &state, ctx, None, false)?;
+    // gate). `ctx.custom_layers` was never drained, so it is already baked
+    // into the router the MCP dispatch clone is taken from — no extra layers
+    // needed for parity. `defer_security_headers = false` also means MCP (if
+    // configured) is merged in internally, so the second tuple element is
+    // always `None` here.
+    let (router, deferred_mcp) =
+        build_router_pre_state(route_list, config, &state, ctx, None, false, Vec::new())?;
+    debug_assert!(
+        deferred_mcp.is_none(),
+        "the fully-dynamic path always merges MCP internally"
+    );
     Ok(router.with_state(state))
 }
 
@@ -503,6 +512,11 @@ type McpPrepared = (
 /// [`try_build_router_with_static_inner`] so that user layers and the static
 /// file middleware can be applied to the typed router before state is baked in.
 #[allow(clippy::too_many_lines)]
+// `mcp_dispatch_extra_layers` is always empty and unused when the `mcp`
+// feature is off (see its doc below) — `needless_pass_by_value` reasons about
+// the whole function body, so the allow has to sit here rather than on the
+// parameter itself.
+#[cfg_attr(not(feature = "mcp"), allow(clippy::needless_pass_by_value))]
 fn build_router_pre_state(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -519,7 +533,32 @@ fn build_router_pre_state(
     // nonces). In the fully-dynamic path this is `false` and the layer is
     // applied as the outermost framework layer below, wrapping the gate.
     defer_security_headers: bool,
-) -> Result<axum::Router<AppState>, RouterBuildError> {
+    // A *clone* of the global custom layers (`AppBuilder::layer`), applied
+    // ONLY to the MCP dispatch clone (see the `mcp_prepared` comment below) —
+    // never to the router this function returns. In the fully-dynamic path
+    // `ctx.custom_layers` is not pre-drained, so it is already baked into
+    // `router` before the dispatch clone is taken and this is empty (a
+    // no-op). In static/ISR mode `try_build_router_with_static_inner` drains
+    // `ctx.custom_layers` before calling this function (so it can reapply
+    // the original outside the static-first middleware, for compression);
+    // this parameter carries a clone of that same set so the MCP dispatch
+    // clone still enforces it, restoring parity without touching the
+    // live-serving router's layer ordering.
+    #[cfg_attr(not(feature = "mcp"), allow(unused_variables))] mcp_dispatch_extra_layers: Vec<
+        crate::app::CustomLayerRegistration,
+    >,
+) -> Result<
+    (
+        axum::Router<AppState>,
+        // The mounted `/mcp` router, held back rather than merged in here
+        // when `defer_security_headers` is true (SSG/ISG path) — see the
+        // `mcp_prepared` comment below for why. `None` in the fully-dynamic
+        // path (merged internally, as before) and whenever MCP isn't
+        // configured.
+        Option<axum::Router<AppState>>,
+    ),
+    RouterBuildError,
+> {
     // Verify registered API versions
     let versions = state.extension::<crate::app::RegisteredApiVersions>();
     let registered_versions: std::collections::HashSet<&str> = versions
@@ -818,166 +857,221 @@ fn build_router_pre_state(
     // `tools/call`. MCP and API auth belong in route guards, `#[secured]`, or
     // the session, all of which do traverse the clone.
     //
-    // Known limitation in static/ISR mode: with a `dist` manifest,
-    // `try_build_router_with_static_inner` drains the global custom layers
-    // (`AppBuilder::layer`) and applies them after this clone is taken, so a
-    // `tools/call` replay skips them. The fully-dynamic path applies them
-    // before the clone and keeps parity. A fix needs the appliers to be
-    // re-usable; they are `FnOnce` today.
+    // In static/ISR mode, `try_build_router_with_static_inner` drains the
+    // global custom layers (`AppBuilder::layer`) out of `ctx.custom_layers`
+    // and applies them to the *live-serving* router only after this clone is
+    // taken (so they can process pre-rendered responses too — see
+    // `RouterContext::custom_layers`'s doc). Left alone, that would mean a
+    // `tools/call` replay skips them entirely (🛡 Warden,
+    // docs/security/2026-09-07-mcp-custom-layer-static-mode/): unlike
+    // `static_gate`, `AppBuilder::layer` is a documented, unrestricted way to
+    // add a real per-path auth check ("wrap every request... cross-cutting
+    // concerns that genuinely apply everywhere", `docs/guide/middleware.md`),
+    // and `docs/guide/mcp.md` promises `tools/call` "runs through the real
+    // handler pipeline... the same in-process path" with no static-mode
+    // carve-out for it. So `try_build_router_with_static_inner` also hands
+    // this function a *clone* of that same drained set
+    // (`mcp_dispatch_extra_layers`) for the dispatch clone alone — applied
+    // here, never to the live-serving router, so the live-serving stack's
+    // ordering/compression trade-off is unchanged. In fully-dynamic mode
+    // `ctx.custom_layers` was never drained, so it is already baked into
+    // `router` above (via `apply_middleware`) and `mcp_dispatch_extra_layers`
+    // is empty — this call is then a no-op, and parity holds exactly as
+    // before.
+    //
+    // That alone isn't sufficient, though: in the SSG/ISG path `mcp_router`
+    // below would otherwise still get merged into `router` *before* the
+    // caller's own `custom_layers` reapplication runs (see
+    // `RouterContext::custom_layers`'s doc), which would additionally wrap
+    // the *live* `/mcp` envelope in `custom_layers` — on top of the dispatch
+    // clone above, doubling every custom layer's side effects per
+    // `tools/call` (a real regression a reviewer caught, see the
+    // `defer_security_headers` branch below). So `mcp_router` is instead
+    // handed back to the caller unmerged in that mode, and the caller merges
+    // it in *after* its own `custom_layers` reapplication.
     #[cfg(feature = "mcp")]
-    let router = if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
-        // The outermost `SecurityHeadersLayer` is applied after this clone, so
-        // the dispatch snapshot would otherwise miss it. That layer also injects
-        // `CspNonce` into request extensions, so a `tools/call` replay of a
-        // handler using the `CspNonce` extractor would 500 when `csp_nonce` is
-        // on. Re-attach it to the dispatch clone only: a direct request gets it
-        // from the outer application, and `serve_mcp` discards the replay's
-        // response headers, so no header is duplicated live. The gate stays off
-        // the clone — a browser redirect is meaningless for JSON-RPC.
-        let dispatch = router
-            .clone()
+    let (router, deferred_mcp_router) =
+        if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
+            // The outermost `SecurityHeadersLayer` is applied after this clone, so
+            // the dispatch snapshot would otherwise miss it. That layer also injects
+            // `CspNonce` into request extensions, so a `tools/call` replay of a
+            // handler using the `CspNonce` extractor would 500 when `csp_nonce` is
+            // on. Re-attach it to the dispatch clone only: a direct request gets it
+            // from the outer application, and `serve_mcp` discards the replay's
+            // response headers, so no header is duplicated live. The gate stays off
+            // the clone — a browser redirect is meaningless for JSON-RPC.
+            let dispatch = apply_layers_in_registration_order(
+                router.clone(),
+                mcp_dispatch_extra_layers,
+                "Custom (MCP dispatch parity, static/ISR mode)",
+            )
             .layer(crate::security::SecurityHeadersLayer::from_config(
                 &config.security.headers,
             ))
             .with_state(state.clone());
-        // For header-based tenancy, forward the configured tenant header on
-        // dispatch so tenant-scoped tools resolve the same tenant a direct HTTP
-        // call would. Other sources key off already-forwarded headers/Host.
-        let tenant_header = (config.tenancy.enabled && config.tenancy.source == "header")
-            .then(|| config.tenancy.header_name.clone());
-        let wiring = crate::mcp::McpWiring {
-            // The CORS config drives the cross-origin Origin allowlist and the
-            // endpoint's own OPTIONS preflight responses.
-            cors: config.cors.clone(),
-            // The same-origin shortcut is gated on the app's trusted-Host
-            // policy so it can't be abused for DNS rebinding.
-            trusted_hosts: TrustedHostPolicy::from_config(config),
-            tenant_header,
-            // Forward the configured CSRF header (default `x-csrf-token`) so
-            // customized CsrfConfig::token_header deployments work via MCP.
-            csrf_header: config.security.csrf.token_header.to_ascii_lowercase(),
-            // The envelope is rate-limited below iff rate limiting is enabled;
-            // when so, a tools/call is counted there and its replay is exempted
-            // from the dispatch pipeline's limiter (avoiding double-counting).
-            envelope_rate_limited: config.security.rate_limit.enabled,
-            // `dispatch` above is cloned from `router`, which already carries
-            // `load_shed_layer` (applied inside `apply_middleware`) — so when
-            // the envelope below is ALSO wrapped with that same shared layer,
-            // a tools/call must mark its replay exempt (avoiding double-
-            // counting against the same in-flight counter).
-            envelope_load_shed: mcp_load_shed_layer.is_some(),
-            // The agent-authority audit path (#1691) writes through the app's
-            // installed `AuditLogger` and mints its correlation id from the
-            // injected entropy seam, both reached from state.
-            state: state.clone(),
+            // For header-based tenancy, forward the configured tenant header on
+            // dispatch so tenant-scoped tools resolve the same tenant a direct HTTP
+            // call would. Other sources key off already-forwarded headers/Host.
+            let tenant_header = (config.tenancy.enabled && config.tenancy.source == "header")
+                .then(|| config.tenancy.header_name.clone());
+            let wiring = crate::mcp::McpWiring {
+                // The CORS config drives the cross-origin Origin allowlist and the
+                // endpoint's own OPTIONS preflight responses.
+                cors: config.cors.clone(),
+                // The same-origin shortcut is gated on the app's trusted-Host
+                // policy so it can't be abused for DNS rebinding.
+                trusted_hosts: TrustedHostPolicy::from_config(config),
+                tenant_header,
+                // Forward the configured CSRF header (default `x-csrf-token`) so
+                // customized CsrfConfig::token_header deployments work via MCP.
+                csrf_header: config.security.csrf.token_header.to_ascii_lowercase(),
+                // The envelope is rate-limited below iff rate limiting is enabled;
+                // when so, a tools/call is counted there and its replay is exempted
+                // from the dispatch pipeline's limiter (avoiding double-counting).
+                envelope_rate_limited: config.security.rate_limit.enabled,
+                // `dispatch` above is cloned from `router`, which already carries
+                // `load_shed_layer` (applied inside `apply_middleware`) — so when
+                // the envelope below is ALSO wrapped with that same shared layer,
+                // a tools/call must mark its replay exempt (avoiding double-
+                // counting against the same in-flight counter).
+                envelope_load_shed: mcp_load_shed_layer.is_some(),
+                // The agent-authority audit path (#1691) writes through the app's
+                // installed `AuditLogger` and mints its correlation id from the
+                // injected entropy seam, both reached from state.
+                state: state.clone(),
+            };
+            let mut mcp_router =
+                crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
+            // NOTE: this envelope's inbound request-timeout layer is applied further
+            // down, outer to the rate-limit layer (see
+            // `apply_request_timeout_middleware` below). It must wrap the limiter so
+            // a stalled Redis rate-limit decision is bounded by `request_timeout_ms`,
+            // matching the main stack.
+            // Gate the envelope under maintenance mode, mirroring the layer
+            // `apply_middleware` installs for direct routes. The `/mcp` router merges
+            // after that layer, so without this `initialize`/`tools/list` would keep
+            // serving the tool catalog during maintenance; the `tools/call` replay is
+            // already gated through the dispatch clone. Applied before
+            // `TrustedProxiesLayer` so it is inner to it, letting the maintenance IP
+            // allow-list read the proxy-resolved identity instead of a spoofable raw
+            // `X-Forwarded-For`.
+            mcp_router = mcp_router.layer(build_maintenance_layer(config, state));
+            // Admission control / load shedding (#1006), mirroring the layer
+            // `apply_middleware` installs for direct routes (see the comment
+            // there). The `/mcp` router is merged after that layer, so without
+            // this, `initialize`/`tools/list`/`tools/call` would bypass
+            // `server.max_concurrent_requests` entirely. Reuses the SAME
+            // `load_shed_layer` instance passed to `apply_middleware` above
+            // (cloned, sharing its `Arc` in-flight counter) rather than building
+            // a second, independently-counting layer — see that call site's
+            // comment. `None` (the default) is a no-op, matching direct routes.
+            if let Some(load_shed) = mcp_load_shed_layer {
+                mcp_router = mcp_router.layer(load_shed);
+            }
+            // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
+            // MCP route is merged after `apply_middleware`, so the centralized
+            // `TrustedProxiesLayer` above does not wrap it; without this, the
+            // endpoint's own DNS-rebinding / same-origin check would fall back to
+            // the raw (possibly proxy-rewritten) `Host` and wrongly 403 a
+            // same-origin browser client behind a TLS-terminating proxy. The
+            // dispatch clone already carries its own copy of this layer.
+            mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
+            // The MCP route is merged after the ingress upload guards
+            // (`build_upload_layers`), so axum's
+            // built-in 2 MiB `DefaultBodyLimit` — not the app's configured limit —
+            // would otherwise govern the `tools/call` envelope's `Bytes` body. Apply
+            // the same cap a direct JSON endpoint gets so larger-but-valid tool
+            // payloads aren't rejected before dispatch.
+            mcp_router = mcp_router.layer(axum::extract::DefaultBodyLimit::max(
+                config.security.upload.max_request_size_bytes,
+            ));
+            // Rate-limit the envelope so `secure_mcp` auth rejections are throttled;
+            // they never reach the dispatch clone's limiter, so credential guessing
+            // would otherwise consume no per-client bucket. A successful tools/call
+            // is counted once here and replayed with `RateLimitExempt`, so the
+            // dispatch pipeline's limiter does not count it twice. No-op when rate
+            // limiting is off, matching `envelope_rate_limited`.
+            //
+            // Known limitation with `key_strategy = AuthenticatedPrincipal` plus
+            // session auth: the envelope keys on the IP fallback, because the session
+            // layer that `populate_rate_limit_principal` reads runs inside
+            // `apply_middleware` and does not wrap this late-merged router. The
+            // tools/call replay is then exempt, so the dispatch clone's
+            // principal-aware limiter is skipped too. A session-authenticated MCP
+            // call therefore misses the per-user bucket a direct request would use.
+            mcp_router = apply_rate_limit_middleware(mcp_router, config, state);
+            // Bound the whole envelope by the global inbound deadline: the rate-limit
+            // decision (a stalled Redis limiter would tie up `/mcp` indefinitely), the
+            // metadata and auth work (initialize, tools/list, and `secure_mcp`
+            // rejections that never reach the dispatch clone), and the in-process
+            // `tools/call` dispatch. The `/mcp` router merges after `apply_middleware`,
+            // so the timeout layer installed there does not wrap it. Applied outer to
+            // the rate-limit layer above, matching the main stack, but inner to the
+            // security-header and CORS layers below, so a timeout 503 still flows out
+            // through them and stays CORS-readable. The mount path is fixed, so
+            // route-level overrides cannot apply and an empty override table is passed.
+            // The layer no-ops when the global timeout is disabled.
+            //
+            // Known limitation for tools/call: this timer wraps the whole POST,
+            // including the dispatch replay, with the global default deadline. The
+            // dispatch clone's own per-route timeout layer is inner to this one, so a
+            // tool whose route declares `timeout = "off"` or a longer `timeout_ms` is
+            // still capped at the global default over MCP. Honoring the per-route
+            // policy would mean propagating the dispatched route's timeout out to this
+            // single fixed-path endpoint, which has no per-route distinction at the
+            // layer level. `mirror_cors = false`: the 503 already exits through this
+            // router's outer `CorsLayer` from `apply_mcp_cors_layer`.
+            mcp_router = apply_request_timeout_middleware(
+                mcp_router,
+                config,
+                state.metrics.clone(),
+                std::sync::Arc::new(std::collections::HashMap::new()),
+                false,
+            );
+            // Security headers (HSTS/CSP/etc.), mirroring the `SecurityHeadersLayer`
+            // `apply_middleware` installs for direct routes. The `/mcp` router merges
+            // after that layer, so without this the envelope's `initialize`,
+            // `tools/list`, auth 401/403, and rate-limit 429 responses would ship
+            // without the configured `security.headers`. The `tools/call` replay's
+            // headers are produced on the dispatch clone and discarded when
+            // `serve_mcp` rebuilds the JSON-RPC response, so the envelope needs its own.
+            mcp_router = mcp_router.layer(crate::security::SecurityHeadersLayer::from_config(
+                &config.security.headers,
+            ));
+            // CORS grant outermost so every response — including auth 401/403, the
+            // 413 body-limit rejection, and a 429 from the limiter above, all
+            // produced before `serve_mcp` runs — is readable by an allowlisted
+            // browser client instead of being masked as a CORS failure.
+            mcp_router = crate::mcp::apply_mcp_cors_layer(mcp_router, &config.cors);
+            // In the SSG/ISG path, merging `mcp_router` in here (as the
+            // fully-dynamic path always does) would put it inside the caller's
+            // later `custom_layers` reapplication (`try_build_router_with_static_inner`,
+            // "Custom (outside static middleware)") — which, combined with
+            // `mcp_dispatch_extra_layers` above, would run every custom layer
+            // *twice* per `tools/call`: once for the live `/mcp` POST, once for
+            // the replay. A stateful layer (a counter, a rate limiter, an audit
+            // log) would then be charged twice per call — a real regression a
+            // reviewer caught (🛡 Warden PR #2608). So in this mode `mcp_router`
+            // is handed back to the caller instead of merged here; the caller
+            // merges it in *after* that reapplication, so the live envelope
+            // never sees `custom_layers` at all — matching the fully-dynamic
+            // path, where `/mcp` structurally never traverses them either
+            // (see `docs/guide/mcp.md`'s "why `/mcp` sits outside the global
+            // middleware stack"). It still gets everything merged in *before*
+            // this point (nothing — `mcp_router` above is fully self-contained)
+            // and everything the caller wraps *after* the custom-layers
+            // reapplication (static_gate, compression, security headers),
+            // exactly as it already does today.
+            if defer_security_headers {
+                (router, Some(mcp_router))
+            } else {
+                (router.merge(mcp_router), None)
+            }
+        } else {
+            (router, None)
         };
-        let mut mcp_router =
-            crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
-        // NOTE: this envelope's inbound request-timeout layer is applied further
-        // down, outer to the rate-limit layer (see
-        // `apply_request_timeout_middleware` below). It must wrap the limiter so
-        // a stalled Redis rate-limit decision is bounded by `request_timeout_ms`,
-        // matching the main stack.
-        // Gate the envelope under maintenance mode, mirroring the layer
-        // `apply_middleware` installs for direct routes. The `/mcp` router merges
-        // after that layer, so without this `initialize`/`tools/list` would keep
-        // serving the tool catalog during maintenance; the `tools/call` replay is
-        // already gated through the dispatch clone. Applied before
-        // `TrustedProxiesLayer` so it is inner to it, letting the maintenance IP
-        // allow-list read the proxy-resolved identity instead of a spoofable raw
-        // `X-Forwarded-For`.
-        mcp_router = mcp_router.layer(build_maintenance_layer(config, state));
-        // Admission control / load shedding (#1006), mirroring the layer
-        // `apply_middleware` installs for direct routes (see the comment
-        // there). The `/mcp` router is merged after that layer, so without
-        // this, `initialize`/`tools/list`/`tools/call` would bypass
-        // `server.max_concurrent_requests` entirely. Reuses the SAME
-        // `load_shed_layer` instance passed to `apply_middleware` above
-        // (cloned, sharing its `Arc` in-flight counter) rather than building
-        // a second, independently-counting layer — see that call site's
-        // comment. `None` (the default) is a no-op, matching direct routes.
-        if let Some(load_shed) = mcp_load_shed_layer {
-            mcp_router = mcp_router.layer(load_shed);
-        }
-        // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
-        // MCP route is merged after `apply_middleware`, so the centralized
-        // `TrustedProxiesLayer` above does not wrap it; without this, the
-        // endpoint's own DNS-rebinding / same-origin check would fall back to
-        // the raw (possibly proxy-rewritten) `Host` and wrongly 403 a
-        // same-origin browser client behind a TLS-terminating proxy. The
-        // dispatch clone already carries its own copy of this layer.
-        mcp_router = apply_trusted_proxies_middleware(mcp_router, config);
-        // The MCP route is merged after the ingress upload guards
-        // (`build_upload_layers`), so axum's
-        // built-in 2 MiB `DefaultBodyLimit` — not the app's configured limit —
-        // would otherwise govern the `tools/call` envelope's `Bytes` body. Apply
-        // the same cap a direct JSON endpoint gets so larger-but-valid tool
-        // payloads aren't rejected before dispatch.
-        mcp_router = mcp_router.layer(axum::extract::DefaultBodyLimit::max(
-            config.security.upload.max_request_size_bytes,
-        ));
-        // Rate-limit the envelope so `secure_mcp` auth rejections are throttled;
-        // they never reach the dispatch clone's limiter, so credential guessing
-        // would otherwise consume no per-client bucket. A successful tools/call
-        // is counted once here and replayed with `RateLimitExempt`, so the
-        // dispatch pipeline's limiter does not count it twice. No-op when rate
-        // limiting is off, matching `envelope_rate_limited`.
-        //
-        // Known limitation with `key_strategy = AuthenticatedPrincipal` plus
-        // session auth: the envelope keys on the IP fallback, because the session
-        // layer that `populate_rate_limit_principal` reads runs inside
-        // `apply_middleware` and does not wrap this late-merged router. The
-        // tools/call replay is then exempt, so the dispatch clone's
-        // principal-aware limiter is skipped too. A session-authenticated MCP
-        // call therefore misses the per-user bucket a direct request would use.
-        mcp_router = apply_rate_limit_middleware(mcp_router, config, state);
-        // Bound the whole envelope by the global inbound deadline: the rate-limit
-        // decision (a stalled Redis limiter would tie up `/mcp` indefinitely), the
-        // metadata and auth work (initialize, tools/list, and `secure_mcp`
-        // rejections that never reach the dispatch clone), and the in-process
-        // `tools/call` dispatch. The `/mcp` router merges after `apply_middleware`,
-        // so the timeout layer installed there does not wrap it. Applied outer to
-        // the rate-limit layer above, matching the main stack, but inner to the
-        // security-header and CORS layers below, so a timeout 503 still flows out
-        // through them and stays CORS-readable. The mount path is fixed, so
-        // route-level overrides cannot apply and an empty override table is passed.
-        // The layer no-ops when the global timeout is disabled.
-        //
-        // Known limitation for tools/call: this timer wraps the whole POST,
-        // including the dispatch replay, with the global default deadline. The
-        // dispatch clone's own per-route timeout layer is inner to this one, so a
-        // tool whose route declares `timeout = "off"` or a longer `timeout_ms` is
-        // still capped at the global default over MCP. Honoring the per-route
-        // policy would mean propagating the dispatched route's timeout out to this
-        // single fixed-path endpoint, which has no per-route distinction at the
-        // layer level. `mirror_cors = false`: the 503 already exits through this
-        // router's outer `CorsLayer` from `apply_mcp_cors_layer`.
-        mcp_router = apply_request_timeout_middleware(
-            mcp_router,
-            config,
-            state.metrics.clone(),
-            std::sync::Arc::new(std::collections::HashMap::new()),
-            false,
-        );
-        // Security headers (HSTS/CSP/etc.), mirroring the `SecurityHeadersLayer`
-        // `apply_middleware` installs for direct routes. The `/mcp` router merges
-        // after that layer, so without this the envelope's `initialize`,
-        // `tools/list`, auth 401/403, and rate-limit 429 responses would ship
-        // without the configured `security.headers`. The `tools/call` replay's
-        // headers are produced on the dispatch clone and discarded when
-        // `serve_mcp` rebuilds the JSON-RPC response, so the envelope needs its own.
-        mcp_router = mcp_router.layer(crate::security::SecurityHeadersLayer::from_config(
-            &config.security.headers,
-        ));
-        // CORS grant outermost so every response — including auth 401/403, the
-        // 413 body-limit rejection, and a 429 from the limiter above, all
-        // produced before `serve_mcp` runs — is readable by an allowlisted
-        // browser client instead of being masked as a CORS failure.
-        mcp_router = crate::mcp::apply_mcp_cors_layer(mcp_router, &config.cors);
-        router.merge(mcp_router)
-    } else {
-        router
-    };
+    #[cfg(not(feature = "mcp"))]
+    let deferred_mcp_router: Option<axum::Router<AppState>> = None;
 
     // Apply the pre-static gate and the outermost `SecurityHeadersLayer` last,
     // after the MCP dispatch clone above. This keeps the gate out of the
@@ -1012,7 +1106,7 @@ fn build_router_pre_state(
         ))
     };
 
-    Ok(router)
+    Ok((router, deferred_mcp_router))
 }
 
 /// Parse `{name}` captures from a route path.
@@ -5592,8 +5686,56 @@ pub fn try_build_router_with_static_inner(
     // SSG/ISG path: a single SecurityHeadersLayer is applied OUTSIDE the
     // static-first middleware below (wrapping cached pages, dynamic misses, and
     // the gate), so the inner router must NOT apply its own — hence `true`.
-    let inner_router =
-        build_router_pre_state(route_list, config, &state, ctx, opaque_present, true)?;
+    //
+    // `custom_layers` was just drained out of `ctx` above so it can be
+    // reapplied to the *live-serving* router outside the static-first
+    // middleware (below). Left at that, a `tools/call` MCP replay — dispatched
+    // against a clone taken inside `build_router_pre_state`, before this
+    // point — would never see it at all: unlike `static_gate` (deliberately
+    // excluded from MCP dispatch everywhere, see the `mcp_prepared` comment),
+    // `AppBuilder::layer` is a documented, unrestricted way to add a real
+    // per-path check, and MCP is documented to dispatch through the same
+    // pipeline a direct call gets. Hand `build_router_pre_state` a *clone* of
+    // the same drained set for its dispatch clone alone, so replay parity
+    // holds without changing anything about how these layers wrap the
+    // live-serving router below (🛡 Warden,
+    // docs/security/2026-09-07-mcp-custom-layer-static-mode/).
+    //
+    // Known limitation: this calls `Layer::layer()` on the registered
+    // layer(s) a *second* time (once here for the dispatch clone, once below
+    // for the live-serving router) — unlike every other mode/path, which
+    // calls it exactly once and shares the resulting *service* by cloning
+    // the already-built router. A layer that allocates its enforcement state
+    // inside `layer()` itself, rather than constructing it once and sharing
+    // it via `Arc` — e.g. `tower::limit::ConcurrencyLimitLayer`, which Tower
+    // documents as a *per-service* limit for exactly this reason, contrasted
+    // with `GlobalConcurrencyLimitLayer`'s shared `Arc<Semaphore>` — gets two
+    // independent instances of that state, so direct and MCP traffic are
+    // capped separately instead of against one shared app-wide budget.
+    // Unavoidable without either of two worse regressions: taking dispatch
+    // from a service that already carries this application would need it
+    // downstream of the static-first middleware (whose whole point is
+    // deciding whether the real handler runs at all — a `tools/call` must
+    // never be answered from a stale cached page), or applying custom_layers
+    // before that middleware would stop them from processing cached-page
+    // responses, the reason they sit outside it in the first place. Use a
+    // layer that owns its shared state behind an `Arc` (constructed once,
+    // cloned into the `Layer` value) rather than allocating inside
+    // `Layer::layer()`, and this is a non-issue — the same discipline the
+    // framework's own mirrored layers on `mcp_router` below already follow.
+    #[cfg(feature = "mcp")]
+    let mcp_dispatch_extra_layers = custom_layers.clone();
+    #[cfg(not(feature = "mcp"))]
+    let mcp_dispatch_extra_layers = Vec::new();
+    let (inner_router, deferred_mcp_router) = build_router_pre_state(
+        route_list,
+        config,
+        &state,
+        ctx,
+        opaque_present,
+        true,
+        mcp_dispatch_extra_layers,
+    )?;
 
     // Attach the inner router for ISR background regeneration. Because user
     // layers are excluded, re-renders produce raw HTML (no compression, etc.)
@@ -5687,6 +5829,23 @@ pub fn try_build_router_with_static_inner(
         custom_layers,
         "Custom (outside static middleware)",
     );
+
+    // Merge the `/mcp` router in now — right after `custom_layers`, not
+    // before. `build_router_pre_state` held it back (see the `mcp_prepared`
+    // comment there) specifically so the live `/mcp` envelope never
+    // traverses `custom_layers`: it already got its own copy applied to the
+    // *dispatch clone* (`mcp_dispatch_extra_layers` above), and merging
+    // `mcp_router` in before this point — inside `custom_layers`, as the
+    // fully-dynamic path never does — would mean every `tools/call` runs
+    // each custom layer twice (once for the envelope, once for the replay).
+    // `mcp_router` is fully self-contained (its own security headers, rate
+    // limit, timeout, CORS — see the comments in `build_router_pre_state`),
+    // so where exactly it merges relative to the shadow/compression/
+    // static_gate/security-headers wraps below doesn't matter; only staying
+    // outside `custom_layers` does.
+    if let Some(mcp_router) = deferred_mcp_router {
+        router = router.merge(mcp_router);
+    }
 
     // Shadow mirroring (#1653) sits here — outside the static-first middleware
     // and inside compression — rather than in `apply_middleware`, which is why
@@ -13769,6 +13928,344 @@ mod trusted_host_tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&body), "dynamic");
+    }
+
+    /// Build a `CustomLayerRegistration` — the runtime shape of an
+    /// `AppBuilder::layer(...)` registration — wrapping a `from_fn` gate that
+    /// rejects a request to `/secret` lacking the `x-api-key: secret123`
+    /// credential, but lets every other path (crucially, `/mcp` itself)
+    /// through unconditionally. Stands in for a real, realistic global
+    /// auth layer scoped by path prefix (protect `/admin/*`+`/secret/*`,
+    /// leave `/mcp` and public routes alone) — exactly the shape that makes
+    /// the outer `/mcp` envelope request itself pass the layer while the
+    /// route the layer actually protects would not.
+    #[cfg(feature = "mcp")]
+    fn deny_unless_api_key_for_secret_path_registration() -> crate::app::CustomLayerRegistration {
+        let gate = axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let protected = req.uri().path() == "/secret";
+                let has_credential = req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
+                    == Some("secret123");
+                if !protected || has_credential {
+                    next.run(req).await
+                } else {
+                    http::Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            },
+        );
+        crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<()>(),
+            type_name: "deny_unless_api_key_for_secret_path",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(gate),
+        }
+    }
+
+    /// A `dist` dir with a valid but empty manifest: enough to route through
+    /// the SSG/ISG branch of `try_build_router_with_static_inner` without any
+    /// route actually being served from the static cache.
+    #[cfg(feature = "mcp")]
+    fn build_empty_dist() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("create dist");
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-09-07T00:00:00Z".to_owned(),
+            autumn_version: "0.3.0".to_owned(),
+            routes: std::collections::HashMap::new(),
+        };
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        (tmp, dist)
+    }
+
+    /// 🛡 Warden (2026-09-07): regression test for an MCP authn-bypass —
+    /// see the ledger at
+    /// `docs/security/2026-09-07-mcp-custom-layer-static-mode/README.md`.
+    ///
+    /// Threat model: against an app that authenticates a path with a global
+    /// `AppBuilder::layer(...)` Tower layer scoped by request path — a real,
+    /// unrestricted, documented way to add a runtime check ("wrap every
+    /// request... cross-cutting concerns that genuinely apply everywhere",
+    /// `docs/guide/middleware.md`; nothing in the type system distinguishes
+    /// "auth" from "cross-cutting concern") — and separately opts into
+    /// SSG/ISR (`autumn build`, i.e. a `dist` manifest is present when the
+    /// app serves) and exposes the same route over MCP, an MCP client with no
+    /// credential at all (not even a session, not an API token — nothing)
+    /// could reach the handler by calling the tool instead of the route,
+    /// while the identical direct HTTP request is correctly rejected. The app
+    /// author did nothing the docs warn against: `docs/guide/mcp.md` promises
+    /// `tools/call` "runs through the real handler pipeline... the same
+    /// in-process path, ... #[secured], authorization, tenancy, rate limits,
+    /// and validation all apply identically to an agent call and an ordinary
+    /// HTTP call" with no static-mode carve-out, and the one documented
+    /// exception (`static_gate` "is never applied to MCP `tools/call`
+    /// dispatch anyway") names a different, narrower registration.
+    ///
+    /// Root cause: `try_build_router_with_static_inner` used to drain
+    /// `custom_layers` out of `RouterContext` and reapply them *outside* the
+    /// static-first middleware — but only after `build_router_pre_state` had
+    /// already taken the MCP dispatch clone (see the `mcp_prepared` comment
+    /// near `build_router_pre_state`'s call site). A direct request
+    /// traversed the reapplied layer; a `tools/call` replay dispatched
+    /// against the pre-drain clone and never saw it.
+    ///
+    /// Fix: `try_build_router_with_static_inner` now clones the drained
+    /// `custom_layers` set and hands the clone to `build_router_pre_state` as
+    /// `mcp_dispatch_extra_layers`, applied only to the MCP dispatch clone —
+    /// restoring parity with the fully-dynamic path (where these layers were
+    /// always baked into the clone) without touching how the original set
+    /// wraps the live-serving router (no double-application, no ordering
+    /// change for direct requests).
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn custom_layer_protects_mcp_dispatch_in_static_mode() {
+        async fn secret_handler() -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+        let route = Route {
+            method: http::Method::GET,
+            path: "/secret",
+            handler: axum::routing::get(secret_handler),
+            name: "secret_tool",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/secret",
+                operation_id: "secret_tool",
+                success_status: 204,
+                ..Default::default()
+            },
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            api_version: None,
+            sunset_opt_out: false,
+        };
+
+        let mut config = AutumnConfig::default();
+        config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
+            custom_layers: vec![deny_unless_api_key_for_secret_path_registration()],
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            #[cfg(feature = "openapi")]
+            openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: Some(crate::mcp::McpRuntime {
+                mount_path: "/mcp".to_owned(),
+                expose_all: true,
+                endpoint_layer: None,
+            }),
+        };
+
+        let (_tmp, dist) = build_empty_dist();
+
+        let app = super::try_build_router_with_static_inner(
+            vec![route],
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            ctx,
+        )
+        .expect("router builds");
+
+        // Direct HTTP request without the credential: the custom layer
+        // (the runtime shape of `AppBuilder::layer(...)`) rejects it.
+        let direct = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/secret")
+                    .header("host", "app.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            direct.status(),
+            StatusCode::UNAUTHORIZED,
+            "a direct request without the credential must be rejected by the custom layer"
+        );
+
+        // The identical handler dispatched via MCP `tools/call`, same missing
+        // credential: the custom layer must reject the replayed request too,
+        // exactly as it rejects the direct one. `tools/call` itself always
+        // returns `200` with a JSON-RPC envelope (see `serve_tools_call`), so
+        // the rejection surfaces as `isError: true` with the layer's `401`
+        // folded into the tool result rather than as an HTTP-level status.
+        let mcp_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "app.example")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "secret_tool", "arguments": {}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(mcp_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["result"]["isError"], true,
+            "the custom AppBuilder::layer() gate that protects the direct route \
+             must also protect the MCP tools/call replay in static/ISR mode — an \
+             unauthenticated tool call must not reach the handler: {json}"
+        );
+        let text = json["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("401") || text.to_ascii_lowercase().contains("unauthorized"),
+            "the tool error should surface the layer's 401 rejection: {json}"
+        );
+    }
+
+    /// 🛡 Warden (2026-09-07 review round 2, Codex P2): the fix above closes
+    /// the bypass, but the naive version of it — merging `mcp_router` inside
+    /// `build_router_pre_state` as before, with only the dispatch clone
+    /// getting `mcp_dispatch_extra_layers` on top — introduced a *different*
+    /// bug: since `/mcp` is nested inside the router that
+    /// `try_build_router_with_static_inner`'s own `custom_layers`
+    /// reapplication wraps, a single `tools/call` would run every custom
+    /// layer TWICE — once for the live `/mcp` POST (the envelope), once for
+    /// the dispatch replay. Harmless for an idempotent layer (security
+    /// headers), but a stateful one (a rate limiter, a counter, an audit
+    /// logger) gets charged twice per call — effectively halving its
+    /// configured limit for MCP traffic relative to direct HTTP. This test
+    /// locks in the fix: `build_router_pre_state` now hands the `/mcp`
+    /// router back to the caller instead of merging it in immediately in
+    /// SSG/ISG mode, and the caller merges it in *after* the `custom_layers`
+    /// reapplication, so the live envelope never traverses them — matching
+    /// the fully-dynamic path, where `/mcp` structurally never does either.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn custom_layer_runs_exactly_once_per_tools_call_in_static_mode() {
+        async fn secret_handler() -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter2 = counter.clone();
+        let gate = axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let counter = counter2.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    next.run(req).await
+                }
+            },
+        );
+        let registration = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<()>(),
+            type_name: "counter",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(gate),
+        };
+        let route = Route {
+            method: http::Method::GET,
+            path: "/secret",
+            handler: axum::routing::get(secret_handler),
+            name: "secret_tool",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/secret",
+                operation_id: "secret_tool",
+                success_status: 204,
+                ..Default::default()
+            },
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            api_version: None,
+            sunset_opt_out: false,
+        };
+        let mut config = AutumnConfig::default();
+        config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            declared_routes: Vec::new(),
+            custom_layers: vec![registration],
+            static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
+            error_page_renderer: None,
+            session_store: None,
+            #[cfg(feature = "openapi")]
+            openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: Some(crate::mcp::McpRuntime {
+                mount_path: "/mcp".to_owned(),
+                expose_all: true,
+                endpoint_layer: None,
+            }),
+        };
+        let (_tmp, dist) = build_empty_dist();
+        let app = super::try_build_router_with_static_inner(
+            vec![route],
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            ctx,
+        )
+        .expect("router builds");
+
+        let _resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "app.example")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "secret_tool", "arguments": {}}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "a custom layer protecting a route must run exactly once per \
+             tools/call, matching a direct HTTP request — not once for the \
+             live /mcp envelope and once again for the dispatch replay"
+        );
     }
 
     #[tokio::test]
