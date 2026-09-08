@@ -1205,26 +1205,19 @@ fn normalized_relative_path(path: &Path, root: &Path) -> String {
     parts.join("/")
 }
 
-/// Rewrite `migrations/<14 digits>_` to `migrations/<timestamp>_` anywhere in a
-/// blob of text, by the same rule [`normalized_relative_path`] applies to a path
-/// component.
-///
-/// `normalized_relative_path` normalizes the timestamp out of the file's own
-/// PATH, but `.autumn/generated.toml` is a manifest that indexes every generated
-/// file BY path, so the raw timestamp survives inside its body and two runs
-/// either side of a second boundary compare unequal — with every digest
-/// identical. That is the same second-boundary straddle the path normalization
-/// was added for, one level in (issue #2600).
-fn normalize_migration_timestamps(text: &str) -> String {
+/// `migrations/20260907011642_create_posts` → `migrations/<timestamp>_create_posts`
+/// wherever it appears in `line`. The body-side twin of
+/// [`normalized_relative_path`], for files that embed migration paths
+/// (`.autumn/generated.toml`'s digest table keys).
+fn normalize_migration_stamp(line: &str) -> String {
     const PREFIX: &str = "migrations/";
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(idx) = rest.find(PREFIX) {
-        let (head, tail) = rest.split_at(idx + PREFIX.len());
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find(PREFIX) {
+        let (head, tail) = rest.split_at(i + PREFIX.len());
         out.push_str(head);
-        // 14 ASCII digits, so byte and char indices coincide for the split.
-        let is_stamp = tail.len() >= 14 && tail.as_bytes()[..14].iter().all(u8::is_ascii_digit);
-        if is_stamp {
+        let stamp_len = tail.bytes().take_while(u8::is_ascii_digit).count();
+        if stamp_len == 14 && tail.as_bytes().get(14) == Some(&b'_') {
             out.push_str("<timestamp>");
             rest = &tail[14..];
         } else {
@@ -1235,52 +1228,33 @@ fn normalize_migration_timestamps(text: &str) -> String {
     out
 }
 
+#[test]
+fn normalize_migration_stamp_rewrites_only_full_stamps() {
+    assert_eq!(
+        normalize_migration_stamp(r#"[files."migrations/20260907011642_create_posts/up.sql"]"#),
+        r#"[files."migrations/<timestamp>_create_posts/up.sql"]"#
+    );
+    // Two paths on one line, both rewritten.
+    assert_eq!(
+        normalize_migration_stamp("migrations/20260907011642_a migrations/20260907011643_b"),
+        "migrations/<timestamp>_a migrations/<timestamp>_b"
+    );
+    // Not a 14-digit stamp, or no `_` after it: left alone.
+    assert_eq!(
+        normalize_migration_stamp("migrations/2026_x migrations/20260907011642x"),
+        "migrations/2026_x migrations/20260907011642x"
+    );
+    assert_eq!(
+        normalize_migration_stamp("digest = \"abc\""),
+        "digest = \"abc\""
+    );
+}
+
 /// The normalization above is what a Windows CI run caught: it used to strip a
 /// literal `"migrations/"` prefix, which never matched a `\`-separated path, so
 /// the timestamp survived and a second-boundary straddle became a hard failure
 /// on the slowest runner. `PathBuf` joining is separator-correct per platform,
 /// so building the fixture that way exercises the real shape on each one.
-#[test]
-fn normalize_migration_timestamps_rewrites_only_a_real_stamp() {
-    // The manifest shape that failed on Windows CI twice: identical digests,
-    // paths one second apart.
-    let a = "[files.\"migrations/20260907060913_create_posts/up.sql\"]\ndigest = \"abc\"";
-    let b = "[files.\"migrations/20260907060914_create_posts/up.sql\"]\ndigest = \"abc\"";
-    assert_eq!(
-        normalize_migration_timestamps(a),
-        normalize_migration_timestamps(b),
-        "a second-boundary straddle must not make two identical manifests differ"
-    );
-    assert_eq!(
-        normalize_migration_timestamps(a),
-        "[files.\"migrations/<timestamp>_create_posts/up.sql\"]\ndigest = \"abc\""
-    );
-
-    // A genuine difference must still survive normalization.
-    let different = "[files.\"migrations/20260907060913_create_posts/up.sql\"]\ndigest = \"xyz\"";
-    assert_ne!(
-        normalize_migration_timestamps(a),
-        normalize_migration_timestamps(different),
-        "normalizing the timestamp must not mask a digest change"
-    );
-    let renamed = "[files.\"migrations/20260907060913_create_authors/up.sql\"]\ndigest = \"abc\"";
-    assert_ne!(
-        normalize_migration_timestamps(a),
-        normalize_migration_timestamps(renamed),
-        "normalizing the timestamp must not mask a renamed migration"
-    );
-
-    // Not a 14-digit stamp, and not under `migrations/` — both left alone.
-    assert_eq!(
-        normalize_migration_timestamps("migrations/not_a_stamp/up.sql"),
-        "migrations/not_a_stamp/up.sql"
-    );
-    assert_eq!(
-        normalize_migration_timestamps("src/20260907060913_thing.rs"),
-        "src/20260907060913_thing.rs"
-    );
-}
-
 #[test]
 fn normalized_relative_path_is_separator_agnostic() {
     let root = PathBuf::from("root");
@@ -1311,6 +1285,89 @@ fn normalized_relative_path_is_separator_agnostic() {
     assert_eq!(
         normalized_relative_path(&elsewhere, &root),
         "data/20260827030722_export.csv"
+    );
+}
+
+/// Replace a 14-digit migration timestamp inside a generated file body with a
+/// fixed token.
+///
+/// [`normalized_relative_path`] removes that timestamp from the path. The
+/// bodies carry it too: `.autumn/generated.toml` records every generated file
+/// by path, so it keys two tables on the migration directory. The manifest
+/// spells those keys with `/` on every platform, so one string rule serves all
+/// three.
+fn normalized_timestamps(body: &str) -> String {
+    const PREFIX: &str = "migrations/";
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find(PREFIX) {
+        let (head, tail) = rest.split_at(at + PREFIX.len());
+        out.push_str(head);
+        let is_stamp = tail.len() >= 15
+            && tail.is_char_boundary(14)
+            && tail.as_bytes()[..14].iter().all(u8::is_ascii_digit)
+            && tail.as_bytes()[14] == b'_';
+        if is_stamp {
+            out.push_str("<timestamp>");
+            rest = &tail[14..];
+        } else {
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A second Windows CI failure found the same second-boundary straddle in the
+/// manifest BODY that the path normalization above already covered: two runs
+/// wrote `migrations/20260907015549_create_posts` and `…550_create_posts`, so
+/// the digest tables were keyed differently and the byte-identity gate failed
+/// for a reason the flag under test does not control.
+#[test]
+fn normalized_timestamps_rewrites_only_a_migration_stamp() {
+    assert_eq!(
+        normalized_timestamps(
+            "[files.\"migrations/20260907015549_create_posts/up.sql\"]\ndigest = \"ab\""
+        ),
+        "[files.\"migrations/<timestamp>_create_posts/up.sql\"]\ndigest = \"ab\""
+    );
+
+    // Two stamps in one body are both rewritten, so they cannot disagree.
+    assert_eq!(
+        normalized_timestamps("migrations/20260907015549_a migrations/20260907015550_b"),
+        "migrations/<timestamp>_a migrations/<timestamp>_b"
+    );
+
+    // The two manifest bodies from that failure, trimmed to the keys that
+    // differed, must normalize to one string.
+    let at_49 = "[files.\"migrations/20260907015549_create_posts/up.sql\"]\ndigest = \"7563a7d6\"";
+    let at_50 = "[files.\"migrations/20260907015550_create_posts/up.sql\"]\ndigest = \"7563a7d6\"";
+    assert_ne!(at_49, at_50);
+    assert_eq!(normalized_timestamps(at_49), normalized_timestamps(at_50));
+
+    // Only a 14-digit run directly under `migrations/` and followed by `_`.
+    assert_eq!(
+        normalized_timestamps("migrations/readme_notes/up.sql"),
+        "migrations/readme_notes/up.sql"
+    );
+    assert_eq!(
+        normalized_timestamps("migrations/2026090701554_short_/up.sql"),
+        "migrations/2026090701554_short_/up.sql"
+    );
+    assert_eq!(
+        normalized_timestamps("migrations/20260907015549x_create/up.sql"),
+        "migrations/20260907015549x_create/up.sql"
+    );
+    assert_eq!(
+        normalized_timestamps("data/20260907015549_export.csv"),
+        "data/20260907015549_export.csv"
+    );
+
+    // A truncated tail must not panic or invent a token.
+    assert_eq!(normalized_timestamps("migrations/"), "migrations/");
+    assert_eq!(
+        normalized_timestamps("migrations/20260907015549"),
+        "migrations/20260907015549"
     );
 }
 
@@ -1345,23 +1402,29 @@ fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
                     if rel.contains("master.key") || rel.contains("credentials.enc") {
                         continue;
                     }
+                    // The bodies carry the migration timestamp too — the
+                    // manifest keys a digest table on each generated path — so
+                    // they need the same normalization the path got.
+                    let body = normalized_timestamps(&body);
                     // `.autumn/generated.toml` records the digest of each file
                     // AND the command that wrote it (issue #1835). The two runs
                     // type different commands by construction — that is the
                     // flag under test — so the recorded command differs while
                     // the digests, which describe the output this gate is
                     // about, must not. Compare the digests, drop the command.
+                    //
+                    // Its table keys embed the migration directory too
+                    // (`[files."migrations/20260907011642_create_posts/up.sql"]`),
+                    // so the same second-boundary straddle the path
+                    // normalization above guards against would otherwise
+                    // survive inside this file's body — which is exactly what
+                    // a Windows CI run caught (issue #2590).
                     let body = if rel.ends_with(".autumn/generated.toml") {
-                        // Also normalize the migration timestamp: the manifest
-                        // indexes files by path, so the raw stamp lands in the
-                        // body even though the path itself is normalized above.
-                        normalize_migration_timestamps(
-                            &body
-                                .lines()
-                                .filter(|line| !line.starts_with("invocation = "))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        )
+                        body.lines()
+                            .filter(|line| !line.starts_with("invocation = "))
+                            .map(normalize_migration_stamp)
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     } else {
                         body
                     };

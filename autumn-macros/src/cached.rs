@@ -608,7 +608,24 @@ fn generate_cache_body(
             __autumn_global
                 .as_deref()
                 .unwrap_or(&**__autumn_moka as &dyn ::autumn_web::cache::Cache);
-        let __autumn_key = ::autumn_web::cache::make_cache_key(#id_expr, #key_args);
+        // Fold the ambient resolved tenant into every cache key, unconditionally.
+        // `key(...)` (or the full parameter list, without it) only ever sees this
+        // function's own explicit arguments — never the request's `CURRENT_TENANT`
+        // task-local a `tenant_scoped` repository read filters by — so a cached
+        // function keyed on some other legitimate parameter (a page, a format, a
+        // filter — anything but the tenant) would otherwise share one cache slot
+        // across every tenant that calls it with the same arguments. `None` outside
+        // a tenancy-enabled request (or with tenancy disabled entirely) leaves
+        // single-tenant apps' keys unchanged.
+        let __autumn_tenant_key_component: ::core::option::Option<::std::string::String> =
+            ::autumn_web::tenancy::CURRENT_TENANT
+                .try_with(::std::clone::Clone::clone)
+                .ok()
+                .flatten();
+        let __autumn_key = ::autumn_web::cache::make_cache_key(
+            #id_expr,
+            &(__autumn_tenant_key_component, #key_args),
+        );
     };
 
     if attrs.result {
