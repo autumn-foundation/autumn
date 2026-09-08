@@ -1796,12 +1796,34 @@ pub fn resolve_custom_domain_dns(
     if observed.is_empty() {
         return CustomDomainDns::Unresolved;
     }
-    match grade_dns_verification(&ObservedTarget::Addresses(observed), &expected) {
+    // The VERDICT comes from the runtime grader, so doctor and the app can
+    // never disagree about whether a domain points here. The addresses to SHOW
+    // are recomputed here rather than parsed back out of the grader's message:
+    // reading data out of prose written for a human breaks silently the day
+    // that prose is reworded.
+    let verdict = grade_dns_verification(&ObservedTarget::Addresses(observed.clone()), &expected);
+    match verdict {
         VerificationOutcome::PointsHere => CustomDomainDns::PointsHere,
         VerificationOutcome::Unresolved => CustomDomainDns::Unresolved,
-        VerificationOutcome::PointsElsewhere { detail } => CustomDomainDns::PointsElsewhere {
-            seen: vec![detail.trim_start_matches("resolves to ").to_owned()],
+        VerificationOutcome::PointsElsewhere { .. } => CustomDomainDns::PointsElsewhere {
+            seen: observed
+                .into_iter()
+                .filter(|addr| !ingress_contains(&expected, *addr))
+                .map(|addr| addr.to_string())
+                .collect(),
         },
+    }
+}
+
+/// Is `addr` one of the ingress addresses? Mirrors the runtime's own test, so
+/// the addresses doctor names are exactly the ones the grader rejected.
+fn ingress_contains(
+    expected: &autumn_web::custom_domain::ExpectedIngress,
+    addr: std::net::IpAddr,
+) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => expected.ipv4.contains(&v4),
+        std::net::IpAddr::V6(v6) => expected.ipv6.contains(&v6),
     }
 }
 
@@ -12441,6 +12463,48 @@ pub struct Vault {
             status: status.to_owned(),
             dns,
         }
+    }
+
+    #[test]
+    fn the_probe_names_only_the_addresses_that_are_not_the_ingress() {
+        // The addresses shown are computed, not parsed out of the grader's
+        // human-readable message.
+        let ingress = autumn_web::custom_domain::ExpectedIngress {
+            hostname: None,
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert!(ingress_contains(&ingress, "203.0.113.10".parse().unwrap()));
+        assert!(!ingress_contains(&ingress, "198.51.100.7".parse().unwrap()));
+
+        // An ingress with nothing resolvable is inconclusive, never a failure.
+        let empty = autumn_web::custom_domain::ExpectedIngress::default();
+        assert_eq!(
+            resolve_custom_domain_dns("example.invalid", &empty),
+            CustomDomainDns::IngressUnknown
+        );
+    }
+
+    #[test]
+    fn the_probe_names_only_the_addresses_that_are_not_the_ingress() {
+        // The addresses shown are computed, not parsed back out of the
+        // grader's human-readable message.
+        let ingress = autumn_web::custom_domain::ExpectedIngress {
+            hostname: None,
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert!(ingress_contains(&ingress, "203.0.113.10".parse().unwrap()));
+        assert!(!ingress_contains(&ingress, "198.51.100.7".parse().unwrap()));
+
+        // An ingress that resolves to nothing is inconclusive, never a failure:
+        // doctor must not fail a correctly connected domain just because it
+        // cannot see the ingress from where it runs.
+        let empty = autumn_web::custom_domain::ExpectedIngress::default();
+        assert_eq!(
+            resolve_custom_domain_dns("no-such-host.invalid", &empty),
+            CustomDomainDns::IngressUnknown
+        );
     }
 
     #[test]
