@@ -6396,23 +6396,51 @@ impl AppBuilder {
         // an export advertised as touching nothing must not run it.
         let config = load_config_only(config_loader_factory, plugin_config_roots).await;
 
-        // Run the SAME duplicate-route check the serving path runs before it
-        // mounts anything (`router.rs`). `generate_spec` keys operations by
-        // (path, method), so a collision would silently DROP the earlier one and
-        // `--check` could pass on a contract for an app that cannot start —
-        // reporting a subset of the API as if it were the whole of it.
+        // Run the SERVING PATH'S OWN preflight before emitting anything. An
+        // export that skips a check the router enforces lets `--check` pass for
+        // an application that cannot start — and worse, does so QUIETLY:
+        // `generate_spec` keys operations by (path, method), so a duplicate
+        // silently DROPS the earlier one and the document describes a subset of
+        // the API as though it were the whole of it.
         //
-        // Reusing the serving path's function rather than re-deriving the rule
-        // here: a second copy would drift, which is how several defects on this
-        // branch happened.
-        if let Err(error) = crate::router::reject_duplicate_user_routes(
+        // Every one of these calls the router's own function rather than
+        // re-deriving its rule. A second copy would drift, and a preflight that
+        // disagreed with the router about what it rejects would be worse than
+        // none. The two that used to be inline in `build_router_pre_state` and
+        // `build_openapi_router` were extracted for exactly this, so there is
+        // still one definition per rule.
+        //
+        // Ordered as the serving path orders them, so an app with more than one
+        // problem reports the same first error either way.
+        let registered_versions: std::collections::HashSet<&str> =
+            api_versions.iter().map(|av| av.version.as_str()).collect();
+        let preflight = crate::router::reject_unregistered_api_versions(
             &routes,
             &scoped_groups,
-            &merge_routers,
-            &nest_routers,
-            &declared_routes,
-            &config,
-        ) {
+            &registered_versions,
+        )
+        .and_then(|()| {
+            crate::router::reject_duplicate_user_routes(
+                &routes,
+                &scoped_groups,
+                &merge_routers,
+                &nest_routers,
+                &declared_routes,
+                &config,
+            )
+        })
+        .and_then(|()| crate::router::validate_openapi_mount_paths(&openapi_config))
+        .and_then(|()| {
+            crate::router::reject_openapi_path_collisions(
+                Some(&openapi_config),
+                &routes,
+                &scoped_groups,
+                &merge_routers,
+                &nest_routers,
+                &config,
+            )
+        });
+        if let Err(error) = preflight {
             eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {error}");
             std::process::exit(1);
         }

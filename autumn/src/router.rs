@@ -566,27 +566,7 @@ fn build_router_pre_state(
         .map(|v| v.0.iter().map(|av| av.version.as_str()).collect())
         .unwrap_or_default();
 
-    let check_route_version = |route: &Route| -> Result<(), RouterBuildError> {
-        if let Some(version) = route
-            .api_version
-            .filter(|ver| !registered_versions.contains(*ver))
-        {
-            return Err(RouterBuildError::UnregisteredApiVersion {
-                route_name: route.name.to_string(),
-                version: version.to_string(),
-            });
-        }
-        Ok(())
-    };
-
-    for route in &route_list {
-        check_route_version(route)?;
-    }
-    for group in &ctx.scoped_groups {
-        for route in &group.routes {
-            check_route_version(route)?;
-        }
-    }
+    reject_unregistered_api_versions(&route_list, &ctx.scoped_groups, &registered_versions)?;
 
     // Fail fast when two user- or plugin-registered routes share a `(method,
     // path)`. `group_and_mount_routes` would hand the overlap to
@@ -1203,16 +1183,7 @@ fn build_openapi_router(
     // Validate user-provided paths up front so a typo like
     // `"openapi.json"` surfaces as a recoverable RouterBuildError
     // rather than an axum panic (`Paths must start with a '/'`).
-    validate_route_path("openapi_json_path", &config.openapi_json_path)?;
-    if let Some(path) = &config.swagger_ui_path {
-        validate_route_path("swagger_ui_path", path)?;
-        // Registering two GET handlers on the same path would cause an
-        // axum `Route::route` panic, so reject collisions as a
-        // configuration error instead.
-        if path == &config.openapi_json_path {
-            return Err(RouterBuildError::DuplicateOpenApiPath { path: path.clone() });
-        }
-    }
+    validate_openapi_mount_paths(&config)?;
 
     let docs = collect_openapi_docs(route_list, scoped_groups);
 
@@ -1658,7 +1629,7 @@ fn reject_mcp_path_collisions(
 /// We emit a `tracing::warn!` so operators know the check is
 /// incomplete in that case.
 #[cfg(feature = "openapi")]
-fn reject_openapi_path_collisions(
+pub fn reject_openapi_path_collisions(
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
@@ -1875,6 +1846,63 @@ fn framework_route_clashes(
 /// The first pairwise collision wins: `existing` names the handler that
 /// registered the path first (in the iteration order used by the actual
 /// mount step), `incoming` names the duplicate that triggered the error.
+/// Fail when a route declares an API version that was never registered.
+///
+/// Extracted from `build_router_pre_state`, which used to inline this as a
+/// closure, so the no-boot dump modes can run the SAME rule. `autumn openapi
+/// export` otherwise emitted a document for a versioned app that cannot start
+/// (issue #802). One definition, both callers — a second copy would drift.
+/// Validate the configured `OpenAPI` JSON and Swagger-UI mount paths.
+///
+/// Shared by `build_openapi_router` and the no-boot dump modes: a malformed
+/// path (`"openapi.json"` with no leading slash) or two endpoints on the same
+/// path make the serving router unbuildable, and an export that ignored that
+/// would let `--check` pass for an app that cannot start (issue #802).
+pub fn validate_openapi_mount_paths(
+    config: &crate::openapi::OpenApiConfig,
+) -> Result<(), RouterBuildError> {
+    validate_route_path("openapi_json_path", &config.openapi_json_path)?;
+    if let Some(path) = &config.swagger_ui_path {
+        validate_route_path("swagger_ui_path", path)?;
+        // Registering two GET handlers on the same path would cause an
+        // axum `Route::route` panic, so reject collisions as a
+        // configuration error instead.
+        if path == &config.openapi_json_path {
+            return Err(RouterBuildError::DuplicateOpenApiPath { path: path.clone() });
+        }
+    }
+    Ok(())
+}
+
+pub fn reject_unregistered_api_versions(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    registered_versions: &std::collections::HashSet<&str>,
+) -> Result<(), RouterBuildError> {
+    let check = |route: &Route| -> Result<(), RouterBuildError> {
+        if let Some(version) = route
+            .api_version
+            .filter(|ver| !registered_versions.contains(*ver))
+        {
+            return Err(RouterBuildError::UnregisteredApiVersion {
+                route_name: route.name.to_string(),
+                version: version.to_string(),
+            });
+        }
+        Ok(())
+    };
+
+    for route in route_list {
+        check(route)?;
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            check(route)?;
+        }
+    }
+    Ok(())
+}
+
 /// Fail when two user- or plugin-registered routes share a `(method, path)`.
 ///
 /// `pub` so the no-boot dump modes can run the SAME check the serving path
