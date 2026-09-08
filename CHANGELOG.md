@@ -66,6 +66,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [migration guide](docs/migrations/next.md#authorize-aliased-authorize-and-ambiguous-attribute-shapes-are-now-a-compile-error)
   and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
 
+- **static_get:** **Breaking:** `#[feature_flag]` combined with
+  `#[static_get]` is now a compile error, in either attribute order (🛡
+  Warden). Found during review of the `#[authorize]` fix above: none of
+  `#[secured]`/`#[step_up]`/`#[throttle]`/`#[feature_flag]`'s pre-body
+  `FromRequestParts` gates run on a cached SSG/ISR hit, since the
+  static-first middleware serves it before the inner router — and the
+  handler along with it — is ever reached; the first three were already
+  rejected for exactly this reason, but `#[feature_flag]` never was. A
+  disabled feature flag on a `#[static_get]` route therefore never actually
+  hid the pre-rendered page: the cache would keep serving it regardless of
+  the flag's live value. **Migration:** use `AppBuilder::static_gate`
+  instead, which runs before a cache hit. See the
+  [migration guide](docs/migrations/next.md#static_get-feature_flag-is-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
 ### Performance
 
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new

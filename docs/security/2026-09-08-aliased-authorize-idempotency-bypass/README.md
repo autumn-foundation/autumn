@@ -516,6 +516,86 @@ scenario requires an unrelated crate to coincidentally invent both the same
 macro name *and* the same bespoke argument syntax Autumn uses. Documented
 here rather than left silent.
 
+## Round 8: fixing round 7 for `#[authorize]` broke `#[feature_flag]` + `#[static_get]`
+
+Round 3 added `__AutumnFlagGate_` to `param_helpers::GUARD_GATE_TYPE_PREFIXES`
+so `#[secured]`/`#[step_up]`/`#[throttle]` could see an earlier
+`#[feature_flag]` gate for idempotency-replay-ownership purposes. That list
+turned out to be shared by an entirely unrelated check:
+`static_route.rs`'s `has_any_guard_gate_param` call, used to decide whether
+an *already-expanded* guard is incompatible with `#[static_get]`. Adding
+`__AutumnFlagGate_` to the shared list made that check start rejecting
+`#[feature_flag]` too — but only when `#[feature_flag]` was written *above*
+`#[static_get]` (so its gate had already expanded by the time
+`static_get_macro` ran); the reverse order kept compiling, since
+`feature_flag_macro` never checked for the static-route marker either. An
+unintended, order-dependent compile break, not itself a security issue —
+Codex found it while reviewing round 7's changes.
+
+**Fix (superseded by round 10 below):** added a narrower
+`has_any_auth_guard_gate_param` (secured/step_up/throttle only) and
+switched `static_route.rs`'s check to it, restoring compilation for
+`#[feature_flag] + #[static_get]` in both orders.
+
+## Round 9: the compile-error migration guide overclaimed universality
+
+A P2 finding on the migration guide itself: `reject_if_ambiguous_authorize_shape`
+only scans attributes still present, unexpanded, at the point a route/guard
+macro runs — an aliased or shape-alike attribute positioned *above* the
+route macro expands first (as its own real macro) and is gone from the
+attribute list before this refusal ever sees it. The migration guide's
+prose didn't scope the claim to this ordering.
+
+Verified this ordering doesn't reopen a gap either way: a genuine aliased
+`#[authorize]` positioned there still runs for real and leaves a
+recognizable in-body check every guard macro's existing fallback body-scan
+already detects (the same mechanism that makes a *literal* `#[authorize]`
+above `#[post]` work); an unrelated attribute positioned there just expands
+as itself and leaves nothing authorize-shaped behind, so the route is
+correctly recognized as unguarded. No code change — clarified
+`docs/migrations/next.md` to scope the claim precisely instead of stating
+it unconditionally.
+
+## Round 10: round 8's fix was backwards — `#[feature_flag]` should stay incompatible with `#[static_get]`, for the same reason the other three guards are
+
+Codex review on round 8 pointed out the real, deeper issue round 8 missed
+entirely: `#[static_get]` routes serve cached SSG/ISR hits through the
+static-first middleware, entirely **before** the inner router — and the
+handler, and every one of its pre-body `FromRequestParts` gates — is ever
+reached. That is exactly why `#[secured]`/`#[step_up]`/`#[throttle]`/
+`#[authorize]` are already rejected in combination with `#[static_get]`
+(`static_route.rs`'s own pre-existing `INCOMPATIBLE_GUARD_MSG` documents
+this rationale). `#[feature_flag]`'s pre-body gate has the identical shape
+and the identical blind spot, but was never included in that rejection —
+predating this entire PR, not introduced by it. Round 8's fix made the
+combination *compile*, which is the wrong direction: a
+`#[feature_flag]`-gated `#[static_get]` route looked correctly protected
+but silently wasn't — once a page was cached, disabling the flag afterward
+never stopped the cache from continuing to serve it.
+
+**Fix:** reverted round 8's narrowing (removed
+`has_any_auth_guard_gate_param`/`AUTH_GUARD_GATE_TYPE_PREFIXES` entirely);
+`static_route.rs`'s already-expanded-guard check is back to the broad
+`has_any_guard_gate_param`, which already includes `__AutumnFlagGate_`.
+Added `"feature_flag"` to `INCOMPATIBLE_GUARD_ATTRS` and the diagnostic
+message for the reverse attribute order (still-unexpanded, below
+`#[static_get]`). `feature_flag_macro` now also calls
+`param_helpers::reject_if_incompatible_route_marker`, mirroring
+`secured`/`step_up`/`throttle`/`authorize` — without this, an **aliased**
+`#[feature_flag]` written below `#[static_get]` would slip past
+`static_get_macro`'s literal-name scan (which can't see aliases, the same
+limitation as every other guard) and expand anyway, unprotected. Confirmed
+`#[feature_flag]` doesn't rewrite the handler's return type, so `#[ws]`'s
+separate, differently-reasoned incompatibility list (return-type mismatch,
+not cache-bypass) does not need the same addition.
+
+Since this closes a genuinely pre-existing (not this-PR-introduced) gap —
+`#[feature_flag] + #[static_get]` compiled and silently under-protected on
+trunk before any of this PR's changes — it has its own `CHANGELOG.md`
+`### Security` entry and
+[migration guide section](../../migrations/next.md#static_get-feature_flag-is-now-a-compile-error),
+separate from the `#[authorize]` aliasing entry.
+
 ## 🗂 Ledger
 
 - `trunk-failure.txt` — round-0 RED run (the original runtime bypass)

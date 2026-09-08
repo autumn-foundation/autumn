@@ -600,6 +600,69 @@ See
 [`docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`](../security/2026-09-08-aliased-authorize-idempotency-bypass/README.md)
 for the full threat model and review history.
 
+### static_get: `#[feature_flag]` is now a compile error
+
+**Why:** Found while reviewing the `#[authorize]` fix above. A
+`#[static_get]` route's cache hits are served by the static-first
+middleware before the inner router — and the handler along with it — is
+ever reached, which is exactly why `#[secured]`/`#[step_up]`/`#[throttle]`/
+`#[authorize]` are already refused in combination with it (see
+`static_route.rs`'s existing `INCOMPATIBLE_GUARD_MSG`). `#[feature_flag]`'s
+pre-body gate has the identical shape but was never added to that refusal,
+so a `#[feature_flag]`-gated `#[static_get]` route compiled successfully
+while silently not working the way it looked: once a page was cached, a
+later-disabled flag no longer hid it — the cache kept serving the
+pre-rendered content regardless of the flag's live value.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::static_get("/beta-page")]
+#[autumn_web::feature_flag("beta_page")]
+async fn beta_page() -> &'static str {
+    "..."
+}
+```
+
+This compiled, and pre-rendered/cached the page at build time; disabling
+`beta_page` afterward did not stop the cached page from being served.
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::feature_flags::FeatureFlagService;
+use axum::{extract::{Request, State}, http::StatusCode, middleware::Next, response::Response};
+
+// AppBuilder::static_gate runs a Tower/axum layer before a cache hit, so
+// -- unlike a #[feature_flag] attribute on the handler -- it can actually
+// gate a pre-rendered page.
+async fn beta_page_gate(
+    State(flags): State<FeatureFlagService>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.uri().path() == "/beta-page" && !flags.is_enabled("beta_page", None) {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+    next.run(req).await
+}
+
+let app = autumn_web::app()
+    .static_gate(axum::middleware::from_fn(beta_page_gate));
+
+#[autumn_web::static_get("/beta-page")]
+async fn beta_page() -> &'static str {
+    "..."
+}
+```
+
+**Automation:** `manual` — moving the gate from an attribute to
+`AppBuilder::static_gate` is a structural change no codemod can make safely
+(it needs the app's `AppBuilder` chain, not just the handler function).
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
