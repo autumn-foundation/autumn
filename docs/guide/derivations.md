@@ -45,7 +45,7 @@ argument is the parent model type. Every other key follows in any order.
 | `fk` | the one `#[belongs_to]` leg to that parent, else `{snake(Parent)}_id` | the child column naming the parent. Required when two legs point at one parent |
 | `parent_table` | inferred from the parent type (`Post` gives `posts`) | the parent's table, for a parent that overrides its own |
 | `tenant` | none | tenant-discriminator column, as `counter_cache_tenant`. Must name a field of the child, not renamed with `#[diesel(column_name)]` |
-| `name` | `{parent_table}.{column}` | the registry name, used by the state table and the actuator |
+| `name` | `{parent_table}.{column}` | the registry name, used by the state table and the actuator. Non-empty, at most 128 bytes, no control characters, and not under the framework's reserved `parked::` prefix |
 
 Each key may appear once. A repeated key is a compile error rather than a
 silent last-one-wins.
@@ -170,10 +170,11 @@ At startup, after migrations, the framework checks the registry and then calls
 `_autumn_derivations`. A derivation whose hash matches is left alone, which
 keeps a boot from re-backfilling what it already backfilled. A derivation with
 no row, or with a different hash, is enqueued as `pending` with its checkpoint
-cleared. A derivation with no row under its name, when exactly one row that no
-registered derivation claims carries its hash, has been renamed: that row is
-carried over under the new name, state and checkpoint included, so a rename
-really does cost nothing. The framework then sweeps what was enqueued in a
+cleared. A derivation whose name has no row carrying its hash, when exactly one
+other row does and that row's own name does not claim it, has been renamed: that
+row is carried over under the new name, state and checkpoint included, so a
+rename really does cost nothing. Rows are matched by hash before names, in two
+passes, so two derivations that only swapped names both keep their state. The framework then sweeps what was enqueued in a
 background task, a few batches per pooled connection. A sharded app reconciles and sweeps on every shard primary as
 well as on the control primary.
 

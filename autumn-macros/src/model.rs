@@ -1124,6 +1124,8 @@ fn set_derivation_key<T>(slot: &mut Option<T>, key: &syn::Ident, value: T) -> sy
 /// The name is the primary key of the `_autumn_derivations` state row and the
 /// key of the actuator report, so it stays short enough to index and read.
 const DERIVATION_NAME_MAX_BYTES: usize = 128;
+/// Must match `autumn_web::derivation::PARKING_PREFIX`.
+const DERIVATION_PARKING_PREFIX: &str = "parked::";
 
 /// Reject a `name = "..."` that cannot serve as a registry key.
 fn check_derivation_name(key: &syn::Ident, value: &str) -> syn::Result<()> {
@@ -1133,6 +1135,10 @@ fn check_derivation_name(key: &syn::Ident, value: &str) -> syn::Result<()> {
         "it must be at most 128 bytes"
     } else if value.chars().any(char::is_control) {
         "it must not contain control characters"
+    } else if value.starts_with(DERIVATION_PARKING_PREFIX) {
+        // `ensure_derivations` parks a row being adopted by a renamed
+        // derivation under this prefix between its two passes.
+        "the `parked::` prefix is reserved for the framework"
     } else {
         return Ok(());
     };
@@ -2112,9 +2118,12 @@ fn emit_counter_caches_impl(
     let lock_version_claim = all_fields
         .iter()
         .find(|f| has_attr(f, "lock_version"))
-        .and_then(|field| field.ident.as_ref())
-        .map(|ident| {
-            let column = unraw_ident(ident);
+        .and_then(|field| Some((field, field.ident.as_ref()?)))
+        .map(|(field, ident)| {
+            // The claim names the *database* column: a field Diesel renames
+            // with `#[diesel(column_name = ...)]` stores the token under the
+            // physical name, and that is the name a derivation would spell.
+            let column = diesel_column_name(field).unwrap_or_else(|| unraw_ident(ident));
             quote! {
                 ::autumn_web::reexports::inventory::submit! {
                     ::autumn_web::derivation::CounterCacheClaim {
@@ -4836,17 +4845,38 @@ fn unraw_ident(ident: &syn::Ident) -> String {
 /// Whether a field carries `#[diesel(column_name = ...)]`, which renames the
 /// database column out from under the Rust field name.
 fn field_has_diesel_column_name(field: &syn::Field) -> bool {
-    let mut found = false;
+    diesel_column_name(field).is_some()
+}
+
+/// The database column a field's `#[diesel(column_name = ...)]` names, when it
+/// carries one. Diesel accepts both spellings, `column_name = revision` and
+/// `column_name = "revision"`, and so does this.
+///
+/// A `column_name` whose value is neither is still reported, as an empty name:
+/// this is a detector, not a validator (Diesel's own derive reports malformed
+/// input with a better message), and a caller asking "is this field renamed?"
+/// must not answer "no" because the rename did not parse.
+fn diesel_column_name(field: &syn::Field) -> Option<String> {
+    let mut found = None;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
-        // Swallow any parse error: this is a detector, not a validator —
-        // diesel's own derive reports malformed input with a better message.
+        // Swallow any parse error, for the reason above.
         let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("column_name") {
-                found = true;
-            }
-            let _ = meta
+            let value = meta
                 .value()
                 .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
+            if meta.path.is_ident("column_name") {
+                let name = match value {
+                    Ok(syn::Expr::Path(path)) => {
+                        path.path.get_ident().map(unraw_ident).unwrap_or_default()
+                    }
+                    Ok(syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(lit),
+                        ..
+                    })) => lit.value(),
+                    _ => String::new(),
+                };
+                found = Some(name);
+            }
             Ok(())
         });
     }
@@ -10783,6 +10813,15 @@ mod tests {
     }
 
     #[test]
+    fn derivation_name_under_the_parking_prefix_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "parked::c")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("reserved"), "{message}");
+    }
+
+    #[test]
     fn derivation_name_with_a_control_character_is_rejected() {
         let model: syn::Ident = syn::parse_quote!(Comment);
         let attrs: Vec<syn::Attribute> =
@@ -10914,6 +10953,52 @@ mod tests {
         assert!(
             generated.contains("cannot maintain `posts.id`"),
             "the parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_lock_version_claim_names_the_physical_column() {
+        // The registry matches a derivation's `column` against the claim by
+        // database name, so a `#[diesel(column_name)]` rename must be resolved
+        // rather than recorded under the Rust field name.
+        for rename in [quote! { revision }, quote! { "revision" }] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    pub struct Doc {
+                        #[id]
+                        pub id: i64,
+                        #[lock_version]
+                        #[diesel(column_name = #rename)]
+                        pub version: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("column : \"revision\""),
+                "the claim must carry the physical column: {generated}"
+            );
+            assert!(
+                !generated.contains("column : \"version\""),
+                "the Rust field name is not a column on the table: {generated}"
+            );
+        }
+        let plain = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    #[lock_version]
+                    pub r#version: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            plain.contains("column : \"version\""),
+            "an unrenamed token claims its (unrawed) field name: {plain}"
         );
     }
 

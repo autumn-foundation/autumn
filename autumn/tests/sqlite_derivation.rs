@@ -757,6 +757,94 @@ async fn a_string_filter_compares_bytes_whatever_the_column_collation() {
 }
 
 #[tokio::test]
+async fn two_derivations_that_swapped_names_both_keep_their_state() {
+    // With names swapped, each derivation's own name is occupied by the
+    // other's row, so a name-first match would enqueue both. Matching by
+    // hash carries each row to where its definition now lives.
+    let pool = boot_pool("sd_swap").await;
+    let mut conn = pool.get().await.expect("conn");
+    ensure_derivations(&mut conn).await.expect("first boot");
+    run_backfill(&mut conn, &BackfillOptions::default())
+        .await
+        .expect("finish every backfill");
+    for (name, rows) in [(COUNT_DERIVATION, 3), (SUM_DERIVATION, 5)] {
+        diesel::sql_query("UPDATE _autumn_derivations SET backfilled_rows = ? WHERE name = ?")
+            .bind::<BigInt, _>(rows)
+            .bind::<Text, _>(name)
+            .execute(&mut conn)
+            .await
+            .expect("stamp a distinguishing progress count");
+    }
+    for (from, to) in [
+        (COUNT_DERIVATION, "sd_posts.swapping"),
+        (SUM_DERIVATION, COUNT_DERIVATION),
+        ("sd_posts.swapping", SUM_DERIVATION),
+    ] {
+        diesel::sql_query("UPDATE _autumn_derivations SET name = ? WHERE name = ?")
+            .bind::<Text, _>(to)
+            .bind::<Text, _>(from)
+            .execute(&mut conn)
+            .await
+            .expect("swap the two names as an older binary spelled them");
+    }
+
+    assert!(
+        ensure_derivations(&mut conn)
+            .await
+            .expect("boot after the swap")
+            .is_empty(),
+        "a swap is two renames, and a rename must not enqueue a backfill"
+    );
+    for (name, rows) in [(COUNT_DERIVATION, 3), (SUM_DERIVATION, 5)] {
+        let row = state_of(&pool, name).await;
+        assert_eq!(row.backfill_state, "complete", "{name}");
+        assert_eq!(
+            row.backfilled_rows, rows,
+            "`{name}` must carry its own row's progress, not the other's"
+        );
+    }
+    let status = derivation_status(&mut conn).await.expect("status");
+    assert_eq!(
+        status.len(),
+        3,
+        "no parked or leftover row survives the reconciliation: {status:?}"
+    );
+
+    // A stale occupant under the destination (a definition nothing registered
+    // carries) gives way to the adopted row rather than blocking it.
+    diesel::sql_query(
+        "UPDATE _autumn_derivations SET name = 'sd_posts.legacy_name' WHERE name = ?",
+    )
+    .bind::<Text, _>(COUNT_DERIVATION)
+    .execute(&mut conn)
+    .await
+    .expect("move the row out from under its name");
+    diesel::sql_query(
+        "INSERT INTO _autumn_derivations \
+           (name, definition_hash, backfill_state, checkpoint, backfilled_rows, updated_at) \
+         VALUES (?, 'stale', 'pending', NULL, 0, CURRENT_TIMESTAMP)",
+    )
+    .bind::<Text, _>(COUNT_DERIVATION)
+    .execute(&mut conn)
+    .await
+    .expect("leave a stale occupant under the destination");
+    assert!(
+        ensure_derivations(&mut conn)
+            .await
+            .expect("boot")
+            .is_empty()
+    );
+    let adopted = state_of(&pool, COUNT_DERIVATION).await;
+    assert_eq!(adopted.backfill_state, "complete");
+    assert_eq!(adopted.backfilled_rows, 3);
+    assert_eq!(
+        derivation_status(&mut conn).await.expect("status").len(),
+        3,
+        "the stale occupant is gone, not left as an unregistered leftover"
+    );
+}
+
+#[tokio::test]
 async fn a_renamed_derivation_keeps_its_finished_backfill() {
     // `definition_hash` leaves the name out so that a rename does not enqueue a
     // backfill. That promise needs the state row to follow the name: a row

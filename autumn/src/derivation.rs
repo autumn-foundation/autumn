@@ -46,7 +46,7 @@
 //! * **Observability.** [`derivation_status`](crate::derivation::derivation_status) reports each derivation's state
 //!   and its drift from the source of truth. `/actuator/derivations` serves it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use diesel::sql_types::{BigInt, Nullable, Text};
@@ -624,11 +624,15 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 /// derivation whose hash matches is left exactly as it is, which is what keeps a
 /// boot from re-backfilling everything it already backfilled.
 ///
-/// A derivation with no row under its name but exactly one row that no
-/// registered derivation claims and whose hash is this derivation's is a
-/// rename: `definition_hash` leaves the name out on purpose, so the old row's
+/// A derivation whose name has no row carrying its hash, when exactly one
+/// other row does and that row's own name does not claim it (no derivation is
+/// registered under that name, or one is with a different hash), has been
+/// renamed: `definition_hash` leaves the name out on purpose, so the old row's
 /// state (a finished backfill included) is carried over under the new name
-/// rather than rebuilt from the start.
+/// rather than rebuilt from the start. Rows are matched by hash first and
+/// moved in two passes, so two derivations that only exchanged names both keep
+/// their state, and a row under the destination name with a hash nothing
+/// registered carries is dropped in favour of the adopted one.
 ///
 /// # Changing a definition under a rolling deployment
 ///
@@ -660,37 +664,113 @@ pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Ve
     check_registry(&defs)?;
 
     let state = load_state(conn).await?;
-    let registered: HashSet<&str> = defs.iter().map(|def| def.name).collect();
-    let mut enqueued = Vec::new();
-    for def in defs {
-        let hash = def.definition_hash();
-        match state.get(def.name) {
-            Some(row) if row.definition_hash == hash => continue,
-            Some(_) => {}
-            None => {
-                // Two unregistered rows with one hash cannot both be this
-                // derivation, so only an unambiguous match is adopted.
-                let mut orphans = state
-                    .values()
-                    .filter(|row| !registered.contains(row.name.as_str()))
-                    .filter(|row| row.definition_hash == hash);
-                if let (Some(orphan), None) = (orphans.next(), orphans.next()) {
-                    if rename_state(conn, &orphan.name, def.name, &hash).await? {
-                        continue;
-                    }
-                    // Another replica may have adopted the row first. Then the
-                    // destination now carries this hash, and enqueuing would
-                    // reset the state that replica just preserved.
-                    if state_hash(conn, def.name).await?.as_deref() == Some(hash.as_str()) {
-                        continue;
-                    }
-                }
+    let hashes: Vec<(&DerivationDef, String)> = defs
+        .iter()
+        .map(|def| (*def, def.definition_hash()))
+        .collect();
+    let registered: HashMap<&str, &str> = hashes
+        .iter()
+        .map(|(def, hash)| (def.name, hash.as_str()))
+        .collect();
+    // A row belongs to the derivation it is named after only while their
+    // hashes agree; any other row is up for adoption by the derivation whose
+    // hash it carries, whatever its name.
+    let unclaimed =
+        |row: &StateRow| registered.get(row.name.as_str()) != Some(&row.definition_hash.as_str());
+
+    // Pass one parks every row a renamed derivation can adopt under a name no
+    // derivation uses. Two derivations that only exchanged names each find
+    // the other's row under their own name; moving both out of the way first
+    // is what lets the second pass put each where it now belongs.
+    let mut pending = Vec::new();
+    for (def, hash) in &hashes {
+        if state
+            .get(def.name)
+            .is_some_and(|row| row.definition_hash == *hash)
+        {
+            continue;
+        }
+        // Two adoptable rows with one hash cannot both be this derivation, so
+        // only an unambiguous match is adopted.
+        let mut candidates = state
+            .values()
+            .filter(|row| row.name != def.name && row.definition_hash == *hash)
+            .filter(|row| unclaimed(row));
+        let parked = match (candidates.next(), candidates.next()) {
+            (Some(row), None) => {
+                rename_state(conn, &row.name, &parking_name(def.name), hash).await?
             }
+            _ => false,
+        };
+        pending.push((def, hash.as_str(), parked));
+    }
+
+    let mut enqueued = Vec::new();
+    for (def, hash, parked) in pending {
+        if parked {
+            let parking = parking_name(def.name);
+            match state_hash(conn, def.name).await?.as_deref() {
+                // Another replica settled this name first; the row it chose
+                // stands, and the parked copy would only be a leftover.
+                Some(current) if current == hash => {
+                    delete_state(conn, &parking, None).await?;
+                    continue;
+                }
+                // The occupant carries a definition no longer registered
+                // under this name (or any other, or it would have been
+                // parked too); enqueuing would have overwritten it anyway.
+                Some(_) => delete_state(conn, def.name, Some(hash)).await?,
+                None => {}
+            }
+            if rename_state(conn, &parking, def.name, hash).await? {
+                continue;
+            }
+        }
+        // Another replica may have adopted (or re-enqueued) a row for this name
+        // between the snapshot and here, and then the destination carries this
+        // hash: enqueuing would reset the state that replica just preserved.
+        if state_hash(conn, def.name).await?.as_deref() == Some(hash) {
+            continue;
         }
         enqueue(conn, def).await?;
         enqueued.push(def.name);
     }
     Ok(enqueued)
+}
+
+/// The name a row being adopted by `name` is parked under between the two
+/// passes of [`ensure_derivations`].
+///
+/// No derivation is registered under it (the macro reserves the prefix, and a
+/// generated `table.column` name cannot contain `::`), so a boot interrupted
+/// between the passes leaves a row the next boot adopts the same way, hash
+/// first.
+fn parking_name(name: &str) -> String {
+    format!("{PARKING_PREFIX}{name}")
+}
+
+/// Must match `DERIVATION_PARKING_PREFIX` in `autumn-macros`.
+const PARKING_PREFIX: &str = "parked::";
+
+/// Delete the state row `name`, keeping it when it carries `keep_hash`.
+async fn delete_state(
+    conn: &mut RuntimeConnection,
+    name: &str,
+    keep_hash: Option<&str>,
+) -> AutumnResult<()> {
+    let sql = format!(
+        "DELETE FROM {STATE_TABLE} WHERE name = {} AND definition_hash <> {}",
+        ph(1),
+        ph(2)
+    );
+    diesel::sql_query(sql)
+        .bind::<Text, _>(name)
+        // `<>` against a hash no row carries deletes unconditionally.
+        .bind::<Text, _>(keep_hash.unwrap_or(""))
+        .execute(conn)
+        .await
+        .map_err(AutumnError::from)?;
+    Ok(())
 }
 
 /// The stored hash for `name`, read fresh rather than from the boot's snapshot.

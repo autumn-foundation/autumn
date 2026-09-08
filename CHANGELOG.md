@@ -207,7 +207,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content-addressed by a `definition_hash` over its lowered shape, so a changed
   filter enqueues a resumable, checkpointed, idempotent backfill (`run_backfill`,
   `BackfillOptions`) and a rename or reformat does not (a renamed derivation
-  adopts its old state row, finished backfill included); the framework-owned
+  adopts its old state row, finished backfill included, matched by hash before
+  name so two derivations that swapped names both keep theirs); the framework-owned
   `_autumn_derivations` state table ships as a framework migration, applied
   automatically when a derivation is registered (on every shard primary too).
   Each batch locks its state row, so replicas take turns on one sweep.
@@ -227,7 +228,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rolling deployment that changed a definition needs (see the guide). The
   collision check also covers the column a `#[commentable(counter_cache)]`
   parent keeps, a `#[votable]` model's aggregate column, a repository's
-  `position(...)` ordering column and a model's `#[lock_version]` token,
+  `position(...)` ordering column and a model's `#[lock_version]` token (under
+  its `#[diesel(column_name)]` when it has one),
   string filters cast to `TEXT` so Postgres `citext` compares bytewise too,
   `column = "id"` and a self-referential derivation reading the column it
   maintains are compile errors, `recompute` sweeps a self-referential table
