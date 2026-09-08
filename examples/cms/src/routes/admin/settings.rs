@@ -7,9 +7,8 @@ use autumn_web::reexports::axum::response::Response;
 use serde::Deserialize;
 
 use crate::capabilities::Capability;
-use crate::models::{NewSiteOption, UpdateSiteOption};
 use crate::permalinks::PermalinkStructure;
-use crate::repositories::{PgSiteOptionRepository, SiteOptionRepository as _};
+use crate::repositories::PgSiteOptionRepository;
 use crate::require_capability;
 use crate::settings::Settings;
 use crate::theme;
@@ -210,11 +209,17 @@ pub async fn save(
         ("front_page_id".to_owned(), form.front_page_id.clone()),
     ]);
 
-    for (name, value) in submitted.to_rows() {
-        upsert_option(&repos, name, &value).await?;
-    }
+    // One transaction for the whole form. Committing option by option let two
+    // administrators saving at once interleave into a configuration neither
+    // submitted, and a failure part-way through left the form half-applied
+    // while reporting an error.
+    repos
+        .with_conn(async |conn| crate::content::save_settings(conn, submitted.to_rows()).await)
+        .await?;
 
-    // Discharge the invalidation `SiteOptionRepository` declares. Without it the
+    // Discharge the invalidation `SiteOptionRepository` declares. *After* the
+    // commit, so a reader that repopulates the cache in between cannot cache
+    // the pre-commit values and then have the invalidation land before them. Without it the
     // site would keep serving the old title, theme and permalink structure for
     // up to the 60-second TTL — the settings form would look broken.
     if !PgSiteOptionRepository::invalidate_declared_caches() {
@@ -225,40 +230,4 @@ pub async fn save(
     }
 
     Ok(Redirect::to("/admin/settings").into_response())
-}
-
-/// Write one option, inserting it if it does not exist yet.
-async fn upsert_option(repos: &Repos, name: &str, value: &str) -> AutumnResult<()> {
-    match repos
-        .options
-        .find_by_name(name.to_owned())
-        .await?
-        .into_iter()
-        .next()
-    {
-        Some(existing) => {
-            repos
-                .options
-                .update(
-                    existing.id,
-                    &UpdateSiteOption {
-                        name: autumn_web::hooks::Patch::Unchanged,
-                        value: autumn_web::hooks::Patch::Set(value.to_owned()),
-                        autoload: autumn_web::hooks::Patch::Unchanged,
-                    },
-                )
-                .await?;
-        }
-        None => {
-            repos
-                .options
-                .save(&NewSiteOption {
-                    name: name.to_owned(),
-                    value: value.to_owned(),
-                    autoload: true,
-                })
-                .await?;
-        }
-    }
-    Ok(())
 }

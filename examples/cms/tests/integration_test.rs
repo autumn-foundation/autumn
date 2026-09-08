@@ -4134,3 +4134,158 @@ async fn an_export_round_trip_keeps_the_sticky_flag() {
         restored["posts"][0]
     );
 }
+
+/// A plugin that registers a hook from inside a hook does not hang the request.
+///
+/// `do_action` held the registry's read lock while running listeners, so a
+/// listener calling `add_action` waited on the write lock — `RwLock` is not
+/// reentrant, so the thread waited on itself, forever. Registering from inside
+/// a hook is an ordinary thing for a plugin to do.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_hook_that_registers_a_hook_does_not_deadlock() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    cms::plugins::add_action(
+        cms::plugins::Action::PostSaved,
+        cms::plugins::DEFAULT_PRIORITY,
+        |_| {
+            // The re-entrant call. Before the fix this never returned.
+            cms::plugins::add_filter(
+                cms::plugins::Filter::TheTitle,
+                cms::plugins::DEFAULT_PRIORITY,
+                |title| title,
+            );
+        },
+    );
+
+    // Saving fires `PostSaved`; the request has to come back.
+    let created = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        create_post(&client, &cookie, "Re-entrant", "Body.", "publish"),
+    )
+    .await
+    .expect("saving must not hang while a listener registers another hook");
+    assert!(created > 0);
+}
+
+/// A settings save is all-or-nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn saving_settings_applies_every_option() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[
+            ("site_title", "Renamed Site"),
+            ("tagline", "A new tagline"),
+            ("posts_per_page", "7"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let screen = client
+        .get("/admin/settings")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(screen.contains("Renamed Site"));
+    assert!(screen.contains("A new tagline"));
+    assert!(
+        screen.contains(r#"value="7""#),
+        "the page size stuck:\n{screen}"
+    );
+
+    // And the public site reflects all of it, so the cache was invalidated
+    // after the commit rather than before it.
+    sign_out(&client);
+    client
+        .get("/")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Renamed Site");
+}
+
+/// A long filename does not leave a blob with no attachment row.
+///
+/// The derived title exceeded the model's 300-character limit, so the row was
+/// refused *after* the bytes were already stored — an object invisible in the
+/// media library and impossible to delete through it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_very_long_filename_still_uploads() {
+    let db = TestDb::shared().await;
+    let _ = db_client().await;
+    let uploads = std::env::temp_dir().join(format!(
+        "cms-longname-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&uploads).expect("create the blob store root");
+    let mut config = AutumnConfig::default();
+    config.security.csrf.enabled = false;
+    config.security.submit_token.enabled = false;
+    let store = autumn_web::storage::LocalBlobStore::new(
+        "default".to_owned(),
+        uploads.clone(),
+        "/_blobs".to_owned(),
+        std::time::Duration::from_secs(900),
+        autumn_web::storage::local::SigningKey::new(b"cms-upload-test-key".to_vec()),
+        Vec::new(),
+    )
+    .expect("local blob store");
+    let client = TestApp::new()
+        .routes(app_routes())
+        .config(config)
+        .with_db(db.pool())
+        .state_initializer(move |state| {
+            state.insert_extension::<autumn_web::storage::BlobStoreState>(
+                autumn_web::storage::BlobStoreState::new(std::sync::Arc::new(store)),
+            );
+        })
+        .build();
+    let cookie = register(&client, "owner").await;
+
+    let long_name = format!("{}.txt", "a".repeat(500));
+    let boundary = "----cmsboundary";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+         filename=\"{long_name}\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--{boundary}--\r\n"
+    );
+
+    let resp = client
+        .post("/admin/media")
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(payload)
+        .send()
+        .await;
+    assert_eq!(
+        resp.status,
+        303,
+        "a long filename is a valid upload: {}",
+        resp.text()
+    );
+
+    // It is in the library, so it can be deleted through the UI.
+    client
+        .get("/admin/media")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("aaaa");
+}

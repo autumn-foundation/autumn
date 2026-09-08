@@ -195,7 +195,13 @@ pub async fn upload(
         stored.ok_or_else(|| AutumnError::bad_request_msg("No file was included in the upload"))?;
     let byte_size = i64::try_from(blob.byte_size).unwrap_or(0);
 
-    let created = repos
+    // The bytes are already in the store, so a failed insert has to take them
+    // back out. `display_title` no longer produces an over-length title, but
+    // any other refusal — a slug collision, a transient database error — would
+    // otherwise leave an object no attachment row points at: invisible in the
+    // media library and impossible to delete through it.
+    let key = blob.key.clone();
+    let created = match repos
         .attachments
         .save(&NewAttachment {
             title: display_title(&filename),
@@ -209,7 +215,23 @@ pub async fn upload(
             caption: String::new(),
             uploader_id: Some(user.id),
         })
-        .await?;
+        .await
+    {
+        Ok(created) => created,
+        Err(error) => {
+            // Best effort: the insert failed for its own reason, and that is
+            // what the caller needs to hear. A failed cleanup is logged rather
+            // than replacing it.
+            if let Err(cleanup) = blobs.store().delete(&key).await {
+                autumn_web::reexports::tracing::warn!(
+                    %cleanup,
+                    key = %key,
+                    "failed to remove the blob for an attachment that could not be saved"
+                );
+            }
+            return Err(error);
+        }
+    };
 
     do_action(Action::AttachmentUploaded, created.id);
     Ok(Redirect::to("/admin/media").into_response())
@@ -309,11 +331,21 @@ fn unique_slug(filename: &str, rng: &autumn_web::entropy::Rng) -> String {
         _ => (stem, None),
     };
     let base = autumn_web::slugify(name);
-    let base = if base.is_empty() {
+    let mut base = if base.is_empty() {
         "file".to_owned()
     } else {
         base
     };
+    // Bounded, because this becomes both the public URL segment and the blob
+    // store key. A 500-character filename produced a key the local backend
+    // could not write at all — `File name too long (os error 63)`, a 500 on an
+    // upload that is otherwise perfectly valid, raised before the attachment
+    // row was even attempted. Most filesystems cap a path component at 255
+    // bytes; 100 leaves ample room for the random suffix and the extension.
+    const MAX_SLUG_BASE: usize = 100;
+    if base.chars().count() > MAX_SLUG_BASE {
+        base = base.chars().take(MAX_SLUG_BASE).collect();
+    }
     // A random suffix rather than a counter: a counter needs a read-then-write
     // against the table and still races.
     let uuid = rng.uuid_v4().simple().to_string();
@@ -328,11 +360,22 @@ fn unique_slug(filename: &str, rng: &autumn_web::entropy::Rng) -> String {
 fn display_title(filename: &str) -> String {
     let stem = filename.rsplit('/').next().unwrap_or(filename);
     let name = stem.rsplit_once('.').map_or(stem, |(name, _)| name);
-    if name.trim().is_empty() {
-        "Untitled".to_owned()
-    } else {
-        name.trim().to_owned()
+    let name = name.trim();
+    if name.is_empty() {
+        return "Untitled".to_owned();
     }
+    // Truncated to the model's own limit. A filename long enough to exceed it
+    // is a perfectly valid upload, and letting the derived title fail
+    // validation meant the bytes were already in the store when the row was
+    // refused — an object with no attachment row, unreachable from the media
+    // library and undeletable through it. Truncating at a char boundary; the
+    // filename is not the title's only source of truth, and the editor can
+    // rename.
+    const MAX_TITLE: usize = 300;
+    if name.chars().count() <= MAX_TITLE {
+        return name.to_owned();
+    }
+    name.chars().take(MAX_TITLE).collect()
 }
 
 #[allow(dead_code)]

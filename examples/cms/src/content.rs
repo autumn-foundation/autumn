@@ -90,6 +90,24 @@ pub async fn update_post_with_revision(
         let before = post.clone();
         apply(&mut post);
 
+        // Re-parenting is validated *here*, inside the transaction that writes
+        // it, under an advisory lock over the whole hierarchy. Validating on a
+        // connection released before this one opens let two editors each check
+        // an acyclic tree and both commit the edge that closed a cycle.
+        //
+        // Only a write that actually moves the post takes the lock, so ordinary
+        // edits never contend for it.
+        if post.parent_id != before.parent_id
+            && let Some(parent_id) = post.parent_id
+        {
+            diesel::sql_query(format!(
+                "SELECT pg_advisory_xact_lock({PAGE_HIERARCHY_LOCK_KEY})"
+            ))
+            .execute(conn)
+            .await?;
+            validate_parent(conn, Some(post_id), &post.post_type, parent_id).await?;
+        }
+
         // The same invariants `PostHooks::before_update` enforces. This path
         // writes the fields with plain Diesel — which is what puts the edit and
         // its revision in one transaction, and is also what bypasses the hook —
@@ -792,6 +810,47 @@ pub async fn would_create_cycle(
 }
 
 // ── Accounts ────────────────────────────────────────────────────────────────
+
+/// Advisory-lock key serializing every change to the page hierarchy.
+///
+/// Re-parenting is a read-then-write over the *tree*, not over one row, so no
+/// row lock serializes it: two editors making A a child of B and B a child of A
+/// each validate against a hierarchy that is still acyclic, and both commit —
+/// closing a cycle that makes every page in it unreachable, since page
+/// resolution walks down from a `NULL` parent.
+///
+/// Transaction-scoped, so it is released on commit or rollback, and taken only
+/// by writes that actually move a post: an edit that leaves `parent_id` alone
+/// never contends for it.
+pub const PAGE_HIERARCHY_LOCK_KEY: i64 = 7_717_260_231_002;
+
+/// Persist a whole settings form in one transaction.
+///
+/// Option-by-option commits let two administrators saving at once interleave
+/// into a configuration neither of them submitted, and a failure part-way
+/// through left the form half-applied while reporting an error. One
+/// transaction, and `ON CONFLICT (name)` rather than read-then-write, which
+/// also removes the race inside each individual upsert.
+pub async fn save_settings(
+    conn: &mut AsyncPgConnection,
+    rows: Vec<(&'static str, String)>,
+) -> AutumnResult<()> {
+    conn.transaction(async move |conn| {
+        for (name, value) in rows {
+            diesel::sql_query(
+                "INSERT INTO options (name, value, autoload, updated_at) \
+                 VALUES ($1, $2, TRUE, NOW()) \
+                 ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+            )
+            .bind::<diesel::sql_types::Text, _>(name)
+            .bind::<diesel::sql_types::Text, _>(value)
+            .execute(conn)
+            .await?;
+        }
+        Ok::<_, AutumnError>(())
+    })
+    .await
+}
 
 /// Advisory-lock key serializing every change to the site's administrator set.
 ///

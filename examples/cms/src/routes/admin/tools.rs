@@ -253,36 +253,35 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
             if post.status == "trash" {
                 continue;
             }
+            // Propagated, not swallowed. `.ok()` turned a database error into an
+            // empty username and still produced a file that *looks* like a
+            // valid backup — importing it silently reassigns the post to
+            // whoever ran the import. A backup that is wrong in a way nobody
+            // can see is worse than an export that fails loudly.
             let author = repos
                 .users
                 .find_by_id(post.author_id)
-                .await
-                .ok()
-                .flatten()
+                .await?
                 .map(|u| u.username)
                 .unwrap_or_default();
             // The parent's slug, resolved now while the ids still mean
             // something in this database.
+            // Same reasoning as `author`: a swallowed error here flattens the
+            // page tree in the backup, so a restore puts `/about/team` back at
+            // `/team` and every link to it starts 404ing.
             let parent_slug = match post.parent_id {
-                Some(parent_id) => repos
-                    .posts
-                    .find_by_id(parent_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|parent| parent.slug),
+                Some(parent_id) => repos.posts.find_by_id(parent_id).await?.map(|p| p.slug),
                 None => None,
             };
             let assigned = repos.post_terms(post.id).await?;
             // The featured image by slug, resolved now while the ids still mean
             // something in this database.
+            // And here: swallowing drops the featured image from the backup.
             let featured_media = match post.featured_media_id {
                 Some(media_id) => repos
                     .attachments
                     .find_by_id(media_id)
-                    .await
-                    .ok()
-                    .flatten()
+                    .await?
                     .map(|attachment| attachment.slug),
                 None => None,
             };

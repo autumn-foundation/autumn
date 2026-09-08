@@ -56,8 +56,10 @@ pub enum Filter {
     TheExcerpt,
 }
 
-type ActionFn = Box<dyn Fn(i64) + Send + Sync>;
-type FilterFn = Box<dyn Fn(String) -> String + Send + Sync>;
+/// `Arc` rather than `Box` so a dispatch can *clone the handles it needs and
+/// drop the lock* before running any plugin code. See `do_action`.
+type ActionFn = std::sync::Arc<dyn Fn(i64) + Send + Sync>;
+type FilterFn = std::sync::Arc<dyn Fn(String) -> String + Send + Sync>;
 
 /// Registered listeners, ordered by `(priority, registration order)` — the
 /// `BTreeMap` key — so two listeners at the same priority run in the order they
@@ -86,7 +88,7 @@ pub fn add_action(action: Action, priority: i32, listener: impl Fn(i64) + Send +
     registry.next_seq += 1;
     registry
         .actions
-        .insert((action, priority, seq), Box::new(listener));
+        .insert((action, priority, seq), std::sync::Arc::new(listener));
 }
 
 /// Register a transformer for `filter`. Lower priorities run first, and each
@@ -101,7 +103,7 @@ pub fn add_filter(
     registry.next_seq += 1;
     registry
         .filters
-        .insert((filter, priority, seq), Box::new(transform));
+        .insert((filter, priority, seq), std::sync::Arc::new(transform));
 }
 
 /// Fire every listener registered for `action`.
@@ -112,11 +114,26 @@ pub fn add_filter(
 /// worth *not* reproducing. Work that can fail belongs in a `#[job]`, which a
 /// listener can enqueue.
 pub fn do_action(action: Action, subject_id: i64) {
-    let registry = registry().read().expect("hook registry poisoned");
-    for ((registered, _, _), listener) in &registry.actions {
-        if *registered == action {
-            listener(subject_id);
-        }
+    // The matching handles are cloned and the guard dropped *before* any
+    // listener runs. Holding the read lock across the call deadlocks the
+    // request the moment a listener registers another hook — `add_action` wants
+    // the write lock, `RwLock` is not reentrant, and the thread waits on itself
+    // forever. Registering from inside a hook is a normal thing for a plugin to
+    // do, so the dispatch has to survive it.
+    //
+    // The snapshot is also the right semantics: a listener added *during* this
+    // dispatch belongs to the next one, not to a set already being iterated.
+    let listeners: Vec<ActionFn> = {
+        let registry = registry().read().expect("hook registry poisoned");
+        registry
+            .actions
+            .iter()
+            .filter(|((registered, _, _), _)| *registered == action)
+            .map(|(_, listener)| std::sync::Arc::clone(listener))
+            .collect()
+    };
+    for listener in listeners {
+        listener(subject_id);
     }
 }
 
@@ -124,12 +141,19 @@ pub fn do_action(action: Action, subject_id: i64) {
 /// order, and return the result.
 #[must_use]
 pub fn apply_filters(filter: Filter, value: String) -> String {
-    let registry = registry().read().expect("hook registry poisoned");
+    // Snapshot-then-release, for the same reason as `do_action`.
+    let transforms: Vec<FilterFn> = {
+        let registry = registry().read().expect("hook registry poisoned");
+        registry
+            .filters
+            .iter()
+            .filter(|((registered, _, _), _)| *registered == filter)
+            .map(|(_, transform)| std::sync::Arc::clone(transform))
+            .collect()
+    };
     let mut value = value;
-    for ((registered, _, _), transform) in &registry.filters {
-        if *registered == filter {
-            value = transform(value);
-        }
+    for transform in transforms {
+        value = transform(value);
     }
     value
 }
