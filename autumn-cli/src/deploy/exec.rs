@@ -1804,15 +1804,26 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
     // The recovery line is a command the operator PASTES AND RUNS, so its own
     // operands must be shell-quoted too. Quoting only the outer `echo` makes the
     // text safe to print, not safe to run: a path holding `$(…)` would execute on
-    // paste, and one holding a space would split into two `mv` arguments. The
-    // trailing `*` stays OUTSIDE the quotes so it still globs the sidecars.
+    // paste, and one holding a space would split into two `mv` arguments.
+    //
+    // `&&`, never `;`: a `systemctl stop` can fail (stop timeout, no permission,
+    // a process that will not die). Sequenced with `;` the `mv` runs anyway and
+    // relocates a LIVE database — the split-WAL loss this refusal exists to
+    // prevent. Each step gates the next.
+    //
+    // Sidecars are named, not globbed: `{file}*` also matches an unrelated
+    // `{file}.backup` and would move it, possibly over a file of that name
+    // already in the shared dir. The loop runs last, so a missing sidecar
+    // leaving it non-zero gates nothing.
     let recovery = format!(
         "Run this on the host once, then deploy again: systemctl stop \
-         {blue_q} {green_q}; mv {current_q}* {shared_parent_q}/",
+         {blue_q} {green_q} && mv {current_q} {shared_q} && \
+         for s in -wal -shm -journal; do [ -e {current_q}$s ] && \
+         mv {current_q}$s {shared_q}$s; done",
         blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
         green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
         current_q = shell_quote(&current),
-        shared_parent_q = shell_quote(&shared_parent),
+        shared_q = shell_quote(&shared),
     );
     // A `current` that is a SYMLINK is refused too, and needs its own message:
     // it points at a database the operator manages elsewhere, and `mv` on the
@@ -1828,9 +1839,10 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
     // next deploy creating an empty one — the very loss this refusal prevents.
     let linked_recovery = format!(
         "Run this on the host once, then deploy again: systemctl stop \
-         {blue_q} {green_q}; src=$(readlink -f {current_q}); mv \"$src\" {shared_q}; \
-         for s in -wal -shm -journal; do [ -e \"$src$s\" ] && mv \"$src$s\" {shared_q}$s; \
-         done; rm -f {current_q}",
+         {blue_q} {green_q} && src=$(readlink -f {current_q}) && \
+         mv \"$src\" {shared_q} && rm -f {current_q} && \
+         for s in -wal -shm -journal; do [ -e \"$src$s\" ] && \
+         mv \"$src$s\" {shared_q}$s; done",
         blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
         green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
         current_q = shell_quote(&current),
@@ -7415,14 +7427,15 @@ mod tests {
         // move. Its operands are shell-quoted so the line is safe to paste, and
         // the whole line is one `echo` word, so those quotes appear escaped.
         assert!(
-            op.shell
-                .contains(r"systemctl stop '\''myapp-blue.service'\'' '\''myapp-green.service'\''"),
+            op.shell.contains(
+                r"systemctl stop '\''myapp-blue.service'\'' '\''myapp-green.service'\'' &&"
+            ),
             "the message must name the units to stop: {}",
             op.shell
         );
         assert!(
             op.shell.contains(
-                r"mv '\''/srv/autumn/myapp/current/app.db'\''* '\''/srv/autumn/myapp/shared/data'\''/"
+                r"mv '\''/srv/autumn/myapp/current/app.db'\'' '\''/srv/autumn/myapp/shared/data/app.db'\''"
             ),
             "the message must name the move, sidecars included: {}",
             op.shell
@@ -7507,7 +7520,7 @@ mod tests {
         let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
         assert!(
             op.shell
-                .contains(r"mv '\''/srv/autumn/myapp/current/$(touch pwned).db'\''*"),
+                .contains(r"mv '\''/srv/autumn/myapp/current/$(touch pwned).db'\'' "),
             "the pasted `mv` must carry the path as a quoted word: {}",
             op.shell
         );
@@ -7518,7 +7531,7 @@ mod tests {
         let op = sqlite_data_link_op(&spaced, RELEASE_DIR).expect("linked");
         assert!(
             op.shell
-                .contains(r"mv '\''/srv/autumn/myapp/current/app data.db'\''*"),
+                .contains(r"mv '\''/srv/autumn/myapp/current/app data.db'\'' "),
             "the source must be one quoted word: {}",
             op.shell
         );
@@ -7561,7 +7574,7 @@ mod tests {
         // next deploy then creates an empty database at the name it does expect.
         assert!(
             op.shell.contains(
-                r#"src=$(readlink -f '\''/srv/autumn/myapp/current/app.db'\''); mv "$src" '\''/srv/autumn/myapp/shared/data/app.db'\''"#
+                r#"src=$(readlink -f '\''/srv/autumn/myapp/current/app.db'\'') && mv "$src" '\''/srv/autumn/myapp/shared/data/app.db'\''"#
             ),
             "the symlink recovery must move the target to the exact shared path: {}",
             op.shell
@@ -7572,6 +7585,47 @@ mod tests {
                 r#"do [ -e "$src$s" ] && mv "$src$s" '\''/srv/autumn/myapp/shared/data/app.db'\''$s"#
             ),
             "each sidecar must move to the matching shared name: {}",
+            op.shell
+        );
+    }
+
+    /// Both printed recoveries must GATE the move on the stop succeeding, and
+    /// must name the sidecars instead of globbing.
+    ///
+    /// `systemctl stop` can fail — a stop timeout, no permission, a process that
+    /// will not die. Sequenced with `;` the `mv` runs regardless and relocates a
+    /// LIVE database, which is the split-WAL loss the refusal exists to prevent.
+    /// And `<file>*` also matches an unrelated `<file>.backup`, moving it and
+    /// possibly overwriting a file of that name already in the shared dir.
+    #[test]
+    fn both_recoveries_gate_the_move_on_the_stop_and_never_glob() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // One `echo` word per line, so the operand quoting appears escaped.
+        for line in ["systemctl stop", "readlink -f"] {
+            assert!(op.shell.contains(line), "expected {line} in: {}", op.shell);
+        }
+        // Every printed `systemctl stop` gates what follows with `&&`, never `;`.
+        for (index, _) in op.shell.match_indices("systemctl stop") {
+            let rest = op.shell.get(index..).unwrap_or_default();
+            let gate = rest.find("&&").unwrap_or(usize::MAX);
+            let seq = rest.find(';').unwrap_or(usize::MAX);
+            assert!(
+                gate < seq,
+                "the stop must gate the move with `&&` before any `;`: {}",
+                op.shell
+            );
+        }
+        // Neither recovery globs the database name.
+        assert!(
+            !op.shell.contains("app.db'\''*") && !op.shell.contains("app.db*"),
+            "sidecars must be named, not globbed: {}",
+            op.shell
+        );
+        // Both name the three real sidecar suffixes instead.
+        assert_eq!(
+            op.shell.matches("for s in -wal -shm -journal").count(),
+            3,
+            "the op plus both recoveries each enumerate the sidecars: {}",
             op.shell
         );
     }
