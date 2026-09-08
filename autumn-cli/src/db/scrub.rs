@@ -2645,6 +2645,10 @@ fn classify_and_apply(
                             "randomized"
                         }
                     );
+                    eprintln!(
+                        "  {}",
+                        encrypted_rewrite_stop(&table.table, &rewrite.column)
+                    );
                 }
             }
             // Last, exactly as `execute` runs it: the pass that makes "emptied"
@@ -3967,6 +3971,40 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
     )
 }
 
+/// Stop a pasted script where an encrypted column would be rewritten.
+///
+/// The rewrite is done per row in Rust: a fabricated value encrypted under the
+/// TARGET's key. Expressing it as SQL would mean embedding that key in a script
+/// meant to be pasted and shared, which is the one thing the printed conninfo
+/// goes out of its way not to do. So this is the one statement the dry run
+/// cannot print truthfully.
+///
+/// Printing a comment there and committing anyway is what the previous version
+/// did, and it produced exactly the state this command promises is impossible.
+/// Measured: pasting the advertised script against a schema with one
+/// `#[encrypted]` column left `users` sampled 200 -> 100 with every address
+/// rewritten AND all 100 kept rows still holding their original production
+/// ciphertext — a sampled-but-unscrubbed copy, committed without a single error.
+///
+/// So the block is made to fail where it cannot tell the truth. The whole script
+/// still prints and still reads, which is what `--dry-run` is for; pasting it
+/// now aborts the transaction here and rolls everything back rather than
+/// committing a copy that looks scrubbed and is not.
+fn encrypted_rewrite_stop(table: &str, column: &str) -> String {
+    let body = format!(
+        " BEGIN RAISE EXCEPTION {message}, {table}, {column}; END ",
+        table = quote_literal(table),
+        column = quote_literal(column),
+        message = quote_literal(
+            "%.% is #[encrypted]: the scrub re-encrypts it per row under the target's key, \
+             which cannot be printed as SQL without embedding that key. This script cannot \
+             be run to completion — run `autumn db scrub` without --dry-run to apply it."
+        ),
+    );
+    let tag = sample::dollar_tag(&body);
+    format!("DO {tag}{body}{tag};")
+}
+
 /// Abort the transaction unless the session is on the target this block is for.
 ///
 /// `\connect` does NOT close the old connection when the new one fails. Measured
@@ -4482,6 +4520,46 @@ mod tests {
     use super::{emptiness_assertion, integrity_assertion, rules_reaching, triggers_reaching};
 
     // ── The dry run's session and connection preamble ──────────────────────
+
+    /// The one statement the dry run cannot print truthfully makes the script
+    /// stop, instead of committing a copy that looks scrubbed and is not.
+    ///
+    /// Measured: before this, pasting the advertised script against a schema
+    /// with one `#[encrypted]` column left `users` sampled 200 -> 100 with every
+    /// address rewritten AND all 100 kept rows still holding their original
+    /// production ciphertext, committed without a single error. After, the same
+    /// paste aborts and rolls back: 200 users, 200 original ciphertexts, 200
+    /// original addresses.
+    #[test]
+    fn an_encrypted_rewrite_stops_a_pasted_script() {
+        let stop = super::encrypted_rewrite_stop("users", "api_token");
+        assert!(
+            stop.contains("RAISE EXCEPTION"),
+            "it must abort the transaction, not merely say something: {stop}"
+        );
+        assert!(
+            stop.contains("'users'") && stop.contains("'api_token'"),
+            "and name the column that cannot be printed: {stop}"
+        );
+        assert!(
+            stop.contains("without --dry-run"),
+            "and say what to run instead: {stop}"
+        );
+        // The key is the reason this cannot be printed as SQL, so it must not
+        // appear in the reason either.
+        assert!(
+            !stop.to_lowercase().contains("primary_key")
+                && !stop.contains("deterministic_key")
+                && !stop.contains("key_derivation_salt"),
+            "no key material may reach the printed script: {stop}"
+        );
+        // Identifiers reach SQL as literals here like everywhere else.
+        let hostile = super::encrypted_rewrite_stop("it's", "c'ol");
+        assert!(
+            hostile.contains("'it''s'") && hostile.contains("'c''ol'"),
+            "a quote must not break out of the literal: {hostile}"
+        );
+    }
 
     /// A failed `\connect` leaves psql on the PREVIOUS database, so the block
     /// proves where it is before it writes — and proves the whole endpoint.

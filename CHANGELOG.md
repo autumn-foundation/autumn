@@ -115,6 +115,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and
   emitted after the session pins, so a `public.current_database()` in the pasting
   session's `search_path` cannot answer for the catalog.
+  Where a schema has an `#[encrypted]` column, the printed script now STOPS at
+  that rewrite rather than commenting past it: the value is re-encrypted per row
+  under the target's key, which cannot be printed as SQL without embedding that
+  key, and committing anyway produced a sampled copy still holding the original
+  production ciphertext with every other column scrubbed — the one state this
+  command promises is impossible. The whole script still prints and still reads;
+  pasting it now aborts and rolls back instead.
   `--dry-run` also refuses a target configured with a keyword-form connection string
   (`host=... password=...`): each printed block is destructive and the `\connect`
   line above it is what points `psql` at the right database, but a keyword-form

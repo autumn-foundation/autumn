@@ -460,6 +460,16 @@ aborted`, and the closing `COMMIT` rolls back. That guard is printed and never
 executed by `autumn db scrub` itself, which opens its own connection and cannot
 be on the wrong database.
 
+One statement the dry run cannot print truthfully is the rewrite of an
+`#[encrypted]` column: the scrub encrypts a fabricated value per row under the
+**target's** key, and expressing that as SQL would mean embedding that key in a
+script meant to be pasted and shared. The script therefore stops there. It still
+prints in full and still reads in full — which is what `--dry-run` is for — but
+pasting it aborts the transaction at that point and rolls everything back, rather
+than committing a copy whose other columns are scrubbed and whose encrypted ones
+still hold the original production ciphertext. Run without `--dry-run` to apply
+it for real.
+
 The walk prints as the loop it is — a `DO` block that repeats the pass and stops on one
 that selects nothing — rather than as a single pass with a comment saying to
 repeat it. The difference is not cosmetic: within a pass the statements run in
