@@ -512,6 +512,67 @@ that means "HTTP-01" from one whose author intended to configure DNS-01;
 defaulting to `None` silently would be right in the first case and wrong in the
 second, which is exactly the choice a human should make.
 
+### Authorize: aliased `#[authorize]` and ambiguous attribute shapes are now a compile error
+
+**Why:** A security review (🛡 Warden) found that `#[authorize]` reached
+through `use ::autumn_web::authorize as x;` was invisible to the
+macro-expansion-time checks that decide who serves a cached
+`.idempotent()` reply — because a proc-macro attribute only ever sees the
+tokens of the item it annotates, never the enclosing module's `use`
+declarations. That let an idempotency-replay cache serve a stale "allowed"
+response after the requester's authorization was revoked, skipping
+`#[authorize]`'s policy re-check entirely. A syntactic heuristic (detecting
+`#[authorize]` by its argument *shape* instead of its literal name) was
+tried and found unsafe in the *other* direction during review: it could
+misclassify an unrelated attribute that happens to share the same argument
+grammar, silently breaking `.idempotent()`'s dedup guarantee instead. No
+heuristic can resolve the ambiguity correctly in both directions, so Autumn
+now refuses to compile it.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::authorize as authz; // or any other alias
+
+#[autumn_web::post("/notes/{id}")]
+#[authz("update", resource = Note)]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // ...
+}
+```
+
+This compiled — and, with `AppBuilder::idempotent()` turned on, was
+vulnerable to the stale-replay bypass above.
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::authorize; // spell it by its real name — no alias
+
+#[autumn_web::post("/notes/{id}")]
+#[authorize("update", resource = Note)]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // ...
+}
+```
+
+`#[authorize]` used under its literal name, exactly as every other
+Autumn macro can be, is unaffected — this only closes the alias case.
+
+If instead the compile error fires on an attribute that is genuinely
+**not** `#[authorize]` (a custom or third-party attribute that happens to
+share its `"action", resource = Type[, from = ident]` argument grammar —
+an `#[audit("update", resource = Note)]`, say), rename that attribute so
+its shape no longer collides. Autumn cannot tell the two cases apart from
+tokens alone, which is exactly why it refuses both rather than guessing.
+
+**Automation:** `manual` — the fix is a `use` statement and an attribute
+spelling change (or renaming an unrelated attribute), which depends on
+which of the two cases above applies; no mechanical rewrite can tell them
+apart. See
+[`docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`](../security/2026-09-08-aliased-authorize-idempotency-bypass/README.md)
+for the full threat model and review history.
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that

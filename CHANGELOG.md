@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-application, no ordering change for direct requests). See
   `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
 
-- **BREAKING: `#[authorize]` reached through a `use ... as ...` alias is now
-  a compile error instead of a silent stale-authorization gap (🛡 Warden):**
+- **authorize:** **Breaking:** `#[authorize]` reached through a
+  `use ... as ...` alias is now a compile error instead of a silent
+  stale-authorization gap (🛡 Warden).
   `idempotency_guard::has_pending_authorize_attr` (used by
   `#[secured]`/`#[step_up]`/`#[throttle]`'s pre-body gates to decide who
   owns serving a cached idempotency replay) and `route::has_authorize_guard`
@@ -61,8 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Migration:** spell `#[authorize(...)]` by its real name at the call site
   (no other Autumn macro's aliasing is affected); if the compile error fires
   on an unrelated attribute that happens to share the same argument shape,
-  rename that attribute. See
-  `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+  rename that attribute. See the
+  [migration guide](docs/migrations/next.md#authorize-aliased-authorize-and-ambiguous-attribute-shapes-are-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
 
 ### Changed
 
