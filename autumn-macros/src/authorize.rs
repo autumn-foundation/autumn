@@ -381,25 +381,47 @@ pub fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArg
     Ok(parsed)
 }
 
-/// Whether `attr` is literally spelled `#[authorize(...)]`.
+/// Whether `attr` is spelled `#[authorize(...)]` (or reached under a path
+/// ending in `authorize`) *and* carries `#[authorize]`'s own argument
+/// grammar (`"action", resource = Type[, from = ident]`, both `action` and
+/// `resource` present).
 ///
-/// Deliberately name-only: a proc-macro attribute never sees the enclosing
-/// module's `use` declarations, so there is no reliable way to tell an
-/// aliased `use ::autumn_web::authorize as x; #[x(...)]` apart from an
-/// unrelated attribute that happens to share `#[authorize]`'s exact argument
-/// grammar (`"action", resource = Type[, from = ident]`) — including one
-/// that also happens to sit on a handler with a matching parameter name,
-/// which a first attempt at this check used as an extra filter and Codex
-/// review on #2628 showed still collides for a plausible `#[audit(...)]`-
-/// style attribute. Guessing either way is unsafe: treating every alias as
-/// "not authorize" reopens a demonstrated authorization bypass (a stale
-/// idempotency replay skips `#[authorize]`'s policy re-check); treating
-/// every shape-alike as "authorize" silently drops `.idempotent()`'s dedup
-/// guarantee for a route whose real owner never materializes.
+/// Name alone is not enough: a proc-macro attribute never sees the
+/// enclosing module's `use` declarations, so there is no reliable way to
+/// tell Autumn's real `#[authorize]`, reached under an import alias
+/// (`use ::autumn_web::authorize as x; #[x(...)]`), apart from an unrelated
+/// attribute that happens to share its exact argument grammar under a
+/// different name — including one that also happens to sit on a handler
+/// with a matching parameter name, which a first attempt at this check used
+/// as an extra filter and Codex review on #2628 showed still collides for a
+/// plausible `#[audit(...)]`-style attribute. Guessing either way is
+/// unsafe: treating every alias as "not authorize" reopens a demonstrated
+/// authorization bypass (a stale idempotency replay skips `#[authorize]`'s
+/// policy re-check); treating every shape-alike as "authorize" silently
+/// drops `.idempotent()`'s dedup guarantee for a route whose real owner
+/// never materializes. So name mismatches are never guessed at here — see
+/// [`reject_if_ambiguous_authorize_shape`], which turns that case into a
+/// compile error instead.
 ///
-/// So this stays exact-name-only, and [`reject_if_ambiguous_authorize_shape`]
-/// turns the genuinely ambiguous case into a compile error instead of a
-/// guess in either direction.
+/// Name alone is *also* not enough in the other direction: a literally-
+/// named `#[authorize(...)]` is just as invisible to real macro-identity
+/// resolution as an alias is, so an entirely unrelated attribute macro
+/// that merely happens to be imported (or reachable via a qualified path)
+/// as `authorize` would be misclassified as Autumn's own guard by a
+/// name-only check, again suppressing replay-layer protection for a route
+/// with no real authorization check on it (Codex review on #2628, seventh
+/// finding). Requiring the grammar too closes the overwhelming majority of
+/// that gap without rejecting Autumn's own legitimate usage: a genuine
+/// `#[authorize(...)]` call with malformed arguments fails to compile
+/// regardless (`authorize_macro` itself requires `action` and `resource`),
+/// so no running binary can ever depend on this function's answer being
+/// "present" for a call that isn't valid Autumn syntax. What remains is the
+/// far narrower coincidence of an unrelated macro reachable as `authorize`
+/// that *also* happens to accept the exact `"action", resource = Type[, from
+/// = ident]` shape — implausible enough (an unrelated crate would have to
+/// coincidentally invent the same bespoke calling convention) that no
+/// further heuristic is warranted; see the security ledger for this
+/// residual, accepted limitation.
 ///
 /// Deliberately does *not* special-case `#[cfg_attr(predicate, ...)]`: an
 /// earlier revision added recursive `cfg_attr`-unwrapping here on the theory
@@ -418,7 +440,7 @@ pub fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArg
 /// resolved to a plain attribute by the time this scan runs, and the
 /// unwrapping code was dead: never reached, and removed.
 pub fn attr_is_authorize_shaped(attr: &syn::Attribute, _input_fn: &syn::ItemFn) -> bool {
-    meta_is_literally_authorize(&attr.meta)
+    meta_is_literally_authorize(&attr.meta) && meta_has_authorize_arg_shape(&attr.meta)
 }
 
 fn meta_is_literally_authorize(meta: &syn::Meta) -> bool {
@@ -428,13 +450,10 @@ fn meta_is_literally_authorize(meta: &syn::Meta) -> bool {
         .is_some_and(|segment| segment.ident == "authorize")
 }
 
-/// Whether `meta` is *not* literally `#[authorize(...)]` but parses through
-/// its argument grammar with both the required `action` and `resource`
-/// present.
-fn meta_is_ambiguous_authorize_shape(meta: &syn::Meta) -> bool {
-    if meta_is_literally_authorize(meta) {
-        return false;
-    }
+/// Whether `meta`'s arguments parse through `#[authorize]`'s own grammar
+/// with both the required `action` and `resource` present, independent of
+/// what `meta` is named.
+fn meta_has_authorize_arg_shape(meta: &syn::Meta) -> bool {
     let syn::Meta::List(list) = meta else {
         return false;
     };
@@ -442,6 +461,16 @@ fn meta_is_ambiguous_authorize_shape(meta: &syn::Meta) -> bool {
         return false;
     };
     args.action.is_some() && args.resource.is_some()
+}
+
+/// Whether `meta` is *not* literally `#[authorize(...)]` but parses through
+/// its argument grammar with both the required `action` and `resource`
+/// present.
+fn meta_is_ambiguous_authorize_shape(meta: &syn::Meta) -> bool {
+    if meta_is_literally_authorize(meta) {
+        return false;
+    }
+    meta_has_authorize_arg_shape(meta)
 }
 
 /// Refuses to compile a handler carrying an attribute that shares
@@ -492,7 +521,7 @@ mod tests {
     //    (Codex review on #2628 — two rounds) ────────────────────────────────
 
     #[test]
-    fn attr_is_authorize_shaped_is_name_only() {
+    fn attr_is_authorize_shaped_requires_name_and_grammar() {
         // A first attempt at this check fell back to parsing the attribute's
         // argument shape when the name didn't match literally (to catch an
         // aliased #[authorize]), then narrowed that to also require a
@@ -500,9 +529,9 @@ mod tests {
         // narrowed version still collides with a plausible #[audit(...)]-
         // style attribute stacked on a handler that legitimately has a
         // same-named resource parameter. There is no shape-based check that
-        // is safe in both directions, so this function is exact-name-only —
-        // disambiguation happens at compile time instead, in
-        // `reject_if_ambiguous_authorize_shape`.
+        // is safe as a *fallback for a name mismatch*, so a different name
+        // is never guessed at here — disambiguation happens at compile time
+        // instead, in `reject_if_ambiguous_authorize_shape`.
         let input_fn: syn::ItemFn = syn::parse_quote! {
             async fn h(note: Note) -> &'static str { "ok" }
         };
@@ -519,6 +548,31 @@ mod tests {
 
         let literal: syn::Attribute = syn::parse_quote! { #[authorize("update", resource = Note)] };
         assert!(attr_is_authorize_shaped(&literal, &input_fn));
+    }
+
+    #[test]
+    fn attr_is_authorize_shaped_rejects_a_same_named_attribute_with_a_different_grammar() {
+        // Codex review on #2628 (seventh finding): the literal name alone
+        // isn't proof of identity either -- an entirely unrelated attribute
+        // macro reachable as `authorize` (imported from elsewhere, or
+        // aliased to that name) would pass a name-only check just as easily
+        // as Autumn's own. Requiring the grammar too closes the vast
+        // majority of that gap without rejecting any genuine Autumn call:
+        // a real `#[authorize(...)]` with malformed arguments fails to
+        // compile via `authorize_macro`'s own validation regardless of what
+        // this function answers.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn h() -> &'static str { "ok" }
+        };
+        let wrong_grammar: syn::Attribute = syn::parse_quote! { #[authorize(skip(note))] };
+        assert!(
+            !attr_is_authorize_shaped(&wrong_grammar, &input_fn),
+            "a same-named attribute that doesn't carry #[authorize]'s own argument shape must \
+             not be treated as Autumn's real guard"
+        );
+
+        let no_args: syn::Attribute = syn::parse_quote! { #[authorize] };
+        assert!(!attr_is_authorize_shaped(&no_args, &input_fn));
     }
 
     #[test]
