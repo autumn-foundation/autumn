@@ -54,11 +54,21 @@ pub struct MemorySearchBackend {
 /// instructions. A document's tokens don't change between searches, only
 /// between writes, so they are computed once here, in [`MemorySearchBackend::write`],
 /// and reused by every later `score` call until the document is rewritten.
+///
+/// Tokens are stored as **counts**, not a flat list: `score` only ever needs
+/// "does query token X appear in this field, and how many times", and a query
+/// has far fewer tokens than a field has words (2 vs. ~200 in the
+/// `benches/keyword_search.rs` corpus). A `Vec<String>` forced `score` to
+/// compare every field token against every query token
+/// (`field_tokens.len() * tokens.len()` string equality checks); a
+/// `HashMap<String, u32>` turns that into one hash lookup per query token,
+/// independent of how long the field is.
 #[derive(Debug, Clone)]
 struct StoredDocument {
     indexed: IndexedDocument,
-    /// Tokens of `indexed.document.fields[i].value`, aligned by index.
-    field_tokens: Vec<Vec<String>>,
+    /// Token → occurrence count within `indexed.document.fields[i].value`,
+    /// aligned by index.
+    field_tokens: Vec<HashMap<String, u32>>,
 }
 
 impl StoredDocument {
@@ -67,7 +77,16 @@ impl StoredDocument {
             .document
             .fields
             .iter()
-            .map(|field| tokenize(&field.value).collect())
+            .map(|field| {
+                let mut counts: HashMap<String, u32> = HashMap::new();
+                for token in tokenize(&field.value) {
+                    counts
+                        .entry(token)
+                        .and_modify(|count| *count = count.saturating_add(1))
+                        .or_insert(1);
+                }
+                counts
+            })
             .collect();
         Self {
             indexed,
@@ -288,10 +307,14 @@ impl MemorySearchBackend {
 /// changed, and any of those could otherwise promote a `D` field to `A` and
 /// reorder someone else's results. A field the index does not declare is
 /// skipped entirely, so it contributes neither score nor a token match.
+///
+/// A per-field occurrence count realistically never approaches 2^24, so the
+/// `u32`-to-`f32` widening below cannot lose precision in practice.
+#[allow(clippy::cast_precision_loss)]
 fn score(
     definition: &IndexDefinition,
     document: &IndexedDocument,
-    field_tokens: &[Vec<String>],
+    field_tokens: &[HashMap<String, u32>],
     tokens: &[String],
 ) -> Option<f32> {
     let mut total = 0.0_f32;
@@ -305,13 +328,11 @@ fn score(
             continue;
         };
         let factor = weight_factor(weight);
-        for field_token in field_tokens {
-            for (index, query_token) in tokens.iter().enumerate() {
-                if field_token == query_token {
-                    total += factor;
-                    if let Some(slot) = matched.get_mut(index) {
-                        *slot = true;
-                    }
+        for (index, query_token) in tokens.iter().enumerate() {
+            if let Some(&count) = field_tokens.get(query_token.as_str()) {
+                total = factor.mul_add(count as f32, total);
+                if let Some(slot) = matched.get_mut(index) {
+                    *slot = true;
                 }
             }
         }

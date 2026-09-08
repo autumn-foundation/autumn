@@ -24,3 +24,7 @@ autumn-cli/tests/golden/** text eol=lf
 # Fuzz corpus seeds are byte-exact regression inputs (MIME bodies where CRLF is
 # semantically meaningful); never normalize or diff them as text.
 fuzz/corpus/** binary
+
+# Same reason: the react-graphql example diff-tests this committed SDL against
+# the schema it serves via include_str!; CRLF on checkout would fail the gate.
+examples/react-graphql/schema.graphql text eol=lf

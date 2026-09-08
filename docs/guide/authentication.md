@@ -140,7 +140,7 @@ cannot be replayed afterwards.
 [session]
 backend      = "memory"       # "memory" | "redis"
 cookie_name  = "autumn.sid"
-max_age_secs = 86400          # 24 hours
+max_age_secs = 86400          # session TTL in seconds — 24 hours
 secure       = true           # HTTPS-only
 http_only    = true           # invisible to JavaScript
 same_site    = "Lax"

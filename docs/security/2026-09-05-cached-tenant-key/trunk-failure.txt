@@ -1,0 +1,29 @@
+$ cargo test -p autumn-web --test warden_scratch_cached_tenant --features "db,cache-moka,test-support" -- --nocapture
+(scratch verification harness — identical logic to the committed
+`autumn/tests/integration/cached_tenant_scope.rs`, but its `setup_pool()`
+points at a natively-installed PostgreSQL 16 service on 127.0.0.1:5432
+instead of spinning up a `testcontainers` container — this sandbox had no
+Docker daemon available. `autumn-macros/src/cached.rs` was reverted to its
+pre-fix state via `git stash` for this run, and restored immediately after.)
+
+running 1 test
+
+thread 'cached_tenant_scoped_read_leaks_across_tenants' (9171) panicked at autumn/tests/warden_scratch_cached_tenant.rs:170:5:
+tenant B received tenant A's cached #[cached] response body: "csv:tenant-a-sentinel" (the cache key never carried the resolved tenant)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: {async_block#0}
+             at ./tests/warden_scratch_cached_tenant.rs:170:5
+   [... tokio runtime frames omitted ...]
+  24: cached_tenant_scoped_read_leaks_across_tenants
+             at ./tests/warden_scratch_cached_tenant.rs:180:6
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test cached_tenant_scoped_read_leaks_across_tenants ... FAILED
+
+failures:
+    cached_tenant_scoped_read_leaks_across_tenants
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+error: test failed, to rerun pass `-p autumn-web --test warden_scratch_cached_tenant`

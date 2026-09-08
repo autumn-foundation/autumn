@@ -51,7 +51,7 @@ const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfN
 /// cannot create a duplicate account — no client-side JavaScript involved. A
 /// new token is minted on every render (including this error re-render), so the
 /// corrected resubmit carries a fresh token rather than a spent one.
-fn signup_page(min_len: usize, submit_token: &str, error: Option<&str>) -> Markup {
+fn signup_page(min_len: usize, submit_token: &str, email: &str, error: Option<&str>) -> Markup {
     layout(
         "Sign up",
         false,
@@ -64,7 +64,7 @@ fn signup_page(min_len: usize, submit_token: &str, error: Option<&str>) -> Marku
                 input type="hidden" name="_submit_token" value=(submit_token);
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -89,6 +89,7 @@ pub async fn signup_form(State(state): State<AppState>, submit_token: SubmitToke
     signup_page(
         state.config_arc().auth.password.min_length,
         submit_token.token(),
+        "",
         None,
     )
 }
@@ -104,27 +105,42 @@ pub async fn signup(
     mut db: Db,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {
+    // `config_arc` shares the resolved config behind an `Arc`; `config()` would
+    // deep-clone every section just to read `[auth.password]` on a request path.
+    // Read once up front so every re-render below (including the two input
+    // checks that used to bypass the form entirely) can reach `min_length`.
+    let config = state.config_arc();
+    let password_cfg = &config.auth.password;
+
     let email = form.email.trim().to_lowercase();
     // Cap input lengths so an attacker cannot drive bcrypt/DB work with huge
     // payloads (254 is the RFC-5321 email maximum; 128 is a generous password cap).
+    // Both used to `Err(...)` out to the generic JSON/error-page response,
+    // dropping the user off the form and losing the email they typed; they now
+    // redisplay the same form the password-policy failure below always has,
+    // with the entered email preserved (Wayfinder: error-path inventory).
     if !email.contains('@') || email.len() > 254 {
-        return Err(AutumnError::unprocessable_msg(
-            "Enter a valid email address (max 254 characters)",
-        ));
+        return Ok(signup_page(
+            password_cfg.min_length,
+            submit_token.token(),
+            &form.email,
+            Some("Enter a valid email address (max 254 characters)"),
+        )
+        .into_response());
     }
     if form.password.len() > 128 {
-        return Err(AutumnError::unprocessable_msg(
-            "Password must be at most 128 characters",
-        ));
+        return Ok(signup_page(
+            password_cfg.min_length,
+            submit_token.token(),
+            &form.email,
+            Some("Password must be at most 128 characters"),
+        )
+        .into_response());
     }
     // Enforce the configured password policy (length, weak-list, similarity to
     // the email, and optional HIBP breach check). On failure, re-render the form
     // with the specific message at HTTP 200 rather than accepting a weak
     // credential.
-    // `config_arc` shares the resolved config behind an `Arc`; `config()` would
-    // deep-clone every section just to read `[auth.password]` on a request path.
-    let config = state.config_arc();
-    let password_cfg = &config.auth.password;
     let mut policy = password_cfg.policy();
     if password_cfg.breach_check != autumn_web::auth::BreachCheck::Off {
         // Breach checking needs an HTTP client for the HIBP k-anonymity lookup;
@@ -144,6 +160,7 @@ pub async fn signup(
         return Ok(signup_page(
             password_cfg.min_length,
             submit_token.token(),
+            &form.email,
             Some(&message),
         )
         .into_response());
@@ -154,7 +171,7 @@ pub async fn signup(
     let tenant_id = email.clone();
     let password_hash = hash_password(&form.password).await?;
 
-    let user: User = diesel::insert_into(users::table)
+    let inserted = diesel::insert_into(users::table)
         .values(&NewUser {
             email,
             password_hash,
@@ -162,10 +179,46 @@ pub async fn signup(
         })
         .returning(User::as_returning())
         .get_result(&mut *db)
-        .await
-        // A duplicate email hits the UNIQUE constraint; surface the same generic
-        // message a failed login does so the form does not enumerate accounts.
-        .map_err(|_| AutumnError::unprocessable_msg("Could not create account"))?;
+        .await;
+    let user = match inserted {
+        Ok(user) => user,
+        Err(err) => {
+            let err: AutumnError = err.into();
+            // A duplicate email hits the `users_email_key` UNIQUE constraint
+            // (Postgres's default name for an unnamed `UNIQUE` column, per
+            // `autumn-cli/src/schema/diff.rs`'s own brownfield-introspection
+            // tests); surface the same generic message a failed login does
+            // so the form does not enumerate accounts — now as an inline
+            // redisplay rather than a full navigation away from the form,
+            // matching every other signup failure mode above. Checked via
+            // the framework's own `unique_violation_field` (the same helper
+            // `examples/teams/src/routes/invitations.rs` uses), matched on
+            // the specific constraint name rather than any `UniqueViolation`
+            // (Codex review finding: `users_pkey` — e.g. a sequence left
+            // behind the table by an import — would otherwise also be
+            // misreported as "duplicate email"). Any other error, including
+            // a `UniqueViolation` on a different constraint, propagates as
+            // the real error it is — masking one as a fake-successful 200
+            // "could not create account" page would both hide it from
+            // availability monitoring and let `SubmitTokenLayer` cache that
+            // 200 as a completed submission.
+            if autumn_web::error::unique_violation_field(
+                &err,
+                &[("users_email_key", "email", "Could not create account")],
+            )
+            .is_some()
+            {
+                return Ok(signup_page(
+                    password_cfg.min_length,
+                    submit_token.token(),
+                    &form.email,
+                    Some("Could not create account"),
+                )
+                .into_response());
+            }
+            return Err(err);
+        }
+    };
 
     establish_session(&session, &user).await;
     Ok(Redirect::to("/dashboard").into_response())
@@ -175,15 +228,28 @@ pub async fn signup(
 
 #[get("/login")]
 pub async fn login_form() -> Markup {
+    login_page("", false, None)
+}
+
+/// `email` re-populates the field and `remember` re-checks the "Remember me"
+/// box on an error redisplay (Codex review finding: a corrected resubmit
+/// must not silently drop an opt-in the user already made); `error`, when
+/// present, is shown above the form (Wayfinder: error-path inventory — the
+/// message must sit adjacent to the form that caused it, and what the user
+/// already entered/chose must not be thrown away).
+fn login_page(email: &str, remember: bool, error: Option<&str>) -> Markup {
     layout(
         "Log in",
         false,
         html! {
             h1 class="text-2xl font-bold mb-6" { "Log in" }
+            @if let Some(error) = error {
+                p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+            }
             form action="/login" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
-                    input #email type="email" name="email" required autocomplete="email"
+                    input #email type="email" name="email" value=(email) required autocomplete="email"
                           class="w-full border rounded px-3 py-2";
                 }
                 div {
@@ -192,7 +258,7 @@ pub async fn login_form() -> Markup {
                           autocomplete="current-password" class="w-full border rounded px-3 py-2";
                 }
                 label class="flex items-center gap-2 text-sm text-gray-600" {
-                    input #remember type="checkbox" name="remember" value="on"
+                    input #remember type="checkbox" name="remember" value="on" checked[remember]
                           class="rounded border-gray-300";
                     "Remember me on this device"
                 }
@@ -216,11 +282,17 @@ pub async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {
+    let remember = form.remember.is_some();
     let email = form.email.trim().to_lowercase();
     // Reject over-long inputs before any DB query or bcrypt work — they can never
-    // match a stored account and only waste CPU.
+    // match a stored account and only waste CPU. Redisplayed inline rather than
+    // sent to a generic error page, same as every failure mode below — a
+    // navigating browser was on the login form and should stay there
+    // (Wayfinder: error-path inventory).
     if email.len() > 254 || form.password.len() > 128 {
-        return Err(AutumnError::unauthorized_msg("Invalid email or password"));
+        return Ok(
+            login_page(&form.email, remember, Some("Invalid email or password")).into_response(),
+        );
     }
 
     let user: Option<User> = users::table
@@ -230,7 +302,6 @@ pub async fn login(
         .await
         .optional()?;
 
-    let invalid = || AutumnError::unauthorized_msg("Invalid email or password");
     // Always run a bcrypt verification so the response time is constant whether
     // or not the email exists — prevents a timing side-channel that reveals
     // which accounts are registered.
@@ -238,11 +309,16 @@ pub async fn login(
         Some(u) => u,
         None => {
             let _ = verify_password(&form.password, DUMMY_HASH).await;
-            return Err(invalid());
+            return Ok(
+                login_page(&form.email, remember, Some("Invalid email or password"))
+                    .into_response(),
+            );
         }
     };
     if !verify_password(&form.password, &user.password_hash).await? {
-        return Err(invalid());
+        return Ok(
+            login_page(&form.email, remember, Some("Invalid email or password")).into_response(),
+        );
     }
 
     establish_session(&session, &user).await;
@@ -256,7 +332,7 @@ pub async fn login(
     // `[auth.remember]` section below — `config()` would deep-clone the whole
     // config twice per login.
     let config = state.config_arc();
-    if form.remember.is_some() && config.auth.remember.enabled {
+    if remember && config.auth.remember.enabled {
         // Thread the resolved `[auth.remember]` config so cookie_name/duration
         // overrides are honoured (issue #1397.2).
         let remember_cfg = &config.auth.remember;

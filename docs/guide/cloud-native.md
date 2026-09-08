@@ -540,18 +540,30 @@ that fails while the replica has not replayed the latest Diesel migration.
 
 Autumn's default behavior routes all replica-eligible reads to the replica
 regardless of whether the same request performed a write. Add
-`read_your_writes` in `[database]` to pin post-write reads to the primary:
+`read_your_writes` in `[database]` to pin post-write reads to the primary.
+
+Pick **one** of the two options below. `read_your_writes` is a single key, so
+setting it twice in one `[database]` table is a TOML duplicate-key error and the
+app will not start.
+
+Option A — intra-request pin only (Laravel "sticky"):
 
 ```toml
+# autumn.toml
 [database]
-primary_url   = "postgres://user:pass@primary:5432/app"
-replica_url   = "postgres://user:pass@replica:5432/app"
-
-# Option A — intra-request pin only (Laravel "sticky")
+primary_url      = "postgres://user:pass@primary:5432/app"
+replica_url      = "postgres://user:pass@replica:5432/app"
 read_your_writes = "request"
+```
 
-# Option B — cross-request pin via signed cookie (Rails automatic role switching)
-read_your_writes = "session"
+Option B — cross-request pin via signed cookie (Rails automatic role switching):
+
+```toml
+# autumn.toml
+[database]
+primary_url          = "postgres://user:pass@primary:5432/app"
+replica_url          = "postgres://user:pass@replica:5432/app"
+read_your_writes     = "session"
 pin_after_write_secs = 5          # how long the cookie pins reads; default 5 s
 ```
 
