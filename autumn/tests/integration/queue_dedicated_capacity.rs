@@ -44,7 +44,7 @@ fn bulk_handler(
         // gap between this and the deadline below is the whole detection band,
         // so keep it wide — the backlog is abandoned at shutdown, never drained,
         // so a longer sleep costs no wall clock.
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_millis(3000)).await;
         Ok(())
     })
 }
@@ -414,7 +414,7 @@ const METRIC_WARMUP_SAMPLES: usize = 5;
 /// with the reservation removed, a `critical` job waits roughly one of these, so
 /// the budget below must stay well under it or the test cannot tell a working
 /// reservation from a broken one.
-const METRIC_FLOOD_SLEEP: Duration = Duration::from_secs(3);
+const METRIC_FLOOD_SLEEP: Duration = Duration::from_millis(3000);
 
 /// Flood depth. Deep enough that `bulk`'s single shared slot cannot drain it
 /// while the loaded phase samples, so the phase really is "one queue fully
