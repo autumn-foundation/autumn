@@ -57,9 +57,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embedded_saas_matches_example_saas` was a single hard-coded test body; it is
   now `assert_starter_matches_example(starter, project_name)`, called by both
   the `saas` and `cms` gates. No behavior change for `saas`.
+### Security
+
+- **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
+  layers in SSG/ISR (`dist`) mode, closing an authn-bypass gap (🛡 Warden):**
+  the dispatch clone `tools/call` replays requests against is assembled
+  *before* `try_build_router_with_static_inner` reapplies the app's global
+  custom layers outside the static-first middleware, so a `dist` manifest
+  being present meant a `tools/call` replay skipped any check a custom layer
+  performed — even though the identical direct HTTP request was correctly
+  rejected by it. Apps gating an MCP-exposed route only with
+  `AppBuilder::layer(...)` (rather than the documented `.scoped(path,
+  RequireApiToken, routes![...])` pattern, a sub-router `.layer(...)`, or
+  `#[secured]`/session auth — none of which were affected) and running in
+  SSG/ISR mode were exposed. `try_build_router_with_static_inner` now hands
+  the router builder a clone of the same drained layer set to apply to the
+  MCP dispatch clone alone, restoring parity with the fully-dynamic path
+  without changing how the original set wraps the live-serving router (no
+  double-application, no ordering change for direct requests). See
+  `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
 
 ### Changed
 
+- **🧭 Wayfinder: `examples/invoice`'s on-screen detail page is now a real
+  HTML document (a11y `html-has-lang`/`bypass` Serious 2→0,
+  `landmark-one-main` Moderate 1→0) [no-plugin]:** `autumn check --a11y`, run against the
+  live `/invoices/{id}` route (`supported`-tier, Chromium-smoked by
+  `tests/system/smoke.rs`), found the on-screen page was a bare Maud
+  fragment with no `<!DOCTYPE>`, `<html>`, `<head>`, or `<main>` — `Invoice`'s
+  own doc comment calls it "the on-screen detail page", so it is a real page
+  a user navigates to, not an htmx partial. A screen reader had no document
+  language to announce and no landmark to jump to; the browser tab and
+  history showed no title; the page also had no viewport meta, so it never
+  reflowed for a 320px/zoomed viewport. Root cause: `invoice_detail` returned
+  `invoice_view(...)` directly with no document wrapper, unlike every other
+  `supported`-tier example's `layout()` function.
+  Baseline (`autumn check --a11y --html "<rendered /invoices/42>"`):
+  2 Serious (`html-has-lang`, `bypass`) + 1 Moderate (`landmark-one-main`).
+  Fix: a new `page()` wrapper in `examples/invoice/src/lib.rs` adds
+  `<!DOCTYPE html>`, `<html lang="en">`, a `<head>` with a charset/viewport
+  meta and a `<title>` via the existing `autumn_web::seo::SeoMeta` (no new
+  dependency), and wraps the content in `<main>` — applied only to
+  `invoice_detail`. `invoice_view` itself is untouched and still returns a
+  bare fragment, so `invoice_pdf`'s `Pdf::from_markup(invoice_view(...))`
+  keeps rendering exactly that fragment; a `<head>` in the shared view would
+  have rendered `<title>`/meta content as visible PDF text.
+  No skip link was added: the page has no nav/header before `<main>` (it's
+  the first thing in `<body>`), the same reasoning `todo-app`/`media-room`
+  established in #2483 — `autumn check --a11y`'s `bypass` rule already
+  exempts this shape, confirmed by the 0-violation re-run below.
+  After (`autumn check --a11y --url http://127.0.0.1:3000/invoices/42`,
+  built binary, live server): 0 violations. `cargo test -p invoice`: 5
+  passed (4 pre-existing + 1 new `detail_page_has_a_document_shell`
+  regression test asserting the doctype/lang/title/main are present);
+  `pdf_route_renders_the_same_content_as_the_html_view` and
+  `pdf_rendering_is_deterministic_given_a_fixed_clock` still pass unchanged,
+  confirming the PDF output is untouched.
 - **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.** [no-plugin]
   `TokenAdminModel` and `FeatureFlagAdminModel` each override
   `AdminModel::execute_action` to batch their `"delete"` bulk action into one
@@ -2312,6 +2365,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   internal-only receiver during development) will see those deliveries start
   failing after upgrade — this is the intended effect of closing the gap. See
   `docs/security/2026-09-03-webhook-ssrf/`.
+- **`#[cached]`'s generated cache key now folds in the ambient resolved
+  tenant:** the key was built exclusively from the function's own explicit
+  arguments (every parameter by default, or exactly the parameters named in
+  `key(...)`) and never consulted the `CURRENT_TENANT` task-local a
+  `tenant_scoped` repository read filters by. An app that turned on Autumn's
+  multi-tenancy (`[tenancy] enabled = true`) and cached a `tenant_scoped`
+  read keyed on any parameter *other* than the tenant itself — a page, an
+  export format, a filter, anything but the literal `tenant_id` the SaaS
+  starter's own `cached_project_count` goes out of its way to thread through
+  `key(tenant_id)` — shared one cache slot across every tenant that called it
+  with the same non-tenant arguments: tenant B received **tenant A's cached
+  response** for the remainder of the entry's TTL. Nothing in the macro, the
+  build-time cache-coherence gate (`autumn cache audit`), or `autumn routes
+  audit` detected or prevented the omission, and Autumn's own tenancy idiom
+  never requires threading `tenant_id` through a function signature for any
+  *other* tenant-scoped operation (`tenant_scoped` finders resolve it from
+  `CURRENT_TENANT` automatically) — so the omission was an easy, natural
+  mistake, not a documented misuse. The generated wrapper now reads
+  `CURRENT_TENANT` (when tenancy is enabled and a tenant has been resolved)
+  and folds it into the key unconditionally, in addition to whatever `key(...)`
+  already names. Apps without tenancy enabled, or calling a `#[cached]`
+  function outside a request (a background job, a scheduled sweep), compute
+  the same key as before — `CURRENT_TENANT` resolves to `None` in both cases.
+  **Compatibility note:** a `#[cached]` function that intentionally serves one
+  shared, cross-tenant value (a genuinely global computation, not a
+  `tenant_scoped` read) now partitions its cache per resolved tenant too when
+  called from within a tenant's request — a harmless drop in hit rate, not a
+  correctness change, since the computed value does not vary by tenant. See
+  `docs/security/2026-09-05-cached-tenant-key/`.
 
 ### Performance
 
@@ -4237,6 +4319,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls 820 → 1, buffers 9,639 → 6,977 (-27.6%). See
   `docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`.
 
+- **`ExperimentAdminModel`'s admin panel bulk "delete" action now issues one
+  `DELETE` CTE instead of one per selected experiment:** it never overrode
+  `AdminModel::execute_action`'s trait default either, so it inherited the
+  same per-id loop the `TokenAdminModel`/`FeatureFlagAdminModel` fixes above
+  closed — a full connection checkout plus a single-row `DELETE ... WHERE
+  id = $1 RETURNING name` per id, cascading to that experiment's sticky
+  assignments and staff overrides and feeding the `autumn_experiment_changes`
+  audit insert. It now overrides `execute_action` for `"delete"` to batch
+  every id into one `WHERE id = ANY($1)` round trip; the returned count,
+  final row state (including the cascaded assignment/override deletes), and
+  audit trail are unchanged (an already-deleted or nonexistent id is still a
+  silent no-op, still counted as "applied"). Measured against a 3,000-row
+  fixture (plus ~270k assignment and ~4.5k override rows) with a 615-id bulk
+  action: delete-CTE statement calls 615 → 1, buffers 62,012 → 58,616
+  (-5.5%; batching flips the cascading assignment/override deletes from
+  555 separate bitmap-index probes to one seq-scan-driven hash join per
+  child table — a different, net-cheaper plan, not the same work counted
+  once — but the N+1 elimination on statement count, not that plan
+  change, is what clears the impact floor here). See
+  `docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/`,
+  including its "Known limitation" section: neither child table has an FK
+  to `autumn_experiments`, so a concurrent `record_assignment`/
+  `set_override` on a `running` experiment being bulk-deleted can still
+  orphan a row (a pre-existing race this change widens the window on, not
+  a new one — not fixed here, flagged for a follow-up decision).
+
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
   `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
@@ -4465,6 +4573,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function that quietly delegated to its borrowed twin would fail even though
   its output is correct.
 
+### Fixed
+
+- **macros: `#[throttle]`/`#[secured]`/`#[step_up]` above the route macro no
+  longer fail to compile, or silently drop the OpenAPI response schema, once
+  stacked (#1668 regression):** #1668 moved these three guards' runtime
+  checks out of the handler body into each guard's own handler-unique
+  `FromRequestParts` gate — `struct` + `impl`, emitted as a sibling item
+  ahead of the (still single) handler function. Every route macro's own
+  `item` parser (`parse::parse_async_handler`, plus the three guard macros'
+  own parsers, needed when one guard expands above another) only ever
+  accepted a lone `ItemFn`, so a guard macro receiving that two-item output
+  as `item` — any of `#[throttle]`/`#[secured]`/`#[step_up]`/`#[route]`
+  written *above* another guard already using the #1668 gate shape — hit a
+  spurious `route macros can only be applied to functions` compile error.
+  `parse::parse_async_handler_with_preamble` now accepts zero or more
+  leading item definitions ahead of the trailing function, returning them
+  separately so the route/guard macro re-emits that preamble (the gate type
+  the function's new first parameter names) verbatim instead of choking on
+  it.
+
+  Fixing the parse gap surfaced a second, previously-masked bug: with
+  parsing no longer failing first, `#[throttle]`/`#[step_up]` above
+  `#[route]` still resolved to no OpenAPI response schema, because
+  `api_doc::infer_response_body`'s `__autumn_inner`-binding recovery (#1677)
+  only trusts that binding when one of `RESPONSE_REWRITING_GUARD_MARKERS`'s
+  marker consts sits earlier in the *same* handler-body block — and #1668
+  moved `#[throttle]`'s/`#[step_up]`'s marker consts into their gate's
+  `impl` block, out of the body, while `#[secured]`'s marker consts stayed
+  in-body for exactly this reason. Both guards now also leave a dead-code
+  copy of their marker const in the handler body (mirroring `#[secured]`'s
+  existing `role_scope_consts` pattern), restoring the invariant
+  `infer_response_body` relies on — including through stacked guards, where
+  only the innermost binding carries the handler's real return type.
+
+  Regression-proven at both the macro-expansion level (`route.rs`'s
+  existing `route_macro_infers_response_schema_when_throttle_expands_first`
+  / `..._when_step_up_expands_first` / `..._under_stacked_guards_above_route`
+  tests, which predate this fix but never previously reached the code path
+  they exercise) and end to end: `cargo test -p autumn-macros --lib` (1073
+  passed), `cargo fmt --all -- --check`, `cargo clippy -p autumn-macros
+  --all-targets -- -D warnings` all clean.
 - **`MemorySearchBackend::keyword_search` no longer compares every field
   token against every query token:** `score` (in `autumn-search/src/memory.rs`)
   looped over each field's tokens and, for every one, scanned the *entire*
