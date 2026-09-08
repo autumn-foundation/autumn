@@ -161,6 +161,11 @@ pub struct DispatchCtx<'a> {
     pub route: &'a RouteValues,
     pub styles: &'a std::collections::BTreeMap<String, super::ast::StylePreset>,
     pub depth: usize,
+    /// Bytes one expression may allocate while building its value. Dispatch
+    /// writes results into state rather than into a buffer, so it has no
+    /// output budget to borrow — this is the only thing bounding what a
+    /// `concat` or `array` in an action step can construct.
+    pub max_value_bytes: usize,
 }
 
 /// Run `steps` against `state`.
@@ -202,12 +207,14 @@ fn run_step(
     // later step in the same action sees what an earlier one wrote.
     macro_rules! eval_in {
         ($expr:expr, $sub:expr) => {{
+            let budget = ::std::cell::Cell::new(ctx.max_value_bytes);
             let eval_ctx = EvalCtx {
                 state,
                 env,
                 route: ctx.route,
                 styles: ctx.styles,
                 depth: ctx.depth,
+                budget: &budget,
             };
             eval($expr, &eval_ctx, $sub)?
         }};
@@ -216,6 +223,7 @@ fn run_step(
     match step {
         ActionStep::Set { target, value } => {
             let value = eval_in!(value, &format!("{path}.value"));
+            check_write_depth(&value, 0, ctx.depth, &format!("{path}.value"))?;
             state.insert(target.clone(), value);
         }
         ActionStep::Update {
@@ -237,6 +245,11 @@ fn run_step(
                 Some(expr) => Some(eval_in!(expr, &format!("{path}.deleteCount"))),
                 None => None,
             };
+            if let Some(operand) = operand.as_ref() {
+                // One extra level: the operand lands *inside* the list or
+                // object the operation mutates.
+                check_write_depth(operand, 1, ctx.depth, &format!("{path}.value"))?;
+            }
             apply_update(
                 state,
                 target,
@@ -275,6 +288,10 @@ fn run_step(
                     ),
                 )));
             }
+
+            // The path's own length plus the value's depth is what the
+            // written state ends up nesting to.
+            check_write_depth(&value, segments.len(), ctx.depth, &format!("{path}.value"))?;
 
             if let Some(slot) = state.get_mut(target) {
                 set_at_path(slot, &segments, value);
@@ -318,12 +335,14 @@ fn record_effect(
 ) -> Result<(), ConstelaError> {
     macro_rules! eval_in {
         ($expr:expr, $sub:expr) => {{
+            let budget = ::std::cell::Cell::new(ctx.max_value_bytes);
             let eval_ctx = EvalCtx {
                 state,
                 env,
                 route: ctx.route,
                 styles: ctx.styles,
                 depth: ctx.depth,
+                budget: &budget,
             };
             eval($expr, &eval_ctx, $sub)?
         }};
@@ -402,6 +421,59 @@ fn record_effect(
     };
     out.effects.push(effect);
     out.suspended_at = Some(path.to_string());
+    Ok(())
+}
+
+/// Whether `value` nests deeper than `limit`, measured iteratively.
+///
+/// Iterative for the reason the limit exists at all: this runs on values a
+/// document produced, and a recursive measurement would overflow on exactly
+/// the input it is meant to reject.
+fn depth_exceeds(value: &Value, limit: usize) -> bool {
+    // (value, depth of that value)
+    let mut stack = vec![(value, 1usize)];
+    while let Some((current, depth)) = stack.pop() {
+        if depth > limit {
+            return true;
+        }
+        let next = depth.saturating_add(1);
+        match current {
+            Value::Array(items) => stack.extend(items.iter().map(|item| (item, next))),
+            Value::Object(entries) => {
+                stack.extend(entries.iter().map(|(_, item)| (item, next)));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Refuse a state write whose value nests too deeply.
+///
+/// `nesting` is how many levels the write itself adds on top of the value —
+/// one for an element pushed into a list, the path length for a `setPath`.
+///
+/// This is the general case of the `setPath` cap, and it has to be general:
+/// state persists across dispatches, so an action as ordinary as
+/// `set x = array(state x)` adds a level *per request*. Nothing bounded that
+/// growth — `ctx.depth` bounds expression recursion, not the shape of the
+/// result — and eventually `serde_json::Value`'s recursive clone or drop
+/// overflows the request thread's stack, on a request that did nothing
+/// unusual.
+fn check_write_depth(
+    value: &Value,
+    nesting: usize,
+    limit: usize,
+    path: &str,
+) -> Result<(), ConstelaError> {
+    let room = limit.saturating_sub(nesting);
+    if room == 0 || depth_exceeds(value, room) {
+        return Err(ConstelaError::Render(Diagnostic::new(
+            path,
+            codes::RENDER_LIMIT,
+            format!("the value written here nests deeper than the {limit}-level state depth limit"),
+        )));
+    }
     Ok(())
 }
 

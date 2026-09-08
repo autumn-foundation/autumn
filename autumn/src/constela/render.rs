@@ -54,6 +54,7 @@
     )
 )]
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -223,10 +224,15 @@ pub struct Renderer<'a> {
     pub ctx: &'a RenderContext,
     nodes: usize,
     portals: Vec<RenderedPortal>,
-    /// Bytes already committed to finished portal buffers. The live buffer's
-    /// own length is added at each check, so the budget covers all output
-    /// rather than whichever buffer happens to be in hand.
-    portal_bytes: usize,
+    /// Bytes of output that are not in the buffer currently being written:
+    /// finished portals, plus — while a portal is being rendered — the caller's
+    /// body up to that point.
+    ///
+    /// The live buffer's own length is added at each check, so the two together
+    /// cover all output. Counting the caller's body during a portal is what
+    /// stops a 3 MiB body followed by a 3 MiB portal from passing a 4 MiB cap
+    /// twice over, each buffer measured as if it were alone.
+    committed_bytes: usize,
 }
 
 /// Render `document` against `ctx`.
@@ -245,7 +251,7 @@ pub fn render(
         ctx,
         nodes: 0,
         portals: Vec::new(),
-        portal_bytes: 0,
+        committed_bytes: 0,
     };
     let env = Env::default();
 
@@ -271,13 +277,19 @@ pub fn render(
 
 impl Renderer<'_> {
     /// An evaluation context for the current environment.
-    const fn eval_ctx<'e>(&'e self, env: &'e Env, depth: usize) -> EvalCtx<'e> {
+    const fn eval_ctx<'e>(
+        &'e self,
+        env: &'e Env,
+        depth: usize,
+        budget: &'e Cell<usize>,
+    ) -> EvalCtx<'e> {
         EvalCtx {
             state: &self.ctx.state,
             env,
             route: &self.ctx.route,
             styles: &self.document.program().styles,
             depth,
+            budget,
         }
     }
 
@@ -288,7 +300,12 @@ impl Renderer<'_> {
         path: &str,
         depth: usize,
     ) -> Result<Value, ConstelaError> {
-        eval(expr, &self.eval_ctx(env, depth), path)
+        // One expression's result feeds one attribute or one text node, so the
+        // output budget is the right ceiling for what building it may allocate.
+        // Fresh per expression: this bounds a single value's construction, and
+        // `reserve` bounds what reaches the buffer.
+        let budget = Cell::new(self.ctx.limits.max_output_bytes);
+        eval(expr, &self.eval_ctx(env, depth, &budget), path)
     }
 
     /// Evaluate `route.title` and `route.meta`.
@@ -324,7 +341,7 @@ impl Renderer<'_> {
     /// first bounds both the output and the allocation.
     fn reserve(&self, emitted: usize, extra: usize, path: &str) -> Result<(), ConstelaError> {
         let projected = emitted
-            .saturating_add(self.portal_bytes)
+            .saturating_add(self.committed_bytes)
             .saturating_add(extra);
         if projected > self.ctx.limits.max_output_bytes {
             return Err(ConstelaError::Render(Diagnostic::new(
@@ -372,7 +389,7 @@ impl Renderer<'_> {
             )));
         }
 
-        let produced = emitted.saturating_add(self.portal_bytes);
+        let produced = emitted.saturating_add(self.committed_bytes);
         if produced > self.ctx.limits.max_output_bytes {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path,
@@ -486,7 +503,7 @@ impl Renderer<'_> {
                 out.push_str(&rendered);
             }
             Node::Portal { target, children } => {
-                self.portal(target, children, env, slot, path, depth)?;
+                self.portal(target, children, env, slot, path, depth, out.len())?;
             }
             Node::Island {
                 id,
@@ -574,6 +591,12 @@ impl Renderer<'_> {
     /// Deliberately not written into `out`: a portal names a destination in
     /// the host page, which only the host layout knows how to reach. See
     /// [`RenderedUi::portals`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the portal's own parts plus the render state threaded \
+                  through every node, and the caller's buffer length the \
+                  budget needs; see `element`"
+    )]
     fn portal(
         &mut self,
         target: &str,
@@ -582,19 +605,33 @@ impl Renderer<'_> {
         slot: Option<&SlotCtx<'_>>,
         path: &str,
         depth: usize,
+        caller_bytes: usize,
     ) -> Result<(), ConstelaError> {
+        // The portal renders into its own buffer, so the caller's body would
+        // drop out of every budget check made inside it. Fold it in for the
+        // duration, and restore afterwards so it is not counted twice — the
+        // caller's own checks add its live length back.
+        let outer = self.committed_bytes;
+        self.committed_bytes = outer.saturating_add(caller_bytes);
+
         let mut inner = String::new();
-        for (i, child) in children.iter().enumerate() {
-            self.node(
-                child,
-                env,
-                slot,
-                &format!("{path}.children[{i}]"),
-                depth,
-                &mut inner,
-            )?;
-        }
-        self.portal_bytes = self.portal_bytes.saturating_add(inner.len());
+        let rendered = (|renderer: &mut Self| {
+            for (i, child) in children.iter().enumerate() {
+                renderer.node(
+                    child,
+                    env,
+                    slot,
+                    &format!("{path}.children[{i}]"),
+                    depth,
+                    &mut inner,
+                )?;
+            }
+            Ok::<(), ConstelaError>(())
+        })(self);
+        self.committed_bytes = outer;
+        rendered?;
+
+        self.committed_bytes = self.committed_bytes.saturating_add(inner.len());
         self.portals.push(RenderedPortal {
             target: target.to_string(),
             content: PreEscaped(inner),

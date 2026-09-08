@@ -1124,3 +1124,161 @@ fn an_event_name_that_cannot_be_emitted_is_rejected() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regressions from the third Codex round on #2623
+// ---------------------------------------------------------------------------
+
+/// `concat` builds its whole result inside the evaluator and hands back a
+/// finished `Value`, so the renderer's output budget never sees it growing. A
+/// 1 MiB state string referenced a few thousand times is a valid document
+/// inside every parse limit, and gigabytes of allocation.
+#[test]
+fn an_expression_cannot_build_a_value_past_the_byte_budget() {
+    let items: Vec<String> = (0..4_000)
+        .map(|_| r#"{"expr":"state","name":"blob"}"#.to_string())
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+            "state":{{"blob":{{"type":"string","initial":""}}}},
+            "view":{{"kind":"text","value":{{"expr":"concat","items":[{}]}}}}}}"#,
+        items.join(",")
+    );
+
+    let document = Document::parse(&source, &Limits::unbounded()).expect("validates");
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(64 * 1024)));
+
+    let ctx = RenderContext {
+        state,
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("over the value budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// The same amplification through `array`, which repeats a whole state value
+/// rather than a string.
+#[test]
+fn array_construction_is_bounded_too() {
+    let elements: Vec<String> = (0..4_000)
+        .map(|_| r#"{"expr":"state","name":"blob"}"#.to_string())
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+            "state":{{"blob":{{"type":"string","initial":""}},
+                     "out":{{"type":"list","initial":[]}}}},
+            "actions":[{{"name":"build","steps":[
+              {{"do":"set","target":"out","value":{{"expr":"array","elements":[{}]}}}}]}}],
+            "view":{{"kind":"element","tag":"div"}}}}"#,
+        elements.join(",")
+    );
+
+    let document = Document::parse(&source, &Limits::unbounded()).expect("validates");
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(64 * 1024)));
+
+    let err = document
+        .dispatch("build", &mut state, &Map::new())
+        .expect_err("over the value budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// State persists across dispatches, so `set x = array(state x)` adds a nesting
+/// level *per request*. Nothing bounded that — `ctx.depth` bounds expression
+/// recursion, not the shape of the result — and `serde_json::Value`'s recursive
+/// clone and drop eventually overflow the request thread on an ordinary
+/// request.
+#[test]
+fn repeated_dispatch_cannot_grow_state_depth_without_bound() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"x":{"type":"list","initial":[]}},
+            "actions":[{"name":"nest","steps":[
+              {"do":"set","target":"x","value":{"expr":"array",
+                "elements":[{"expr":"state","name":"x"}]}}]}],
+            "view":{"kind":"element","tag":"div"}}"#,
+    );
+
+    let mut state = document.initial_state();
+    // Far more dispatches than the depth limit allows, exactly as a bot
+    // clicking one button repeatedly would produce.
+    let mut refused = false;
+    for _ in 0..500 {
+        if document.dispatch("nest", &mut state, &Map::new()).is_err() {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "state nesting grew without bound");
+}
+
+/// A portal renders into its own buffer, so the caller's body would drop out of
+/// every budget check made inside it — letting a 3 MiB body and a 3 MiB portal
+/// each pass a 4 MiB cap as if the other did not exist.
+#[test]
+fn the_byte_budget_spans_the_body_and_its_portals_together() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"blob":{"type":"string","initial":""}},
+            "view":{"kind":"element","tag":"div","children":[
+              {"kind":"text","value":{"expr":"state","name":"blob"}},
+              {"kind":"portal","target":"head","children":[
+                {"kind":"text","value":{"expr":"state","name":"blob"}}]}]}}"#,
+    );
+
+    let mut state = document.initial_state();
+    // Each half fits a 100 KiB budget on its own; together they must not.
+    state.insert("blob".into(), Value::String("x".repeat(60 * 1024)));
+
+    let ctx = RenderContext {
+        state,
+        limits: RenderLimits {
+            max_output_bytes: 100 * 1024,
+            ..RenderLimits::default()
+        },
+        ..RenderContext::default()
+    };
+    let err = document
+        .render(&ctx)
+        .expect_err("body plus portal is over budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// Numbers must render the way JavaScript renders them, thresholds included —
+/// otherwise a server render and the upstream client runtime disagree on the
+/// same document.
+#[test]
+fn numbers_render_with_javascripts_exponent_thresholds() {
+    let cases = [
+        ("1e21", "1e+21"),
+        ("1e-7", "1e-7"),
+        ("1e20", "100000000000000000000"),
+        ("0.000001", "0.000001"),
+        ("3", "3"),
+        ("3.5", "3.5"),
+        ("-0", "0"),
+    ];
+    for (literal, expected) in cases {
+        let rendered = render(&format!(
+            r#"{{"version":"1.0","view":{{"kind":"text","value":{{"expr":"lit","value":{literal}}}}}}}"#
+        ));
+        assert_eq!(rendered, expected, "literal {literal}");
+    }
+}
+
+/// Two handlers that collapse onto one emitted attribute mean the browser keeps
+/// whichever came first and the other binding vanishes — from a document that
+/// validated.
+#[test]
+fn two_handlers_binding_the_same_event_are_rejected() {
+    let codes = codes_of(
+        r#"{"version":"1.0",
+            "state":{"n":{"type":"number","initial":0}},
+            "actions":[{"name":"a","steps":[]},{"name":"b","steps":[]}],
+            "view":{"kind":"element","tag":"button","props":{
+              "onClick":{"event":"click","action":"a"},
+              "onTap":{"event":"Click","action":"b"}}}}"#,
+    );
+    assert!(codes.contains(&codes::DUPLICATE), "{codes:?}");
+}

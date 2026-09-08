@@ -49,6 +49,7 @@
     )
 )]
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
@@ -110,6 +111,19 @@ pub(crate) struct EvalCtx<'a> {
     pub styles: &'a BTreeMap<String, StylePreset>,
     /// Remaining recursion budget.
     pub depth: usize,
+    /// Bytes an expression may still allocate while *building* a value.
+    ///
+    /// The renderer's output budget cannot see this: `concat`, `array`, `obj`
+    /// and string `+` construct their result inside the evaluator and hand back
+    /// a finished `Value`, so a document that concatenates a 1 MiB state string
+    /// a few thousand times allocates gigabytes before a single byte reaches
+    /// the output buffer. Every construction charges against this first.
+    ///
+    /// A [`Cell`] because evaluation takes `&self` throughout and the budget
+    /// has to be spent *across* sibling sub-expressions, not merely bounded per
+    /// expression — a thousand small concats are the same attack as one large
+    /// one.
+    pub budget: &'a Cell<usize>,
 }
 
 impl EvalCtx<'_> {
@@ -131,6 +145,7 @@ impl EvalCtx<'_> {
             // `-` so a future edit to that guard cannot turn this into a panic
             // on a hostile document.
             depth: self.depth.saturating_sub(1),
+            budget: self.budget,
         })
     }
 }
@@ -198,16 +213,86 @@ pub fn text_of(value: &Value) -> String {
 /// Format a number the way JavaScript's `String` does for the common cases:
 /// an integral value has no fractional part.
 fn number_to_string(n: &serde_json::Number) -> String {
-    n.as_f64().map_or_else(
-        || n.to_string(),
-        |f| {
-            if f.fract() == 0.0 && f.abs() < 1e21 {
-                format!("{f:.0}")
-            } else {
-                f.to_string()
+    let Some(f) = n.as_f64() else {
+        return n.to_string();
+    };
+    if f == 0.0 {
+        // Covers -0.0, which JavaScript also renders as "0".
+        return "0".to_string();
+    }
+
+    // ECMAScript switches to exponential notation at |x| >= 1e21 and again at
+    // 0 < |x| < 1e-6; Rust's `f64::to_string` switches nowhere, so it prints
+    // 1e21 as twenty-two digits and 1e-7 as 0.0000001. Inside those thresholds
+    // both agree, and Rust's shortest-round-trip digits are what ECMAScript
+    // specifies too.
+    let magnitude = f.abs();
+    if !(1e-6..1e21).contains(&magnitude) {
+        let exponential = format!("{f:e}");
+        // Rust writes `1e21`; ECMAScript writes `1e+21`.
+        return match exponential.split_once('e') {
+            Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+                format!("{mantissa}e+{exponent}")
             }
-        },
-    )
+            _ => exponential,
+        };
+    }
+
+    if f.fract() == 0.0 {
+        format!("{f:.0}")
+    } else {
+        f.to_string()
+    }
+}
+
+/// Roughly how many bytes a value occupies, counted iteratively and stopping
+/// once `cap` is passed.
+///
+/// Iterative because it runs on values a document produced; early-exiting
+/// because the only question asked of it is "is this already too big", which a
+/// partial walk answers as well as a complete one.
+fn approx_bytes(value: &Value, cap: usize) -> usize {
+    let mut total = 0usize;
+    let mut stack = vec![value];
+    while let Some(current) = stack.pop() {
+        total = total.saturating_add(match current {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 8,
+            Value::String(text) => text.len(),
+            Value::Array(items) => {
+                stack.extend(items.iter());
+                8
+            }
+            Value::Object(entries) => {
+                stack.extend(entries.iter().map(|(_, value)| value));
+                entries
+                    .keys()
+                    .map(String::len)
+                    .sum::<usize>()
+                    .saturating_add(8)
+            }
+        });
+        if total > cap {
+            return total;
+        }
+    }
+    total
+}
+
+/// Charge `bytes` against the evaluator's construction budget.
+///
+/// Charged *before* the allocation wherever the size is knowable in advance, so
+/// an oversized value is refused rather than built and then measured.
+fn charge(ctx: &EvalCtx<'_>, bytes: usize, path: &str) -> Result<(), ConstelaError> {
+    let remaining = ctx.budget.get();
+    if bytes > remaining {
+        return Err(ConstelaError::Render(Diagnostic::new(
+            path,
+            codes::RENDER_LIMIT,
+            "expression builds a value larger than the render byte budget allows",
+        )));
+    }
+    ctx.budget.set(remaining.saturating_sub(bytes));
+    Ok(())
 }
 
 /// The numeric value of `value`, or `0.0` — JavaScript's behaviour for the
@@ -338,24 +423,31 @@ pub(crate) fn eval(expr: &Expr, ctx: &EvalCtx<'_>, path: &str) -> Result<Value, 
             let mut out = String::new();
             for (i, item) in items.iter().enumerate() {
                 let value = eval(item, &inner, &format!("{path}.items[{i}]"))?;
-                out.push_str(&text_of(&value));
+                let piece = text_of(&value);
+                // Charged per piece, so the string is refused as it grows
+                // rather than after it is whole.
+                charge(ctx, piece.len(), path)?;
+                out.push_str(&piece);
             }
             Ok(Value::String(out))
         }
         Expr::Array { elements } => {
             let mut out = Vec::with_capacity(elements.len());
             for (i, element) in elements.iter().enumerate() {
-                out.push(eval(element, &inner, &format!("{path}.elements[{i}]"))?);
+                let value = eval(element, &inner, &format!("{path}.elements[{i}]"))?;
+                // An element can be a whole state field, so `array` repeated
+                // over a large one amplifies just as `concat` does.
+                charge(ctx, approx_bytes(&value, ctx.budget.get()), path)?;
+                out.push(value);
             }
             Ok(Value::Array(out))
         }
         Expr::Obj { props } => {
             let mut out = Map::new();
             for (key, value) in props {
-                out.insert(
-                    key.clone(),
-                    eval(value, &inner, &format!("{path}.props.{key}"))?,
-                );
+                let value = eval(value, &inner, &format!("{path}.props.{key}"))?;
+                charge(ctx, approx_bytes(&value, ctx.budget.get()), path)?;
+                out.insert(key.clone(), value);
             }
             Ok(Value::Object(out))
         }
@@ -467,7 +559,9 @@ fn eval_binary(
             if left.is_number() && right.is_number() {
                 number_value(as_number(&left) + as_number(&right))
             } else {
-                Value::String(format!("{}{}", js_string(&left), js_string(&right)))
+                let joined = format!("{}{}", js_string(&left), js_string(&right));
+                charge(ctx, joined.len(), path)?;
+                Value::String(joined)
             }
         }
         BinaryOp::Sub => number_value(as_number(&left) - as_number(&right)),
@@ -532,12 +626,14 @@ mod tests {
         let expr: Expr = serde_json::from_str(source).expect("expression parses");
         let styles = BTreeMap::new();
         let route = RouteValues::default();
+        let budget = Cell::new(usize::MAX);
         let ctx = EvalCtx {
             state,
             env,
             route: &route,
             styles: &styles,
             depth: 64,
+            budget: &budget,
         };
         eval(&expr, &ctx, "expr").expect("evaluates")
     }
@@ -775,12 +871,14 @@ mod tests {
         let route = RouteValues::default();
         let state = Map::new();
         let env = Env::default();
+        let budget = Cell::new(usize::MAX);
         let ctx = EvalCtx {
             state: &state,
             env: &env,
             route: &route,
             styles: &styles,
             depth: 3,
+            budget: &budget,
         };
         let err = eval(&expr, &ctx, "expr").expect_err("over budget");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);

@@ -311,6 +311,7 @@ impl Document {
             // document's nesting at parse time, and this is the backstop for
             // the case where that was raised.
             depth: RenderLimits::default().max_depth,
+            max_value_bytes: RenderLimits::default().max_output_bytes,
         };
         let mut outcome = Dispatched::default();
         dispatch::run_steps(

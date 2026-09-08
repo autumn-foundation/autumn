@@ -803,21 +803,45 @@ impl<'a> Validator<'a> {
         if let Some(name) = element_ref {
             self.check_binding_name(name, &format!("{path}.ref"));
         }
+        // Both maps guard the same failure: two props that collapse onto one
+        // emitted name, where HTML keeps whichever came first and the other
+        // binding silently disappears from a *validated* document.
         let mut canonical_seen: BTreeMap<String, &str> = BTreeMap::new();
+        let mut event_seen: BTreeMap<String, &str> = BTreeMap::new();
         for (attr, prop) in props {
             // Two spellings of one attribute (`class` and `className`) would
             // emit it twice, and HTML would silently keep whichever came
             // first. Report it rather than pick.
-            if let Prop::Value(_) = prop {
-                let canonical = policy::canonical_attr(attr);
-                if let Some(previous) = canonical_seen.insert(canonical.clone(), attr) {
-                    self.error(
-                        format!("{path}.props.{attr}"),
-                        codes::DUPLICATE,
-                        format!(
-                            "{attr:?} and {previous:?} are both the {canonical:?} attribute; write only one"
-                        ),
-                    );
+            match prop {
+                Prop::Value(_) => {
+                    let canonical = policy::canonical_attr(attr);
+                    if let Some(previous) = canonical_seen.insert(canonical.clone(), attr) {
+                        self.error(
+                            format!("{path}.props.{attr}"),
+                            codes::DUPLICATE,
+                            format!(
+                                "{attr:?} and {previous:?} are both the {canonical:?} attribute; write only one"
+                            ),
+                        );
+                    }
+                }
+                Prop::Handler(handler) => {
+                    // Two handlers can declare the same `event` outright, and
+                    // two different spellings can also collide after the
+                    // filtering and 32-character truncation
+                    // `canonical_event` applies.
+                    let canonical = policy::canonical_event(&handler.event);
+                    if !canonical.is_empty()
+                        && let Some(previous) = event_seen.insert(canonical.clone(), attr)
+                    {
+                        self.error(
+                            format!("{path}.props.{attr}"),
+                            codes::DUPLICATE,
+                            format!(
+                                "{attr:?} and {previous:?} both bind the {canonical:?} event; only one would be emitted"
+                            ),
+                        );
+                    }
                 }
             }
             self.check_prop(attr, prop, &format!("{path}.props.{attr}"), scope);
