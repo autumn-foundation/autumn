@@ -224,7 +224,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derivation onto its own table sweeps one parent per batch, a batch the
   database aborts to break a deadlock is retried from its checkpoint, and
   `derivation::resweep` re-enqueues one derivation for the settling pass a
-  rolling deployment that changed a definition needs (see the guide). `CounterCacheSpec`
+  rolling deployment that changed a definition needs (see the guide). The
+  collision check also covers the column a `#[commentable(counter_cache)]`
+  parent keeps, `BackfillReport::batches_run` lets a paced caller tell "more
+  to do" from "stuck" (the boot sweep now stops on no progress rather than
+  after a fixed number of rounds), a tenant-scoped leg orders each parent's
+  deltas so no intermediate value overflows, and `/actuator/derivations`
+  still reports leftover rows after the last derivation is removed. `CounterCacheSpec`
   gains four plumbing fields `#[model]` fills in (`contrib_of`, `contrib_sql`,
   `filter_sql`, `derivation`), so a hand-written spec literal needs four more
   lines; it is framework plumbing and not constructed by hand. The one other

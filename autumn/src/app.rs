@@ -10469,15 +10469,6 @@ async fn setup_database(
 #[cfg(feature = "db")]
 const BOOT_BACKFILL_BATCHES: usize = 8;
 
-/// Rounds one boot backfill task runs before it gives up.
-///
-/// Each round that leaves work behind has committed `BOOT_BACKFILL_BATCHES`
-/// checkpoints, and a checkpoint only moves forward, so the sweep terminates on
-/// its own. This is the guard that keeps a pathological loop from spinning
-/// forever anyway.
-#[cfg(feature = "db")]
-const BOOT_BACKFILL_MAX_ROUNDS: usize = 100_000;
-
 /// Reconcile the declared derivations on every primary, then repair them in the
 /// background.
 ///
@@ -10603,12 +10594,18 @@ fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::Run
                 break;
             }
             rounds += 1;
-            if rounds >= BOOT_BACKFILL_MAX_ROUNDS {
+            // A round that left work behind but advanced no checkpoint is
+            // stuck, not slow: nothing a further round would do differently.
+            // A round that advanced one is progress, however many parents are
+            // left (a self-referential derivation sweeps one per batch, so a
+            // large table takes many rounds), and a checkpoint only moves
+            // forward, so the sweep terminates on its own.
+            if report.batches_run == 0 {
                 tracing::warn!(
                     database = %label,
                     pending = ?report.in_progress,
-                    "derivation backfill gave up after {BOOT_BACKFILL_MAX_ROUNDS} rounds; \
-                     see /actuator/derivations"
+                    rounds,
+                    "derivation backfill made no progress; see /actuator/derivations"
                 );
                 break;
             }

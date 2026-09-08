@@ -270,6 +270,7 @@ inventory::collect!(DerivationDescriptor);
 /// derivation's source alone, so the pair is rejected at boot like two
 /// derivations on one column.
 #[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
 pub struct CounterCacheClaim {
     /// The child model declaring the counter cache.
     pub model: &'static str,
@@ -285,10 +286,30 @@ pub struct CounterCacheClaim {
 
 inventory::collect!(CounterCacheClaim);
 
-/// Every plain `counter_cache` linked into this binary, in a stable order.
-fn registered_counter_cache_claims() -> Vec<&'static CounterCacheClaim> {
-    let mut claims: Vec<&'static CounterCacheClaim> =
-        inventory::iter::<CounterCacheClaim>.into_iter().collect();
+/// Every parent column something other than a `#[derivation]` maintains in
+/// this binary, in a stable order: the plain `counter_cache` claims, and the
+/// `comment_count`-style column a `#[commentable(counter_cache = ...)]` parent
+/// keeps, which is registered through the commentable descriptor and builds
+/// its counter spec at run time rather than through `#[model]`.
+fn registered_column_claims() -> Vec<CounterCacheClaim> {
+    let mut claims: Vec<CounterCacheClaim> = inventory::iter::<CounterCacheClaim>
+        .into_iter()
+        .copied()
+        .collect();
+    claims.extend(
+        inventory::iter::<crate::commentable::CommentableDescriptor>
+            .into_iter()
+            .filter_map(|descriptor| {
+                let column = descriptor.spec.counter_column?;
+                Some(CounterCacheClaim {
+                    model: (descriptor.model)(),
+                    child_table: descriptor.spec.comments_table,
+                    parent_table: descriptor.spec.parent_table,
+                    column,
+                    module_path: "#[commentable]",
+                })
+            }),
+    );
     claims.sort_unstable_by_key(|claim| {
         (
             claim.parent_table,
@@ -338,7 +359,7 @@ fn find(name: &str) -> Option<&'static DerivationDef> {
 /// every entry point checks them rather than only the boot path.
 fn check_registry(defs: &[&DerivationDef]) -> AutumnResult<()> {
     check_unique_names(defs)?;
-    check_unique_columns(defs, &registered_counter_cache_claims())
+    check_unique_columns(defs, &registered_column_claims())
 }
 
 /// Reject two derivations claiming one name.
@@ -368,10 +389,7 @@ fn check_unique_names(defs: &[&DerivationDef]) -> AutumnResult<()> {
 /// Every mutation path applies each derivation's own delta, so one column with
 /// two derivations counts twice. No repair can fix that: the two definitions
 /// disagree on what the column means, so each sweep would undo the other.
-fn check_unique_columns(
-    defs: &[&DerivationDef],
-    claims: &[&CounterCacheClaim],
-) -> AutumnResult<()> {
+fn check_unique_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -> AutumnResult<()> {
     let mut seen: HashMap<(&str, &str), &DerivationDef> = HashMap::new();
     for def in defs {
         // A plain counter cache on the same column is the same double count,
@@ -382,10 +400,10 @@ fn check_unique_columns(
             .find(|claim| (claim.parent_table, claim.column) == (def.parent_table, def.column))
         {
             return Err(AutumnError::from(std::io::Error::other(format!(
-                "derivation `{}` on {}::{} maintains `{}.{}`, which the `counter_cache` on \
-                 {}::{} ({}) already maintains. The column would count twice, and the \
-                 derivation's backfill would overwrite the counter cache's rows, so remove \
-                 one or point it at another column",
+                "derivation `{}` on {}::{} maintains `{}.{}`, which the counter cache \
+                 declared by {}::{} (child table `{}`) already maintains. The column would \
+                 count twice, and the derivation's backfill would overwrite the counter \
+                 cache's rows, so remove one or point it at another column",
                 def.name,
                 def.module_path,
                 def.model,
@@ -746,6 +764,10 @@ pub struct BackfillReport {
     /// Parent rows actually repaired. A value that already agreed with the
     /// source of truth is neither counted here nor written.
     pub rows_repaired: usize,
+    /// Batches that advanced a checkpoint in this call. A call that returns
+    /// with work `in_progress` and `0` here made no progress, which is how a
+    /// caller looping on the budget tells "more to do" from "stuck".
+    pub batches_run: usize,
 }
 
 /// Advance one derivation's checkpoint. Runs inside the batch's transaction.
@@ -996,6 +1018,7 @@ pub async fn run_backfill(
                 }
                 Batch::Advanced { repaired } => {
                     report.rows_repaired += repaired;
+                    report.batches_run += 1;
                     batches += 1;
                 }
             }
@@ -1037,6 +1060,15 @@ async fn run_one_batch_retrying(
             outcome => return outcome,
         }
     }
+}
+
+/// Whether `error` is the database reporting that `_autumn_derivations` does
+/// not exist: Postgres `42P01` (`relation "..." does not exist`) or `SQLite`'s
+/// `no such table`.
+fn is_missing_state_table(error: &AutumnError) -> bool {
+    let message = error.to_string();
+    message.contains(STATE_TABLE)
+        && (message.contains("does not exist") || message.contains("no such table"))
 }
 
 /// Whether `error` is the database aborting one transaction so that another
@@ -1149,15 +1181,18 @@ pub async fn derivation_status(
     conn: &mut RuntimeConnection,
 ) -> AutumnResult<Vec<DerivationStatus>> {
     let defs = registered_derivations();
-    // A binary with no derivation never applies the state-table migration
-    // (see `has_derivations`), so there is nothing to read and no table to
-    // read it from: the report is empty rather than a missing-table error.
-    if defs.is_empty() {
-        return Ok(Vec::new());
-    }
     check_registry(&defs)?;
 
-    let state = load_state(conn).await?;
+    // A binary with no derivation never applies the state-table migration
+    // (see `has_derivations`), so an app that never had one has no table to
+    // read: that is an empty report. An app whose last derivation was removed
+    // still has the table, and its leftover rows are exactly what an operator
+    // needs to see, so only the missing table is forgiven, and only then.
+    let state = match load_state(conn).await {
+        Ok(state) => state,
+        Err(error) if defs.is_empty() && is_missing_state_table(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     let mut out = Vec::with_capacity(defs.len() + state.len());
     for def in &defs {
         let row = state.get(def.name);
@@ -1458,7 +1493,7 @@ mod tests {
             column: def.column,
             module_path: "likes::module",
         };
-        let err = check_unique_columns(&[&def], &[&claim])
+        let err = check_unique_columns(&[&def], &[claim])
             .expect_err("a counter cache and a derivation cannot share a column");
         let message = err.to_string();
         assert!(
@@ -1467,14 +1502,45 @@ mod tests {
         );
         assert!(message.contains("likes::module"), "{message}");
         assert!(message.contains("dv_likes"), "{message}");
-        assert!(message.contains("counter_cache"), "{message}");
+        assert!(message.contains("counter cache"), "{message}");
 
         // A counter cache on another column of the same parent is fine.
         let other = CounterCacheClaim {
             column: "like_count",
             ..claim
         };
-        check_unique_columns(&[&def], &[&other]).expect("different columns coexist");
+        check_unique_columns(&[&def], &[other]).expect("different columns coexist");
+
+        // A `#[commentable(counter_cache = ...)]` parent's column is a claim of
+        // the same kind, spelled by its descriptor rather than by `#[model]`.
+        let commentable = CounterCacheClaim {
+            model: "app::models::DvPost",
+            child_table: "comments",
+            module_path: "#[commentable]",
+            ..claim
+        };
+        let message = check_unique_columns(&[&def], &[commentable])
+            .expect_err("a commentable counter and a derivation cannot share a column")
+            .to_string();
+        assert!(
+            message.contains("#[commentable]::app::models::DvPost"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_missing_state_table_is_recognised_and_other_errors_are_not() {
+        for message in [
+            "relation \"_autumn_derivations\" does not exist",
+            "no such table: _autumn_derivations",
+        ] {
+            let error = AutumnError::from(std::io::Error::other(message));
+            assert!(is_missing_state_table(&error), "{message}");
+        }
+        for message in ["relation \"posts\" does not exist", "deadlock detected"] {
+            let error = AutumnError::from(std::io::Error::other(message));
+            assert!(!is_missing_state_table(&error), "{message}");
+        }
     }
 
     #[test]

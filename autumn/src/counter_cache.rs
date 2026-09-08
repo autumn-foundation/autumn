@@ -899,7 +899,48 @@ fn fold_and_order<M: 'static>(
     }
     folded
         .sort_by_key(|&(spec_index, parent_id, _, _)| (specs[spec_index].parent_table, parent_id));
+    order_tenant_runs(specs, &mut folded);
     folded
+}
+
+/// Order each tenant-scoped parent's deltas so their running sum stays between
+/// zero and their total.
+///
+/// A tenant-scoped leg cannot fold: each delta is guarded by its own child's
+/// tenant, and two children of one parent need not share one. What it can do
+/// is choose the order. Walking toward the total and stepping back past it
+/// keeps every prefix within `[min(0, total), max(0, total)]` whenever the
+/// deltas allow it at all, so `[MAX, MAX, -MAX]` goes out as `MAX, -MAX, MAX`
+/// and a parent whose start and end both fit never passes through a value
+/// that does not. The sort is stable, so the global lock order is unchanged.
+fn order_tenant_runs<M: 'static>(specs: &[CounterCacheSpec<M>], folded: &mut [Contribution]) {
+    let mut start = 0;
+    while start < folded.len() {
+        let (spec_index, parent_id, _, _) = folded[start];
+        let mut end = start + 1;
+        while end < folded.len() && folded[end].0 == spec_index && folded[end].1 == parent_id {
+            end += 1;
+        }
+        if specs[spec_index].tenant_column.is_some() && end - start > 1 {
+            let run = &mut folded[start..end];
+            let total: i128 = run.iter().map(|&(_, _, delta, _)| i128::from(delta)).sum();
+            let mut remaining: Vec<Contribution> = run.to_vec();
+            let mut prefix: i128 = 0;
+            for slot in run.iter_mut() {
+                let toward_total = prefix < total || (prefix == total && total < 0);
+                let pick = if toward_total {
+                    (0..remaining.len()).max_by_key(|&i| remaining[i].2)
+                } else {
+                    (0..remaining.len()).min_by_key(|&i| remaining[i].2)
+                }
+                .expect("a run has at least one delta left per slot");
+                let next = remaining.swap_remove(pick);
+                prefix += i128::from(next.2);
+                *slot = next;
+            }
+        }
+        start = end;
+    }
 }
 
 /// Spec indices in the same global order, for the paths that resolve the parent
@@ -2110,6 +2151,39 @@ mod tests {
                 (0, 8, 4, 1)
             ]
         );
+    }
+
+    #[test]
+    fn a_tenant_scoped_run_is_ordered_so_no_prefix_leaves_the_span_of_zero_and_total() {
+        // The leg cannot fold (each delta is guarded by its own child's
+        // tenant), so the order is what keeps `[MAX, MAX, -MAX]` from passing
+        // through `2 * MAX` on the way to its representable total.
+        let mut specs = two_legs();
+        specs[1].tenant_column = Some("tenant_id");
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (1, 2, i64::MAX, 10),
+                (1, 2, i64::MAX, 11),
+                (1, 2, -i64::MAX, 12),
+            ],
+        );
+        let deltas: Vec<i64> = ordered.iter().map(|&(_, _, d, _)| d).collect();
+        assert_eq!(deltas, vec![i64::MAX, -i64::MAX, i64::MAX]);
+        // …and symmetrically for a negative total.
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (1, 2, -i64::MAX, 10),
+                (1, 2, -i64::MAX, 11),
+                (1, 2, i64::MAX, 12),
+            ],
+        );
+        let deltas: Vec<i64> = ordered.iter().map(|&(_, _, d, _)| d).collect();
+        assert_eq!(deltas, vec![-i64::MAX, i64::MAX, -i64::MAX]);
+        // Every child keeps its own witness, and other parents are untouched.
+        let witnesses: Vec<i64> = ordered.iter().map(|&(_, _, _, w)| w).collect();
+        assert_eq!(witnesses, vec![10, 12, 11]);
     }
 
     #[test]
