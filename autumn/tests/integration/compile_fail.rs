@@ -2,13 +2,6 @@
 //! Tests for compile failures using trybuild.
 //!
 #[test]
-#[ignore = "scratch: run manually with TRYBUILD=overwrite to regenerate one golden"]
-fn scratch_generate_one_golden() {
-    let t = trybuild::TestCases::new();
-    t.compile_fail("tests/compile-fail/authorize_ambiguous_shape_alias_behind_cfg_attr.rs");
-}
-
-#[test]
 // A flat registry of trybuild fixtures: one `t.compile_fail(...)` per case, plus
 // the comment explaining why each case must not compile. It grows by a line per
 // guarantee and has no structure worth extracting.
