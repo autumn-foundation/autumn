@@ -263,17 +263,41 @@ impl CustomDomainTask {
         }
     }
 
-    /// Is `hostname`'s certificate still available to serve?
+    /// Is `hostname`'s certificate available AND usable?
     ///
-    /// Two `stat` calls, and only for a store this task can enumerate. A store
-    /// it cannot answers `true`, so a non-filesystem store is never wrongly
-    /// re-ordered.
+    /// Present-on-disk is not enough: a corrupt or mismatched pair passes a
+    /// `stat` but is rejected by both `warm` and the handshake source, so
+    /// answering `true` for it would suppress the repair below and leave the
+    /// domain hard down until its renew window opened — months, potentially.
+    /// The pair is therefore parsed, through the same loader the handshake
+    /// uses, and a pair that will not load counts as absent.
+    ///
+    /// Only for a store this task can enumerate; a store it cannot answers
+    /// `true`, so a non-filesystem store is never wrongly re-ordered.
     fn certificate_present(&self, hostname: &str) -> bool {
-        self.cache.get(hostname).is_some()
-            || self
-                .cert_store_paths
-                .as_ref()
-                .is_none_or(|fs| fs.find_cert_for_domains(&[hostname.to_owned()]).is_some())
+        if self.cache.get(hostname).is_some() {
+            return true;
+        }
+        let Some(fs) = self.cert_store_paths.as_ref() else {
+            return true;
+        };
+        let Some((chain_path, key_path)) = fs.find_cert_for_domains(&[hostname.to_owned()]) else {
+            return false;
+        };
+        let (Ok(chain), Ok(key)) = (std::fs::read(&chain_path), std::fs::read(&key_path)) else {
+            return false;
+        };
+        match crate::tls::certified_key_from_pem(&chain, &key, &self.provider) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    hostname,
+                    "stored custom-domain certificate is present but unusable ({e}); \
+                     treating it as missing so the repair pass re-orders it"
+                );
+                false
+            }
+        }
     }
 
     /// Does `hostname` still resolve to this deployment?
@@ -319,18 +343,21 @@ impl CustomDomainTask {
     ///
     /// A resolver reports the ADDRESSES a name ends at, following any CNAME
     /// silently — so an operator who configured only `ingress_hostname` has
-    /// nothing to compare an observed address against. Resolve the ingress
-    /// hostname each pass and use its addresses, rather than requiring the
-    /// operator to duplicate them in config where they would go stale.
+    /// nothing to compare an observed address against. The hostname's addresses
+    /// are therefore resolved and **added to** whatever was configured
+    /// explicitly, rather than replacing them or being skipped.
+    ///
+    /// The union matters for the setup the guide documents: subdomains CNAME to
+    /// a load balancer while apex domains use static A/AAAA records. Those are
+    /// two DIFFERENT address sets, and a tenant subdomain resolves to the load
+    /// balancer's. Returning only the configured apex addresses would leave
+    /// every subdomain stuck at `pending_dns` forever.
     ///
     /// Resolved per tick, not cached: an ingress behind a load balancer whose
     /// address changes must not leave every tenant domain failing verification
     /// until the process restarts.
     async fn effective_ingress(&self) -> ExpectedIngress {
         let mut ingress = self.ingress.clone();
-        if !ingress.ipv4.is_empty() || !ingress.ipv6.is_empty() {
-            return ingress;
-        }
         let Some(host) = ingress.hostname.clone() else {
             return ingress;
         };
@@ -339,8 +366,13 @@ impl CustomDomainTask {
         {
             for addr in addrs {
                 match addr {
-                    std::net::IpAddr::V4(v4) => ingress.ipv4.push(v4),
-                    std::net::IpAddr::V6(v6) => ingress.ipv6.push(v6),
+                    std::net::IpAddr::V4(v4) if !ingress.ipv4.contains(&v4) => {
+                        ingress.ipv4.push(v4);
+                    }
+                    std::net::IpAddr::V6(v6) if !ingress.ipv6.contains(&v6) => {
+                        ingress.ipv6.push(v6);
+                    }
+                    _ => {}
                 }
             }
         }

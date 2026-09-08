@@ -9123,6 +9123,15 @@ async fn build_acme_tls_listener(
             // whoever registered it.
             let mut reserved = acme_cfg.domains.clone();
             reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
+            // The ingress hostname is the sharpest of the three. It ALREADY
+            // resolves to the ingress addresses, so a tenant who registers it
+            // needs no DNS change at all: verification passes on the first
+            // tick, HTTP-01 validates, and from then on every request to the
+            // deployment's own infrastructure hostname routes to that tenant.
+            // It is not necessarily covered by `domains` — an operator may run
+            // ingress under a separate infrastructure zone — so it is reserved
+            // explicitly rather than by assuming overlap.
+            reserved.extend(cd_cfg.ingress_hostname.clone());
             let registry = std::sync::Arc::new(
                 crate::custom_domain::CustomDomainRegistry::new(
                     std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(

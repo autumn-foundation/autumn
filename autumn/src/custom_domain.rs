@@ -683,6 +683,18 @@ impl std::error::Error for RegisterError {}
 pub struct CustomDomainRegistry {
     store: Arc<dyn CustomDomainStore>,
     index: RwLock<HashMap<String, CustomDomain>>,
+    /// Serialises the STORE half of every write, per hostname.
+    ///
+    /// Each write drops the index lock before awaiting the store — holding a
+    /// `std` lock across an await is not an option — so without this two
+    /// writers for the same hostname can commit out of order. The damaging
+    /// order is a delete overtaken by an in-flight save: the index entry is
+    /// gone, but the file is recreated, and the next restart hydrates a domain
+    /// the app offboarded, which can then be re-issued and served.
+    ///
+    /// Keyed by hostname rather than global so a slow write for one tenant
+    /// cannot stall every other tenant's.
+    writes: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     max_domains: usize,
     /// Hostnames and wildcard patterns no tenant may claim.
     reserved: Vec<String>,
@@ -702,6 +714,7 @@ impl CustomDomainRegistry {
         Self {
             store,
             index: RwLock::new(HashMap::new()),
+            writes: tokio::sync::Mutex::new(HashMap::new()),
             max_domains,
             reserved: Vec::new(),
             hydrated: std::sync::atomic::AtomicBool::new(false),
@@ -843,6 +856,10 @@ impl CustomDomainRegistry {
             record
         };
 
+        // Held until the store write commits, so an offboard for this hostname
+        // cannot delete the file and then be overtaken by this save.
+        let gate = self.write_gate(&host).await;
+        let _write = gate.lock().await;
         if let Err(e) = self.store.save(&record).await {
             // Roll the claim back: a hostname that is not durable must not
             // route, or it would disappear on the next restart with no record
@@ -851,6 +868,12 @@ impl CustomDomainRegistry {
             return Err(RegisterError::Store(e.to_string()));
         }
         Ok(record)
+    }
+
+    /// The write gate for one hostname, creating it on first use.
+    async fn write_gate(&self, host: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.writes.lock().await;
+        Arc::clone(gates.entry(host.to_owned()).or_default())
     }
 
     /// The record for `hostname` (normalising the lookup key), if registered.
@@ -1097,6 +1120,12 @@ impl CustomDomainRegistry {
         // Delete from the store first: a crash between the two leaves a record
         // that `load` re-hydrates, which is recoverable — the reverse leaves a
         // hostname that routes but has no durable record.
+        //
+        // Under the same gate as every other write for this hostname, so an
+        // in-flight save cannot land after the delete and resurrect the record
+        // at the next restart.
+        let gate = self.write_gate(&host).await;
+        let _write = gate.lock().await;
         self.store.delete(&host).await?;
         Ok(write_lock(&self.index).remove(&host).is_some())
     }
@@ -1166,6 +1195,8 @@ impl CustomDomainRegistry {
         let Ok(host) = normalize_hostname(hostname) else {
             return Ok(false);
         };
+        let gate = self.write_gate(&host).await;
+        let _write = gate.lock().await;
         let updated = {
             let mut index = write_lock(&self.index);
             let Some(record) = index.get_mut(&host) else {

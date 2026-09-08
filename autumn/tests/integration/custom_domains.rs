@@ -711,3 +711,92 @@ async fn a_custom_domain_never_overrides_an_authenticated_tenant_source() {
         "the configured tenancy source must win over a client-supplied Host"
     );
 }
+
+// ── Codex round 2 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_tenant_cannot_claim_the_deployments_ingress_hostname() {
+    // The ingress hostname already resolves to the ingress, so a tenant who
+    // registered it would need no DNS change at all: verification passes on the
+    // first tick, HTTP-01 validates, and every request to the deployment's own
+    // infrastructure hostname would then route to that tenant. It is reserved
+    // even when it sits outside the ACME domains and the tenancy base domain.
+    let registry = Arc::new(
+        CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10).with_reserved([
+            "myapp.com".to_owned(),
+            "*.myapp.com".to_owned(),
+            // A separate infrastructure zone — not covered by the two above.
+            "ingress.myapp-infra.net".to_owned(),
+        ]),
+    );
+
+    let err = registry
+        .register("ingress.myapp-infra.net", "tenant-a", NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RegisterError::Reserved { .. }), "{err:?}");
+
+    // The operator's own names stay reserved too.
+    for host in ["myapp.com", "acme.myapp.com"] {
+        assert!(
+            registry.register(host, "tenant-a", NOW).await.is_err(),
+            "{host} must stay reserved"
+        );
+    }
+    // An unrelated tenant hostname is still fine.
+    assert!(
+        registry
+            .register("app.clientco.com", "tenant-a", NOW)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn an_offboard_is_not_overtaken_by_an_in_flight_save() {
+    // Both writes target the same hostname. Without per-hostname serialisation
+    // the save can land after the delete, leaving no index entry but a file on
+    // disk — which the next restart hydrates as a live domain the app already
+    // offboarded.
+    let store = Arc::new(MemoryCustomDomainStore::new());
+    let registry = Arc::new(CustomDomainRegistry::new(store.clone(), 10));
+    registry.load().await.unwrap();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    let writer = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move {
+            registry
+                .record_verified("app.clientco.com", NOW + 1)
+                .await
+                .unwrap();
+        })
+    };
+    let remover = {
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move { registry.remove("app.clientco.com").await.unwrap() })
+    };
+    writer.await.unwrap();
+    remover.await.unwrap();
+
+    // Whichever order they ran in, the durable state and the index must agree.
+    let on_disk = store.load_all_blocking();
+    let in_index = registry.get("app.clientco.com");
+    assert_eq!(
+        on_disk.is_empty(),
+        in_index.is_none(),
+        "the store and the index disagree: on_disk={on_disk:?} in_index={in_index:?}"
+    );
+
+    // And a fresh registry over the same store must see the same thing.
+    let reloaded = CustomDomainRegistry::new(store, 10);
+    reloaded.load().await.unwrap();
+    assert_eq!(
+        reloaded.get("app.clientco.com").is_none(),
+        in_index.is_none(),
+        "a restart resurrected a domain the app offboarded"
+    );
+}
