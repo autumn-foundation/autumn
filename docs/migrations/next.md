@@ -567,6 +567,166 @@ that means "HTTP-01" from one whose author intended to configure DNS-01;
 defaulting to `None` silently would be right in the first case and wrong in the
 second, which is exactly the choice a human should make.
 
+### Authorize: aliased `#[authorize]` and ambiguous attribute shapes are now a compile error
+
+**Why:** A security review (🛡 Warden) found that `#[authorize]` reached
+through `use ::autumn_web::authorize as x;` was invisible to the
+macro-expansion-time checks that decide who serves a cached
+`.idempotent()` reply — because a proc-macro attribute only ever sees the
+tokens of the item it annotates, never the enclosing module's `use`
+declarations. That let an idempotency-replay cache serve a stale "allowed"
+response after the requester's authorization was revoked, skipping
+`#[authorize]`'s policy re-check entirely. A syntactic heuristic (detecting
+`#[authorize]` by its argument *shape* instead of its literal name) was
+tried and found unsafe in the *other* direction during review: it could
+misclassify an unrelated attribute that happens to share the same argument
+grammar, silently breaking `.idempotent()`'s dedup guarantee instead. No
+heuristic can resolve the ambiguity correctly in both directions, so Autumn
+now refuses to compile it.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::authorize as authz; // or any other alias
+
+#[autumn_web::post("/notes/{id}")]
+#[authz("update", resource = Note)]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // ...
+}
+```
+
+This compiled — and, with `AppBuilder::idempotent()` turned on, was
+vulnerable to the stale-replay bypass above.
+
+This refusal fires when the aliased or shape-alike attribute is still
+present, unexpanded, at the point a route/guard macro (`#[post]`,
+`#[secured]`, `#[step_up]`, `#[throttle]`, `#[feature_flag]`) expands and
+scans for it — which is always true for the documented, natural attribute
+order shown above (`#[post(...)]` above `#[authz(...)]`, so `#[post]`
+expands first and sees the alias still raw below it). Written the other way
+around — the aliased or shape-alike attribute *above* the route macro — it
+expands first on its own and is gone from the attribute list by the time
+any Autumn macro runs, so this specific refusal never fires for it. That
+ordering doesn't reopen a gap, though: a genuine aliased `#[authorize]`
+positioned there still runs for real and leaves its own recognizable
+in-body check, which every route/guard macro's fallback body-scan already
+detects (the same mechanism that makes a *literal* `#[authorize]` above
+`#[post]` work correctly); an unrelated, non-Autumn attribute positioned
+there just expands as whatever it actually is and leaves nothing
+authorize-shaped behind, so the route is correctly treated as unguarded
+rather than falsely protected.
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::authorize; // spell it by its real name — no alias
+
+#[autumn_web::post("/notes/{id}")]
+#[authorize("update", resource = Note)]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // ...
+}
+```
+
+`#[authorize]` used under its literal name and applied unconditionally,
+exactly as every other Autumn macro normally is, is unaffected — this only
+closes the alias case. This includes a literal `#[authorize(...)]` reached
+through `#[cfg_attr(predicate, authorize(...))]`: the compiler resolves
+`cfg_attr` before Autumn's route/guard macros ever see the attribute, so it
+behaves exactly like any other `cfg_attr`-conditional attribute (fully
+present or fully absent depending on the predicate, decided by the
+compiler, not guessed at by a macro) — nothing new to migrate there. An
+*aliased* name behind `cfg_attr` is still caught by this same change, since
+by the time it reaches Autumn's ambiguity check the wrapper is already gone
+and it's indistinguishable from an ordinary aliased `#[authorize]`.
+
+If instead the compile error fires on an attribute that is genuinely
+**not** `#[authorize]` (a custom or third-party attribute that happens to
+share its `"action", resource = Type[, from = ident]` argument grammar —
+an `#[audit("update", resource = Note)]`, say), rename that attribute so
+its shape no longer collides. Autumn cannot tell the two cases apart from
+tokens alone, which is exactly why it refuses both rather than guessing.
+
+**Automation:** `manual` — the fix is a `use` statement and an attribute
+spelling change, or renaming an unrelated attribute, which depends on which
+of the two cases above applies; no mechanical rewrite can tell them apart.
+See
+[`docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`](../security/2026-09-08-aliased-authorize-idempotency-bypass/README.md)
+for the full threat model and review history.
+
+### static_get: `#[feature_flag]` is now a compile error
+
+**Why:** Found while reviewing the `#[authorize]` fix above. A
+`#[static_get]` route's cache hits are served by the static-first
+middleware before the inner router — and the handler along with it — is
+ever reached, which is exactly why `#[secured]`/`#[step_up]`/`#[throttle]`/
+`#[authorize]` are already refused in combination with it (see
+`static_route.rs`'s existing `INCOMPATIBLE_GUARD_MSG`). `#[feature_flag]`'s
+pre-body gate has the identical shape but was never added to that refusal,
+so a `#[feature_flag]`-gated `#[static_get]` route compiled successfully
+while silently not working the way it looked: once a page was cached, a
+later-disabled flag no longer hid it — the cache kept serving the
+pre-rendered content regardless of the flag's live value.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::static_get("/beta-page")]
+#[autumn_web::feature_flag("beta_page")]
+async fn beta_page() -> &'static str {
+    "..."
+}
+```
+
+This compiled, and pre-rendered/cached the page at build time; disabling
+`beta_page` afterward did not stop the cached page from being served.
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::feature_flags::{FeatureFlagService, InMemoryFlagStore};
+use axum::{extract::{Request, State}, http::StatusCode, middleware::Next, response::Response};
+use std::sync::Arc;
+
+// AppBuilder::static_gate runs a Tower/axum layer before a cache hit, so
+// -- unlike a #[feature_flag] attribute on the handler -- it can actually
+// gate a pre-rendered page. It runs outside the app's own router, before
+// AppState exists, so the flag service can't be pulled from there the way
+// #[feature_flag]'s extractor does -- construct and share it explicitly
+// instead, and register the *same* store with the app via
+// `.with_flag_store(...)` so both see the same flag state.
+async fn beta_page_gate(
+    State(flags): State<FeatureFlagService>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if req.uri().path() == "/beta-page" && !flags.is_enabled("beta_page", None) {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+    next.run(req).await
+}
+
+let store = Arc::new(InMemoryFlagStore::new());
+let flags = FeatureFlagService::new(store.clone());
+
+let app = autumn_web::app()
+    .static_gate(axum::middleware::from_fn_with_state(flags, beta_page_gate))
+    .with_flag_store(store);
+
+#[autumn_web::static_get("/beta-page")]
+async fn beta_page() -> &'static str {
+    "..."
+}
+```
+
+**Automation:** `manual` — moving the gate from an attribute to
+`AppBuilder::static_gate` is a structural change no codemod can make safely
+(it needs the app's `AppBuilder` chain, not just the handler function).
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
