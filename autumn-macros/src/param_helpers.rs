@@ -76,6 +76,40 @@ pub fn has_any_guard_gate_param(func: &ItemFn) -> bool {
         .any(|prefix| has_guard_gate_param_with_prefix(func, prefix))
 }
 
+/// Type-name prefixes of the pre-body `FromRequestParts` gate parameter each
+/// *auth/rate* guard macro inserts — deliberately excludes
+/// `__AutumnFlagGate_`. `#[feature_flag]` is not an auth/rate guard and
+/// carries no such incompatibility with a static route on its own; it is
+/// included in [`GUARD_GATE_TYPE_PREFIXES`] only because it is a *sibling*
+/// pre-body gate whose idempotency-replay ownership the other three need to
+/// see (Codex review on #2628, third finding).
+const AUTH_GUARD_GATE_TYPE_PREFIXES: &[&str] = &[
+    "__AutumnSecuredGate_",
+    "__AutumnStepUpGate_",
+    "__AutumnThrottleGate_",
+];
+
+/// Whether `func` already carries an *auth/rate* guard's pre-body gate
+/// parameter — `#[secured]`/`#[step_up]`/`#[throttle]`, but not
+/// `#[feature_flag]`.
+///
+/// For a "does this combination make sense" check (e.g. a static route
+/// macro refusing to combine with an auth/rate guard), use this instead of
+/// [`has_any_guard_gate_param`]: that function's broader prefix list also
+/// matches `#[feature_flag]`'s gate, which is unrelated to auth/rate
+/// incompatibility and was never meant to trip a check scoped to it. Codex
+/// review on #2628 (eighth finding) found `static_route.rs` doing exactly
+/// that — `__AutumnFlagGate_` joining [`GUARD_GATE_TYPE_PREFIXES`] for the
+/// idempotency-ownership use case above made `#[feature_flag]` written
+/// above `#[static_get]` an unintended, order-dependent compile break
+/// (the reverse order was, and remained, unaffected, since
+/// `feature_flag_macro` never checked the static-route marker either way).
+pub fn has_any_auth_guard_gate_param(func: &ItemFn) -> bool {
+    AUTH_GUARD_GATE_TYPE_PREFIXES
+        .iter()
+        .any(|prefix| has_guard_gate_param_with_prefix(func, prefix))
+}
+
 /// Whether `func` has a parameter whose type name starts with `prefix` — one
 /// of the [`GUARD_GATE_TYPE_PREFIXES`]. Exposed separately from
 /// [`has_any_guard_gate_param`] so a caller that only cares about ONE guard
@@ -302,5 +336,32 @@ mod tests {
             async fn h(Json(body): Json<T>) {}
         };
         assert!(!has_any_guard_gate_param(&f));
+    }
+
+    #[test]
+    fn has_any_guard_gate_param_detects_feature_flag_too() {
+        let flagged: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnFlagGate_h) {}
+        };
+        assert!(has_any_guard_gate_param(&flagged));
+    }
+
+    #[test]
+    fn has_any_auth_guard_gate_param_excludes_feature_flag() {
+        // Codex review on #2628 (eighth finding): a feature-flag gate is not
+        // an auth/rate guard, so a check scoped to "is there an
+        // auth/rate guard here" (e.g. static_route.rs's incompatibility
+        // check) must not match it, even though the broader
+        // `has_any_guard_gate_param` (used for idempotency-replay
+        // ownership) correctly does.
+        let flagged: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnFlagGate_h) {}
+        };
+        assert!(!has_any_auth_guard_gate_param(&flagged));
+
+        let secured: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnSecuredGate_h) {}
+        };
+        assert!(has_any_auth_guard_gate_param(&secured));
     }
 }

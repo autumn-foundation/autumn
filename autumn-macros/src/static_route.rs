@@ -234,7 +234,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // onto the surviving single function is the guard's own signature/body
     // rewrite: `#[secured]`/`#[step_up]`/`#[throttle]` each insert a
     // handler-unique pre-body gate parameter
-    // (`param_helpers::has_any_guard_gate_param`), and `#[authorize]` —
+    // (`param_helpers::has_any_auth_guard_gate_param`), and `#[authorize]` —
     // which inserts no such parameter — leaves its role/policy-check marker
     // directly in the body (`api_doc::extract_secured_info`, the same
     // recovery the `#[get]`/`#[post]` route macro already relies on for
@@ -242,7 +242,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let unexpanded_guard_attr = input_fn.attrs.iter().find(|attr| {
         crate::param_helpers::attr_or_cfg_attr_matches_any(attr, &INCOMPATIBLE_GUARD_ATTRS)
     });
-    let already_expanded_guard = crate::param_helpers::has_any_guard_gate_param(&input_fn)
+    let already_expanded_guard = crate::param_helpers::has_any_auth_guard_gate_param(&input_fn)
         || crate::api_doc::extract_secured_info(&input_fn).0;
     if !leading_guard_items.is_empty() || unexpanded_guard_attr.is_some() || already_expanded_guard
     {
@@ -523,12 +523,40 @@ mod tests {
     }
 
     #[test]
+    fn static_get_accepts_a_feature_flag_guard_expanded_above_it() {
+        // Codex review on #2628 (eighth finding): round 3 added
+        // `__AutumnFlagGate_` to `param_helpers::GUARD_GATE_TYPE_PREFIXES` so
+        // `#[secured]`/`#[step_up]`/`#[throttle]` could see an earlier
+        // `#[feature_flag]` gate for idempotency-replay-ownership purposes.
+        // `static_get_macro` shared that same broad prefix list for an
+        // unrelated question -- "is there an auth/rate guard here that's
+        // incompatible with a static route" -- so `#[feature_flag]`
+        // expanded above `#[static_get]` was wrongly rejected too, even
+        // though `#[feature_flag]` is not an auth/rate guard and the
+        // reverse attribute order was never rejected. Must compile.
+        let flagged = crate::feature_flag::feature_flag_macro(
+            quote! { "my_flag" },
+            quote! {
+                async fn about() -> &'static str { "about" }
+            },
+        );
+        let flagged_fn = crate::param_helpers::extract_fn_item(flagged, "about");
+        let generated = static_get_macro(quote! { "/about" }, quote! { #flagged_fn }).to_string();
+
+        assert!(
+            !generated.contains("compile_error"),
+            "a #[feature_flag] gate stacked above #[static_get] must not be rejected as an \
+             incompatible auth/rate guard: {generated}"
+        );
+    }
+
+    #[test]
     fn static_get_rejects_an_authorize_guard_expanded_above_it() {
         // `#[authorize]` is the one guard with no pre-body gate parameter —
         // it leaves only a body marker/policy-check statement — so this
         // exercises the `api_doc::extract_secured_info` half of the
         // already-expanded-guard detection, not
-        // `param_helpers::has_any_guard_gate_param`.
+        // `param_helpers::has_any_auth_guard_gate_param`.
         let authorized = crate::authorize::authorize_macro(
             quote! { "view", resource = Room },
             quote! {
