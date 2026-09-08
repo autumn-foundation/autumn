@@ -1854,7 +1854,7 @@ async fn recompute_batch_retrying(
 /// Whether `error` is the database aborting one transaction so that another
 /// can proceed: Postgres's deadlock detector (`40P01`) or a serialisation
 /// failure (`40001`), and `SQLite`'s busy timeout.
-pub(crate) fn is_lock_contention(error: &AutumnError) -> bool {
+pub fn is_lock_contention(error: &AutumnError) -> bool {
     let message = error.to_string();
     message.contains("deadlock detected")
         || message.contains("could not serialize access")
