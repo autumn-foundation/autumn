@@ -138,7 +138,8 @@ pub enum SampleError {
     },
     /// `--sample` named a table the classified universe does not have.
     UnknownRoot {
-        /// The table names, sorted.
+        /// The quoted table names, sorted, each with a suggestion where
+        /// trimming it would have matched a real table.
         tables: Vec<String>,
     },
     /// The same root table was given twice.
@@ -530,7 +531,16 @@ pub fn parse_spec(raw: &str) -> Result<SampleSpec, SampleError> {
     let (table, amount) = raw
         .rsplit_once('=')
         .ok_or_else(|| invalid("no `=` between the table and the amount"))?;
-    let table = table.trim();
+    // The table portion is taken VERBATIM. A quoted identifier may begin or end
+    // with a space (`CREATE TABLE " users"` is legal), and trimming it silently
+    // retargeted the root: measured, `--sample " users=5"` reported "Sampling
+    // control from users" and subsetted `users` — a different table that
+    // happened to exist — while the one the operator named was never a root.
+    // Losing a wrong target beats gaining tolerance for `users = 500`, which
+    // `resolve_roles` now names as a suggestion instead of guessing at.
+    //
+    // The amount is still trimmed: it is a count or a percentage, so it has no
+    // meaningful leading or trailing space to preserve.
     if table.is_empty() {
         return Err(invalid("the table name is empty"));
     }
@@ -739,13 +749,23 @@ fn resolve_roles(
             });
         }
     }
-    let unknown = sorted_unique(
-        inputs
-            .roots
-            .iter()
-            .filter(|s| !keys.contains_key(s.table.as_str()))
-            .map(|s| s.table.clone()),
-    );
+    // Rendered quoted, because the table portion is verbatim and an identifier
+    // may carry leading or trailing space: unquoted, `--sample " users=5"` and
+    // `--sample "users=5"` produce an identical message. Where trimming WOULD
+    // have matched, say so rather than trimming — guessing is what silently
+    // retargeted the root before.
+    let unknown = sorted_unique(inputs.roots.iter().filter_map(|s| {
+        if keys.contains_key(s.table.as_str()) {
+            return None;
+        }
+        let name = &s.table;
+        let trimmed = name.trim();
+        Some(if trimmed == name || !keys.contains_key(trimmed) {
+            format!("{name:?}")
+        } else {
+            format!("{name:?} \u{2014} did you mean {trimmed:?}? the table is taken verbatim, since one may begin or end with a space")
+        })
+    }));
     if !unknown.is_empty() {
         return Err(SampleError::UnknownRoot { tables: unknown });
     }
@@ -2133,6 +2153,34 @@ mod tests {
         );
     }
 
+    /// A table name may begin or end with a space; an amount may not.
+    ///
+    /// Trimming the table portion did not merely make such a root unnameable —
+    /// it silently retargeted the run. Measured against `PostgreSQL` 16.13 with
+    /// both `" users"` and `users` present, `--sample " users=5"` reported
+    /// "Sampling control from users" and subsetted `users`: a different table,
+    /// chosen by the parser rather than the operator.
+    #[test]
+    fn spec_keeps_leading_and_trailing_space_in_a_table_name() {
+        assert_eq!(
+            parse_spec(" users=5").unwrap(),
+            root(" users", SampleAmount::Count(5))
+        );
+        assert_eq!(
+            parse_spec("users =5").unwrap(),
+            root("users ", SampleAmount::Count(5))
+        );
+        // The amount is still trimmed — it has no whitespace worth preserving.
+        assert_eq!(
+            parse_spec("users= 5 ").unwrap(),
+            root("users", SampleAmount::Count(5))
+        );
+        assert_eq!(
+            parse_spec("users= 2.5% ").unwrap(),
+            root("users", SampleAmount::Percent(2.5))
+        );
+    }
+
     #[test]
     fn spec_rejects_malformed_amounts() {
         for bad in [
@@ -2333,8 +2381,53 @@ mod tests {
         assert_eq!(
             err,
             SampleError::UnknownRoot {
-                tables: vec!["nope".to_owned()]
-            }
+                tables: vec!["\"nope\"".to_owned()]
+            },
+            "quoted, so a name whose only oddity is invisible reads as one"
+        );
+    }
+
+    /// A root that differs from a real table only by surrounding space says so.
+    ///
+    /// The parser takes the table verbatim, so `--sample " users=5"` against a
+    /// schema with `users` is an unknown root rather than a silent retarget.
+    /// Unquoted and unexplained, that message would be indistinguishable from
+    /// naming `users` itself and finding it missing.
+    #[test]
+    fn plan_suggests_the_trimmed_name_for_a_space_padded_root() {
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root(" users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        let SampleError::UnknownRoot { tables: reported } = err else {
+            panic!("a space-padded root must be unknown, not silently trimmed");
+        };
+        assert_eq!(reported.len(), 1);
+        assert!(
+            reported[0].contains("\" users\"") && reported[0].contains("did you mean \"users\""),
+            "the message must show the space and name the table it would have hit: {}",
+            reported[0]
+        );
+
+        // A name that trims to nothing real gets no invented suggestion.
+        let err = plan_of(
+            &[root(" nope ", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        let SampleError::UnknownRoot { tables: reported } = err else {
+            panic!("unknown is unknown");
+        };
+        assert!(
+            !reported[0].contains("did you mean"),
+            "no suggestion where trimming would not have matched: {}",
+            reported[0]
         );
     }
 

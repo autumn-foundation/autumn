@@ -111,7 +111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference data does not shrink, and measuring the sampled base tables alone
   reported `488.0 kB → 232.0 kB` on a database still holding a 44 MB view.
   A `--sample` spec splits at its LAST `=`, so a table whose quoted name
-  contains one (`events=2026`) can be named as a root. See the
+  contains one (`events=2026`) can be named as a root, and the table portion is
+  taken verbatim rather than trimmed — a quoted name may begin or end with a
+  space, and trimming silently retargeted such a root at whatever table the
+  trimmed name happened to hit. A root that differs from a real table only by
+  surrounding space is now reported as unknown, with the trimmed name suggested.
+  See the
   [migration guide](docs/migrations/next.md#scrub-a-delete-trigger-or-rule-on-a-table-autumn-db-scrub-empties-is-refused). Legacy
   `INHERITS` inheritance is refused for a sampled run (a statement naming the
   parent reaches the child, which the plan models separately); an exact `100%`
