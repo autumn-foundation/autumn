@@ -409,6 +409,31 @@ fn reject_untagged_variants(data: &syn::DataEnum) -> syn::Result<()> {
 /// Split out of [`reject_undescribable_enum`] to keep that function within the
 /// crate's line budget; it is one rule, checked in one place.
 fn reject_aliased_variants(data: &syn::DataEnum) -> syn::Result<()> {
+    // `#[serde(other)]` is the SAME deserialize-only widening as `alias`, one
+    // keyword over: the marked variant becomes the catch-all, so serde accepts
+    // ANY unrecognised spelling for it. A closed `enum` array listing only the
+    // catch-all's own name therefore rejects, on a request, every value the
+    // handler happily takes.
+    //
+    // Checked alongside `alias` rather than in its own pass because they are one
+    // rule — "the deserialize side accepts more than the serialize side writes"
+    // — and splitting it is how this crate keeps shipping half a guard.
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::serde_bare_word(&v.attrs, &["other"]).is_some())
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] cannot describe a variant marked \
+             `#[serde(other)]`: it is serde's catch-all, so deserialization accepts any \
+             unrecognised spelling while serialization only ever writes this variant's own \
+             name — a closed string set would reject requests the handler accepts. Write the \
+             `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+
     // `#[serde(alias = "…")]` is a DESERIALIZE-only widening: the alias is
     // accepted on input and never written on output. A closed string set built
     // from the canonical spellings is therefore too narrow for a request (an
@@ -775,6 +800,23 @@ mod tests {
         })
         .expect_err("a variant-level untagged must be refused");
         assert!(err.contains("untagged"), "{err}");
+    }
+
+    /// `#[serde(other)]` is the catch-all: deserialization accepts ANY
+    /// unrecognised spelling for that variant, so a closed string set rejects
+    /// requests the handler takes. Same deserialize-only widening as `alias`.
+    #[test]
+    fn a_catch_all_variant_is_refused() {
+        let err = audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                Retired,
+                #[serde(other)]
+                Unknown,
+            }
+        })
+        .expect_err("a #[serde(other)] catch-all must be refused");
+        assert!(err.contains("other"), "{err}");
     }
 
     /// The container-level form must still be caught — the new variant scan is

@@ -6376,6 +6376,9 @@ impl AppBuilder {
             openapi,
             config_loader_factory,
             plugin_config_roots,
+            merge_routers,
+            nest_routers,
+            declared_routes,
             ..
         } = self;
 
@@ -6392,6 +6395,27 @@ impl AppBuilder {
         // production credentials, and telemetry cannot affect the document, so
         // an export advertised as touching nothing must not run it.
         let config = load_config_only(config_loader_factory, plugin_config_roots).await;
+
+        // Run the SAME duplicate-route check the serving path runs before it
+        // mounts anything (`router.rs`). `generate_spec` keys operations by
+        // (path, method), so a collision would silently DROP the earlier one and
+        // `--check` could pass on a contract for an app that cannot start —
+        // reporting a subset of the API as if it were the whole of it.
+        //
+        // Reusing the serving path's function rather than re-deriving the rule
+        // here: a second copy would drift, which is how several defects on this
+        // branch happened.
+        if let Err(error) = crate::router::reject_duplicate_user_routes(
+            &routes,
+            &scoped_groups,
+            &merge_routers,
+            &nest_routers,
+            &declared_routes,
+            &config,
+        ) {
+            eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {error}");
+            std::process::exit(1);
+        }
 
         let mut openapi_config = openapi_config;
         openapi_config.api_versions = api_versions;

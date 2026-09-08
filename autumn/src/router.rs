@@ -1875,7 +1875,14 @@ fn framework_route_clashes(
 /// The first pairwise collision wins: `existing` names the handler that
 /// registered the path first (in the iteration order used by the actual
 /// mount step), `incoming` names the duplicate that triggered the error.
-fn reject_duplicate_user_routes(
+/// Fail when two user- or plugin-registered routes share a `(method, path)`.
+///
+/// `pub` so the no-boot dump modes can run the SAME check the serving path
+/// runs. `autumn openapi export` otherwise emitted a document in which the
+/// later of two colliding operations silently overwrote the earlier — so
+/// `--check` could pass on a contract for an app that cannot start at all
+/// (issue #802). One function, both callers, no second copy to drift.
+pub fn reject_duplicate_user_routes(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
     merge_routers: &[axum::Router<AppState>],
