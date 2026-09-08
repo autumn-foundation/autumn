@@ -34,6 +34,35 @@ use super::site::{Csrf, Repos, render};
 /// reach a row without going through the resolver's type-aware branches —
 /// `/?p=<id>`, `/archives/<id>` and search — where a type registered
 /// `public: false` would otherwise render in full.
+/// Whether `path`'s leading segments are a date prefix a permalink can mint.
+///
+/// The dated structures produce `/{year}/{slug}` and `/{year}/{month}/{slug}`
+/// and `/{year}/{month}/{day}/{slug}` — nothing else. Accepting any prefix gave
+/// every post an unbounded set of aliases, which is a duplicate-content problem
+/// for search engines and a correctness one for anything that treats a URL as
+/// an identity.
+///
+/// The ranges are checked as well as the shape: `/2026/13/hello` names no month
+/// and must 404 rather than serve the post.
+fn is_dated_permalink_prefix(path: &[String]) -> bool {
+    let Some((_, prefix)) = path.split_last() else {
+        return false;
+    };
+    let numeric = |segment: &String, lo: u32, hi: u32| {
+        segment
+            .parse::<u32>()
+            .is_ok_and(|value| (lo..=hi).contains(&value))
+    };
+    match prefix {
+        [year] => numeric(year, 1000, 9999),
+        [year, month] => numeric(year, 1000, 9999) && numeric(month, 1, 12),
+        [year, month, day] => {
+            numeric(year, 1000, 9999) && numeric(month, 1, 12) && numeric(day, 1, 31)
+        }
+        _ => false,
+    }
+}
+
 fn is_publicly_routable(post: &Post) -> bool {
     content_types::find_post_type(&post.post_type).is_some_and(|registered| registered.public)
 }
@@ -294,7 +323,12 @@ pub async fn dispatch(
             if let Some(page) = resolve_page_path(&repos, &path).await? {
                 return single_post(&repos, &session, &csrf, page).await;
             }
-            let Some(last) = path.last() else {
+            // …but only when the prefix is a shape a permalink actually mints.
+            // Taking the last segment of *any* path served `/hello` as
+            // `/anything/hello`, `/2026/13/hello` and unboundedly many other
+            // non-permalinks: duplicate-content aliases for every post, and a
+            // 200 where a 404 belongs.
+            let Some(last) = path.last().filter(|_| is_dated_permalink_prefix(&path)) else {
                 return not_found(&repos, &session, &csrf).await;
             };
             match find_visible(&repos, "post", last).await? {

@@ -3277,3 +3277,129 @@ async fn a_transition_is_attributed_to_the_acting_editor() {
         &transition_line[..transition_line.len().min(80)]
     );
 }
+
+/// A post is reachable at its permalink, and only at its permalink.
+///
+/// The dated fallback took the last segment of *any* multi-segment path, so
+/// `/hello` was also served at `/anything/hello` and `/2026/13/hello` — an
+/// unbounded set of duplicate-content aliases, and a 200 where a 404 belongs.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_post_is_not_served_from_arbitrary_paths() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Hello", "Body.", "publish").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("permalink_structure", "day_and_name")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let dated = chrono::Utc::now().format("%Y/%m/%d").to_string();
+    client
+        .get(&format!("/{dated}/hello"))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+
+    for alias in [
+        "/anything/hello",
+        "/2026/13/hello",
+        "/2026/00/hello",
+        "/2026/01/32/hello",
+        "/a/b/c/d/hello",
+        "/99/hello",
+    ] {
+        assert_eq!(
+            client.get(alias).send().await.status,
+            404,
+            "`{alias}` is not a permalink and must not serve the post"
+        );
+    }
+}
+
+/// An ordinary save does not unfile a post from taxonomies the editor hides.
+///
+/// `set_post_terms` replaces a post's filings wholesale, and the editor renders
+/// only `category` and `post_tag` — so a save silently deleted every custom
+/// taxonomy assignment, including the ones the importer had just restored. The
+/// form is not evidence about taxonomies it never showed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn saving_a_post_keeps_assignments_the_editor_does_not_render() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Filed", "Body.", "publish").await;
+
+    // A term in a taxonomy the editor has no field for, filed against the post.
+    // Written directly because registering one would leak into every later
+    // test through the process-global registry — and `post_terms` does not
+    // care whether the taxonomy is registered, which is exactly the state an
+    // import leaves behind.
+    let db = TestDb::shared().await;
+    try_execute(
+        db,
+        "INSERT INTO terms (taxonomy, name, slug, description) \
+         VALUES ('genre', 'Longform', 'longform', '')",
+    )
+    .await
+    .expect("insert custom term");
+    try_execute(
+        db,
+        &format!(
+            "INSERT INTO post_terms (post_id, term_id) \
+             SELECT {id}, id FROM terms WHERE slug = 'longform'"
+        ),
+    )
+    .await
+    .expect("file the post under it");
+
+    // An ordinary edit that names only a tag.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Filed"),
+            ("slug", "filed"),
+            ("excerpt", ""),
+            ("body", "Edited body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", "rust"),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The tag was applied, and the custom-taxonomy filing survived.
+    let editor = client
+        .get(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(editor.contains("rust"), "the tag should have been applied");
+
+    // Read the filing back. `1/COUNT(*)` divides by zero — and so errors —
+    // exactly when the row is gone, which is the assertion this needs from a
+    // helper that reports success or failure rather than rows.
+    let still_filed = try_execute(
+        db,
+        &format!(
+            "SELECT 1/COUNT(*) FROM post_terms pt JOIN terms t ON t.id = pt.term_id \
+             WHERE pt.post_id = {id} AND t.taxonomy = 'genre'"
+        ),
+    )
+    .await;
+    assert!(
+        still_filed.is_ok(),
+        "the custom-taxonomy filing was deleted by an ordinary save: {still_filed:?}"
+    );
+}

@@ -981,6 +981,25 @@ async fn apply_terms(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResul
         }
     }
 
+    // `set_post_terms` replaces the post's filings wholesale, so anything this
+    // form does not reconstruct is deleted. The editor renders `category` and
+    // `post_tag` only, which meant an ordinary save silently unfiled a post
+    // from every custom taxonomy — including the ones the importer had just
+    // restored. Carry those forward: the form is not evidence about taxonomies
+    // it never showed.
+    let editable: std::collections::HashSet<&str> = taxonomies
+        .iter()
+        .map(|taxonomy| taxonomy.slug)
+        .filter(|slug| matches!(*slug, "category" | "post_tag"))
+        .collect();
+    for term in repos.post_terms(post.id).await? {
+        if !editable.contains(term.taxonomy.as_str()) {
+            term_ids.push(term.id);
+        }
+    }
+    term_ids.sort_unstable();
+    term_ids.dedup();
+
     // Every repository read above is finished, so the connection is taken only
     // for the write.
     repos
