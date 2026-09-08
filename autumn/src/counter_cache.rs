@@ -876,12 +876,11 @@ fn fold_and_order<M: 'static>(
             totals.push((spec_index, parent_id, i128::from(delta), witness));
             continue;
         }
-        match seen.get(&(spec_index, parent_id)) {
-            Some(&at) => totals[at].2 += i128::from(delta),
-            None => {
-                seen.insert((spec_index, parent_id), totals.len());
-                totals.push((spec_index, parent_id, i128::from(delta), witness));
-            }
+        if let Some(&at) = seen.get(&(spec_index, parent_id)) {
+            totals[at].2 += i128::from(delta);
+        } else {
+            seen.insert((spec_index, parent_id), totals.len());
+            totals.push((spec_index, parent_id, i128::from(delta), witness));
         }
     }
     // A net total that no single `i64` delta can carry goes out as several
