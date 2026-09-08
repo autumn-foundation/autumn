@@ -35,8 +35,18 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - id: plan
+        env:
+          # workflow_dispatch's `type: choice` only constrains the manual UI
+          # dropdown - the API/CLI (`gh workflow run -f samples=...`) can pass
+          # any string, so it's re-validated here rather than trusted, and
+          # kept out of the shell command line to avoid interpolating it.
+          SAMPLES: ${{ inputs.samples }}
         run: |
-          echo "matrix=$(seq 1 "${{ inputs.samples }}" | jq -R . | jq -cs '{n: .}')" >> "$GITHUB_OUTPUT"
+          case "$SAMPLES" in
+            5|10|20) ;;
+            *) echo "::error::samples must be one of 5, 10, 20 (got: $SAMPLES)"; exit 1 ;;
+          esac
+          echo "matrix=$(seq 1 "$SAMPLES" | jq -R . | jq -cs '{n: .}')" >> "$GITHUB_OUTPUT"
 
   # Job id must stay "test" to reuse ci.yml's cache entry.
   test:
