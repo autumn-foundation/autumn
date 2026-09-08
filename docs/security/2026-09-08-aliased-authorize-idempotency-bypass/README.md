@@ -220,7 +220,7 @@ extract either way.
   `authorize`/`secured`/`step_up`/`throttle`/`route` and this PR's own new
   fixtures), consistent with a rustc/dependency version drift between this
   sandbox and whichever environment last generated those goldens.
-- `cargo test -p autumn-macros --lib`: 1192/1192 pass, including every
+- `cargo test -p autumn-macros --lib`: 1187/1187 pass, including every
   golden-expansion test pinning `#[secured]`/`#[step_up]`/`#[throttle]`/
   `#[authorize]`'s exact generated output (unaffected — the fix only adds an
   early rejection, never changes what a guard emits when it does compile)
@@ -387,6 +387,134 @@ New tests: `rejects_the_literal_name_behind_cfg_attr_since_presence_is_unknowabl
 (replaces the now-incorrect `accepts_the_literal_name_behind_cfg_attr_without_ambiguity`),
 `rejects_an_aliased_authorize_shape_behind_nested_cfg_attr`,
 `attr_is_authorize_shaped_recognizes_the_literal_name_behind_nested_cfg_attr`.
+
+> **Superseded by Round 6 below.** Every claim in rounds 4 and 5 about
+> `cfg_attr` staying unexpanded when a *sibling* attribute macro runs was
+> wrong, verified empirically. All of the cfg_attr-specific code introduced
+> in these two rounds — `for_each_conditionally_applied_meta`,
+> `find_unsafe_cfg_attr_authorize_meta`,
+> `conditionally_applied_meta_is_unsafe_to_resolve`, and the unit tests
+> named above — was removed in Round 6. Left in place here, uncorrected, as
+> an honest record of the reasoning that seemed right at the time and where
+> it broke down; see Round 6 for what actually happens and why the security
+> property survives anyway (via a different, pre-existing code path).
+
+## Round 6: rounds 4 and 5 were built on a wrong premise about `cfg_attr` — corrected, verified empirically
+
+Codex review on the round-5 commit flagged that the reasoning behind the
+`cfg_attr`-specific code (`param_helpers.rs`'s pre-existing, and previously
+unquestioned, claim that `cfg_attr` stays unexpanded until *every* attribute
+macro on an item has run) doesn't hold for a `cfg_attr` sitting alongside a
+*separate*, active attribute macro on the same item — only for the case
+`param_helpers::attr_or_cfg_attr_matches_any` was actually written for
+(#2513): detecting a `cfg_attr`-wrapped guard for a **refuse-this-
+combination** check, where over-detection is harmless. Rounds 4/5 reused
+that pattern for a **replay-ownership** decision, where guessing wrong in
+either direction is unsafe — and the underlying premise turned out to be
+false for this shape of check.
+
+This was not taken on faith. Two real `rustc` compiles (via `cargo check
+--example`, against the already-built crate, deleted after use — not a
+unit test constructing tokens by hand) settled it:
+
+1. `#[route] #[cfg_attr(all(), authorize(...))]` and the reverse attribute
+   order both show `#[authorize]`'s own signature injection (hidden
+   `Session`/`State` parameters) firing — proof `authorize_macro` really
+   runs and `cfg_attr` is already gone by the time it or `route_macro` sees
+   the item, regardless of which is written first.
+2. `#[route] #[cfg_attr(all(), authz_alias(...))]` (an aliased name behind
+   `cfg_attr`) produces this file's *ordinary*, non-`cfg_attr`
+   `AMBIGUOUS_NAME_MESSAGE` — not a `cfg_attr`-specific one — and the alias
+   import is flagged `unused`, proof the compiler resolved `cfg_attr` and
+   handed `route_macro` a plain, already-unwrapped attribute *before*
+   `authz_alias` was ever looked up as its own macro.
+
+**Conclusion:** on this workspace's MSRV, `cfg_attr` is resolved by the
+compiler before a *sibling* attribute macro on the same item ever runs,
+independent of write order. So the round-4/5 `cfg_attr`-unwrapping code in
+`attr_is_authorize_shaped` and `reject_if_ambiguous_authorize_shape` was
+dead: never reached by real compiled code, only by the unit tests that
+constructed input via `syn::parse_quote!` (which cannot observe real
+`rustc` expansion order at all — they were passing for the wrong reason).
+The *security property* rounds 4/5 were chasing was never actually missing:
+an aliased name behind `cfg_attr` is still caught, because by the time
+`reject_if_ambiguous_authorize_shape` runs, the wrapper is already gone and
+it's indistinguishable from an ordinary aliased `#[authorize]` — the
+pre-existing, unmodified `meta_is_ambiguous_authorize_shape` path already
+handles it correctly.
+
+**Fix:** removed `for_each_conditionally_applied_meta`,
+`find_unsafe_cfg_attr_authorize_meta`, and
+`conditionally_applied_meta_is_unsafe_to_resolve` entirely.
+`attr_is_authorize_shaped` and `reject_if_ambiguous_authorize_shape` are
+back to plain, non-`cfg_attr`-aware checks. Removed the round-4/5 unit
+tests for the reason above. Added real, `rustc`-verified coverage instead:
+`tests/compile-fail/authorize_ambiguous_shape_alias_behind_cfg_attr.rs`, a
+trybuild fixture proving the aliased-behind-`cfg_attr` case is refused via
+the *ordinary* path — genuine end-to-end coverage the unit tests never
+provided. Corrected `docs/migrations/next.md`, which had documented the
+round-5 `cfg_attr` refusal as its own breaking case; removed that
+subsection (a literal `#[authorize]` behind `cfg_attr` was never actually
+refused in real builds, so there was nothing to migrate).
+
+**Lesson:** `param_helpers::attr_or_cfg_attr_matches_any`'s own doc comment
+(#2513) is correct for what it's used for — a **refuse-this-combination**
+check, where treating a `cfg_attr`-wrapped guard as unconditionally present
+is a safe, conservative direction to guess. It is not a general fact about
+`cfg_attr` expansion order safe to reuse for every kind of check; applying
+it to a **replay-ownership** decision (where over- *and* under-detection are
+both unsafe) was the actual mistake, not the underlying Rust semantics,
+which — per the two probes above — are actually more forgiving here than
+rounds 4/5 assumed. `param_helpers.rs`'s own use of the pattern is
+unaffected by this correction: it was never subject to this failure mode,
+since its checks are refuse-only, not replay-ownership decisions, and their
+guess is safe in the "always suspect a cfg_attr-wrapped guard" direction
+regardless of real expansion order.
+
+## Round 7: name alone still can't prove *identity* even when it matches
+
+Rounds 0–6 closed the case where Autumn's real `#[authorize]` is reached
+under a name that *doesn't* match ("authorize" spelled some other way).
+Codex review found the mirror-image gap: name alone also can't prove that
+an attribute *literally* named `authorize` really is Autumn's macro. A
+proc-macro attribute never sees import resolution, so an entirely unrelated
+attribute macro reachable as `authorize` — imported from another crate
+under that name, or aliased to it — passes `attr_is_authorize_shaped`'s
+name check exactly as easily as Autumn's own, misleading
+`has_authorize_guard`/`should_own_replay` into suppressing replay-layer
+protection for a route that has no real authorization check on it at all.
+
+Unlike the name-*mismatch* case, this one narrows without breaking
+Autumn's own primary feature: `#[authorize]` always requires
+`"action", resource = Type[, from = ident]`, and `authorize_macro` itself
+already enforces that grammar independently — a genuine Autumn call with
+malformed arguments fails to compile regardless of what
+`attr_is_authorize_shaped` answers. So requiring the argument shape *in
+addition to* the name closes the overwhelming majority of the gap without
+any cost to legitimate usage: a real Autumn call always matches (name *and*
+valid grammar), while an unrelated macro reachable as `authorize` would
+have to coincidentally also accept Autumn's exact bespoke calling
+convention to still slip through.
+
+**Fix:** `attr_is_authorize_shaped` now requires both `meta_is_literally_authorize`
+and a new `meta_has_authorize_arg_shape` helper (the argument-parsing logic
+already used by `meta_is_ambiguous_authorize_shape`, extracted so both
+share it). New tests:
+`attr_is_authorize_shaped_rejects_a_same_named_attribute_with_a_different_grammar`
+(a same-named attribute with unrelated arguments, and a bare `#[authorize]`
+with none, are both no longer treated as present).
+
+**Accepted residual limitation:** an unrelated macro reachable as
+`authorize` that *also* happens to accept the exact
+`"action", resource = Type[, from = ident]` grammar would still be
+misclassified as Autumn's guard. This is not fixed, and — unlike every
+other gap in this document — is not expected to be: refusing every
+literally-named `#[authorize(...)]` attribute (the only way to close it
+completely) would break the framework's own core feature for every
+legitimate caller, with no compensating benefit, since the residual
+scenario requires an unrelated crate to coincidentally invent both the same
+macro name *and* the same bespoke argument syntax Autumn uses. Documented
+here rather than left silent.
 
 ## 🗂 Ledger
 
