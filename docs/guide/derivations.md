@@ -340,6 +340,16 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   regardless of `batch_size`, and any batch the database aborts to break a
   deadlock is retried from its committed checkpoint. No test in this release
   covers the self-referential shape end to end.
+- **Weights are ordinary numbers, not the edges of `i64`.** The delta paths
+  never overflow on their own (a difference that does not fit goes out as two
+  deltas, a bulk mutation's total is netted in `i128`, and a tenant-scoped
+  parent's deltas are ordered so no running sum leaves the span of zero and
+  their total), but a parent already sitting at `i64::MIN` or `i64::MAX` that
+  receives weights of the same magnitude can still refuse an intermediate
+  value, and SQLite's integer `SUM` raises `integer overflow` when a
+  scan's running total leaves `i64` even if the final aggregate fits. A
+  summed column whose values approach 2^63 is outside what a derivation is
+  for; keep weights small enough that any partial sum of them fits.
 - **No configuration keys.** Reconciliation and the boot backfill are automatic
   and use the default `BackfillOptions`. Call `run_backfill` to pace a large
   repair by hand.

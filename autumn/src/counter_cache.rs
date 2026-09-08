@@ -927,13 +927,17 @@ fn order_tenant_runs<M: 'static>(specs: &[CounterCacheSpec<M>], folded: &mut [Co
             let mut prefix: i128 = 0;
             for slot in run.iter_mut() {
                 let toward_total = prefix < total || (prefix == total && total < 0);
+                // Ties keep their original (child) order, so equal weights go
+                // out as they were captured and the mutation stays
+                // deterministic: `min_by_key` takes the first minimum, and the
+                // reversed scan makes `max_by_key` take the first maximum.
                 let pick = if toward_total {
-                    (0..remaining.len()).max_by_key(|&i| remaining[i].2)
+                    (0..remaining.len()).rev().max_by_key(|&i| remaining[i].2)
                 } else {
                     (0..remaining.len()).min_by_key(|&i| remaining[i].2)
                 }
                 .expect("a run has at least one delta left per slot");
-                let next = remaining.swap_remove(pick);
+                let next = remaining.remove(pick);
                 prefix += i128::from(next.2);
                 *slot = next;
             }
