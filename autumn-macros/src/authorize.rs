@@ -439,27 +439,51 @@ fn meta_is_ambiguous_authorize_shape(meta: &syn::Meta) -> bool {
 
 /// Runs `check` against `attr`'s own [`syn::Meta`], or — if `attr` is
 /// `#[cfg_attr(predicate, meta1, meta2, ...)]` — against each conditionally-
-/// applied `meta1, meta2, ...` (skipping the leading predicate). Short-
-/// circuits on the first match, same as `Iterator::any`.
+/// applied `meta1, meta2, ...` (skipping the leading predicate), recursing
+/// when one of those is itself a nested `cfg_attr` (e.g.
+/// `#[cfg_attr(a, cfg_attr(b, authorize(...)))]`). Short-circuits on the
+/// first match, same as `Iterator::any`.
+///
+/// The recursion matters: a single level of unwrapping only reaches a
+/// `cfg_attr` that wraps the target attribute directly, not one that wraps
+/// *another* `cfg_attr` (Codex review on #2628, fifth finding).
 fn for_each_conditionally_applied_meta(
     attr: &syn::Attribute,
     check: impl Fn(&syn::Meta) -> bool,
 ) -> bool {
-    if attr.path().is_ident("cfg_attr") {
-        let Ok(nested) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-        ) else {
+    meta_or_nested_cfg_attr_matches(&attr.meta, &check)
+}
+
+fn meta_or_nested_cfg_attr_matches(meta: &syn::Meta, check: &impl Fn(&syn::Meta) -> bool) -> bool {
+    if meta.path().is_ident("cfg_attr") {
+        let syn::Meta::List(list) = meta else {
             return false;
         };
-        return nested.iter().skip(1).any(check);
+        let Ok(nested) = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone())
+        else {
+            return false;
+        };
+        return nested
+            .iter()
+            .skip(1)
+            .any(|nested_meta| meta_or_nested_cfg_attr_matches(nested_meta, check));
     }
-    check(&attr.meta)
+    check(meta)
 }
 
 /// Refuses to compile a handler carrying an attribute — plainly written, or
 /// conditionally applied via `#[cfg_attr(predicate, ...)]` — that shares
 /// `#[authorize]`'s exact argument grammar (`"action", resource = Type[, from
 /// = ident]`) under a different name.
+///
+/// Also refuses a *literal* `#[authorize(...)]` when it only reaches the
+/// handler conditionally, through `#[cfg_attr(predicate, authorize(...))]`
+/// (at any nesting depth) — unlike a plainly-written `#[authorize(...)]`,
+/// whether this one applies at all depends on a `cfg` predicate Autumn
+/// cannot evaluate at macro-expansion time (Codex review on #2628, fifth
+/// finding). See the doc comment below for why that presence ambiguity is
+/// just as unsafe to guess as the name ambiguity.
 ///
 /// Idempotency-replay ownership — which of a `#[secured]`/`#[step_up]`/
 /// `#[throttle]` gate, the route macro's standalone `IdempotencyReplayLayer`,
@@ -471,8 +495,20 @@ fn for_each_conditionally_applied_meta(
 /// any other name is refused outright: the author must either spell it
 /// `#[authorize(...)]` by its real name (no alias) if that's what it is, or
 /// rename the unrelated attribute so its shape no longer collides.
+///
+/// The same two-directions-are-both-unsafe argument applies to a `cfg_attr`-
+/// conditional `#[authorize]`, even spelled correctly: treating it as
+/// "present" (keeping the standalone replay layer off, an earlier gate
+/// deferring to it) silently drops the idempotency guarantee whenever the
+/// predicate turns out false and nothing else ends up owning replay;
+/// treating it as "absent" reopens the original stale-authorization bypass
+/// whenever the predicate turns out true and a cached reply is served before
+/// `#[authorize]`'s in-body policy re-check ever runs. So it is refused
+/// outright too: the author must apply `#[authorize(...)]` unconditionally
+/// (moving any conditional behavior inside the handler body or the policy
+/// itself) rather than behind `cfg_attr`.
 pub fn reject_if_ambiguous_authorize_shape(input_fn: &syn::ItemFn) -> Option<TokenStream> {
-    const MESSAGE: &str = "this attribute's arguments match #[authorize]'s grammar (\"action\", \
+    const AMBIGUOUS_NAME_MESSAGE: &str = "this attribute's arguments match #[authorize]'s grammar (\"action\", \
          resource = Type[, from = ident]) under a different name, which Autumn \
          cannot resolve: a proc-macro attribute never sees `use` aliases, so this \
          could be #[authorize] reached through `use ::autumn_web::authorize as ...;`, \
@@ -480,23 +516,61 @@ pub fn reject_if_ambiguous_authorize_shape(input_fn: &syn::ItemFn) -> Option<Tok
          either way is unsafe for idempotency-replay handling. Spell it \
          `#[authorize(...)]` by its real name if that's what this is, or rename the \
          other attribute so its argument shape no longer collides.";
+    const CFG_ATTR_MESSAGE: &str = "an #[authorize]-shaped attribute applied conditionally via #[cfg_attr(...)] \
+         cannot be resolved at compile time: Autumn cannot evaluate whether the cfg \
+         predicate holds, so it cannot safely decide whether the standalone \
+         idempotency-replay layer or an earlier gate should defer to #[authorize]'s \
+         own in-body check. Treating it as present would silently drop the \
+         idempotency guarantee if the predicate turns out false; treating it as \
+         absent would let a cached reply skip #[authorize]'s policy check if the \
+         predicate turns out true. Apply #[authorize(...)] unconditionally instead \
+         of behind cfg_attr.";
 
     for attr in &input_fn.attrs {
         if attr.path().is_ident("cfg_attr") {
-            let Ok(nested) = attr.parse_args_with(
-                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-            ) else {
-                continue;
-            };
-            for meta in nested.iter().skip(1) {
-                if meta_is_ambiguous_authorize_shape(meta) {
-                    return Some(syn::Error::new_spanned(meta, MESSAGE).to_compile_error());
-                }
+            if let Some(offending) = find_unsafe_cfg_attr_authorize_meta(&attr.meta) {
+                return Some(
+                    syn::Error::new_spanned(offending, CFG_ATTR_MESSAGE).to_compile_error(),
+                );
             }
             continue;
         }
         if meta_is_ambiguous_authorize_shape(&attr.meta) {
-            return Some(syn::Error::new_spanned(attr, MESSAGE).to_compile_error());
+            return Some(syn::Error::new_spanned(attr, AMBIGUOUS_NAME_MESSAGE).to_compile_error());
+        }
+    }
+    None
+}
+
+/// Whether `meta` (nested inside a `cfg_attr`) matches #[authorize]'s
+/// grammar under a different name, OR is literally `#[authorize(...)]` --
+/// unlike at the top level, a literal name nested inside `cfg_attr` is still
+/// unsafe to resolve, since its presence (not just its identity) depends on
+/// a predicate Autumn cannot evaluate.
+fn conditionally_applied_meta_is_unsafe_to_resolve(meta: &syn::Meta) -> bool {
+    meta_is_literally_authorize(meta) || meta_is_ambiguous_authorize_shape(meta)
+}
+
+/// Recursively unwraps `meta` (expected to be a `cfg_attr(...)` [`syn::Meta`])
+/// looking for a nested meta that [`conditionally_applied_meta_is_unsafe_to_resolve`],
+/// descending into any nested `cfg_attr` it finds along the way.
+fn find_unsafe_cfg_attr_authorize_meta(meta: &syn::Meta) -> Option<syn::Meta> {
+    let syn::Meta::List(list) = meta else {
+        return None;
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return None;
+    }
+    let nested = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse2(list.tokens.clone())
+        .ok()?;
+    for candidate in nested.iter().skip(1) {
+        if candidate.path().is_ident("cfg_attr") {
+            if let Some(found) = find_unsafe_cfg_attr_authorize_meta(candidate) {
+                return Some(found);
+            }
+        } else if conditionally_applied_meta_is_unsafe_to_resolve(candidate) {
+            return Some(candidate.clone());
         }
     }
     None
@@ -599,15 +673,50 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_literal_name_behind_cfg_attr_without_ambiguity() {
+    fn rejects_the_literal_name_behind_cfg_attr_since_presence_is_unknowable() {
+        // Codex review on #2628 (fifth finding): even the *correctly spelled*
+        // #[authorize] is unsafe here, because cfg_attr means Autumn cannot
+        // know at macro-expansion time whether the predicate holds -- and
+        // idempotency-replay ownership needs a definite answer regardless of
+        // which way the predicate actually goes at build time.
         let input_fn: syn::ItemFn = syn::parse_quote! {
             #[cfg_attr(feature = "auth", authorize("update", resource = Note))]
             async fn h(note: Note) -> &'static str { "ok" }
         };
-        assert!(
-            reject_if_ambiguous_authorize_shape(&input_fn).is_none(),
-            "the literal #[authorize] spelling behind cfg_attr is never ambiguous"
-        );
+        let generated = reject_if_ambiguous_authorize_shape(&input_fn)
+            .expect(
+                "a literal #[authorize] whose presence depends on a cfg predicate must still \
+                 be refused -- Autumn can't decide replay ownership without knowing whether it \
+                 will actually apply",
+            )
+            .to_string();
+        assert!(generated.contains("compile_error"));
+    }
+
+    #[test]
+    fn rejects_an_aliased_authorize_shape_behind_nested_cfg_attr() {
+        // Same finding as above, but nested: a single level of cfg_attr
+        // unwrapping only reaches a #[cfg_attr] that wraps the target
+        // attribute directly, not one that wraps *another* #[cfg_attr].
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[cfg_attr(feature = "a", cfg_attr(feature = "b", authz_alias("update", resource = Note)))]
+            async fn h(note: Note) -> &'static str { "ok" }
+        };
+        let generated = reject_if_ambiguous_authorize_shape(&input_fn)
+            .expect("an aliased #[authorize] hidden behind nested cfg_attr must still be refused")
+            .to_string();
+        assert!(generated.contains("compile_error"));
+    }
+
+    #[test]
+    fn attr_is_authorize_shaped_recognizes_the_literal_name_behind_nested_cfg_attr() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn h(note: Note) -> &'static str { "ok" }
+        };
+        let attr: syn::Attribute = syn::parse_quote! {
+            #[cfg_attr(feature = "a", cfg_attr(feature = "b", authorize("update", resource = Note)))]
+        };
+        assert!(attr_is_authorize_shaped(&attr, &input_fn));
     }
 
     #[test]
