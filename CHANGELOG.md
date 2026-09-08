@@ -27,6 +27,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-application, no ordering change for direct requests). See
   `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
 
+### Performance
+
+- **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
+  `autumn/benches/feed_render.rs` profiling harness — rendering a realistic
+  30-entry Atom feed, the same `Feed::atom(...).entries(...)` shape
+  `examples/blog`'s `feed_xml` handler builds from real `Post` rows — showed
+  `feed::escape` accounting for ~72% of `Feed::render`'s instructions.
+  `escape` walked every character through `chars()` (a full UTF-8 decode
+  plus a 5-way match per character) even though real titles/bodies are
+  overwhelmingly plain ASCII text containing none of the five characters it
+  escapes. It now does one cheap byte scan first (`needs_escaping`): if the
+  string has no non-ASCII byte, none of `&<>"'`, and no stray ASCII control
+  byte, it returns the input unchanged instead of rebuilding it one `char`
+  at a time; any non-ASCII byte still falls through to the original
+  per-`char` path unconditionally, so `is_xml_char`'s
+  `U+FFFE`/`U+FFFF`-filtering is never bypassed. Behavior is unchanged — the
+  existing round-trip/no-raw-angle-bracket proptests pass without
+  modification, plus four new unit tests pin the fast/slow-path boundary.
+  Measured (`valgrind --tool=callgrind`/`dhat`, base-subtracted): instructions
+  620,067 → 381,893 per render (-38.4%); `escape`'s own share of the profile
+  72% → 54%; allocation bytes/blocks per render unchanged (both paths make
+  exactly one `String` allocation).
+
 ### Changed
 
 - **🧭 Wayfinder: `examples/invoice`'s on-screen detail page is now a real
@@ -257,6 +280,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::widgets::current_locale` out of an argument name. 47 self-tests:
   `./scripts/check-docs-symbols.sh --self-test`.
 
+- **ci:** [no-plugin] the dependency-advisory gate (#1600, #2050) now also audits the two
+  satellite dependency graphs that sit **outside** the main workspace and its
+  own `Cargo.lock` — `fuzz/` (compiled and run by every `fuzz.yml` CI job) and
+  `examples/island-flock/` (never built in CI, but its compiled wasm/js
+  bundle is committed and served by the `flock` example). Each satellite now
+  carries its own narrower `deny.toml` (advisories + sources; licenses are not
+  yet gated there — see that file's header), audited by
+  `scripts/check-advisories.sh`'s new `audit_satellite_graphs` step. Neither
+  graph had ever been checked before: `fuzz/Cargo.lock` was regenerated here
+  (502 lines stale, and resolving to a yanked `chacha20 0.10.1` until this
+  fix), and `examples/island-flock/`'s graph carries two `unmaintained`
+  advisories now triaged and waived with reachability notes (RUSTSEC-2024-0370
+  confirmed unreachable — a proc-macro dependency never linked into the wasm
+  output; RUSTSEC-2025-0141 reachability undetermined, revisit at the next
+  rebuild). See `docs/reports/2026-09-07-ballast-dependency-ledger-audit.md`
+  for the full evidence trail.
 - **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves
   every **option** a documented `autumn …` line passes, not only its command.
   A flag the command does not declare is the same dead end as a phantom
