@@ -176,32 +176,6 @@ fn parse_throttle_args(attr: TokenStream) -> syn::Result<ThrottleAttrs> {
     })
 }
 
-/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
-///
-/// Rust rejects `impl Trait` in local variable type annotations, so the
-/// wrapper must skip the explicit annotation when the handler return type
-/// contains `impl Trait` at any depth (e.g. `AutumnResult<impl IntoResponse>`).
-fn type_contains_impl_trait(ty: &syn::Type) -> bool {
-    match ty {
-        syn::Type::ImplTrait(_) => true,
-        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
-            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
-                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
-                _ => false,
-            }),
-            syn::PathArguments::Parenthesized(args) => {
-                args.inputs.iter().any(type_contains_impl_trait)
-                    || matches!(&args.output,
-                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
-            }
-            syn::PathArguments::None => false,
-        }),
-        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
-        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
-        _ => false,
-    }
-}
-
 fn build_spec_tokens(attrs: &ThrottleAttrs) -> TokenStream {
     match attrs {
         ThrottleAttrs::Named(name) => {
@@ -413,11 +387,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __autumn_inner: () = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
         },
-        syn::ReturnType::Type(_, ty) if type_contains_impl_trait(ty) => quote! {
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                (async move #original_body).await
-            )
-        },
+        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    (async move #original_body).await
+                )
+            }
+        }
         // A bare numeric/bool primitive does not implement `IntoResponse`;
         // Autumn's plain primitive-output wrapper serves it by stringifying. The
         // route macro suppresses that wrapper when `#[throttle]` is present (the
@@ -912,6 +888,30 @@ mod tests {
         assert!(
             generated_s.contains("30"),
             "30s should expand to 30 seconds:\n{generated_s}"
+        );
+    }
+
+    /// Echo clone-class regression, `throttle`'s side of the pair covered by
+    /// `step_up::tests::step_up_handles_nested_impl_trait_return_type` — see
+    /// `secured::tests::secured_handles_nested_impl_trait_return_type` for
+    /// why the recursive `type_contains_impl_trait` guard matters. Already
+    /// green here (`throttle_macro` has the fix); kept alongside the other
+    /// three copies so the four macros stay provably in lockstep on this
+    /// rule.
+    #[test]
+    fn throttle_handles_nested_impl_trait_return_type() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                async fn handler() -> Result<impl IntoResponse, String> {
+                    Ok("ok")
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__autumn_inner :"),
+            "should not emit an explicit local annotation for nested impl Trait: {generated}"
         );
     }
 }
