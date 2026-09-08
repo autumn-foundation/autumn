@@ -71,7 +71,14 @@
 #          `db_impl` facades put `Lock`, `LockGuard` and friends,
 #        - paths that leave the crate into a sibling in this workspace
 #          (`autumn_macros`, `autumn_edge`, `autumn_search`), which is where
-#          every attribute macro a handler is decorated with actually lives.
+#          every attribute macro a handler is decorated with actually lives,
+#          including a whole crate re-exported under an alias
+#          (`pub use autumn_edge as edge`),
+#        - the TYPE namespace winning for traversal where one name is both a
+#          module and a value: `pub mod app` beside `pub use app::app`, and
+#          `pub use autumn_edge as edge` beside `pub use autumn_macros::edge`.
+#          Letting the value win turns every path under it into an unchecked
+#          "associated item".
 #   3. VISIBILITY, which is the difference between an item existing and a reader
 #      being able to name it. Only bare `pub` counts: `autumn/src/lib.rs` has 49
 #      `pub(crate)`/`pub(super)` modules, and a path through one is E0603 in the
@@ -109,12 +116,17 @@
 # someone to write one, and in output a module path is a label to read rather
 # than a line to copy. Two shapes are read as output:
 #
-#   - A line carrying a compiler error code. `docs/migrations/TEMPLATE.md` and
-#     `docs/migrations/next.md` both carry the migration cheat-sheet row
+#   - The CELL carrying a compiler error code — not the whole row.
+#     `docs/migrations/TEMPLATE.md` carries the migration cheat-sheet row
 #
-#       | `error[E0432]: unresolved import `autumn_web::foo`` | … | `use autumn_web::bar;` |
+#       | `error[E0432]: unresolved import `autumn_web::foo`` | … | `use …;` |
 #
-#     whose entire job is to display a path that does not resolve.
+#     whose first cell exists to display a path that does not resolve. The next
+#     cell gives the FIX, and a fix is a live recommendation: `0.7.0.md` pairs
+#     ``error[E0063]: missing field `seo` …`` with
+#     `autumn_web::seo::SeoRouteDefaults::EMPTY`, and waiving the whole row
+#     would leave unchecked the one path in it a reader actually copies. So the
+#     exemption runs from the error code to the end of its own table cell.
 #   - A log line (`INFO`, `WARN`, …). The path in one is the tracing TARGET that
 #     emitted it — the module's real position in the crate, routinely a private
 #     one. `docs/guide/bot-protection.md` quotes the crate's own startup log,
@@ -274,6 +286,13 @@ def mask_literals(text):
                 continue
         i += 1
     return ''.join(out)
+
+
+def is_module_ish(binding):
+    """Whether a resolved name occupies the TYPE namespace, i.e. can be walked
+    through as a module: a `pub mod` declared here, or a re-export of one."""
+    return (binding == 'mod'
+            or (isinstance(binding, tuple) and binding and binding[0] == 'modref'))
 
 
 def brace_depths(masked):
@@ -498,6 +517,15 @@ class Surface:
             if not target and not is_glob and leaf in crate.exported_macros:
                 out[alias] = 'item'
                 continue
+            # `pub use autumn_edge as edge;` -- a single-segment re-export whose
+            # one segment names a CRATE, not an item in this module. Falling
+            # through to the leaf lookup below resolved it to nothing, so the
+            # only binding `edge` ever got was the later
+            # `pub use autumn_macros::edge;` proc macro, and every path under
+            # `autumn_web::edge::…` was waved through as its associated item.
+            if not target and not is_glob and leaf in self.crates:
+                out[alias] = ('modref', leaf, ())
+                continue
             r = self._resolve_target(crate, mp, target)
             if is_glob:
                 if r and r[0] == 'mod':
@@ -508,8 +536,11 @@ class Surface:
                 continue
             if r is None:
                 continue
+            prior = out.get(alias)
             if r[0] == 'opaque':
                 out[alias] = 'opaque'
+                if is_module_ish(prior):
+                    out[alias] = prior
                 continue
             tc, tm = r[1], r[2]
             sub = self.names_of(tc, tm, depth + 1)
@@ -529,13 +560,20 @@ class Surface:
             # re-export win turned a resolvable trait into an opaque one.
             if out.get(alias) in ('unknown', 'opaque') and alias in local:
                 out[alias] = local[alias]
-            # Rust resolves a path segment in the TYPE namespace, and a module
-            # may share its name with a value: `lib.rs` declares `pub mod app`
-            # and then `pub use app::app;` to publish the `app()` builder
-            # function beside it. Both are real, but only the module can be
-            # walked THROUGH, and letting the function win made the nonexistent
-            # `autumn_web::app::run` resolve as an associated item.
-            if local.get(alias) == 'mod':
+            # Rust resolves a path SEGMENT in the type namespace, and one name
+            # can be a module there and a value elsewhere. Whichever order the
+            # two are written in, the module is the one a path can be walked
+            # THROUGH, so it wins:
+            #   `pub mod app` + `pub use app::app;`      (local module, value
+            #                                             after it)
+            #   `pub use autumn_edge as edge;` … later
+            #   `pub use autumn_macros::edge;`           (re-exported module,
+            #                                             macro after it)
+            # Letting the value win made `autumn_web::app::run` and
+            # `autumn_web::edge::Bogus` resolve as "associated items" of a leaf.
+            if is_module_ish(prior) and not is_module_ish(out.get(alias)):
+                out[alias] = prior
+            if local.get(alias) == 'mod' and not is_module_ish(out.get(alias)):
                 out[alias] = 'mod'
         self._memo[key] = out
         return out
@@ -685,8 +723,29 @@ PATH_SHAPE = re.compile(r'[a-zA-Z_]\w*(?:::[a-zA-Z_]\w*)*\Z')
 #     `docs/guide/bot-protection.md` is the crate's own log output, and
 #     `router` is `pub(crate)`.
 # Counted as waived rather than suppressed by name, so the number stays visible.
-ILLUSTRATIVE = re.compile(
-    r'error\[E\d{4}\]|^\s*(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR)\b')
+ERROR_CODE = re.compile(r'error\[E\d{4}\]')
+LOG_LEVEL = re.compile(r'^\s*(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR)\b')
+
+
+def is_shown_as_output(line, col):
+    """Whether the path at column `col` is being SHOWN rather than recommended.
+
+    A log line is output end to end, so the whole line is exempt. A compiler
+    error is not: the migration guides quote one in a table row whose next cell
+    gives the FIX, and that fix is a live recommendation to audit.
+    `docs/migrations/0.7.0.md` pairs ``error[E0063]: missing field `seo` …``
+    with `add `seo: autumn_web::seo::SeoRouteDefaults::EMPTY``; waiving the
+    whole row would leave the corrective path unchecked, which is the one a
+    reader actually copies. So the exemption runs from the error code to the end
+    of its own table cell.
+    """
+    if LOG_LEVEL.search(line):
+        return True
+    m = ERROR_CODE.search(line)
+    if not m or col < m.start():
+        return False
+    cell_end = line.find('|', m.end())
+    return col < (cell_end if cell_end != -1 else len(line))
 
 
 def scan_paths(text):
@@ -757,7 +816,8 @@ def occurrences(root, files):
             line_end = text.find('\n', offset)
             line = text[text.rfind('\n', 0, offset) + 1:
                         line_end if line_end != -1 else len(text)]
-            waived = bool(ILLUSTRATIVE.search(line))
+            col = offset - (text.rfind('\n', 0, offset) + 1)
+            waived = is_shown_as_output(line, col)
             spec = re.sub(r'\s+', ' ', raw).strip()
             spec = re.sub(r'\s*::\s*', '::', spec)
             spec = re.sub(r'\s*([{},])\s*', r'\1', spec)
@@ -874,6 +934,8 @@ pub use app::app;
 pub(crate) mod route;
 pub use route::Route;
 pub use fake_macros::get;
+pub use fake_edge as edge;
+pub use fake_macros::edge;
 pub mod reexports {
     pub use axum;
 }
@@ -940,12 +1002,15 @@ macro_rules! declassify { () => {} }
         _write(tmp, 'fake/src/storage/migrations.rs',
                '#[macro_export]\nmacro_rules! add_blob_column { () => {} }\n'
                'pub use add_blob_column;\n')
+        _write(tmp, 'fake_edge/src/lib.rs', 'pub struct CapsuleRequest;\n')
         _write(tmp, 'fake_macros/src/lib.rs',
                '#[proc_macro_attribute]\npub fn get(a: TokenStream) -> TokenStream { a }\n'
+               '#[proc_macro_attribute]\npub fn edge(a: TokenStream) -> TokenStream { a }\n'
                '#[proc_macro_derive(OpenApiSchema, attributes(schema))]\n'
                'pub fn derive_open_api_schema(a: TokenStream) -> TokenStream { a }\n')
 
-        s = Surface(tmp, {'autumn_web': 'fake/src', 'fake_macros': 'fake_macros/src'})
+        s = Surface(tmp, {'autumn_web': 'fake/src', 'fake_macros': 'fake_macros/src',
+                          'fake_edge': 'fake_edge/src'})
 
         check('plain module item', s.resolve('app::AppBuilder'), 'ok')
         check('module itself', s.resolve('app'), 'ok')
@@ -1007,6 +1072,14 @@ macro_rules! declassify { () => {} }
         # the value shadows the module and anything under it resolves.
         check('module wins over a same-named value for traversal',
               s.resolve('app::AppBuilder'), 'ok')
+        # `pub use fake_edge as edge;` is a single-segment re-export naming a
+        # CRATE, and a macro of the same name is re-exported after it. The
+        # module must survive in the type namespace or everything under
+        # `edge::` is waved through as an associated item of the macro.
+        check('crate re-exported under an alias is traversable',
+              s.resolve('edge::CapsuleRequest'), 'ok')
+        check('…and a bogus item under it is still dead',
+              s.resolve('edge::Bogus'), 'dead:edge::Bogus')
         check('unexported macro_rules! is not nameable',
               s.resolve('extract::impl_extractor_deref'),
               'dead:extract::impl_extractor_deref')
@@ -1037,6 +1110,19 @@ macro_rules! declassify { () => {} }
               ['Error', 'app::AppBuilder'])
         check('compiler-error line is waived',
               [p for (p, _, _, w) in found if w], ['foo'])
+        # The waiver covers the error's own table cell, not the row: the FIX
+        # column is a live recommendation and must stay audited.
+        _write(tmp, 'docs/guide/mig.md',
+               '| `error[E0063]: missing field` | a literal | '
+               'add `autumn_web::app::AppBuilder` |\n'
+               'INFO  autumn_web::route::Route: started\n')
+        rows = occurrences(tmp, ['docs/guide/mig.md'])
+        check('path inside the error cell is waived',
+              sorted(p for (p, _, _, w) in rows if w),
+              ['route::Route'])
+        check('path in the fix column is still audited',
+              sorted(p for (p, _, _, w) in rows if not w),
+              ['app::AppBuilder'])
 
         # -- the reader-facing scope matches the sibling gates ----------------
         check('guide is corpus', reader_facing('docs/guide/a.md'), True)

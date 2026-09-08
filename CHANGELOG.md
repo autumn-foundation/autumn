@@ -227,7 +227,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn_web::app::run` resolve. A `macro_rules!` without `#[macro_export]` is
   textually scoped and joins no path. And where a module shares its name with a
   value (`pub mod app` beside `pub use app::app`), the type namespace wins for
-  traversal, as Rust's own resolution does. Grouped imports are matched by counting braces over the
+  traversal, as Rust's own resolution does — the same rule covering a whole
+  crate re-exported under an alias (`pub use autumn_edge as edge`) that a
+  same-named macro re-export would otherwise shadow, which had left everything
+  under `autumn_web::edge::` unaudited. Grouped imports are matched by counting braces over the
   whole document rather than per line, so the 14 groups that nest
   (`storage::{BlobStoreState, variant::{Transform, …}}`) or run across lines
   have their symbols audited instead of silently collapsing to the module
@@ -244,10 +247,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to write one, so a path inside a compiler-error line (the migration-guide
   cheat-sheet row in `docs/migrations/TEMPLATE.md` exists to display one) or a
   log line (`INFO  autumn_web::router: …` is the crate's own tracing target,
-  and `router` is private) is read as output. A brace group containing `(` is
+  and `router` is private) is read as output. The compiler-error exemption
+  covers the error's own table CELL rather than the row, because the next cell
+  holds the fix and a fix is a live recommendation — `0.7.0.md` pairs an
+  `error[E0063]` with `autumn_web::seo::SeoRouteDefaults::EMPTY`, the one path
+  in that row a reader actually copies. A brace group containing `(` is
   not a path claim at all — the skill's api-reference lists *signatures* that
   way — so its prefix is kept and the group dropped, rather than inventing
-  `autumn_web::widgets::current_locale` out of an argument name. 43 self-tests:
+  `autumn_web::widgets::current_locale` out of an argument name. 47 self-tests:
   `./scripts/check-docs-symbols.sh --self-test`.
 
 - **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves
