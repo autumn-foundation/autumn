@@ -12467,26 +12467,6 @@ pub struct Vault {
 
     #[test]
     fn the_probe_names_only_the_addresses_that_are_not_the_ingress() {
-        // The addresses shown are computed, not parsed out of the grader's
-        // human-readable message.
-        let ingress = autumn_web::custom_domain::ExpectedIngress {
-            hostname: None,
-            ipv4: vec!["203.0.113.10".parse().unwrap()],
-            ipv6: vec![],
-        };
-        assert!(ingress_contains(&ingress, "203.0.113.10".parse().unwrap()));
-        assert!(!ingress_contains(&ingress, "198.51.100.7".parse().unwrap()));
-
-        // An ingress with nothing resolvable is inconclusive, never a failure.
-        let empty = autumn_web::custom_domain::ExpectedIngress::default();
-        assert_eq!(
-            resolve_custom_domain_dns("example.invalid", &empty),
-            CustomDomainDns::IngressUnknown
-        );
-    }
-
-    #[test]
-    fn the_probe_names_only_the_addresses_that_are_not_the_ingress() {
         // The addresses shown are computed, not parsed back out of the
         // grader's human-readable message.
         let ingress = autumn_web::custom_domain::ExpectedIngress {
