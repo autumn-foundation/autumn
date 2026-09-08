@@ -2258,11 +2258,7 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
     // Normalize BEFORE any containment check: a lexical prefix compare on
     // `/srv/app/shared/../releases/r1/app.db` would call it durable, while the
     // kernel resolves it into `releases/`, where retention deletes it.
-    let Some(text) = lexically_normalized(&raw) else {
-        return SqliteDataFile::Refused(format!(
-            "the configured SQLite database path {raw} climbs above the filesystem root."
-        ));
-    };
+    let text = lexically_normalized(&raw);
     if text.starts_with('/') {
         // Anything the deploy itself manages is transient — `releases/` is
         // replaced every deploy and pruned by retention, and `current` is just a
@@ -2274,23 +2270,12 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
         // app_dir = "/srv/autumn/tmp/../myapp"` names the same directory as
         // `/srv/autumn/myapp`, and comparing the raw spelling would miss a
         // database sitting in the releases dir it resolves to.
-        // FAIL CLOSED. `unwrap_or_default` here graded the database durable
-        // whenever the app dir would not normalize — the containment check was
-        // skipped and the fall-through returned `Persistent`, so a file in the
-        // releases dir was called durable while retention deletes it.
-        let (Some(app_dir), Some(shared)) = (
-            lexically_normalized(&cfg.app_dir),
-            lexically_normalized(&cfg.shared_dir()),
-        ) else {
-            return SqliteDataFile::Refused(format!(
-                "the deploy's app directory ({}) does not name an absolute path, so \
-                 whether the SQLite database {text} sits inside it cannot be decided. \
-                 Set `[deploy] app_dir` to an absolute path.",
-                cfg.app_dir
-            ));
-        };
-        // An app dir that is not absolute grades nothing — `within` on an empty
-        // root would swallow every absolute path.
+        let app_dir = lexically_normalized(&cfg.app_dir);
+        let shared = lexically_normalized(&cfg.shared_dir());
+        // FAIL CLOSED on the one case that cannot be decided: a non-absolute app
+        // dir. Falling through to `Persistent` here graded a database under
+        // `releases/` durable while release retention deletes it, and `within`
+        // against an empty root would swallow every absolute path.
         if !app_dir.starts_with('/') {
             return SqliteDataFile::Refused(format!(
                 "the deploy's app directory ({}) is not an absolute path, so whether \
@@ -2347,8 +2332,11 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
 /// behaviour, not the kernel's. Re-check it before supporting a VFS that does not
 /// normalize lexically.
 ///
-/// Returns `None` when the path climbs above the filesystem root.
-fn lexically_normalized(path: &str) -> Option<String> {
+/// Total: every path normalizes. An absolute path cannot climb out (POSIX
+/// defines `/..` as `/`), and a relative one keeps a leading `..` for the caller
+/// to refuse. The old `Option` implied a failure mode that does not exist, and
+/// the caller's `unwrap_or_default()` on it graded a database durable.
+fn lexically_normalized(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut names: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -2374,11 +2362,11 @@ fn lexically_normalized(path: &str) -> Option<String> {
         }
     }
     let joined = names.join("/");
-    Some(if absolute {
+    if absolute {
         format!("/{joined}")
     } else {
         joined
-    })
+    }
 }
 
 /// Whether `path` is `root` itself or sits under it. Compares whole path
@@ -5829,11 +5817,11 @@ mod tests {
     fn path_grading_uses_posix_rules_on_every_host() {
         assert_eq!(
             lexically_normalized("/srv/autumn/myapp/shared/../releases/r1/app.db"),
-            Some("/srv/autumn/myapp/releases/r1/app.db".to_owned())
+            "/srv/autumn/myapp/releases/r1/app.db"
         );
         assert_eq!(
             lexically_normalized("./data//nested/../app.db"),
-            Some("data/app.db".to_owned())
+            "data/app.db"
         );
         // POSIX defines `/..` as `/`, so an ABSOLUTE path cannot climb out —
         // `/a/../..` is `/`. Returning `None` here made a real `app_dir`
@@ -5841,22 +5829,19 @@ mod tests {
         // releases dir durable.
         assert_eq!(
             lexically_normalized("/a/../.."),
-            Some("/".to_owned()),
+            "/",
             "an absolute path cannot climb above the root"
         );
         assert_eq!(
             lexically_normalized("/../srv/autumn/myapp"),
-            Some("/srv/autumn/myapp".to_owned()),
+            "/srv/autumn/myapp",
             "a leading `..` on an absolute path is dropped, as POSIX does"
         );
-        assert_eq!(
-            lexically_normalized("../app.db"),
-            Some("../app.db".to_owned())
-        );
-        assert_eq!(lexically_normalized("."), Some(String::new()));
+        assert_eq!(lexically_normalized("../app.db"), "../app.db");
+        assert_eq!(lexically_normalized("."), "");
         // A leading `/` means absolute here, whatever the host says.
         assert!(
-            lexically_normalized("/var/lib/app.db").is_some_and(|text| text.starts_with('/')),
+            lexically_normalized("/var/lib/app.db").starts_with('/'),
             "a POSIX absolute path must stay absolute"
         );
     }
