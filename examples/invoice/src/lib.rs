@@ -10,6 +10,7 @@
 use autumn_web::extract::Path;
 use autumn_web::pdf::Pdf;
 use autumn_web::prelude::*;
+use autumn_web::seo::SeoMeta;
 use autumn_web::time::Clock;
 use chrono::{DateTime, Utc};
 
@@ -78,9 +79,32 @@ fn invoice_view(invoice: &Invoice, generated_at: DateTime<Utc>) -> Markup {
     }
 }
 
+/// Minimal HTML document shell for the on-screen page only.
+///
+/// `invoice_view` stays a bare content fragment so `Pdf::from_markup`
+/// (`invoice_pdf` below) keeps rendering exactly that fragment, not a full
+/// document with a `<head>` a PDF renderer would draw as visible text.
+fn page(title: &str, content: Markup) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                (SeoMeta::new().title(title).render())
+            }
+            body {
+                main { (content) }
+            }
+        }
+    }
+}
+
 #[get("/invoices/{id}")]
 pub async fn invoice_detail(id: Path<i64>, clock: Clock) -> Markup {
-    invoice_view(&Invoice::demo(*id), clock.now())
+    let invoice = Invoice::demo(*id);
+    let title = format!("Invoice #{}", invoice.id);
+    page(&title, invoice_view(&invoice, clock.now()))
 }
 
 #[get("/invoices/{id}/pdf")]

@@ -49,10 +49,75 @@
 #      `default_value` is not required, and reading it as required reported 28
 #      correct pages as broken (`autumn upgrade` defaults its `path` to "." and
 #      the guide runs it bare 20 times) before that was caught by measuring.
+#   5. Every OPTION the line passes is one that command declares. `autumn build
+#      --release` is `error: unexpected argument '--release' found`, exit 2 —
+#      the same dead end as a phantom subcommand, reached by the same reader
+#      copying the same line. This was left out of the first version on the
+#      grounds that a source-parsed flag set would be too noisy to gate; it was
+#      then built and measured, and with four clap forms understood (below) the
+#      corpus-wide noise was ZERO. The baseline found five real defects:
+#      `autumn build --release` twice (the flag is `--debug`; release is the
+#      default), `autumn dev --profile` (only `console`, `seed` and `task` have
+#      it), `autumn setup --tailwind` (`setup` IS the Tailwind install, and
+#      takes only `--force`), and — inside a copyable fence, commented
+#      "explicit project path" — `autumn lifecycle check --path .`, where
+#      `path` is a POSITIONAL and the line clap accepts is `autumn lifecycle
+#      check .`.
+#
+#      Gating flags needs clap forms that gating commands did not, each of which
+#      is a false positive — the gate telling an author to break a page that
+#      works — if missed:
+#        - `#[command(flatten)]`, so `graph impact` inherits `GraphArgs`'s
+#          `--json` along with the other three `graph` subcommands;
+#        - `trailing_var_arg`, so the six task arguments the guide documents
+#          (`autumn task cleanup-posts --confirm`) are seen as forwarded to the
+#          task rather than judged against the CLI;
+#        - `allow_hyphen_values` on a POSITIONAL, so `autumn config set retries
+#          -1` reads as the correct line it is. Counted, not flagged, so the
+#          budget is spent and `--actorr` after it is still judged;
+#        - clap's own `--help`/`-h`, present on every command and declared
+#          nowhere in the derive input — but NOT `--version`, which
+#          `#[command(version)]` puts on the root alone (nothing here sets
+#          `propagate_version`, so `autumn migrate --version` is an error, and
+#          a gate that vouched for it would be worse than no gate);
+#        - a bracket-BALANCED read of `#[arg(…)]` (see `_arg_fields`), without
+#          which every option whose attribute carries a list — five of them,
+#          including `sbom --binary` and `upgrade --accept` — is invisible.
+#      Options passed to the ROOT are resolved too, against a root node keyed
+#      `''`: `autumn --help` and `autumn --version` are real lines in this
+#      corpus, and without it `autumn --helpp` read exactly like them.
+#      A token that starts with `-` is judged unless it carries prose
+#      PUNCTUATION — the corpus writes arrows (`0.5.0 -> 0.6.0`) and
+#      slash-joined shorthand (`autumn token issue --name/--scope/--expires-at`)
+#      in command position, and neither is a line anyone can copy. The filter is
+#      never by canonical spelling: requiring `--[a-z-]+` dropped exactly the
+#      misspellings this exists for (`--show_config` for `--show-config`).
 #
 # Both `requires_sub` and the required-positional COUNT were validated against
 # the built binary's `--help` usage strings across all 173 command paths: exact
 # agreement, no mismatch in either direction.
+#
+# The OPTION model was validated the same way, by running the built binary and
+# reading its exit code rather than reasoning about clap's parser. Every row
+# below was measured, and the gate agrees with all of them:
+#
+#   exit 0  autumn --version · replay --help · db --help · deploy --help · db -h
+#           replay -h · replay -hpapi · replay -hx · routes /admin --help posture
+#   exit 2  migrate --version · --version=foo · replay --help=foo
+#           test --reset=true · routes --user-only=yes · routes /admin --methd POST
+#           config set retries 3 --actorr · replay -xh · replay -zz
+#   accepted (exit 1, parsed then failed for want of a project/database)
+#           test --nocapture · test --package blog · test --reset · test --nope
+#           config set retries -1 · routes /admin --method POST
+#
+# Run those from an EMPTY directory: a line clap accepts then fails at runtime
+# exits 1, so exit 2 cleanly means "the parser rejected it". Do not run them in
+# a real project — `autumn test --reset` drops the test database, and
+# `config set` writes to a live one.
+#
+# Nothing here adds a build dependency: the gate still parses the derive input
+# and runs in seconds with no toolchain. The binary is how the MODEL is checked
+# when a question turns on clap's behaviour rather than on the source.
 #
 # TRUTH SET: parsed from the clap derive input in `autumn-cli/src/**/*.rs`, not
 # from a checked-in snapshot. A snapshot is one forgotten regeneration away
@@ -66,12 +131,14 @@
 # `visible_alias`/`alias` (without which the real `autumn c` reads as drift).
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
-#   - Whether a flag EXISTS. Options are parsed — the walk has to know their
-#     value arity to find the subcommands written after them — but an option a
-#     command does not declare is not reported, only walked away from: clap's
-#     `conflicts_with`/`value_enum` forms make a source-parsed flag set far
-#     noisier than a command set, and a wrong flag at least fails against a
-#     command that exists. Commands first.
+#   - Whether an option's VALUE is one the command accepts. `--format yaml`
+#     against a `value_enum` of `text|json` is a real defect and is not gated:
+#     the accepted set lives in a separate enum per option, and unlike a flag
+#     name there is no single derive site to read it from. Names first.
+#   - Anything after an option the command does not declare. The walk stops
+#     there — reporting the flag, but not guessing whether it ate the next
+#     token — so a subcommand written after a bad flag goes unjudged. It is one
+#     defect per line either way, and the line has to be fixed regardless.
 #   - Tokens past the point where the resolved command has no subcommands.
 #     `autumn db pull posts` is a positional table name, not a subcommand, and
 #     the parser records which commands take positionals so those tokens are
@@ -161,6 +228,16 @@
 #
 #     <!-- cli-surface-allow: autumn generate island — planned, see #493 -->
 #
+# The same marker waives one FLAG of a command, by naming it after the command:
+#
+#     <!-- cli-surface-allow: autumn build --release — release is the default -->
+#
+# That form is matched by its own pattern, and first (see `FLAG_WAIVER`): the
+# command pattern's separator alternatives include `--`, so it reads the line
+# above as the command `build` with the reason `release — …`, waiving a whole
+# command where one flag was meant. Separate a flag waiver's reason with `—` or
+# `:`, never `--`.
+#
 # The marker sits in the page beside the claim, so when the sentence is deleted
 # or the command ships, the waiver goes with it. A central allowlist would
 # outlive both. Every waiver must carry a reason after the command.
@@ -178,6 +255,7 @@
 # USAGE:
 #   scripts/check-docs-cli.sh              # gate the corpus
 #   scripts/check-docs-cli.sh --list       # print the parsed command surface
+#   scripts/check-docs-cli.sh --list-options  # …with each command's options
 #   scripts/check-docs-cli.sh --self-test  # synthetic-corpus tests
 
 set -euo pipefail
@@ -307,24 +385,19 @@ def _subcommand_type(payload):
     return _last(m.group(2)), not m.group(1)
 
 
-def _positionals(payload):
-    """(takes_any, required_count) for a variant's positional arguments.
+def _positional_fields(payload):
+    """Yield `(attr_text, type)` for each POSITIONAL field, in declaration order.
 
-    `takes_any` matters because a positional makes the next token in `autumn db
-    pull posts` unjudgeable — it is a table name, not a subcommand — so the walk
-    stops there rather than reporting drift it cannot prove.
+    Shared by `_positionals` and `_hyphen_slots` so the two can never disagree
+    about what a positional is or what order they come in — a second, parallel
+    walk is how the waiver grammar and the detector drifted apart, and the same
+    trap applies here.
 
-    `required_count` matters because clap rejects the command outright without
-    them, and it is a COUNT rather than a flag because a command can require
-    more than one: `autumn generate controller pages` supplies `name` and stops,
-    but `actions` is `required = true` as well, so clap still rejects it.
-    `autumn replay` exits with "the following required arguments were not
-    provided: <CAPSULE>". Required-ness is the field's type — a bare `String` is
-    required, `Option<T>` and `Vec<T>` are not — and the field carries no
-    `#[arg]` attribute at all in that case, which is why this walks fields
-    rather than matching attributes.
+    Walks lines rather than matching attributes because a positional often
+    carries NO `#[arg]` at all: `ConfigCommands::Set.key` is a bare
+    `key: String`, and a field the walk cannot see is a slot counted in the
+    wrong place.
     """
-    takes_any, required = False, 0
     attrs = []
     pending = ''
     for raw in payload.split('\n'):
@@ -352,8 +425,29 @@ def _positionals(payload):
             continue
         if re.search(r'\b(long|short)\b', attr_text):
             continue                            # a named option, not a positional
+        yield attr_text, m.group(2).strip()
+
+
+def _positionals(payload):
+    """(takes_any, required_count) for a variant's positional arguments.
+
+    `takes_any` matters because a positional makes the next token in `autumn db
+    pull posts` unjudgeable — it is a table name, not a subcommand — so the walk
+    stops there rather than reporting drift it cannot prove.
+
+    `required_count` matters because clap rejects the command outright without
+    them, and it is a COUNT rather than a flag because a command can require
+    more than one: `autumn generate controller pages` supplies `name` and stops,
+    but `actions` is `required = true` as well, so clap still rejects it.
+    `autumn replay` exits with "the following required arguments were not
+    provided: <CAPSULE>". Required-ness is the field's type — a bare `String` is
+    required, `Option<T>` and `Vec<T>` are not — and the field carries no
+    `#[arg]` attribute at all in that case, which is why this walks fields
+    rather than matching attributes.
+    """
+    takes_any, required = False, 0
+    for attr_text, ftype in _positional_fields(payload):
         takes_any = True
-        ftype = m.group(2).strip()
         # Not required when clap can supply it: an explicit `default_value`
         # (`autumn upgrade`'s `path: String` defaults to "." and the guide runs
         # it bare 20 times), an `Option<>`, or a `Vec<>` that accepts none.
@@ -381,15 +475,99 @@ def _positionals(payload):
 # either direction is a false positive: skip too little and `json` in
 # `autumn routes --format json` reads as a bad subcommand; skip too much and a
 # real subcommand after a boolean flag goes unchecked.
-_ARG_FIELD = re.compile(
-    r'#\[arg\(([^\]]*)\)\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*,')
+#
+# The attribute body is BRACKET-BALANCED rather than regexed. It was regexed
+# (`#\[arg\(([^\]]*)\)\]`), and a character class that cannot cross a `]` cannot
+# cross `conflicts_with_all = ["manifest_path", "locked"]` either: the match
+# died at the list's first `]` and the whole field went missing from the option
+# map. Five real options were invisible that way — `sbom --binary`,
+# `upgrade --accept`, `db scrub --check`, `db scrub --dry-run` and
+# `generate admin --select` — every one of them a flag the guide tells readers
+# to run. An option missing from the map is not a quiet inaccuracy in a table
+# nobody reads: `resolve()` stops the walk at an option it does not recognise,
+# so those five spellings silently switched the gate OFF for the rest of their
+# line, and (once flags are gated) each would be reported as drift against a
+# flag that is actually there. Multi-line `#[arg(…)]` forms failed identically.
+# Clap's generated help and version are TERMINAL actions: it prints and exits 0
+# without ever checking that the command's required subcommand or positionals
+# were supplied. So `autumn replay --help` succeeds — the CLI's own tests assert
+# it (`autumn-cli/tests/integration/replay.rs`) — even though `replay` requires
+# `<CAPSULE>`, and so do `autumn db --help` and `autumn deploy --help` against
+# their required subcommands.
+#
+# Recognising these as ordinary booleans (which is what putting them in the
+# option map did) made the walk consume one and then apply the end-of-input
+# requirements to a line that never reaches them. Only terminal when the node
+# actually DECLARES the flag: `autumn migrate --version` is still drift, since
+# `--version` lives on the root alone.
+TERMINAL_OPTIONS = frozenset({'--help', '-h', '--version', '-V'})
+
+# Flags clap supplies itself, on every command, taking no value.
+#
+# `--help`/`-h` ONLY. `--version` is declared once, by `#[command(version)]` on
+# the root `Cli`, and clap does not put a root version flag on subcommands
+# unless `propagate_version` is set — which this CLI does not set anywhere. So
+# `autumn migrate --version` is `error: unexpected argument '--version' found`,
+# and seeding it onto every node would make the gate accept a line the CLI
+# rejects, which is the one thing a drift gate must never do. The root's own
+# `autumn --version` never reaches this map: the walk requires a command word
+# in the first position, so a bare flag there resolves to nothing.
+BUILTIN_OPTIONS = {'--help': False, '-h': False}
+
+# …and `#[command(version)]` on the root `Cli`, which is what puts `--version`
+# on `autumn` itself. DERIVED, not assumed: assuming the root declares it is the
+# same mistake in the other direction as assuming subcommands inherit it, and
+# the corpus runs `autumn --version` in `skills/generate/SKILL.md`, so an
+# assumption that went stale would report a correct line.
+_ROOT_VERSION = re.compile(
+    r'#\[command\([^)]*\bversion\b[^)]*\)\]\s*(?:pub\s+)?struct\s+Cli\b')
+
+_ARG_OPEN = re.compile(r'#\[arg\(')
+# The trailing comma is OPTIONAL: a struct's last field may legally omit it, and
+# requiring it made that field — and only that one — invisible to the option
+# map, which is a false-positive drift report waiting on whoever writes one.
+# `_positionals` has always accepted it; the two now agree.
+_ARG_TAIL = re.compile(
+    r'\]\s*(?:pub\s+)?([a-z_0-9]+)\s*:\s*([A-Za-z0-9_:<>, ]+?)\s*(?:,|\}|$)')
+
+# `#[command(flatten)] args: GraphArgs` — the flattened struct's options belong
+# to every command that flattens it. Without this, `autumn graph impact --json`
+# reads as drift against a `--json` that GraphArgs declares for all four `graph`
+# subcommands.
+_FLATTEN = re.compile(
+    r'#\[command\(flatten\)\]\s*(?:pub\s+)?[a-z_0-9]+\s*:\s*([A-Za-z0-9_:]+)\s*,')
 
 
-def _options(payload):
-    """Map every option spelling on a variant to whether it takes a value."""
+def _arg_fields(payload):
+    """Yield `(attrs, field, type)` for every `#[arg(…)]` field in a body."""
+    i = 0
+    while True:
+        m = _ARG_OPEN.search(payload, i)
+        if not m:
+            return
+        j, depth = m.end(), 1
+        while j < len(payload) and depth:
+            c = payload[j]
+            if c in '([{':
+                depth += 1
+            elif c in ')]}':
+                depth -= 1
+            j += 1
+        attrs = payload[m.end():j - 1]
+        i = j
+        tail = _ARG_TAIL.match(payload, j)
+        if tail:
+            yield attrs, tail.group(1), tail.group(2)
+
+
+def _options(payload, structs=None, seen=()):
+    """Map every option spelling on a variant to whether it takes a value.
+
+    `structs` resolves `#[command(flatten)]`; passing None skips that (the
+    surface builder always passes it, the self-test's simplest cases do not).
+    """
     opts = {}
-    for m in _ARG_FIELD.finditer(payload):
-        attrs, field, ftype = m.group(1), m.group(2), m.group(3)
+    for attrs, field, ftype in _arg_fields(payload):
         if not re.search(r'\b(long|short)\b', attrs):
             continue                            # positional, not an option
         takes_value = ftype.strip() != 'bool'
@@ -400,12 +578,60 @@ def _options(payload):
             opts['--' + field.replace('_', '-')] = takes_value
         for alias in re.findall(r'\balias\s*=\s*"([^"]+)"', attrs):
             opts['--' + alias] = takes_value
+        for group in re.findall(r'\baliases\s*=\s*\[([^\]]*)\]', attrs):
+            for alias in re.findall(r'"([^"]+)"', group):
+                opts['--' + alias] = takes_value
         short = re.search(r"\bshort\s*=\s*'(.)'", attrs)
         if short:
             opts['-' + short.group(1)] = takes_value
         elif re.search(r'\bshort\b', attrs):
             opts['-' + field[0]] = takes_value
+    for m in _FLATTEN.finditer(payload):
+        inner = _last(m.group(1))
+        if structs and inner in structs and inner not in seen:
+            opts.update(_options(structs[inner], structs, seen + (inner,)))
     return opts
+
+
+def _hyphen_slots(payload):
+    """Which POSITIONAL SLOTS accept a hyphen-leading value, in order.
+
+    `ConfigCommands::Set.value` is `#[arg(allow_hyphen_values = true)]`, so
+    `autumn config set retries -1` is a correct line — and reporting `-1` as an
+    undeclared flag would be this gate telling an author to break a page that
+    works. That is worse than the gap it closes: a gate that cries wolf on
+    correct docs stops being read.
+
+    Positional, not a count. A count was the first version and it leaked in the
+    other direction: the allowance belongs to ONE SLOT (`value`, the second),
+    and a plain budget stayed unspent when that slot was filled by an ordinary
+    token, so `autumn config set retries 3 --actorr` — which clap rejects,
+    both positionals being full — consumed `--actorr` against a stale allowance
+    and reported nothing. Indexing by slot spends it when the slot is filled,
+    however it is filled.
+
+    `trailing_var_arg` fields are excluded: those are `_trailing`'s, which stops
+    the walk outright rather than consuming one token.
+    """
+    slots = []
+    for attr_text, _ftype in _positional_fields(payload):
+        if re.search(r'\btrailing_var_arg\s*=\s*true', attr_text):
+            continue
+        slots.append(
+            bool(re.search(r'\ballow_hyphen_values\s*=\s*true', attr_text)))
+    return slots
+
+
+def _trailing(payload):
+    """Does this command forward everything after its positional, untouched?
+
+    `autumn task cleanup-posts --confirm` passes `--confirm` to the TASK, not to
+    the CLI: the `args: Vec<String>` field is `trailing_var_arg`, so clap stops
+    interpreting at the first positional. Gating flags without knowing that
+    would report every documented task argument as drift.
+    """
+    return any(re.search(r'\btrailing_var_arg\s*=\s*true', attrs)
+               for attrs, _f, _t in _arg_fields(payload))
 
 
 def build_surface(sources):
@@ -429,7 +655,8 @@ def build_surface(sources):
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
                 node = {'children': {}, 'positionals': False, 'options': {},
-                        'requires_sub': False, 'required_args': 0}
+                        'requires_sub': False, 'required_args': 0,
+                        'trailing': False, 'hyphen_slots': []}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -448,14 +675,18 @@ def build_surface(sources):
                                 node['children'] = build(st, seen)
                                 node['requires_sub'] = required and bool(node['children'])
                             node['positionals'], node['required_args'] = _positionals(structs[it])
-                            node['options'] = _options(structs[it])
+                            node['options'] = _options(structs[it], structs)
+                            node['trailing'] = _trailing(structs[it])
+                            node['hyphen_slots'] = _hyphen_slots(structs[it])
                 elif kind == 'struct':
                     st, required = _subcommand_type(payload)
                     if st:
                         node['children'] = build(st, seen)
                         node['requires_sub'] = required and bool(node['children'])
                     node['positionals'], node['required_args'] = _positionals(payload)
-                    node['options'] = _options(payload)
+                    node['options'] = _options(payload, structs)
+                    node['trailing'] = _trailing(payload)
+                    node['hyphen_slots'] = _hyphen_slots(payload)
                 for spelling in spellings:
                     tree[spelling] = node
             return tree
@@ -470,15 +701,45 @@ def build_surface(sources):
         flat = {}
         for k, v in t.items():
             key = (prefix + ' ' + k).strip()
+            # clap gives every command `--help`/`-h`, and the root's
+            # `#[command(version)]` gives `--version`/`-V`. They are declared
+            # nowhere in the derive input, so without this they read as drift.
+            opts = dict(BUILTIN_OPTIONS)
+            opts.update(v['options'])
             flat[key] = {'children': set(v['children']),
                          'positionals': v['positionals'],
-                         'options': v['options'],
+                         'options': opts,
                          'requires_sub': v['requires_sub'],
-                         'required_args': v['required_args']}
+                         'required_args': v['required_args'],
+                         'trailing': v['trailing'],
+                         'hyphen_slots': v['hyphen_slots']}
             flat.update(flatten(v['children'], key))
         return flat
 
-    return flatten(tree)
+    def root_node():
+        """The root command itself, keyed `''`.
+
+        `autumn --help` and `autumn --version` are real lines in this corpus and
+        `autumn --helpp` is not, but the walk reaches the root with no command
+        word, so it bailed before any option was judged and every root-level
+        spelling — typos included — went unchecked. `''` is a key `flatten`
+        cannot produce (its keys are built from non-empty spellings), so it
+        cannot collide with a command path; every place that enumerates or
+        counts the surface filters it out.
+        """
+        opts = dict(BUILTIN_OPTIONS)
+        if _ROOT_VERSION.search(text):
+            opts.update({'--version': False, '-V': False})
+        if 'Cli' in structs:                    # any real `#[arg]` on the root
+            opts.update(_options(structs['Cli'], structs))
+        return {'children': set(), 'positionals': False, 'options': opts,
+                'requires_sub': True, 'required_args': 0, 'trailing': False,
+                'hyphen_slots': []}
+
+    flat = flatten(tree)
+    if flat:                                    # only alongside a real surface
+        flat[''] = root_node()
+    return flat
 
 
 def cli_sources(root):
@@ -2128,6 +2389,33 @@ def _redirect(tok):
 
 WAIVER = re.compile(r'<!--\s*cli-surface-allow:\s*autumn\s+([a-z0-9 -]+?)\s*(?:—|--|:)\s*(\S.*?)-->')
 
+# The same marker, naming an OPTION as well as a command. It has to be matched
+# separately and FIRST, because `WAIVER` cannot read one: its command capture is
+# non-greedy and its separator alternatives include `--`, so
+# `cli-surface-allow: autumn build --release — why` matches there as the command
+# `build` with the reason `release — why`. That silently waives a whole command
+# instead of one of its flags. Matching this pattern first and skipping the
+# `WAIVER` matches it overlaps keeps each marker read exactly once, as whichever
+# kind it is. `—` or `:` separate the reason here; `--` cannot, since the thing
+# to its left is itself spelled with dashes.
+# The option is captured loosely and then validated with `_reportable_flag` —
+# the SAME predicate the detector uses — so the two cannot disagree about what
+# is waivable. They did: the detector was widened to report `--show_config`
+# while this pattern still allowed only letters, digits and hyphens, so the one
+# spelling a page might most want to name ("`--show_config` is not a flag") was
+# reportable and un-waivable at once, and the command pattern then misread the
+# marker as a bare waiver for `dev`.
+#
+# The command is optional (a root option is waived with no command before it)
+# and, when present, must be followed by WHITESPACE. That is what keeps
+# `autumn system-test — planned` from reading as the command `system` plus an
+# option `-test`: in a hyphenated command name there is no space before the
+# `-`. An earlier version used a one-letter rule for shorts instead, which
+# happened to stop that case but also made `-zz` un-waivable while reportable.
+FLAG_WAIVER = re.compile(
+    r'<!--\s*cli-surface-allow:\s*autumn\s+(?:([a-z0-9][a-z0-9 -]*?)\s+)?'
+    r'(-\S*)\s*(?:—|:)\s*(\S.*?)-->')
+
 INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
 # `docs/plugins.md` is a live product guide sitting at the `docs/` root rather
 # than under `docs/guide/`, linked from seven corpus pages as *the* plugin
@@ -2819,12 +3107,18 @@ def blocks(text):
 
 
 def _short_cluster(tok, options):
-    """Tokens consumed by a compact short-option group, or None if unknown.
+    """`(tokens consumed, is terminal)` for a compact short group, or None.
 
-    Returns 1 when the group is self-contained — every letter is a boolean
+    Consumes 1 when the group is self-contained — every letter is a boolean
     (`-rd`), or the letter that takes a value carries it attached (`-pfoo`) —
     and 2 when the group ends on a value-taking option whose value is the next
     token (`-rp foo`).
+
+    TERMINAL when any letter is one of clap's print-and-exit actions. A cluster
+    is not a lesser kind of option: `autumn replay -hpapi` is `-h` plus
+    `-p api`, and clap prints help and exits 0 without ever checking that
+    `<CAPSULE>` was supplied. Collapsing it to an ordinary group dropped that,
+    and the walk went on to report the line as incomplete — a correct line.
 
     Returns None the moment a letter is not declared, so an unrecognised group
     is still not walked past: whether it eats the following token is exactly
@@ -2833,15 +3127,270 @@ def _short_cluster(tok, options):
     """
     for pos, ch in enumerate(tok[1:], start=1):
         name = '-' + ch
+        # A terminal letter ends the parse where it stands. clap prints help and
+        # exits at `-h` WITHOUT looking at the rest of the group, so a later
+        # undeclared letter is never reached and cannot make the line a defect:
+        # `autumn replay -hx` exits 0 (measured). Checked before the
+        # unknown-letter bail below, which would otherwise reject the token.
+        if name in TERMINAL_OPTIONS and name in options:
+            return 1, True
         if name not in options:
             return None
         if options[name]:                       # this letter takes a value
-            return 1 if pos < len(tok) - 1 else 2
-    return 1
+            return (1 if pos < len(tok) - 1 else 2), False
+    return 1, False
 
 
-def resolve(tokens, surface, runnable=False):
+# A token that starts with `-` is judged as a flag unless it carries a character
+# that marks it as prose rather than something a reader could type. The corpus
+# writes several such things in command position: `->` in a prose arrow
+# (`autumn upgrade - app-code migrations 0.5.0 -> 0.6.0`), slash-joined
+# shorthand naming several flags at once (`autumn token issue
+# --name/--scope/--expires-at`, `autumn seed --count/--model`), and
+# `--flag <PLACEHOLDER>` forms. Reporting those would be reporting prose.
+#
+# The exclusion is by prose PUNCTUATION, never by requiring the token to be
+# spelled the way this project spells its flags. Matching `--[a-z0-9-]+` was the
+# first version and it silently dropped exactly the misspellings the gate is for:
+# `autumn dev --show_config` (an underscore where the real flag has a hyphen) is
+# rejected by clap and was reported by nothing, and an unresolvable compact short
+# like `-zz` went the same way. A gate that only reports flags already spelled
+# correctly reports almost nothing.
+_PROSE_IN_FLAG = re.compile(r'''[/<>{}$`|\\"'()\[\]]''')
+
+
+def _reportable_name(name):
+    """Could the detector ever REPORT this spelling as an option name?
+
+    The waiver validator's question, and deliberately not the detector's. An
+    author waiving a defect writes the name the report showed them, so the set
+    that must be waivable is exactly the set that can be reported — which,
+    since `--=value` became a defect, includes `--`. Reporting a spelling a
+    marker cannot name is a defect with no way to waive it, which is finding 7
+    in this PR's own table.
+
+    A bare `-` is still not one of them: only the long path shortens a name and
+    it can only shorten to something starting `--`, so `-` alone is never
+    emitted, and a marker containing one is a command waiver for the command
+    pattern to read.
+    """
+    return (name.startswith('-') and name != '-'
+            and not _PROSE_IN_FLAG.search(name))
+
+
+def _reportable_flag(name, tok=None):
+    """Is this dashed token a flag spelling a reader could copy, or prose?
+
+    `tok` is the token `name` was derived from, and the `-`/`--` exemption is
+    the TOKEN's, not the name's. Those two are the same thing right up until a
+    long option is split on `=`: `--=debug` normalizes to the name `--` and was
+    waved through as the end-of-options marker, though clap rejects it (`error:
+    unexpected argument '--' found`, exit 2) while a bare `--` it accepts.
+    Callers that hold the token pass it.
+    """
+    tok = name if tok is None else tok
+    return tok not in ('-', '--') and _reportable_name(name)
+
+
+def _missing_value(kind, eaten, i, tokens, runnable):
+    """Is this a value-taking option written with no value left to take?
+
+    `_classify_option` answers what an option IS from the node alone; whether
+    the value it needs is actually THERE depends on the token list, so it is
+    asked here. `autumn build --package` at the end of a line is "a value is
+    required for '--package <PACKAGE>' but none was supplied", exit 2
+    (measured) — the walk stepped over two tokens where only one existed and
+    ran off the end reporting nothing.
+
+    ONLY inside a fence, for the same reason `requires_sub` is: in prose a
+    command-and-flag without a value is how English names the flag. The corpus
+    does this ten times on correct pages — "`autumn plugin-check
+    --plugin-name` takes one string", "`autumn new --starter` writes through
+    the same machinery" — and reporting them would have been this gate's worst
+    regression yet, ten false positives at once. Found by running the corpus,
+    not by the injection tests, which is why the corpus run is not optional.
+
+    Shared by all three option loops rather than written in each: a rule taught
+    to one of them and not the others has been the cause of four review rounds
+    on this PR.
+    """
+    # `cluster` as well as `known`: a compact group ending on a value-taking
+    # short has exactly the same arity, so `autumn build -p` is "a value is
+    # required for '--package <PACKAGE>'" (measured) just as `--package` is.
+    # Checking only `known` left the short spelling of this defect accepted —
+    # the same shape as finding 1, where `--name=value` was the unchecked
+    # spelling of an unchecked name.
+    if not (runnable and kind in ('known', 'cluster') and eaten == 2):
+        return False
+    if i + eaten > len(tokens):
+        return True                             # nothing there at all
+    # …and a token being PRESENT is not the same as it being a value the
+    # option can take. Two kinds of token sit in that slot without being one:
+    #
+    #   - a REDIRECTION, which the shell removes before the binary is launched,
+    #     so `autumn build --package >/tmp/out` reaches clap as
+    #     `build --package`;
+    #   - another OPTION, or the `--` terminator, which clap reads as the next
+    #     argument rather than as a value.
+    #
+    # All measured: `--package --debug`, `--package -p` and `--package --` are
+    # each "a value is required for '--package <PACKAGE>'". No value-taking
+    # option in this CLI carries `allow_hyphen_values` — its three sites are all
+    # positionals — so a hyphen-led token is never a value here.
+    nxt = tokens[i + 1]
+    if _redirect(nxt):
+        return True
+    return nxt == '--' or (nxt.startswith('-') and len(nxt) > 1)
+
+
+def _starts_trailing(node, supplied):
+    """Does an UNKNOWN hyphen token here start a `trailing_var_arg` capture?
+
+    `hyphen_slots` counts only the command's own positionals, so its length is
+    the index at which the trailing field begins. When that field is the FIRST
+    positional the boundary is zero, and the very first hyphen token starts the
+    capture: `Test.cargo_args` is `trailing_var_arg` + `allow_hyphen_values`
+    with nothing before it, so `autumn test --nocapture` forwards `--nocapture`
+    to cargo and is a correct line.
+
+    Asked only AFTER `_classify_option`, so the command's own options keep
+    precedence — `autumn test --reset` is still the CLI's.
+
+    Shared by the outer option branch and the leaf loop, which see the same
+    token in different states: an option token never reaches the leaf loop (the
+    outer branch takes every one of them), so a rule taught to only one of them
+    is a rule that does not apply where it is needed. That is how this arrived:
+    the first attempt lived in the leaf loop alone and changed nothing.
+    """
+    return node['trailing'] and supplied >= len(node['hyphen_slots'])
+
+
+def _classify_option(tok, node):
+    """What IS this option token, to `node`? `(kind, eaten)`.
+
+    The single definition of an option, shared by all three walkers — the outer
+    walk, the leaf loop and the options-only scan. Each of the three grew its
+    own copy, and each time one of them learned something the others did not,
+    that gap was a review finding: the leaf loop could not read a compact short
+    (`-papi`), and the options-only scan did not know help was terminal. Policy
+    on an UNKNOWN option still belongs to the caller — the leaf loop must offer
+    it to an `allow_hyphen_values` slot first — so this reports nothing and
+    decides nothing; it only says what the token is.
+
+      'terminal'  clap prints and exits 0 without checking requirements
+      'known'     declared here; `eaten` tokens belong to it
+      'cluster'   a compact short group; `eaten` tokens belong to it
+      'novalue'   declared, but given an attached value it does not take
+      'unknown'   not declared; `eaten` is 1 when the value is attached
+                  (so the name alone was wrong) and 0 when its arity is a guess
+    """
+    # `=` is the LONG-option separator ONLY. A short token carries its value in
+    # its SUFFIX, `=` and all, so `autumn sbom -oartifact=prod.json` passes
+    # `artifact=prod.json` to `-o` (measured: the parser accepts it, and
+    # `autumn data export -ofoo=bar.json` fails only for a missing `--url`).
+    # Splitting unconditionally made the name `-oartifact` — and because
+    # `attached` was then true, the compact-short branch below was skipped too,
+    # so such a token could only ever come back `unknown`.
+    #
+    # The two spellings genuinely disagree here, which is why this is a split
+    # and not a shared rule: `--help=foo` is exit 2, while `-h=foo` prints help
+    # and exits 0, because clap short-circuits on the action at the letter.
+    # Handing the whole token to `_short_cluster` reproduces both.
+    long = tok.startswith('--')
+    name = tok.split('=', 1)[0] if long else tok
+    attached = ('=' in tok) if long else False
+    if name in node['options']:
+        # ARITY FIRST, before anything else a declared name might mean. A
+        # valueless flag given a value is rejected whatever else it is: clap's
+        # `bool` fields are `ArgAction::SetTrue` with `num_args(0)`, so
+        # `--reset=true` is "unexpected value 'true' for '--reset'", exit 2 —
+        # and help and version are valueless too, so `autumn replay --help=foo`
+        # is the same error and not a terminal action. Ordering this check
+        # after the terminal one accepted exactly those lines.
+        if attached and not node['options'][name]:
+            return 'novalue', 1
+        if name in TERMINAL_OPTIONS:
+            return 'terminal', 0
+        if attached:                            # `--name=value`, self-contained
+            return 'known', 1
+        return 'known', 2 if node['options'][name] else 1
+    if not long:
+        cluster = _short_cluster(tok, node['options'])
+        if cluster is not None:
+            eaten, terminal = cluster
+            return ('terminal', 0) if terminal else ('cluster', eaten)
+    return 'unknown', 1 if attached else 0
+
+
+def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
+    """Judge the OPTIONS in `tokens[i:]`, resolving no NEW command defects.
+
+    Reached once a positional has been met on a node that also has subcommands,
+    where a bare token can no longer be told from a subcommand name. Options
+    still can be, so they are still checked; everything else is stepped over.
+
+    A subcommand IS still followed once the node's declared positional slots are
+    full, because at that point a token matching a child name can only be that
+    child. `routes` takes one `PREFIX` then an optional subcommand, so `autumn
+    routes /admin audit --strict` is correct and `--strict` belongs to `audit`;
+    judging it against `routes` forever reported that correct line. The slot
+    count comes from `hyphen_slots`, which carries one entry per positional.
+
+    Always returns None: a command defect cannot be proven from here, and
+    guessing one is how a gate reports a page that is correct.
+    """
+    filled = 0
+    slots = len(node['hyphen_slots'])
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == '--':                         # end of options; only operands left
+            return None
+        if not (tok.startswith('-') and len(tok) > 1):
+            if filled >= slots and tok in node['children']:
+                # The child resolves the ambiguity that sent us here, so the
+                # ordinary walk can take over again — including its
+                # `requires_sub` and required-argument checks, which this
+                # options-only mode does not have and must not reimplement.
+                return _walk(tokens, i + 1, path + ' ' + tok,
+                             surface, runnable, flags)
+            filled += 1                         # a value, or another positional
+            i += 1
+            continue
+        if node['trailing']:
+            # Everything from the first positional onward belongs to the
+            # forwarded command, so none of it is this CLI's to judge.
+            return None
+        name = tok.split('=', 1)[0]
+        kind, eaten = _classify_option(tok, node)
+        if kind == 'terminal':
+            return None
+        if _missing_value(kind, eaten, i, tokens, runnable):
+            if flags is not None:
+                flags.append((path, name, 'needsvalue'))
+            return None
+        if kind in ('known', 'cluster'):
+            i += eaten
+            continue
+        if kind == 'novalue':
+            if flags is not None:
+                flags.append((path, name, kind))
+            return None                         # see `_walk`'s option branch
+        if flags is not None and _reportable_flag(name, tok):
+            flags.append((path, name, kind))
+        if eaten:                               # attached value: arity is known
+            i += eaten
+            continue
+        return None                             # arity unknown: stop here
+    return None
+
+
+def resolve(tokens, surface, runnable=False, flags=None):
     """Return the drifted command path, or None when the command resolves.
+
+    `flags`, when given, collects `(command path, option)` for every option a
+    line names that the command does not declare — the flag half of the same
+    defect, kept out of the return value so a caller that only wants commands
+    is unaffected.
 
     Takes SHELL TOKENS, not a string to be split on whitespace: a quoted option
     value is one token however many spaces are inside it. Splitting on
@@ -2866,12 +3415,41 @@ def resolve(tokens, surface, runnable=False):
         # same defect as a bare `autumn db` — and in prose it is just the name
         # of the binary, which the corpus writes constantly.
         return 'autumn' if runnable else None
+    if tokens[0].startswith('-') and len(tokens[0]) > 1:
+        # An option passed to the root itself. The root is a command like any
+        # other and clap rejects a spelling it does not declare, but it is
+        # reached with no command word, so the `TOKEN` bail below used to swallow
+        # every root-level flag — `autumn --helpp` read exactly like the
+        # `autumn --help` the guide runs. Not walked past: the root takes a
+        # required subcommand, so there is nothing after it to judge.
+        root = surface.get('', {'options': {}})
+        kind, _eaten = _classify_option(tokens[0], root)
+        if kind == 'novalue':
+            if flags is not None:
+                flags.append(('', tokens[0].split('=', 1)[0], kind))
+        elif kind == 'unknown':
+            name = tokens[0].split('=', 1)[0]
+            if flags is not None and _reportable_flag(name, tokens[0]):
+                flags.append(('', name, kind))
+        return None
     if not TOKEN.match(tokens[0]):
         return None
     if tokens[0] not in surface:
         return 'autumn ' + tokens[0]
-    path = tokens[0]
-    i = 1
+    return _walk(tokens, 1, tokens[0], surface, runnable, flags)
+
+
+def _walk(tokens, i, path, surface, runnable, flags):
+    """The token walk proper, entered at `tokens[i]` with `path` resolved.
+
+    Split out so that `_scan_options_only` can hand control BACK to it once a
+    positional's ambiguity has been resolved by an exact child name. It stayed
+    in options-only mode instead, and so never applied the child's
+    `requires_sub` or required-argument checks: `autumn routes /admin posture`
+    and `autumn routes /admin posture bogus` both passed, though clap rejects
+    each. Two walks that must agree about what a command needs is the same trap
+    that put the waiver grammar out of step with the detector; there is now one.
+    """
     while i < len(tokens):
         tok = tokens[i]
         node = surface[path]
@@ -2879,27 +3457,43 @@ def resolve(tokens, surface, runnable=False):
             return None
         if tok.startswith('-') and len(tok) > 1:
             name = tok.split('=', 1)[0]
-            if '=' in tok:                      # --name=value, self-contained
-                i += 1
-                continue
-            if not tok.startswith('--') and len(tok) > 2:
-                # A compact short-option group. POSIX lets shorts bundle and
-                # lets the last one carry its value attached, so `-pfoo` is
-                # `--package foo` and `-rd` is two booleans — both of which
-                # read as one unrecognised token and stopped the walk, leaving
-                # every subcommand written after them unchecked.
-                eaten = _short_cluster(tok, node['options'])
-                if eaten is not None:
-                    i += eaten
-                    continue
-            if name not in node['options']:
-                # An option this command does not declare. Flags are out of
-                # scope, so this is not reported — but it also cannot be walked
-                # past safely, since whether it consumes the next token is
-                # unknown. Stop rather than risk a false positive.
+            # `--name=value` carries its own value, so its ARITY is known — but
+            # its NAME still has to exist. Returning here on the strength of the
+            # `=` alone let `autumn build --definitely-not-real=value` through
+            # without ever reaching the membership check below, which is the
+            # attached spelling of the very defect this gate reports.
+            kind, eaten = _classify_option(tok, node)
+            if kind == 'terminal':
                 return None
-            i += 2 if node['options'][name] else 1
-            continue
+            if _missing_value(kind, eaten, i, tokens, runnable):
+                if flags is not None:
+                    flags.append((path, name, 'needsvalue'))
+                return None
+            if kind in ('known', 'cluster'):
+                i += eaten
+                continue
+            if kind == 'novalue':
+                if flags is not None:
+                    flags.append((path, name, kind))
+                # Stop, rather than walk past. The value is inside the token
+                # so the arity IS known, but clap's parse fails right here and
+                # never reaches the end-of-input requirement checks — carrying
+                # on reported `autumn replay --help=foo` as ALSO needing
+                # <CAPSULE>, a second complaint about something clap never got
+                # to evaluate. One accurate defect per line.
+                return None
+            if _starts_trailing(node, 0):
+                return None                     # forwarded verbatim, not judged
+            # Not declared here. Reported when it is spelled like a flag; then
+            # an attached value can be walked PAST (its arity is inside the
+            # token) while a detached one stops the walk, since whether it eats
+            # the next token is a guess and guessing invents defects.
+            if flags is not None and _reportable_flag(name, tok):
+                flags.append((path, name, kind))
+            if eaten:
+                i += eaten
+                continue
+            return None
         if not node['children']:
             # A leaf: everything left is arguments, and here the ambiguity
             # between "value" and "subcommand name" is gone, so the remaining
@@ -2907,20 +3501,60 @@ def resolve(tokens, surface, runnable=False):
             # than abandoned. `autumn generate controller pages` supplies
             # `name` and stops, but `actions` is `required = true` too.
             supplied = 0
+            operands_only = False
+            # Positional slots declared `allow_hyphen_values`. Indexed by
+            # `supplied` — the slot about to be filled — so the allowance is
+            # spent when its slot is, however it is filled. A declared option
+            # still wins, so `autumn config set k v --actor me` reads `--actor`
+            # as the flag it is, while `-1` is the value it is.
+            hyphen_slots = node['hyphen_slots']
             while i < len(tokens):
                 t2 = tokens[i]
                 if t2 == '--':
+                    # POSIX end-of-options. Everything after it is an operand,
+                    # so nothing after it is a flag of this command's to judge:
+                    # `autumn task <name> -- --arg value` hands `--arg` to the
+                    # task. It still counts toward the positionals.
+                    operands_only = True
                     i += 1
                     continue
-                if t2.startswith('-') and len(t2) > 1:
+                if not operands_only and t2.startswith('-') and len(t2) > 1:
+                    # `trailing_var_arg`: once the capture is under way, clap
+                    # forwards the rest verbatim. `autumn task cleanup-posts
+                    # --confirm` sends `--confirm` to the task.
+                    if node['trailing'] and supplied > len(hyphen_slots):
+                        return None
                     o = t2.split('=', 1)[0]
-                    if '=' in t2:
+                    kind, eaten = _classify_option(t2, node)
+                    if kind == 'terminal':
+                        return None
+                    if _missing_value(kind, eaten, i, tokens, runnable):
+                        if flags is not None:
+                            flags.append((path, o, 'needsvalue'))
+                        return None
+                    if kind in ('known', 'cluster'):
+                        i += eaten
+                        continue
+                    if kind == 'novalue':
+                        if flags is not None:
+                            flags.append((path, o, kind))
+                        return None             # see `_walk`'s option branch
+                    if _starts_trailing(node, supplied):
+                        return None             # forwarded verbatim, not judged
+                    if supplied < len(hyphen_slots) and hyphen_slots[supplied]:
+                        # Not a flag at all: the value of an
+                        # `allow_hyphen_values` positional. Filling the slot
+                        # spends the allowance, so a later unknown flag is
+                        # still reported.
+                        supplied += 1
                         i += 1
                         continue
-                    if o not in node['options']:
-                        return None             # unknown arity: cannot count on
-                    i += 2 if node['options'][o] else 1
-                    continue
+                    if flags is not None and _reportable_flag(o, t2):
+                        flags.append((path, o, kind))
+                    if eaten:                   # attached value: arity is known
+                        i += eaten
+                        continue
+                    return None                 # unknown arity: cannot count on
                 eaten = _redirect(t2)
                 if eaten:                       # a redirection is not an argument
                     i += eaten
@@ -2934,13 +3568,31 @@ def resolve(tokens, surface, runnable=False):
         if eaten:                               # shell plumbing, not the command
             i += eaten
             continue
-        if not TOKEN.match(tok):
-            return None
-        if tok in node['children']:
+        if tok in node['children']:             # always TOKEN-shaped, so first
             path = path + ' ' + tok
             i += 1
             continue
-        if node['positionals']:                 # unjudgeable: a value, not a name
+        # The positional check comes BEFORE the `TOKEN` bail, because the
+        # positional VALUES this corpus writes are mostly not token-shaped:
+        # `/admin` in `autumn routes /admin --method POST` is a path. Judged
+        # after the bail, that line stopped at `/admin` and its options went
+        # unchecked — the very case this branch exists to keep judging.
+        if node['positionals']:
+            # This token is unjudgeable as a COMMAND — `/admin` in `autumn
+            # routes /admin` is the `prefix` positional, not a subcommand name,
+            # and nothing here can prove otherwise. But the OPTIONS after it are
+            # still this node's to check: `routes` carries a positional, four
+            # options and two subcommands at once, and the guide writes `autumn
+            # routes /admin --method POST`. Returning outright stopped at the
+            # positional and left every option after it unjudged, so `--methd`
+            # on that line read exactly like the `--method` it misspells.
+            #
+            # Only option-shaped tokens are judged from here. Anything else may
+            # be another positional value, or the value of an option, and no
+            # further subcommand resolution is attempted.
+            return _scan_options_only(tokens, i, node, path, flags,
+                                      surface, runnable)
+        if not TOKEN.match(tok):
             return None
         return 'autumn ' + path + ' ' + tok
 
@@ -2966,7 +3618,7 @@ def resolve(tokens, surface, runnable=False):
 
 
 def scan(root, surface, files):
-    defects, waived = [], 0
+    defects, flag_defects, waived = [], [], 0
     for f in files:
         text = (root / f).read_text(errors='replace')
         line_block = blocks(text)
@@ -2979,13 +3631,46 @@ def scan(root, surface, files):
         # runnable block on the same page — re-admitting, unnoticed, the exact
         # defect this gate was written to remove.
         allowed = collections.defaultdict(set)
+        flag_allowed = collections.defaultdict(set)
+        flag_spans = []
+        for m in FLAG_WAIVER.finditer(text):
+            if not _reportable_name(m.group(2)):
+                # Not a spelling the detector would ever report, so this is not
+                # a flag waiver; leave it to the command pattern. Asked as
+                # "could this be reported?" rather than "is this token a flag?"
+                # — the author writes the name the REPORT showed them, and
+                # since `--=debug` is reported as `--`, `--` has to be sayable
+                # here or that defect is unwaivable.
+                continue
+            marker_line = text.count('\n', 0, m.start()) + 1
+            marker_block = line_block[marker_line]
+            key = ((m.group(1) or '').strip() + ' ' + m.group(2)).strip()
+            flag_allowed[key].update({marker_block, marker_block - 1})
+            flag_spans.append(m.span())
         for m in WAIVER.finditer(text):
+            # …unless this marker was already read as a flag waiver, which the
+            # command pattern would otherwise misread as a bare command.
+            if any(s <= m.start() < e for s, e in flag_spans):
+                continue
             marker_line = text.count('\n', 0, m.start()) + 1
             marker_block = line_block[marker_line]
             allowed[m.group(1).strip()].update({marker_block, marker_block - 1})
 
         for lineno, display, argv, where in invocations(text):
-            bad = resolve(argv, surface, runnable=where == FENCED_COMMAND)
+            hits = []
+            bad = resolve(argv, surface, runnable=where == FENCED_COMMAND,
+                          flags=hits)
+            for cmd_path, opt, kind in hits:
+                # Waived by the command-and-flag pair, and — exactly as for a
+                # command — never inside a fence. The reason is the same one:
+                # a fenced line is handed over to be run, so a page may NAME a
+                # flag that does not exist ("there is no `--release`; release is
+                # the default") but never hand one over.
+                key = (cmd_path + ' ' + opt).strip()
+                if where == PROSE_SPAN and line_block[lineno] in flag_allowed.get(key, ()):
+                    waived += 1
+                    continue
+                flag_defects.append((f, lineno, cmd_path, opt, display, kind))
             if bad is None:
                 continue
             command = bad[len('autumn '):]
@@ -2997,7 +3682,7 @@ def scan(root, surface, files):
                 waived += 1
                 continue
             defects.append((f, lineno, bad, display))
-    return defects, waived
+    return defects, flag_defects, waived
 
 
 # ------------------------------------------------------------------- modes
@@ -3046,6 +3731,63 @@ def self_test():
             #[arg(short, long)]
             package: Option<String>,
         },
+        // A multi-line `#[arg]` carrying a bracketed list. Both forms defeated
+        // the regex this parser used to use, and an option missing from the map
+        // is a flag the gate reports as drift against a flag that is there.
+        Sbom {
+            #[arg(
+                long,
+                value_name = "FILE",
+                conflicts_with_all = ["locked", "verify"]
+            )]
+            binary: Option<String>,
+            #[arg(long, conflicts_with_all = ["binary"])]
+            locked: bool,
+        },
+        // A trailing capture that is the command's FIRST positional, as the
+        // real `Test.cargo_args` is: there is no CLI-flag position in front of
+        // it, so the first unknown hyphen token starts the capture.
+        Test {
+            #[arg(long)]
+            reset: bool,
+            #[arg(
+                value_name = "CARGO_TEST_ARGS",
+                trailing_var_arg = true,
+                allow_hyphen_values = true
+            )]
+            cargo_args: Vec<String>,
+        },
+        // `trailing_var_arg`: everything after the positional goes to the task,
+        // so the CLI never sees those flags and must not judge them.
+        Task {
+            #[arg(long)]
+            list: bool,
+            name: Option<String>,
+            #[arg(value_name = "ARGS", trailing_var_arg = true,
+                  allow_hyphen_values = true)]
+            args: Vec<String>,
+        },
+        // `#[command(flatten)]`: the flattened struct's options are this
+        // command's options too.
+        Graph {
+            #[command(flatten)]
+            args: GraphArgs,
+        },
+        // A positional, options AND subcommands on the same command, as the
+        // real `routes` has. The options after the positional are still this
+        // command's to judge, even though the token itself is not.
+        Routes {
+            #[arg(value_name = "PREFIX")]
+            prefix: Option<String>,
+            #[arg(long, value_name = "METHOD")]
+            method: Vec<String>,
+            #[arg(long)]
+            user_only: bool,
+            #[command(subcommand)]
+            command: Option<RoutesSubcommands>,
+        },
+        #[command(subcommand, name = "config")]
+        Config(ConfigCommands),
         Controller {
             name: String,
             #[arg(required = true)]
@@ -3075,6 +3817,37 @@ def self_test():
         path: String,
     }
     enum UpgradeCommands { Apply }
+    enum RoutesSubcommands {
+        Audit {
+            #[arg(long)]
+            strict: bool,
+        },
+        // A child that itself REQUIRES a subcommand, so the handback to the
+        // ordinary walk has something to prove.
+        #[command(subcommand)]
+        Posture(PostureSubcommands),
+    }
+    enum PostureSubcommands { Digest }
+    // A positional that accepts a hyphen-leading value, as the real
+    // `ConfigCommands::Set.value` does.
+    enum ConfigCommands {
+        Set {
+            key: String,
+            #[arg(allow_hyphen_values = true)]
+            value: String,
+            #[arg(long, value_name = "ACTOR")]
+            actor: Option<String>,
+        },
+    }
+    #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
+    struct Cli {
+        #[command(subcommand)]
+        command: Commands,
+    }
+    struct GraphArgs {
+        #[arg(long)]
+        json: bool,
+    }
     '''
     surface = build_surface([fake])
     failures = []
@@ -3126,9 +3899,10 @@ def self_test():
     # --- options are walked through, not treated as the end of the command.
     # Regression test for a version that stopped at the first `-` and left every
     # subcommand written after an option unchecked.
-    expect(surface['migrate']['options'] == {'--with-maintenance': False, '--shard': True,
-                                             '-p': True, '--package': True,
-                                             '-v': False, '--verbose': False},
+    expect(surface['migrate']['options'] == dict(BUILTIN_OPTIONS,
+                                                 **{'--with-maintenance': False, '--shard': True,
+                                                    '-p': True, '--package': True,
+                                                    '-v': False, '--verbose': False}),
            f"option value-taking must come from the field type, got {surface['migrate']['options']}")
     expect(resolve(tk('migrate --with-maintenance status'), surface) is None,
            'a boolean option must not hide the subcommand after it')
@@ -3142,6 +3916,348 @@ def self_test():
            'an undeclared option stops the walk rather than risking a false positive')
     expect(resolve(tk('migrate -- nope'), surface) is None,
            'everything after `--` is arguments')
+
+    # --- the flag half of the same defect. An option a command does not declare
+    # is `unexpected argument … exit 2` for whoever copies the line, and until
+    # #2498 it was walked away from in silence. It is collected through an
+    # out-parameter so that a caller asking only about commands is unaffected.
+    def opts_of(argv, runnable=False):
+        return [(p, n) for p, n, _k in raw_opts(argv, runnable)]
+
+    def raw_opts(argv, runnable=False):
+        hits = []
+        resolve(tk(argv), surface, runnable=runnable, flags=hits)
+        return hits
+
+    expect(opts_of('migrate --unknown-option nope') == [('migrate', '--unknown-option')],
+           'an undeclared option must be reported when a collector is passed')
+    expect(opts_of('migrate --shard eu status') == [],
+           'a declared option is not drift')
+    expect(opts_of('console --nope') == [('console', '--nope')],
+           'an undeclared option on a LEAF command must be reported too')
+    expect(opts_of('migrate --help') == [] and opts_of('console -h') == [],
+           "clap's own --help is on every command and is not drift")
+    # …but NOT --version. It is declared once, by `#[command(version)]` on the
+    # root, and clap propagates it to subcommands only under
+    # `propagate_version`, which this CLI does not set. Seeding it everywhere
+    # made the gate accept `autumn migrate --version`, which the CLI rejects.
+    expect(opts_of('migrate --version') == [('migrate', '--version')],
+           '--version is not propagated to subcommands and is drift on one')
+
+    # `--name=value` carries its value, so the walk may step over it — but the
+    # NAME is still checked. Skipping on the strength of the `=` alone let the
+    # attached spelling of a bad flag through in both the option walk and the
+    # leaf loop.
+    expect(opts_of('migrate --shard=eu') == [], 'a known attached option is fine')
+    expect(opts_of('migrate --nope=eu') == [('migrate', '--nope')],
+           'an UNKNOWN attached option is drift, not a token to step over')
+    expect(opts_of('console --nope=x') == [('console', '--nope')],
+           'the same, on a leaf command')
+    expect(opts_of('migrate --nope=eu status') == [('migrate', '--nope')],
+           'an attached option is walked past, so the rest of the line is judged')
+
+    # The shape filter excludes prose PUNCTUATION, never a non-canonical
+    # spelling: an underscore where the flag has a hyphen, or an unresolvable
+    # compact short, are exactly what this gate is for.
+    expect(opts_of('migrate --with_maintenance') == [('migrate', '--with_maintenance')],
+           'an underscore misspelling of a real flag must be reported')
+    expect(opts_of('migrate -zz') == [('migrate', '-zz')],
+           'an unresolvable compact short must be reported')
+
+    # --- options passed to the ROOT. `autumn --help` and `autumn --version` are
+    # both real lines in this corpus; `autumn --helpp` is not, and used to read
+    # exactly like them because the walk bailed on a dashed first token before
+    # judging anything.
+    expect(opts_of('--help') == [] and opts_of('-h') == [],
+           'a root option clap always supplies is not drift')
+    expect(opts_of('--version') == [],
+           '#[command(version)] on the root makes `autumn --version` valid')
+    expect(opts_of('--helpp') == [('', '--helpp')],
+           'a root-level typo must be reported')
+    expect(surface[''] and '' not in {p for p in surface if p},
+           'the root is keyed by a string no command path can collide with')
+    # …and the root's `--version` is DERIVED: a `Cli` without it must not get one.
+    noversion = build_surface(['''
+        #[command(name = "autumn", about = "x")]
+        struct Cli { #[command(subcommand)] command: Commands, }
+        enum Commands { Console }
+    '''])
+    expect('--version' not in noversion['']['options'],
+           'a root without #[command(version)] must not be given one')
+
+    # --- `allow_hyphen_values` on a positional. `autumn config set retries -1`
+    # is a CORRECT line, and reporting `-1` would be the gate telling an author
+    # to break a page that works — worse than the gap it closes.
+    expect(surface['config set']['hyphen_slots'] == [False, True],
+           f"the allowance is per SLOT, in order: {surface['config set']['hyphen_slots']}")
+    expect(opts_of('config set retries -1') == [],
+           "a hyphen-leading value of an allow_hyphen_values positional is not a flag")
+    expect(opts_of('config set retries -1 --actor me') == [],
+           'a declared option after such a value still resolves')
+    expect(opts_of('config set retries -1 --actorr me') == [('config set', '--actorr')],
+           'the allowance is spent, so a later unknown flag is still reported')
+    # …and spent by an ORDINARY value too. A plain budget stayed unspent here,
+    # so `--actorr` was consumed against an allowance whose slot was full.
+    expect(opts_of('config set retries 3 --actorr') == [('config set', '--actorr')],
+           'a filled slot spends its allowance however it was filled')
+    expect(opts_of('config set -1 x') == [('config set', '-1')],
+           'the allowance belongs to slot 1, so a hyphen in slot 0 is reported')
+    expect(opts_of('console -1') == [('console', '-1')],
+           'a command with no such positional still reports a hyphen token')
+
+    # --- a positional does not end the option scan on a command that also has
+    # subcommands. `routes` has all three at once and the guide writes `autumn
+    # routes /admin --method POST`; stopping at `/admin` left `--methd` on that
+    # line reading exactly like the `--method` it misspells.
+    expect(surface['routes']['positionals'] and surface['routes']['children'],
+           'the synthetic `routes` must have both a positional and subcommands')
+    expect(opts_of('routes /admin --method POST') == [],
+           'a declared option after a positional resolves')
+    expect(opts_of('routes /admin --methd POST') == [('routes', '--methd')],
+           'an UNDECLARED option after a positional must still be reported')
+    expect(opts_of('routes /admin --user-only') == [],
+           'a boolean option after a positional resolves')
+    expect(resolve(tk('routes /admin --methd POST'), surface) is None,
+           'no COMMAND defect may be invented from a position past a positional')
+    # A subcommand written BEFORE any positional still resolves normally, and
+    # its own options are judged against it rather than against the parent.
+    expect(opts_of('routes audit --strict') == [],
+           'a subcommand reached before a positional keeps its own options')
+    expect(opts_of('routes audit --nope') == [('routes audit', '--nope')],
+           "…and reports against the SUBCOMMAND's path, not the parent's")
+    # …and a subcommand written AFTER the positional is followed too, once the
+    # declared slots are full. Judging every later option against the parent
+    # forever reported `autumn routes /admin audit --strict`, which is correct.
+    expect(opts_of('routes /admin audit --strict') == [],
+           'a subcommand after a filled positional slot takes its own options')
+    expect(opts_of('routes /admin audit --nope') == [('routes audit', '--nope')],
+           'a bad option there reports against the CHILD, not the parent')
+    expect(opts_of('routes /admin --methd POST') == [('routes', '--methd')],
+           'a bad option before any subcommand still reports against the parent')
+
+    # A compact short group is one option and its value: `-papi` is
+    # `--package api`. The outer walk always resolved these; the leaf loop did
+    # not, so once a leaf had begun taking positionals every bundled short read
+    # as an undeclared flag — a correct line reported.
+    expect(opts_of('replay capsule.json -papi') == [],
+           'a compact short after a leaf positional is not drift')
+    expect(opts_of('replay capsule.json -zz') == [('replay', '-zz')],
+           '…but an unresolvable one still is')
+
+    # Once the child is selected the ordinary walk takes over, so the child's
+    # own `requires_sub` and phantom-subcommand checks apply again. Staying in
+    # options-only mode past the handback let `autumn routes /admin posture`
+    # and `… posture bogus` both pass, though clap rejects each.
+    expect(resolve(tk('routes /admin posture bogus'), surface)
+           == 'autumn routes posture bogus',
+           'a phantom subcommand under a followed child must be reported')
+    expect(resolve(tk('routes /admin posture'), surface, runnable=True)
+           == 'autumn routes posture',
+           "a followed child's required subcommand is still required")
+    expect(resolve(tk('routes /admin posture digest'), surface) is None,
+           'a complete command through that path resolves')
+    expect(resolve(tk('routes /admin posture'), surface) is None,
+           '…and in PROSE a bare group is still just its name')
+
+    # --- clap's help/version PRINT AND EXIT 0, without checking that the
+    # command's required subcommand or positionals were supplied. Treating them
+    # as ordinary booleans made the walk consume one and then apply the
+    # end-of-input requirements: `autumn replay --help` was reported as needing
+    # <CAPSULE>, though the CLI's own tests assert that line succeeds.
+    for form in ('replay --help', 'replay -h', 'db --help', 'db -h'):
+        expect(resolve(tk(form), surface, runnable=True) is None,
+               f'`autumn {form}` prints help and exits 0; it is not incomplete')
+    # …and the requirement checks still fire on the same commands without one.
+    expect(resolve(tk('replay'), surface, runnable=True) == 'autumn replay',
+           'a required positional is still required without --help')
+    expect(resolve(tk('db'), surface, runnable=True) == 'autumn db',
+           'a required subcommand is still required without --help')
+    # Terminal only where the flag is DECLARED: `--version` is the root's alone,
+    # so on a subcommand it stays drift rather than becoming a free pass.
+    expect(opts_of('migrate --version') == [('migrate', '--version')],
+           '--version on a subcommand is drift, not a terminal action')
+    expect(resolve(tk('replay --version'), surface, runnable=True) is None,
+           "…and an undeclared option still stops the walk, not reporting the args")
+    # …in the options-only scan too. The terminal rule landed in two of the
+    # three option loops, so `autumn routes /admin --help posture` — where the
+    # positional routes resolution into that scan — carried on into `posture`
+    # and reported its required subcommand missing.
+    expect(resolve(tk('routes /admin --help posture'), surface, runnable=True) is None,
+           'help is terminal in the options-only scan as well')
+    expect(resolve(tk('routes /admin --help'), surface, runnable=True) is None,
+           '…and at the end of such a line')
+
+    # --- one definition of what an option IS, for all three walkers. Each grew
+    # its own copy, and every time one learned something the others did not,
+    # the gap was a review finding. `_classify_option` decides nothing and
+    # reports nothing; policy on an unknown stays with the caller.
+    routes = surface['routes']
+    expect(_classify_option('--help', routes) == ('terminal', 0),
+           'a declared help flag is terminal')
+    expect(_classify_option('--method', routes) == ('known', 2),
+           'a value-taking option eats the next token')
+    expect(_classify_option('--user-only', routes) == ('known', 1),
+           'a boolean option eats nothing')
+    expect(_classify_option('--method=GET', routes) == ('known', 1),
+           'an attached value is self-contained')
+    expect(_classify_option('-papi', surface['replay']) == ('cluster', 1),
+           'a compact short group is one token')
+    # A cluster carrying a terminal letter IS terminal: `-hpapi` is `-h` plus
+    # `-p api`, and clap prints help and exits 0 without checking <CAPSULE>.
+    # Collapsing it to an ordinary group reported that correct line incomplete.
+    expect(_classify_option('-hpapi', surface['replay']) == ('terminal', 0),
+           'a cluster containing -h is terminal, not an ordinary group')
+    # …and a letter AFTER the terminal one is never parsed by clap, so it cannot
+    # turn a successful help invocation into a defect. `autumn replay -hx`
+    # exits 0 (measured against the built binary).
+    expect(_classify_option('-hx', surface['replay']) == ('terminal', 0),
+           'an undeclared letter after -h does not reject the group')
+    expect(resolve(tk('replay -hx'), surface, runnable=True) is None,
+           '…and the line is complete, not missing <CAPSULE>')
+    expect(opts_of('replay -xh') == [('replay', '-xh')],
+           'but an undeclared letter BEFORE -h is reached, so it still reports')
+
+    # --- a value-taking option written with no value. `autumn build --package`
+    # is "a value is required for '--package <PACKAGE>'", exit 2 (measured).
+    # FENCE-ONLY, like `requires_sub`: in prose a command-and-flag without a
+    # value is how English names the flag, and the corpus does that ten times
+    # on correct pages.
+    expect(raw_opts('migrate --shard', runnable=True)
+           == [('migrate', '--shard', 'needsvalue')],
+           'a value-taking option with nothing after it is reported in a fence')
+    expect(raw_opts('migrate --shard') == [],
+           '…and NOT in prose, where it is how English names the flag')
+    expect(raw_opts('migrate --shard eu', runnable=True) == [],
+           'a value that is present resolves')
+    expect(raw_opts('migrate --with-maintenance', runnable=True) == [],
+           'a BOOLEAN option needs nothing after it')
+    expect(raw_opts('migrate --shard=eu', runnable=True) == [],
+           'an attached value counts as supplied')
+    # …and the SHORT spelling of the same defect. `_classify_option` calls a
+    # bare `-p` a cluster, so a check written for `known` alone missed it.
+    expect(raw_opts('migrate -p', runnable=True)
+           == [('migrate', '-p', 'needsvalue')],
+           'a bare value-taking short is reported too')
+    expect(raw_opts('migrate -p blog', runnable=True) == [],
+           '…and resolves when its value is there')
+    expect(raw_opts('migrate -pblog', runnable=True) == [],
+           '…or attached to the letter')
+    expect(raw_opts('migrate -p') == [],
+           'still prose-exempt, like the long spelling')
+    # …and shell plumbing is not a value. The shell strips a redirection before
+    # the binary starts, so the option is left with nothing.
+    for form in ('migrate --shard >/tmp/out', 'migrate --shard > /tmp/out',
+                 'migrate --shard 2>/dev/null', 'migrate -p >/tmp/out'):
+        hits = raw_opts(form, runnable=True)
+        expect([k for _p, _o, k in hits] == ['needsvalue'],
+               f'a redirection cannot serve as the value in {form!r}: {hits}')
+    expect(raw_opts('migrate --shard eu >/tmp/out', runnable=True) == [],
+           'a real value followed by a redirection resolves')
+    # …nor is another option, or the `--` terminator: clap reads those as the
+    # next argument, not as the value. All three measured as "a value is
+    # required for '--shard <NAME>'".
+    for form in ('migrate --shard --with-maintenance', 'migrate --shard -p',
+                 'migrate --shard --', 'migrate --shard --notanoption'):
+        hits = raw_opts(form, runnable=True)
+        expect([k for _p, _o, k in hits] == ['needsvalue'],
+               f'an option token cannot be the value in {form!r}: {hits}')
+    expect(raw_opts('migrate --with-maintenance --shard eu', runnable=True) == [],
+           'a boolean before a value-taking option is not its value')
+    expect(raw_opts('migrate --shard eu --with-maintenance', runnable=True) == [],
+           'a value followed by another option resolves')
+    expect(resolve(tk('replay -hpapi'), surface, runnable=True) is None,
+           '…so <CAPSULE> is not reported missing')
+    expect(resolve(tk('replay -papi'), surface, runnable=True) == 'autumn replay',
+           'the same cluster WITHOUT -h still needs its positional')
+    expect(opts_of('replay -zz') == [('replay', '-zz')],
+           'an undeclared cluster is still reported')
+    expect(_classify_option('--nope', routes) == ('unknown', 0),
+           'an undeclared detached option has unknown arity')
+    expect(_classify_option('--nope=x', routes) == ('unknown', 1),
+           '…but an attached one does not')
+    expect(_classify_option('--version', routes) == ('unknown', 0),
+           'terminal only where DECLARED: --version is the root\'s alone')
+
+    # A bracketed list inside `#[arg]`, and a multi-line one. The regex that
+    # used to read these stopped at the list's first `]`, so the field vanished
+    # and its flag became a false positive.
+    expect(surface['sbom']['options'].get('--binary') is True,
+           'a multi-line #[arg] with a bracketed list must still be parsed')
+    expect(surface['sbom']['options'].get('--locked') is False,
+           'a single-line #[arg] with a bracketed list must still be parsed')
+    expect(opts_of('sbom --binary /tmp/app') == [],
+           'an option only visible through balanced parsing must not read as drift')
+
+    # `#[command(flatten)]`
+    expect(surface['graph']['options'].get('--json') is False,
+           'a flattened args struct contributes its options')
+
+    # A last field may legally omit its trailing comma. Requiring one made that
+    # field invisible to the option map while `_positionals` still saw it — an
+    # option missing from the map is reported as drift against a flag that is
+    # really there.
+    nocomma = build_surface(['''
+        enum Commands {
+            Only {
+                #[arg(long)]
+                last_one: bool
+            },
+        }
+    '''])
+    expect('--last-one' in nocomma['only']['options'],
+           f"a field with no trailing comma is still an option: "
+           f"{sorted(nocomma['only']['options'])}")
+    expect(opts_of('graph --json') == [], 'a flattened option is not drift')
+
+    # `trailing_var_arg` — the CLI's own flags before the positional are still
+    # judged; everything after it belongs to the task.
+    expect(surface['task']['trailing'], 'trailing_var_arg not detected')
+    expect(opts_of('task cleanup --confirm') == [],
+           'a flag after the positional of a trailing_var_arg command is forwarded')
+    expect(opts_of('task --nope') == [('task', '--nope')],
+           "a trailing_var_arg command's OWN flag position is still judged")
+    expect(opts_of('task name -- --arg value') == [],
+           'nothing after `--` is a flag of this command to judge')
+    # …and when the trailing field is the FIRST positional there is no CLI-flag
+    # position in front of it, so the first unknown hyphen token starts the
+    # capture. `autumn test --nocapture` forwards `--nocapture` to cargo.
+    expect(surface['test']['trailing'] and surface['test']['hyphen_slots'] == [],
+           'the trailing field is the only positional, so the boundary is zero')
+    expect(opts_of('test --nocapture') == [],
+           'an unknown hyphen token starts a first-positional trailing capture')
+    expect(opts_of('test --reset') == [],
+           "…while the command's OWN option keeps precedence")
+    expect(opts_of('test --nocapture some_test') == [],
+           'and everything after it is forwarded too')
+    expect(resolve(tk('test --nocapture'), surface, runnable=True) is None,
+           'such a line is complete, not missing an argument')
+
+    # --- a valueless flag given a value. clap's `bool` fields are
+    # `ArgAction::SetTrue` with `num_args(0)`, so `--reset=true` is "unexpected
+    # value 'true' for '--reset'". The arity was already in the option map; the
+    # attached branch simply never asked, and accepted every such line.
+    expect(_classify_option('--reset=true', surface['test']) == ('novalue', 1),
+           'an attached value on a valueless flag is its own kind')
+    expect(_classify_option('--method=GET', surface['routes']) == ('known', 1),
+           '…while a value-taking option accepts the attached form')
+    expect(raw_opts('test --reset=true') == [('test', '--reset', 'novalue')],
+           'it is reported, and as novalue rather than unknown')
+    expect(raw_opts('routes --methd=GET') == [('routes', '--methd', 'unknown')],
+           'an undeclared attached option stays unknown')
+    # The distinction is the whole point of carrying the kind: `--reset` IS
+    # declared, and reporting "has no --reset" would send an author to fix the
+    # wrong thing.
+    expect(raw_opts('routes --user-only=yes --method=GET')
+           == [('routes', '--user-only', 'novalue')],
+           'one defect per line: nothing further is reported after it')
+    expect(resolve(tk('replay --help=foo'), surface, runnable=True) is None,
+           'clap fails at the bad token, so <CAPSULE> is not ALSO reported missing')
+
+    # Not every dashed token is a flag: the corpus writes prose arrows and
+    # slash-joined shorthand in command position, and neither is copyable.
+    for prose in ('-> 0.6.0', '--name/--scope', '--<PLACEHOLDER>'):
+        expect(opts_of('migrate ' + prose) == [],
+               f'{prose!r} is prose, not a flag spelling')
 
     # --- a redirection is shell plumbing, not part of the command. `<` and `>`
     # are deliberately not split on (the docs write `--shard <new>`), so a
@@ -3195,6 +4311,48 @@ def self_test():
            'an unknown short group still stops the walk rather than guessing')
     expect(resolve(tk('migrate -vZ nope'), surface) is None,
            'one unknown letter makes the whole group unknown')
+
+    # --- an `=` INSIDE a short group is part of the value, not a separator.
+    # Eighteenth round: the name was split off before the group was ever read,
+    # so `-pa=b` became the name `-pa` and, being "attached", never reached
+    # `_short_cluster` at all. Measured against the built CLI:
+    #   autumn sbom -oartifact=prod.json      accepted (exit 1, no manifest)
+    #   autumn data export -ofoo=bar.json     accepted (exit 2 wants --url)
+    #   autumn replay -h=foo                  exit 0, prints help
+    # while the long spelling really does separate on `=`.
+    expect(_classify_option('-pa=b', surface['migrate']) == ('cluster', 1),
+           'an `=` inside a short group belongs to the value')
+    expect(_classify_option('-p=b', surface['migrate']) == ('cluster', 1),
+           '…including immediately after the letter')
+    expect(_classify_option('--shard=a=b', surface['migrate']) == ('known', 1),
+           'the long form still separates on the FIRST `=`, value and all')
+    expect(resolve(tk('migrate -pa=b nope'), surface) == 'autumn migrate nope',
+           'so the drift behind such a token is still reached')
+    expect(resolve(tk('migrate -Za=b nope'), surface) is None,
+           'an unknown short group carrying `=` is still unknown, not a name')
+    expect(_classify_option('-h=foo', surface['migrate']) == ('terminal', 0),
+           'a short group short-circuits on help even with an `=` after it')
+
+    # --- `--=value` is not the end-of-options marker. Nineteenth round: the
+    # name normalizes to `--`, which `_reportable_flag` exempted as the bare
+    # marker, so the token went unreported though clap rejects it:
+    #   autumn build --=debug   exit 2, `unexpected argument '--' found`
+    #   autumn build --         exit 1, accepted
+    # The exemption is the TOKEN's, so it is asked of the token. Checked on all
+    # FOUR paths that report an option, since a rule reaching some of them and
+    # not the others has been this PR's most repeated defect.
+    expect(opts_of('migrate --=debug') == [('migrate', '--')],
+           'an `--=value` token is reported by the outer walk')
+    expect(opts_of('--=debug') == [('', '--')],
+           '…by the root branch')
+    expect(opts_of('migrate status --=debug') == [('migrate status', '--')],
+           '…by the leaf loop')
+    expect(opts_of('routes /admin --=debug') == [('routes', '--')],
+           '…and by the options-only scan past a positional')
+    expect(opts_of('migrate -- nope') == [],
+           'while a bare `--` stays exempt on every one of them')
+    expect(opts_of('routes /admin -- nope') == [],
+           '…including past a positional')
 
     # --- quoting. These are what shell-aware tokenization buys: splitting on
     # whitespace consumed `"eu` as the option value and then stopped at `west"`,
@@ -4134,11 +5292,93 @@ def self_test():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir) / 'waiver-selftest.md'
         tmp.write_text(waived_page)
-        found_defects, n_waived = scan(tmp.parent, surface, [tmp.name])
+        found_defects, _flag, n_waived = scan(tmp.parent, surface, [tmp.name])
     reported = sorted(lineno for _, lineno, _, _ in found_defects)
     expect(n_waived == 1, f'the sentence above the marker must be waived, got {n_waived}')
     expect(reported == [6, 9],
            f'a fenced block and a distant paragraph must both still report, got {reported}')
+
+    # A FLAG waiver, end to end. Written first because both halves of it were
+    # wrong when the flag gate was built: the lookup key carried an `autumn `
+    # prefix that the waiver map does not store, so no flag waiver could ever
+    # match; and the command pattern read `autumn build --release — why` as the
+    # command `build`, waiving every use of a whole command instead of one flag
+    # of it. Neither shows up in a corpus that has no flag waivers yet, which is
+    # exactly why it is asserted here.
+    flag_page = '\n'.join([
+        'There is no `autumn migrate --nope`.',
+        '',
+        '<!-- cli-surface-allow: autumn migrate --nope — named only to say so -->',
+        '',
+        '```bash',
+        'autumn migrate --nope',
+        '```',
+        '',
+        'A later paragraph passing `autumn migrate --alsonope` by mistake.',
+    ])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir) / 'flag-waiver-selftest.md'
+        tmp.write_text(flag_page)
+        f_cmd, f_flags, f_waived = scan(tmp.parent, surface, [tmp.name])
+    expect(f_waived == 1, f'the waived flag must be waived, got {f_waived}')
+    expect(sorted(l for _f, l, _c, _o, _d, _k in f_flags) == [6, 9],
+           f'a fence and a distant paragraph must both still report: {f_flags}')
+    expect(f_cmd == [],
+           f'a flag waiver must not register as a COMMAND waiver: {f_cmd}')
+    # …and the reverse, which is the one that actually broke the corpus: a
+    # HYPHENATED command name is not a command plus a short option. Reading
+    # `autumn system-test` as `system` + `-test` turned that page's real command
+    # waiver into a flag waiver for a flag nothing reports, and the command it
+    # was holding back came straight back as a defect.
+    expect(not FLAG_WAIVER.search(
+        '<!-- cli-surface-allow: autumn system-test — planned, not shipped -->'),
+        'a hyphenated command name must not read as a command plus a short option')
+    expect(WAIVER.search(
+        '<!-- cli-surface-allow: autumn system-test — planned, not shipped -->'),
+        'a hyphenated command name is still an ordinary command waiver')
+    expect(FLAG_WAIVER.search(
+        '<!-- cli-surface-allow: autumn console -p — why -->').group(2) == '-p',
+        'a one-letter short option is a flag waiver')
+    # The waiver grammar must cover EVERY spelling the detector reports, or a
+    # page can be told about a defect it has no way to waive. These are the two
+    # the widened detector added.
+    # `--` joined them when `--=value` became a defect: it is REPORTED as `--`
+    # (that is what clap calls the unexpected argument), so `--` is what an
+    # author has to be able to write here. It was rejected as the bare
+    # end-of-options marker, leaving that defect unwaivable — finding 7's shape
+    # a second time, which is why the invariant is asserted as a loop rather
+    # than case by case.
+    for spelling in ('--show_config', '-zz', '--'):
+        m = FLAG_WAIVER.search(
+            f'<!-- cli-surface-allow: autumn dev {spelling} — why -->')
+        expect(m and m.group(2) == spelling and m.group(1) == 'dev',
+               f'{spelling} is reportable, so it must be waivable: {m and m.groups()}')
+        expect(_reportable_name(spelling),
+               f'{spelling} must be reportable for that waiver to be needed')
+    # The two predicates answer different questions and must keep disagreeing
+    # exactly here: `--` can be REPORTED (from `--=debug`) but a bare `--`
+    # TOKEN on a command line is the end-of-options marker, not a defect.
+    expect(_reportable_name('--') and not _reportable_flag('--'),
+           '`--` is waivable as a name while exempt as a token')
+    expect(not _reportable_name('-') and not _reportable_flag('-'),
+           'a bare `-` is neither, so its marker stays a command waiver')
+    # A root option is waived with no command before it.
+    m = FLAG_WAIVER.search('<!-- cli-surface-allow: autumn --helpp — why -->')
+    expect(m and m.group(1) is None and m.group(2) == '--helpp',
+           f'a root option waiver names no command: {m and m.groups()}')
+    # …and the command waiver it would have been misread as is not created, so
+    # real command drift on the waived command still reports.
+    cmd_still = '\n'.join([
+        '`autumn migrate phantom`',
+        '',
+        '<!-- cli-surface-allow: autumn migrate --nope — named only to say so -->',
+    ])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = pathlib.Path(tmpdir) / 'flag-waiver-scope.md'
+        tmp.write_text(cmd_still)
+        c_defects, _cf, _cw = scan(tmp.parent, surface, [tmp.name])
+    expect([b for _f, _l, b, _d in c_defects] == ['autumn migrate phantom'],
+           f'a flag waiver must not silence command drift: {c_defects}')
 
     # A backticked span INSIDE a fence is not a command line, but it is fenced.
     # The two facts were one boolean, so it was waivable — a marker could
@@ -4154,7 +5394,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = pathlib.Path(tmpdir) / 'subst-selftest.md'
         tmp.write_text(subst_page)
-        subst_defects, subst_waived = scan(tmp.parent, surface, [tmp.name])
+        subst_defects, _flag2, subst_waived = scan(tmp.parent, surface, [tmp.name])
     expect(subst_waived == 0 and len(subst_defects) == 1,
            f'a waiver must not reach a backtick substitution in a fence: '
            f'{subst_defects}, {subst_waived} waived')
@@ -5191,25 +6431,62 @@ def self_test():
 
 def main():
     surface = build_surface(cli_sources(ROOT))
-    if not surface:
+    if not any(p for p in surface):             # the root key alone is not a surface
         print('ERROR: parsed an empty command surface from autumn-cli/src — '
               'the clap derive input moved or changed shape, and this gate '
               'cannot tell drift from a parser failure. Fix the parser.',
               file=sys.stderr)
         return 1
 
-    if MODE == '--list':
-        for path in sorted(surface):
-            print(path)
-        print(f'\n{len([p for p in surface if " " not in p])} top-level commands, '
-              f'{len(surface)} command paths')
+    if MODE in ('--list', '--list-options'):
+        show_opts = MODE == '--list-options'
+        for path in sorted(p for p in surface if p):
+            if show_opts:
+                # Everything but clap's own, which are on every command and
+                # would treble the output without telling anyone anything.
+                own = sorted(o for o in surface[path]['options']
+                             if o not in BUILTIN_OPTIONS)
+                print(f'{path}    {" ".join(own)}' if own else path)
+            else:
+                print(path)
+        real = {p: v for p, v in surface.items() if p}
+        print(f'\n{len([p for p in real if " " not in p])} top-level commands, '
+              f'{len(real)} command paths, '
+              f'{sum(len(v["options"]) for v in real.values())} option spellings')
         return 0
 
     files = corpus(ROOT)
-    defects, waived = scan(ROOT, surface, files)
+    defects, flag_defects, waived = scan(ROOT, surface, files)
+    real = {p: v for p, v in surface.items() if p}
+    options = sum(len(v['options']) for v in real.values())
     print(f'corpus: {len(files)} reader-facing markdown files')
-    print(f'surface: {len(surface)} command paths parsed from autumn-cli/src')
-    print(f'defects: {len(defects)}' + (f' ({waived} waived)' if waived else ''))
+    print(f'surface: {len(real)} command paths, {options} option spellings '
+          f'parsed from autumn-cli/src')
+    print(f'defects: {len(defects)} command, {len(flag_defects)} flag'
+          + (f' ({waived} waived)' if waived else ''))
+    if flag_defects:
+        print()
+        for f, lineno, cmd_path, opt, argv, kind in flag_defects:
+            line = ('autumn ' + argv).strip()
+            # `cmd_path` is '' for an option passed to the root itself. The
+            # note has to match the defect: `--reset` IS declared, and telling
+            # an author it does not exist would send them to fix the wrong
+            # thing.
+            note = {'novalue': 'takes no value',
+                    'needsvalue': 'requires a value'}.get(
+                        kind, 'is not an option of this command')
+            print(f'{f}:{lineno}: `{("autumn " + cmd_path).strip()}`: '
+                  f'`{opt}` {note}  (line: {line})')
+        print()
+        print('Each line above tells a reader to pass an option the command '
+              'does not declare; clap answers with "unexpected argument" and '
+              'exits 2. Fix the page, or — if a SENTENCE is deliberately naming '
+              'an option that does not exist — waive it, quoting the command '
+              'and the option EXACTLY as reported above (a fenced block is '
+              'handed over to be run, so nothing waives one):')
+        print('    <!-- cli-surface-allow: autumn <command> <--option> — why -->')
+        print('Run `scripts/check-docs-cli.sh --list-options` to see the real '
+              'options of a command.')
     if defects:
         print()
         for f, lineno, bad, argv in defects:
@@ -5232,6 +6509,7 @@ def main():
               'part that failed to resolve, which may be shorter than the line):')
         print('    <!-- cli-surface-allow: autumn <command> — why -->')
         print('Run `scripts/check-docs-cli.sh --list` to see the real surface.')
+    if defects or flag_defects:
         return 1
     print('CLI drift gate OK.')
     return 0
@@ -5243,9 +6521,10 @@ PYEOF
 
 mode="${1:-}"
 case "$mode" in
-  --self-test) run_py --self-test "$root" ;;
-  --list)      run_py --list "$root" ;;
-  "")          echo "Checking CLI invocations across the reader-facing docs..."
-               run_py --check "$root" ;;
-  *)           echo "usage: $0 [--list|--self-test]" >&2; exit 2 ;;
+  --self-test)    run_py --self-test "$root" ;;
+  --list)         run_py --list "$root" ;;
+  --list-options) run_py --list-options "$root" ;;
+  "")             echo "Checking CLI invocations across the reader-facing docs..."
+                  run_py --check "$root" ;;
+  *)              echo "usage: $0 [--list|--list-options|--self-test]" >&2; exit 2 ;;
 esac

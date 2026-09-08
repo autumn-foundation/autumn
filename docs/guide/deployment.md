@@ -3093,7 +3093,7 @@ default `cargo test` run; pass `-- --ignored` to include them.
 
 ### Extending the CI workflow
 
-**Tailwind CSS**: install the Tailwind CLI (`autumn setup --tailwind`) and add a
+**Tailwind CSS**: install the Tailwind CLI (`autumn setup`) and add a
 step before `cargo build` to run it. The generated `build.rs` will auto-detect
 it on `PATH` or at `target/autumn/tailwindcss`.
 

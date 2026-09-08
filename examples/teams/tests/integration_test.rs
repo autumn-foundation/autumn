@@ -96,10 +96,48 @@ async fn protected_route_redirects_to_login_when_unauthenticated() {
 /// mailbox").
 async fn db_client(mail_dir: &std::path::Path) -> TestClient {
     let db = TestDb::shared().await;
-    db.execute_sql(include_str!(
-        "../migrations/00000000000000_create_teams/up.sql"
-    ))
-    .await;
+    // The migration's `CREATE TABLE` statements (no `IF NOT EXISTS` — this is
+    // the same SQL `diesel migration run` applies in production, so it isn't
+    // weakened here) must run exactly once against the process-global shared
+    // container, or the second ignored test in this binary panics with
+    // "relation already exists" (Codex review finding, surfaced once CI
+    // started actually running every ignored test in this file — see
+    // ci.yml's `-p teams -- --ignored` sweep). `TRUNCATE` below still runs
+    // before every test, matching `examples/saas`'s per-test reset.
+    static SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    SCHEMA_READY
+        .get_or_init(|| async {
+            // `TestDb::execute_sql` runs each call through Diesel's prepared-
+            // statement path, which Postgres refuses for a string containing
+            // more than one command ("cannot insert multiple commands into a
+            // prepared statement") — discovered when CI ran this for the
+            // first time (against a real Postgres testcontainer) rather than
+            // never at all. The migration file is one `;`-separated command
+            // per statement, so splitting on `;` and executing each piece on
+            // its own reproduces exactly what `diesel migration run`
+            // applies, one statement at a time — but two of its explanatory
+            // comments contain a mid-sentence `;` of their own ("a typed FK;
+            // application code…", "`pending`; accepting sets it…", both
+            // full-line `--` comments — Codex review finding: naively
+            // splitting the raw file breaks those apart into invalid
+            // fragments), so every full-line `--` comment is dropped first.
+            // The file has no block (`/* */`) comments and no semicolon
+            // inside any string literal, so this leaves pure SQL to split.
+            const MIGRATION_SQL: &str =
+                include_str!("../migrations/00000000000000_create_teams/up.sql");
+            let sql_without_comments = MIGRATION_SQL
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for statement in sql_without_comments.split(';') {
+                let statement = statement.trim();
+                if !statement.is_empty() {
+                    db.execute_sql(statement).await;
+                }
+            }
+        })
+        .await;
     db.execute_sql("TRUNCATE invitations, memberships, organizations, users RESTART IDENTITY")
         .await;
 
@@ -183,6 +221,90 @@ async fn signup_creates_organization_with_owner_membership() {
         .assert_ok()
         .assert_body_contains("owner@acme.test")
         .assert_body_contains("owner");
+}
+
+/// Every recoverable signup/login failure mode redisplays the form inline
+/// (HTTP 200, same page, error adjacent to the fields) with the entered email
+/// preserved, instead of navigating the user to a generic error page and
+/// losing what they typed (Wayfinder: error-path inventory).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = db_client(dir.path()).await;
+
+    // Malformed email at signup.
+    let resp = client
+        .post("/signup")
+        .form("email=not-an-email&password=Tr0ubad0ur-Xy7-correct-horse")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Enter a valid email address"));
+    assert!(
+        resp.text().contains(r#"value="not-an-email""#),
+        "expected the entered email to be preserved in the re-rendered form, got: {}",
+        resp.text()
+    );
+
+    // Over-long password at signup.
+    let long_password = "x".repeat(129);
+    let resp = client
+        .post("/signup")
+        .form(&format!("email=long@acme.test&password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("at most 128 characters"));
+    assert!(resp.text().contains(r#"value="long@acme.test""#));
+
+    // Weak password at signup (Codex review finding: teams had no
+    // weak-password redisplay coverage at all, unlike saas's pre-existing
+    // `signup_rejects_weak_password`; asserted here alongside email
+    // preservation, which no prior test checked for either app's
+    // weak-password branch).
+    let resp = client
+        .post("/signup")
+        .form("email=weak@acme.test&password=password")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("too common"));
+    assert!(resp.text().contains(r#"value="weak@acme.test""#));
+
+    // Duplicate email at signup: the first signup succeeds, the second is
+    // redisplayed inline rather than dropped onto a generic error page.
+    let _ = signup(&client, "dupe@acme.test").await;
+    let resp = client
+        .post("/signup")
+        .form("email=dupe@acme.test&password=Tr0ubad0ur-Xy7-correct-horse-2")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Could not create account"));
+    assert!(resp.text().contains(r#"value="dupe@acme.test""#));
+
+    // Invalid credentials at login preserve the entered (nonexistent) email.
+    let resp = client
+        .post("/login")
+        .form("email=nobody@acme.test&password=wrong-password-entirely")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Invalid email or password"));
+    assert!(resp.text().contains(r#"value="nobody@acme.test""#));
+
+    // Over-long input at login (Codex review finding: the "invalid
+    // credentials" case above exercises the same `login_page` call but not
+    // this distinct length-guard branch).
+    let resp = client
+        .post("/login")
+        .form(&format!("email=toolong@acme.test&password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Invalid email or password"));
+    assert!(resp.text().contains(r#"value="toolong@acme.test""#));
 }
 
 /// AC4 + AC5(a) + success metric: inviting sends a real email (captured as an

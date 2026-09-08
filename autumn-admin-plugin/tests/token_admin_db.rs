@@ -201,6 +201,46 @@ async fn token_admin_list_paginates_and_searches() {
 
 #[tokio::test]
 #[ignore = "requires Docker"]
+async fn token_admin_list_per_page_zero_returns_every_record() {
+    let (pool, _container) = setup_pool().await;
+    let model = TokenAdminModel;
+
+    for i in 0..30u32 {
+        model
+            .create(
+                &pool,
+                serde_json::json!({
+                    "principal_id": format!("service:{i}"),
+                    "name": format!("token-{i}"),
+                    "scopes": "[]",
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    // `per_page: 0` means "no limit" — pins the fix from #1075 (per_page=0
+    // was silently capped to 25 in the built-in admin models).
+    let result = model
+        .list(
+            &pool,
+            ListParams {
+                page: 1,
+                per_page: 0,
+                search: None,
+                sort_by: None,
+                sort_dir: SortDirection::default(),
+                filters: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.total, 30);
+    assert_eq!(result.records.len(), 30);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
 async fn token_admin_update_changes_name_and_scopes() {
     let (pool, _container) = setup_pool().await;
     let model = TokenAdminModel;
