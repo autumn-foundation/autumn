@@ -907,4 +907,28 @@ mod tests {
             "30s should expand to 30 seconds:\n{generated_s}"
         );
     }
+
+    /// Echo clone-class regression, `throttle`'s side of the pair covered by
+    /// `step_up::tests::step_up_handles_nested_impl_trait_return_type` — see
+    /// `secured::tests::secured_handles_nested_impl_trait_return_type` for
+    /// why the recursive `type_contains_impl_trait` guard matters. Already
+    /// green here (throttle_macro has the fix); kept alongside the other
+    /// three copies so the four macros stay provably in lockstep on this
+    /// rule.
+    #[test]
+    fn throttle_handles_nested_impl_trait_return_type() {
+        let generated = throttle_macro(
+            quote! { limit = 5, per = "1m" },
+            quote! {
+                async fn handler() -> Result<impl IntoResponse, String> {
+                    Ok("ok")
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__autumn_inner :"),
+            "should not emit an explicit local annotation for nested impl Trait: {generated}"
+        );
+    }
 }

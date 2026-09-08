@@ -554,4 +554,28 @@ mod tests {
              find it before any generated control flow: {generated}"
         );
     }
+
+    /// Echo clone-class regression (missed-fix half): see
+    /// `secured::tests::secured_handles_nested_impl_trait_return_type` for
+    /// the full rationale. `authorize_macro` ships the same shallow
+    /// `matches!(ty.as_ref(), syn::Type::ImplTrait(_))` guard secured_macro
+    /// did before its fix, so it emits the same uncompilable
+    /// `let __autumn_inner: Result<impl IntoResponse, _> = …` for a handler
+    /// shaped like this.
+    #[test]
+    fn authorize_handles_nested_impl_trait_return_type() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn update_post(post: Post) -> Result<impl IntoResponse, String> {
+                    Ok("ok")
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__autumn_inner :"),
+            "should not emit an explicit local annotation for nested impl Trait: {generated}"
+        );
+    }
 }

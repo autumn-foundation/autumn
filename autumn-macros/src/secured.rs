@@ -634,4 +634,32 @@ mod tests {
             "must defer replay-ownership while #[authorize] is still pending:\n{generated}"
         );
     }
+
+    /// Echo clone-class regression (missed-fix half): `step_up_macro` and
+    /// `throttle_macro` both guard their `original_response` match with a
+    /// recursive `type_contains_impl_trait` check (see their own
+    /// `*_handles_nested_impl_trait_return_type` tests) specifically because
+    /// Rust rejects `impl Trait` in local variable type annotations (E0562)
+    /// even when it's nested, e.g. `Result<impl IntoResponse, _>`.
+    /// `secured_macro` never received that fix — it still guards with a
+    /// shallow `matches!(ty.as_ref(), syn::Type::ImplTrait(_))` that only
+    /// catches a *top-level* `impl Trait` return type, so it emits
+    /// `let __autumn_inner: Result<impl IntoResponse, _> = …`, which fails to
+    /// compile for any real handler shaped like this.
+    #[test]
+    fn secured_handles_nested_impl_trait_return_type() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! {
+                async fn handler() -> Result<impl IntoResponse, String> {
+                    Ok("ok")
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__autumn_inner :"),
+            "should not emit an explicit local annotation for nested impl Trait: {generated}"
+        );
+    }
 }
