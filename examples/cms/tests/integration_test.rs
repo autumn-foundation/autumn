@@ -3403,3 +3403,111 @@ async fn saving_a_post_keeps_assignments_the_editor_does_not_render() {
         "the custom-taxonomy filing was deleted by an ordinary save: {still_filed:?}"
     );
 }
+
+/// A post is served at its own dated permalink and no other date.
+///
+/// Restricting the fallback by shape was not enough: `/2025/01/hello` has a
+/// valid shape and is not the post's permalink, so a single post was still
+/// reachable at thousands of dates. `/YYYY/<slug>` is not a shape any structure
+/// mints at all.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_dated_permalink_matches_only_the_posts_own_date() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Hello", "Body.", "publish").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("permalink_structure", "day_and_name")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let now = chrono::Utc::now();
+    let day = now.format("%Y/%m/%d").to_string();
+    let month = now.format("%Y/%m").to_string();
+    let year = now.format("%Y").to_string();
+
+    // Its own date, in both dated shapes — these are the aliases that exist so
+    // that changing the permalink structure does not 404 shared links.
+    client
+        .get(&format!("/{day}/hello"))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+    client
+        .get(&format!("/{month}/hello"))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+
+    // A bare year is not a shape any structure mints.
+    assert_eq!(
+        client.get(&format!("/{year}/hello")).send().await.status,
+        404
+    );
+
+    // Well-shaped dates that are not this post's.
+    for alias in ["/2015/01/hello", "/2015/01/02/hello"] {
+        assert_eq!(
+            client.get(alias).send().await.status,
+            404,
+            "`{alias}` is not this post's permalink"
+        );
+    }
+
+    // Unpadded is not what the generator writes, so it is not an alias either.
+    let unpadded = format!("/{}/{}/hello", now.format("%Y"), now.format("%-m"));
+    if unpadded != format!("/{month}/hello") {
+        assert_eq!(client.get(&unpadded).send().await.status, 404);
+    }
+}
+
+/// Search results past the first page are reachable from the UI.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn search_results_render_pagination() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("posts_per_page", "2")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    for n in 1..=5 {
+        create_post(
+            &client,
+            &cookie,
+            &format!("Widget Report {n}"),
+            "All about widgets.",
+            "publish",
+        )
+        .await;
+    }
+
+    sign_out(&client);
+    let first = client.get("/search?s=widgets").send().await;
+    let html = first.assert_ok().text();
+    assert!(
+        html.contains("Older →"),
+        "the first page of results must link to the next:\n{html}"
+    );
+    assert!(
+        html.contains("s=widgets&amp;page=2"),
+        "and that link must carry the search term:\n{html}"
+    );
+
+    let second = client.get("/search?s=widgets&page=2").send().await;
+    let html = second.assert_ok().text();
+    assert!(html.contains("← Newer"), "the second page must link back");
+    assert!(html.contains("Page 2 of 3"), "and say where it is:\n{html}");
+}

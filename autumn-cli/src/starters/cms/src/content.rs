@@ -382,6 +382,24 @@ pub async fn recount_terms_for_post_public(
 
 /// Rebuild one term's published-post count from ground truth.
 pub async fn recount_term(conn: &mut AsyncPgConnection, term_id: i64) -> AutumnResult<i64> {
+    // The term row is locked *before* the count is taken, so concurrent
+    // recounts of the same term serialize around the snapshot rather than
+    // around the write.
+    //
+    // Without it, two posts filed under one term publishing at once each count
+    // a set that excludes the other's uncommitted transition, and both then
+    // write the same too-low number — the second update overwriting the first
+    // with a value that was already stale when it was computed. The term stays
+    // under-counted in the admin, the widgets and the sitemap until some
+    // unrelated mutation happens to recount it.
+    let _locked: Option<i64> = terms::table
+        .find(term_id)
+        .select(terms::id)
+        .for_update()
+        .first(conn)
+        .await
+        .optional()?;
+
     // The same registered-type predicate the archive queries use. Counting rows
     // of a `public: false` type made the number disagree with the archive it
     // labels: the category widget advertised a count the visibility-aware term
@@ -531,17 +549,10 @@ pub async fn moderate_comment(
 
         // Recomputed from ground truth rather than moved by a delta: the
         // cascade above changes an unknown number of rows, so no delta derived
-        // from the one named in the request would be right.
-        let approved: i64 = comments::table
-            .filter(comments::post_id.eq(comment.post_id))
-            .filter(comments::status.eq("approved"))
-            .count()
-            .get_result(conn)
-            .await?;
-        diesel::update(posts::table.find(comment.post_id))
-            .set(posts::comment_count.eq(approved))
-            .execute(conn)
-            .await?;
+        // from the one named in the request would be right. The helper takes
+        // the post's row lock before counting, so two moderators working the
+        // same post serialize around the snapshot.
+        recount_post_comments(conn, comment.post_id).await?;
         Ok::<_, AutumnError>(saved)
     })
     .await
@@ -589,11 +600,14 @@ pub async fn create_comment(
             .returning(Comment::as_returning())
             .get_result(conn)
             .await?;
+        // Recomputed under the post's lock rather than incremented. A bare
+        // `+ 1` is safe against another increment, but not against a
+        // concurrent moderation recomputing the whole count from a snapshot
+        // taken before this insert — that write would simply lose the new
+        // comment. One definition of the counter, taken under one lock, is
+        // what makes every combination of these paths agree.
         if approved {
-            diesel::update(posts::table.find(post_id))
-                .set(posts::comment_count.eq(posts::comment_count + 1))
-                .execute(conn)
-                .await?;
+            recount_post_comments(conn, post_id).await?;
         }
         Ok::<_, AutumnError>(saved)
     })
@@ -606,17 +620,7 @@ pub async fn create_comment(
 /// introduce — the same role `recompute_counter_caches` plays for the
 /// framework's own counters.
 pub async fn recount_comments(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<i64> {
-    let count: i64 = comments::table
-        .filter(comments::post_id.eq(post_id))
-        .filter(comments::status.eq("approved"))
-        .count()
-        .get_result(conn)
-        .await?;
-    diesel::update(posts::table.find(post_id))
-        .set(posts::comment_count.eq(count))
-        .execute(conn)
-        .await?;
-    Ok(count)
+    recount_post_comments(conn, post_id).await
 }
 
 /// A comment plus the author name to render above it.
@@ -1336,6 +1340,19 @@ pub fn guard_deferred_transition(target_status: &str, title: &str) -> AutumnResu
 /// shadowed by a segment something else claims.
 const BARE_PATH_TYPES: &[&str] = &["post", "page"];
 
+/// One registration, identified by which registry it lives in as well as by its
+/// slug.
+///
+/// The two registries have separate namespaces — a post type and a taxonomy may
+/// both be called `product` as far as either registry is concerned — but they
+/// share the *URL* namespace, which is what `segment_claim` arbitrates. So an
+/// exclusion has to name both, or one registry's entry excuses the other's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration<'a> {
+    PostType(&'a str),
+    Taxonomy(&'a str),
+}
+
 /// What already owns a first URL segment, if anything does.
 ///
 /// The one answer to "is this segment free?", because the question kept being
@@ -1349,10 +1366,13 @@ const BARE_PATH_TYPES: &[&str] = &["post", "page"];
 /// The order mirrors `permalinks::resolve`: whatever it tries first is what a
 /// URL actually means.
 ///
-/// `exclude` is the registration being added or replaced, whose own segments
-/// must not count against it.
+/// `exclude` names the registration being added or replaced, whose own segments
+/// must not count against it — as a *kind and slug*, not a bare slug. A bare
+/// slug was matched in both registries, so registering a taxonomy `product`
+/// silently excused an existing `product` post type from the check and accepted
+/// the collision it was meant to catch.
 #[must_use]
-pub fn segment_claim(segment: &str, exclude: Option<&str>) -> Option<String> {
+pub fn segment_claim(segment: &str, exclude: Option<Registration<'_>>) -> Option<String> {
     if is_reserved_path(segment) {
         return Some(format!("the application's own `/{segment}` route"));
     }
@@ -1360,7 +1380,9 @@ pub fn segment_claim(segment: &str, exclude: Option<&str>) -> Option<String> {
         return Some("a year archive".to_owned());
     }
     for taxonomy in crate::content_types::all_taxonomies() {
-        if taxonomy.rewrite_base == segment && exclude != Some(taxonomy.slug) {
+        if taxonomy.rewrite_base == segment
+            && exclude != Some(Registration::Taxonomy(taxonomy.slug))
+        {
             return Some(format!("the `{}` taxonomy's term archives", taxonomy.slug));
         }
     }
@@ -1373,7 +1395,7 @@ pub fn segment_claim(segment: &str, exclude: Option<&str>) -> Option<String> {
         // serve.
         if !registered.public
             || BARE_PATH_TYPES.contains(&registered.slug)
-            || exclude == Some(registered.slug)
+            || exclude == Some(Registration::PostType(registered.slug))
         {
             continue;
         }
@@ -1598,16 +1620,7 @@ pub async fn delete_comment(conn: &mut AsyncPgConnection, comment_id: i64) -> Au
             .execute(conn)
             .await?;
 
-        let approved: i64 = comments::table
-            .filter(comments::post_id.eq(comment.post_id))
-            .filter(comments::status.eq("approved"))
-            .count()
-            .get_result(conn)
-            .await?;
-        diesel::update(posts::table.find(comment.post_id))
-            .set(posts::comment_count.eq(approved))
-            .execute(conn)
-            .await?;
+        recount_post_comments(conn, comment.post_id).await?;
         Ok::<_, AutumnError>(())
     })
     .await
@@ -1866,6 +1879,39 @@ pub async fn approved_comments_page(
         .await?)
 }
 
+/// Rebuild a post's approved-comment counter from ground truth, under its lock.
+///
+/// The lock is taken before the count for the same reason `recount_term` takes
+/// one: two moderators approving different pending comments on one post each
+/// count a set that excludes the other's uncommitted change, and both write the
+/// same too-low number. Serializing the *snapshot* rather than only the write
+/// is what makes the result right.
+///
+/// Every path that changes which comments are approved goes through here —
+/// insertion, moderation and deletion — so there is one definition of the
+/// counter rather than three.
+async fn recount_post_comments(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<i64> {
+    let _locked: Option<i64> = posts::table
+        .find(post_id)
+        .select(posts::id)
+        .for_update()
+        .first(conn)
+        .await
+        .optional()?;
+
+    let approved: i64 = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .count()
+        .get_result(conn)
+        .await?;
+    diesel::update(posts::table.find(post_id))
+        .set(posts::comment_count.eq(approved))
+        .execute(conn)
+        .await?;
+    Ok(approved)
+}
+
 /// How many approved comments a post has, counted in SQL.
 pub async fn approved_comment_count(
     conn: &mut AsyncPgConnection,
@@ -1948,7 +1994,7 @@ pub async fn publish_due_post(
 
 #[cfg(test)]
 mod slug_shape_tests {
-    use super::{reads_as_date_archive, segment_claim};
+    use super::{Registration, reads_as_date_archive, segment_claim};
 
     /// The namespace answer covers every branch `permalinks::resolve` tries
     /// before it reaches bare post/page content — the whole point of having one
@@ -1969,8 +2015,12 @@ mod slug_shape_tests {
         // must not reserve their own names against content.
         assert!(segment_claim("post", None).is_none());
         assert!(segment_claim("page", None).is_none());
-        // A registration is never in conflict with itself.
-        assert!(segment_claim("category", Some("category")).is_none());
+        // A registration is never in conflict with itself…
+        assert!(segment_claim("category", Some(Registration::Taxonomy("category"))).is_none());
+        // …but an exclusion in one registry must not excuse the other. A
+        // taxonomy called `category` does not get to take the `category`
+        // taxonomy's base just because the slugs match across registries.
+        assert!(segment_claim("category", Some(Registration::PostType("category"))).is_some());
     }
 
     #[test]

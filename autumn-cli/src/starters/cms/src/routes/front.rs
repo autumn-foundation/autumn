@@ -34,31 +34,41 @@ use super::site::{Csrf, Repos, render};
 /// reach a row without going through the resolver's type-aware branches —
 /// `/?p=<id>`, `/archives/<id>` and search — where a type registered
 /// `public: false` would otherwise render in full.
-/// Whether `path`'s leading segments are a date prefix a permalink can mint.
+/// Whether `path`'s leading segments are the date `post` was actually published
+/// on, in a shape a permalink structure mints.
 ///
-/// The dated structures produce `/{year}/{slug}` and `/{year}/{month}/{slug}`
-/// and `/{year}/{month}/{day}/{slug}` — nothing else. Accepting any prefix gave
-/// every post an unbounded set of aliases, which is a duplicate-content problem
-/// for search engines and a correctness one for anything that treats a URL as
-/// an identity.
+/// Two conditions, and both are needed. The *shape* must be one the generator
+/// produces: `MonthAndName` mints `/{year}/{month}/{slug}` and `DayAndName`
+/// mints `/{year}/{month}/{day}/{slug}` — `/{year}/{slug}` is not a structure
+/// this application has, so accepting it invented a URL space nothing links to.
+/// And the *values* must be the post's own publication date, because otherwise
+/// every post is still reachable at every date: `/2025/01/hello`,
+/// `/2025/02/hello`, and so on for thousands of URLs that are not its
+/// permalink.
 ///
-/// The ranges are checked as well as the shape: `/2026/13/hello` names no month
-/// and must 404 rather than serve the post.
-fn is_dated_permalink_prefix(path: &[String]) -> bool {
+/// That leaves exactly the two aliases a site gets by switching structure —
+/// which is the point of the fallback, so that changing the permalink setting
+/// does not 404 every link anyone has already shared.
+fn is_dated_permalink_for(path: &[String], post: &Post) -> bool {
     let Some((_, prefix)) = path.split_last() else {
         return false;
     };
-    let numeric = |segment: &String, lo: u32, hi: u32| {
-        segment
-            .parse::<u32>()
-            .is_ok_and(|value| (lo..=hi).contains(&value))
-    };
+    // The generator falls back to `created_at` for a post that has never been
+    // published, so the matcher has to accept the same date it would mint.
+    let date = post.published_at.unwrap_or(post.created_at).date();
+    // Compared as the strings the generator writes — `%Y/%m/%d`, so a
+    // four-digit year and zero-padded two-digit month and day. Parsing instead
+    // would make `/2026/9/hello` and `/2026/009/hello` aliases of
+    // `/2026/09/hello`, which is the same defect one layer down.
+    use chrono::Datelike as _;
+    let expected: [String; 3] = [
+        format!("{:04}", date.year()),
+        format!("{:02}", date.month()),
+        format!("{:02}", date.day()),
+    ];
     match prefix {
-        [year] => numeric(year, 1000, 9999),
-        [year, month] => numeric(year, 1000, 9999) && numeric(month, 1, 12),
-        [year, month, day] => {
-            numeric(year, 1000, 9999) && numeric(month, 1, 12) && numeric(day, 1, 31)
-        }
+        [year, month] => *year == expected[0] && *month == expected[1],
+        [year, month, day] => *year == expected[0] && *month == expected[1] && *day == expected[2],
         _ => false,
     }
 }
@@ -239,6 +249,19 @@ pub async fn search(
         @if cards.is_empty() && !trimmed.is_empty() {
             p class="text-gray-500" { "Nothing matched. Try a different phrase." }
         }
+        // The term has to ride along, or "Older" searches for nothing.
+        (pagination_nav(
+            page_number as usize,
+            total.div_ceil(per_page as usize).max(1),
+            &|n| {
+                let encoded = query_escape(trimmed);
+                if n <= 1 {
+                    format!("/search?s={encoded}")
+                } else {
+                    format!("/search?s={encoded}&page={n}")
+                }
+            },
+        ))
     };
     Ok(render(&repos, &session, &csrf, "Search", body)
         .await?
@@ -323,17 +346,21 @@ pub async fn dispatch(
             if let Some(page) = resolve_page_path(&repos, &path).await? {
                 return single_post(&repos, &session, &csrf, page).await;
             }
-            // …but only when the prefix is a shape a permalink actually mints.
-            // Taking the last segment of *any* path served `/hello` as
-            // `/anything/hello`, `/2026/13/hello` and unboundedly many other
-            // non-permalinks: duplicate-content aliases for every post, and a
-            // 200 where a 404 belongs.
-            let Some(last) = path.last().filter(|_| is_dated_permalink_prefix(&path)) else {
+            // …but only at the post's *own* dated permalink. Taking the last
+            // segment of any path served `/hello` as `/anything/hello`; taking
+            // it at any well-shaped date still served it at `/2025/01/hello`
+            // and thousands of other dates that are not its own. The prefix has
+            // to be the date this post was published, in a shape a structure
+            // actually mints, which leaves exactly the aliases that exist so a
+            // permalink change does not 404 links people have already shared.
+            let Some(last) = path.last() else {
                 return not_found(&repos, &session, &csrf).await;
             };
             match find_visible(&repos, "post", last).await? {
-                Some(post) => single_post(&repos, &session, &csrf, post).await,
-                None => not_found(&repos, &session, &csrf).await,
+                Some(post) if is_dated_permalink_for(&path, &post) => {
+                    single_post(&repos, &session, &csrf, post).await
+                }
+                _ => not_found(&repos, &session, &csrf).await,
             }
         }
 
@@ -784,24 +811,36 @@ async fn listing(
         @for (post, url) in &cards {
             (theme.post_card(post, url, settings))
         }
+        (pagination_nav(page, last_page, &|n| page_url(base_path, n)))
+    })
+}
+
+/// The Older/Newer control, shared by every paginated screen.
+///
+/// Extracted because the search results screen had none: its `?page=2` worked
+/// if you typed it, but nothing rendered a link to it, so everything past the
+/// first page was undiscoverable from the UI. A second copy of this markup
+/// would have been a second thing to forget.
+fn pagination_nav(page: usize, last_page: usize, url_for: &dyn Fn(usize) -> String) -> Markup {
+    html! {
         @if last_page > 1 {
             nav aria-label="Pagination" class="flex items-center justify-between mt-8 text-sm" {
                 @if page > 1 {
-                    a href=(page_url(base_path, page - 1))
+                    a href=(url_for(page - 1))
                       class="text-indigo-700 hover:underline" { "← Newer" }
                 } @else {
                     span {}
                 }
                 span class="text-gray-500" { "Page " (page) " of " (last_page) }
                 @if page < last_page {
-                    a href=(page_url(base_path, page + 1))
+                    a href=(url_for(page + 1))
                       class="text-indigo-700 hover:underline" { "Older →" }
                 } @else {
                     span {}
                 }
             }
         }
-    })
+    }
 }
 
 /// The half-open `[from, until)` range a `/YYYY[/MM[/DD]]` archive covers.
@@ -826,6 +865,26 @@ fn archive_bounds(
 
 /// A listing's page link. Page 1 drops the parameter so the canonical URL of a
 /// first page has no query string.
+/// Percent-encode a value for a query string.
+///
+/// maud escapes the attribute for HTML, which is a different job: an unescaped
+/// `&` or `#` in the search term would still end the parameter, so "rock & roll"
+/// would page as a search for "rock". Unreserved characters pass through; a
+/// space becomes `+`, matching what the browser submits from the form.
+fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 fn page_url(base_path: &str, page: usize) -> String {
     if page <= 1 {
         base_path.to_owned()

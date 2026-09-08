@@ -175,7 +175,7 @@ impl std::error::Error for RegistrationError {}
 fn claim_on(
     field: &'static str,
     segment: &str,
-    exclude: &'static str,
+    exclude: crate::content::Registration<'_>,
 ) -> Result<(), RegistrationError> {
     match crate::content::segment_claim(segment, Some(exclude)) {
         Some(claimed_by) => Err(RegistrationError {
@@ -213,9 +213,10 @@ pub fn register_post_type(post_type: PostType) -> Result<(), RegistrationError> 
     // permanently unreachable. Neither check can trip on the type's own
     // registration: they look at application routes and taxonomy bases, and a
     // post type is neither.
-    claim_on("slug", post_type.slug, post_type.slug)?;
+    let this = crate::content::Registration::PostType(post_type.slug);
+    claim_on("slug", post_type.slug, this)?;
     if post_type.has_archive {
-        claim_on("archive_base", post_type.archive_base, post_type.slug)?;
+        claim_on("archive_base", post_type.archive_base, this)?;
     }
 
     let mut types = post_types().write().expect("post type registry poisoned");
@@ -239,7 +240,11 @@ pub fn register_taxonomy(taxonomy: Taxonomy) -> Result<(), RegistrationError> {
     // registered public post type's slug makes every one of that type's item
     // URLs resolve as a term archive, because the resolver tries taxonomies
     // first.
-    claim_on("rewrite_base", taxonomy.rewrite_base, taxonomy.slug)?;
+    claim_on(
+        "rewrite_base",
+        taxonomy.rewrite_base,
+        crate::content::Registration::Taxonomy(taxonomy.slug),
+    )?;
 
     let mut taxes = taxonomies().write().expect("taxonomy registry poisoned");
     match taxes.iter_mut().find(|t| t.slug == taxonomy.slug) {
