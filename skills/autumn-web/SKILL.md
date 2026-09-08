@@ -84,7 +84,7 @@ the framework almost certainly already generates or ships it:
 | Hand-parsed `Range` headers / manual `206 Partial Content` / `Content-Range` / `416` for seekable media or resumable downloads | `autumn_web::range` (`resolve` + `partial_bytes_response`) and `Download::into_response_ranged(&headers).await` — RFC 7233 single-range parsing, multi-range single-range collapse, `If-Range` via `.etag(..)`/`.last_modified(..)`, blob slices via `BlobStore::get_range` (no whole-object buffering) (0.6.0) |
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
-| A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
+| A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument, 256 instruments, 8 labels/series by default) instead of leaking series (0.7.0, issue #1378); those three are the `[metrics]` section — `max_series_per_metric` / `max_instruments` / `max_labels_per_series`, plus `AUTUMN_METRICS__*` — so an app with a genuinely larger label space raises them rather than losing series, while the name/value/help-length caps stay fixed. Lowering a cap never evicts a retained series (that would reset a counter); an out-of-range value fails the boot naming the key. `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
@@ -1235,6 +1235,71 @@ deliveries. Presets: `stripe`, `github`, `slack`, `generic`.
 
 Read `docs/guide/signed-webhooks.md` and `examples/signed-webhooks/`.
 
+Everything above is webhooks arriving **in**. For the other direction — letting
+your own users/customers register an endpoint and dispatching signed events to
+it — use `autumn_web::webhook_outbound`: `WebhookSubscription` (their endpoint,
+signing secret and subscribed topics), a pluggable `OutboundWebhookHandler`, and
+`WebhookOutboundManager` off `AppState`. The
+`autumn_webhook_delivery` job signs and POSTs it with retries and deactivation;
+dead-letter inspection and replay live under `/actuator/webhooks/*`.
+
+Two things to get right when generating this code:
+
+- **There is no default store.** `OutboundWebhookPlugin::new(store)` takes one as
+  a required argument. `InMemoryOutboundWebhookHandler` ships with the framework
+  but is process-local AND unbounded — subscriptions and delivery logs vanish
+  on restart, are not shared across replicas, and are held in plain hash maps
+  with no cap or eviction. A retry replaces its log row rather than adding one
+  (same id, `attempt` advanced in place), so growth is per DISPATCH, not per
+  attempt — and nothing ever evicts, so memory grows with dispatch volume for
+  the lifetime of the process. It is for tests and local development; any
+  long-running app needs a durable shared implementation of the trait. (`OutboundWebhookStore` /
+  `InMemoryOutboundWebhookStore` are compatibility aliases; prefer the
+  `…Handler` names in new code.)
+- **`dispatch()` is not transactional.** It writes a delivery-log row per
+  subscription and *then* enqueues the job; no transaction spans the pluggable
+  store and the queue, so a crash between the two leaves a logged event that was
+  never enqueued. Do not present it to a user as an outbox guarantee, and do not
+  write a reconciler over the log table to claim one: a successful enqueue
+  writes no marker, so an enqueued row is indistinguishable from one whose
+  process died first, and a sweeper can only duplicate or drop. Implementing the
+  trait does not fix it either — `OutboundWebhookHandler` is storage-only and the
+  enqueue happens after it returns, so no impl can make the two atomic. If an app
+  needs a stronger guarantee, do NOT invent an exactly-once design here — the
+  answer depends on the job backend, the handler, and how the app sequences its
+  own transaction against `dispatch()`. Tell the user the constraints and let
+  them decide:
+    - `Ok` from `dispatch()` is not durability. The default
+      `jobs.backend = "local"` queue is in-process and non-durable, so a crash
+      loses it; durable delivery needs `postgres`/`redis` jobs AND a durable
+      `OutboundWebhookHandler`.
+    - No stable event or delivery ID is transmitted: nothing Autumn sends
+      distinguishes a first attempt from a retry of the same event, and the
+      `Autumn-Signature` header's `t=` is recomputed per attempt but is
+      neither unique nor stable — it is a whole-second `Utc::now().timestamp()`
+      and nothing guarantees two attempts differ. On the `local` backend they
+      routinely do not: equal jitter puts the first retry 500-1000 ms later, so
+      the same second yields a byte-identical signature. (`redis`/`postgres` do
+      not jitter and retry at the exact exponential delay — do not describe
+      jitter as backend-neutral.) (Do not enumerate
+      the headers — under `telemetry-otlp` the shared client also injects W3C
+      `traceparent`/`tracestate`.) Receiver-side deduplication needs an ID the
+      app mints into the payload itself.
+    - Retries duplicate only after the job is enqueued, so `dispatch()` is
+      neither at-least-once nor at-most-once. Idempotency buys protection from
+      duplicates, not from loss.
+  An enqueue that fails is the one handled case —
+  marked `is_dlq` and replayable — but only on the default enqueue path. With a
+  `WebhookDelegateExt` installed, `dispatch()` calls the delegate instead of
+  enqueuing and a delegate error is returned without marking the row, so a
+  failed delegated delivery never reaches the DLQ.
+
+Do not
+hand-roll outbound delivery with a bare HTTP client — the user-supplied
+destination URL is an SSRF sink (`docs/security/2026-09-03-webhook-ssrf/`), and
+the subsystem is where that is handled. Read
+`docs/guide/outbound-webhooks.md`.
+
 ## Mail CSS inlining — render styled in Gmail/Outlook (0.6.0)
 
 Gmail strips `<style>` in many contexts and Outlook (Word engine) ignores
@@ -1518,10 +1583,33 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
   cannot leak.
 - Non-goals: not fair (no FIFO), not a lease (no heartbeat — use the scheduler
   for long-lived leader election), not row-level (use `with_lock`), Postgres
-  only.
+  only — under the `sqlite` feature `from_state` refuses rather than pretending
+  to hold a lock (see below).
 
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
+
+## Postgres-only subsystems on a SQLite app (unreleased, issue #1905)
+
+Some subsystems are Postgres-only by construction: they open a
+`diesel::PgConnection` and issue `pg_notify` / `pg_advisory_xact_lock` / `jsonb`
+SQL. Autumn never picks an implementation for you, so wire them
+backend-conditionally rather than assuming Postgres.
+
+- `PgFlagStore` / `PgExperimentStore` / `PgConfigStore`:
+  `from_database_config(&config.database)` returns `None` unless the configured
+  primary names Postgres. `.expect()` on it fails at BOOT on a `sqlite://`
+  target — pick `InMemoryFlagStore` / `InMemoryConfigStore` on that arm instead.
+- `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
+  (`effective_primary_url()` returns the target whatever backend it names).
+- `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`
+  feature: SQLite has no cross-connection advisory lock. Single-host mutual
+  exclusion is a `Mutex`.
+- `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite
+  build's state cannot produce — use the in-process coordinator.
+
+`docs/guide/sqlite-in-production.md` carries a support-matrix row per
+subsystem; `docs/guide/feature-flags.md` shows the branching shape.
 
 ## The plugin API stability contract (unreleased, issue #1601)
 
@@ -1774,6 +1862,9 @@ for the common cases:
 | `infinite_feed(items, next_cursor, &FeedConfig)` / `feed_page(items, next_cursor, &FeedConfig)` | htmx infinite-scroll / "Load more" feed from a `CursorPage`: single `hx-get` sentinel carries the cursor and appends the next page in place (no reload, no duplicate rows). `FeedMode::{Reveal,Button}`; progressive `<a href>` fallback. `feed_page` is the append fragment a handler returns for each page (`page.next_cursor.as_deref()`) |
 | `bulk_actions_form(&BulkActionsConfig, csrf_token, csrf_field, submit_token, submit_field, content)` / `bulk_select_checkbox(id, &cfg)` / `bulk_actions_toolbar(&cfg)` | No-JS bulk-select + "Delete selected" over a list (#1312): wrap the list in `bulk_actions_form` (a `POST` form carrying the hidden CSRF and one-time submit-token fields plus the submit button), and put one `bulk_select_checkbox` — `name="ids"`, `aria-label="Select row <id>"` — in each row's first cell. Keep page furniture ("New …" link, search box) *outside* the form. Always pass the submit-token pair on a destructive form: a tokenless request passes through `SubmitTokenLayer` unguarded, so a double-click would re-run the whole batch. `BulkActionsConfig::new(action)` + `.field_name(..)`/`.submit_label(..)`/`.select_label(..)`. The toolbar emits no confirmation prompt: inline `onclick` confirms are blocked by the default `script-src 'self'` CSP, and `confirm_action` submits its own form so it cannot carry the selection — to confirm a batch, post it to an interstitial page that lists the rows and asks for a second submit. `autumn generate scaffold` wires all of this automatically |
 | `comment_thread(&cfg, &CommentView::from_thread(&nodes))` / `CommentThread::new(dom_id, action)` | The view half of `#[commentable]` (#1367): nested `<ol>` comment thread with a `<details>`-disclosed inline reply form on every node. Ordinary `<form method="post">` (works with scripting off) that also carries `hx-post`/`hx-target`/`hx-swap="outerHTML"` to swap the thread in place. Thread `.csrf_token(...)` and `.return_to(path)` for the no-JS round trip, `.max_depth(n)` so the UI never offers a reply the write path would `422`, `.read_only(Some(prompt))` for a signed-out visitor |
+| `active_search(id, label, &ActiveSearchConfig)` / `active_search_empty_state(msg)` | Search box whose results appear as the user types — htmx-driven, server-rendered Maud fragments; you author no JavaScript, but the page must load htmx. The handler returns the results fragment; `active_search_empty_state` is the no-matches body. Emits a `<noscript>` GET-form fallback (`docs/guide/active-search-and-autocomplete.md`) |
+| `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
+| `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 
 ### Whole-form rendering — `form_for` (0.6.0)

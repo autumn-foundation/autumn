@@ -2796,6 +2796,7 @@ when export is disabled.
 The generated `fly.toml` wires Fly's `[metrics]` block to this endpoint:
 
 ```toml
+# fly.toml — Fly's own [metrics] block, not Autumn's `[metrics]` section
 [metrics]
   port = 3000
   path = "/actuator/prometheus"
@@ -2809,6 +2810,7 @@ still want it unreachable from public traffic. The Fly-native way is to scrape a
 Bind a second internal listener and point `[metrics]` at it:
 
 ```toml
+# fly.toml — Fly's own [metrics] block, not Autumn's `[metrics]` section
 [metrics]
   port = 9091                       # internal-only; no [http_service] on it
   path = "/actuator/prometheus"
@@ -3017,7 +3019,7 @@ default `cargo test` run; pass `-- --ignored` to include them.
 
 ### Extending the CI workflow
 
-**Tailwind CSS**: install the Tailwind CLI (`autumn setup --tailwind`) and add a
+**Tailwind CSS**: install the Tailwind CLI (`autumn setup`) and add a
 step before `cargo build` to run it. The generated `build.rs` will auto-detect
 it on `PATH` or at `target/autumn/tailwindcss`.
 

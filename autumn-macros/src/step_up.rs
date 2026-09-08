@@ -17,7 +17,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{LitStr, parse_quote};
+use syn::LitStr;
 
 use crate::idempotency_guard::should_own_replay;
 
@@ -162,33 +162,6 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
     }
 }
 
-/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
-///
-/// Rust forbids `impl Trait` in local variable type annotations, so the
-/// macro must skip the explicit annotation for return types like
-/// `AutumnResult<impl IntoResponse>` even though the top-level type is not
-/// `impl Trait` itself.
-fn type_contains_impl_trait(ty: &syn::Type) -> bool {
-    match ty {
-        syn::Type::ImplTrait(_) => true,
-        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
-            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
-                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
-                _ => false,
-            }),
-            syn::PathArguments::Parenthesized(args) => {
-                args.inputs.iter().any(type_contains_impl_trait)
-                    || matches!(&args.output,
-                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
-            }
-            syn::PathArguments::None => false,
-        }),
-        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
-        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
-        _ => false,
-    }
-}
-
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 #[allow(clippy::too_many_lines)]
 // `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
@@ -218,6 +191,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // review on #2513, tenth finding). See
     // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
     if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
+    }
+
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
         return err;
     }
 
@@ -287,44 +267,27 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // reaches a `FromRequest` body extractor (`Json` / `Form` / `Multipart`)
     // and short-circuits on the first rejection, so a stale/missing step-up
     // session never causes the body to be parsed.
-    let gate_item = quote! {
-        #[doc(hidden)]
-        #[allow(non_camel_case_types)]
-        pub struct #gate_ident;
-
-        #[doc(hidden)]
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>
-            for #gate_ident
-        {
-            type Rejection = ::autumn_web::reexports::axum::response::Response;
-
-            fn from_request_parts(
-                parts: &mut ::autumn_web::reexports::axum::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> impl ::core::future::Future<Output = ::core::result::Result<Self, Self::Rejection>>
-                + Send {
-                async move {
-                    // A real `Session` extraction (not a raw extensions
-                    // lookup) so a missing `SessionLayer` still fails loudly,
-                    // exactly as the hidden `__autumn_session: Session`
-                    // handler parameter this replaces did.
-                    let __autumn_session: ::autumn_web::session::Session = match
-                        <::autumn_web::session::Session as ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>>
-                            ::from_request_parts(parts, state).await
-                    {
-                        ::core::result::Result::Ok(__session) => __session,
-                        ::core::result::Result::Err(__never) => match __never {},
-                    };
-                    let __autumn_step_up_headers = parts.headers.clone();
-                    let __autumn_step_up_uri = parts.uri.clone();
-                    let __autumn_step_up_method = parts.method.clone();
-                    #replay_check
-                    #check_call
-                    ::core::result::Result::Ok(#gate_ident)
-                }
-            }
-        }
-    };
+    let gate_item = crate::request_gate::wrap_gate(
+        &gate_ident,
+        &quote! {
+            // A real `Session` extraction (not a raw extensions
+            // lookup) so a missing `SessionLayer` still fails loudly,
+            // exactly as the hidden `__autumn_session: Session`
+            // handler parameter this replaces did.
+            let __autumn_session: ::autumn_web::session::Session = match
+                <::autumn_web::session::Session as ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState>>
+                    ::from_request_parts(parts, state).await
+            {
+                ::core::result::Result::Ok(__session) => __session,
+                ::core::result::Result::Err(__never) => match __never {},
+            };
+            let __autumn_step_up_headers = parts.headers.clone();
+            let __autumn_step_up_uri = parts.uri.clone();
+            let __autumn_step_up_method = parts.method.clone();
+            #replay_check
+            #check_call
+        },
+    );
 
     let original_body = input_fn.block.clone();
     let original_response = match &input_fn.sig.output {
@@ -335,11 +298,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
         // Rust rejects `impl Trait` in local variable type annotations; drop
         // the annotation and let type inference handle it instead.
-        syn::ReturnType::Type(_, ty) if type_contains_impl_trait(ty) => quote! {
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                (async move #original_body).await
-            )
-        },
+        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    (async move #original_body).await
+                )
+            }
+        }
         syn::ReturnType::Type(_, ty) => quote! {
             let __autumn_inner: #ty = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
@@ -349,15 +314,8 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Insert the gate as the FIRST parameter — ahead of every other
     // extractor, including any earlier-inserted guard gate (which then
     // correctly runs AFTER this one; see `should_own_replay`'s doc comment).
-    let gate_param: syn::FnArg = parse_quote! { _: #gate_ident };
-    input_fn.sig.inputs.insert(0, gate_param);
+    crate::request_gate::insert_gate_param(&mut input_fn, &gate_ident);
 
-    input_fn
-        .attrs
-        .push(parse_quote!(#[allow(clippy::too_many_arguments)]));
-    input_fn.sig.output = parse_quote! {
-        -> ::autumn_web::reexports::axum::response::Response
-    };
     input_fn.block = syn::parse_quote! {
         {
             #max_age_marker
@@ -380,6 +338,28 @@ mod tests {
 
     use super::step_up_macro;
     use crate::static_route::static_get_macro;
+
+    /// Characterization test (Echo refactor, clone class: the
+    /// `FromRequestParts` gate skeleton shared with `secured`/`throttle`):
+    /// pins `#[step_up(max_age = "5m")]`'s exact expansion — exercising the
+    /// session extraction, the freshness check, and (as the only guard on
+    /// this handler) the replay lookup all at once — so that factoring the
+    /// gate's struct+impl skeleton into `request_gate::wrap_gate` cannot
+    /// silently change a single token of it.
+    #[test]
+    fn step_up_macro_expansion_is_unchanged_by_the_gate_skeleton_refactor() {
+        let generated = step_up_macro(
+            quote! { max_age = "5m" },
+            quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            generated,
+            include_str!("../testdata/step_up_golden.txt").trim_end()
+        );
+    }
 
     #[test]
     fn step_up_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
