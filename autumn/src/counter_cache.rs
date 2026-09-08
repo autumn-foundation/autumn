@@ -1316,7 +1316,13 @@ fn push_diff(
 ///
 /// `-i64::MIN` is not an `i64`, so that one weight leaves as two halves that
 /// are. Every other weight negates in place.
-fn push_removal(index: usize, parent: i64, contrib: i64, witness: i64, out: &mut Vec<Contribution>) {
+fn push_removal(
+    index: usize,
+    parent: i64,
+    contrib: i64,
+    witness: i64,
+    out: &mut Vec<Contribution>,
+) {
     match contrib.checked_neg() {
         Some(negated) => out.push((index, parent, negated, witness)),
         None => {
@@ -1989,7 +1995,12 @@ mod tests {
         // delta issued is the sum of every delta requested.
         let ordered = fold_and_order(
             &specs,
-            vec![(1, 2, i64::MAX, 10), (1, 2, -5, 11), (1, 2, 5, 12), (1, 2, 1, 13)],
+            vec![
+                (1, 2, i64::MAX, 10),
+                (1, 2, -5, 11),
+                (1, 2, 5, 12),
+                (1, 2, 1, 13),
+            ],
         );
         assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, 1, 13)]);
     }
@@ -2004,7 +2015,11 @@ mod tests {
         push_diff(0, Some((7, i64::MIN)), Some((7, i64::MAX)), 1, &mut out);
         assert_eq!(
             out,
-            vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX, 1)]
+            vec![
+                (0, 7, i64::MAX / 2 + 1, 1),
+                (0, 7, i64::MAX / 2 + 1, 1),
+                (0, 7, i64::MAX, 1)
+            ]
         );
         let specs = two_legs();
         assert_eq!(fold_and_order(&specs, out.clone()), out);
@@ -2023,9 +2038,14 @@ mod tests {
         // moving the parent the wrong way by 2^63.
         let mut out = Vec::new();
         push_diff(0, Some((7, i64::MIN)), None, 1, &mut out);
-        assert_eq!(out, vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1)]);
         assert_eq!(
-            out.iter().map(|&(_, _, delta, _)| i128::from(delta)).sum::<i128>(),
+            out,
+            vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1)]
+        );
+        assert_eq!(
+            out.iter()
+                .map(|&(_, _, delta, _)| i128::from(delta))
+                .sum::<i128>(),
             -i128::from(i64::MIN)
         );
 
@@ -2033,7 +2053,11 @@ mod tests {
         push_diff(0, Some((7, i64::MIN)), Some((8, 4)), 1, &mut out);
         assert_eq!(
             out,
-            vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1), (0, 8, 4, 1)]
+            vec![
+                (0, 7, i64::MAX / 2 + 1, 1),
+                (0, 7, i64::MAX / 2 + 1, 1),
+                (0, 8, 4, 1)
+            ]
         );
     }
 

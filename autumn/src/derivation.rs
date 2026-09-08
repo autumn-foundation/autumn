@@ -287,9 +287,8 @@ inventory::collect!(CounterCacheClaim);
 
 /// Every plain `counter_cache` linked into this binary, in a stable order.
 fn registered_counter_cache_claims() -> Vec<&'static CounterCacheClaim> {
-    let mut claims: Vec<&'static CounterCacheClaim> = inventory::iter::<CounterCacheClaim>
-        .into_iter()
-        .collect();
+    let mut claims: Vec<&'static CounterCacheClaim> =
+        inventory::iter::<CounterCacheClaim>.into_iter().collect();
     claims.sort_unstable_by_key(|claim| {
         (
             claim.parent_table,
@@ -369,7 +368,10 @@ fn check_unique_names(defs: &[&DerivationDef]) -> AutumnResult<()> {
 /// Every mutation path applies each derivation's own delta, so one column with
 /// two derivations counts twice. No repair can fix that: the two definitions
 /// disagree on what the column means, so each sweep would undo the other.
-fn check_unique_columns(defs: &[&DerivationDef], claims: &[&CounterCacheClaim]) -> AutumnResult<()> {
+fn check_unique_columns(
+    defs: &[&DerivationDef],
+    claims: &[&CounterCacheClaim],
+) -> AutumnResult<()> {
     let mut seen: HashMap<(&str, &str), &DerivationDef> = HashMap::new();
     for def in defs {
         // A plain counter cache on the same column is the same double count,
@@ -1301,7 +1303,10 @@ mod tests {
         let err = check_unique_columns(&[&def], &[&claim])
             .expect_err("a counter cache and a derivation cannot share a column");
         let message = err.to_string();
-        assert!(message.contains("dv_posts.published_comment_count"), "{message}");
+        assert!(
+            message.contains("dv_posts.published_comment_count"),
+            "{message}"
+        );
         assert!(message.contains("likes::module"), "{message}");
         assert!(message.contains("dv_likes"), "{message}");
         assert!(message.contains("counter_cache"), "{message}");

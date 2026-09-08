@@ -432,7 +432,10 @@ async fn reconciliation_enqueues_only_the_derivation_whose_definition_changed() 
     // First boot: nothing is recorded, so every derivation is enqueued.
     let mut first = ensure_derivations(&mut conn).await.expect("first boot");
     first.sort_unstable();
-    assert_eq!(first, vec![COUNT_DERIVATION, SUM_DERIVATION, TAG_DERIVATION]);
+    assert_eq!(
+        first,
+        vec![COUNT_DERIVATION, SUM_DERIVATION, TAG_DERIVATION]
+    );
     assert_eq!(
         state_of(&pool, COUNT_DERIVATION).await.backfill_state,
         "pending"
@@ -736,7 +739,9 @@ async fn a_string_filter_compares_bytes_whatever_the_column_collation() {
         "the set-based scan must agree with the record path on a NOCASE column"
     );
     assert_eq!(
-        recompute(&mut conn, TAG_DERIVATION).await.expect("recompute"),
+        recompute(&mut conn, TAG_DERIVATION)
+            .await
+            .expect("recompute"),
         0,
         "nothing to repair: SQL counted the same row Rust did"
     );
@@ -762,7 +767,10 @@ async fn a_renamed_derivation_keeps_its_finished_backfill() {
     run_backfill(&mut conn, &BackfillOptions::default())
         .await
         .expect("finish every backfill");
-    assert_eq!(state_of(&pool, COUNT_DERIVATION).await.backfill_state, "complete");
+    assert_eq!(
+        state_of(&pool, COUNT_DERIVATION).await.backfill_state,
+        "complete"
+    );
 
     // The binary that wrote this row called the derivation something else.
     diesel::sql_query(
@@ -789,7 +797,9 @@ async fn a_renamed_derivation_keeps_its_finished_backfill() {
     );
     let status = derivation_status(&mut conn).await.expect("status");
     assert!(
-        !status.iter().any(|entry| entry.name == "sd_posts.legacy_name"),
+        !status
+            .iter()
+            .any(|entry| entry.name == "sd_posts.legacy_name"),
         "no unregistered leftover: the old row IS the new row: {status:?}"
     );
 
@@ -807,7 +817,10 @@ async fn a_renamed_derivation_keeps_its_finished_backfill() {
         ensure_derivations(&mut conn).await.expect("boot"),
         vec![COUNT_DERIVATION]
     );
-    assert_eq!(state_of(&pool, COUNT_DERIVATION).await.backfill_state, "pending");
+    assert_eq!(
+        state_of(&pool, COUNT_DERIVATION).await.backfill_state,
+        "pending"
+    );
     assert_eq!(
         state_of(&pool, "sd_posts.legacy_name").await.backfill_state,
         "complete",

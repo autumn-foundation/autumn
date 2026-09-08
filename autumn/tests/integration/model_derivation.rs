@@ -1276,7 +1276,9 @@ async fn ac5_a_renamed_derivation_keeps_its_finished_backfill() {
     );
     let status = derivation_status(&mut conn).await.expect("status");
     assert!(
-        !status.iter().any(|entry| entry.name == "dv_posts.legacy_name"),
+        !status
+            .iter()
+            .any(|entry| entry.name == "dv_posts.legacy_name"),
         "the old row IS the new row, so nothing is left unregistered: {status:?}"
     );
 
@@ -1294,9 +1296,14 @@ async fn ac5_a_renamed_derivation_keeps_its_finished_backfill() {
         ensure_derivations(&mut conn).await.expect("boot"),
         vec![COUNT_DERIVATION]
     );
-    assert_eq!(state_of(&mut conn, COUNT_DERIVATION).await.backfill_state, "pending");
     assert_eq!(
-        state_of(&mut conn, "dv_posts.legacy_name").await.backfill_state,
+        state_of(&mut conn, COUNT_DERIVATION).await.backfill_state,
+        "pending"
+    );
+    assert_eq!(
+        state_of(&mut conn, "dv_posts.legacy_name")
+            .await
+            .backfill_state,
         "complete"
     );
 }
