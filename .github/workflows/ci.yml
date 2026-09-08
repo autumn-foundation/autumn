@@ -336,6 +336,44 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-toml.sh --self-test && ./scripts/check-docs-toml.sh
+      - name: Rust symbol drift gate
+        # The four gates above cover the link a reader clicks, the command they
+        # run, the variable they set and the config key they write. None of them
+        # looks at what the guide is mostly MADE of: Rust. The reader-facing
+        # corpus names 1,495 `autumn_web::…` paths — a larger copy-surface than
+        # the env layer and the `autumn.toml` layer together — and nothing in
+        # the tree could tell a live path from a renamed one.
+        #
+        # It catches both ends of the visibility scale, which is why gating the
+        # whole surface beats gating import lines alone. Loud:
+        # maintenance-mode.md hands over
+        # `use autumn_web::middleware::{MaintenanceLayer, MaintenanceState};`
+        # where only the first exists — `MaintenanceState` is in
+        # `autumn_web::maintenance`, a different module with a same-named
+        # sibling under `middleware::` — so the reader gets E0432 on a line
+        # where half the import is right. Silent: `#[autumn_web::main]` emits
+        # `fn main()` fresh and never re-emits the declared return type, so
+        # api-versioning.md's opening fence could say
+        # `-> Result<(), autumn_web::Error>` for a type that does not exist, and
+        # still build. Nothing reported it; the reader just carried away the
+        # wrong name for the framework's error type.
+        #
+        # Truth set is the crate sources themselves — no snapshot to
+        # regenerate, because a rename lands in the same commit as the surface
+        # it renames. Resolution follows what Rust does rather than what the
+        # source looks like (`pub use` re-exports including aliased and
+        # private-facade ones, globs, `#[macro_export]` hoisting to the crate
+        # root, inline `mod` blocks, proc-macro derive names, and hops into
+        # sibling workspace crates), because a documented path is almost never
+        # a path to where the item is defined. It also checks VISIBILITY: only
+        # bare `pub` counts, since a path through one of lib.rs's 49
+        # `pub(crate)` modules is E0603 in the reader's crate however public the
+        # item inside it is. Paths that leave the workspace are reported as
+        # OPAQUE and counted rather than guessed at.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-symbols.sh --self-test && ./scripts/check-docs-symbols.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
