@@ -34,7 +34,7 @@ fn has_pending_authorize_attr(input_fn: &syn::ItemFn) -> bool {
     input_fn
         .attrs
         .iter()
-        .any(crate::authorize::attr_is_authorize_shaped)
+        .any(|attr| crate::authorize::attr_is_authorize_shaped(attr, input_fn))
 }
 
 fn block_has_generated_replay_guard(block: &Block) -> bool {

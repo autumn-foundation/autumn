@@ -393,15 +393,29 @@ pub fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArg
 /// `#[authorize]`'s policy re-check).
 ///
 /// Falls back to parsing `attr`'s argument tokens through `#[authorize]`'s
-/// own grammar (the same parser `authorize_macro` itself uses): only a
-/// genuine `#[authorize(...)]` — or a hypothetical unrelated attribute that
-/// happens to share its exact `"action", resource = Type[, from = ident]`
-/// shape — parses successfully with both the required `action` and
-/// `resource` present. A caller that treats a false positive here as "an
-/// authorize check might still run" only loses an optimization (the gate or
-/// outer layer stops serving a cached replay), never a security property, so
-/// this errs toward over-matching rather than under-matching.
-pub fn attr_is_authorize_shaped(attr: &syn::Attribute) -> bool {
+/// own grammar (the same parser `authorize_macro` itself uses), requiring
+/// both the required `action` and `resource`. A shape match alone is not
+/// enough: an unrelated attribute (a custom `#[audit("update", resource =
+/// Note)]`, say) can coincidentally share that exact grammar, and treating
+/// every such match as "an authorize check will run" is not free — with no
+/// real `#[authorize]` anywhere, the caller (a stacked gate deferring
+/// ownership, or the route macro dropping the standalone
+/// `IdempotencyReplayLayer`) would leave *nothing* to serve a cached replay,
+/// silently losing `.idempotent()`'s dedup guarantee rather than merely an
+/// optimization (Codex review on #2628).
+///
+/// So a shape-only match also requires a parameter binding matching
+/// `#[authorize]`'s own calling convention: the function must bind a
+/// parameter named `from` (if given) or the `snake_case` of `resource` —
+/// `authorize_macro` computes the identical name and requires the handler to
+/// have it (`&#from_ident` is read directly in the generated policy check),
+/// so a genuine aliased `#[authorize]` always satisfies this, while an
+/// unrelated attribute needs to coincidentally match the argument grammar
+/// *and* happen to sit on a handler with a same-named parameter — narrow
+/// enough that a caller here still treats a match as "an authorize check
+/// might run" and stays conservative, without the false-positive rate of a
+/// bare shape check.
+pub fn attr_is_authorize_shaped(attr: &syn::Attribute, input_fn: &syn::ItemFn) -> bool {
     if attr
         .path()
         .segments
@@ -413,13 +427,87 @@ pub fn attr_is_authorize_shaped(attr: &syn::Attribute) -> bool {
     let syn::Meta::List(list) = &attr.meta else {
         return false;
     };
-    parse_with_leading_literal(list.tokens.clone())
-        .is_ok_and(|args| args.action.is_some() && args.resource.is_some())
+    let Ok(args) = parse_with_leading_literal(list.tokens.clone()) else {
+        return false;
+    };
+    let Some(resource) = &args.resource else {
+        return false;
+    };
+    if args.action.is_none() {
+        return false;
+    }
+    let from_name = args
+        .from
+        .as_ref()
+        .map_or_else(|| snake_case(&resource.to_string()), ToString::to_string);
+    has_input_named(input_fn, &from_name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── `attr_is_authorize_shaped` (Codex review on #2628) ──────────────────
+
+    #[test]
+    fn shape_match_requires_the_from_parameter_binding() {
+        // Codex review on #2628: an unrelated attribute sharing #[authorize]'s
+        // exact argument grammar (a custom `#[audit(...)]`, say) must not be
+        // treated as an authorize check unless the handler also binds the
+        // parameter #[authorize] itself would require — otherwise a false
+        // positive here silently drops ALL replay-serving (no gate/layer
+        // owns it, and the unrelated macro emits none), losing
+        // `.idempotent()`'s dedup guarantee rather than merely an
+        // optimization.
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn h() -> &'static str { "ok" }
+        };
+        let attr: syn::Attribute = syn::parse_quote! { #[audit("update", resource = Note)] };
+        assert!(
+            !attr_is_authorize_shaped(&attr, &input_fn),
+            "a shape match with no matching parameter binding must not count as authorize-shaped"
+        );
+    }
+
+    #[test]
+    fn shape_match_with_matching_parameter_binding_counts() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn h(note: Note) -> &'static str { "ok" }
+        };
+        let attr: syn::Attribute = syn::parse_quote! { #[authz_alias("update", resource = Note)] };
+        assert!(
+            attr_is_authorize_shaped(&attr, &input_fn),
+            "an aliased #[authorize] whose handler binds the expected `note` parameter must \
+             still be detected"
+        );
+    }
+
+    #[test]
+    fn shape_match_honors_explicit_from_binding() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn h(my_note: Note) -> &'static str { "ok" }
+        };
+        let attr: syn::Attribute =
+            syn::parse_quote! { #[authz_alias("update", resource = Note, from = my_note)] };
+        assert!(
+            attr_is_authorize_shaped(&attr, &input_fn),
+            "an explicit `from = my_note` binding must be checked instead of the snake_case \
+             default"
+        );
+    }
+
+    #[test]
+    fn literal_authorize_name_always_counts_even_without_the_parameter() {
+        // The literal-name fast path stays unconditional: a genuinely
+        // misspelled/incomplete #[authorize] invocation is a compile error
+        // from `authorize_macro` itself, not something this detection helper
+        // should silently wave through as "not authorize".
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn h() -> &'static str { "ok" }
+        };
+        let attr: syn::Attribute = syn::parse_quote! { #[authorize("update", resource = Note)] };
+        assert!(attr_is_authorize_shaped(&attr, &input_fn));
+    }
 
     #[test]
     fn authorize_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
