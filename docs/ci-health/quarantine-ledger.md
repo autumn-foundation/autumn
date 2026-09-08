@@ -92,8 +92,17 @@ without also filling in the intake form above.
   that macOS's scheduling merely exposes more reliably.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
-  now committed as `.github/workflows/manual-macos-contention-check.yml`,
-  gated on a human dispatching it (new macOS CI spend needs sign-off).
+  committed as `.github/workflows/manual-macos-contention-check.yml`, gated
+  on a human dispatching it (new macOS CI spend needs sign-off). As shipped
+  in #2527 the workflow failed to parse (`jobs.test.if` referenced the
+  `matrix` context, which isn't available there — GitHub rejected every
+  dispatch attempt with zero jobs run, caught by #2548 but not fixed before
+  #2527 merged); fixed in `docs/reports/2026-09-08-semaphore-macos-contention-harness-fix.md`
+  and verified `actionlint`-clean. Still needs a human to actually dispatch
+  it — that gap is unchanged by the fix. #2548 separately banked 13/13 clean
+  organic macOS samples on the tracked corpus since #2510 merged —
+  reassuring, still short of the ≥20 (≥50 for the sub-10% end) this ledger's
+  intake form requires to close an entry.
 - **A fix is already in flight** (PR #2510) that reclassifies
   `ECONNRESET`/`ECONNABORTED` (retryable) separately from `ECONNREFUSED`
   (hard zero-tolerance failure) — but per its own description it could not

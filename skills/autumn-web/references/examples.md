@@ -423,6 +423,90 @@ async fn main() {
 `autumn-web` keeps the `BlobStore` trait and local backend. S3 lives in
 `autumn-storage-s3`.
 
+## React SPA + GraphQL plugin over a `#[model]`
+
+`examples/react-graphql` is the reference for two asks: "a TypeScript/React
+front end on Autumn" and "expose a GraphQL API". Neither needs a new
+framework primitive — the plugin surface and the repository layer cover
+both.
+
+**GraphQL is a plugin, not a framework feature.** `src/graphql_plugin.rs` is
+a generic `GraphqlPlugin<Q, M, S>` over any `async_graphql::Schema`
+(`async-graphql = { version = "7", default-features = false }` — the
+GraphiQL/playground features load CDN scripts the default `script-src
+'self'` CSP blocks). Copy that one file when an app needs GraphQL; it has no
+dependency on the example. What it does with the `AppBuilder`:
+
+```rust
+impl<Q, M, S> Plugin for GraphqlPlugin<Q, M, S> {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        let router = Router::new()
+            .route("/", post(post_graphql::<Q, M, S>).get(get_graphql::<Q, M, S>))
+            .route("/sdl", get(sdl::<Q, M, S>))
+            .layer(Extension(self.schema.clone()));   // router-local, not AppState: two schemas can share root types at two paths
+        app.nest(&self.path, router)                   // raw router...
+            .declare_plugin_routes(self.route_infos()) // ...made visible to `autumn routes` and audit-clean
+    }
+    fn contract(&self) -> Option<PluginContract> { /* .autumn_web("0.7") */ }
+}
+// per request:  schema.execute(request.data(state))   // AppState into the GraphQL context
+```
+
+Rules the plugin encodes, keep them when adapting it: `GET ?query=` accepts
+**query operations only** (a mutation over `GET` is `405` before any resolver
+runs — caches and prefetchers replay `GET`s); parse the `GET` parameters
+yourself because `async_graphql::http::parse_query_string` reads
+`operation_name`, not the spec's `operationName`; guard the mount with
+`.guard(RequireApiToken::new(store), "RequireApiToken")` — a `.scoped(...)`
+around the app's own `routes![]` never reaches a router a plugin nests, so
+the plugin applies the layer itself and declares its routes `Gated`; expose a
+`BIGSERIAL` key as the `ID` scalar, never `Int` (32-bit by contract).
+
+**Resolvers go through the repository — never a second data layer.** With
+`AppState` in the context, a resolver builds the generated repository the
+same way a task or a seed does (there is no extractor outside a handler):
+
+```rust
+fn repo(ctx: &Context<'_>) -> Result<PgNoteRepository> {
+    let pool = ctx.data::<AppState>()?.pool().ok_or("no database pool configured")?.clone();
+    Ok(PgNoteRepository::with_pool_untracked(pool))
+}
+async fn create_note(&self, ctx: &Context<'_>, input: NewNoteInput) -> Result<Note> {
+    repo(ctx)?.save(&NewNote { title: input.title, body: input.body, pinned: false }).await.map_err(to_gql)
+}
+```
+
+so `#[normalize(trim)]`, the model's `#[validate]` rules, and the
+repository's `MutationHooks` apply identically to GraphQL, the generated
+`api = "/api/notes"` REST handlers mounted beside it. (The startup seed is
+the one deliberate exception: it runs count-then-insert on a single
+connection inside a transaction behind `pg_advisory_xact_lock`, keyed with
+`autumn_web::lock::distributed_lock_key`, so a scaled deployment seeds once
+and a `pool_size = 1` deployment does not deadlock — a session `Lock` plus a
+repository call would need two pool slots.)
+Two caveats the example documents: `repo.save` does **not** run the model's
+`#[validate]` rules itself (only the generated REST handler does — #2586), so
+a `before_create` hook calls `validate()`; and `AutumnError` exposes no
+accessor for its per-field details (#2587), so the hook folds the validator
+messages into `unprocessable_msg(..)`, and `to_gql` maps `AutumnError` →
+GraphQL error with `err.status()` in `extensions.status`. Expose the
+`#[model]` struct to GraphQL with an `#[Object] impl Note { .. }` block, not
+a derive on the model — keeps `models.rs` free of GraphQL vocabulary.
+
+**The SPA is bytes under `static/`.** Autumn renders the page shell with
+Maud (`div id="root"` + `script type="module" src=(asset_url("app/app.js"))`)
+and owns the security headers; React owns `#root`. Vite builds into
+`static/app/` with **fixed file names** (`entryFileNames: "app.js"`,
+`assetFileNames: "app.[ext]"`, no hash — `asset_url` fingerprints in release)
+and the bundle is committed, so `cargo run`, tests, and the Chromium smoke
+need no Node; `npm run dev` proxies `/graphql` to `:3000` so the browser
+stays same-origin (no `[cors]` section needed). `autumn build --embed` bakes
+it into the binary through the usual `embed_static!()` +
+`.embedded_static(..)` opt-in behind the crate's `embed-assets` feature.
+Commit `schema.graphql` from `GET /graphql/sdl` and drift-test it
+(`build_schema().sdl() == include_str!("../schema.graphql")`); write the TS
+types against that file.
+
 ## Seekable video from a stored blob (Range / 206)
 
 Serve a private stored video behind a policy so a browser `<video>` element can
