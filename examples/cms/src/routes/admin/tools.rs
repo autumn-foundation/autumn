@@ -450,7 +450,7 @@ pub async fn import(
         if post.status != "draft" {
             repos
                 .with_conn(async |conn| {
-                    content::transition_status(conn, created.id, &post.status).await
+                    content::transition_status(conn, created.id, &post.status, Some(user.id)).await
                 })
                 .await?;
         }

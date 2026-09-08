@@ -245,11 +245,7 @@ pub async fn create_post(
     // learn about, with each retry allocating another suffixed slug. The guard
     // depends only on the content being submitted, so asking first costs
     // nothing and makes the failure clean.
-    if status == "private" && body.title.trim().is_empty() {
-        return Err(AutumnError::unprocessable_msg(
-            "A private post must have a title",
-        ));
-    }
+    crate::content::guard_deferred_transition(&status, &body.title)?;
     let deferred_transition = (status == "private").then(|| status.clone());
     let initial_status = if deferred_transition.is_some() {
         "draft".to_owned()
@@ -286,7 +282,8 @@ pub async fn create_post(
         Some(target) => {
             repos
                 .with_conn(async |conn| {
-                    crate::content::transition_status(conn, created.id, &target).await
+                    crate::content::transition_status(conn, created.id, &target, Some(user.id))
+                        .await
                 })
                 .await?
         }

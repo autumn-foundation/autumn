@@ -332,11 +332,25 @@ pub async fn dispatch(
                 .await?
                 .into_iter()
                 .next();
-            match author {
+            // An account with nothing published has no archive, and saying so
+            // with a 404 is the point: the 200 page carried the account's
+            // public name and profile, so on a site with open registration
+            // `/author/<username>` answered "does this person have an account
+            // here?" for anyone who asked. `/api/v1/authors` already refuses
+            // to list accounts that have not published; this is the same rule
+            // on the other surface.
+            let has_public_content = match &author {
                 Some(author) => {
+                    let mut conn = repos.conn().await?;
+                    crate::content::published_post_count_by_author(&mut conn, author.id).await? > 0
+                }
+                None => false,
+            };
+            match author {
+                Some(author) if has_public_content => {
                     author_archive(&repos, &session, &csrf, &settings, &author, &params).await
                 }
-                None => not_found(&repos, &session, &csrf).await,
+                _ => not_found(&repos, &session, &csrf).await,
             }
         }
 

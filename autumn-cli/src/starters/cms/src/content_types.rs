@@ -135,53 +135,56 @@ fn taxonomies() -> &'static RwLock<Vec<Taxonomy>> {
 /// A registration that silently produces unreachable content is the worst
 /// outcome available: the plugin looks installed, the admin screens work, the
 /// items save — and every one of their URLs resolves to something else. Naming
-/// the collision at startup is the whole point.
+/// the collision at startup is the whole point, so the error says which field
+/// clashed and what already owns the segment.
 #[derive(Debug, PartialEq, Eq)]
-pub enum RegistrationError {
-    /// The segment is claimed by one of the application's own literal routes.
-    ReservedPath { field: &'static str, value: String },
-    /// The segment is claimed by a registered taxonomy's term archives.
-    TaxonomyBase { field: &'static str, value: String },
+pub struct RegistrationError {
+    /// The field whose value collided: `slug`, `archive_base`, `rewrite_base`.
+    pub field: &'static str,
+    /// The value it carried.
+    pub value: String,
+    /// What already owns that URL segment, in prose.
+    pub claimed_by: String,
 }
 
 impl std::fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ReservedPath { field, value } => write!(
-                f,
-                "`{field}` cannot be `{value}`: the application serves that path itself, \
-                 so the content registered under it would never be reachable"
-            ),
-            Self::TaxonomyBase { field, value } => write!(
-                f,
-                "`{field}` cannot be `{value}`: a registered taxonomy publishes its term \
-                 archives under that segment, and the resolver reaches those first"
-            ),
-        }
+        let Self {
+            field,
+            value,
+            claimed_by,
+        } = self;
+        write!(
+            f,
+            "`{field}` cannot be `{value}`: /{value} already means {claimed_by}, and the \
+             resolver reaches that first — content registered here would never be reachable"
+        )
     }
 }
 
 impl std::error::Error for RegistrationError {}
 
-/// Whether `segment` is already claimed by something the resolver reaches
-/// before custom post types.
-fn claim_on(field: &'static str, segment: &str) -> Result<(), RegistrationError> {
-    if crate::content::is_reserved_path(segment) {
-        return Err(RegistrationError::ReservedPath {
+/// Whether `segment` is free, given that `exclude` is the registration being
+/// added or replaced and so must not collide with itself.
+///
+/// Delegates to `content::segment_claim`, which is the single list of everything
+/// that can own a first URL segment — literal routes, year archives, taxonomy
+/// rewrite bases, custom type slugs and custom archive bases. Keeping a second
+/// list here is what let a taxonomy claim a base an existing post type already
+/// used.
+fn claim_on(
+    field: &'static str,
+    segment: &str,
+    exclude: &'static str,
+) -> Result<(), RegistrationError> {
+    match crate::content::segment_claim(segment, Some(exclude)) {
+        Some(claimed_by) => Err(RegistrationError {
             field,
             value: segment.to_owned(),
-        });
+            claimed_by,
+        }),
+        None => Ok(()),
     }
-    if all_taxonomies()
-        .iter()
-        .any(|taxonomy| taxonomy.rewrite_base == segment)
-    {
-        return Err(RegistrationError::TaxonomyBase {
-            field,
-            value: segment.to_owned(),
-        });
-    }
-    Ok(())
 }
 
 /// Register a custom post type. Call during startup, before the router is
@@ -210,9 +213,9 @@ pub fn register_post_type(post_type: PostType) -> Result<(), RegistrationError> 
     // permanently unreachable. Neither check can trip on the type's own
     // registration: they look at application routes and taxonomy bases, and a
     // post type is neither.
-    claim_on("slug", post_type.slug)?;
+    claim_on("slug", post_type.slug, post_type.slug)?;
     if post_type.has_archive {
-        claim_on("archive_base", post_type.archive_base)?;
+        claim_on("archive_base", post_type.archive_base, post_type.slug)?;
     }
 
     let mut types = post_types().write().expect("post type registry poisoned");
@@ -231,13 +234,12 @@ pub fn register_post_type(post_type: PostType) -> Result<(), RegistrationError> 
 /// reason.
 pub fn register_taxonomy(taxonomy: Taxonomy) -> Result<(), RegistrationError> {
     // Before the registry is touched, and for replacements too — see
-    // `register_post_type`.
-    if crate::content::is_reserved_path(taxonomy.rewrite_base) {
-        return Err(RegistrationError::ReservedPath {
-            field: "rewrite_base",
-            value: taxonomy.rewrite_base.to_owned(),
-        });
-    }
+    // `register_post_type`. Checked against the *whole* namespace rather than
+    // just the reserved-path list: a taxonomy whose base matches an already
+    // registered public post type's slug makes every one of that type's item
+    // URLs resolve as a term archive, because the resolver tries taxonomies
+    // first.
+    claim_on("rewrite_base", taxonomy.rewrite_base, taxonomy.slug)?;
 
     let mut taxes = taxonomies().write().expect("taxonomy registry poisoned");
     match taxes.iter_mut().find(|t| t.slug == taxonomy.slug) {

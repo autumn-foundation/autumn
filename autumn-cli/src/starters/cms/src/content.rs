@@ -139,6 +139,7 @@ pub async fn transition_status(
     conn: &mut AsyncPgConnection,
     post_id: i64,
     target: &str,
+    editor_id: Option<i64>,
 ) -> AutumnResult<Post> {
     let target = target.to_owned();
     conn.transaction(async move |conn| {
@@ -159,9 +160,16 @@ pub async fn transition_status(
         // Publishing, trashing, restoring and importing all land here, so
         // leaving it out made the flag cosmetic — the link was hidden while
         // the rows accumulated anyway.
+        //
+        // Attributed to whoever acted, when there is one. `None` is the
+        // scheduler and the seeder — paths with no user behind them, where the
+        // owner is the only honest answer.
         if type_supports_revisions(&post.post_type) {
-            post.record_revision(conn, &format!("Status: {} → {new_status}", post.status))
-                .await?;
+            let summary = format!("Status: {} → {new_status}", post.status);
+            match editor_id {
+                Some(actor) => post.record_revision_by(conn, &summary, actor).await?,
+                None => post.record_revision(conn, &summary).await?,
+            }
         }
 
         // Stamp the first publish date, and never move it afterwards — an
@@ -200,6 +208,7 @@ pub async fn restore_revision(
     conn: &mut AsyncPgConnection,
     post_id: i64,
     revision_id: i64,
+    editor_id: Option<i64>,
 ) -> AutumnResult<Post> {
     conn.transaction(async move |conn| {
         let revision: Revision = revisions::table
@@ -218,8 +227,11 @@ pub async fn restore_revision(
             .await
             .map_err(AutumnError::not_found)?;
 
-        post.record_revision(conn, &format!("Restored revision #{}", revision.id))
-            .await?;
+        let summary = format!("Restored revision #{}", revision.id);
+        match editor_id {
+            Some(actor) => post.record_revision_by(conn, &summary, actor).await?,
+            None => post.record_revision(conn, &summary).await?,
+        }
 
         // The restore replaces content only. Status is deliberately left
         // alone: restoring the text of a draft must not silently republish
@@ -724,26 +736,6 @@ pub async fn revisions_for(
         .await?)
 }
 
-/// The terms every post by `author_id` is filed under.
-///
-/// Collected *before* the author is deleted: `posts.author_id` cascades, which
-/// takes the `post_terms` rows with it, so afterwards there is nothing left to
-/// tell you which terms need rebuilding.
-pub async fn term_ids_for_author(
-    conn: &mut AsyncPgConnection,
-    author_id: i64,
-) -> AutumnResult<Vec<i64>> {
-    let mut ids: Vec<i64> = post_terms::table
-        .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
-        .filter(posts::author_id.eq(author_id))
-        .select(post_terms::term_id)
-        .load(&mut *conn)
-        .await?;
-    ids.sort_unstable();
-    ids.dedup();
-    Ok(ids)
-}
-
 /// Rebuild the published-post counts of the given terms.
 pub async fn recount_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     for term_id in term_ids {
@@ -935,9 +927,6 @@ pub async fn update_user(
 /// rebuild their counts — the cascade reaches `post_terms` and nothing in it
 /// maintains `terms.post_count`.
 pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> AutumnResult<()> {
-    // Collected before the delete: the cascade takes the `post_terms` rows
-    // with it, so afterwards nothing names the terms that need rebuilding.
-    let affected_terms = term_ids_for_author(conn, target_id).await?;
     // Deleting is a demotion to "no role at all", so it takes the same guard.
     // The recounts run inside the same transaction as the cascade: doing them
     // afterwards means a transient failure leaves the account and its posts
@@ -949,6 +938,32 @@ pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> Autumn
         crate::capabilities::Role::Subscriber,
         move |conn| {
             async move {
+                // The author's posts are locked before their filings are read,
+                // and both happen inside this transaction. Reading the term ids
+                // outside it left a window: an editor filing one of these posts
+                // under a new term in between had that `post_terms` row removed
+                // by the cascade while its term was absent from the list to
+                // rebuild, so the term kept a count of a post that no longer
+                // existed — and kept appearing in widgets and the sitemap on
+                // the strength of it.
+                //
+                // `FOR UPDATE` on the posts is what closes it: inserting a
+                // `post_terms` row takes `FOR KEY SHARE` on the post it
+                // references, and that conflicts, so a concurrent filing waits
+                // for this transaction rather than racing it.
+                let post_ids: Vec<i64> = posts::table
+                    .filter(posts::author_id.eq(target_id))
+                    .select(posts::id)
+                    .for_update()
+                    .load(conn)
+                    .await?;
+                let affected_terms: Vec<i64> = post_terms::table
+                    .filter(post_terms::post_id.eq_any(&post_ids))
+                    .select(post_terms::term_id)
+                    .distinct()
+                    .load(conn)
+                    .await?;
+
                 diesel::delete(users::table.find(target_id))
                     .execute(conn)
                     .await?;
@@ -1162,6 +1177,24 @@ pub async fn published_posts_in_period(
 /// This archive spans post types, so it filters on registered visibility as
 /// well as status — a `public: false` type has no public route, and a listing
 /// that renders its title and a body-derived excerpt is a public route.
+/// How many published, publicly-routable posts an account has.
+///
+/// The question `/author/<username>` has to ask before it renders anything: an
+/// account with no public content has no archive, and a 200 page for one
+/// discloses that the account exists.
+pub async fn published_post_count_by_author(
+    conn: &mut AsyncPgConnection,
+    author_id: i64,
+) -> AutumnResult<i64> {
+    Ok(posts::table
+        .filter(posts::author_id.eq(author_id))
+        .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(public_type_slugs()))
+        .count()
+        .get_result(conn)
+        .await?)
+}
+
 pub async fn published_posts_by_author(
     conn: &mut AsyncPgConnection,
     author_id: i64,
@@ -1246,6 +1279,13 @@ pub fn reads_as_date_archive(slug: &str) -> bool {
 /// suite's `every_reserved_prefix_has_a_literal_route` covers the same names
 /// from the other direction, so a route added without updating this list is
 /// visible there.
+///
+/// `category` and `tag` are deliberately absent: they are taxonomy rewrite
+/// bases, and `segment_claim` reads those from the registry. Listing them
+/// statically as well made the built-in taxonomies unable to re-register
+/// themselves (the static entry outranked the "not in conflict with yourself"
+/// rule), and covered only the two built-ins — a custom taxonomy's base was
+/// never reserved against a content slug at all.
 const RESERVED_PATHS: &[&str] = &[
     "admin",
     "api",
@@ -1262,14 +1302,89 @@ const RESERVED_PATHS: &[&str] = &[
     "static",
     "archives",
     "author",
-    "category",
-    "tag",
 ];
 
 /// Whether a slug would be shadowed by one of the application's own routes.
 #[must_use]
 pub fn is_reserved_path(slug: &str) -> bool {
     RESERVED_PATHS.contains(&slug)
+}
+
+/// Refuse a creation whose deferred transition would fail after the insert.
+///
+/// `private` and `future` are only reachable by transitioning a draft, so a
+/// creation asking for either saves a draft first and moves it afterwards. When
+/// the guard on that edge rejects, the draft is already committed — along with
+/// its initial revision and term assignments — so the request reports an error
+/// and leaves behind a row the caller never asked for, with each retry
+/// consuming another suffixed slug.
+///
+/// The guard depends only on the content being submitted, so asking first costs
+/// one comparison and makes the failure clean. Shared by the admin editor and
+/// the REST API, which had the same shape and were fixed one at a time.
+pub fn guard_deferred_transition(target_status: &str, title: &str) -> AutumnResult<()> {
+    if matches!(target_status, "private" | "future") && title.trim().is_empty() {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A {target_status} post must have a title"
+        )));
+    }
+    Ok(())
+}
+
+/// The post types addressed at the bare URL path rather than under a prefix of
+/// their own. Only these two compete for a bare slug, and only these two can be
+/// shadowed by a segment something else claims.
+const BARE_PATH_TYPES: &[&str] = &["post", "page"];
+
+/// What already owns a first URL segment, if anything does.
+///
+/// The one answer to "is this segment free?", because the question kept being
+/// asked in three places that each knew about a different subset: registration
+/// checked reserved paths and taxonomy bases, slug allocation checked reserved
+/// paths and year archives, and taxonomy registration checked reserved paths
+/// alone. Every combination the incomplete versions missed produced the same
+/// outcome — content that saves, appears in the admin, and is unreachable at
+/// its own canonical URL, permanently.
+///
+/// The order mirrors `permalinks::resolve`: whatever it tries first is what a
+/// URL actually means.
+///
+/// `exclude` is the registration being added or replaced, whose own segments
+/// must not count against it.
+#[must_use]
+pub fn segment_claim(segment: &str, exclude: Option<&str>) -> Option<String> {
+    if is_reserved_path(segment) {
+        return Some(format!("the application's own `/{segment}` route"));
+    }
+    if reads_as_date_archive(segment) {
+        return Some("a year archive".to_owned());
+    }
+    for taxonomy in crate::content_types::all_taxonomies() {
+        if taxonomy.rewrite_base == segment && exclude != Some(taxonomy.slug) {
+            return Some(format!("the `{}` taxonomy's term archives", taxonomy.slug));
+        }
+    }
+    for registered in crate::content_types::all_post_types() {
+        // `post` and `page` are skipped exactly as `permalinks::resolve` skips
+        // them: they own the bare paths rather than a prefix, so neither their
+        // slug nor their nominal `archive_base` claims a segment. `post` ships
+        // with `has_archive: true` and `archive_base: "post"`, so checking it
+        // here would reserve `/post` against content the resolver would in fact
+        // serve.
+        if !registered.public
+            || BARE_PATH_TYPES.contains(&registered.slug)
+            || exclude == Some(registered.slug)
+        {
+            continue;
+        }
+        if registered.slug == segment {
+            return Some(format!("the `{}` post type's items", registered.slug));
+        }
+        if registered.has_archive && registered.archive_base == segment {
+            return Some(format!("the `{}` post type's archive", registered.slug));
+        }
+    }
+    None
 }
 
 /// A slug that is free across every post type sharing the bare URL path.
@@ -1295,25 +1410,24 @@ pub async fn ensure_unique_slug(
     // requires uniqueness within a type. Returning early for custom types made
     // a second item with the same title fail with a constraint error instead of
     // getting the usual `-2`.
-    const BARE_PATH_TYPES: &[&str] = &["post", "page"];
     let competing_types: Vec<&str> = if BARE_PATH_TYPES.contains(&post_type) {
         BARE_PATH_TYPES.to_vec()
     } else {
         vec![post_type]
     };
 
-    // Two shapes are reserved because a literal route already owns the bare
-    // path they would mint, so content given one is unreachable at its own
-    // canonical URL:
-    //
-    //   * a four-digit slug, which the resolver reads as a year archive; and
-    //   * the names of the application's own literal routes.
+    // A bare-path slug that something else already owns is reserved, because
+    // the content given it would be unreachable at its own canonical URL.
+    // `segment_claim` is the whole list — literal routes, year archives,
+    // taxonomy rewrite bases, custom type slugs and custom archive bases —
+    // rather than the two shapes this used to know about, which left a post
+    // slugged `product` shadowed by a custom type's archive.
     //
     // Reserving is what keeps both features working. Falling back to content
     // when the archive or route "has nothing" would instead make `/2026` or
     // `/search` mean different things depending on what happens to exist.
-    let shadowed_by_a_route = BARE_PATH_TYPES.contains(&post_type)
-        && (reads_as_date_archive(desired) || is_reserved_path(desired));
+    let shadowed_by_a_route =
+        BARE_PATH_TYPES.contains(&post_type) && segment_claim(desired, None).is_some();
     let mut candidate = if shadowed_by_a_route {
         format!("{desired}-2")
     } else {
@@ -1834,7 +1948,30 @@ pub async fn publish_due_post(
 
 #[cfg(test)]
 mod slug_shape_tests {
-    use super::reads_as_date_archive;
+    use super::{reads_as_date_archive, segment_claim};
+
+    /// The namespace answer covers every branch `permalinks::resolve` tries
+    /// before it reaches bare post/page content — the whole point of having one
+    /// function rather than three partial lists.
+    #[test]
+    fn segment_claim_names_every_kind_of_owner() {
+        // A literal application route.
+        assert!(segment_claim("search", None).is_some());
+        assert!(segment_claim("feed", None).is_some());
+        // A year archive.
+        assert!(segment_claim("2026", None).is_some());
+        // A built-in taxonomy's rewrite base.
+        assert!(segment_claim("category", None).is_some());
+        assert!(segment_claim("tag", None).is_some());
+        // Nothing owns an ordinary word.
+        assert!(segment_claim("about", None).is_none());
+        // `post` and `page` share the bare path and claim no prefix, so they
+        // must not reserve their own names against content.
+        assert!(segment_claim("post", None).is_none());
+        assert!(segment_claim("page", None).is_none());
+        // A registration is never in conflict with itself.
+        assert!(segment_claim("category", Some("category")).is_none());
+    }
 
     #[test]
     fn only_a_lone_four_digit_slug_reads_as_a_year() {

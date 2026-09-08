@@ -688,6 +688,13 @@ pub async fn create(
         ));
     }
 
+    // Asked before anything is written. `private` and `future` are reached by
+    // transitioning the draft this creates, and that edge carries the
+    // `can_publish` guard — so a rejection after the insert left the draft, its
+    // initial revision and its term assignments committed, with each retry
+    // consuming another suffixed slug.
+    content::guard_deferred_transition(&status, &form.title)?;
+
     // The same parent validation the update path runs. Creation skipped it
     // before, so repeated creates could build a hierarchy deeper than the
     // permalink builder renders — producing a canonical URL that starts
@@ -747,7 +754,9 @@ pub async fn create(
     apply_terms(&repos, &created, &form).await?;
     if status == "future" || status == "private" {
         repos
-            .with_conn(async |conn| content::transition_status(conn, created.id, &status).await)
+            .with_conn(async |conn| {
+                content::transition_status(conn, created.id, &status, Some(user.id)).await
+            })
             .await?;
     }
     do_action(Action::PostSaved, created.id);
@@ -893,7 +902,9 @@ pub async fn update(
     // field write above — so an illegal edge is refused rather than persisted.
     if status != updated.status {
         repos
-            .with_conn(async |conn| content::transition_status(conn, id, &status).await)
+            .with_conn(async |conn| {
+                content::transition_status(conn, id, &status, Some(user.id)).await
+            })
             .await?;
         do_action(Action::PostTransitioned, id);
     }
@@ -1016,7 +1027,9 @@ pub async fn transition(
     }
 
     repos
-        .with_conn(async |conn| content::transition_status(conn, id, &query.to).await)
+        .with_conn(async |conn| {
+            content::transition_status(conn, id, &query.to, Some(user.id)).await
+        })
         .await?;
     do_action(Action::PostTransitioned, id);
 
@@ -1161,7 +1174,9 @@ pub async fn restore(
     }
 
     repos
-        .with_conn(async |conn| content::restore_revision(conn, id, revision_id).await)
+        .with_conn(async |conn| {
+            content::restore_revision(conn, id, revision_id, Some(user.id)).await
+        })
         .await?;
     do_action(Action::PostSaved, id);
     Ok(Redirect::to(&format!("/admin/content/{post_type}/{id}")).into_response())

@@ -3137,3 +3137,143 @@ async fn restoring_an_untitled_revision_onto_a_live_post_is_refused() {
         .json();
     assert_eq!(post["title"], serde_json::json!("Final Title"));
 }
+
+/// An account with nothing published has no author archive.
+///
+/// The `Some(author)` branch returned a 200 carrying the account's public name
+/// and profile, so on a site with open registration `/author/<username>`
+/// answered "does this person have an account here?" for anyone who asked —
+/// while `/api/v1/authors` already refused to list them.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_author_archive_needs_published_content() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+    create_post(&client, &owner, "Owner Post", "Body.", "publish").await;
+
+    // A second account that has published nothing.
+    sign_out(&client);
+    register(&client, "lurker").await;
+    sign_out(&client);
+
+    assert_eq!(
+        client.get("/author/lurker").send().await.status,
+        404,
+        "an account with no public content must not have an archive"
+    );
+    let unknown = client.get("/author/nobody-at-all").send().await;
+    assert_eq!(
+        unknown.status, 404,
+        "and it must be indistinguishable from an account that does not exist"
+    );
+
+    // The author who has published still has one.
+    client
+        .get("/author/owner")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Owner Post");
+}
+
+/// A refused deferred transition on the admin path persists nothing.
+///
+/// `private` and `future` are reached by transitioning the draft the editor
+/// creates, so a rejection after the insert left the draft, its initial
+/// revision and its term assignments committed — with each retry consuming
+/// another suffixed slug.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_admin_creation_persists_nothing() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for _ in 0..3 {
+        let refused = client
+            .post("/admin/content/post")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", ""),
+                ("slug", "sneaky"),
+                ("excerpt", ""),
+                ("body", "Should not persist."),
+                ("status", "private"),
+                ("password", ""),
+                ("tags", ""),
+                ("comment_status", "open"),
+            ]))
+            .send()
+            .await;
+        assert_eq!(refused.status, 422, "body: {}", refused.text());
+    }
+
+    let listing = client
+        .get("/admin/content/post")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        !listing.contains("Should not persist."),
+        "a refused creation must write nothing:\n{listing}"
+    );
+    sign_out(&client);
+    assert_eq!(client.get("/sneaky").send().await.status, 404);
+}
+
+/// A status transition is credited to whoever performed it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_transition_is_attributed_to_the_acting_editor() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+    let id = create_post(&client, &owner, "Awaiting Review", "Body.", "draft").await;
+
+    sign_out(&client);
+    let editor = register(&client, "editor").await;
+    client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "editor"),
+            ("email", "editor@example.com"),
+            ("display_name", "Editor"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The Editor publishes somebody else's draft.
+    client
+        .post(&format!("/admin/content/post/{id}/status?to=publish"))
+        .header("cookie", &editor)
+        .send()
+        .await
+        .assert_status(303);
+
+    let history = client
+        .get(&format!("/admin/content/post/{id}/revisions"))
+        .header("cookie", &owner)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        history.contains("draft → publish"),
+        "the transition must be in the history:\n{history}"
+    );
+    let transition_line = history
+        .split("draft → publish")
+        .nth(1)
+        .expect("text after the transition summary");
+    // The snapshot records the state *before* the transition, so its status is
+    // the one being left — `draft` — and its author is whoever acted.
+    assert!(
+        transition_line.starts_with(" · draft · by Editor"),
+        "the transition must be credited to the acting editor: {}",
+        &transition_line[..transition_line.len().min(80)]
+    );
+}
