@@ -203,8 +203,10 @@ fn seed_fixture(conn: &mut PgConnection) {
     .expect("seed measured viral post comments");
 
     // Real dead tuples: touch a slice of rows post-insert.
-    conn.batch_execute("UPDATE ledger_dd_comments SET body = body || ' (edited)' WHERE id % 11 = 0")
-        .expect("create dead tuples");
+    conn.batch_execute(
+        "UPDATE ledger_dd_comments SET body = body || ' (edited)' WHERE id % 11 = 0",
+    )
+    .expect("create dead tuples");
     conn.batch_execute("ANALYZE ledger_dd_posts")
         .expect("analyze posts");
     conn.batch_execute("ANALYZE ledger_dd_comments")
@@ -343,12 +345,11 @@ async fn repository_dependent_destroy_leaf_batch_profile() {
     // cascade doesn't touch rows outside the target post (result-equivalence
     // edge case: a sibling post's comments, including one with a NULL
     // `author`/`edited_at`, must survive byte-for-byte).
-    let sibling_checksum_before = diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM ledger_dd_comments WHERE post_id = 1",
-    )
-    .get_result::<CountRow>(&mut conn)
-    .expect("count sibling comments before")
-    .n;
+    let sibling_checksum_before =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM ledger_dd_comments WHERE post_id = 1")
+            .get_result::<CountRow>(&mut conn)
+            .expect("count sibling comments before")
+            .n;
 
     let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder(config).build().expect("pool");
@@ -405,12 +406,11 @@ async fn repository_dependent_destroy_leaf_batch_profile() {
         "exactly the target post's comments must be removed, no more, no less"
     );
 
-    let sibling_checksum_after = diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM ledger_dd_comments WHERE post_id = 1",
-    )
-    .get_result::<CountRow>(&mut conn)
-    .expect("count sibling comments after")
-    .n;
+    let sibling_checksum_after =
+        diesel::sql_query("SELECT COUNT(*) AS n FROM ledger_dd_comments WHERE post_id = 1")
+            .get_result::<CountRow>(&mut conn)
+            .expect("count sibling comments after")
+            .n;
     assert_eq!(
         sibling_checksum_before, sibling_checksum_after,
         "a sibling post's comments (including NULL author/edited_at rows) must survive untouched"
