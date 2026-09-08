@@ -339,6 +339,19 @@ pub fn max_labels_per_series() -> usize {
 /// way to change these. It is public for a binary that builds its own
 /// configuration, and for tests.
 ///
+/// # Instruments registered before `run`
+///
+/// `[metrics]` is read inside `AppBuilder::run`, so code in `main` that runs
+/// *ahead* of it registers under the defaults. `describe_*` and
+/// `set_histogram_buckets` are unaffected — they only stash, and their
+/// staging areas are bounded by [`MAX_INSTRUMENTS_CEILING`] rather than by
+/// the installed cap precisely so a raised `max_instruments` still collects
+/// them. But a metric actually **recorded** before `run` is registered under
+/// the default 256, and an inert handle handed out then stays inert: the
+/// caller already holds it, and no later raise can retroactively register it.
+/// An app that records more than 256 distinct metric names before its own
+/// `run` should call [`set_limits`] itself first.
+///
 /// # Semantics
 ///
 /// Limits are consulted at each decision, not baked in at registration, so a
@@ -405,9 +418,25 @@ struct Registry {
     /// Registered instruments keyed by metric name.
     instruments: RwLock<HashMap<Box<str>, Arc<Instrument>>>,
     /// Bucket bounds configured before their histogram was registered.
+    ///
+    /// Bounded by [`MAX_INSTRUMENTS_CEILING`], **not** by the installed
+    /// [`max_instruments`] — see [`Self::pending_help`].
     pending_buckets: RwLock<HashMap<Box<str>, Box<[f64]>>>,
     /// Help text recorded by `describe_*` before its instrument was
     /// registered, with the kind the description was written for.
+    ///
+    /// Bounded by [`MAX_INSTRUMENTS_CEILING`] rather than by the installed
+    /// [`max_instruments`], because these are staging areas rather than the
+    /// registry, and they fill *before the configuration is installed*. The
+    /// documented startup pattern calls `describe_*` and
+    /// `set_histogram_buckets` from `main` ahead of `AppBuilder::run`, which
+    /// is where `[metrics]` is applied — so bounding the staging area by the
+    /// running cap would silently discard the very descriptions an app that
+    /// raised `max_instruments` was entitled to keep, and no later raise can
+    /// bring back a stash that was never taken. The ceiling is still a hard
+    /// bound (that is what stops a call site generating unbounded names), and
+    /// what actually *registers* is still governed by the configured cap,
+    /// enforced in [`instrument`] at first use.
     pending_help: RwLock<PendingHelp>,
     /// Names already warned about, so a rejected name warns exactly once.
     warned_names: RwLock<HashSet<Box<str>>>,
@@ -474,7 +503,7 @@ impl Registry {
         {
             tracing::warn!(
                 metric = %sanitize_for_log(name),
-                cap = max_instruments(),
+                cap = MAX_INSTRUMENTS_CEILING,
                 "too many histograms have bucket bounds configured but were never registered; \
                  ignoring further `set_histogram_buckets` calls for unregistered names"
             );
@@ -487,7 +516,7 @@ impl Registry {
         if !self.pending_help_full_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 metric = %sanitize_for_log(name),
-                cap = max_instruments(),
+                cap = MAX_INSTRUMENTS_CEILING,
                 "too many app metrics have been described but were never registered; \
                  ignoring further `describe_*` calls for unregistered names"
             );
@@ -1330,7 +1359,7 @@ fn describe(name: &str, kind: InstrumentKind, help: &str) {
                     .pending_help
                     .write()
                     .unwrap_or_else(PoisonError::into_inner);
-                if pending.len() >= max_instruments() && !pending.contains_key(name) {
+                if pending.len() >= MAX_INSTRUMENTS_CEILING && !pending.contains_key(name) {
                     Description::Full
                 } else {
                     pending.insert(name.into(), (kind, help));
@@ -1414,7 +1443,7 @@ pub fn set_histogram_buckets(name: &str, upper_bounds: &[f64]) {
                 .pending_buckets
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            if pending.len() >= max_instruments() && !pending.contains_key(name) {
+            if pending.len() >= MAX_INSTRUMENTS_CEILING && !pending.contains_key(name) {
                 BucketOverride::Full
             } else {
                 pending.insert(name.into(), upper_bounds.into());
@@ -2583,6 +2612,47 @@ mod tests {
         assert_eq!(max_series_per_metric(), MAX_SERIES_PER_METRIC_CEILING);
         assert_eq!(max_instruments(), MAX_INSTRUMENTS_CEILING);
         assert_eq!(max_labels_per_series(), MAX_LABELS_PER_SERIES_CEILING);
+    }
+
+    #[test]
+    fn a_description_stashed_before_the_cap_is_raised_still_applies() {
+        // The documented startup pattern calls `describe_*` from `main`,
+        // *before* `AppBuilder::run` installs `[metrics]` (see
+        // `examples/bookmarks/src/main.rs`). A stash bounded by the running
+        // cap would drop those descriptions for an app that raised
+        // `max_instruments`, and no later raise can recover one that was
+        // never taken — so the staging area is bounded by the ceiling and
+        // this asserts the ordering end to end.
+        // Reproduces the drop: the stash must hold MORE than the default cap
+        // while that default is still the one in force, which is exactly the
+        // position an app raising `max_instruments` is in before `run`.
+        // Describing does not register, so this costs pending entries (bounded
+        // by the ceiling) and not registry slots — only the one name recorded
+        // at the end becomes an instrument.
+        let names: Vec<String> = (0..DEFAULT_MAX_INSTRUMENTS + 50)
+            .map(|_| unique_name("facade_describe_before_limits"))
+            .collect();
+        for name in &names {
+            describe_counter(name, "described before the config was installed");
+        }
+
+        // Now the config lands, raising the cap past what was described.
+        let _limits = LimitsGuard::raised_to(Limits {
+            max_instruments: DEFAULT_MAX_INSTRUMENTS + 256,
+            ..Limits::default()
+        });
+
+        // The last name is past the default cap, so a stash bounded by the
+        // running cap would have refused it and its HELP would be empty.
+        let last = names.last().expect("described at least one name");
+        counter(last).increment(1);
+
+        assert_eq!(
+            expect_instrument(last).help,
+            "described before the config was installed",
+            "a description stashed past the default cap, before the configured \
+             cap was installed, must still apply"
+        );
     }
 
     #[test]

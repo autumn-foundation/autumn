@@ -306,10 +306,19 @@ format rather than memory: name, label-value and help-text lengths, and bucket
 count. Raising those would not let an app express anything new — only emit a
 scrape body a stricter parser may reject.
 
-`[metrics]` is applied once, at startup, before anything can record. The
+`[metrics]` is applied by `AppBuilder::run`, before it builds anything. The
 effective values are readable at runtime through
 `autumn_web::metrics::max_series_per_metric()` and its two siblings, and appear
 on `/actuator/configprops`.
+
+Code in `main` that runs *ahead* of `.run()` therefore sees the defaults.
+`describe_*` and `set_histogram_buckets` are unaffected — they only stash, and
+their staging areas are bounded generously rather than by the running cap
+precisely so the startup pattern above keeps working when you raise
+`max_instruments`. But a metric actually **recorded** before `.run()` registers
+under the default 256, and an inert handle handed out then stays inert. If your
+app records more than 256 distinct metric names before its own `run`, call
+`metrics::set_limits` yourself first.
 
 Hitting the series cap logs **one** warning per instrument and is visible in the
 scrape itself, so you can alert on it:

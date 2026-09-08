@@ -97,6 +97,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   labeled sample the app records. `metrics::set_limits`, the programmatic entry
   point, has no boot to fail and clamps instead, warning when it does.
 
+  The `describe_*` / `set_histogram_buckets` staging areas are bounded by the
+  *ceiling* rather than by the running cap, because the documented startup
+  pattern fills them from `main` before `run` installs `[metrics]` — bounding
+  them by the running cap would silently discard exactly the descriptions an
+  app raising `max_instruments` was entitled to keep, and no later raise can
+  recover a stash that was never taken. What actually registers is still
+  governed by the configured cap.
+
   `metrics::{MAX_SERIES_PER_METRIC, MAX_INSTRUMENTS, MAX_LABELS_PER_SERIES}`
   are **deprecated, not removed** — they now read as
   `DEFAULT_MAX_SERIES_PER_METRIC` and friends, with
