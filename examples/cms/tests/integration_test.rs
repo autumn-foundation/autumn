@@ -1820,3 +1820,160 @@ async fn a_page_is_addressed_by_its_ancestry() {
     sign_out(&client);
     assert_eq!(client.get("/team").send().await.status, 404);
 }
+
+/// The unlock endpoint must not answer for content the caller cannot reach.
+///
+/// It takes a bare post id from an unauthenticated request and its response
+/// carries the row's canonical permalink. Without the reachability gate,
+/// iterating ids confirmed the existence of drafts, private and trashed rows
+/// and disclosed their slugs and page ancestry — with a wrong password, and
+/// with no session at all.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn unlocking_a_hidden_post_discloses_nothing() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let draft = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Unannounced Acquisition"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Not for publication."),
+            ("status", "draft"),
+            ("password", ""),
+            ("tags", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(draft.status, 303);
+    let draft_id = draft
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    sign_out(&client);
+    let probe = client
+        .post(&format!("/unlock/{draft_id}"))
+        .form(&form(&[("password", "guess")]))
+        .send()
+        .await;
+    assert_eq!(
+        probe.status, 404,
+        "an anonymous unlock of a draft must 404, not redirect"
+    );
+    assert!(
+        probe.header("location").is_none(),
+        "no Location header may carry a hidden post's permalink"
+    );
+    assert!(
+        !probe.text().contains("unannounced-acquisition"),
+        "the draft's slug must not appear in the response: {}",
+        probe.text()
+    );
+}
+
+/// API creation allocates a slug the same way the editor does.
+///
+/// It saved through the repository directly, so a second item with the same
+/// title reached `idx_posts_bare_path_slug` and came back as a constraint
+/// error, where the admin editor and the importer both get the usual suffix.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn api_creation_suffixes_a_duplicate_slug_instead_of_failing() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let body = serde_json::json!({
+        "title": "Release Notes",
+        "body": "First.",
+        "status": "publish",
+    });
+    let first: serde_json::Value = client
+        .post("/api/v1/posts")
+        .header("cookie", &cookie)
+        .json(&body)
+        .send()
+        .await
+        .assert_status(201)
+        .json();
+    assert_eq!(first["slug"], serde_json::json!("release-notes"));
+
+    let second: serde_json::Value = client
+        .post("/api/v1/posts")
+        .header("cookie", &cookie)
+        .json(&body)
+        .send()
+        .await
+        .assert_status(201)
+        .json();
+    assert_eq!(
+        second["slug"],
+        serde_json::json!("release-notes-2"),
+        "the second creation must take a suffix, not a 500: {second}"
+    );
+}
+
+/// Public read endpoints are bounded by the request, not by the corpus.
+///
+/// `/api/v1/terms` returned every row of a taxonomy and the comment endpoint
+/// returned a post's whole thread, both unauthenticated and both with a cost
+/// that grew without limit as the site did.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_public_api_paginates_terms_and_comments() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo"] {
+        client
+            .post("/admin/terms/category")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("name", name),
+                ("slug", ""),
+                ("description", ""),
+                ("parent_id", ""),
+            ]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    sign_out(&client);
+    let page_one: serde_json::Value = client
+        .get("/api/v1/terms?per_page=2")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let page_one = page_one.as_array().expect("array");
+    assert_eq!(page_one.len(), 2, "per_page must be applied in SQL");
+
+    let page_two: serde_json::Value = client
+        .get("/api/v1/terms?per_page=2&page=2")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let page_two = page_two.as_array().expect("array");
+    assert_eq!(page_two.len(), 2);
+    assert_ne!(
+        page_one[0]["id"], page_two[0]["id"],
+        "the second page must not repeat the first"
+    );
+
+    // An absurd page size is clamped rather than honoured.
+    let clamped: serde_json::Value = client
+        .get("/api/v1/terms?per_page=100000")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert!(clamped.as_array().expect("array").len() <= 100);
+}

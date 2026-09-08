@@ -42,13 +42,17 @@ pub async fn render_thread(
     let settings = repos.settings().await?;
     let viewer = repos.current_user(session).await?;
 
-    let rows: Vec<Comment> = repos
-        .comments
-        .find_by_post_id(post.id)
-        .await?
-        .into_iter()
-        .filter(|c| c.status == "approved")
-        .collect();
+    // Status filter and bound both in SQL. The generated `find_by_post_id`
+    // returns every row of every status, so filtering afterwards made a public
+    // page view cost the whole moderation queue — which, with guest comments
+    // on, anyone can grow.
+    let mut conn = repos.conn().await?;
+    let total = content::approved_comment_count(&mut conn, post.id).await?;
+    let rows: Vec<Comment> =
+        content::approved_comments_page(&mut conn, post.id, 0, content::MAX_THREAD_COMMENTS)
+            .await?;
+    drop(conn);
+    let truncated = total > i64::try_from(rows.len()).unwrap_or(i64::MAX);
 
     // Resolve account-backed display names once. A registered commenter renders
     // under their *current* public name; a guest renders under the name they
@@ -87,6 +91,15 @@ pub async fn render_thread(
                 p class="text-gray-500 text-sm mb-8" { "No comments yet." }
             } @else {
                 (render_nodes(&views, 0))
+            }
+
+            @if truncated {
+                p class="text-sm text-gray-500 mb-8" {
+                    "Showing the first "
+                    (autumn_web::format::pluralize(
+                        i64::try_from(sorted.len()).unwrap_or(0), "comment"))
+                    " of " (total) "."
+                }
             }
 
             @if may_comment {

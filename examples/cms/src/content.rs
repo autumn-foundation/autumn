@@ -1435,6 +1435,125 @@ pub async fn populated_terms(
         .await?)
 }
 
+/// One page of a taxonomy's terms, ordered by name, bounded in SQL.
+///
+/// The public terms endpoint is unauthenticated, so "return everything" makes
+/// its database, memory and response cost a function of the site's taxonomy
+/// size rather than of the request. The caller clamps `limit`; the offset and
+/// the limit are both applied by Postgres.
+pub async fn terms_page(
+    conn: &mut AsyncPgConnection,
+    taxonomy: &str,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<Term>> {
+    Ok(terms::table
+        .filter(terms::taxonomy.eq(taxonomy))
+        .order((terms::name.asc(), terms::id.asc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(Term::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// The most approved comments one rendered thread holds.
+///
+/// A public post's thread is served to anyone, and with guest comments enabled
+/// anyone can also grow it. Without a bound, a post that has accumulated tens
+/// of thousands of comments makes every single page view cost the whole set in
+/// database and application memory — and the pending, spam and trashed rows a
+/// moderation queue collects made it worse, because they were loaded and then
+/// discarded in Rust. The bound is generous enough that no real discussion
+/// reaches it, and the renderer says so when one does.
+pub const MAX_THREAD_COMMENTS: i64 = 200;
+
+/// A post's approved comments, oldest first, bounded.
+///
+/// Both the status filter and the bound are applied in SQL. Ordering oldest
+/// first is what makes truncation safe for threading: a reply is always created
+/// after the comment it replies to, so any comment inside the window has its
+/// parent inside the window too, and `assemble_thread` never drops a subtree
+/// because its root fell off the end.
+pub async fn approved_comments_page(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<Comment>> {
+    Ok(comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .order((comments::created_at.asc(), comments::id.asc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(Comment::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// How many approved comments a post has, counted in SQL.
+pub async fn approved_comment_count(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<i64> {
+    Ok(comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .count()
+        .get_result(conn)
+        .await?)
+}
+
+/// Publish one due scheduled post and rebuild its terms' counts — atomically.
+///
+/// Returns whether this call was the one that published it.
+///
+/// The two halves must commit together. Recounting afterwards and returning the
+/// error on failure does not make it retryable: the sweep selects only
+/// `status = 'future'`, so once the row is `publish` nothing ever revisits it
+/// and the counts stay wrong for good. Rolling the publication back instead
+/// leaves the post `future`, which the next sweep picks up and retries whole.
+///
+/// The `UPDATE` is guarded on the status *and* on the `published_at` the caller
+/// observed, so two replicas racing the sweep cannot both claim the post, and an
+/// editor who reschedules between the query and this call prevents publication
+/// rather than being overridden by it.
+pub async fn publish_due_post(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    observed_published_at: Option<chrono::NaiveDateTime>,
+    new_status: &str,
+) -> AutumnResult<bool> {
+    use diesel_async::AsyncConnection as _;
+
+    let new_status = new_status.to_owned();
+    conn.transaction(async |conn| {
+        let now = chrono::Utc::now().naive_utc();
+        let updated = diesel::update(
+            posts::table
+                .find(post_id)
+                .filter(posts::status.eq("future"))
+                .filter(posts::published_at.eq(observed_published_at))
+                .filter(posts::published_at.le(now)),
+        )
+        .set((posts::status.eq(&new_status), posts::updated_at.eq(now)))
+        .execute(conn)
+        .await?;
+
+        if updated == 0 {
+            return Ok(false);
+        }
+
+        // The post was `future` when its terms were last counted, so every
+        // term it is filed under excluded it. This is the moment it became
+        // public.
+        recount_terms_for_post(conn, post_id).await?;
+        Ok::<_, AutumnError>(true)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod slug_shape_tests {
     use super::reads_as_date_archive;

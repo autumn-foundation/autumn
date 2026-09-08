@@ -38,6 +38,42 @@ fn is_publicly_routable(post: &Post) -> bool {
     content_types::find_post_type(&post.post_type).is_some_and(|registered| registered.public)
 }
 
+/// Whether `viewer` may reach `post` at all: its registered type is public, and
+/// its status is either published or one this viewer has a reason to see.
+///
+/// Password protection is deliberately *not* part of this. An unlockable post
+/// is reachable — that is what lets it render a password form — so the password
+/// gate is a separate question asked after this one.
+///
+/// One predicate, two callers. `single_post` had this inline, and `unlock` —
+/// which takes a bare post id from an unauthenticated request — had none of it,
+/// so posting any existing id returned that row's canonical permalink in the
+/// `Location` header. Iterating ids confirmed the existence of drafts, private
+/// and trashed rows and disclosed their slugs and page ancestry, with a wrong
+/// password and no session at all.
+fn viewer_may_read(post: &Post, viewer: Option<&User>) -> bool {
+    if !is_publicly_routable(post) {
+        return false;
+    }
+    if post.is_public() {
+        return true;
+    }
+    match (viewer, post.status.as_str()) {
+        // A private post is readable by its author and by anyone holding
+        // `read_private_posts` — the WordPress rule.
+        (Some(user), "private") => {
+            user.id == post.author_id || user.role().can(Capability::ReadPrivatePosts)
+        }
+        // A draft, pending or scheduled post is previewable by someone who
+        // could edit it. Everyone else gets a 404 rather than a 403: a 403
+        // would confirm that unpublished content exists at that URL.
+        (Some(user), _) => {
+            crate::capabilities::can_edit_post(user.role(), user.id, post.author_id, &post.status)
+        }
+        (None, _) => false,
+    }
+}
+
 /// Query parameters every listing screen understands.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQueryParams {
@@ -508,32 +544,8 @@ async fn single_post(
     // type-aware branches. A type registered `public: false` has no public
     // route by definition, so no caller of this function should be able to
     // render one, whatever path it arrived by.
-    if !is_publicly_routable(&post) {
+    if !viewer_may_read(&post, viewer.as_ref()) {
         return not_found(repos, session, csrf).await;
-    }
-
-    // Visibility. `publish` is public; everything else needs a reason.
-    if !post.is_public() {
-        let allowed = match (&viewer, post.status.as_str()) {
-            // A private post is readable by its author and by anyone holding
-            // `read_private_posts` — the WordPress rule.
-            (Some(user), "private") => {
-                user.id == post.author_id || user.role().can(Capability::ReadPrivatePosts)
-            }
-            // A draft, pending or scheduled post is previewable by someone who
-            // could edit it. Everyone else gets a 404 rather than a 403: a 403
-            // would confirm that unpublished content exists at that URL.
-            (Some(user), _) => crate::capabilities::can_edit_post(
-                user.role(),
-                user.id,
-                post.author_id,
-                &post.status,
-            ),
-            (None, _) => false,
-        };
-        if !allowed {
-            return not_found(repos, session, csrf).await;
-        }
     }
 
     let terms = repos.post_terms(post.id).await?;
@@ -649,7 +661,15 @@ pub struct UnlockForm {
     pub password: String,
 }
 
+// Unauthenticated, and every request is one password guess. The shipped
+// configuration has no global limiter, so without a per-route bound a client
+// that has picked up the (reusable) CSRF token can guess a content password as
+// fast as it can open connections — and the redirect target starts serving the
+// body on success, which is a free oracle telling it when to stop. The key is
+// the client address rather than the post id so that spreading the attack
+// across many protected posts does not buy a fresh budget for each.
 #[post("/unlock/{id}")]
+#[throttle(limit = 10, per = "1m", key = "ip")]
 pub async fn unlock(
     repos: Repos,
     session: Session,
@@ -661,6 +681,16 @@ pub async fn unlock(
         .find_by_id(id)
         .await?
         .ok_or_else(|| AutumnError::not_found_msg("No such post"))?;
+
+    // The same reachability gate `single_post` applies, and for the same
+    // reason: the response carries the row's canonical permalink, so answering
+    // for a row this viewer could not have loaded discloses the slug and page
+    // ancestry of hidden content to anyone willing to iterate ids.
+    let viewer = repos.current_user(&session).await?;
+    if !viewer_may_read(&post, viewer.as_ref()) {
+        return Err(AutumnError::not_found_msg("No such post"));
+    }
+
     let settings = repos.settings().await?;
 
     // A wrong password simply does not unlock; the redirect re-renders the form.

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::capabilities::Capability;
 use crate::content_types;
 use crate::models::{NewPost, Post};
-use crate::repositories::{CommentRepository as _, PostRepository as _, TermRepository as _};
+use crate::repositories::PostRepository as _;
 
 use super::site::Repos;
 
@@ -234,9 +234,13 @@ pub async fn create_post(
         status.clone()
     };
 
+    // Through the shared allocator, not a direct save: `idx_posts_bare_path_slug`
+    // and `idx_posts_type_slug` make slug uniqueness the database's invariant,
+    // so an API client creating a second item with an existing title hit a
+    // constraint error where the admin editor and the importer get the usual
+    // `-2` suffix.
     let created = repos
-        .posts
-        .save(&NewPost {
+        .save_post_with_unique_slug(NewPost {
             post_type: registered.slug.to_owned(),
             title: body.title,
             slug: body.slug,
@@ -280,6 +284,19 @@ pub struct TermView {
 pub struct TermQuery {
     #[serde(default)]
     pub taxonomy: Option<String>,
+    #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub per_page: Option<usize>,
+}
+
+/// The pagination half of a query string, for endpoints that need nothing else.
+#[derive(Debug, Default, Deserialize)]
+pub struct PageQuery {
+    #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub per_page: Option<usize>,
 }
 
 /// `GET /api/v1/terms`.
@@ -294,7 +311,13 @@ pub async fn list_terms(
             "Unknown taxonomy `{taxonomy}`"
         )));
     }
-    let terms = repos.terms.find_by_taxonomy(taxonomy).await?;
+    // Clamped and applied in SQL. The generated `find_by_taxonomy` is
+    // unbounded, so an unauthenticated request against a large taxonomy
+    // materialized and serialized every row of it.
+    let per_page = i64::try_from(query.per_page.unwrap_or(50).clamp(1, 100)).unwrap_or(50);
+    let offset = i64::try_from(query.page.unwrap_or(1).max(1) - 1).unwrap_or(0) * per_page;
+    let mut conn = repos.conn().await?;
+    let terms = crate::content::terms_page(&mut conn, &taxonomy, offset, per_page).await?;
     Ok(Json(
         terms
             .iter()
@@ -329,6 +352,7 @@ pub struct CommentView {
 pub async fn list_comments(
     repos: Repos,
     Path(id): Path<i64>,
+    Query(query): Query<PageQuery>,
 ) -> AutumnResult<Json<Vec<CommentView>>> {
     // Only for content the public can see — otherwise the comment endpoint
     // would leak the existence of, and the discussion on, an unpublished post.
@@ -347,9 +371,14 @@ pub async fn list_comments(
         return Err(AutumnError::not_found_msg("No such post"));
     }
 
-    let mut rows = repos.comments.find_by_post_id(id).await?;
-    rows.retain(|c| c.status == "approved");
-    rows.sort_by_key(|c| (c.created_at, c.id));
+    // Status filter, ordering and bound all in SQL. The generated
+    // `find_by_post_id` returns every row of every status, so retaining in Rust
+    // made this unauthenticated endpoint cost the post's whole moderation
+    // queue — which, with guest comments enabled, anyone can grow.
+    let per_page = i64::try_from(query.per_page.unwrap_or(50).clamp(1, 100)).unwrap_or(50);
+    let offset = i64::try_from(query.page.unwrap_or(1).max(1) - 1).unwrap_or(0) * per_page;
+    let mut conn = repos.conn().await?;
+    let rows = crate::content::approved_comments_page(&mut conn, id, offset, per_page).await?;
 
     Ok(Json(
         rows.iter()

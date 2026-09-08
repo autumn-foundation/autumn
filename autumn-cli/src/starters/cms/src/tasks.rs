@@ -65,45 +65,24 @@ pub async fn publish_scheduled(state: AppState) -> AutumnResult<()> {
         // an editor who reschedules a post to a later date — between the query
         // and this update, leaving it `future` — have it published early
         // anyway, which is the one thing scheduling is for.
-        let updated = diesel::update(
-            posts::table
-                .find(post.id)
-                .filter(posts::status.eq("future"))
-                .filter(posts::published_at.eq(post.published_at))
-                .filter(posts::published_at.le(now)),
-        )
-        .set((
-            posts::status.eq(&new_status),
-            posts::updated_at.eq(chrono::Utc::now().naive_utc()),
-        ))
-        .execute(&mut conn)
-        .await?;
+        // The status change and the term recount commit together.
+        //
+        // Returning the recount error was not enough — the previous attempt at
+        // this. Once the row is `publish`, no later sweep selects it (the query
+        // above filters `status = 'future'`), so there is nothing left to retry
+        // and the counts stay wrong permanently while the task reports failure.
+        // Only atomicity actually fixes it: if the recount fails, the
+        // publication rolls back with it and the next sweep sees the post as
+        // `future` again and tries the whole thing afresh.
+        //
+        // The `UPDATE` is guarded on the status and on the `published_at` the
+        // query observed, so two replicas racing this sweep cannot both claim
+        // the post, and an editor who reschedules in between prevents it.
+        let updated =
+            crate::content::publish_due_post(&mut conn, post.id, post.published_at, &new_status)
+                .await?;
 
-        if updated > 0 {
-            // The post was `future` when its terms were last counted, so every
-            // term it is filed under excluded it. This is the moment it became
-            // public, and the guarded `UPDATE` above is deliberately not
-            // `transition_status` (which recounts), so recount here or every
-            // affected archive shows a count one short of what it lists.
-            //
-            // A failure here is returned, not logged and dropped. The row is
-            // already `publish`, so no later sweep selects it again —
-            // swallowing the error would leave those counts wrong permanently
-            // with the task reporting success. Returning it lets the
-            // scheduler retry the whole sweep, which is idempotent: the
-            // guarded update matches nothing for rows already published, and a
-            // recount assigns rather than increments.
-            if let Err(error) =
-                crate::content::recount_terms_for_post_public(&mut conn, post.id).await
-            {
-                autumn_web::reexports::tracing::error!(
-                    post_id = post.id,
-                    %error,
-                    "published a scheduled post but could not rebuild its term counts; \
-                     failing the sweep so it is retried"
-                );
-                return Err(error);
-            }
+        if updated {
             autumn_web::reexports::tracing::info!(
                 post_id = post.id,
                 slug = %post.slug,
