@@ -15,7 +15,8 @@ use crate::capabilities::Capability;
 use crate::content;
 use crate::models::{NewPost, NewTerm};
 use crate::repositories::{
-    PostMetaRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
+    AttachmentRepository as _, PostMetaRepository as _, PostRepository as _, TermRepository as _,
+    UserRepository as _,
 };
 use crate::require_capability;
 
@@ -32,6 +33,11 @@ pub struct Export {
     pub exported_at: chrono::DateTime<chrono::Utc>,
     pub terms: Vec<ExportTerm>,
     pub posts: Vec<ExportPost>,
+    /// Attachment metadata rows. Defaulted so a version-2 file still imports:
+    /// unlike `password`, whose absence would silently *unprotect* content,
+    /// an absent media list means only that there is no media to restore.
+    #[serde(default)]
+    pub attachments: Vec<ExportAttachment>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,6 +92,39 @@ pub struct ExportPost {
     /// Term slugs, qualified by taxonomy.
     #[serde(default)]
     pub terms: Vec<ExportTermRef>,
+    /// The featured image's **slug**, for the same reason `author` and `parent`
+    /// are slugs: an attachment id means nothing in another database. Without
+    /// it a restore silently dropped every featured image, and the association
+    /// was unrecoverable even with the blob store backed up.
+    #[serde(default)]
+    pub featured_media: Option<String>,
+}
+
+/// An attachment's metadata row.
+///
+/// The bytes are not in here and cannot be: a blob lives in the blob store,
+/// which is backed up separately (it is object storage in a real deployment).
+/// What the export carries is the row that gives those bytes a name, a type and
+/// an accessible description — without it a restored site cannot resolve
+/// `/media/{slug}` at all, so the separately-backed-up blob has nothing
+/// pointing at it. With it, restoring the store's contents is enough to make
+/// the media whole.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportAttachment {
+    pub slug: String,
+    pub title: String,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub byte_size: i64,
+    #[serde(default)]
+    pub width: Option<i32>,
+    #[serde(default)]
+    pub height: Option<i32>,
+    #[serde(default)]
+    pub alt_text: String,
+    #[serde(default)]
+    pub caption: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -106,7 +145,16 @@ fn default_comment_status() -> String {
 /// fields missing, which is what makes the password's presence an invariant
 /// rather than something the restore path has to guess at — a version-1 file's
 /// protected posts would otherwise have been restored as public.
-pub const EXPORT_VERSION: u32 = 2;
+///
+/// Bumped to 3 for `attachments` and `ExportPost::featured_media`. Version 2 is
+/// still *read*, because that addition is not the same kind of change: a
+/// missing password would have silently unprotected content, whereas a missing
+/// media list only means there is none to restore. Refusing version 2 outright
+/// would strand backups for no safety gain.
+pub const EXPORT_VERSION: u32 = 3;
+
+/// The versions this site can read.
+const READABLE_EXPORT_VERSIONS: &[u32] = &[2, 3];
 
 #[get("/admin/tools")]
 pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
@@ -135,7 +183,7 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                     (csrf.input())
                     label for="payload" class="sr-only" { "Export JSON" }
                     textarea #payload name="payload" rows="8" required
-                             placeholder="{\"version\": 2, …}"
+                             placeholder="{\"version\": 3, …}"
                              class="w-full border rounded px-3 py-2 font-mono text-xs" {}
                     button type="submit"
                            class="px-4 py-2 border rounded bg-white hover:bg-gray-50" {
@@ -212,6 +260,18 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 None => None,
             };
             let assigned = repos.post_terms(post.id).await?;
+            // The featured image by slug, resolved now while the ids still mean
+            // something in this database.
+            let featured_media = match post.featured_media_id {
+                Some(media_id) => repos
+                    .attachments
+                    .find_by_id(media_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|attachment| attachment.slug),
+                None => None,
+            };
             posts.push(ExportPost {
                 post_type: post.post_type.clone(),
                 title: post.title.clone(),
@@ -231,8 +291,26 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                         slug: t.slug.clone(),
                     })
                     .collect(),
+                featured_media,
             });
         }
+    }
+
+    // Metadata only — the bytes live in the blob store, which is backed up
+    // separately. Carrying the rows is what lets a restore resolve
+    // `/media/{slug}` and re-attach featured images once those bytes are back.
+    let mut attachments = Vec::new();
+    for attachment in repos.attachments.find_all().await? {
+        attachments.push(ExportAttachment {
+            slug: attachment.slug.clone(),
+            title: attachment.title.clone(),
+            mime_type: attachment.mime_type.clone(),
+            byte_size: attachment.byte_size,
+            width: attachment.width,
+            height: attachment.height,
+            alt_text: attachment.alt_text.clone(),
+            caption: attachment.caption.clone(),
+        });
     }
 
     let payload = Export {
@@ -241,6 +319,7 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
         exported_at: chrono::Utc::now(),
         terms,
         posts,
+        attachments,
     };
 
     let body = serde_json::to_vec_pretty(&payload)
@@ -284,9 +363,9 @@ pub async fn import(
 
     let payload: Export = serde_json::from_str(&form.payload)
         .map_err(|err| AutumnError::unprocessable_msg(format!("Not a valid export file: {err}")))?;
-    if payload.version != EXPORT_VERSION {
+    if !READABLE_EXPORT_VERSIONS.contains(&payload.version) {
         return Err(AutumnError::unprocessable_msg(format!(
-            "This export is version {}; this site reads version {EXPORT_VERSION}",
+            "This export is version {}; this site reads {READABLE_EXPORT_VERSIONS:?}",
             payload.version
         )));
     }
@@ -342,6 +421,48 @@ pub async fn import(
                 )
                 .await?;
         }
+    }
+
+    // Attachment metadata first, so posts can reference it. Matched by slug —
+    // the same "ids mean nothing across installations" rule the author and
+    // parent references follow. A row already present is left alone rather than
+    // overwritten: the site's own metadata is more current than the file's.
+    //
+    // The blob is deliberately absent. The bytes live in the blob store and are
+    // backed up with it; restoring the row is what gives those bytes something
+    // to be found by, and `Attachment::blob()` already answers `None` for a row
+    // whose file has not been restored yet, so `/media/{slug}` degrades to a
+    // 404 on the file rather than an error on the page.
+    let mut media_ids: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for attachment in &payload.attachments {
+        let existing = repos
+            .attachments
+            .find_by_slug(attachment.slug.clone())
+            .await?
+            .into_iter()
+            .next();
+        let id = match existing {
+            Some(found) => found.id,
+            None => {
+                repos
+                    .attachments
+                    .save(&crate::models::NewAttachment {
+                        title: attachment.title.clone(),
+                        slug: attachment.slug.clone(),
+                        file: None,
+                        mime_type: attachment.mime_type.clone(),
+                        byte_size: attachment.byte_size,
+                        width: attachment.width,
+                        height: attachment.height,
+                        alt_text: attachment.alt_text.clone(),
+                        caption: attachment.caption.clone(),
+                        uploader_id: Some(user.id),
+                    })
+                    .await?
+                    .id
+            }
+        };
+        media_ids.insert(attachment.slug.clone(), id);
     }
 
     // Every `(post_type, source slug)` a previous run of this importer recorded.
@@ -409,7 +530,23 @@ pub async fn import(
                 status: "draft".to_owned(),
                 author_id,
                 parent_id: None,
-                featured_media_id: None,
+                // Resolved against the media restored above, falling back to a
+                // row already on this site with that slug — importing into a
+                // populated site should re-attach to the image that is already
+                // there rather than dropping the association.
+                featured_media_id: match &post.featured_media {
+                    Some(slug) => match media_ids.get(slug) {
+                        Some(id) => Some(*id),
+                        None => repos
+                            .attachments
+                            .find_by_slug(slug.clone())
+                            .await?
+                            .into_iter()
+                            .next()
+                            .map(|attachment| attachment.id),
+                    },
+                    None => None,
+                },
                 menu_order: 0,
                 comment_status: post.comment_status.clone(),
                 password: post.password.clone(),

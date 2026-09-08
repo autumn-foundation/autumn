@@ -158,6 +158,15 @@ pub async fn upload(
                 alt_text = String::from_utf8_lossy(&raw).trim().to_owned();
             }
             Some("file") => {
+                // Refused *before* the body is read, so a second file part
+                // costs nothing. Overwriting `stored` instead left the earlier
+                // blob in the store with no attachment row pointing at it:
+                // unreachable from the media library, undeletable through the
+                // UI, and repeatable — an Author could fill local disk or an S3
+                // bucket a few hundred megabytes at a time.
+                if stored.is_some() {
+                    return Err(AutumnError::unprocessable_msg("Upload one file at a time"));
+                }
                 filename = field.file_name().unwrap_or("upload").to_owned();
                 mime_type = field.content_type().unwrap_or("").to_owned();
                 if !ALLOWED_MIME.contains(&mime_type.as_str()) {

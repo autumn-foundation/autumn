@@ -139,12 +139,14 @@ fn taxonomies() -> &'static RwLock<Vec<Taxonomy>> {
 /// clashed and what already owns the segment.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RegistrationError {
-    /// The field whose value collided: `slug`, `archive_base`, `rewrite_base`.
+    /// The field whose value was rejected: `slug`, `archive_base`,
+    /// `rewrite_base`.
     pub field: &'static str,
     /// The value it carried.
     pub value: String,
-    /// What already owns that URL segment, in prose.
-    pub claimed_by: String,
+    /// Why it was rejected — what already owns that URL segment, or what makes
+    /// the value unusable as one.
+    pub reason: String,
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -152,14 +154,36 @@ impl std::fmt::Display for RegistrationError {
         let Self {
             field,
             value,
-            claimed_by,
+            reason,
         } = self;
         write!(
             f,
-            "`{field}` cannot be `{value}`: /{value} already means {claimed_by}, and the \
-             resolver reaches that first — content registered here would never be reachable"
+            "`{field}` cannot be `{value}`: {reason} — content registered here would \
+             never be reachable"
         )
     }
+}
+
+/// Whether a value is usable as a single URL path segment.
+///
+/// The resolver matches a custom type's items as exactly two lowercased
+/// segments whose first equals the registered slug, and the generator writes
+/// the slug verbatim. So `press/release` mints `/press/release/<item>` that
+/// nothing resolves, and `Product` mints `/Product/<item>` that the lowercased
+/// match never sees. Both register happily today and produce content that is
+/// unreachable for good — the same failure the collision check exists to
+/// prevent, arriving by a different route.
+fn segment_shape_problem(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return Some("a URL segment cannot be empty".to_owned());
+    }
+    if value != autumn_web::slugify(value) {
+        return Some(format!(
+            "it is not a normalized URL segment (try `{}`)",
+            autumn_web::slugify(value)
+        ));
+    }
+    None
 }
 
 impl std::error::Error for RegistrationError {}
@@ -177,11 +201,22 @@ fn claim_on(
     segment: &str,
     exclude: crate::content::Registration<'_>,
 ) -> Result<(), RegistrationError> {
+    // Shape first: a value that cannot be a URL segment at all is a different
+    // and more basic problem than one that collides with something.
+    if let Some(reason) = segment_shape_problem(segment) {
+        return Err(RegistrationError {
+            field,
+            value: segment.to_owned(),
+            reason,
+        });
+    }
     match crate::content::segment_claim(segment, Some(exclude)) {
         Some(claimed_by) => Err(RegistrationError {
             field,
             value: segment.to_owned(),
-            claimed_by,
+            reason: format!(
+                "/{segment} already means {claimed_by}, and the resolver reaches that first"
+            ),
         }),
         None => Ok(()),
     }
@@ -321,6 +356,28 @@ mod tests {
         assert!(!page.has_archive);
         // A page has no comment thread by default, matching WordPress.
         assert!(!page.supports_comments);
+    }
+
+    /// A registration whose slug cannot be a URL segment is refused.
+    ///
+    /// The collision check answered "is this segment taken?" and never "is this
+    /// a segment at all". `press/release` mints `/press/release/<item>`, which
+    /// the resolver — matching exactly two segments — never sees, and `Product`
+    /// mints `/Product/<item>`, which its lowercased match never sees. Both
+    /// registered happily and produced permanently unreachable content, the
+    /// same outcome the collision check exists to prevent.
+    #[test]
+    fn registration_refuses_a_value_that_is_not_a_url_segment() {
+        for bad in ["press/release", "Product", "", "a b", "café"] {
+            let outcome = register_post_type(PostType::new(bad, "Item", "Items"));
+            assert!(
+                outcome.is_err(),
+                "`{bad}` is not a usable URL segment and must be refused"
+            );
+        }
+        // A well-formed one still registers, and can be re-registered.
+        assert!(register_post_type(PostType::new("gadget", "Gadget", "Gadgets")).is_ok());
+        assert!(register_post_type(PostType::new("gadget", "Gadget", "Gadgets")).is_ok());
     }
 
     #[test]

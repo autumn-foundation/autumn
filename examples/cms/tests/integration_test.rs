@@ -3511,3 +3511,206 @@ async fn search_results_render_pagination() {
     assert!(html.contains("← Newer"), "the second page must link back");
     assert!(html.contains("Page 2 of 3"), "and say where it is:\n{html}");
 }
+
+/// An absurd page number is bounded, not an overflow.
+///
+/// `page` is an unbounded `usize` from the query string and the offset is
+/// `(page - 1) * per_page`, so `?page=18446744073709551615` overflows: a panic
+/// under overflow checks (which is what a debug build, and this test, uses) and
+/// a wrapped, unrelated page in release.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_absurd_page_number_does_not_overflow() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Only Post", "Body.", "publish").await;
+
+    sign_out(&client);
+    for path in [
+        "/?page=18446744073709551615",
+        "/?page=9223372036854775808",
+        "/search?s=body&page=18446744073709551615",
+        "/api/v1/posts?page=18446744073709551615",
+        "/api/v1/terms?page=18446744073709551615",
+        "/api/v1/authors?page=18446744073709551615",
+    ] {
+        let resp = client.get(path).send().await;
+        assert!(
+            resp.status.is_success(),
+            "`{path}` must be bounded rather than overflow, got {}",
+            resp.status
+        );
+    }
+}
+
+/// A second `file` part is refused rather than orphaning a blob.
+///
+/// Every `file` field was written to the blob store but only the last got an
+/// attachment row, so the earlier objects were unreachable from the media
+/// library and undeletable through the UI — repeatable, so an Author could
+/// consume storage indefinitely.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_second_file_part_is_refused() {
+    // This is the one test that needs a blob store, so it builds its own app
+    // rather than making every other test carry one.
+    let db = TestDb::shared().await;
+    let _ = db_client().await; // migrate + truncate through the shared path
+    // A plain temp directory rather than a `tempfile` dev-dependency: the
+    // starter ships its own `Cargo.toml.tmpl`, so a new dev-dependency here
+    // would have to be added there too or the scaffolded project would not
+    // build its tests.
+    let uploads = std::env::temp_dir().join(format!(
+        "cms-upload-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&uploads).expect("create the blob store root");
+    let mut config = AutumnConfig::default();
+    config.security.csrf.enabled = false;
+    config.security.submit_token.enabled = false;
+    // `TestApp` does not run the storage preflight that `App::run` does, so the
+    // store is mounted onto the state directly.
+    let store = autumn_web::storage::LocalBlobStore::new(
+        "default".to_owned(),
+        uploads.clone(),
+        "/_blobs".to_owned(),
+        std::time::Duration::from_secs(900),
+        autumn_web::storage::local::SigningKey::new(b"cms-upload-test-key".to_vec()),
+        Vec::new(),
+    )
+    .expect("local blob store");
+    let client = TestApp::new()
+        .routes(app_routes())
+        .config(config)
+        .with_db(db.pool())
+        .state_initializer(move |state| {
+            state.insert_extension::<autumn_web::storage::BlobStoreState>(
+                autumn_web::storage::BlobStoreState::new(std::sync::Arc::new(store)),
+            );
+        })
+        .build();
+    let cookie = register(&client, "owner").await;
+
+    let boundary = "----cmsboundary";
+    let part = |name: &str, body: &str| {
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"{name}\"\r\nContent-Type: text/plain\r\n\r\n{body}\r\n"
+        )
+    };
+    let payload = format!(
+        "{}{}--{boundary}--\r\n",
+        part("one.txt", "first"),
+        part("two.txt", "second")
+    );
+
+    let refused = client
+        .post("/admin/media")
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(payload)
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "a second file part must be refused: {}",
+        refused.text()
+    );
+
+    // Nothing was recorded, so nothing was stored under a row-less key either.
+    let library = client
+        .get("/admin/media")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(!library.contains("one.txt"));
+    assert!(!library.contains("two.txt"));
+}
+
+/// A featured image survives an export round trip.
+///
+/// The export carried no attachment reference, so a restore silently dropped
+/// every featured image — and without the metadata rows, body links to
+/// `/media/{slug}` had nothing to resolve against either.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_export_round_trip_keeps_featured_media() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // An attachment and a post that features it. Written directly because a
+    // multipart upload is not what this test is about.
+    let db = TestDb::shared().await;
+    try_execute(
+        db,
+        "INSERT INTO attachments (title, slug, mime_type, byte_size, alt_text, caption) \
+         VALUES ('Cover', 'cover-image', 'image/png', 1234, 'A cover', '')",
+    )
+    .await
+    .expect("insert attachment");
+    let id = create_post(&client, &cookie, "Illustrated", "Body.", "publish").await;
+    try_execute(
+        db,
+        &format!(
+            "UPDATE posts SET featured_media_id = (SELECT id FROM attachments \
+             WHERE slug = 'cover-image') WHERE id = {id}"
+        ),
+    )
+    .await
+    .expect("attach the image");
+
+    // The export carries both halves.
+    let exported = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let payload: serde_json::Value = serde_json::from_str(&exported).expect("valid export JSON");
+    assert_eq!(payload["version"], serde_json::json!(3));
+    assert_eq!(
+        payload["attachments"][0]["slug"],
+        serde_json::json!("cover-image")
+    );
+    let post = payload["posts"]
+        .as_array()
+        .expect("posts")
+        .iter()
+        .find(|p| p["slug"] == serde_json::json!("illustrated"))
+        .expect("the post is in the export");
+    assert_eq!(post["featured_media"], serde_json::json!("cover-image"));
+
+    // Importing it into a site that has neither restores both and re-attaches.
+    let fresh = db_client().await;
+    let cookie = register(&fresh, "owner").await;
+    fresh
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", exported.as_str())]))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    let editor = fresh
+        .get("/admin/content/post/1")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        editor.contains("cover-image") || editor.contains("Cover"),
+        "the restored post must still name its featured image:\n{editor}"
+    );
+}

@@ -127,15 +127,31 @@ pub struct ListQueryParams {
     pub s: Option<String>,
 }
 
+/// The highest page number any paginated screen will honour.
+///
+/// `page` arrives from the query string as an unbounded `usize`, and
+/// `(page - 1) * per_page` overflows long before a real corpus does:
+/// `/?page=18446744073709551615` panics a build with overflow checks and wraps
+/// in release, where it can return an unrelated page. Clamping rather than
+/// erroring keeps an absurd request cheap and boring — it lands past the end
+/// and renders "nothing here" — and bounds the arithmetic everywhere the page
+/// number is used, including the "Page N of M" label.
+pub const MAX_PAGE: usize = 100_000;
+
 impl ListQueryParams {
     /// The zero-based offset for the requested page.
     fn offset(&self, per_page: i64) -> usize {
-        let page = self.page.unwrap_or(1).max(1);
-        (page - 1) * usize::try_from(per_page.max(1)).unwrap_or(10)
+        let per_page = usize::try_from(per_page.max(1)).unwrap_or(10);
+        // Clamped *and* saturating: the clamp keeps the number meaningful, the
+        // saturating multiply means no future change to either bound can make
+        // this overflow again.
+        self.page_number()
+            .saturating_sub(1)
+            .saturating_mul(per_page)
     }
 
     fn page_number(&self) -> usize {
-        self.page.unwrap_or(1).max(1)
+        self.page.unwrap_or(1).clamp(1, MAX_PAGE)
     }
 }
 

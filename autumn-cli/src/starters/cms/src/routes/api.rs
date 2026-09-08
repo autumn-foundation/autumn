@@ -17,6 +17,16 @@ use crate::repositories::PostRepository as _;
 
 use super::site::Repos;
 
+/// The requested page, clamped to something the offset arithmetic can hold.
+///
+/// `page` is an unbounded `usize` from the query string, and multiplying it by
+/// a page size overflows long before a real corpus does — a panic under
+/// overflow checks, a wrapped and unrelated page in release. See
+/// `front::MAX_PAGE`.
+fn clamped_page(page: Option<usize>) -> usize {
+    page.unwrap_or(1).clamp(1, super::front::MAX_PAGE)
+}
+
 /// Whether a post's registered type is reachable on the public front end.
 ///
 /// `Post::is_public` answers for the row's status; this answers for its type.
@@ -108,7 +118,9 @@ pub async fn list_posts(
     // Both branches take the same offset. Without one, a site with more than
     // `per_page` matches had no request that could reach the older rows at all
     // — the endpoint was bounded but not navigable.
-    let offset = (query.page.unwrap_or(1).max(1) - 1) * per_page;
+    let offset = clamped_page(query.page)
+        .saturating_sub(1)
+        .saturating_mul(per_page);
     let posts = match query.search.as_deref().map(str::trim) {
         Some(term) if !term.is_empty() => {
             // The same bounded, visibility-aware search the front end uses.
@@ -352,7 +364,9 @@ pub async fn list_terms(
     // unbounded, so an unauthenticated request against a large taxonomy
     // materialized and serialized every row of it.
     let per_page = i64::try_from(query.per_page.unwrap_or(50).clamp(1, 100)).unwrap_or(50);
-    let offset = i64::try_from(query.page.unwrap_or(1).max(1) - 1).unwrap_or(0) * per_page;
+    let offset = i64::try_from(clamped_page(query.page).saturating_sub(1))
+        .unwrap_or(0)
+        .saturating_mul(per_page);
     let mut conn = repos.conn().await?;
     let terms = crate::content::terms_page(&mut conn, &taxonomy, offset, per_page).await?;
     Ok(Json(
@@ -413,7 +427,9 @@ pub async fn list_comments(
     // made this unauthenticated endpoint cost the post's whole moderation
     // queue — which, with guest comments enabled, anyone can grow.
     let per_page = i64::try_from(query.per_page.unwrap_or(50).clamp(1, 100)).unwrap_or(50);
-    let offset = i64::try_from(query.page.unwrap_or(1).max(1) - 1).unwrap_or(0) * per_page;
+    let offset = i64::try_from(clamped_page(query.page).saturating_sub(1))
+        .unwrap_or(0)
+        .saturating_mul(per_page);
     let mut conn = repos.conn().await?;
     let rows = crate::content::approved_comments_page(&mut conn, id, offset, per_page).await?;
 
@@ -458,7 +474,9 @@ pub async fn list_authors(
     // the corpus.
     let mut conn = repos.conn().await?;
     let per_page = i64::try_from(query.per_page.unwrap_or(50).clamp(1, 100)).unwrap_or(50);
-    let offset = i64::try_from(query.page.unwrap_or(1).max(1) - 1).unwrap_or(0) * per_page;
+    let offset = i64::try_from(clamped_page(query.page).saturating_sub(1))
+        .unwrap_or(0)
+        .saturating_mul(per_page);
     let authors = crate::content::published_authors_page(&mut conn, offset, per_page).await?;
 
     Ok(Json(
