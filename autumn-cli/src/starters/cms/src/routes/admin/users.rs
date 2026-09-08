@@ -212,7 +212,6 @@ pub async fn update(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path(id): Path<i64>,
     Form(form): Form<UpdateUserForm>,
 ) -> AutumnResult<Response> {
@@ -233,16 +232,20 @@ pub async fn update(
     // Credentials are deliberately not reachable from this screen: a role
     // change and a password change are different operations, and conflating
     // them is how an admin screen becomes an account-takeover primitive.
-    crate::content::update_user(
-        &mut db,
-        id,
-        Role::parse(&form.role),
-        form.email.clone(),
-        form.display_name.trim().to_owned(),
-        form.bio.clone(),
-        form.website.trim().to_owned(),
-    )
-    .await?;
+    repos
+        .with_conn(async |conn| {
+            crate::content::update_user(
+                conn,
+                id,
+                Role::parse(&form.role),
+                form.email.clone(),
+                form.display_name.trim().to_owned(),
+                form.bio.clone(),
+                form.website.trim().to_owned(),
+            )
+            .await
+        })
+        .await?;
 
     Ok(Redirect::to("/admin/users").into_response())
 }
@@ -252,7 +255,6 @@ pub async fn delete(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path(id): Path<i64>,
 ) -> AutumnResult<Response> {
     let actor = require_capability!(repos, session, csrf, Capability::EditUsers);
@@ -276,7 +278,9 @@ pub async fn delete(
     // means a transient failure leaves the account and its posts permanently
     // gone with the counts stale — and a retry finds no user to delete, so
     // nothing ever repairs them.
-    crate::content::delete_user(&mut db, id).await?;
+    repos
+        .with_conn(async |conn| crate::content::delete_user(conn, id).await)
+        .await?;
 
     Ok(Redirect::to("/admin/users").into_response())
 }

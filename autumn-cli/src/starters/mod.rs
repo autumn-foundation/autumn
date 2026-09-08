@@ -703,6 +703,69 @@ mod tests {
         }
     }
 
+    /// Rendering a starter under a project name that is NOT its own must not
+    /// leave the starter's own crate name in a Rust path.
+    ///
+    /// `assert_starter_matches_example` cannot see this. It renders with the
+    /// starter's own name, where `{{crate_name}}` and a hardcoded `cms` produce
+    /// identical bytes — so a template variable that was never substituted
+    /// compares equal and ships. `autumn new my-blog --starter cms` then
+    /// scaffolds a crate named `my_blog` whose `main.rs` says `cms::bootstrap()`,
+    /// and it does not compile.
+    ///
+    /// Rendering under a different name is what separates the two, so that is
+    /// what this does: scaffold each built-in as `acme-site` and assert no
+    /// emitted Rust source names the starter itself.
+    fn assert_no_hardcoded_crate_name(starter: &'static Dir<'static>, starter_name: &str) {
+        let contents = load_from_embedded(starter).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("acme-site");
+        let vars = TemplateVars {
+            project_name: "acme-site",
+            crate_name: "acme_site",
+            autumn_version: env!("CARGO_PKG_VERSION"),
+            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        };
+        scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
+
+        let needle = format!("{starter_name}::");
+        for file in &contents.files {
+            let emitted = emit_rel_path(&file.rel_path);
+            if !emitted.ends_with(".rs") {
+                continue;
+            }
+            let rendered = fs::read_to_string(dest.join(emitted)).unwrap();
+            for (line_no, line) in rendered.lines().enumerate() {
+                // `crate::<name>::` and `some_<name>::` are ordinary paths; only
+                // the crate root spelled as the starter's own name is the bug.
+                let Some(at) = line.find(&needle) else {
+                    continue;
+                };
+                let preceded_by_ident = line[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':');
+                assert!(
+                    preceded_by_ident,
+                    "{emitted}:{} names the crate `{starter_name}` after rendering as \
+                     `acme-site`; template it as {{{{crate_name}}}}:: or the scaffolded \
+                     project will not compile:\n  {line}",
+                    line_no + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saas_starter_has_no_hardcoded_crate_name() {
+        assert_no_hardcoded_crate_name(&builtin::SAAS, "saas");
+    }
+
+    #[test]
+    fn cms_starter_has_no_hardcoded_crate_name() {
+        assert_no_hardcoded_crate_name(&builtin::CMS, "cms");
+    }
+
     /// The embedded `saas` starter must reproduce `examples/saas/` exactly, so
     /// the flagship starter and the drift-gated example cannot diverge.
     #[test]

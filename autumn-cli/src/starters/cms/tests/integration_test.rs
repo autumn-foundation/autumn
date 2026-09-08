@@ -20,7 +20,7 @@ const MIGRATION_SQL: &str =
 
 /// The application's real route table — the same one `main` mounts.
 fn app_routes() -> Vec<autumn_web::Route> {
-    cms::all_routes()
+    {{crate_name}}::all_routes()
 }
 
 /// URL-encode form pairs.
@@ -105,16 +105,10 @@ fn every_reserved_prefix_has_a_literal_route() {
     }
 }
 
-/// Every `POST` form in the source carries a CSRF token.
-///
-/// The runtime test above proves the mechanism works on one form. This proves
-/// no form was *forgotten* — the actual failure mode, since a missing token is
-/// invisible until someone submits that particular form in a deployment with
-/// CSRF on (and this suite runs with it off). Scanning the source is crude, but
-/// it is the only check that covers all twenty-odd forms at once.
-#[test]
-fn every_post_form_emits_a_csrf_token() {
-    let sources = [
+/// Every route source, for the scans below. One list, so a new module cannot
+/// be added to one gate and forgotten by the other.
+fn route_sources() -> &'static [(&'static str, &'static str)] {
+    &[
         ("routes/site.rs", include_str!("../src/routes/site.rs")),
         ("routes/auth.rs", include_str!("../src/routes/auth.rs")),
         ("routes/front.rs", include_str!("../src/routes/front.rs")),
@@ -159,8 +153,52 @@ fn every_post_form_emits_a_csrf_token() {
             include_str!("../src/routes/admin/tools.rs"),
         ),
         ("theme.rs", include_str!("../src/theme.rs")),
-    ];
+    ]
+}
 
+/// No handler takes the `Db` extractor.
+///
+/// `Db` is checked out before the handler body runs and held until the response
+/// is returned. The repositories are pool-backed and acquire their *own*
+/// connection per call, so a handler holding a `Db` and then reaching for a
+/// repository needs two slots at once. With the shipped `pool_size = 10`, ten
+/// concurrent requests in that shape each hold one while waiting for a second
+/// that only another of them could release — a pool-wide deadlock, reachable
+/// from `/comments/{id}`, which is unauthenticated.
+///
+/// The rule is therefore: handlers get their connection from `Repos::with_conn`,
+/// which scopes it to a single call and cannot span a repository read. This
+/// scans for the extractor because the failure is invisible until the pool is
+/// under real concurrency, which no test in this suite produces.
+#[test]
+fn no_handler_holds_a_pool_connection_across_repository_calls() {
+    let sources = route_sources();
+    let mut offenders = Vec::new();
+    for (name, source) in sources {
+        for (line_no, line) in source.lines().enumerate() {
+            if line.contains("autumn_web::Db") && !line.trim_start().starts_with("//") {
+                offenders.push(format!("{name}:{}: {}", line_no + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these handlers take the `Db` extractor; use `Repos::with_conn` instead so the \
+         connection cannot be held across a repository call:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// Every `POST` form in the source carries a CSRF token.
+///
+/// The runtime test above proves the mechanism works on one form. This proves
+/// no form was *forgotten* — the actual failure mode, since a missing token is
+/// invisible until someone submits that particular form in a deployment with
+/// CSRF on (and this suite runs with it off). Scanning the source is crude, but
+/// it is the only check that covers all twenty-odd forms at once.
+#[test]
+fn every_post_form_emits_a_csrf_token() {
+    let sources = route_sources();
     let mut forms = 0_usize;
     for (name, source) in sources {
         let lines: Vec<&str> = source.lines().collect();
@@ -325,7 +363,7 @@ async fn db_client() -> TestClient {
 
     // Registrations are process-global; the real `main` calls this too, so the
     // test app and the shipped app see the same post types and shortcodes.
-    cms::bootstrap();
+    {{crate_name}}::bootstrap();
 
     // The forms post normally; disabling CSRF keeps the tests from having to
     // scrape a hidden token out of every rendered page.
@@ -373,7 +411,7 @@ async fn csrf_client() -> TestClient {
          revisions, comments, menus, menu_items, widgets RESTART IDENTITY CASCADE",
     )
     .await;
-    cms::bootstrap();
+    {{crate_name}}::bootstrap();
 
     let mut config = AutumnConfig::default();
     config.security.csrf.enabled = true;
@@ -2294,4 +2332,368 @@ async fn importing_under_a_trashed_parent_keeps_the_child_reachable() {
         .await
         .assert_ok()
         .assert_body_contains("Imported child.");
+}
+
+/// A password-protected post's body must not be searchable.
+///
+/// `search_vector` covers title, excerpt and body, so a query matching only
+/// protected body text still returned the post — turning `/search` and
+/// `/api/v1/posts?search=` into an oracle for probing content the password
+/// exists to withhold. The title stays searchable because it is already public.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn search_does_not_reach_into_a_protected_body() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Quarterly Briefing"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "The acquisition of Zephyrine closes in March."),
+            ("status", "publish"),
+            ("password", "letmein"),
+            ("tags", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+
+    // A word that occurs only in the protected body finds nothing.
+    let hidden: serde_json::Value = client
+        .get("/api/v1/posts?search=Zephyrine")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(
+        hidden.as_array().map(Vec::len),
+        Some(0),
+        "body text of a protected post must not be searchable: {hidden}"
+    );
+    let page = client.get("/search?q=Zephyrine").send().await;
+    page.assert_ok();
+    assert!(
+        !page.text().contains("Quarterly Briefing"),
+        "the front-end search must not surface it either"
+    );
+
+    // The title still is — it renders publicly on the index either way.
+    let visible: serde_json::Value = client
+        .get("/api/v1/posts?search=Quarterly")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(visible.as_array().map(Vec::len), Some(1));
+}
+
+/// Un-approving a comment takes its approved replies with it.
+///
+/// `assemble_thread` builds from the roots down, so a reply whose parent is no
+/// longer approved can never be rendered — while it stayed `approved` and
+/// stayed in `comment_count`. The post advertised comments no reader could see.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn unapproving_a_parent_hides_and_uncounts_its_replies() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Moderated", "Body.", "publish").await;
+
+    for (body, reply_to) in [
+        ("Parent comment", ""),
+        ("Reply under parent", "1"),
+        ("Unrelated comment", ""),
+    ] {
+        let mut fields = vec![("body", body)];
+        if !reply_to.is_empty() {
+            fields.push(("reply_to", reply_to));
+        }
+        client
+            .post(&format!("/comments/{post_id}"))
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    client
+        .get("/moderated")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("3 comments");
+
+    // Spam the parent.
+    client
+        .post("/admin/comments/1/status?to=spam")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    let page = client.get("/moderated").send().await;
+    page.assert_ok().assert_body_contains("1 comment");
+    assert!(
+        !page.text().contains("Reply under parent"),
+        "the orphaned reply must not render"
+    );
+    assert!(
+        page.text().contains("Unrelated comment"),
+        "an unrelated comment is untouched"
+    );
+
+    // The API agrees — it is the same approved-status query.
+    let api: serde_json::Value = client
+        .get(&format!("/api/v1/posts/{post_id}/comments"))
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(api.as_array().map(Vec::len), Some(1));
+}
+
+/// A reader can actually reply, without a hand-written POST.
+///
+/// The thread rendered no per-comment control and the single top-level form
+/// never supplied `reply_to`, so the threading the schema, the depth cap and
+/// the renderer all support was unreachable from a browser.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_thread_offers_a_reply_control_that_works() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Conversation", "Body.", "publish").await;
+
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "The first comment")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let page = client
+        .get("/conversation")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    let html = page.assert_ok().text();
+    assert!(
+        html.contains(r#"name="reply_to""#),
+        "the thread must render a control that supplies reply_to:\n{html}"
+    );
+    assert!(
+        html.contains(r#"value="1""#),
+        "and it must name the comment it replies to"
+    );
+
+    // The control posts to the same endpoint, and the reply nests.
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "A threaded reply"), ("reply_to", "1")]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/conversation")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("A threaded reply")
+        .assert_body_contains("aria-level=\"2\"");
+}
+
+/// Plain permalinks belong in the sitemap.
+///
+/// With that structure every post's canonical URL is `/?p=<id>`, which
+/// `front_page` serves — so skipping query-string paths dropped the entire post
+/// corpus from `sitemap.xml` on a site that chose it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_sitemap_carries_plain_permalinks() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Findable", "Body.", "publish").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("site_title", "Test Site"),
+            ("tagline", ""),
+            ("permalink_structure", "plain"),
+            ("posts_per_page", "10"),
+            ("default_comment_status", "open"),
+            ("active_theme", "default"),
+            ("date_format", "%B %-d, %Y"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let sitemap = client.get("/sitemap.xml").send().await;
+    let body = sitemap.assert_ok().text();
+    assert!(
+        body.contains(&format!("/?p={post_id}")),
+        "the plain permalink must be listed:\n{body}"
+    );
+}
+
+/// Re-running an import does not duplicate a row the allocator had to re-slug.
+///
+/// The dedupe checked the slug the file names. When an imported `about`
+/// collided with an existing post and landed as `about-2`, the retry found
+/// nothing under `about` and created `about-3`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_importing_a_reslugged_page_is_still_idempotent() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // An existing post already holds the bare path `about`.
+    create_post(&client, &cookie, "About", "Existing post.", "publish").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "Imported",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [{
+            "post_type": "page", "title": "About", "slug": "about",
+            "excerpt": "", "body": "Imported page.", "status": "publish",
+            "comment_status": "closed", "password": "", "author": "owner",
+            "published_at": null, "parent": null, "terms": []
+        }]
+    })
+    .to_string();
+
+    client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    // The same file again: nothing new.
+    client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("0 imported");
+
+    sign_out(&client);
+    assert_eq!(
+        client.get("/about-3").send().await.status,
+        404,
+        "a second suffix means the retry duplicated the page"
+    );
+    client
+        .get("/about-2")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Imported page.");
+}
+
+/// Multi-level menus are reachable from the admin UI.
+///
+/// The item form forced `parent_id: None` and carried no parent field, so the
+/// two-level menu the schema stores and the theme renders could not be built.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn menu_items_can_be_nested_and_only_within_their_own_menu() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for (name, location) in [("Main", "primary"), ("Footer", "")] {
+        client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", name), ("location", location)]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    // A root item in menu 1, and one in menu 2.
+    client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", "Products"), ("url", "/products")]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post("/admin/appearance/menus/2/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", "Legal"), ("url", "/legal")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The admin screen offers the parent selector.
+    let screen = client
+        .get("/admin/appearance")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    screen
+        .assert_ok()
+        .assert_body_contains(r#"name="parent_id""#)
+        .assert_body_contains("Under Products");
+
+    // Nesting under a root item of the same menu works.
+    client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("label", "Widgets"),
+            ("url", "/products/widgets"),
+            ("parent_id", "1"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Nesting under an item of a *different* menu is refused: the renderer
+    // walks one menu's roots, so a foreign parent renders nowhere.
+    let foreign = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("label", "Smuggled"),
+            ("url", "/x"),
+            ("parent_id", "2"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(foreign.status, 422, "body: {}", foreign.text());
+
+    // And so is nesting under an item that is itself nested — the renderer
+    // draws two levels.
+    let too_deep = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("label", "Deeper"),
+            ("url", "/y"),
+            ("parent_id", "3"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(too_deep.status, 422, "body: {}", too_deep.text());
 }

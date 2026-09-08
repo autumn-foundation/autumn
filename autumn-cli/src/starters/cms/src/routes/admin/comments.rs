@@ -179,7 +179,6 @@ pub async fn moderate(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path(id): Path<i64>,
     Query(query): Query<ModerateQuery>,
 ) -> AutumnResult<Response> {
@@ -188,7 +187,8 @@ pub async fn moderate(
     // The approved-comment counter moves inside the same transaction as the
     // status change, so a reader never sees a count that disagrees with the
     // thread.
-    let updated = content::moderate_comment(&mut db, id, &query.to).await?;
+    let mut conn = repos.conn().await?;
+    let updated = content::moderate_comment(&mut conn, id, &query.to).await?;
     if updated.status == "approved" {
         do_action(Action::CommentApproved, updated.id);
     }
@@ -201,7 +201,6 @@ pub async fn delete(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path(id): Path<i64>,
 ) -> AutumnResult<Response> {
     let _user = require_capability!(repos, session, csrf, Capability::ModerateComments);
@@ -212,7 +211,8 @@ pub async fn delete(
     // one — leaving every deleted reply permanently in the post's displayed
     // count. `content::delete_comment` recomputes from ground truth in the same
     // transaction, so it is right whatever the cascade took.
-    content::delete_comment(&mut db, id).await?;
+    let mut conn = repos.conn().await?;
+    content::delete_comment(&mut conn, id).await?;
 
     Ok(Redirect::to("/admin/comments?status=trash").into_response())
 }

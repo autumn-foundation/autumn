@@ -234,7 +234,6 @@ pub async fn register(
     // fresh one or the corrected resubmit would be rejected as a replay.
     submit_token: Submit,
     State(state): State<AppState>,
-    mut db: autumn_web::Db,
     Form(form): Form<RegisterForm>,
 ) -> AutumnResult<Response> {
     let password_cfg = state.config_arc().auth.password.clone();
@@ -319,8 +318,16 @@ pub async fn register(
     // here: a `count() == 0` read followed by an insert lets two concurrent
     // signups both see an empty table and both become administrators, and the
     // bcrypt hash above sits right inside that window.
+    // The connection is checked out here, after every repository read is
+    // done, and released when the handler returns. Taking it as a `Db`
+    // extractor instead held it across those reads — and each repository
+    // call acquires a *second* connection from the same pool, so enough
+    // concurrent requests could each hold one slot while waiting for a
+    // second that only another of them could release. One connection at a
+    // time, acquired last, cannot deadlock that way.
+    let mut conn = repos.conn().await?;
     let created = crate::content::register_user(
-        &mut db,
+        &mut conn,
         NewUser {
             username: username.clone(),
             email,

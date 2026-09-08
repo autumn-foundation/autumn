@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::capabilities::Capability;
 use crate::content;
 use crate::models::{NewPost, NewTerm};
-use crate::repositories::{PostRepository as _, TermRepository as _, UserRepository as _};
+use crate::repositories::{
+    PostMetaRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
+};
 use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
@@ -276,7 +278,6 @@ pub async fn import(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Form(form): Form<ImportForm>,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ImportContent);
@@ -343,6 +344,13 @@ pub async fn import(
         }
     }
 
+    // Every `(post_type, source slug)` a previous run of this importer recorded.
+    // Loaded once: the alternative is a lookup per post, and an import is a
+    // bulk operation.
+    let imported_source_slugs = repos
+        .with_conn(async |conn| content::imported_source_slugs(conn).await)
+        .await?;
+
     let mut imported = 0_usize;
     let mut skipped = 0_usize;
     let mut orphaned = 0_i64;
@@ -352,16 +360,23 @@ pub async fn import(
     // already on this site.
     let mut created_ids: Vec<(i64, String, String, Option<String>)> = Vec::new();
     for post in &payload.posts {
-        // Idempotent on `(post_type, slug)` — the same pair the database's
-        // unique index enforces — so re-running an import updates nothing and
-        // duplicates nothing.
-        let exists = repos
+        // Idempotent on the slug *the file names*, not only on the slug the
+        // row ended up with. Those differ whenever the allocator had to add a
+        // suffix — an imported `about` landing as `about-2` because a post
+        // already held the bare path — which is exactly the
+        // partly-populated-site case this import is for. Checking only
+        // `(post_type, about)` found nothing on a retry and created `about-3`,
+        // so the advertised idempotent re-run duplicated content precisely
+        // where the allocator had done its job. The source slug is recorded in
+        // `post_meta` at import time and consulted here.
+        let already_here = repos
             .posts
             .find_by_slug(post.slug.clone())
             .await?
             .into_iter()
-            .any(|p| p.post_type == post.post_type);
-        if exists {
+            .any(|p| p.post_type == post.post_type)
+            || imported_source_slugs.contains(&(post.post_type.clone(), post.slug.clone()));
+        if already_here {
             skipped += 1;
             continue;
         }
@@ -403,6 +418,17 @@ pub async fn import(
             })
             .await?;
 
+        // The slug the file named, so a re-run recognises this row even when
+        // the allocator stored it under a suffix.
+        repos
+            .post_meta
+            .save(&crate::models::NewPostMeta {
+                post_id: created.id,
+                meta_key: content::IMPORT_SOURCE_SLUG_KEY.to_owned(),
+                meta_value: post.slug.clone(),
+            })
+            .await?;
+
         let mut term_ids = Vec::new();
         for reference in &post.terms {
             if let Some(term) = repos
@@ -416,11 +442,17 @@ pub async fn import(
             }
         }
         if !term_ids.is_empty() {
-            content::set_post_terms(&mut db, created.id, term_ids).await?;
+            repos
+                .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
+                .await?;
         }
 
         if post.status != "draft" {
-            content::transition_status(&mut db, created.id, &post.status).await?;
+            repos
+                .with_conn(async |conn| {
+                    content::transition_status(conn, created.id, &post.status).await
+                })
+                .await?;
         }
         created_ids.push((
             created.id,
@@ -460,7 +492,9 @@ pub async fn import(
         };
         if let Some(parent_id) = parent_id
             && parent_id != *child_id
-            && !content::set_post_parent(&mut db, *child_id, parent_id).await?
+            && !repos
+                .with_conn(async |conn| content::set_post_parent(conn, *child_id, parent_id).await)
+                .await?
         {
             // `set_post_parent` applies the editor's own parent rules — a live
             // row of the same type, no cycle, within `MAX_PAGE_DEPTH` — and

@@ -61,8 +61,15 @@ while IFS= read -r path; do
       sed -i.bak "s|POSTGRES_DB: ${name}|POSTGRES_DB: {{project_name}}|g" "${dst}/${rel}"
       ;;
     src/main.rs|tests/integration_test.rs)
-      sed -i.bak -e "s|\\b${name}::|{{crate_name}}::|g" \
+      # NOT `\\b${name}::` — BSD sed (every macOS box) has no `\\b`, so that
+      # pattern silently matched nothing and shipped a starter hardcoded to
+      # `cms::`, which fails to compile under any other project name. The
+      # example has no identifier ending in `cms` before `::`, and the
+      # assertion below is what actually holds that true.
+      sed -i.bak -e "s|${name}::|{{crate_name}}::|g" \
                  -e "s|-p ${name}|-p {{project_name}}|g" "${dst}/${rel}"
+      grep -q "{{crate_name}}::" "${dst}/${rel}" || {
+        echo "FAIL: ${rel} has no {{crate_name}}:: after substitution" >&2; exit 1; }
       ;;
     README.md)
       sed -i.bak -e "1s|^# ${name} — |# {{project_name}} — |" \
@@ -72,6 +79,17 @@ while IFS= read -r path; do
   rm -f "${dst}/${rel}.bak"
   copied=$((copied + 1))
 done < <(find "$src" -type f -not -path "*/target/*" -not -path "*/.git/*" | sort)
+
+# A substitution that silently matches nothing is the failure mode this script
+# actually has (see the BSD-sed note above), and the drift test cannot catch it:
+# it renders the starter with project name `cms`, where `{{crate_name}}` and a
+# hardcoded `cms` produce identical bytes. So assert here, on the only thing
+# that distinguishes them.
+if grep -rn "[^{A-Za-z0-9_]${name}::" "$dst" >&2; then
+  echo "FAIL: the starter still names the crate \`${name}\` in a Rust path;" >&2
+  echo "      it would not compile under any other project name." >&2
+  exit 1
+fi
 
 echo "synced ${copied} files: ${src} -> ${dst}"
 echo "now run: cargo test -p autumn-cli --bin autumn embedded_cms_matches_example_cms"

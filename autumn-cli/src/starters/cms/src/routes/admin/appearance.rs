@@ -37,6 +37,11 @@ pub struct MenuItemForm {
     pub term_id: String,
     #[serde(default)]
     pub position: String,
+    /// The item this one nests under, if any. The schema and the renderer both
+    /// support a second level; without this field every item was forced to the
+    /// root and the multi-level menu the theme draws was unreachable.
+    #[serde(default)]
+    pub parent_id: String,
 }
 
 #[derive(Deserialize)]
@@ -90,7 +95,12 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                             ol class="space-y-1 text-sm mb-4" {
                                 @for item in items {
                                     li class="flex items-center justify-between gap-2" {
-                                        span { (item.label) }
+                                        span {
+                                            @if item.parent_id.is_some() {
+                                                span class="text-gray-400" { "└ " }
+                                            }
+                                            (item.label)
+                                        }
                                         form method="post"
                                              action=(format!("/admin/appearance/menu-items/{}/delete",
                                                               item.id)) {
@@ -150,6 +160,21 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                                     input #(format!("url-{}", menu.id)) type="text" name="url"
                                           placeholder="/custom-url"
                                           class="w-full border rounded px-2 py-1.5";
+                                }
+                                // Only the menu's own root items are offered:
+                                // the renderer draws two levels, and the
+                                // handler refuses a parent from another menu.
+                                div class="sm:col-span-2" {
+                                    label for=(format!("parent-{}", menu.id)) class="sr-only" {
+                                        "Nest under"
+                                    }
+                                    select #(format!("parent-{}", menu.id)) name="parent_id"
+                                           class="w-full border rounded px-2 py-1.5" {
+                                        option value="" { "Top level" }
+                                        @for item in items.iter().filter(|i| i.parent_id.is_none()) {
+                                            option value=(item.id) { "Under " (item.label) }
+                                        }
+                                    }
                                 }
                                 div class="sm:col-span-5" {
                                     button type="submit"
@@ -296,7 +321,6 @@ pub async fn create_menu(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Form(form): Form<MenuForm>,
 ) -> AutumnResult<Response> {
     let _user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
@@ -311,7 +335,8 @@ pub async fn create_menu(
     // menu detached and the site's navigation simply gone, from a request that
     // reported an error.
     let location = form.location.trim().to_owned();
-    crate::content::replace_menu_at_location(&mut db, &name, &location).await?;
+    let mut conn = repos.conn().await?;
+    crate::content::replace_menu_at_location(&mut conn, &name, &location).await?;
     Ok(Redirect::to("/admin/appearance").into_response())
 }
 
@@ -326,11 +351,33 @@ pub async fn create_menu_item(
     let _user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
     let parse = |raw: &str| raw.trim().parse::<i64>().ok().filter(|v| *v > 0);
 
+    // A parent has to be an item of *this* menu and itself a root item. The
+    // first stops a crafted request grafting one menu's items onto another's —
+    // the renderer walks from the roots of one menu, so a foreign parent makes
+    // the item render nowhere. The second holds the tree to the two levels the
+    // renderer draws, rather than accepting a depth it would silently drop.
+    let parent_id = match parse(&form.parent_id) {
+        Some(candidate) => {
+            let parent = repos
+                .menu_items
+                .find_by_id(candidate)
+                .await?
+                .filter(|item| item.menu_id == menu_id && item.parent_id.is_none())
+                .ok_or_else(|| {
+                    AutumnError::unprocessable_msg(
+                        "A menu item can only nest under a top-level item of the same menu",
+                    )
+                })?;
+            Some(parent.id)
+        }
+        None => None,
+    };
+
     repos
         .menu_items
         .save(&NewMenuItem {
             menu_id,
-            parent_id: None,
+            parent_id,
             label: form.label.trim().to_owned(),
             url: form.url.trim().to_owned(),
             post_id: parse(&form.post_id),

@@ -83,6 +83,13 @@ pub async fn render_thread(
     let open = post.comment_status == "open" && content::type_supports_comments(&post.post_type);
     let may_comment = open && (viewer.is_some() || settings.allow_guest_comments);
     let moderated = settings.comment_moderation;
+    let thread_ctx = ThreadCtx {
+        post_id: post.id,
+        csrf,
+        may_comment,
+        guest: viewer.is_none(),
+        moderated,
+    };
 
     Ok(html! {
         section class="mt-12 pt-8 border-t border-gray-200" aria-labelledby="comments-heading" {
@@ -93,7 +100,7 @@ pub async fn render_thread(
             @if views.is_empty() {
                 p class="text-gray-500 text-sm mb-8" { "No comments yet." }
             } @else {
-                (render_nodes(&views, 0))
+                (render_nodes(&views, 0, &thread_ctx))
             }
 
             @if truncated {
@@ -119,11 +126,33 @@ pub async fn render_thread(
     })
 }
 
+/// What the thread renderer needs to draw a reply control under each comment.
+struct ThreadCtx<'a> {
+    post_id: i64,
+    csrf: &'a Csrf,
+    may_comment: bool,
+    /// Whether the viewer is signed out, and so needs name/email fields.
+    guest: bool,
+    moderated: bool,
+}
+
 /// Render the thread as nested ordered lists.
 ///
 /// An `<ol>` per level with `aria-level` makes the nesting available to a
 /// screen reader rather than only to a sighted reader's eye for indentation.
-fn render_nodes(views: &[autumn_web::widgets::CommentView], depth: usize) -> Markup {
+///
+/// Each comment carries its own reply control. Without one, `reply_to` had no
+/// way of being set from a browser: the page rendered a single top-level form
+/// that always posted a root comment, so the threading the schema, the depth
+/// cap and the renderer all support was reachable only by a hand-written POST.
+/// The control is a `<details>` holding a real form with a hidden `reply_to` —
+/// no JavaScript, so it works the same everywhere and degrades to an expanded
+/// form when scripting is off.
+fn render_nodes(
+    views: &[autumn_web::widgets::CommentView],
+    depth: usize,
+    ctx: &ThreadCtx<'_>,
+) -> Markup {
     html! {
         ol class=(if depth == 0 { "space-y-6 mb-8" } else { "space-y-4 mt-4 ml-6 border-l border-gray-100 pl-4" })
            role="list" {
@@ -145,10 +174,79 @@ fn render_nodes(views: &[autumn_web::widgets::CommentView], depth: usize) -> Mar
                             }
                         }
                     }
+                    // The server refuses a reply whose parent is already at the
+                    // cap, so the control is not offered there — an error page
+                    // is a poor way to learn a thread is full.
+                    @if ctx.may_comment && depth < content::MAX_COMMENT_DEPTH {
+                        details class="mt-2" {
+                            summary class="text-xs text-indigo-700 cursor-pointer" {
+                                "Reply to " (view.author)
+                            }
+                            (reply_form(view.id, ctx))
+                        }
+                    }
                     @if !view.replies.is_empty() {
-                        (render_nodes(&view.replies, depth + 1))
+                        (render_nodes(&view.replies, depth + 1, ctx))
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The name/email pair a signed-out commenter has to supply.
+///
+/// Shared by the top-level form and every reply form, so the two cannot drift
+/// in what they collect or what they require. `suffix` keeps the `id`
+/// attributes unique on a page that renders many of these — a duplicated `id`
+/// is what makes a `<label for=…>` point at the wrong field.
+fn guest_fields(suffix: &str) -> Markup {
+    html! {
+        div class="grid grid-cols-1 sm:grid-cols-2 gap-3" {
+            div {
+                label for=(format!("author_name{suffix}"))
+                      class="block text-sm font-medium mb-1" { "Name" }
+                input id=(format!("author_name{suffix}")) type="text" name="author_name"
+                      required maxlength="80" class="w-full border rounded px-3 py-2";
+            }
+            div {
+                label for=(format!("author_email{suffix}"))
+                      class="block text-sm font-medium mb-1" {
+                    "Email "
+                    span class="text-gray-400 font-normal" { "(not published)" }
+                }
+                input id=(format!("author_email{suffix}")) type="email" name="author_email"
+                      maxlength="254" class="w-full border rounded px-3 py-2";
+            }
+        }
+    }
+}
+
+/// The inline form under one comment. Posts to the same endpoint as the
+/// top-level form, with `reply_to` naming the parent.
+fn reply_form(parent_id: i64, ctx: &ThreadCtx<'_>) -> Markup {
+    let suffix = format!("-reply-{parent_id}");
+    html! {
+        form action=(format!("/comments/{}", ctx.post_id)) method="post"
+             class="space-y-3 mt-2 max-w-lg" {
+            (ctx.csrf.input())
+            input type="hidden" name="reply_to" value=(parent_id);
+            @if ctx.moderated && ctx.guest {
+                p class="text-xs text-gray-500" {
+                    "Replies are reviewed before they appear."
+                }
+            }
+            @if ctx.guest { (guest_fields(&suffix)) }
+            div {
+                label for=(format!("comment_body{suffix}"))
+                      class="block text-sm font-medium mb-1" { "Reply" }
+                textarea id=(format!("comment_body{suffix}")) name="body" rows="3" required
+                         maxlength="10000" class="w-full border rounded px-3 py-2" {}
+            }
+            button type="submit"
+                   class="px-3 py-1.5 text-sm bg-indigo-600 text-white rounded \
+                          hover:bg-indigo-700" {
+                "Post reply"
             }
         }
     }
@@ -170,23 +268,7 @@ fn comment_form(
                     "Comments are reviewed before they appear."
                 }
             }
-            @if viewer.is_none() {
-                div class="grid grid-cols-1 sm:grid-cols-2 gap-3" {
-                    div {
-                        label for="author_name" class="block text-sm font-medium mb-1" { "Name" }
-                        input #author_name type="text" name="author_name" required maxlength="80"
-                              class="w-full border rounded px-3 py-2";
-                    }
-                    div {
-                        label for="author_email" class="block text-sm font-medium mb-1" {
-                            "Email "
-                            span class="text-gray-400 font-normal" { "(not published)" }
-                        }
-                        input #author_email type="email" name="author_email" maxlength="254"
-                              class="w-full border rounded px-3 py-2";
-                    }
-                }
-            }
+            @if viewer.is_none() { (guest_fields("")) }
             div {
                 label for="comment_body" class="block text-sm font-medium mb-1" { "Comment" }
                 textarea #comment_body name="body" rows="4" required maxlength="10000"
@@ -213,7 +295,6 @@ fn comment_form(
 pub async fn post_comment(
     repos: Repos,
     session: Session,
-    mut db: autumn_web::Db,
     Path(post_id): Path<i64>,
     Form(form): Form<CommentForm>,
 ) -> AutumnResult<Response> {
@@ -260,26 +341,40 @@ pub async fn post_comment(
         ));
     }
 
-    // Enforce the reply-depth cap on the write path, so the renderer never has
-    // to defend itself against a chain deep enough to overflow the stack.
+    // A `reply_to` naming a comment on a *different* post would graft a subtree
+    // onto someone else's thread. This half is a repository read, so it happens
+    // before the connection below is taken.
     if let Some(parent_id) = form.reply_to {
         let parent = repos
             .comments
             .find_by_id(parent_id)
             .await?
             .ok_or_else(|| AutumnError::not_found_msg("No such comment"))?;
-        // A `reply_to` naming a comment on a *different* post would graft a
-        // subtree onto someone else's thread.
         if parent.post_id != post.id {
             return Err(AutumnError::unprocessable_msg(
                 "That comment is not on this post",
             ));
         }
-        if content::reply_depth(&mut db, parent_id).await? > content::MAX_COMMENT_DEPTH {
-            return Err(AutumnError::unprocessable_msg(
-                "This conversation is nested as deeply as it goes",
-            ));
-        }
+    }
+
+    // One connection, checked out after every repository read is done and
+    // released before the last one. Taking it as a `Db` extractor instead held
+    // it from the very start of the handler, across all of the reads above —
+    // and each repository call acquires a *second* connection from the same
+    // pool. With the shipped `pool_size = 10`, ten concurrent submissions to
+    // this unauthenticated route could each hold one slot while waiting for a
+    // second that only another of them could release. The throttle raises the
+    // bar; it does not remove the shape.
+    let mut conn = repos.conn().await?;
+
+    // Enforce the reply-depth cap on the write path, so the renderer never has
+    // to defend itself against a chain deep enough to overflow the stack.
+    if let Some(parent_id) = form.reply_to
+        && content::reply_depth(&mut conn, parent_id).await? > content::MAX_COMMENT_DEPTH
+    {
+        return Err(AutumnError::unprocessable_msg(
+            "This conversation is nested as deeply as it goes",
+        ));
     }
 
     // A signed-in commenter's identity comes from the session, never from the
@@ -314,7 +409,7 @@ pub async fn post_comment(
     };
 
     let created = content::create_comment(
-        &mut db,
+        &mut conn,
         NewComment {
             post_id: post.id,
             parent_id: form.reply_to,
@@ -328,6 +423,9 @@ pub async fn post_comment(
         },
     )
     .await?;
+
+    // Released before the permalink read below, so the handler never holds two.
+    drop(conn);
 
     do_action(Action::CommentPosted, created.id);
     if status == "approved" {

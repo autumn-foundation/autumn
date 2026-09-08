@@ -8,13 +8,12 @@
 
 use autumn_web::AutumnError;
 use autumn_web::AutumnResult;
-use autumn_web::db::Db;
 use diesel::prelude::*;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
 
 use crate::models::{Comment, NewRevision, Post, Revision, Term, User};
-use crate::schema::{comments, menus, post_terms, posts, revisions, terms, users};
+use crate::schema::{comments, menus, post_meta, post_terms, posts, revisions, terms, users};
 
 /// The maximum reply nesting a comment thread accepts.
 ///
@@ -42,7 +41,7 @@ pub const REVISION_LIMIT: i64 = 25;
 /// write is refused with `409 Conflict` rather than overwriting their work.
 /// `None` skips the check, for callers with no form behind them.
 pub async fn update_post_with_revision(
-    db: &mut Db,
+    conn: &mut AsyncPgConnection,
     post_id: i64,
     editor_id: i64,
     summary: &str,
@@ -51,68 +50,65 @@ pub async fn update_post_with_revision(
     apply: impl for<'a> FnOnce(&'a mut Post) + Send + 'static,
 ) -> AutumnResult<Post> {
     let summary = summary.to_owned();
-    db.tx(move |conn| {
-        async move {
-            // Lock the row for the duration: two editors saving the same post
-            // must serialise, or the second silently overwrites the first and
-            // the revision trail records an edit that never happened.
-            let mut post: Post = posts::table
-                .find(post_id)
-                .select(Post::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .map_err(AutumnError::not_found)?;
+    conn.transaction(async move |conn| {
+        // Lock the row for the duration: two editors saving the same post
+        // must serialise, or the second silently overwrites the first and
+        // the revision trail records an edit that never happened.
+        let mut post: Post = posts::table
+            .find(post_id)
+            .select(Post::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
 
-            // Stale-edit detection. The row lock above serializes concurrent
-            // saves but does not make the second one *correct*: without this,
-            // the later request applies its whole stale form snapshot over the
-            // row the first editor just wrote, silently losing their changes.
-            if let Some(expected) = expected_lock_version
-                && expected != post.lock_version
-            {
-                return Err(AutumnError::conflict_msg(
-                    "Somebody else saved this content while you were editing. \
+        // Stale-edit detection. The row lock above serializes concurrent
+        // saves but does not make the second one *correct*: without this,
+        // the later request applies its whole stale form snapshot over the
+        // row the first editor just wrote, silently losing their changes.
+        if let Some(expected) = expected_lock_version
+            && expected != post.lock_version
+        {
+            return Err(AutumnError::conflict_msg(
+                "Somebody else saved this content while you were editing. \
                      Reload the page to see their changes before saving again.",
-                ));
-            }
-
-            // `supports_revisions: false` on the registered type means exactly
-            // that — no snapshot, rather than a flag the editor ignores.
-            if record_revision {
-                post.record_revision(conn, &summary).await?;
-            }
-
-            apply(&mut post);
-            post.updated_at = chrono::Utc::now().naive_utc();
-            post.lock_version += 1;
-
-            let saved: Post = diesel::update(posts::table.find(post_id))
-                .set((
-                    posts::title.eq(&post.title),
-                    posts::slug.eq(&post.slug),
-                    posts::excerpt.eq(&post.excerpt),
-                    posts::body.eq(&post.body),
-                    posts::status.eq(&post.status),
-                    posts::parent_id.eq(post.parent_id),
-                    posts::featured_media_id.eq(post.featured_media_id),
-                    posts::menu_order.eq(post.menu_order),
-                    posts::comment_status.eq(&post.comment_status),
-                    posts::password.eq(&post.password),
-                    posts::sticky.eq(post.sticky),
-                    posts::published_at.eq(post.published_at),
-                    posts::lock_version.eq(post.lock_version),
-                    posts::updated_at.eq(post.updated_at),
-                ))
-                .returning(Post::as_returning())
-                .get_result(conn)
-                .await?;
-
-            prune_revisions(conn, post_id).await?;
-            let _ = editor_id;
-            Ok::<_, AutumnError>(saved)
+            ));
         }
-        .scope_boxed()
+
+        // `supports_revisions: false` on the registered type means exactly
+        // that — no snapshot, rather than a flag the editor ignores.
+        if record_revision {
+            post.record_revision(conn, &summary).await?;
+        }
+
+        apply(&mut post);
+        post.updated_at = chrono::Utc::now().naive_utc();
+        post.lock_version += 1;
+
+        let saved: Post = diesel::update(posts::table.find(post_id))
+            .set((
+                posts::title.eq(&post.title),
+                posts::slug.eq(&post.slug),
+                posts::excerpt.eq(&post.excerpt),
+                posts::body.eq(&post.body),
+                posts::status.eq(&post.status),
+                posts::parent_id.eq(post.parent_id),
+                posts::featured_media_id.eq(post.featured_media_id),
+                posts::menu_order.eq(post.menu_order),
+                posts::comment_status.eq(&post.comment_status),
+                posts::password.eq(&post.password),
+                posts::sticky.eq(post.sticky),
+                posts::published_at.eq(post.published_at),
+                posts::lock_version.eq(post.lock_version),
+                posts::updated_at.eq(post.updated_at),
+            ))
+            .returning(Post::as_returning())
+            .get_result(conn)
+            .await?;
+
+        prune_revisions(conn, post_id).await?;
+        let _ = editor_id;
+        Ok::<_, AutumnError>(saved)
     })
     .await
 }
@@ -123,57 +119,58 @@ pub async fn update_post_with_revision(
 /// This is the only path that changes `posts.status` outside the repository's
 /// own update, and it is what the admin's Publish / Move to Trash / Restore
 /// buttons call.
-pub async fn transition_status(db: &mut Db, post_id: i64, target: &str) -> AutumnResult<Post> {
+pub async fn transition_status(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    target: &str,
+) -> AutumnResult<Post> {
     let target = target.to_owned();
-    db.tx(move |conn| {
-        async move {
-            let post: Post = posts::table
-                .find(post_id)
-                .select(Post::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .map_err(AutumnError::not_found)?;
+    conn.transaction(async move |conn| {
+        let post: Post = posts::table
+            .find(post_id)
+            .select(Post::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
 
-            // The macro-generated enforcing transition: an undeclared edge or a
-            // failed guard is a 400 and nothing is written.
-            let new_status = post.transition_status_to(&target)?;
+        // The macro-generated enforcing transition: an undeclared edge or a
+        // failed guard is a 400 and nothing is written.
+        let new_status = post.transition_status_to(&target)?;
 
-            // Same rule the editor's save path follows: a type registered
-            // `supports_revisions: false` gets no snapshot, from any path.
-            // Publishing, trashing, restoring and importing all land here, so
-            // leaving it out made the flag cosmetic — the link was hidden while
-            // the rows accumulated anyway.
-            if type_supports_revisions(&post.post_type) {
-                post.record_revision(conn, &format!("Status: {} → {new_status}", post.status))
-                    .await?;
-            }
-
-            // Stamp the first publish date, and never move it afterwards — an
-            // unpublish/republish cycle must not reorder the blog index.
-            let published_at = match (post.published_at, new_status.as_str()) {
-                (None, "publish" | "private") => Some(chrono::Utc::now().naive_utc()),
-                (existing, _) => existing,
-            };
-
-            let saved: Post = diesel::update(posts::table.find(post_id))
-                .set((
-                    posts::status.eq(&new_status),
-                    posts::published_at.eq(published_at),
-                    posts::lock_version.eq(post.lock_version + 1),
-                    posts::updated_at.eq(chrono::Utc::now().naive_utc()),
-                ))
-                .returning(Post::as_returning())
-                .get_result(conn)
+        // Same rule the editor's save path follows: a type registered
+        // `supports_revisions: false` gets no snapshot, from any path.
+        // Publishing, trashing, restoring and importing all land here, so
+        // leaving it out made the flag cosmetic — the link was hidden while
+        // the rows accumulated anyway.
+        if type_supports_revisions(&post.post_type) {
+            post.record_revision(conn, &format!("Status: {} → {new_status}", post.status))
                 .await?;
-
-            // A post entering or leaving public visibility changes every term's
-            // published-post count, so rebuild the ones it is filed under.
-            recount_terms_for_post(conn, post_id).await?;
-
-            Ok::<_, AutumnError>(saved)
         }
-        .scope_boxed()
+
+        // Stamp the first publish date, and never move it afterwards — an
+        // unpublish/republish cycle must not reorder the blog index.
+        let published_at = match (post.published_at, new_status.as_str()) {
+            (None, "publish" | "private") => Some(chrono::Utc::now().naive_utc()),
+            (existing, _) => existing,
+        };
+
+        let saved: Post = diesel::update(posts::table.find(post_id))
+            .set((
+                posts::status.eq(&new_status),
+                posts::published_at.eq(published_at),
+                posts::lock_version.eq(post.lock_version + 1),
+                posts::updated_at.eq(chrono::Utc::now().naive_utc()),
+            ))
+            .returning(Post::as_returning())
+            .get_result(conn)
+            .await?;
+
+        // A post entering or leaving public visibility changes every term's
+        // published-post count, so rebuild the ones it is filed under.
+        recount_terms_for_post(conn, post_id).await?;
+
+        Ok::<_, AutumnError>(saved)
     })
     .await
 }
@@ -183,48 +180,49 @@ pub async fn transition_status(db: &mut Db, post_id: i64, target: &str) -> Autum
 /// The restore is itself an edit, so it appends a new revision rather than
 /// rewinding the trail — the history of a document is append-only or it is not
 /// a history.
-pub async fn restore_revision(db: &mut Db, post_id: i64, revision_id: i64) -> AutumnResult<Post> {
-    db.tx(move |conn| {
-        async move {
-            let revision: Revision = revisions::table
-                .find(revision_id)
-                .filter(revisions::post_id.eq(post_id))
-                .select(Revision::as_select())
-                .first(conn)
-                .await
-                .map_err(AutumnError::not_found)?;
+pub async fn restore_revision(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    revision_id: i64,
+) -> AutumnResult<Post> {
+    conn.transaction(async move |conn| {
+        let revision: Revision = revisions::table
+            .find(revision_id)
+            .filter(revisions::post_id.eq(post_id))
+            .select(Revision::as_select())
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
 
-            let post: Post = posts::table
-                .find(post_id)
-                .select(Post::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .map_err(AutumnError::not_found)?;
+        let post: Post = posts::table
+            .find(post_id)
+            .select(Post::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
 
-            post.record_revision(conn, &format!("Restored revision #{}", revision.id))
-                .await?;
+        post.record_revision(conn, &format!("Restored revision #{}", revision.id))
+            .await?;
 
-            // The restore replaces content only. Status is deliberately left
-            // alone: restoring the text of a draft must not silently republish
-            // it, and restoring a published post's older text must not
-            // unpublish it.
-            let saved: Post = diesel::update(posts::table.find(post_id))
-                .set((
-                    posts::title.eq(&revision.title),
-                    posts::excerpt.eq(&revision.excerpt),
-                    posts::body.eq(&revision.body),
-                    posts::lock_version.eq(post.lock_version + 1),
-                    posts::updated_at.eq(chrono::Utc::now().naive_utc()),
-                ))
-                .returning(Post::as_returning())
-                .get_result(conn)
-                .await?;
+        // The restore replaces content only. Status is deliberately left
+        // alone: restoring the text of a draft must not silently republish
+        // it, and restoring a published post's older text must not
+        // unpublish it.
+        let saved: Post = diesel::update(posts::table.find(post_id))
+            .set((
+                posts::title.eq(&revision.title),
+                posts::excerpt.eq(&revision.excerpt),
+                posts::body.eq(&revision.body),
+                posts::lock_version.eq(post.lock_version + 1),
+                posts::updated_at.eq(chrono::Utc::now().naive_utc()),
+            ))
+            .returning(Post::as_returning())
+            .get_result(conn)
+            .await?;
 
-            prune_revisions(conn, post_id).await?;
-            Ok::<_, AutumnError>(saved)
-        }
-        .scope_boxed()
+        prune_revisions(conn, post_id).await?;
+        Ok::<_, AutumnError>(saved)
     })
     .await
 }
@@ -233,8 +231,11 @@ pub async fn restore_revision(db: &mut Db, post_id: i64, revision_id: i64) -> Au
 /// history starts at its creation rather than at its first *edit*.
 ///
 /// A single statement, so it needs no transaction of its own.
-pub async fn record_initial_revision(db: &mut Db, post: &Post) -> AutumnResult<()> {
-    let conn = &mut **db;
+pub async fn record_initial_revision(
+    conn: &mut AsyncPgConnection,
+    post: &Post,
+) -> AutumnResult<()> {
+    let conn = &mut *conn;
     diesel::insert_into(revisions::table)
         .values(&NewRevision {
             post_id: post.id,
@@ -276,50 +277,51 @@ async fn prune_revisions(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnRe
 ///
 /// Both the terms being removed and the terms being added need recounting, so
 /// the union is computed before the join rows change.
-pub async fn set_post_terms(db: &mut Db, post_id: i64, term_ids: Vec<i64>) -> AutumnResult<()> {
-    db.tx(move |conn| {
-        async move {
-            let previous: Vec<i64> = post_terms::table
-                .filter(post_terms::post_id.eq(post_id))
-                .select(post_terms::term_id)
-                .load(conn)
-                .await?;
+pub async fn set_post_terms(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    term_ids: Vec<i64>,
+) -> AutumnResult<()> {
+    conn.transaction(async move |conn| {
+        let previous: Vec<i64> = post_terms::table
+            .filter(post_terms::post_id.eq(post_id))
+            .select(post_terms::term_id)
+            .load(conn)
+            .await?;
 
-            diesel::delete(post_terms::table.filter(post_terms::post_id.eq(post_id)))
+        diesel::delete(post_terms::table.filter(post_terms::post_id.eq(post_id)))
+            .execute(conn)
+            .await?;
+
+        let mut wanted = term_ids.clone();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if !wanted.is_empty() {
+            let rows: Vec<_> = wanted
+                .iter()
+                .map(|term_id| {
+                    (
+                        post_terms::post_id.eq(post_id),
+                        post_terms::term_id.eq(*term_id),
+                    )
+                })
+                .collect();
+            diesel::insert_into(post_terms::table)
+                .values(rows)
+                .on_conflict((post_terms::post_id, post_terms::term_id))
+                .do_nothing()
                 .execute(conn)
                 .await?;
-
-            let mut wanted = term_ids.clone();
-            wanted.sort_unstable();
-            wanted.dedup();
-            if !wanted.is_empty() {
-                let rows: Vec<_> = wanted
-                    .iter()
-                    .map(|term_id| {
-                        (
-                            post_terms::post_id.eq(post_id),
-                            post_terms::term_id.eq(*term_id),
-                        )
-                    })
-                    .collect();
-                diesel::insert_into(post_terms::table)
-                    .values(rows)
-                    .on_conflict((post_terms::post_id, post_terms::term_id))
-                    .do_nothing()
-                    .execute(conn)
-                    .await?;
-            }
-
-            let mut affected = previous;
-            affected.extend(wanted);
-            affected.sort_unstable();
-            affected.dedup();
-            for term_id in affected {
-                recount_term(conn, term_id).await?;
-            }
-            Ok::<_, AutumnError>(())
         }
-        .scope_boxed()
+
+        let mut affected = previous;
+        affected.extend(wanted);
+        affected.sort_unstable();
+        affected.dedup();
+        for term_id in affected {
+            recount_term(conn, term_id).await?;
+        }
+        Ok::<_, AutumnError>(())
     })
     .await
 }
@@ -422,71 +424,107 @@ pub async fn reply_depth(conn: &mut AsyncPgConnection, parent_id: i64) -> Autumn
 /// Move a comment through the moderation queue, keeping
 /// `posts.comment_count` — which counts **approved** comments, as WordPress's
 /// does — correct in the same transaction.
-pub async fn moderate_comment(db: &mut Db, comment_id: i64, target: &str) -> AutumnResult<Comment> {
+pub async fn moderate_comment(
+    conn: &mut AsyncPgConnection,
+    comment_id: i64,
+    target: &str,
+) -> AutumnResult<Comment> {
     if !crate::hooks::COMMENT_STATUSES.contains(&target) {
         return Err(AutumnError::bad_request_msg(format!(
             "Unknown comment status `{target}`"
         )));
     }
     let target = target.to_owned();
-    db.tx(move |conn| {
-        async move {
-            let comment: Comment = comments::table
-                .find(comment_id)
-                .select(Comment::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .map_err(AutumnError::not_found)?;
+    conn.transaction(async move |conn| {
+        let comment: Comment = comments::table
+            .find(comment_id)
+            .select(Comment::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
 
-            if comment.status == target {
-                // Idempotent: a double-clicked Approve must not increment twice.
-                return Ok::<_, AutumnError>(comment);
-            }
+        if comment.status == target {
+            // Idempotent: a double-clicked Approve must not increment twice.
+            return Ok::<_, AutumnError>(comment);
+        }
 
-            let saved: Comment = diesel::update(comments::table.find(comment_id))
-                .set(comments::status.eq(&target))
-                .returning(Comment::as_returning())
-                .get_result(conn)
-                .await?;
+        let saved: Comment = diesel::update(comments::table.find(comment_id))
+            .set(comments::status.eq(&target))
+            .returning(Comment::as_returning())
+            .get_result(conn)
+            .await?;
 
-            // The delta is derived from the before/after pair rather than from
-            // the action name, so every path — approve, spam, trash, restore —
-            // moves the counter by the right amount without its own branch.
-            let delta = i64::from(target == "approved") - i64::from(comment.status == "approved");
-            if delta != 0 {
-                diesel::update(posts::table.find(comment.post_id))
-                    .set(posts::comment_count.eq(posts::comment_count + delta))
+        // Hiding a comment hides the thread under it. `assemble_thread` builds
+        // from the roots down, so a reply whose parent is no longer approved
+        // can never be attached or rendered — while it stayed `approved` and
+        // stayed in `comment_count`. The post then advertised comments no
+        // reader could see. Moving the approved descendants with the parent is
+        // what makes counting and rendering ask the same question.
+        //
+        // The reverse does not cascade: approving a parent must not approve
+        // replies nobody has moderated. They stay pending and appear when they
+        // are approved on their own.
+        if comment.status == "approved" && target != "approved" {
+            let mut frontier = vec![comment_id];
+            // The reply depth is capped on the write path, so this terminates
+            // in at most that many rounds whatever the data looks like.
+            for _ in 0..=MAX_COMMENT_DEPTH {
+                let children: Vec<i64> = comments::table
+                    .filter(comments::parent_id.eq_any(&frontier))
+                    .filter(comments::status.eq("approved"))
+                    .select(comments::id)
+                    .load(conn)
+                    .await?;
+                if children.is_empty() {
+                    break;
+                }
+                diesel::update(comments::table.filter(comments::id.eq_any(&children)))
+                    .set(comments::status.eq(&target))
                     .execute(conn)
                     .await?;
+                frontier = children;
             }
-            Ok::<_, AutumnError>(saved)
         }
-        .scope_boxed()
+
+        // Recomputed from ground truth rather than moved by a delta: the
+        // cascade above changes an unknown number of rows, so no delta derived
+        // from the one named in the request would be right.
+        let approved: i64 = comments::table
+            .filter(comments::post_id.eq(comment.post_id))
+            .filter(comments::status.eq("approved"))
+            .count()
+            .get_result(conn)
+            .await?;
+        diesel::update(posts::table.find(comment.post_id))
+            .set(posts::comment_count.eq(approved))
+            .execute(conn)
+            .await?;
+        Ok::<_, AutumnError>(saved)
     })
     .await
 }
 
 /// Insert a comment, bumping the approved counter when it lands approved.
-pub async fn create_comment(db: &mut Db, new: crate::models::NewComment) -> AutumnResult<Comment> {
-    db.tx(move |conn| {
-        async move {
-            let approved = new.status == "approved";
-            let post_id = new.post_id;
-            let saved: Comment = diesel::insert_into(comments::table)
-                .values(&new)
-                .returning(Comment::as_returning())
-                .get_result(conn)
+pub async fn create_comment(
+    conn: &mut AsyncPgConnection,
+    new: crate::models::NewComment,
+) -> AutumnResult<Comment> {
+    conn.transaction(async move |conn| {
+        let approved = new.status == "approved";
+        let post_id = new.post_id;
+        let saved: Comment = diesel::insert_into(comments::table)
+            .values(&new)
+            .returning(Comment::as_returning())
+            .get_result(conn)
+            .await?;
+        if approved {
+            diesel::update(posts::table.find(post_id))
+                .set(posts::comment_count.eq(posts::comment_count + 1))
+                .execute(conn)
                 .await?;
-            if approved {
-                diesel::update(posts::table.find(post_id))
-                    .set(posts::comment_count.eq(posts::comment_count + 1))
-                    .execute(conn)
-                    .await?;
-            }
-            Ok::<_, AutumnError>(saved)
         }
-        .scope_boxed()
+        Ok::<_, AutumnError>(saved)
     })
     .await
 }
@@ -615,12 +653,15 @@ pub fn to_comment_views(nodes: &[ThreadNode]) -> Vec<autumn_web::widgets::Commen
 }
 
 /// A post's revision history, newest first.
-pub async fn revisions_for(db: &mut Db, post_id: i64) -> AutumnResult<Vec<Revision>> {
+pub async fn revisions_for(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<Vec<Revision>> {
     Ok(revisions::table
         .filter(revisions::post_id.eq(post_id))
         .order((revisions::created_at.desc(), revisions::id.desc()))
         .select(Revision::as_select())
-        .load(&mut **db)
+        .load(&mut *conn)
         .await?)
 }
 
@@ -629,12 +670,15 @@ pub async fn revisions_for(db: &mut Db, post_id: i64) -> AutumnResult<Vec<Revisi
 /// Collected *before* the author is deleted: `posts.author_id` cascades, which
 /// takes the `post_terms` rows with it, so afterwards there is nothing left to
 /// tell you which terms need rebuilding.
-pub async fn term_ids_for_author(db: &mut Db, author_id: i64) -> AutumnResult<Vec<i64>> {
+pub async fn term_ids_for_author(
+    conn: &mut AsyncPgConnection,
+    author_id: i64,
+) -> AutumnResult<Vec<i64>> {
     let mut ids: Vec<i64> = post_terms::table
         .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
         .filter(posts::author_id.eq(author_id))
         .select(post_terms::term_id)
-        .load(&mut **db)
+        .load(&mut *conn)
         .await?;
     ids.sort_unstable();
     ids.dedup();
@@ -642,9 +686,9 @@ pub async fn term_ids_for_author(db: &mut Db, author_id: i64) -> AutumnResult<Ve
 }
 
 /// Rebuild the published-post counts of the given terms.
-pub async fn recount_terms(db: &mut Db, term_ids: &[i64]) -> AutumnResult<()> {
+pub async fn recount_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     for term_id in term_ids {
-        recount_term(db, *term_id).await?;
+        recount_term(conn, *term_id).await?;
     }
     Ok(())
 }
@@ -657,7 +701,7 @@ pub async fn recount_terms(db: &mut Db, term_ids: &[i64]) -> AutumnResult<()> {
 /// cycle already present in the data (only reachable by a direct write)
 /// terminates the walk at the depth bound rather than spinning.
 pub async fn would_create_cycle(
-    db: &mut Db,
+    conn: &mut AsyncPgConnection,
     post_id: i64,
     candidate_parent_id: i64,
 ) -> AutumnResult<bool> {
@@ -681,7 +725,7 @@ pub async fn would_create_cycle(
         cursor = posts::table
             .find(current)
             .select(posts::parent_id)
-            .first::<Option<i64>>(&mut **db)
+            .first::<Option<i64>>(&mut *conn)
             .await
             .optional()?
             .flatten();
@@ -713,30 +757,30 @@ const ADMIN_SET_LOCK_KEY: i64 = 7_717_260_231_001;
 /// table and both be persisted as administrators: the window is not
 /// theoretical, because password hashing (bcrypt, deliberately slow) happens
 /// between the check and the insert.
-pub async fn register_user(db: &mut Db, new: crate::models::NewUser) -> AutumnResult<User> {
+pub async fn register_user(
+    conn: &mut AsyncPgConnection,
+    new: crate::models::NewUser,
+) -> AutumnResult<User> {
     let mut new = new;
     crate::hooks::normalize_new_user(&mut new)?;
-    db.tx(move |conn| {
-        async move {
-            diesel::sql_query(format!(
-                "SELECT pg_advisory_xact_lock({ADMIN_SET_LOCK_KEY})"
-            ))
-            .execute(conn)
-            .await?;
+    conn.transaction(async move |conn| {
+        diesel::sql_query(format!(
+            "SELECT pg_advisory_xact_lock({ADMIN_SET_LOCK_KEY})"
+        ))
+        .execute(conn)
+        .await?;
 
-            let existing: i64 = users::table.count().get_result(conn).await?;
-            if existing == 0 {
-                new.role = crate::capabilities::Role::Administrator.slug().to_owned();
-            }
-
-            let created: User = diesel::insert_into(users::table)
-                .values(&new)
-                .returning(User::as_returning())
-                .get_result(conn)
-                .await?;
-            Ok::<_, AutumnError>(created)
+        let existing: i64 = users::table.count().get_result(conn).await?;
+        if existing == 0 {
+            new.role = crate::capabilities::Role::Administrator.slug().to_owned();
         }
-        .scope_boxed()
+
+        let created: User = diesel::insert_into(users::table)
+            .values(&new)
+            .returning(User::as_returning())
+            .get_result(conn)
+            .await?;
+        Ok::<_, AutumnError>(created)
     })
     .await
 }
@@ -748,7 +792,7 @@ pub async fn register_user(db: &mut Db, new: crate::models::NewUser) -> AutumnRe
 /// [`ADMIN_SET_LOCK_KEY`], so two requests demoting each other cannot both see
 /// a spare administrator and both proceed.
 async fn with_administrator_guard<F>(
-    db: &mut Db,
+    conn: &mut AsyncPgConnection,
     target_id: i64,
     new_role: crate::capabilities::Role,
     mutate: F,
@@ -760,41 +804,37 @@ where
         + Send
         + 'static,
 {
-    db.tx(move |conn| {
-        async move {
-            diesel::sql_query(format!(
-                "SELECT pg_advisory_xact_lock({ADMIN_SET_LOCK_KEY})"
-            ))
-            .execute(conn)
-            .await?;
+    conn.transaction(async move |conn| {
+        diesel::sql_query(format!(
+            "SELECT pg_advisory_xact_lock({ADMIN_SET_LOCK_KEY})"
+        ))
+        .execute(conn)
+        .await?;
 
-            let target: User = users::table
-                .find(target_id)
-                .select(User::as_select())
-                .first(conn)
-                .await
-                .map_err(AutumnError::not_found)?;
+        let target: User = users::table
+            .find(target_id)
+            .select(User::as_select())
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
 
-            let administrator = crate::capabilities::Role::Administrator;
-            let losing_an_administrator =
-                target.role() == administrator && new_role != administrator;
-            if losing_an_administrator {
-                let remaining: i64 = users::table
-                    .filter(users::role.eq(administrator.slug()))
-                    .count()
-                    .get_result(conn)
-                    .await?;
-                if remaining <= 1 {
-                    return Err(AutumnError::unprocessable_msg(
-                        "This is the only administrator account; promote another user first",
-                    ));
-                }
+        let administrator = crate::capabilities::Role::Administrator;
+        let losing_an_administrator = target.role() == administrator && new_role != administrator;
+        if losing_an_administrator {
+            let remaining: i64 = users::table
+                .filter(users::role.eq(administrator.slug()))
+                .count()
+                .get_result(conn)
+                .await?;
+            if remaining <= 1 {
+                return Err(AutumnError::unprocessable_msg(
+                    "This is the only administrator account; promote another user first",
+                ));
             }
-
-            mutate(conn).await?;
-            Ok::<_, AutumnError>(())
         }
-        .scope_boxed()
+
+        mutate(conn).await?;
+        Ok::<_, AutumnError>(())
     })
     .await
 }
@@ -802,7 +842,7 @@ where
 /// Change an account's role and profile fields, guarding the last
 /// administrator.
 pub async fn update_user(
-    db: &mut Db,
+    conn: &mut AsyncPgConnection,
     target_id: i64,
     role: crate::capabilities::Role,
     email: String,
@@ -810,7 +850,7 @@ pub async fn update_user(
     bio: String,
     website: String,
 ) -> AutumnResult<()> {
-    with_administrator_guard(db, target_id, role, move |conn| {
+    with_administrator_guard(conn, target_id, role, move |conn| {
         async move {
             diesel::update(users::table.find(target_id))
                 .set((
@@ -835,17 +875,17 @@ pub async fn update_user(
 /// Returns the terms its cascaded posts were filed under, so the caller can
 /// rebuild their counts — the cascade reaches `post_terms` and nothing in it
 /// maintains `terms.post_count`.
-pub async fn delete_user(db: &mut Db, target_id: i64) -> AutumnResult<()> {
+pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> AutumnResult<()> {
     // Collected before the delete: the cascade takes the `post_terms` rows
     // with it, so afterwards nothing names the terms that need rebuilding.
-    let affected_terms = term_ids_for_author(db, target_id).await?;
+    let affected_terms = term_ids_for_author(conn, target_id).await?;
     // Deleting is a demotion to "no role at all", so it takes the same guard.
     // The recounts run inside the same transaction as the cascade: doing them
     // afterwards means a transient failure leaves the account and its posts
     // permanently gone with the counts stale, and a retry finds no user to
     // delete, so nothing ever repairs them.
     with_administrator_guard(
-        db,
+        conn,
         target_id,
         crate::capabilities::Role::Subscriber,
         move |conn| {
@@ -1241,7 +1281,10 @@ pub async fn ensure_unique_slug(
 pub const MAX_PAGE_DEPTH: usize = 8;
 
 /// How many ancestors a page would have under `candidate_parent_id`.
-pub async fn depth_under(db: &mut Db, candidate_parent_id: i64) -> AutumnResult<usize> {
+pub async fn depth_under(
+    conn: &mut AsyncPgConnection,
+    candidate_parent_id: i64,
+) -> AutumnResult<usize> {
     let mut depth = 1usize;
     let mut cursor = Some(candidate_parent_id);
     while let Some(current) = cursor {
@@ -1251,7 +1294,7 @@ pub async fn depth_under(db: &mut Db, candidate_parent_id: i64) -> AutumnResult<
         cursor = posts::table
             .find(current)
             .select(posts::parent_id)
-            .first::<Option<i64>>(&mut **db)
+            .first::<Option<i64>>(&mut *conn)
             .await
             .optional()?
             .flatten();
@@ -1271,7 +1314,7 @@ pub async fn depth_under(db: &mut Db, candidate_parent_id: i64) -> AutumnResult<
 /// resolves to nothing. `post_id` is `None` when creating (no row to cycle
 /// back to yet).
 pub async fn validate_parent(
-    db: &mut Db,
+    conn: &mut AsyncPgConnection,
     post_id: Option<i64>,
     post_type: &str,
     candidate_parent_id: i64,
@@ -1284,7 +1327,7 @@ pub async fn validate_parent(
     let parent: Option<Post> = posts::table
         .find(candidate_parent_id)
         .select(Post::as_select())
-        .first(&mut **db)
+        .first(&mut *conn)
         .await
         .optional()?;
     let Some(parent) = parent else {
@@ -1297,13 +1340,13 @@ pub async fn validate_parent(
     }
 
     if let Some(post_id) = post_id
-        && would_create_cycle(db, post_id, candidate_parent_id).await?
+        && would_create_cycle(conn, post_id, candidate_parent_id).await?
     {
         return Err(AutumnError::unprocessable_msg(
             "A page cannot be placed under itself or one of its own children",
         ));
     }
-    if depth_under(db, candidate_parent_id).await? >= MAX_PAGE_DEPTH {
+    if depth_under(conn, candidate_parent_id).await? >= MAX_PAGE_DEPTH {
         return Err(AutumnError::unprocessable_msg(format!(
             "Pages can be nested at most {MAX_PAGE_DEPTH} levels deep"
         )));
@@ -1323,17 +1366,21 @@ pub async fn validate_parent(
 /// Invalid links are skipped rather than raised: an import that aborts part-way
 /// leaves the site half-restored, which is worse than one page landing at the
 /// top level. The caller reports the count.
-pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> AutumnResult<bool> {
+pub async fn set_post_parent(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    parent_id: i64,
+) -> AutumnResult<bool> {
     let post: Option<Post> = posts::table
         .find(post_id)
         .select(Post::as_select())
-        .first(&mut **db)
+        .first(&mut *conn)
         .await
         .optional()?;
     let Some(post) = post else {
         return Ok(false);
     };
-    if validate_parent(db, Some(post_id), &post.post_type, parent_id)
+    if validate_parent(conn, Some(post_id), &post.post_type, parent_id)
         .await
         .is_err()
     {
@@ -1341,7 +1388,7 @@ pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> Autum
     }
     diesel::update(posts::table.find(post_id))
         .set(posts::parent_id.eq(parent_id))
-        .execute(&mut **db)
+        .execute(&mut *conn)
         .await?;
     Ok(true)
 }
@@ -1354,33 +1401,30 @@ pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> Autum
 /// every approved descendant permanently included in the post's displayed
 /// count. The counter is recomputed from ground truth rather than adjusted by a
 /// delta, so it is right whatever the cascade removed.
-pub async fn delete_comment(db: &mut Db, comment_id: i64) -> AutumnResult<()> {
-    db.tx(move |conn| {
-        async move {
-            let comment: Comment = comments::table
-                .find(comment_id)
-                .select(Comment::as_select())
-                .first(conn)
-                .await
-                .map_err(AutumnError::not_found)?;
+pub async fn delete_comment(conn: &mut AsyncPgConnection, comment_id: i64) -> AutumnResult<()> {
+    conn.transaction(async move |conn| {
+        let comment: Comment = comments::table
+            .find(comment_id)
+            .select(Comment::as_select())
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
 
-            diesel::delete(comments::table.find(comment_id))
-                .execute(conn)
-                .await?;
+        diesel::delete(comments::table.find(comment_id))
+            .execute(conn)
+            .await?;
 
-            let approved: i64 = comments::table
-                .filter(comments::post_id.eq(comment.post_id))
-                .filter(comments::status.eq("approved"))
-                .count()
-                .get_result(conn)
-                .await?;
-            diesel::update(posts::table.find(comment.post_id))
-                .set(posts::comment_count.eq(approved))
-                .execute(conn)
-                .await?;
-            Ok::<_, AutumnError>(())
-        }
-        .scope_boxed()
+        let approved: i64 = comments::table
+            .filter(comments::post_id.eq(comment.post_id))
+            .filter(comments::status.eq("approved"))
+            .count()
+            .get_result(conn)
+            .await?;
+        diesel::update(posts::table.find(comment.post_id))
+            .set(posts::comment_count.eq(approved))
+            .execute(conn)
+            .await?;
+        Ok::<_, AutumnError>(())
     })
     .await
 }
@@ -1428,12 +1472,30 @@ pub async fn search_published(
         id: i64,
     }
 
-    const MATCH_PREDICATE: &str = "status = 'publish' \
-         AND search_vector @@ websearch_to_tsquery('english', $1) \
-         AND post_type = ANY($2)";
+    // The vector a *reader without the password* is allowed to match against.
+    //
+    // `search_vector` covers title, excerpt and body. For a password-protected
+    // post the body is exactly what the password withholds, so matching it here
+    // turned search into an oracle: a caller could probe words and learn
+    // whether they occur in protected content, without ever having the
+    // password. Title and a hand-written excerpt stay searchable because both
+    // are already public — the index renders them and the password form is
+    // titled. A derived excerpt is not in play; `display_excerpt` returns empty
+    // for a protected post with no hand-written one.
+    const PUBLIC_VECTOR: &str = "(CASE WHEN password = '' THEN search_vector \
+         ELSE setweight(to_tsvector('english', COALESCE(title, '')), 'A') \
+              || setweight(to_tsvector('english', COALESCE(excerpt, '')), 'B') \
+         END)";
+
+    let match_predicate = format!(
+        "status = 'publish' \
+         AND {PUBLIC_VECTOR} @@ websearch_to_tsquery('english', $1) \
+         AND post_type = ANY($2)"
+    );
+    let match_predicate = match_predicate.as_str();
 
     let total: i64 = diesel::sql_query(format!(
-        "SELECT COUNT(*) AS count FROM posts WHERE {MATCH_PREDICATE}"
+        "SELECT COUNT(*) AS count FROM posts WHERE {match_predicate}"
     ))
     .bind::<Text, _>(query)
     .bind::<Array<Text>, _>(public_types.to_vec())
@@ -1441,9 +1503,12 @@ pub async fn search_published(
     .await?
     .count;
 
+    // Ranked on the same restricted vector, not on `search_vector`: ordering
+    // derived from body matches would leak through position what the predicate
+    // refuses to leak through membership.
     let matched: Vec<i64> = diesel::sql_query(format!(
-        "SELECT id FROM posts WHERE {MATCH_PREDICATE} \
-         ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', $1)) DESC, \
+        "SELECT id FROM posts WHERE {match_predicate} \
+         ORDER BY ts_rank({PUBLIC_VECTOR}, websearch_to_tsquery('english', $1)) DESC, \
                   published_at DESC NULLS LAST, id DESC \
          LIMIT $3 OFFSET $4"
     ))
@@ -1487,28 +1552,29 @@ pub async fn search_published(
 /// duplicate slug is the easy way to get one) leaves the site with *no* menu at
 /// that location — the navigation simply disappears, from a request that
 /// reported an error.
-pub async fn replace_menu_at_location(db: &mut Db, name: &str, location: &str) -> AutumnResult<()> {
+pub async fn replace_menu_at_location(
+    conn: &mut AsyncPgConnection,
+    name: &str,
+    location: &str,
+) -> AutumnResult<()> {
     let name = name.to_owned();
     let location = location.to_owned();
-    db.tx(move |conn| {
-        async move {
-            if !location.is_empty() {
-                diesel::update(menus::table.filter(menus::location.eq(&location)))
-                    .set(menus::location.eq(""))
-                    .execute(conn)
-                    .await?;
-            }
-            diesel::insert_into(menus::table)
-                .values((
-                    menus::name.eq(&name),
-                    menus::slug.eq(autumn_web::slugify(&name)),
-                    menus::location.eq(&location),
-                ))
+    conn.transaction(async move |conn| {
+        if !location.is_empty() {
+            diesel::update(menus::table.filter(menus::location.eq(&location)))
+                .set(menus::location.eq(""))
                 .execute(conn)
                 .await?;
-            Ok::<_, AutumnError>(())
         }
-        .scope_boxed()
+        diesel::insert_into(menus::table)
+            .values((
+                menus::name.eq(&name),
+                menus::slug.eq(autumn_web::slugify(&name)),
+                menus::location.eq(&location),
+            ))
+            .execute(conn)
+            .await?;
+        Ok::<_, AutumnError>(())
     })
     .await
 }
@@ -1531,6 +1597,32 @@ pub async fn populated_terms(
         .select(Term::as_select())
         .load(conn)
         .await?)
+}
+
+/// The `post_meta` key under which the importer records the slug a post carried
+/// in the file it came from.
+///
+/// The stored row's own slug is not that slug whenever the allocator had to
+/// suffix it, so this is what makes a re-import idempotent. Underscore-prefixed
+/// in WordPress's convention for meta the UI does not show.
+pub const IMPORT_SOURCE_SLUG_KEY: &str = "_import_source_slug";
+
+/// Every `(post_type, source slug)` pair a previous import recorded.
+///
+/// Joined to `posts` so a row deleted since the import it came from does not
+/// keep its slug reserved — re-importing content the site no longer holds is a
+/// restore, and should work.
+pub async fn imported_source_slugs(
+    conn: &mut AsyncPgConnection,
+) -> AutumnResult<std::collections::HashSet<(String, String)>> {
+    Ok(post_meta::table
+        .inner_join(posts::table.on(posts::id.eq(post_meta::post_id)))
+        .filter(post_meta::meta_key.eq(IMPORT_SOURCE_SLUG_KEY))
+        .select((posts::post_type, post_meta::meta_value))
+        .load::<(String, String)>(conn)
+        .await?
+        .into_iter()
+        .collect())
 }
 
 /// One page of a taxonomy's terms, ordered by name, bounded in SQL.

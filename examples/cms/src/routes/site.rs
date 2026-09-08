@@ -308,6 +308,30 @@ impl Repos {
         Ok((rows, usize::try_from(total).unwrap_or(0)))
     }
 
+    /// Run one operation on a connection held only for the duration of the call.
+    ///
+    /// The rule this enforces: **a handler never holds a pool connection across
+    /// a repository call.** The repositories are pool-backed and acquire their
+    /// own connection per call, so a handler that holds one (the `Db` extractor
+    /// holds it from before the body runs until the response is returned) and
+    /// then reaches for a repository needs *two* slots at once. With the shipped
+    /// `pool_size = 10`, ten concurrent requests in that shape can each hold one
+    /// slot while waiting for a second that only another of them could release,
+    /// and none of them can make progress.
+    ///
+    /// Writing the checkout as a scope rather than a `let` is what makes it
+    /// hard to get wrong: the connection cannot outlive the call, so a
+    /// repository read added later cannot silently end up inside its lifetime.
+    pub async fn with_conn<T, F>(&self, f: F) -> AutumnResult<T>
+    where
+        F: AsyncFnOnce(
+            &mut autumn_web::reexports::diesel_async::AsyncPgConnection,
+        ) -> AutumnResult<T>,
+    {
+        let mut conn = self.conn().await?;
+        f(&mut conn).await
+    }
+
     /// Save a post, allocating a slug that is free across the types sharing
     /// the bare URL path, and retrying if a concurrent write takes it first.
     ///

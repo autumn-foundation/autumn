@@ -667,7 +667,6 @@ pub async fn create(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path(post_type): Path<String>,
     Form(form): Form<PostForm>,
 ) -> AutumnResult<Response> {
@@ -694,7 +693,11 @@ pub async fn create(
     // permalink builder renders — producing a canonical URL that starts
     // mid-tree and resolves to nothing.
     if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
-        content::validate_parent(&mut db, None, registered.slug, parent_id).await?;
+        repos
+            .with_conn(async |conn| {
+                content::validate_parent(conn, None, registered.slug, parent_id).await
+            })
+            .await?;
     }
 
     // Slug allocation and the retry it needs live on `Repos` so the importer
@@ -736,12 +739,16 @@ pub async fn create(
     // asked for revisions. `supports_revisions: false` is a registration the
     // storage should honour, not a flag the editor ignores.
     if registered.supports_revisions {
-        content::record_initial_revision(&mut db, &created).await?;
+        repos
+            .with_conn(async |conn| content::record_initial_revision(conn, &created).await)
+            .await?;
     }
 
-    apply_terms(&repos, &mut db, &created, &form).await?;
+    apply_terms(&repos, &created, &form).await?;
     if status == "future" || status == "private" {
-        content::transition_status(&mut db, created.id, &status).await?;
+        repos
+            .with_conn(async |conn| content::transition_status(conn, created.id, &status).await)
+            .await?;
     }
     do_action(Action::PostSaved, created.id);
 
@@ -757,7 +764,6 @@ pub async fn update(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path((post_type, id)): Path<(String, i64)>,
     Form(form): Form<PostForm>,
 ) -> AutumnResult<Response> {
@@ -802,14 +808,19 @@ pub async fn update(
     // that closes a cycle, and page resolution walks down from a NULL parent,
     // so every page in the cycle becomes unreachable at its own permalink.
     if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
-        content::validate_parent(&mut db, Some(id), &post_type, parent_id).await?;
+        repos
+            .with_conn(async |conn| {
+                content::validate_parent(conn, Some(id), &post_type, parent_id).await
+            })
+            .await?;
     }
 
-    let slug = {
-        let mut conn = repos.conn().await?;
-        let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
-        content::ensure_unique_slug(&mut conn, &post_type, &desired, Some(id)).await?
-    };
+    let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
+    let slug = repos
+        .with_conn(async |conn| {
+            content::ensure_unique_slug(conn, &post_type, &desired, Some(id)).await
+        })
+        .await?;
 
     let form_snapshot = (
         form.title.trim().to_owned(),
@@ -835,50 +846,55 @@ pub async fn update(
         .and_then(|value| value.parse::<i32>().ok());
 
     // The content edit and its revision commit together.
-    let updated =
-        content::update_post_with_revision(
-            &mut db,
-            id,
-            user.id,
-            "Edited",
-            expected_lock_version,
-            registered.supports_revisions,
-            move |post| {
-                let (
-                    title,
-                    slug,
-                    excerpt,
-                    body,
-                    password,
-                    sticky,
-                    comments_open,
-                    parent,
-                    media,
-                    order,
-                ) = form_snapshot;
-                post.title = title;
-                post.slug = slug;
-                post.excerpt = excerpt;
-                post.body = body;
-                post.password = password;
-                post.sticky = sticky;
-                post.comment_status = if comments_open { "open" } else { "closed" }.to_owned();
-                post.parent_id = parent;
-                post.featured_media_id = media;
-                post.menu_order = order;
-                if let Some(when) = scheduled_for {
-                    post.published_at = Some(when);
-                }
-            },
-        )
+    let updated = repos
+        .with_conn(async |conn| {
+            content::update_post_with_revision(
+                conn,
+                id,
+                user.id,
+                "Edited",
+                expected_lock_version,
+                registered.supports_revisions,
+                move |post| {
+                    let (
+                        title,
+                        slug,
+                        excerpt,
+                        body,
+                        password,
+                        sticky,
+                        comments_open,
+                        parent,
+                        media,
+                        order,
+                    ) = form_snapshot;
+                    post.title = title;
+                    post.slug = slug;
+                    post.excerpt = excerpt;
+                    post.body = body;
+                    post.password = password;
+                    post.sticky = sticky;
+                    post.comment_status = if comments_open { "open" } else { "closed" }.to_owned();
+                    post.parent_id = parent;
+                    post.featured_media_id = media;
+                    post.menu_order = order;
+                    if let Some(when) = scheduled_for {
+                        post.published_at = Some(when);
+                    }
+                },
+            )
+            .await
+        })
         .await?;
 
-    apply_terms(&repos, &mut db, &updated, &form).await?;
+    apply_terms(&repos, &updated, &form).await?;
 
     // A status change goes through the state machine, never through the plain
     // field write above — so an illegal edge is refused rather than persisted.
     if status != updated.status {
-        content::transition_status(&mut db, id, &status).await?;
+        repos
+            .with_conn(async |conn| content::transition_status(conn, id, &status).await)
+            .await?;
         do_action(Action::PostTransitioned, id);
     }
     do_action(Action::PostSaved, id);
@@ -906,12 +922,7 @@ fn requested_status(form: &PostForm, user: &User) -> String {
 }
 
 /// Save the post's categories and tags, creating any tag that does not exist.
-async fn apply_terms(
-    repos: &Repos,
-    db: &mut autumn_web::Db,
-    post: &Post,
-    form: &PostForm,
-) -> AutumnResult<()> {
+async fn apply_terms(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResult<()> {
     let taxonomies = content_types::taxonomies_for(&post.post_type);
     if taxonomies.is_empty() {
         return Ok(());
@@ -959,7 +970,11 @@ async fn apply_terms(
         }
     }
 
-    content::set_post_terms(db, post.id, term_ids).await
+    // Every repository read above is finished, so the connection is taken only
+    // for the write.
+    repos
+        .with_conn(async |conn| content::set_post_terms(conn, post.id, term_ids).await)
+        .await
 }
 
 // ── Status transitions ──────────────────────────────────────────────────────
@@ -974,7 +989,6 @@ pub async fn transition(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path((post_type, id)): Path<(String, i64)>,
     Query(query): Query<TransitionQuery>,
 ) -> AutumnResult<Response> {
@@ -1001,7 +1015,9 @@ pub async fn transition(
         ));
     }
 
-    content::transition_status(&mut db, id, &query.to).await?;
+    repos
+        .with_conn(async |conn| content::transition_status(conn, id, &query.to).await)
+        .await?;
     do_action(Action::PostTransitioned, id);
 
     let destination = if query.to == "trash" {
@@ -1019,7 +1035,6 @@ pub async fn revisions(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path((post_type, id)): Path<(String, i64)>,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
@@ -1045,7 +1060,9 @@ pub async fn revisions(
         ));
     }
 
-    let history = content::revisions_for(&mut db, id).await?;
+    let history = repos
+        .with_conn(async |conn| content::revisions_for(conn, id).await)
+        .await?;
     let body = html! {
         p class="text-sm text-gray-500 mb-4" {
             "Every edit is snapshotted before it is applied, so restoring a revision returns \
@@ -1104,7 +1121,6 @@ pub async fn restore(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    mut db: autumn_web::Db,
     Path((post_type, id, revision_id)): Path<(String, i64, i64)>,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
@@ -1127,7 +1143,9 @@ pub async fn restore(
         ));
     }
 
-    content::restore_revision(&mut db, id, revision_id).await?;
+    repos
+        .with_conn(async |conn| content::restore_revision(conn, id, revision_id).await)
+        .await?;
     do_action(Action::PostSaved, id);
     Ok(Redirect::to(&format!("/admin/content/{post_type}/{id}")).into_response())
 }

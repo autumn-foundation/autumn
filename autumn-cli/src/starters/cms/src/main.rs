@@ -21,7 +21,7 @@ async fn main() {
     // Registrations happen before the router is built, which is what makes a
     // custom post type appear in the admin menu, the router and the REST API
     // at once — the whole point of a registry.
-    cms::bootstrap();
+    {{crate_name}}::bootstrap();
 
     autumn_web::app()
         .migrations(MIGRATIONS)
@@ -29,9 +29,9 @@ async fn main() {
         // `settings::cached_settings`); this is the backend it lives in. Swap
         // in the Redis backend to share it across replicas.
         .with_cache_backend(autumn_web::cache::MokaCache::new(1_000, None))
-        .routes(cms::all_routes())
-        .tasks(tasks![cms::tasks::publish_scheduled])
-        .one_off_tasks(one_off_tasks![cms::seed::seed_demo_content])
+        .routes({{crate_name}}::all_routes())
+        .tasks(tasks![{{crate_name}}::tasks::publish_scheduled])
+        .one_off_tasks(one_off_tasks![{{crate_name}}::seed::seed_demo_content])
         .run()
         .await;
 }

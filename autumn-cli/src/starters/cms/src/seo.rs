@@ -52,12 +52,14 @@ pub async fn sitemap(repos: Repos, State(state): State<AppState>) -> AutumnResul
             .published_posts(post_type.slug, i64::try_from(remaining).unwrap_or(i64::MAX))
             .await?
         {
+            // Emitted whatever shape it has, query string included. The
+            // `plain` structure makes every post's canonical URL `/?p=<id>` —
+            // which `front_page` serves — so skipping query-string paths
+            // dropped the *entire* post corpus from the sitemap on a site that
+            // chose that structure. A query string is valid in `<loc>`; the
+            // `&` that a multi-parameter one would carry is escaped by
+            // `escape_xml` below.
             let path = repos.permalink(&post, &settings).await?;
-            // The `plain` structure yields `/?p=1`. That is a valid URL but a
-            // poor sitemap entry, and it duplicates the canonical one.
-            if path.starts_with("/?") {
-                continue;
-            }
             let lastmod = post.published_at.map(|published| {
                 post.updated_at
                     .max(published)

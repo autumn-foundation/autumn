@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::capabilities::Capability;
 use crate::content_types;
 use crate::models::{NewPost, Post};
+use crate::plugins::{Action, do_action};
 use crate::repositories::PostRepository as _;
 
 use super::site::Repos;
@@ -175,7 +176,6 @@ pub struct CreatePostBody {
 pub async fn create_post(
     repos: Repos,
     session: Session,
-    mut db: autumn_web::Db,
     Json(body): Json<CreatePostBody>,
 ) -> AutumnResult<(StatusCode, Json<PostView>)> {
     let user = repos.require_user(&session).await?;
@@ -258,10 +258,27 @@ pub async fn create_post(
         })
         .await?;
 
+    let deferred_transition_fired = deferred_transition.is_some();
     let created = match deferred_transition {
-        Some(target) => crate::content::transition_status(&mut db, created.id, &target).await?,
+        Some(target) => {
+            repos
+                .with_conn(async |conn| {
+                    crate::content::transition_status(conn, created.id, &target).await
+                })
+                .await?
+        }
         None => created,
     };
+
+    // The same actions the admin editor and the scheduler fire. Without them a
+    // plugin listening for content changes — a search index, a cache purge, a
+    // webhook — silently missed everything created through the API, which is a
+    // supported way to create content and therefore has to be a supported way
+    // to observe it.
+    do_action(Action::PostSaved, created.id);
+    if deferred_transition_fired {
+        do_action(Action::PostTransitioned, created.id);
+    }
 
     let url = repos.permalink(&created, &settings).await?;
     Ok((StatusCode::CREATED, Json(PostView::from(&created, url))))
