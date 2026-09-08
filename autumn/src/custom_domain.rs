@@ -17,7 +17,7 @@
 //!
 //! Certificate selection by SNI ([`SniCertResolver`]) is behind the `tls`
 //! feature; the ACME orchestration that drives this state machine is in
-//! [`crate::acme::tenant_domains`], behind `acme`.
+//! `crate::acme::tenant_domains`, behind the `acme` feature.
 //!
 //! # State machine
 //!
@@ -530,7 +530,7 @@ impl CustomDomainStore for MemoryCustomDomainStore {
 }
 
 /// Filesystem [`CustomDomainStore`]: one `0600` JSON file per domain under a
-/// `0700` directory, mirroring [`crate::acme::store::FsAcmeStore`].
+/// `0700` directory, mirroring `crate::acme::store::FsAcmeStore`.
 ///
 /// A file per domain (rather than one index file) keeps a 1,000-domain
 /// deployment's writes independent: registering or offboarding one tenant
@@ -1184,7 +1184,7 @@ impl CustomDomainRegistry {
 /// Is a certificate expiring at `not_after_unix` inside its renew-before
 /// window at `now_unix`?
 ///
-/// Mirrors [`crate::acme::renewal::needs_renewal`] but compiles without the
+/// Mirrors `crate::acme::renewal::needs_renewal` but compiles without the
 /// `acme` feature, so the registry's renewal scheduling is testable in a
 /// default build.
 #[must_use]
@@ -1398,7 +1398,7 @@ fn retry_after(hits: &[i64], now_unix: i64, window: i64) -> i64 {
 ///
 /// Deliberately independent of the `acme` feature so the orchestration and its
 /// tests compile in a default build; the ACME adapter converts to and from
-/// [`crate::acme::store::StoredCert`].
+/// `crate::acme::store::StoredCert`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedCertificate {
     /// PEM certificate chain, leaf first.
@@ -1556,7 +1556,7 @@ pub(crate) fn now_unix() -> i64 {
 ///
 /// The seam lives here, in the core module, so the retention engine can drive
 /// it without the `acme` feature; the implementation that actually knows about
-/// certificates is [`crate::acme::tenant_domains::CustomDomainTask`].
+/// certificates is `crate::acme::tenant_domains::CustomDomainTask`.
 pub trait CustomDomainPruner: Send + Sync {
     /// Delete what the retention policy no longer keeps and return how many
     /// records went (or would go, when `dry_run`).
