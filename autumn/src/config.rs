@@ -6057,6 +6057,11 @@ impl AutumnConfig {
             "AUTUMN_RETENTION__AUDIT_ARCHIVES",
             &mut self.retention.audit_archives,
         );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__CUSTOM_DOMAINS",
+            &mut self.retention.custom_domains,
+        );
     }
 
     fn apply_scheduler_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -13991,7 +13996,8 @@ path = "/healthz"
             .with("AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS", "180d")
             .with("AUTUMN_RETENTION__WEBHOOK_REPLAY", "1d")
             .with("AUTUMN_RETENTION__SESSIONS", "14d")
-            .with("AUTUMN_RETENTION__AUDIT_ARCHIVES", "365d");
+            .with("AUTUMN_RETENTION__AUDIT_ARCHIVES", "365d")
+            .with("AUTUMN_RETENTION__CUSTOM_DOMAINS", "30d");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
 
@@ -14006,6 +14012,7 @@ path = "/healthz"
         assert_eq!(config.retention.webhook_replay.as_deref(), Some("1d"));
         assert_eq!(config.retention.sessions.as_deref(), Some("14d"));
         assert_eq!(config.retention.audit_archives.as_deref(), Some("365d"));
+        assert_eq!(config.retention.custom_domains.as_deref(), Some("30d"));
     }
 
     #[test]
