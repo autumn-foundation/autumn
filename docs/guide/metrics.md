@@ -316,9 +316,15 @@ Code in `main` that runs *ahead* of `.run()` therefore sees the defaults.
 their staging areas are bounded generously rather than by the running cap
 precisely so the startup pattern above keeps working when you raise
 `max_instruments`. But a metric actually **recorded** before `.run()` registers
-under the default 256, and an inert handle handed out then stays inert. If your
-app records more than 256 distinct metric names before its own `run`, call
-`metrics::set_limits` yourself first.
+under the default 256, and an inert handle handed out then stays inert.
+
+If your app records more than 256 distinct metric names before its own `run`,
+you need **both**: call `metrics::set_limits` before recording, *and* set the
+same (or a larger) `max_instruments` in `[metrics]`. `run` installs the
+configured section unconditionally — `autumn.toml` is the authority — so
+setting only the former puts the default back at startup, and every metric
+name registered after that is refused against a registry already over the
+restored cap.
 
 Hitting the series cap logs **one** warning per instrument and is visible in the
 scrape itself, so you can alert on it:

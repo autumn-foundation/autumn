@@ -410,8 +410,15 @@ pub fn max_labels_per_series() -> usize {
 /// them. But a metric actually **recorded** before `run` is registered under
 /// the default 256, and an inert handle handed out then stays inert: the
 /// caller already holds it, and no later raise can retroactively register it.
-/// An app that records more than 256 distinct metric names before its own
-/// `run` should call [`set_limits`] itself first.
+///
+/// An app in that position must do **two** things, not one: call this
+/// function before it records, *and* set the same (or a larger)
+/// `max_instruments` in `[metrics]`. `run` installs the configured section
+/// unconditionally — `autumn.toml` is the authority — so a config that says
+/// nothing puts the default back, and although the instruments registered
+/// before `run` survive, every metric name registered *after* startup is then
+/// refused against a registry already over the restored cap. Calling this
+/// alone widens the pre-`run` window and nothing else.
 ///
 /// # Semantics
 ///

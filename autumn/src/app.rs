@@ -15122,6 +15122,16 @@ mod tests {
 
     #[cfg(feature = "i18n")]
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard must span the `load_config_and_telemetry` await — that \
+                  await is what mutates the limits, so dropping the lock before it \
+                  would serialize nothing. Same shape, and the same reason, as \
+                  `config_runtime_drift_actuator_prefix_is_mounted`'s circuit-breaker \
+                  guard: the contending holders are sibling libtest threads, not \
+                  tasks on this runtime, so blocking here cannot starve the future \
+                  that would release it."
+    )]
     async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
         // `load_config_and_telemetry` installs the `[metrics]` section, so
         // calling it here resets the process-global metric limits as a side
