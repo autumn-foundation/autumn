@@ -782,21 +782,17 @@ async fn an_offboard_is_not_overtaken_by_an_in_flight_save() {
     writer.await.unwrap();
     remover.await.unwrap();
 
-    // Whichever order they ran in, the durable state and the index must agree.
-    let on_disk = store.load_all_blocking();
+    // Whichever order they ran in, what a restart sees must match what this
+    // process serves. Read the durable state the way a restart does — through
+    // `load` — rather than through a test-only accessor, so this asserts the
+    // real recovery path.
     let in_index = registry.get("app.clientco.com");
-    assert_eq!(
-        on_disk.is_empty(),
-        in_index.is_none(),
-        "the store and the index disagree: on_disk={on_disk:?} in_index={in_index:?}"
-    );
-
-    // And a fresh registry over the same store must see the same thing.
     let reloaded = CustomDomainRegistry::new(store, 10);
     reloaded.load().await.unwrap();
     assert_eq!(
         reloaded.get("app.clientco.com").is_none(),
         in_index.is_none(),
-        "a restart resurrected a domain the app offboarded"
+        "the store and the index disagree: a restart would resurrect a domain \
+         the app offboarded (or lose one it kept)"
     );
 }
