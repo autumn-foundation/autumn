@@ -48,10 +48,17 @@ fn pat_binds_name(pat: &syn::Pat, name: &str) -> bool {
 /// `#[throttle]` each mint a handler-unique gate type named
 /// `__Autumn{Kind}Gate_{fn_name}` and insert it as a new leading parameter, so
 /// its check runs — and can reject — before Axum's body extractor ever runs.
+/// `#[feature_flag]` mints the same shape (`__AutumnFlagGate_{fn_name}`) —
+/// Codex review on #2628 found it missing here, which let it wrongly own a
+/// cached idempotency replay (and let a later-expanding `#[secured]`/
+/// `#[step_up]`/`#[throttle]` also wrongly claim ownership, since neither
+/// could see its gate was already there) even when a still-pending
+/// `#[authorize]` needed to run first.
 const GUARD_GATE_TYPE_PREFIXES: &[&str] = &[
     "__AutumnSecuredGate_",
     "__AutumnStepUpGate_",
     "__AutumnThrottleGate_",
+    "__AutumnFlagGate_",
 ];
 
 /// Whether `func` already carries another guard's pre-body gate parameter.

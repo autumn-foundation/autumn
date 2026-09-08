@@ -85,6 +85,13 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
+    }
+
     let flag_key = &args.flag_key;
     let fn_name = &input_fn.sig.ident;
 
@@ -112,6 +119,26 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         },
     );
+
+    // Whether THIS gate should also serve a cached idempotency replay: see
+    // `idempotency_guard::should_own_replay` for the full ordering rationale.
+    // Unconditionally serving one here — as this gate did before Codex review
+    // on #2628 — would let it return a cached response before a still-pending
+    // `#[secured]`/`#[authorize]` check (stacked on the same handler, expanding
+    // after this one) ever ran.
+    let owns_replay = crate::idempotency_guard::should_own_replay(&input_fn);
+    let replay_check = if owns_replay {
+        quote! {
+            if let ::core::option::Option::Some(replay) = parts.extensions.get::<::autumn_web::idempotency::IdempotencyReplayResponse>() {
+                let opt_ext = ::core::option::Option::Some(::autumn_web::reexports::axum::extract::Extension(replay.clone()));
+                if let ::core::option::Option::Some(resp) = ::autumn_web::idempotency::__replay_response(&opt_ext) {
+                    return ::std::result::Result::Err(resp);
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     // Generate the gate struct and its FromRequestParts impl.
     //
@@ -143,12 +170,7 @@ pub fn feature_flag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::reexports::axum::response::IntoResponse::into_response(e)
                     })?;
                 if flags.enabled(#flag_key) {
-                    if let ::core::option::Option::Some(replay) = parts.extensions.get::<::autumn_web::idempotency::IdempotencyReplayResponse>() {
-                        let opt_ext = ::core::option::Option::Some(::autumn_web::reexports::axum::extract::Extension(replay.clone()));
-                        if let ::core::option::Option::Some(resp) = ::autumn_web::idempotency::__replay_response(&opt_ext) {
-                            return ::std::result::Result::Err(resp);
-                        }
-                    }
+                    #replay_check
                     ::std::result::Result::Ok(#gate_ident)
                 } else {
                     #disabled_rejection
@@ -310,6 +332,76 @@ mod tests {
         assert!(
             !code.contains("async move"),
             "must not wrap body in async move block: {code}"
+        );
+    }
+
+    // ── Idempotency-replay ownership (Codex review on #2628) ────────────────
+
+    #[test]
+    fn owns_replay_when_unguarded() {
+        let result = feature_flag_macro(
+            quote! { "my_flag" },
+            quote! {
+                async fn my_handler() -> &'static str { "ok" }
+            },
+        );
+        let code = result.to_string();
+        assert!(
+            code.contains("__replay_response"),
+            "an unguarded handler's gate must still serve a cached replay: {code}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_when_authorize_still_pending() {
+        // Before this fix, the gate unconditionally checked for and served a
+        // cached idempotency replay, regardless of what other guards were
+        // stacked on the same handler. With #[authorize] written below
+        // #[feature_flag] (so it hasn't expanded yet and its policy re-check
+        // still needs to run), that let this gate return a stale cached
+        // response before #[authorize] ever got a chance to deny it.
+        let generated = feature_flag_macro(
+            quote! { "my_flag" },
+            quote! {
+                #[authorize("update", resource = Post)]
+                async fn h() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership while #[authorize] is still pending:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn defers_replay_when_stacked_after_another_gate() {
+        let generated = feature_flag_macro(
+            quote! { "my_flag" },
+            quote! {
+                async fn h(_g: __AutumnSecuredGate_h) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("__replay_response"),
+            "must defer replay-ownership to an earlier-inserted gate:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_authorize_shaped_attribute() {
+        let generated = feature_flag_macro(
+            quote! { "my_flag" },
+            quote! {
+                #[authz_alias("update", resource = Note)]
+                async fn h(note: Note) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error"),
+            "an attribute sharing #[authorize]'s shape under another name must be refused:\n{generated}"
         );
     }
 }
