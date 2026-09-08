@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
+  layers in SSG/ISR (`dist`) mode, closing an authn-bypass gap (🛡 Warden):**
+  the dispatch clone `tools/call` replays requests against is assembled
+  *before* `try_build_router_with_static_inner` reapplies the app's global
+  custom layers outside the static-first middleware, so a `dist` manifest
+  being present meant a `tools/call` replay skipped any check a custom layer
+  performed — even though the identical direct HTTP request was correctly
+  rejected by it. Apps gating an MCP-exposed route only with
+  `AppBuilder::layer(...)` (rather than the documented `.scoped(path,
+  RequireApiToken, routes![...])` pattern, a sub-router `.layer(...)`, or
+  `#[secured]`/session auth — none of which were affected) and running in
+  SSG/ISR mode were exposed. `try_build_router_with_static_inner` now hands
+  the router builder a clone of the same drained layer set to apply to the
+  MCP dispatch clone alone, restoring parity with the fully-dynamic path
+  without changing how the original set wraps the live-serving router (no
+  double-application, no ordering change for direct requests). See
+  `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
+
 ### Changed
 
 - **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.** [no-plugin]
