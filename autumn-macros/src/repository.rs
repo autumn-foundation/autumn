@@ -19718,7 +19718,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
                 // #2586: normalize before the per-row `#[validate]` pass inside
                 // the body, so a skip-invalid import judges — and stores — the
-                // same canonical value `save_many` does. Same zero-clone probe.
+                // same canonical value `save_many` does.
+                //
+                // Costs one clone of the batch, as `save_many` already does:
+                // `#[model]` emits `impl Normalize` for every `New*` (empty-bodied
+                // when nothing is normalized), so the probe's `Yes` arm always
+                // wins here and the borrowed `No` arm is reachable only for a
+                // hand-written `New*`. Making that fallback real means gating the
+                // impl on the model actually having `#[normalize]` columns — see
+                // the follow-up issue; it is not specific to this path.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
                 #[allow(unused_imports)]

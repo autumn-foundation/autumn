@@ -148,9 +148,13 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 /// Holds an immutable borrow of the caller's input. The specialized `Yes` impl
 /// (selected only when the concrete type is `Normalize + Clone`) clones and
 /// canonicalizes, returning the owned value; the `No` fallback returns the
-/// borrow untouched — so a model with no `#[normalize]` columns (or a
-/// hand-written `New*` that doesn't implement `Normalize`) pays no clone on the
-/// save path. The generated code unifies the two arms with `Borrow` (see
+/// borrow untouched, paying no clone.
+///
+/// In practice only a **hand-written** `New*` reaches that fallback: `#[model]`
+/// emits `impl Normalize` for every generated `New*`, empty-bodied when the
+/// model declares no `#[normalize]` columns, so the `Yes` arm wins and clones
+/// even when normalization is a no-op. The generated code unifies the two arms
+/// with `Borrow` (see
 /// `#[repository]` `save`, `save_many`, `save_many_skip_invalid` and
 /// `find_or_create_by_*`).
 #[doc(hidden)]
