@@ -1237,7 +1237,7 @@ mod tests {
                 serde_json::to_string(&state).expect("serialize"),
                 format!("\"{state}\"")
             );
-            assert!(state.is_sweepable() != (state == BackfillState::Complete));
+            assert_ne!(state.is_sweepable(), state == BackfillState::Complete);
         }
         assert_eq!(BackfillState::parse("done"), None);
 
