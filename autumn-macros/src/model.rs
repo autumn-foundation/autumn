@@ -2085,8 +2085,32 @@ fn emit_counter_caches_impl(
         .iter()
         .filter(|a| a.counter_cache.is_some())
         .collect();
+    // The `#[lock_version]` column is a maintained column too: every update
+    // increments it as the optimistic-concurrency token, so a derivation
+    // adjusting it as an aggregate would break the protocol and the backfill
+    // would erase it. Its claim is emitted whether or not this model keeps a
+    // counter cache of its own, since the usual shape is a parent that keeps
+    // none while a child's derivation names one of its columns (#1769).
+    let lock_version_claim = all_fields
+        .iter()
+        .find(|f| has_attr(f, "lock_version"))
+        .and_then(|field| field.ident.as_ref())
+        .map(|ident| {
+            let column = unraw_ident(ident);
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::derivation::CounterCacheClaim {
+                        model: ::core::stringify!(#model_ident),
+                        child_table: #table_name,
+                        parent_table: #table_name,
+                        column: #column,
+                        module_path: ::core::module_path!(),
+                    }
+                }
+            }
+        });
     if cached.is_empty() && derivations.is_empty() {
-        return Ok(TokenStream::new());
+        return Ok(lock_version_claim.unwrap_or_default());
     }
 
     // Both declaration kinds share every validation below, so the diagnostics
@@ -2187,25 +2211,7 @@ fn emit_counter_caches_impl(
     // parent column (#1769): the two would double count, and the backfill
     // would then overwrite the counter cache's rows.
     let mut claim_items: Vec<TokenStream> = Vec::new();
-    // The `#[lock_version]` column is maintained too: every update increments
-    // it as the optimistic-concurrency token, so a derivation adjusting it as
-    // an aggregate would break the protocol and the backfill would erase it.
-    if let Some(field) = all_fields.iter().find(|f| has_attr(f, "lock_version"))
-        && let Some(ident) = field.ident.as_ref()
-    {
-        let column = unraw_ident(ident);
-        claim_items.push(quote! {
-            ::autumn_web::reexports::inventory::submit! {
-                ::autumn_web::derivation::CounterCacheClaim {
-                    model: ::core::stringify!(#model_ident),
-                    child_table: #table_name,
-                    parent_table: #table_name,
-                    column: #column,
-                    module_path: ::core::module_path!(),
-                }
-            }
-        });
-    }
+    claim_items.extend(lock_version_claim);
     for (index, assoc) in cached.iter().enumerate() {
         let decl = assoc
             .counter_cache
