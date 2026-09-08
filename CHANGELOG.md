@@ -167,6 +167,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Rust symbol drift gate for the docs corpus [no-plugin]:** the four docs
+  gates that came before it cover the link a reader clicks
+  (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
+  variable they set (`check-docs-config.sh`) and the config key they write
+  (`check-docs-toml.sh`). None of them looks at what the guide is mostly *made*
+  of. The reader-facing corpus carries 874 `rust` fences naming **1,436
+  `autumn_web::…` paths** — a larger copy-surface than the env layer (689
+  occurrences) and the `autumn.toml` layer (172 fences) together — and nothing
+  in the tree could tell a live path from a renamed one.
+  `scripts/check-docs-symbols.sh` resolves every one of them against the crate
+  sources, and it runs in CI's docs-only job beside the other four.
+  It catches **both** ends of the visibility scale, which is the reason to gate
+  the whole surface rather than import lines alone. Its baseline found **2 live
+  defects**, one of each kind, both fixed here. Loud:
+  `docs/guide/maintenance-mode.md` handed over
+  `use autumn_web::middleware::{MaintenanceLayer, MaintenanceState};` where only
+  the first name is there — `MaintenanceState` lives in
+  `autumn_web::maintenance`, a *different* module that happens to have a
+  same-named sibling under `middleware::` — so a reader copying it got E0432 on
+  a line where half the import was correct. Silent, and the reason this gate is
+  worth more than its loud half: `#[autumn_web::main]` parses the function it
+  decorates and emits `fn main()` **fresh** (`main_macro.rs` reads
+  `input_fn.sig` only to check `async`), so the declared return type is never
+  re-emitted and never reaches name resolution. The opening fence of
+  `docs/guide/api-versioning.md` — the first thing a reader of that page
+  compiles — declared `-> Result<(), autumn_web::Error>` for a type that does
+  not exist (the crate root exports `AutumnError` and `AutumnResult`), and it
+  **still built**. Nothing reported it, and the reader carried away the wrong
+  name for the framework's error type with nothing anywhere to correct them.
+  The truth set is the crate sources themselves — no snapshot to regenerate,
+  because a rename lands in the same commit as the surface it renames.
+  Resolution follows what Rust *does* rather than what the source looks like,
+  since a documented path is almost never a path to where the item is defined:
+  `pub use` re-exports including aliased ones (`pub use http_client as http` is
+  why `autumn_web::http::Client` is real and `autumn_web::http_client::Client`
+  is what nobody writes) and ones through a *private* facade module, glob
+  re-exports, `#[macro_export]` macros hoisting to the crate root (so
+  `autumn_web::declassify` resolves and `autumn_web::classify::declassify` does
+  not), the `pub use <crate-root macro>;` idiom that makes the module path real
+  again, inline `mod x { … }` blocks, `#[proc_macro_derive(Name)]` exporting
+  under its attribute's name rather than its function's, a leading `::` naming
+  the external crate over a local module of the same name, and hops into sibling
+  workspace crates. Deliberately out of scope: anything past the first item
+  segment (`AutumnError::not_found_msg` is checked as far as `AutumnError`;
+  associated items need type resolution, and guessing at them is how a gate
+  starts reporting confident nonsense), feature gates (the surface is read as a
+  superset so a path behind `--features ws` still resolves), and bare
+  identifiers after a prelude glob. Paths that leave the workspace —
+  `reexports::axum::…`, maud's `PreEscaped`, diesel's `db::Pool`: 57 of the
+  1,436 — are reported as **opaque** and counted rather than guessed at, because
+  an opaque count that grows quietly is how a gate goes hollow. One waiver rule,
+  not a list: a path quoted inside an `error[E1234]` message is being shown as
+  broken on purpose, which is what the migration-guide cheat-sheet row in
+  `docs/migrations/TEMPLATE.md` exists to do. 32 self-tests:
+  `./scripts/check-docs-symbols.sh --self-test`.
+
 - **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves
   every **option** a documented `autumn …` line passes, not only its command.
   A flag the command does not declare is the same dead end as a phantom
