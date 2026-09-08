@@ -638,6 +638,11 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 /// framework cannot see the fleet, so it does not wait; the contract is one
 /// [`resweep`](crate::derivation::resweep) (or [`recompute`](crate::derivation::recompute))
 /// once no old replica writes, which the guide's deployment section spells out.
+/// A derivation removed for a deployment and reinstated later is the same
+/// contract: its row survives with a matching hash, nothing maintained the
+/// column in between, and this reconciliation cannot tell the two apart (a
+/// binary that links only some of an app's models must not orphan the rest),
+/// so reinstating it calls for the same `resweep`.
 ///
 /// Returns the names enqueued, in name order.
 ///

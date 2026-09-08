@@ -229,7 +229,11 @@ synchronous repair) from a post-deploy hook, and the next sweep settles every
 parent. Both are idempotent, so running them on a healthy derivation costs one
 pass and changes nothing. A one-shot deploy, a single replica, and a change
 that only adds a derivation (no old definition to disagree with) need none of
-this.
+this. A derivation **removed** for a deployment and reinstated later is the
+same case in another shape: its state row survives (the status report shows
+it as `unregistered` in between), nothing maintained the column while it was
+gone, and reconciliation cannot tell a reinstated definition from one that was
+never absent, so reinstating it calls for the same `resweep`.
 
 ## Status and repair
 
