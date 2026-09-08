@@ -2600,22 +2600,21 @@ fn classify_and_apply(
                 eprintln!("  {line}");
             }
             eprintln!("  BEGIN;");
-            // Inside the transaction, so a `\connect` that silently failed
-            // aborts this block instead of running it against the previous
-            // target. First statement after BEGIN: nothing destructive may
-            // precede the proof that we are where we think we are.
-            if let Some(guard) = password_free_conninfo(url)
-                .as_deref()
-                .and_then(|conninfo| target_guard(conninfo, &facts.endpoint))
-            {
-                eprintln!("  {guard}");
-            }
             // The same session pins `execute` sets, before anything reads or
             // writes: without them a role-level `search_path` resolves the
-            // generated calls somewhere else entirely.
+            // generated calls somewhere else entirely. They come before the
+            // guard for that reason — the guard is `pg_catalog`-qualified too,
+            // but a pin that only lands after the check it protects is not a
+            // pin. `SET LOCAL` writes nothing, so nothing destructive precedes
+            // the proof below.
             for statement in session_settings() {
                 eprintln!("  {statement};");
             }
+            // Inside the transaction, so a `\connect` that silently failed
+            // aborts this block instead of running it against the previous
+            // target. Before every destructive statement: nothing may run until
+            // the session has proved it is where this block thinks it is.
+            eprintln!("  {}", target_guard(&facts.endpoint));
             // The same locks `execute` takes, before any destructive statement:
             // without them a pasted run lets a concurrent insert land after the
             // DELETE that was supposed to remove it.
@@ -3131,6 +3130,13 @@ fn triggers_reaching(extra: &str) -> String {
 /// report. Held as strings because they only ever go back into SQL as literals.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerEndpoint {
+    /// `current_database()`, asked of the target itself rather than parsed out
+    /// of its URL. libpq defaults an omitted database name to the user name,
+    /// which defaults to the OS user — rules this command would have to
+    /// reimplement to guess, and did not: a URI with no database silently
+    /// emitted no guard at all, leaving 19 destructive statements unprotected.
+    /// The connection already knows the answer.
+    pub database: String,
     /// `inet_server_addr()`, e.g. `10.0.0.2/32`.
     pub address: Option<String>,
     /// `inet_server_port()`.
@@ -3640,17 +3646,22 @@ fn probe_database_facts(
     // address, and resolving one at print time is not this command's job. NULL
     // over a Unix socket, which the guard compares as NULL rather than papering
     // over.
-    let endpoint = pair_rows(
-        "SELECT coalesce(pg_catalog.inet_server_addr()::text, '') AS tbl, coalesce(pg_catalog.inet_server_port()::text, '') AS col",
+    let (address, port) = pair_rows(
+        "SELECT coalesce(pg_catalog.inet_server_addr()::text, '') AS tbl, \
+         coalesce(pg_catalog.inet_server_port()::text, '') AS col",
         &mut conn,
     )?
     .into_iter()
     .next()
-    .map(|(addr, port)| ServerEndpoint {
-        address: (!addr.is_empty()).then_some(addr),
-        port: (!port.is_empty()).then_some(port),
-    })
     .unwrap_or_default();
+    let endpoint = ServerEndpoint {
+        database: names("SELECT pg_catalog.current_database() AS name", &mut conn)?
+            .into_iter()
+            .next()
+            .unwrap_or_default(),
+        address: (!address.is_empty()).then_some(address),
+        port: (!port.is_empty()).then_some(port),
+    };
 
     // Rules are the other way a `DELETE` runs code the plan never saw. Unlike a
     // trigger they fire only on the relation the statement NAMES — measured on
@@ -3956,84 +3967,55 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
     )
 }
 
-/// The database the printed `\connect` line actually asks for.
-///
-/// Read back out of the SAME password-free conninfo the boundary prints, not
-/// re-derived from the original URL's parts: re-deriving is what once printed a
-/// host the run never touched, because a query parameter overrides the
-/// authority component it duplicates. `?dbname=` wins over the path for the
-/// same reason, which `pg::sanitize_prefers_query_user_password_dbname_over_url_structure`
-/// pins.
-fn expected_database(conninfo: &str) -> Option<String> {
-    let url = url::Url::parse(conninfo).ok()?;
-    // Last wins, as libpq takes the last occurrence of a repeated keyword.
-    let from_query = url
-        .query_pairs()
-        .filter(|(key, _)| key == "dbname")
-        .map(|(_, value)| value.into_owned())
-        .last();
-    // `query_pairs()` decodes; `path()` does NOT. Comparing the raw path against
-    // `current_database()` would make the guard fire on a CORRECT run for any
-    // name that needs encoding — `it's` arrives as `it%27s` and never matches —
-    // turning a safety check into a false refusal.
-    let name = from_query.unwrap_or_else(|| {
-        percent_encoding::percent_decode_str(url.path().trim_start_matches('/'))
-            .decode_utf8_lossy()
-            .into_owned()
-    });
-    (!name.is_empty()).then_some(name)
-}
-
 /// Abort the transaction unless the session is on the target this block is for.
 ///
 /// `\connect` does NOT close the old connection when the new one fails. Measured
 /// on psql 16.13: a failed `\connect -reuse-previous=off` prints "Previous
-/// connection kept" and the session carries on against the PREVIOUS database —
-/// so a pasted stream runs this target's `BEGIN` and its deletes against the
-/// preceding target. `\set ON_ERROR_STOP on` does not help; measured, an
-/// interactive session ignores it and keeps going.
+/// connection kept" and the session carries on against the PREVIOUS database, so
+/// a pasted stream runs this target's `BEGIN` and its deletes against the
+/// preceding one. `\set ON_ERROR_STOP on` does not help; measured, an
+/// interactive session ignores it and keeps going. It is the likely case rather
+/// than a remote one, because the printed conninfo has its password removed on
+/// purpose: a password-authenticated target fails to connect exactly this way.
 ///
-/// It is also the likely case rather than a remote one, because the printed
-/// conninfo has its password removed on purpose: a password-authenticated
-/// target fails to connect exactly this way.
+/// Identity is the whole endpoint, not the database name. A sharded fleet runs
+/// the same name on every shard — the topology in docs/guide/sharding.md names
+/// all three `app` — and measured on two clusters both holding `app`, a
+/// name-only guard let shard1's block scrub shard0 from 200 users to 100 while
+/// the shard it named went untouched.
 ///
-/// So the promise is verified rather than assumed, inside the transaction where
-/// a failure is contained: the `RAISE` aborts it, every following statement is
-/// refused with "current transaction is aborted", and `COMMIT` becomes a
-/// rollback. Measured: the guarded block left all 10 rows of its victim table.
+/// Every value is asked of the target connection while planning, never parsed
+/// out of its URL. libpq defaults an omitted database name to the user name,
+/// which defaults to the OS user: deriving it meant reimplementing those rules,
+/// and the version that tried simply emitted NO guard for a URI without one,
+/// leaving 19 destructive statements unprotected.
 ///
-/// This statement is printed and never executed. `execute` opens its own
-/// connection to a URL it was given and cannot be on the wrong database, so
-/// there is nothing here for it to run — the guard exists for the paste, which
-/// is the only path that can land on the wrong target.
-fn target_guard(conninfo: &str, endpoint: &ServerEndpoint) -> Option<String> {
-    let database = expected_database(conninfo)?;
-    // `RAISE` substitutes bare `%` in argument order; it has no `%1$s`
-    // positional form. Writing one puts the databases in the message the wrong
-    // way round and leaves `2$s` in the text — measured, before this was fixed:
-    // "this block is for database cifix_prev2$s, but the session is on
-    // cifix_stmt1$s", naming each database as the other.
-    // The database name alone does not identify a target. A sharded fleet runs
-    // the SAME name on different hosts — docs/guide/sharding.md names all three
-    // `app` — so a retained connection to another shard answers
-    // `current_database()` exactly as the intended one would. Measured on two
-    // clusters both holding `app`: with a name-only guard a failed `\connect`
-    // let shard1's block scrub shard0 from 200 users to 100, 400 comments to 200
-    // and 500 audit rows to 0, while the shard it named went untouched.
-    //
-    // `IS DISTINCT FROM` rather than `<>`: both sides are NULL over a Unix
-    // socket, and `NULL <> NULL` is NULL, which would let the guard pass by
-    // failing to be false.
+/// Every call is `pg_catalog`-qualified, and the caller emits this after the
+/// session pins. Unqualified, they are resolved by the pasting session's own
+/// `search_path`: measured on a database configured `public, pg_catalog`, a
+/// `public.current_database()` returning the intended name answered `app` while
+/// `pg_catalog.current_database()` answered the truth, so the guard would have
+/// consulted the shadow and passed.
+///
+/// `IS DISTINCT FROM` rather than `<>`, because address and port are both NULL
+/// over a Unix socket and `NULL <> NULL` is NULL, which would let the guard pass
+/// by failing to be false.
+///
+/// Printed and never executed: `execute` opens its own connection to a URL it
+/// was given and cannot be on the wrong database.
+fn target_guard(endpoint: &ServerEndpoint) -> String {
     let literal =
         |value: Option<&String>| value.map_or_else(|| "NULL".to_owned(), |v| quote_literal(v));
+    // `RAISE` substitutes bare `%` in argument order and has no `%1$s` form.
+    // Writing one named each database as the other and left `2$s` in the text.
     let body = format!(
-        " BEGIN IF current_database() <> {name} \
-         OR inet_server_addr()::text IS DISTINCT FROM {addr} \
-         OR inet_server_port()::text IS DISTINCT FROM {port} THEN \
+        " BEGIN IF pg_catalog.current_database() <> {name} \
+         OR pg_catalog.inet_server_addr()::text IS DISTINCT FROM {addr} \
+         OR pg_catalog.inet_server_port()::text IS DISTINCT FROM {port} THEN \
          RAISE EXCEPTION {message}, {name}, {addr}, {port}, \
-         current_database(), inet_server_addr()::text, inet_server_port()::text; \
-         END IF; END ",
-        name = quote_literal(&database),
+         pg_catalog.current_database(), pg_catalog.inet_server_addr()::text, \
+         pg_catalog.inet_server_port()::text; END IF; END ",
+        name = quote_literal(&endpoint.database),
         addr = literal(endpoint.address.as_ref()),
         port = literal(endpoint.port.as_ref()),
         message = quote_literal(
@@ -4042,7 +4024,7 @@ fn target_guard(conninfo: &str, endpoint: &ServerEndpoint) -> Option<String> {
         ),
     );
     let tag = sample::dollar_tag(&body);
-    Some(format!("DO {tag}{body}{tag};"))
+    format!("DO {tag}{body}{tag};")
 }
 
 /// Connection-string keywords whose value is a credential.
@@ -4501,99 +4483,47 @@ mod tests {
 
     // ── The dry run's session and connection preamble ──────────────────────
 
-    /// The guard names the database the `\connect` line actually asks for.
-    ///
-    /// Read back out of the printed conninfo rather than re-derived from the
-    /// original URL's parts, because a query parameter overrides the authority
-    /// component it duplicates — `?dbname=` wins over the path.
-    #[test]
-    fn the_expected_database_comes_from_the_printed_conninfo() {
-        assert_eq!(
-            super::expected_database("postgres://bob@db.internal:6543/app"),
-            Some("app".to_owned())
-        );
-        assert_eq!(
-            super::expected_database("postgres://bob@db.internal/app?dbname=copy"),
-            Some("copy".to_owned()),
-            "the query form is the one that authenticates, so it is the one to assert on"
-        );
-        assert_eq!(
-            super::expected_database("postgres://db/app?dbname=first&dbname=second"),
-            Some("second".to_owned()),
-            "libpq takes the last occurrence of a repeated keyword"
-        );
-        assert_eq!(
-            super::expected_database("postgres://db.internal:6543"),
-            None,
-            "no database named means nothing to assert, so no guard is emitted"
-        );
-        // `query_pairs()` decodes and `path()` does not. Comparing the raw path
-        // would make the guard fire on a CORRECT run for any name needing
-        // encoding, turning the safety check into a false refusal.
-        assert_eq!(
-            super::expected_database("postgres://db/it%27s"),
-            Some("it's".to_owned()),
-            "the path is percent-encoded and has to be decoded before comparison"
-        );
-        assert_eq!(
-            super::expected_database("postgres://db/a%20b"),
-            Some("a b".to_owned())
-        );
-    }
-
     /// A failed `\connect` leaves psql on the PREVIOUS database, so the block
-    /// proves where it is before it writes.
+    /// proves where it is before it writes — and proves the whole endpoint.
     ///
     /// Measured on psql 16.13: a failed `\connect -reuse-previous=off` prints
     /// "Previous connection kept" and the session carries on; `ON_ERROR_STOP`
-    /// does not stop an interactive paste. Pasting a real generated script whose
-    /// connect failed, into a session on another database, left that database at
-    /// 200/400/500 rows with all 11 destructive statements refused.
+    /// does not stop an interactive paste. With the database name alone, two
+    /// clusters both holding `app` let shard1's block scrub shard0 from 200
+    /// users to 100. With the endpoint pinned, the same paste aborted and left
+    /// shard0 at 200/400/500.
     #[test]
-    fn the_target_guard_aborts_the_block_on_the_wrong_database() {
+    fn the_target_guard_pins_the_whole_endpoint_and_qualifies_every_call() {
         let here = super::ServerEndpoint {
+            database: "app_copy".to_owned(),
             address: Some("10.0.0.2/32".to_owned()),
             port: Some("5432".to_owned()),
         };
-        let guard = super::target_guard("postgres://bob@db/app_copy", &here)
-            .expect("a conninfo naming a database gets a guard");
-        // The database name alone does not identify a target: a sharded fleet
-        // runs the same name on every shard. Measured on two clusters both
-        // holding `app`, a name-only guard let shard1's block scrub shard0
-        // (200 users -> 100) while the intended shard went untouched.
+        let guard = super::target_guard(&here);
         assert!(
-            guard.contains("inet_server_addr()::text IS DISTINCT FROM '10.0.0.2/32'")
-                && guard.contains("inet_server_port()::text IS DISTINCT FROM '5432'"),
-            "the guard must pin the endpoint, not just the name: {guard}"
+            guard.contains("pg_catalog.current_database() <> 'app_copy'")
+                && guard
+                    .contains("pg_catalog.inet_server_addr()::text IS DISTINCT FROM '10.0.0.2/32'")
+                && guard.contains("pg_catalog.inet_server_port()::text IS DISTINCT FROM '5432'"),
+            "the guard must pin the whole endpoint: {guard}"
         );
-        assert!(
-            !guard.contains("inet_server_addr()::text <> "),
-            "`<>` is NULL-blind over a Unix socket; the comparison must be \
-             IS DISTINCT FROM: {guard}"
-        );
-
-        // Over a Unix socket the server reports neither, and the guard compares
-        // that as NULL rather than papering over it — a retained TCP connection
-        // then fails the comparison instead of passing it.
-        let socket =
-            super::target_guard("postgres://db/app_copy", &super::ServerEndpoint::default())
-                .expect("guard");
-        assert!(
-            socket.contains("IS DISTINCT FROM NULL"),
-            "a socket target pins NULL explicitly: {socket}"
-        );
-        assert!(
-            guard.contains("current_database() <> 'app_copy'"),
-            "the guard must compare against the target it is for: {guard}"
-        );
-        assert!(
-            guard.contains("RAISE EXCEPTION"),
-            "and abort the transaction rather than merely print: {guard}"
-        );
-        // `RAISE` substitutes bare `%` in argument order and has no `%1$s`
-        // form. Writing one named each database as the other and left `2$s` in
-        // the text; the live message read "this block is for database
-        // cifix_prev2$s, but the session is on cifix_stmt1$s".
+        // Unqualified, these resolve through the PASTING session's search_path.
+        // Measured on a database configured `public, pg_catalog`, a shadowing
+        // `public.current_database()` answered `app` while
+        // `pg_catalog.current_database()` answered the truth — so an unqualified
+        // guard consults the shadow and passes.
+        for call in [
+            "current_database()",
+            "inet_server_addr()",
+            "inet_server_port()",
+        ] {
+            for (at, _) in guard.match_indices(call) {
+                assert!(
+                    guard[..at].ends_with("pg_catalog."),
+                    "every catalog call must be qualified: {call} at {at} in {guard}"
+                );
+            }
+        }
         assert!(
             !guard.contains("$s"),
             "RAISE has no positional format specifiers: {guard}"
@@ -4603,33 +4533,24 @@ mod tests {
             6,
             "three placeholders for the target endpoint, three for the session's: {guard}"
         );
-        // The message reads expected-then-actual, so the arguments must too:
-        // getting this backwards is exactly the bug the positional-specifier
-        // attempt shipped, and it names each database as the other.
-        let expected_at = guard
-            .find("'app_copy', '10.0.0.2/32', '5432'")
-            .expect("expected trio");
-        let actual_at = guard
-            .find("current_database(), inet_server_addr()::text, inet_server_port()::text")
-            .expect("actual trio");
+
+        // Over a Unix socket the server reports neither, and the guard compares
+        // that as NULL rather than papering over it.
+        let socket = super::target_guard(&super::ServerEndpoint {
+            database: "app_copy".to_owned(),
+            ..super::ServerEndpoint::default()
+        });
         assert!(
-            expected_at < actual_at,
-            "arguments must be in the order the message reads them: {guard}"
+            socket.contains("IS DISTINCT FROM NULL"),
+            "a socket target pins NULL explicitly: {socket}"
         );
 
-        assert_eq!(
-            super::target_guard("postgres://db.internal:6543", &here),
-            None,
-            "a conninfo with no database gets no guard rather than a vacuous one"
-        );
-
-        // The database name reaches SQL as a literal, so it is quoted like every
-        // other identifier-shaped value this module prints.
-        let hostile = super::target_guard("postgres://db/it%27s", &here).expect("guard");
-        assert!(
-            !hostile.contains("%27"),
-            "the name must be compared decoded, or a correct run is refused: {hostile}"
-        );
+        // The database name comes from the target connection, so a quote in it
+        // reaches SQL as a literal like every other value this module prints.
+        let hostile = super::target_guard(&super::ServerEndpoint {
+            database: "it's".to_owned(),
+            ..super::ServerEndpoint::default()
+        });
         assert!(
             hostile.contains("'it''s'"),
             "a quote in the database name must not break out of the literal: {hostile}"

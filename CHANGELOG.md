@@ -110,6 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the deliberately password-free conninfo makes likely rather than remote.
   `ON_ERROR_STOP` alone does not help an interactive paste; the guard aborts the
   transaction, so every following statement is refused and `COMMIT` rolls back.
+  Its values are asked of the target connection rather than parsed out of its
+  URL — libpq defaults an omitted database name to the user name, so deriving it
+  meant reimplementing those rules — and every call is `pg_catalog`-qualified and
+  emitted after the session pins, so a `public.current_database()` in the pasting
+  session's `search_path` cannot answer for the catalog.
   `--dry-run` also refuses a target configured with a keyword-form connection string
   (`host=... password=...`): each printed block is destructive and the `\connect`
   line above it is what points `psql` at the right database, but a keyword-form

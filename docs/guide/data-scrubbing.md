@@ -445,6 +445,15 @@ untouched. Both are compared with `IS DISTINCT FROM`, because the server reports
 neither over a Unix socket and `NULL <> NULL` would let the check pass by
 failing to be false.
 
+All three values are asked of the target connection while the run plans, never
+parsed out of its URL: libpq defaults an omitted database name to the user name,
+which defaults to the OS user, and the connection already knows the answer those
+rules produce. The guard is emitted after the session pins and every call in it
+is `pg_catalog`-qualified, so a `public.current_database()` sitting ahead of
+`pg_catalog` in the pasting session's `search_path` cannot answer for the
+catalog — measured, such a function returned the intended name while
+`pg_catalog.current_database()` returned the truth.
+
 An interactive paste ignores `ON_ERROR_STOP`, but it cannot ignore an aborted
 transaction: every following statement is refused with `current transaction is
 aborted`, and the closing `COMMIT` rolls back. That guard is printed and never
