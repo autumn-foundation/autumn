@@ -35,7 +35,7 @@ use autumn_web::config::DatabaseConfig;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::derivation::{
     BackfillOptions, BackfillState, DerivationDef, derivation_status, drift, ensure_derivations,
-    recompute, registered_derivations, run_backfill,
+    recompute, registered_derivations, resweep, run_backfill,
 };
 use autumn_web::reexports::{diesel, diesel_async};
 
@@ -852,4 +852,67 @@ async fn a_zero_batch_size_is_an_error_rather_than_a_silent_completion() {
         "pending",
         "nothing was marked complete"
     );
+}
+
+#[tokio::test]
+async fn a_resweep_re_enqueues_a_finished_derivation_under_its_own_hash() {
+    // The settling pass after a rolling deployment: the definition has not
+    // changed, so reconciliation would leave the row alone, but every parent
+    // has to be visited once more. `resweep` puts the row back on the queue
+    // with its hash intact, and the next sweep runs it to completion again.
+    let pool = boot_pool("sd_resweep").await;
+    let mut conn = pool.get().await.expect("conn");
+    let post = seed_post(&pool, "settle").await;
+    diesel::sql_query("INSERT INTO sd_comments (post_id, published, score) VALUES (?, 1, 3)")
+        .bind::<BigInt, _>(post)
+        .execute(&mut conn)
+        .await
+        .expect("a comment nobody counted");
+    ensure_derivations(&mut conn).await.expect("first boot");
+    run_backfill(&mut conn, &BackfillOptions::default())
+        .await
+        .expect("first sweep");
+    let done = state_of(&pool, COUNT_DERIVATION).await;
+    assert_eq!(done.backfill_state, "complete");
+    assert_eq!(derived(&pool, "published_comment_count", post).await, 1);
+
+    // An old replica's delta lands after the sweep passed this parent.
+    diesel::sql_query("UPDATE sd_posts SET published_comment_count = 4 WHERE id = ?")
+        .bind::<BigInt, _>(post)
+        .execute(&mut conn)
+        .await
+        .expect("stale delta");
+
+    resweep(&mut conn, COUNT_DERIVATION).await.expect("resweep");
+    let queued = state_of(&pool, COUNT_DERIVATION).await;
+    assert_eq!(queued.backfill_state, "pending");
+    assert_eq!(queued.checkpoint, None);
+    assert!(
+        ensure_derivations(&mut conn)
+            .await
+            .expect("boot")
+            .is_empty(),
+        "the hash is unchanged, so reconciliation neither re-enqueues nor undoes the resweep"
+    );
+    assert_eq!(
+        state_of(&pool, COUNT_DERIVATION).await.backfill_state,
+        "pending"
+    );
+
+    let report = run_backfill(&mut conn, &BackfillOptions::default())
+        .await
+        .expect("settling sweep");
+    assert!(
+        report.completed.contains(&COUNT_DERIVATION.to_owned()),
+        "{report:?}"
+    );
+    assert_eq!(derived(&pool, "published_comment_count", post).await, 1);
+    assert_eq!(
+        state_of(&pool, COUNT_DERIVATION).await.backfill_state,
+        "complete"
+    );
+
+    resweep(&mut conn, "sd_posts.nope")
+        .await
+        .expect_err("an unregistered name is refused");
 }

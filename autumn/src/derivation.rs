@@ -605,6 +605,17 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 /// state (a finished backfill included) is carried over under the new name
 /// rather than rebuilt from the start.
 ///
+/// # Changing a definition under a rolling deployment
+///
+/// The delta paths do not consult the state row: a replica applies the
+/// definition compiled into it. While a rollout replaces replicas one by one,
+/// the old ones keep maintaining the column under the old definition and the
+/// new binary's backfill assigns the new one, so a parent an old replica
+/// touches after the sweep has passed it is wrong until it is swept again. The
+/// framework cannot see the fleet, so it does not wait; the contract is one
+/// [`resweep`](crate::derivation::resweep) (or [`recompute`](crate::derivation::recompute))
+/// once no old replica writes, which the guide's deployment section spells out.
+///
 /// Returns the names enqueued, in name order.
 ///
 /// # Errors
@@ -966,7 +977,18 @@ pub async fn run_backfill(
                 report.in_progress.push(def.name.to_owned());
                 break;
             }
-            match run_one_batch(conn, def, options.batch_size).await? {
+            // A self-referential derivation (a comment's `reply_count`) has
+            // rows that are children and parents at once. A mutation holds
+            // its child row and then wants the parent; a batch of several
+            // parents holds the first and then wants the next, which may be
+            // that child. One parent per batch takes one lock and never a
+            // second, so the sweep cannot be one side of that cycle.
+            let batch_size = if def.child_table == def.parent_table {
+                1
+            } else {
+                options.batch_size
+            };
+            match run_one_batch_retrying(conn, def, batch_size).await? {
                 Batch::Stopped => break,
                 Batch::Completed => {
                     report.completed.push(def.name.to_owned());
@@ -980,6 +1002,80 @@ pub async fn run_backfill(
         }
     }
     Ok(report)
+}
+
+/// How many times a batch that lost a lock race is retried before the error
+/// surfaces. Each batch is its own transaction, rolled back on the error and
+/// resumed from the committed checkpoint, so a retry repeats no work.
+const LOCK_CONTENTION_RETRIES: u32 = 5;
+
+/// [`run_one_batch`], retried when the database aborted the batch to break a
+/// lock cycle or a serialisation conflict with a concurrent writer.
+///
+/// A sweep that stopped on the first deadlock would stay stopped until the
+/// next boot, leaving the derivation `running` and stale. The batch is the
+/// unit of retry: it committed nothing, so running it again is exactly what
+/// the next boot would have done, only sooner.
+async fn run_one_batch_retrying(
+    conn: &mut RuntimeConnection,
+    def: &'static DerivationDef,
+    batch_size: i64,
+) -> AutumnResult<Batch> {
+    let mut attempt = 0;
+    loop {
+        match run_one_batch(conn, def, batch_size).await {
+            Err(error) if attempt < LOCK_CONTENTION_RETRIES && is_lock_contention(&error) => {
+                attempt += 1;
+                tracing::warn!(
+                    derivation = def.name,
+                    attempt,
+                    error = %error,
+                    "backfill batch lost a lock race; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25 * u64::from(attempt))).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Whether `error` is the database aborting one transaction so that another
+/// can proceed: Postgres's deadlock detector (`40P01`) or a serialisation
+/// failure (`40001`), and `SQLite`'s busy timeout.
+fn is_lock_contention(error: &AutumnError) -> bool {
+    let message = error.to_string();
+    message.contains("deadlock detected")
+        || message.contains("could not serialize access")
+        || message.contains("database is locked")
+}
+
+/// Put one derivation back on the backfill queue under its current definition.
+///
+/// The row keeps its hash and drops its checkpoint, so the next
+/// [`run_backfill`](crate::derivation::run_backfill) (or the next boot) sweeps
+/// the whole parent table again. This is the operator's step after a **rolling
+/// deployment that changed a definition**: replicas still on the old binary
+/// keep applying deltas under the old filter or transform while the new
+/// binary's backfill runs, and a parent such a replica touches after the sweep
+/// has passed it stays wrong until it is swept again. Once no old replica
+/// writes, one re-sweep settles every parent. The sweep is idempotent, so
+/// calling this on a healthy derivation costs one pass and changes nothing.
+///
+/// Prefer [`recompute`] when the table is small enough to repair in one call;
+/// this is the checkpointed, resumable form for a large one.
+///
+/// # Errors
+///
+/// Returns an error when `name` is not a registered derivation or when the
+/// state row cannot be written. A derivation with no state row yet (a first
+/// boot has not run) is enqueued.
+pub async fn resweep(conn: &mut RuntimeConnection, name: &str) -> AutumnResult<()> {
+    let def = find(name).ok_or_else(|| {
+        AutumnError::from(std::io::Error::other(format!(
+            "`{name}` is not a registered derivation"
+        )))
+    })?;
+    enqueue(conn, def).await
 }
 
 // ── Repair and status ───────────────────────────────────────────────────────
@@ -1328,6 +1424,23 @@ mod tests {
 
         // `check_registry` runs both checks, so it catches this one too.
         check_registry(&[&first, &second]).expect_err("the registry check covers columns");
+    }
+
+    #[test]
+    fn lock_contention_is_recognised_and_other_errors_are_not() {
+        let contention = [
+            "deadlock detected",
+            "ERROR: could not serialize access due to concurrent update",
+            "database is locked",
+        ];
+        for message in contention {
+            let error = AutumnError::from(std::io::Error::other(message));
+            assert!(is_lock_contention(&error), "{message}");
+        }
+        let other = AutumnError::from(std::io::Error::other(
+            "column \"published_comment_count\" does not exist",
+        ));
+        assert!(!is_lock_contention(&other));
     }
 
     #[test]

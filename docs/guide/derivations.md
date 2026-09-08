@@ -213,6 +213,23 @@ report.rows_repaired; // parent rows actually written
 call rather than the sweep, which is how a caller paces a repair by hand: the
 next call resumes from the committed checkpoints.
 
+### Changing a definition under a rolling deployment
+
+The delta paths never read the state row: each replica maintains the column
+under the definition compiled into it. During a rolling deployment that changes
+a filter or a transform, the replicas still on the old binary keep applying
+deltas under the old definition while the new binary's backfill assigns the
+new one, so a parent an old replica touches after the sweep has passed it is
+wrong until it is swept again. The framework cannot see the fleet, so it does
+not wait for it. Treat a definition change like a column rename: once no
+replica on the old binary is writing, call `derivation::resweep(conn, name)`
+(the checkpointed, resumable pass) or `derivation::recompute(conn, name)` (one
+synchronous repair) from a post-deploy hook, and the next sweep settles every
+parent. Both are idempotent, so running them on a healthy derivation costs one
+pass and changes nothing. A one-shot deploy, a single replica, and a change
+that only adds a derivation (no old definition to disagree with) need none of
+this.
+
 ## Status and repair
 
 `GET /actuator/derivations` reports every derivation this binary declares. It is
@@ -315,9 +332,14 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   `tenant` field renamed with `#[diesel(column_name = "...")]` is rejected. A
   foreign-key field renamed that way is not detected, so keep `fk` fields
   unrenamed.
-- **Self-referential derivations are untested.** A child that derives onto its
-  own table (a comment's `reply_count`) takes the same lock order as any other
-  parent, but no test in this release covers it.
+- **Self-referential derivations sweep one parent per batch.** A child that
+  derives onto its own table (a comment's `reply_count`) has rows that are
+  children and parents at once, so a batch locking several parents in id order
+  could form a lock cycle with a mutation that holds a child row and wants its
+  parent. The backfill takes one parent per transaction for such a derivation
+  regardless of `batch_size`, and any batch the database aborts to break a
+  deadlock is retried from its committed checkpoint. No test in this release
+  covers the self-referential shape end to end.
 - **No configuration keys.** Reconciliation and the boot backfill are automatic
   and use the default `BackfillOptions`. Call `run_backfill` to pace a large
   repair by hand.
