@@ -106,23 +106,6 @@ fn descendant_ids(all: &[Post], root: i64) -> std::collections::HashSet<i64> {
     found
 }
 
-/// Whether an error is the bare-path slug index rejecting a duplicate.
-///
-/// Matched on the specific index rather than any unique violation: a
-/// `(post_type, slug)` clash or a primary-key conflict is a different problem
-/// and must not be retried as though a suffix would fix it.
-fn is_bare_path_slug_conflict(error: &AutumnError) -> bool {
-    autumn_web::error::unique_violation_field(
-        error,
-        &[(
-            "idx_posts_bare_path_slug",
-            "slug",
-            "That URL is already taken",
-        )],
-    )
-    .is_some()
-}
-
 /// The publish date the editor's `datetime-local` field carries, if any.
 fn scheduled_at(form: &PostForm) -> Option<chrono::NaiveDateTime> {
     form.publish_at
@@ -704,67 +687,47 @@ pub async fn create(
         ));
     }
 
-    // A post and a page may both be slugged `about` — the unique index is on
-    // `(post_type, slug)` — but both mint `/about`, and only one can be served
-    // there. The slug is de-duplicated below, and `idx_posts_bare_path_slug`
-    // enforces it in the database: the check and the insert are separate
-    // statements, so two concurrent creates can each find the slug free.
-    //
-    // The database is therefore the authority and this loop is the UX: on a
-    // lost race, recompute the suffix and try again rather than handing the
-    // editor a constraint error for something the app can resolve itself.
-    let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
-    let mut created = None;
-    for _ in 0..5 {
-        let slug = {
-            let mut conn = repos.conn().await?;
-            content::ensure_unique_slug(&mut conn, registered.slug, &desired, None).await?
-        };
-        let attempt = repos
-            .posts
-            .save(&NewPost {
-                post_type: registered.slug.to_owned(),
-                title: form.title.trim().to_owned(),
-                slug,
-                excerpt: form.excerpt.trim().to_owned(),
-                body: form.body.clone(),
-                status: if status == "future" || status == "private" {
-                    // Both are only reachable by transition, so create as a
-                    // draft and move it immediately below — the state machine
-                    // stays the single authority on which statuses are
-                    // reachable how.
-                    "draft".to_owned()
-                } else {
-                    status.clone()
-                },
-                author_id: user.id,
-                parent_id: optional_id(form.parent_id.as_ref()),
-                featured_media_id: optional_id(form.featured_media_id.as_ref()),
-                menu_order: optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
-                comment_status: form
-                    .comment_status
-                    .as_deref()
-                    .map_or("closed", |_| "open")
-                    .to_owned(),
-                password: form.password.trim().to_owned(),
-                sticky: form.sticky.is_some(),
-                published_at: scheduled_for,
-            })
-            .await;
-        match attempt {
-            Ok(post) => {
-                created = Some(post);
-                break;
-            }
-            Err(error) if is_bare_path_slug_conflict(&error) => continue,
-            Err(error) => return Err(error),
-        }
+    // The same parent validation the update path runs. Creation skipped it
+    // before, so repeated creates could build a hierarchy deeper than the
+    // permalink builder renders — producing a canonical URL that starts
+    // mid-tree and resolves to nothing.
+    if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
+        content::validate_parent(&mut db, None, parent_id).await?;
     }
-    let Some(created) = created else {
-        return Err(AutumnError::conflict_msg(
-            "Could not allocate a unique URL for this content; try a different title or slug",
-        ));
-    };
+
+    // Slug allocation and the retry it needs live on `Repos` so the importer
+    // uses exactly the same path — `idx_posts_bare_path_slug` makes the
+    // invariant the database's, so every insert path has to allocate through
+    // one place.
+    let created = repos
+        .save_post_with_unique_slug(NewPost {
+            post_type: registered.slug.to_owned(),
+            title: form.title.trim().to_owned(),
+            slug: form.slug.trim().to_owned(),
+            excerpt: form.excerpt.trim().to_owned(),
+            body: form.body.clone(),
+            status: if status == "future" || status == "private" {
+                // Both are only reachable by transition, so create as a draft
+                // and move it immediately below — the state machine stays the
+                // single authority on which statuses are reachable how.
+                "draft".to_owned()
+            } else {
+                status.clone()
+            },
+            author_id: user.id,
+            parent_id: optional_id(form.parent_id.as_ref()),
+            featured_media_id: optional_id(form.featured_media_id.as_ref()),
+            menu_order: optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
+            comment_status: form
+                .comment_status
+                .as_deref()
+                .map_or("closed", |_| "open")
+                .to_owned(),
+            password: form.password.trim().to_owned(),
+            sticky: form.sticky.is_some(),
+            published_at: scheduled_for,
+        })
+        .await?;
 
     // The first revision records the content as created, so the history has a
     // starting point rather than beginning at the first *edit*.
@@ -833,20 +796,7 @@ pub async fn update(
     // that closes a cycle, and page resolution walks down from a NULL parent,
     // so every page in the cycle becomes unreachable at its own permalink.
     if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
-        if content::would_create_cycle(&mut db, id, parent_id).await? {
-            return Err(AutumnError::unprocessable_msg(
-                "A page cannot be placed under itself or one of its own children",
-            ));
-        }
-        // The permalink builder walks a bounded number of ancestors; a page
-        // stored deeper than that would render a URL starting mid-tree, which
-        // resolves to nothing. Refuse at assignment rather than emit a 404 link.
-        if content::depth_under(&mut db, parent_id).await? >= content::MAX_PAGE_DEPTH {
-            return Err(AutumnError::unprocessable_msg(format!(
-                "Pages can be nested at most {} levels deep",
-                content::MAX_PAGE_DEPTH
-            )));
-        }
+        content::validate_parent(&mut db, Some(id), parent_id).await?;
     }
 
     let slug = {

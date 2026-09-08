@@ -12,9 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::capabilities::Capability;
 use crate::content_types;
 use crate::models::{NewPost, Post};
-use crate::repositories::{
-    CommentRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
-};
+use crate::repositories::{CommentRepository as _, PostRepository as _, TermRepository as _};
 
 use super::site::Repos;
 
@@ -101,19 +99,28 @@ pub async fn list_posts(
         )));
     }
 
-    let mut posts = match query.search.as_deref().map(str::trim) {
-        Some(term) if !term.is_empty() => repos
-            .posts
-            .search(term)
+    // The page size is clamped before it reaches any query: an unbounded
+    // `per_page` is a denial-of-service by query string.
+    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
+    let posts = match query.search.as_deref().map(str::trim) {
+        Some(term) if !term.is_empty() => {
+            // The same bounded, visibility-aware search the front end uses.
+            // The generated `search()` is unbounded, and truncating after it
+            // returns means a broad unauthenticated query still costs the whole
+            // match set in database and application memory.
+            let mut conn = repos.conn().await?;
+            crate::content::search_published(
+                &mut conn,
+                term,
+                std::slice::from_ref(&post_type),
+                0,
+                i64::try_from(per_page).unwrap_or(20),
+            )
             .await?
-            .into_iter()
-            .filter(|p| p.post_type == post_type && p.is_public())
-            .collect(),
-        _ => repos.published_posts(&post_type, i64::MAX).await?,
+            .0
+        }
+        _ => repos.published_posts_page(&post_type, 0, per_page).await?.0,
     };
-    // A caller-supplied page size is clamped: an unbounded `per_page` is a
-    // denial-of-service by query string.
-    posts.truncate(query.per_page.unwrap_or(20).clamp(1, 100));
 
     let mut out = Vec::with_capacity(posts.len());
     for post in &posts {
@@ -347,25 +354,26 @@ pub struct AuthorView {
 /// serialization away from going with it.
 #[get("/api/v1/authors")]
 pub async fn list_authors(repos: Repos) -> AutumnResult<Json<Vec<AuthorView>>> {
-    let published = repos.published_posts("post", i64::MAX).await?;
-    let mut author_ids: Vec<i64> = published.iter().map(|p| p.author_id).collect();
-    author_ids.sort_unstable();
-    author_ids.dedup();
+    // One `SELECT DISTINCT` join rather than loading every published post to
+    // deduplicate its author id and then querying once per author: the cost of
+    // listing bylines should scale with the number of authors, not the size of
+    // the corpus.
+    let mut conn = repos.conn().await?;
+    let authors = crate::content::published_authors(&mut conn).await?;
 
-    let mut out = Vec::with_capacity(author_ids.len());
-    for id in author_ids {
-        if let Some(user) = repos.users.find_by_id(id).await.ok().flatten() {
-            out.push(AuthorView {
+    Ok(Json(
+        authors
+            .iter()
+            .map(|user| AuthorView {
                 id: user.id,
                 username: user.username.clone(),
                 name: user.public_name().to_owned(),
                 bio: user.bio.clone(),
                 website: user.website.clone(),
                 url: format!("/author/{}", user.username),
-            });
-        }
-    }
-    Ok(Json(out))
+            })
+            .collect(),
+    ))
 }
 
 /// The site's public metadata — WordPress's `/wp-json` root document.

@@ -1089,6 +1089,77 @@ async fn a_stale_editor_submission_is_refused() {
 
 /// A backup restore must not publish content that was protected, nor flatten a
 /// page tree.
+/// Restoring a page whose slug an existing post already holds must not abort
+/// the run part-way.
+///
+/// `idx_posts_bare_path_slug` made bare-path uniqueness the database's
+/// invariant, which meant every insert path had to allocate through the shared
+/// allocator — the importer did not, so this aborted after earlier rows had
+/// already committed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_a_slug_an_existing_post_holds_does_not_abort_the_run() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A hand-built export containing a page slugged `about`, plus another post
+    // after it — so a mid-run abort would be visible as the second going missing.
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "Imported",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {
+                "post_type": "page", "title": "About", "slug": "about",
+                "excerpt": "", "body": "Imported page.", "status": "publish",
+                "comment_status": "closed", "password": "", "author": "owner",
+                "published_at": null, "parent": null, "terms": []
+            },
+            {
+                "post_type": "post", "title": "Second", "slug": "second",
+                "excerpt": "", "body": "Imported post.", "status": "publish",
+                "comment_status": "open", "password": "", "author": "owner",
+                "published_at": null, "parent": null, "terms": []
+            }
+        ]
+    })
+    .to_string();
+
+    // An existing post already holds `about`.
+    create_post(&client, &cookie, "About", "Existing post.", "publish").await;
+
+    let result = client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await;
+    result.assert_ok().assert_body_contains("2 imported");
+
+    sign_out(&client);
+    // Everything is reachable: the original post, the re-slugged page, and the
+    // row that came after the collision.
+    client
+        .get("/about")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Existing post.");
+    client
+        .get("/about-2")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Imported page.");
+    client
+        .get("/second")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Imported post.");
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn export_preserves_password_protection_and_page_ancestry() {

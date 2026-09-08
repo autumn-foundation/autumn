@@ -379,9 +379,12 @@ pub async fn import(
         // Everything lands as a draft first and is transitioned afterwards, so
         // the state machine sees every move into a published status — an import
         // cannot write a status the UI could not reach.
+        // Through the shared allocator: the bare-path index is enforced by the
+        // database, so importing a page whose slug an existing post already
+        // holds would otherwise abort the restore part-way, after earlier rows
+        // had committed.
         let created = repos
-            .posts
-            .save(&NewPost {
+            .save_post_with_unique_slug(NewPost {
                 post_type: post.post_type.clone(),
                 title: post.title.clone(),
                 slug: post.slug.clone(),

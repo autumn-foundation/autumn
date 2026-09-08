@@ -838,6 +838,21 @@ pub async fn delete_user(db: &mut Db, target_id: i64) -> AutumnResult<Vec<i64>> 
     Ok(affected_terms)
 }
 
+/// The post types that are reachable on the public front end.
+///
+/// Every public listing query filters on this. It exists because "published"
+/// and "publicly routable" are two different questions, and answering only the
+/// first — once per query, in whichever query was written most recently — is
+/// how the same defect kept reappearing on a new screen each review round.
+#[must_use]
+pub fn public_type_slugs() -> Vec<String> {
+    crate::content_types::all_post_types()
+        .into_iter()
+        .filter(|registered| registered.public)
+        .map(|registered| registered.slug.to_owned())
+        .collect()
+}
+
 // ── Set-based listing queries ───────────────────────────────────────────────
 //
 // Every public listing goes through these. They exist because the obvious
@@ -911,10 +926,13 @@ pub async fn published_posts_in_term(
     offset: i64,
     limit: i64,
 ) -> AutumnResult<(Vec<Post>, i64)> {
+    let public_types = public_type_slugs();
+
     let total: i64 = post_terms::table
         .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
         .filter(post_terms::term_id.eq(term_id))
         .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(&public_types))
         .count()
         .get_result(conn)
         .await?;
@@ -923,6 +941,7 @@ pub async fn published_posts_in_term(
         .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
         .filter(post_terms::term_id.eq(term_id))
         .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(&public_types))
         .order((posts::published_at.desc(), posts::id.desc()))
         .offset(offset.max(0))
         .limit(limit.max(0))
@@ -967,15 +986,21 @@ pub async fn published_posts_in_period(
 }
 
 /// One page of an author's published posts.
+/// This archive spans post types, so it filters on registered visibility as
+/// well as status — a `public: false` type has no public route, and a listing
+/// that renders its title and a body-derived excerpt is a public route.
 pub async fn published_posts_by_author(
     conn: &mut AsyncPgConnection,
     author_id: i64,
     offset: i64,
     limit: i64,
 ) -> AutumnResult<(Vec<Post>, i64)> {
+    let public_types = public_type_slugs();
+
     let total: i64 = posts::table
         .filter(posts::author_id.eq(author_id))
         .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(&public_types))
         .count()
         .get_result(conn)
         .await?;
@@ -983,6 +1008,7 @@ pub async fn published_posts_by_author(
     let rows: Vec<Post> = posts::table
         .filter(posts::author_id.eq(author_id))
         .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(&public_types))
         .order((posts::published_at.desc(), posts::id.desc()))
         .offset(offset.max(0))
         .limit(limit.max(0))
@@ -991,6 +1017,31 @@ pub async fn published_posts_by_author(
         .await?;
 
     Ok((rows, total))
+}
+
+/// The distinct authors of published, publicly-routable content.
+///
+/// One query rather than loading every post to deduplicate its `author_id` and
+/// then querying per author — the cost of listing bylines should scale with the
+/// number of authors, not with the size of the corpus.
+pub async fn published_authors(conn: &mut AsyncPgConnection) -> AutumnResult<Vec<User>> {
+    let author_ids: Vec<i64> = posts::table
+        .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(public_type_slugs()))
+        .select(posts::author_id)
+        .distinct()
+        .load(conn)
+        .await?;
+
+    if author_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(users::table
+        .filter(users::id.eq_any(&author_ids))
+        .order(users::username.asc())
+        .select(User::as_select())
+        .load(conn)
+        .await?)
 }
 
 /// Whether a single-segment slug would be resolved as a date archive.
@@ -1086,6 +1137,34 @@ pub async fn depth_under(db: &mut Db, candidate_parent_id: i64) -> AutumnResult<
         }
     }
     Ok(depth)
+}
+
+/// Validate a proposed parent for a page: no cycle, and within the depth the
+/// permalink builder can render.
+///
+/// One function so create and update cannot diverge — the update path had this
+/// and creation did not, which let repeated creates build a hierarchy deeper
+/// than `page_ancestry` walks, whose canonical URL then starts mid-tree and
+/// resolves to nothing. `post_id` is `None` when creating (no row to cycle
+/// back to yet).
+pub async fn validate_parent(
+    db: &mut Db,
+    post_id: Option<i64>,
+    candidate_parent_id: i64,
+) -> AutumnResult<()> {
+    if let Some(post_id) = post_id
+        && would_create_cycle(db, post_id, candidate_parent_id).await?
+    {
+        return Err(AutumnError::unprocessable_msg(
+            "A page cannot be placed under itself or one of its own children",
+        ));
+    }
+    if depth_under(db, candidate_parent_id).await? >= MAX_PAGE_DEPTH {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "Pages can be nested at most {MAX_PAGE_DEPTH} levels deep"
+        )));
+    }
+    Ok(())
 }
 
 /// Re-parent a post. Used by the importer's ancestry pass.

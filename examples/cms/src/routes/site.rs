@@ -294,6 +294,57 @@ impl Repos {
         Ok((rows, usize::try_from(total).unwrap_or(0)))
     }
 
+    /// Save a post, allocating a slug that is free across the types sharing
+    /// the bare URL path, and retrying if a concurrent write takes it first.
+    ///
+    /// Shared by the editor and the importer. `idx_posts_bare_path_slug` makes
+    /// the invariant the database's, which means *every* insert path has to
+    /// allocate through here — the importer did not, so restoring a page whose
+    /// slug an existing post already held aborted the run part-way, after
+    /// earlier rows had committed.
+    pub async fn save_post_with_unique_slug(
+        &self,
+        new: crate::models::NewPost,
+    ) -> AutumnResult<Post> {
+        use crate::repositories::PostRepository as _;
+
+        let desired = crate::hooks::normalize_slug(&new.slug, &new.title);
+        for _ in 0..5 {
+            let slug = {
+                let mut conn = self.conn().await?;
+                crate::content::ensure_unique_slug(&mut conn, &new.post_type, &desired, None)
+                    .await?
+            };
+            let attempt = crate::models::NewPost {
+                slug,
+                ..new.clone()
+            };
+            match self.posts.save(&attempt).await {
+                Ok(post) => return Ok(post),
+                // Only the bare-path index is retried: a `(post_type, slug)`
+                // clash or a primary-key conflict is a different problem and a
+                // suffix would not fix it.
+                Err(error)
+                    if autumn_web::error::unique_violation_field(
+                        &error,
+                        &[(
+                            "idx_posts_bare_path_slug",
+                            "slug",
+                            "That URL is already taken",
+                        )],
+                    )
+                    .is_some() =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(AutumnError::conflict_msg(
+            "Could not allocate a unique URL for this content; try a different title or slug",
+        ))
+    }
+
     /// The terms a post is filed under, across every taxonomy.
     ///
     /// Two queries: the filings, then the terms. A post carries a handful of
