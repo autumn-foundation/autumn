@@ -1034,19 +1034,23 @@ impl CustomDomainRegistry {
         now_unix: i64,
         cert_not_after_unix: i64,
     ) -> io::Result<bool> {
-        self.mutate_if(hostname, |d| tenant.is_none_or(|t| d.tenant == t), |d| {
-            d.status = DomainStatus::Active;
-            if d.verified_at_unix.is_none() {
-                d.verified_at_unix = Some(now_unix);
-            }
-            if d.activated_at_unix.is_none() {
-                d.activated_at_unix = Some(now_unix);
-            }
-            d.cert_not_after_unix = Some(cert_not_after_unix);
-            d.failure_reason = None;
-            d.consecutive_failures = 0;
-            d.next_attempt_unix = None;
-        })
+        self.mutate_if(
+            hostname,
+            |d| tenant.is_none_or(|t| d.tenant == t),
+            |d| {
+                d.status = DomainStatus::Active;
+                if d.verified_at_unix.is_none() {
+                    d.verified_at_unix = Some(now_unix);
+                }
+                if d.activated_at_unix.is_none() {
+                    d.activated_at_unix = Some(now_unix);
+                }
+                d.cert_not_after_unix = Some(cert_not_after_unix);
+                d.failure_reason = None;
+                d.consecutive_failures = 0;
+                d.next_attempt_unix = None;
+            },
+        )
         .await
     }
 

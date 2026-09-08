@@ -8941,7 +8941,10 @@ pub fn run(opts: DoctorOptions) {
                 .filter(|cd| cd.enabled)
                 .map(|cd| read_custom_domain_registry(&cd.store_dir))
                 .unwrap_or_default();
-            let cd_ingress = cd_cfg.as_ref().filter(|cd| cd.enabled).map(|cd| cd.ingress());
+            let cd_ingress = cd_cfg
+                .as_ref()
+                .filter(|cd| cd.enabled)
+                .map(autumn_web::config::CustomDomainsConfig::ingress);
             let registered_count = registered.len();
             tasks.push(Box::new(move || {
                 check_custom_domains_config_impl(
@@ -8972,7 +8975,7 @@ pub fn run(opts: DoctorOptions) {
                 let total = registered.len();
                 // The ingress every registered domain is graded against — the
                 // deployment's, not this CLI host's.
-                let probe_ingress = cd_ingress.clone().unwrap_or_default();
+                let probe_ingress = cd_ingress.unwrap_or_default();
                 for (index, (hostname, tenant, status)) in registered
                     .into_iter()
                     .take(MAX_CUSTOM_DOMAIN_PROBES)
@@ -12513,8 +12516,7 @@ pub struct Vault {
     fn a_pending_custom_domain_that_does_not_point_here_yet_is_only_a_warning() {
         // Not yet published is the ordinary state right after registration.
         assert_eq!(
-            check_custom_domain_dns_impl(&probe("pending_dns", CustomDomainDns::Unresolved))
-                .status,
+            check_custom_domain_dns_impl(&probe("pending_dns", CustomDomainDns::Unresolved)).status,
             CheckStatus::Warn
         );
         assert_eq!(
@@ -12534,8 +12536,7 @@ pub struct Vault {
         );
         // Unknowable from inside a NAT is never a hard failure.
         assert_eq!(
-            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::IngressUnknown))
-                .status,
+            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::IngressUnknown)).status,
             CheckStatus::Warn
         );
     }
