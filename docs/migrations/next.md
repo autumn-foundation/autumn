@@ -630,12 +630,17 @@ This compiled, and pre-rendered/cached the page at build time; disabling
 **After (`{X.Z}`):**
 
 ```rust
-use autumn_web::feature_flags::FeatureFlagService;
+use autumn_web::feature_flags::{FeatureFlagService, InMemoryFlagStore};
 use axum::{extract::{Request, State}, http::StatusCode, middleware::Next, response::Response};
+use std::sync::Arc;
 
 // AppBuilder::static_gate runs a Tower/axum layer before a cache hit, so
 // -- unlike a #[feature_flag] attribute on the handler -- it can actually
-// gate a pre-rendered page.
+// gate a pre-rendered page. It runs outside the app's own router, before
+// AppState exists, so the flag service can't be pulled from there the way
+// #[feature_flag]'s extractor does -- construct and share it explicitly
+// instead, and register the *same* store with the app via
+// `.with_flag_store(...)` so both see the same flag state.
 async fn beta_page_gate(
     State(flags): State<FeatureFlagService>,
     req: Request,
@@ -650,8 +655,12 @@ async fn beta_page_gate(
     next.run(req).await
 }
 
+let store = Arc::new(InMemoryFlagStore::new());
+let flags = FeatureFlagService::new(store.clone());
+
 let app = autumn_web::app()
-    .static_gate(axum::middleware::from_fn(beta_page_gate));
+    .static_gate(axum::middleware::from_fn_with_state(flags, beta_page_gate))
+    .with_flag_store(store);
 
 #[autumn_web::static_get("/beta-page")]
 async fn beta_page() -> &'static str {
