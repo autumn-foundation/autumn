@@ -101,8 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule, on a table the run empties is now refused before anything is written,
   `--check` and `--dry-run` included. Drop or disable it on the copy.
   Each printed target block now opens with `\set ON_ERROR_STOP on` and, inside
-  its transaction, a guard that aborts unless `current_database()` is the target
-  the block is for: `\connect` does **not** close the old connection when the new
+  its transaction, a guard that aborts unless the session is on the target the
+  block is for — database name **and** the address and port the server reports,
+  since a sharded fleet runs the same database name on every shard and a
+  name-only check passes on the wrong one: `\connect` does **not** close the old connection when the new
   one fails — psql prints `Previous connection kept` and carries on — so a pasted
   stream would otherwise run one target's deletes against the previous one, which
   the deliberately password-free conninfo makes likely rather than remote.

@@ -425,14 +425,25 @@ previous target. Removing the password from the printed conninfo is what makes
 that failure likely rather than remote. So each block opens with
 `\set ON_ERROR_STOP on` — which covers running the file with `psql -f`, where a
 failed `\connect` already halts — and, as its first statement inside the
-transaction, one that aborts unless `current_database()` is the target the block
-names:
+transaction, one that aborts unless the session is on the target the block names
+— the database name together with the address and port the server itself
+reports:
 
 ```text
-ERROR:  this block is for database app_copy, but the session is on app_shard_1
-        — the \connect above did not take effect (psql keeps the previous
-        connection when one fails)
+ERROR:  this block is for app at 10.0.0.3/32:5432, but the session is on app at
+        10.0.0.2/32:5432 — the \connect above did not take effect (psql keeps
+        the previous connection when one fails)
 ```
+
+The name alone is not an identity. A sharded fleet runs the same database name
+on every shard — the topology in [Sharding](sharding.md) names all three `app` —
+so a retained connection to shard 0 answers `current_database()` exactly as the
+intended shard would. Measured on two clusters both holding `app`: with a
+name-only guard, shard 1's block scrubbed shard 0 from 200 users to 100, 400
+comments to 200 and 500 audit rows to 0, while the shard it named went
+untouched. Both are compared with `IS DISTINCT FROM`, because the server reports
+neither over a Unix socket and `NULL <> NULL` would let the check pass by
+failing to be false.
 
 An interactive paste ignores `ON_ERROR_STOP`, but it cannot ignore an aborted
 transaction: every following statement is refused with `current transaction is

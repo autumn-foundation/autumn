@@ -2606,7 +2606,7 @@ fn classify_and_apply(
             // precede the proof that we are where we think we are.
             if let Some(guard) = password_free_conninfo(url)
                 .as_deref()
-                .and_then(target_guard)
+                .and_then(|conninfo| target_guard(conninfo, &facts.endpoint))
             {
                 eprintln!("  {guard}");
             }
@@ -3125,6 +3125,18 @@ fn triggers_reaching(extra: &str) -> String {
     )
 }
 
+/// Where a connection actually landed, as the server itself reports it.
+///
+/// Both `None` over a Unix socket, where Postgres has no address or port to
+/// report. Held as strings because they only ever go back into SQL as literals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerEndpoint {
+    /// `inet_server_addr()`, e.g. `10.0.0.2/32`.
+    pub address: Option<String>,
+    /// `inet_server_port()`.
+    pub port: Option<String>,
+}
+
 /// they are probed here rather than assumed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DatabaseFacts {
@@ -3162,6 +3174,11 @@ pub struct DatabaseFacts {
     /// Tables carrying user-defined triggers, which can copy pre-scrub values
     /// into another table mid-scrub.
     pub triggered_tables: BTreeSet<String>,
+    /// The address and port the connection actually reached, as the server
+    /// reports them. Both `None` over a Unix socket. The dry run's target guard
+    /// compares these so a retained connection to a different host holding the
+    /// same database name cannot pass for the intended one.
+    pub endpoint: ServerEndpoint,
     /// The connection's `session_replication_role`. Anything but `origin`
     /// inverts which triggers and rules fire, so the hazard checks below would
     /// be answering for a session the run is not in.
@@ -3610,6 +3627,31 @@ fn probe_database_facts(
     .next()
     .unwrap_or_else(|| "origin".to_owned());
 
+    // The endpoint this connection actually reached, for the dry run's target
+    // guard. Comparing the database name alone is not enough: a sharded fleet
+    // runs the SAME database name on different hosts — the topology in
+    // docs/guide/sharding.md names all three `app` — so a retained connection to
+    // one shard answers `current_database()` exactly as the intended one would.
+    // Measured: two clusters both holding `app`, a failed `\connect`, and the
+    // shard1 block scrubbed shard0 (200 -> 100 users) past a name-only guard.
+    //
+    // Read from the live connection rather than parsed out of the URL, because a
+    // hostname is not what the server reports back — `inet_server_addr()` is an
+    // address, and resolving one at print time is not this command's job. NULL
+    // over a Unix socket, which the guard compares as NULL rather than papering
+    // over.
+    let endpoint = pair_rows(
+        "SELECT coalesce(pg_catalog.inet_server_addr()::text, '') AS tbl, coalesce(pg_catalog.inet_server_port()::text, '') AS col",
+        &mut conn,
+    )?
+    .into_iter()
+    .next()
+    .map(|(addr, port)| ServerEndpoint {
+        address: (!addr.is_empty()).then_some(addr),
+        port: (!port.is_empty()).then_some(port),
+    })
+    .unwrap_or_default();
+
     // Rules are the other way a `DELETE` runs code the plan never saw. Unlike a
     // trigger they fire only on the relation the statement NAMES — measured on
     // PostgreSQL 16: a rule on a leaf partition or an inheritance child does not
@@ -3713,6 +3755,7 @@ fn probe_database_facts(
         rls_tables,
         legacy_inheritance,
         triggered_tables,
+        endpoint,
         replication_role,
         delete_triggered_tables,
         materialized_views,
@@ -3963,19 +4006,38 @@ fn expected_database(conninfo: &str) -> Option<String> {
 /// connection to a URL it was given and cannot be on the wrong database, so
 /// there is nothing here for it to run — the guard exists for the paste, which
 /// is the only path that can land on the wrong target.
-fn target_guard(conninfo: &str) -> Option<String> {
+fn target_guard(conninfo: &str, endpoint: &ServerEndpoint) -> Option<String> {
     let database = expected_database(conninfo)?;
     // `RAISE` substitutes bare `%` in argument order; it has no `%1$s`
     // positional form. Writing one puts the databases in the message the wrong
     // way round and leaves `2$s` in the text — measured, before this was fixed:
     // "this block is for database cifix_prev2$s, but the session is on
     // cifix_stmt1$s", naming each database as the other.
+    // The database name alone does not identify a target. A sharded fleet runs
+    // the SAME name on different hosts — docs/guide/sharding.md names all three
+    // `app` — so a retained connection to another shard answers
+    // `current_database()` exactly as the intended one would. Measured on two
+    // clusters both holding `app`: with a name-only guard a failed `\connect`
+    // let shard1's block scrub shard0 from 200 users to 100, 400 comments to 200
+    // and 500 audit rows to 0, while the shard it named went untouched.
+    //
+    // `IS DISTINCT FROM` rather than `<>`: both sides are NULL over a Unix
+    // socket, and `NULL <> NULL` is NULL, which would let the guard pass by
+    // failing to be false.
+    let literal =
+        |value: Option<&String>| value.map_or_else(|| "NULL".to_owned(), |v| quote_literal(v));
     let body = format!(
-        " BEGIN IF current_database() <> {name} THEN \
-         RAISE EXCEPTION {message}, {name}, current_database(); END IF; END ",
+        " BEGIN IF current_database() <> {name} \
+         OR inet_server_addr()::text IS DISTINCT FROM {addr} \
+         OR inet_server_port()::text IS DISTINCT FROM {port} THEN \
+         RAISE EXCEPTION {message}, {name}, {addr}, {port}, \
+         current_database(), inet_server_addr()::text, inet_server_port()::text; \
+         END IF; END ",
         name = quote_literal(&database),
+        addr = literal(endpoint.address.as_ref()),
+        port = literal(endpoint.port.as_ref()),
         message = quote_literal(
-            "this block is for database %, but the session is on % — the \\connect \
+            "this block is for % at %:%, but the session is on % at %:% — the \\connect \
              above did not take effect (psql keeps the previous connection when one fails)"
         ),
     );
@@ -4489,8 +4551,37 @@ mod tests {
     /// 200/400/500 rows with all 11 destructive statements refused.
     #[test]
     fn the_target_guard_aborts_the_block_on_the_wrong_database() {
-        let guard = super::target_guard("postgres://bob@db/app_copy")
+        let here = super::ServerEndpoint {
+            address: Some("10.0.0.2/32".to_owned()),
+            port: Some("5432".to_owned()),
+        };
+        let guard = super::target_guard("postgres://bob@db/app_copy", &here)
             .expect("a conninfo naming a database gets a guard");
+        // The database name alone does not identify a target: a sharded fleet
+        // runs the same name on every shard. Measured on two clusters both
+        // holding `app`, a name-only guard let shard1's block scrub shard0
+        // (200 users -> 100) while the intended shard went untouched.
+        assert!(
+            guard.contains("inet_server_addr()::text IS DISTINCT FROM '10.0.0.2/32'")
+                && guard.contains("inet_server_port()::text IS DISTINCT FROM '5432'"),
+            "the guard must pin the endpoint, not just the name: {guard}"
+        );
+        assert!(
+            !guard.contains("inet_server_addr()::text <> "),
+            "`<>` is NULL-blind over a Unix socket; the comparison must be \
+             IS DISTINCT FROM: {guard}"
+        );
+
+        // Over a Unix socket the server reports neither, and the guard compares
+        // that as NULL rather than papering over it — a retained TCP connection
+        // then fails the comparison instead of passing it.
+        let socket =
+            super::target_guard("postgres://db/app_copy", &super::ServerEndpoint::default())
+                .expect("guard");
+        assert!(
+            socket.contains("IS DISTINCT FROM NULL"),
+            "a socket target pins NULL explicitly: {socket}"
+        );
         assert!(
             guard.contains("current_database() <> 'app_copy'"),
             "the guard must compare against the target it is for: {guard}"
@@ -4509,23 +4600,32 @@ mod tests {
         );
         assert_eq!(
             guard.matches('%').count(),
-            2,
-            "one placeholder for the target, one for the session: {guard}"
+            6,
+            "three placeholders for the target endpoint, three for the session's: {guard}"
         );
+        // The message reads expected-then-actual, so the arguments must too:
+        // getting this backwards is exactly the bug the positional-specifier
+        // attempt shipped, and it names each database as the other.
+        let expected_at = guard
+            .find("'app_copy', '10.0.0.2/32', '5432'")
+            .expect("expected trio");
+        let actual_at = guard
+            .find("current_database(), inet_server_addr()::text, inet_server_port()::text")
+            .expect("actual trio");
         assert!(
-            guard.find("'app_copy'").unwrap() < guard.find("current_database();").unwrap(),
-            "and the arguments must be in the order the message reads them: {guard}"
+            expected_at < actual_at,
+            "arguments must be in the order the message reads them: {guard}"
         );
 
         assert_eq!(
-            super::target_guard("postgres://db.internal:6543"),
+            super::target_guard("postgres://db.internal:6543", &here),
             None,
             "a conninfo with no database gets no guard rather than a vacuous one"
         );
 
         // The database name reaches SQL as a literal, so it is quoted like every
         // other identifier-shaped value this module prints.
-        let hostile = super::target_guard("postgres://db/it%27s").expect("guard");
+        let hostile = super::target_guard("postgres://db/it%27s", &here).expect("guard");
         assert!(
             !hostile.contains("%27"),
             "the name must be compared decoded, or a correct run is refused: {hostile}"
