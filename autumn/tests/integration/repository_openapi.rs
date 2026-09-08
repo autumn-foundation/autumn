@@ -554,6 +554,150 @@ mod collision {
     }
 }
 
+/// `Option` and `Vec` are matched on the LAST PATH SEGMENT too, so an
+/// application's own generic of that name reaches the nullable / array branch.
+///
+/// These live in their own module rather than in `collision` above: declaring
+/// `Option<T>` shadows the prelude for the WHOLE module, which would silently
+/// re-point `collision::HoldsCollisions`'s `Option<Value>` fields at the
+/// impostor and quietly change what those tests assert.
+mod wrapper_collision {
+    /// Last segment `Option`, but an ordinary struct: it serializes as an
+    /// object, is never `null`, and must be sent.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct Option<T> {
+        pub held: T,
+    }
+
+    /// Last segment `Vec`, but an ordinary struct: it serializes as an object,
+    /// not as an array.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct Vec<T> {
+        pub head: T,
+    }
+
+    // The impostor fields are written BARE, exactly as a colliding import would
+    // leave them. The genuine ones are written with a full path — which the
+    // macro still matches on the same last segment, so they exercise the guard
+    // from the other side rather than bypassing it.
+    #[derive(autumn_web::openapi::OpenApiSchema)]
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct HoldsWrapperCollisions {
+        pub maybe: Option<::std::string::String>,
+        pub many: Vec<::std::string::String>,
+        pub real_maybe: ::core::option::Option<::std::string::String>,
+        pub real_many: ::std::vec::Vec<::std::string::String>,
+    }
+}
+
+/// An application `Option<T>` is an ordinary object. Advertising it as nullable
+/// told a generated client the field may be `null` when it never is — and,
+/// worse, dropped it from `required`, so a client could omit a field the server
+/// demands. No opaque component was emitted either, so `--strict` passed while
+/// it happened.
+#[test]
+fn an_impostor_option_is_neither_nullable_nor_optional() {
+    let schema =
+        <wrapper_collision::HoldsWrapperCollisions as autumn_web::openapi::OpenApiSchema>::schema();
+
+    let impostor = &schema["properties"]["maybe"];
+    assert!(
+        impostor.get("oneOf").is_none(),
+        "an application `Option` that serializes as an object must not be \
+         advertised as nullable: {impostor}"
+    );
+    assert!(
+        impostor["$ref"]
+            .as_str()
+            .is_some_and(|r| r.contains("Option")),
+        "it falls through to a $ref carrying its full identity: {impostor}"
+    );
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("the struct has required fields")
+        .iter()
+        .map(|v| v.as_str().expect("required entries are strings"))
+        .collect();
+    assert!(
+        required.contains(&"maybe"),
+        "an application `Option` is not optional — it must stay required: \
+         {required:?}"
+    );
+}
+
+/// The same collision one level over: an application `Vec<T>` is an object, not
+/// an array, so `items` would describe a shape that never appears on the wire.
+#[test]
+fn an_impostor_vec_is_not_advertised_as_an_array() {
+    let schema =
+        <wrapper_collision::HoldsWrapperCollisions as autumn_web::openapi::OpenApiSchema>::schema();
+
+    let impostor = &schema["properties"]["many"];
+    assert_ne!(
+        impostor["type"], "array",
+        "an application `Vec` that serializes as an object must not be \
+         advertised as an array: {impostor}"
+    );
+    assert!(
+        impostor.get("items").is_none(),
+        "and it must carry no `items`: {impostor}"
+    );
+    assert!(
+        impostor["$ref"].as_str().is_some_and(|r| r.contains("Vec")),
+        "it falls through to a $ref carrying its full identity: {impostor}"
+    );
+}
+
+/// The guard must not cost the mapping it exists to protect: the genuine
+/// `Option` and `Vec` keep their nullable / array shapes and their
+/// requiredness, even though they are matched by the same last segment.
+#[test]
+fn the_genuine_option_and_vec_keep_their_shapes() {
+    let schema =
+        <wrapper_collision::HoldsWrapperCollisions as autumn_web::openapi::OpenApiSchema>::schema();
+
+    let real_maybe = &schema["properties"]["real_maybe"];
+    let one_of = real_maybe["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a genuine Option stays nullable: {real_maybe}"));
+    assert!(
+        one_of.iter().any(|b| b["type"] == "null"),
+        "with a null branch: {real_maybe}"
+    );
+
+    let real_many = &schema["properties"]["real_many"];
+    assert_eq!(
+        real_many["type"], "array",
+        "a genuine Vec stays an array: {real_many}"
+    );
+    assert_eq!(real_many["items"]["type"], "string", "{real_many}");
+
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("the struct has required fields")
+        .iter()
+        .map(|v| v.as_str().expect("required entries are strings"))
+        .collect();
+    assert!(
+        !required.contains(&"real_maybe"),
+        "a genuine Option is still dropped from required: {required:?}"
+    );
+    assert!(
+        required.contains(&"real_many"),
+        "a genuine Vec is still required: {required:?}"
+    );
+}
+
 /// The scalar table matches the LAST PATH SEGMENT, so a colliding application
 /// type reaches it. The inventory check alone could not catch this one — an
 /// underived type has nothing registered to find — so the FULL runtime identity

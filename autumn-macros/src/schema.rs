@@ -570,6 +570,96 @@ pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
     emit_json_schema_tokens(&field.ty)
 }
 
+/// Emit the schema for a type whose last path segment is `Option`.
+///
+/// Split out of [`emit_json_schema_tokens`] only for length: the nullable case
+/// carries two runtime guards (the wrapper's own identity, and — for
+/// `Option<Value>` — the inner type's) and their reasoning does not compress.
+fn emit_option_schema_tokens(ty: &syn::Type, inner: &syn::Type) -> TokenStream {
+    // Everything below describes `ty` as NULLABLE, which is only true if
+    // `ty` is `std`'s `Option`. `unwrap_single_generic` matched the last
+    // path segment, so an application's own `domain::Option<T>` reaches
+    // here too — and it is an ordinary struct, not a nullable anything.
+    // The whole nullable body is therefore emitted as the MATCHED arm of
+    // the runtime identity guard: a registered `domain::Option<T>` gets its
+    // real schema, an unregistered one gets the honest `$ref` (which
+    // `--strict` then reports as opaque), and only genuine `Option` is
+    // described as nullable.
+
+    // `Option<serde_json::Value>` must NOT be wrapped. The unconstrained
+    // schema already admits null, and `oneOf` demands that EXACTLY ONE
+    // branch match — so `oneOf [{unconstrained}, {"type":"null"}]` would
+    // reject the very null it is meant to permit, because null matches both.
+    //
+    // But `is_serde_json_value` matches the LAST PATH SEGMENT, so it also
+    // fires for an application type of one's own called `Value`. That type
+    // is ordinary: if it carries `#[derive(OpenApiSchema)]` its schema is a
+    // normal non-null object and it NEEDS the null branch, or serializing
+    // `None` emits a null the schema forbids. A proc macro cannot tell the
+    // two apart, so the choice is deferred to runtime — the same escape the
+    // scalar table uses for its own last-segment collisions.
+    if is_serde_json_value(&type_name_str(inner)) {
+        // THREE outcomes, not two. The inventory check alone cannot tell the
+        // genuine `serde_json::Value` from an application `Value` that
+        // derives nothing — it answers `None` for both — so the identity is
+        // checked as well, exactly as `emit_identity_guarded` does for the
+        // non-optional path. Without it an underived colliding `Value` was
+        // published as arbitrary JSON: `--strict` passed while a client
+        // still received `unknown` for a field with a fixed wire shape.
+        let inner_ty = inner;
+        let matched = quote! {{
+            match ::autumn_web::openapi::registered_derived_schema(
+                ::core::any::type_name::<#inner_ty>()
+            ) {
+                // A colliding application `Value` with a real schema: wrap
+                // it like any other optional type.
+                ::core::option::Option::Some(__derived) => {
+                    ::autumn_web::reexports::serde_json::json!({
+                        "oneOf": [__derived, { "type": "null" }]
+                    })
+                }
+                ::core::option::Option::None => {
+                    let __identity = ::core::any::type_name::<#inner_ty>();
+                    if __identity == "serde_json::value::Value" {
+                        // Genuine `serde_json::Value`: unconstrained already
+                        // admits null, and wrapping it in `oneOf` would
+                        // REJECT that null (it matches both branches).
+                        ::autumn_web::reexports::serde_json::json!({
+                            "description": "Arbitrary JSON: an object, array, string, \
+                                            number, boolean or null.",
+                        })
+                    } else {
+                        // An underived application `Value`: an ordinary
+                        // type, so it gets the ordinary nullable `$ref`.
+                        let __ref_path = ::std::format!(
+                            "#/components/schemas/{}",
+                            __identity
+                        );
+                        ::autumn_web::reexports::serde_json::json!({
+                            "oneOf": [{ "$ref": __ref_path }, { "type": "null" }]
+                        })
+                    }
+                }
+            }
+        }};
+        return emit_identity_guarded(
+            ty,
+            &std_wrapper_predicate(&OPTION_IDENTITY_PREFIXES),
+            &matched,
+        );
+    }
+    let inner_tokens = emit_json_schema_tokens(inner);
+    let matched = quote! {{
+        let __inner = #inner_tokens;
+        ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
+    }};
+    emit_identity_guarded(
+        ty,
+        &std_wrapper_predicate(&OPTION_IDENTITY_PREFIXES),
+        &matched,
+    )
+}
+
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
@@ -578,77 +668,22 @@ pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
 pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
     if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
-        // `Option<serde_json::Value>` must NOT be wrapped. The unconstrained
-        // schema already admits null, and `oneOf` demands that EXACTLY ONE
-        // branch match — so `oneOf [{unconstrained}, {"type":"null"}]` would
-        // reject the very null it is meant to permit, because null matches both.
-        //
-        // But `is_serde_json_value` matches the LAST PATH SEGMENT, so it also
-        // fires for an application type of one's own called `Value`. That type
-        // is ordinary: if it carries `#[derive(OpenApiSchema)]` its schema is a
-        // normal non-null object and it NEEDS the null branch, or serializing
-        // `None` emits a null the schema forbids. A proc macro cannot tell the
-        // two apart, so the choice is deferred to runtime — the same escape the
-        // scalar table uses for its own last-segment collisions.
-        if is_serde_json_value(&type_name_str(&inner)) {
-            // THREE outcomes, not two. The inventory check alone cannot tell the
-            // genuine `serde_json::Value` from an application `Value` that
-            // derives nothing — it answers `None` for both — so the identity is
-            // checked as well, exactly as `emit_identity_guarded` does for the
-            // non-optional path. Without it an underived colliding `Value` was
-            // published as arbitrary JSON: `--strict` passed while a client
-            // still received `unknown` for a field with a fixed wire shape.
-            let inner_ty = &inner;
-            return quote! {{
-                match ::autumn_web::openapi::registered_derived_schema(
-                    ::core::any::type_name::<#inner_ty>()
-                ) {
-                    // A colliding application `Value` with a real schema: wrap
-                    // it like any other optional type.
-                    ::core::option::Option::Some(__derived) => {
-                        ::autumn_web::reexports::serde_json::json!({
-                            "oneOf": [__derived, { "type": "null" }]
-                        })
-                    }
-                    ::core::option::Option::None => {
-                        let __identity = ::core::any::type_name::<#inner_ty>();
-                        if __identity == "serde_json::value::Value" {
-                            // Genuine `serde_json::Value`: unconstrained already
-                            // admits null, and wrapping it in `oneOf` would
-                            // REJECT that null (it matches both branches).
-                            ::autumn_web::reexports::serde_json::json!({
-                                "description": "Arbitrary JSON: an object, array, string, \
-                                                number, boolean or null.",
-                            })
-                        } else {
-                            // An underived application `Value`: an ordinary
-                            // type, so it gets the ordinary nullable `$ref`.
-                            let __ref_path = ::std::format!(
-                                "#/components/schemas/{}",
-                                __identity
-                            );
-                            ::autumn_web::reexports::serde_json::json!({
-                                "oneOf": [{ "$ref": __ref_path }, { "type": "null" }]
-                            })
-                        }
-                    }
-                }
-            }};
-        }
-        let inner_tokens = emit_json_schema_tokens(&inner);
-        return quote! {{
-            let __inner = #inner_tokens;
-            ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
-        }};
+        return emit_option_schema_tokens(ty, &inner);
     }
 
     // Vec<T> → {"type": "array", "items": <T-schema>}
+    //
+    // Guarded exactly like `Option` above: `domain::Vec<T>` is matched by the
+    // last path segment but is not an array, so the array body is the MATCHED
+    // arm and anything else falls through to its registered schema or an
+    // honest `$ref`.
     if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Vec") {
         let inner_tokens = emit_json_schema_tokens(&inner);
-        return quote! {{
+        let matched = quote! {{
             let __items = #inner_tokens;
             ::autumn_web::reexports::serde_json::json!({ "type": "array", "items": __items })
         }};
+        return emit_identity_guarded(ty, &std_wrapper_predicate(&VEC_IDENTITY_PREFIXES), &matched);
     }
 
     let name = type_name_str(ty);
@@ -815,7 +850,47 @@ fn emit_identity_guarded(
     }}
 }
 
-/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?
+/// The `type_name` prefixes that identify `std`'s own `Option` / `Vec`.
+///
+/// Both spellings are listed for each because `core::option::Option` /
+/// `alloc::vec::Vec` are what today's rustc renders, while `std::option::` /
+/// `std::vec::` are the re-export paths a future rustc could plausibly print.
+/// Accepting both costs one string comparison and removes a silent-wrong-spec
+/// failure mode from a toolchain upgrade.
+const OPTION_IDENTITY_PREFIXES: [&str; 2] = ["core::option::Option<", "std::option::Option<"];
+const VEC_IDENTITY_PREFIXES: [&str; 2] = ["alloc::vec::Vec<", "std::vec::Vec<"];
+
+/// Emit an expression that is `true` at runtime iff `__identity` (the enclosing
+/// scope's `type_name::<T>()`) names one of `prefixes`.
+///
+/// `Option` and `Vec` are matched by the macro on their LAST PATH SEGMENT, for
+/// the same reason every other type here is: a proc macro sees only the tokens
+/// as written. But an application's own `domain::Option<T>` — an ordinary
+/// struct that happens to spell that segment — is not nullable, and a
+/// `domain::Vec<T>` is not an array. Describing them as such advertised a wire
+/// shape those types do not serialize, and (because no opaque component was
+/// emitted) `autumn openapi export --strict` passed while doing it. Deferring
+/// the decision to `type_name` is the same escape the scalar table uses for its
+/// own last-segment collisions.
+fn std_wrapper_predicate(prefixes: &[&str]) -> TokenStream {
+    let checks = prefixes
+        .iter()
+        .map(|p| quote! { __identity.starts_with(#p) });
+    quote! { #(#checks)||* }
+}
+
+/// Emit an expression that is `true` at runtime iff `ty` really is `std`'s
+/// wrapper named by `prefixes`, for use OUTSIDE [`emit_identity_guarded`]
+/// (which binds `__identity` itself).
+fn emit_is_std_wrapper(ty: &syn::Type, prefixes: &[&str]) -> TokenStream {
+    let predicate = std_wrapper_predicate(prefixes);
+    quote! {{
+        let __identity = ::core::any::type_name::<#ty>();
+        #predicate
+    }}
+}
+
+/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?
 ///
 /// Matched on the LAST PATH SEGMENT for the same reason the scalar table is: a
 /// proc macro sees only the tokens as written, and `use serde_json::Value;` is
@@ -941,15 +1016,37 @@ pub fn emit_schema_fn_body_named(
             let base = emit_json_schema_tokens_for_field(f);
             // `Option<T>` already emits `oneOf [T, null]`, so wrapping it again
             // would only nest a second, redundant null branch.
-            let schema_expr = if nullable && !is_option_type(&f.ty) {
+            //
+            // `is_option_type` matches the LAST PATH SEGMENT, though, so an
+            // application's own `domain::Option<T>` answers `true` here while
+            // `emit_json_schema_tokens` (identity-guarded above) correctly
+            // emits a NON-nullable schema for it. Skipping the wrap on that
+            // answer alone would leave a `Patch` field whose `null` — the wire
+            // form of `Clear` — is forbidden by its own schema. So when the
+            // compile-time answer is `true` the choice is deferred to the same
+            // runtime identity the emitter uses, and the two agree by
+            // construction.
+            let schema_expr = if !nullable {
+                base
+            } else if is_option_type(&f.ty) {
+                let is_std_option = emit_is_std_wrapper(&f.ty, &OPTION_IDENTITY_PREFIXES);
+                quote! {{
+                    let __inner = #base;
+                    if #is_std_option {
+                        __inner
+                    } else {
+                        ::autumn_web::reexports::serde_json::json!({
+                            "oneOf": [__inner, { "type": "null" }]
+                        })
+                    }
+                }}
+            } else {
                 quote! {{
                     let __inner = #base;
                     ::autumn_web::reexports::serde_json::json!({
                         "oneOf": [__inner, { "type": "null" }]
                     })
                 }}
-            } else {
-                base
             };
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
@@ -957,27 +1054,48 @@ pub fn emit_schema_fn_body_named(
         })
         .collect();
 
-    let mut required_names: Vec<String> = if all_optional {
-        Vec::new()
-    } else {
-        fields
-            .iter()
-            .filter(|f| !is_option_type(&f.ty) && !treat_as_optional(f))
-            .filter_map(|f| resolve_name(f))
-            .collect()
-    };
-    for f in extra_required {
-        if let Some(name) = resolve_name(f) {
-            required_names.push(name);
+    // A field is required unless it is genuinely optional.
+    //
+    // `treat_as_optional` reads serde attributes, which a proc macro sees
+    // exactly and completely — that answer is final. `is_option_type` does not:
+    // it matches the LAST PATH SEGMENT, so an application's own
+    // `domain::Option<T>` — an ordinary struct the client must actually send —
+    // answered `true` and was silently dropped from `required`, while its
+    // property schema (identity-guarded in `emit_json_schema_tokens`) correctly
+    // described a non-nullable object. Requiredness is therefore emitted as a
+    // runtime-conditional push for exactly the fields that answer `true`,
+    // keyed on the same `type_name` identity the emitter uses, so a property's
+    // shape and its requiredness cannot disagree.
+    //
+    // The pushes are emitted in the original order — model fields first, then
+    // `extra_required` — so `required` keeps the ordering it has always had.
+    let mut required_pushes: Vec<TokenStream> = Vec::new();
+    if !all_optional {
+        for f in fields {
+            if treat_as_optional(f) {
+                continue;
+            }
+            let Some(name) = resolve_name(f) else {
+                continue;
+            };
+            let push = quote! {
+                __required.push(::autumn_web::reexports::serde_json::json!(#name));
+            };
+            required_pushes.push(if is_option_type(&f.ty) {
+                let is_std_option = emit_is_std_wrapper(&f.ty, &OPTION_IDENTITY_PREFIXES);
+                quote! { if !(#is_std_option) { #push } }
+            } else {
+                push
+            });
         }
     }
-
-    let required_tokens: Vec<TokenStream> = required_names
-        .iter()
-        .map(|name| {
-            quote! { ::autumn_web::reexports::serde_json::json!(#name) }
-        })
-        .collect();
+    for f in extra_required {
+        if let Some(name) = resolve_name(f) {
+            required_pushes.push(quote! {
+                __required.push(::autumn_web::reexports::serde_json::json!(#name));
+            });
+        }
+    }
 
     quote! {
         let mut __props = ::autumn_web::reexports::serde_json::Map::new();
@@ -991,8 +1109,10 @@ pub fn emit_schema_fn_body_named(
             "properties".to_owned(),
             ::autumn_web::reexports::serde_json::Value::Object(__props),
         );
-        let __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
-            ::std::vec![#(#required_tokens),*];
+        #[allow(unused_mut)]
+        let mut __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
+            ::std::vec::Vec::new();
+        #(#required_pushes)*
         if !__required.is_empty() {
             __schema.insert(
                 "required".to_owned(),

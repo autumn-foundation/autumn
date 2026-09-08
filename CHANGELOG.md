@@ -66,6 +66,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `serde_json::Value`. Apps that were registering models explicitly are
   unaffected: an explicit `register_schema` is still seeded first and still wins.
 
+- **openapi:** an application type whose last path segment is `Option` or `Vec`
+  is no longer described as nullable or as an array (issue #802). Both macros
+  match those two wrappers on the type's **last path segment**, because a proc
+  macro sees only the tokens as written — so an app's own `domain::Option<T>` or
+  `domain::Vec<T>` (ordinary structs that merely spell that name) took the
+  nullable / array branch. A `#[model]` field of such a type was published as
+  `oneOf [T, null]` or `type: array` and, worse, dropped from `required`, so a
+  generated client could omit a field the server demands; an `#[api]` handler
+  returning `Json<domain::Option<T>>` documented the *inner* type it never
+  wraps. Nothing flagged it: no opaque component was emitted, so
+  `autumn openapi export --strict` passed while it happened. Both paths now
+  check the type's full runtime `type_name` before treating it as a `std`
+  wrapper — the same escape the scalar table already uses for its own
+  last-segment collisions — so a colliding type resolves to its registered
+  schema, or to an honest `$ref` that `--strict` reports as opaque. Genuine
+  `Option` / `Vec` are unchanged, requiredness included.
+
 
 ### Changed
 

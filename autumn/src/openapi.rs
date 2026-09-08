@@ -267,10 +267,17 @@ pub struct SchemaEntry {
     /// `SchemaEntry` const-promotable to `&'static` in `Array` / `Nullable`
     /// wrappers, since `type_name` is not yet a stably-const fn.
     ///
-    /// `None` for primitives and for the `Array` / `Nullable` wrapper entries
-    /// (whose `name` is the sentinel `"array"` / `"nullable"`), and for legacy
-    /// short-name refs (e.g. the repository macro's model refs) which keep their
-    /// last-segment display key.
+    /// Set on the `Array` / `Nullable` wrapper entries too, where it names the
+    /// WRAPPER (`core::option::Option<T>`, `alloc::vec::Vec<T>`). The route
+    /// macros match those two on the last path segment, so an application's own
+    /// `domain::Option<T>` reaches the same arm; `wrapper_is_impostor` reads
+    /// this identity to tell the two apart and renders an impostor as an
+    /// ordinary `$ref` rather than as something nullable or array-shaped.
+    ///
+    /// `None` for primitives, and for legacy short-name refs (e.g. the
+    /// repository macro's model refs) which keep their last-segment display
+    /// key. A `None` wrapper is treated as genuine, so hand-built entries keep
+    /// their previous behaviour.
     pub identity: Option<fn() -> &'static str>,
 }
 
@@ -1063,10 +1070,49 @@ fn rewrite_identity_refs(value: &mut serde_json::Value, index: &SchemaComponentI
     }
 }
 
+/// `type_name` prefixes that identify `std`'s own `Option` / `Vec`.
+///
+/// Both spellings are accepted for each: `core::option::Option` /
+/// `alloc::vec::Vec` are what today's rustc renders, while `std::option::` /
+/// `std::vec::` are re-export paths a future rustc could plausibly print.
+#[cfg(feature = "openapi")]
+const OPTION_TYPE_NAME_PREFIXES: [&str; 2] = ["core::option::Option<", "std::option::Option<"];
+#[cfg(feature = "openapi")]
+const VEC_TYPE_NAME_PREFIXES: [&str; 2] = ["alloc::vec::Vec<", "std::vec::Vec<"];
+
+/// Does this `Array` / `Nullable` entry describe an application type that merely
+/// SPELLS `Vec` / `Option` in its last path segment?
+///
+/// The route macros can only match a type by the tokens as written, so
+/// `domain::Option<T>` — an ordinary struct — produces a `Nullable` entry just
+/// as `std`'s `Option<T>` does. Rendering it as nullable (or as an array, for a
+/// `domain::Vec<T>`) advertises a wire shape that type does not serialize.
+/// The wrapper entry carries its own `type_name`, which settles it.
+///
+/// An entry with no identity is treated as genuine: hand-built entries and
+/// anything emitted before wrapper identities existed keep their old shape.
+#[cfg(feature = "openapi")]
+fn wrapper_is_impostor(entry: &SchemaEntry) -> bool {
+    let prefixes: &[&str] = match entry.kind {
+        SchemaKind::Array(_) => &VEC_TYPE_NAME_PREFIXES,
+        SchemaKind::Nullable(_) => &OPTION_TYPE_NAME_PREFIXES,
+        SchemaKind::Ref | SchemaKind::Primitive(_) => return false,
+    };
+    entry.identity.is_some_and(|resolve| {
+        let identity = resolve();
+        !prefixes.iter().any(|prefix| identity.starts_with(prefix))
+    })
+}
+
 /// Flatten an entry, yielding each leaf `Ref` entry reached through
 /// `Array` / `Nullable` wrappers (so a `Json<Vec<User>>` contributes `User`).
 #[cfg(feature = "openapi")]
 fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
+    // An impostor wrapper is a named type in its own right: it earns its own
+    // component, rather than contributing the inner type it never wraps.
+    if wrapper_is_impostor(entry) {
+        return vec![entry];
+    }
     match entry.kind {
         SchemaKind::Ref => vec![entry],
         SchemaKind::Array(inner) | SchemaKind::Nullable(inner) => flatten_ref_entries(inner),
@@ -1398,6 +1444,13 @@ pub fn schema_entry_to_value(
 
 #[cfg(feature = "openapi")]
 fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_json::Value {
+    // `domain::Option<T>` / `domain::Vec<T>` reach the wrapper arms by last-path
+    // -segment match but are ordinary named types: describe them as such.
+    if wrapper_is_impostor(entry) {
+        return serde_json::json!({
+            "$ref": format!("#/components/schemas/{}", index.display_key(entry))
+        });
+    }
     match entry.kind {
         SchemaKind::Primitive(json_type) => serde_json::json!({ "type": json_type }),
         SchemaKind::Ref => {

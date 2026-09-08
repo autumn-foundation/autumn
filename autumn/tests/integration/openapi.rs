@@ -100,6 +100,43 @@ async fn post_widgets(axum::Json(_body): axum::Json<Vec<Widget>>) -> http::Statu
     http::StatusCode::OK
 }
 
+// `Option` and `Vec` are matched on the LAST PATH SEGMENT here too, so an
+// application's own generic of that name reaches the `Nullable` / `Array` arms
+// of the route macro's schema-entry builder. Neither is nullable nor an array.
+//
+// Each impostor gets its own module so it shadows exactly one prelude name:
+// declaring both in one module would silently re-point every bare `Option` /
+// `Vec` in it.
+mod impostor_opt {
+    /// Last segment `Option`, but an ordinary struct: an object, never `null`.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Option<T> {
+        pub held: T,
+    }
+}
+
+mod impostor_vec {
+    /// Last segment `Vec`, but an ordinary struct: an object, not an array.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Vec<T> {
+        pub head: T,
+    }
+}
+
+#[get("/impostor-option")]
+async fn get_impostor_option() -> axum::Json<impostor_opt::Option<Widget>> {
+    axum::Json(impostor_opt::Option {
+        held: Widget { id: 0 },
+    })
+}
+
+#[get("/impostor-vec")]
+async fn get_impostor_vec() -> axum::Json<impostor_vec::Vec<Widget>> {
+    axum::Json(impostor_vec::Vec {
+        head: Widget { id: 0 },
+    })
+}
+
 // `Valid<Json<T>>` is Autumn's documented validation pattern. The
 // generator must see straight through the wrapper so the resulting
 // spec still reports a request body.
@@ -312,6 +349,65 @@ fn json_vec_response_is_emitted_as_array_schema() {
     assert_eq!(
         media.schema["items"]["$ref"], "#/components/schemas/Widget",
         "array items must still ref the element type"
+    );
+}
+
+/// An application `Option<T>` is an ordinary named type. Rendering the route's
+/// response as `oneOf [<inner>, null]` advertised both a null the handler never
+/// emits and the WRONG payload — the inner type, which this wrapper does not
+/// wrap. The wrapper entry carries its own `type_name`, so the generator can
+/// tell it from `std`'s `Option` and emit an honest `$ref` instead.
+#[test]
+fn an_impostor_option_response_is_a_ref_not_a_nullable() {
+    let route = __autumn_route_info_get_impostor_option();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/impostor-option"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert!(
+        schema.get("oneOf").is_none(),
+        "an application `Option` must not be advertised as nullable: {schema}"
+    );
+    assert!(
+        schema["$ref"]
+            .as_str()
+            .is_some_and(|r| r.contains("Option")),
+        "it is an ordinary named component: {schema}"
+    );
+}
+
+/// The same collision one level over: an application `Vec<T>` is an object, so
+/// `type: array` + `items` described a shape the handler never serializes.
+#[test]
+fn an_impostor_vec_response_is_a_ref_not_an_array() {
+    let route = __autumn_route_info_get_impostor_vec();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/impostor-vec"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert_ne!(
+        schema["type"], "array",
+        "an application `Vec` must not be advertised as an array: {schema}"
+    );
+    assert!(
+        schema.get("items").is_none(),
+        "and it must carry no `items`: {schema}"
+    );
+    assert!(
+        schema["$ref"].as_str().is_some_and(|r| r.contains("Vec")),
+        "it is an ordinary named component: {schema}"
     );
 }
 
