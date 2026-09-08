@@ -556,8 +556,9 @@ async fn update_note(note: Note) -> AutumnResult<&'static str> {
 }
 ```
 
-`#[authorize]` used under its literal name, exactly as every other
-Autumn macro can be, is unaffected — this only closes the alias case.
+`#[authorize]` used under its literal name and applied unconditionally,
+exactly as every other Autumn macro normally is, is unaffected — this only
+closes the alias case.
 
 If instead the compile error fires on an attribute that is genuinely
 **not** `#[authorize]` (a custom or third-party attribute that happens to
@@ -566,10 +567,42 @@ an `#[audit("update", resource = Note)]`, say), rename that attribute so
 its shape no longer collides. Autumn cannot tell the two cases apart from
 tokens alone, which is exactly why it refuses both rather than guessing.
 
+**`#[cfg_attr(predicate, authorize(...))]` is also refused — even the
+literal, correctly-spelled name:**
+
+```rust
+#[autumn_web::post("/notes/{id}")]
+#[cfg_attr(feature = "strict_auth", authorize("update", resource = Note))]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // ...
+}
+```
+
+This is a distinct case from the alias/shape collision above, and the
+literal spelling does not save it: whether a `cfg_attr`-wrapped attribute
+applies at all depends on a cfg predicate Autumn cannot evaluate at
+macro-expansion time, so it cannot safely decide whether `#[authorize]`'s
+in-body policy re-check will run. Guessing "present" can silently drop
+`.idempotent()`'s dedup guarantee (if the predicate turns out false and
+nothing ends up owning replay); guessing "absent" can reopen the same
+stale-authorization bypass this change closes (if the predicate turns out
+true). Fix it by applying `#[authorize(...)]` unconditionally and moving
+whatever the predicate was gating inside the handler body or the policy
+itself:
+
+```rust
+#[autumn_web::post("/notes/{id}")]
+#[authorize("update", resource = Note)]
+async fn update_note(note: Note) -> AutumnResult<&'static str> {
+    // any behavior that used to depend on the `strict_auth` feature moves
+    // here, or into the Note policy's own `update` check
+}
+```
+
 **Automation:** `manual` — the fix is a `use` statement and an attribute
-spelling change (or renaming an unrelated attribute), which depends on
-which of the two cases above applies; no mechanical rewrite can tell them
-apart. See
+spelling change, renaming an unrelated attribute, or moving `#[authorize]`
+out from behind `cfg_attr`, which depends on which of the cases above
+applies; no mechanical rewrite can tell them apart. See
 [`docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`](../security/2026-09-08-aliased-authorize-idempotency-bypass/README.md)
 for the full threat model and review history.
 
