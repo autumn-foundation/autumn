@@ -1308,6 +1308,52 @@ async fn ac5_a_renamed_derivation_keeps_its_finished_backfill() {
     );
 }
 
+/// AC5: replicas booting together reconcile one at a time. A second boot's
+/// reconciliation waits behind the first's transaction rather than acting on a
+/// snapshot the first is busy rewriting, which is what keeps a name swap from
+/// costing two backfills when two replicas both see it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ac5_concurrent_reconciliations_take_turns() {
+    use std::time::Duration;
+
+    let (_guard, _pg, pool) = setup().await;
+    let mut holder = pool.get().await.expect("conn");
+    mark_all_complete(&mut holder).await;
+
+    // Stand in for a replica mid-reconciliation: the lock `ensure_derivations`
+    // takes, held open in a transaction it has not committed yet.
+    holder
+        .batch_execute("BEGIN; LOCK TABLE _autumn_derivations IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .expect("hold the reconciliation lock");
+
+    let waiter_pool = pool.clone();
+    let mut waiter = tokio::spawn(async move {
+        let mut conn = waiter_pool.get().await.expect("conn");
+        ensure_derivations(&mut conn).await.expect("second boot")
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut waiter)
+            .await
+            .is_err(),
+        "a second reconciliation must wait for the first's transaction"
+    );
+
+    holder
+        .batch_execute("COMMIT")
+        .await
+        .expect("release the lock");
+    let enqueued = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("the second boot proceeds once the first commits")
+        .expect("join");
+    assert!(
+        enqueued.is_empty(),
+        "with every row current, the second boot enqueues nothing: {enqueued:?}"
+    );
+}
+
 // ── AC6: resumable backfill ────────────────────────────────────────────────
 
 /// AC6: a backfill stopped mid-sweep keeps its checkpoint, and resuming

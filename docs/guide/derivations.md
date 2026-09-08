@@ -174,7 +174,9 @@ cleared. A derivation whose name has no row carrying its hash, when exactly one
 other row does and that row's own name does not claim it, has been renamed: that
 row is carried over under the new name, state and checkpoint included, so a
 rename really does cost nothing. Rows are matched by hash before names, in two
-passes, so two derivations that only swapped names both keep their state. The framework then sweeps what was enqueued in a
+passes, so two derivations that only swapped names both keep their state, and
+the whole reconciliation runs in one transaction holding the state table, so
+replicas booting together take turns rather than racing each other's renames. The framework then sweeps what was enqueued in a
 background task, a few batches per pooled connection. A sharded app reconciles and sweeps on every shard primary as
 well as on the control primary.
 
@@ -346,7 +348,10 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   its own table, `sum(<the maintained column>)` or a filter naming it is a
   compile error: the parent-side update runs no repository hook, so a row's
   new aggregate would change what it contributes to its own parent without
-  that parent being maintained.
+  that parent being maintained. The same holds for the two columns every
+  aggregate reads implicitly: onto its own table a derivation cannot maintain
+  its `fk` or its `tenant` column, since a maintained value would re-parent
+  the row without carrying its contribution off the old parent.
 - **Self-referential derivations sweep one parent per batch.** A child that
   derives onto its own table (a comment's `reply_count`) has rows that are
   children and parents at once, so a batch locking several parents in id order

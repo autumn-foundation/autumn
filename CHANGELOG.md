@@ -232,7 +232,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `#[diesel(column_name)]` when it has one),
   string filters cast to `TEXT` so Postgres `citext` compares bytewise too,
   `column = "id"` and a self-referential derivation reading the column it
-  maintains are compile errors, `recompute` sweeps a self-referential table
+  maintains (its `fk` and `tenant` columns included) are compile errors,
+  reconciliation holds the state table for its transaction so replicas
+  booting together take turns, `recompute` sweeps a self-referential table
   one parent per batch with the same deadlock retry, `sum(...)` rejects
   anything after its one field name, `BackfillReport::batches_run` lets a paced caller tell "more
   to do" from "stuck" (the boot sweep now stops on no progress rather than

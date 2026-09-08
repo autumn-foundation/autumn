@@ -2394,6 +2394,32 @@ fn emit_counter_caches_impl(
                 ),
             ));
         };
+        // The grouping key and the tenant discriminator are read by every
+        // aggregate as well, `transform` and `filter` aside, so onto its own
+        // table a derivation must not maintain either: the parent-side update
+        // would re-parent (or re-tenant) the row without the repository hook
+        // that carries the contribution off the old parent.
+        if self_referential {
+            let implicit = if *column == fk {
+                Some("foreign key")
+            } else if decl.tenant_column.as_deref() == Some(column.as_str()) {
+                Some("tenant column")
+            } else {
+                None
+            };
+            if let Some(role) = implicit {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` onto its own table cannot maintain its {role}: \
+                         `{column}` groups the contributions, and the parent-side update \
+                         runs no repository hook, so a maintained value would re-parent \
+                         the row without carrying its contribution off the old parent. \
+                         Maintain a dedicated aggregate column"
+                    ),
+                ));
+            }
+        }
         // Read through the field's own ident, which keeps a raw-identifier
         // spelling (`r#type`) that the column name (`type`) has dropped.
         let fk_ident = fk_field
@@ -10999,6 +11025,59 @@ mod tests {
         assert!(
             plain.contains("column : \"version\""),
             "an unrenamed token claims its (unrawed) field name: {plain}"
+        );
+    }
+
+    #[test]
+    fn model_self_referential_derivation_cannot_maintain_its_fk_or_tenant() {
+        // The grouping key and the tenant discriminator are implicit sources:
+        // every aggregate reads them, so maintaining one onto the same table
+        // would re-parent the row behind the repository's back.
+        for (attr, role) in [
+            (
+                quote! { #[derivation(Node, column = "parent_id", fk = parent_id)] },
+                "foreign key",
+            ),
+            (
+                quote! { #[derivation(Node, column = "org_id", fk = parent_id, tenant = "org_id")] },
+                "tenant column",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attr
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub org_id: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains(&format!("cannot maintain its {role}")),
+                "{role} is an implicit source of every contribution: {generated}"
+            );
+        }
+        // The same declaration onto another table is fine: the parent's
+        // `parent_id` is an ordinary column there.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "parent_id", fk = parent_id)]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("cannot maintain its"),
+            "only a self-referential derivation reads the column it maintains: {generated}"
         );
     }
 

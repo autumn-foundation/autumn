@@ -632,7 +632,10 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 /// rather than rebuilt from the start. Rows are matched by hash first and
 /// moved in two passes, so two derivations that only exchanged names both keep
 /// their state, and a row under the destination name with a hash nothing
-/// registered carries is dropped in favour of the adopted one.
+/// registered carries is dropped in favour of the adopted one. The whole
+/// reconciliation runs in one transaction that holds the state table, so
+/// replicas booting together take turns rather than racing each other's
+/// renames.
 ///
 /// # Changing a definition under a rolling deployment
 ///
@@ -662,7 +665,53 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Vec<&'static str>> {
     let defs = registered_derivations();
     check_registry(&defs)?;
+    // One transaction holding the state table for the whole reconciliation:
+    // replicas booting together take turns, so each one's snapshot is the
+    // truth for as long as it acts on it. Without that, two replicas parking
+    // the same swapped rows could leave one enqueuing fresh rows into the
+    // names the other had just emptied, and the finished backfills the winner
+    // then discards in favour of the loser's pending ones.
+    scoped_immediate_transaction::<Vec<&'static str>, AutumnError, _>(conn, move |conn| {
+        async move {
+            lock_state_table(conn).await?;
+            reconcile(conn, &defs).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
 
+/// Exclude every other reconciliation (and writer) for the rest of the
+/// transaction.
+///
+/// `SHARE ROW EXCLUSIVE` conflicts with itself and with every row-writing
+/// mode, so a second replica's `ensure_derivations` waits at its own lock and
+/// a backfill batch's `FOR UPDATE` waits too, while plain reads (the actuator's
+/// status) go through.
+#[cfg(not(feature = "sqlite"))]
+async fn lock_state_table(conn: &mut RuntimeConnection) -> AutumnResult<()> {
+    diesel::sql_query(format!(
+        "LOCK TABLE {STATE_TABLE} IN SHARE ROW EXCLUSIVE MODE"
+    ))
+    .execute(conn)
+    .await
+    .map_err(AutumnError::from)?;
+    Ok(())
+}
+
+/// The enclosing `BEGIN IMMEDIATE` already excludes every other writer in the
+/// database, so there is nothing further to take.
+#[cfg(feature = "sqlite")]
+#[allow(clippy::unused_async, reason = "one call shape for both backends")]
+async fn lock_state_table(_conn: &mut RuntimeConnection) -> AutumnResult<()> {
+    Ok(())
+}
+
+/// The body of [`ensure_derivations`], under the table lock.
+async fn reconcile(
+    conn: &mut RuntimeConnection,
+    defs: &[&'static DerivationDef],
+) -> AutumnResult<Vec<&'static str>> {
     let state = load_state(conn).await?;
     let hashes: Vec<(&DerivationDef, String)> = defs
         .iter()
@@ -708,29 +757,14 @@ pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Ve
     let mut enqueued = Vec::new();
     for (def, hash, parked) in pending {
         if parked {
-            let parking = parking_name(def.name);
-            match state_hash(conn, def.name).await?.as_deref() {
-                // Another replica settled this name first; the row it chose
-                // stands, and the parked copy would only be a leftover.
-                Some(current) if current == hash => {
-                    delete_state(conn, &parking, None).await?;
-                    continue;
-                }
-                // The occupant carries a definition no longer registered
-                // under this name (or any other, or it would have been
-                // parked too); enqueuing would have overwritten it anyway.
-                Some(_) => delete_state(conn, def.name, Some(hash)).await?,
-                None => {}
-            }
-            if rename_state(conn, &parking, def.name, hash).await? {
+            // Whatever still sits under the destination carries a definition
+            // this derivation no longer has (a row parked by another
+            // derivation is already gone); enqueuing would have overwritten
+            // it anyway.
+            delete_stale_state(conn, def.name, hash).await?;
+            if rename_state(conn, &parking_name(def.name), def.name, hash).await? {
                 continue;
             }
-        }
-        // Another replica may have adopted (or re-enqueued) a row for this name
-        // between the snapshot and here, and then the destination carries this
-        // hash: enqueuing would reset the state that replica just preserved.
-        if state_hash(conn, def.name).await?.as_deref() == Some(hash) {
-            continue;
         }
         enqueue(conn, def).await?;
         enqueued.push(def.name);
@@ -752,11 +786,11 @@ fn parking_name(name: &str) -> String {
 /// Must match `DERIVATION_PARKING_PREFIX` in `autumn-macros`.
 const PARKING_PREFIX: &str = "parked::";
 
-/// Delete the state row `name`, keeping it when it carries `keep_hash`.
-async fn delete_state(
+/// Delete the state row `name` unless it carries `hash`.
+async fn delete_stale_state(
     conn: &mut RuntimeConnection,
     name: &str,
-    keep_hash: Option<&str>,
+    hash: &str,
 ) -> AutumnResult<()> {
     let sql = format!(
         "DELETE FROM {STATE_TABLE} WHERE name = {} AND definition_hash <> {}",
@@ -765,39 +799,17 @@ async fn delete_state(
     );
     diesel::sql_query(sql)
         .bind::<Text, _>(name)
-        // `<>` against a hash no row carries deletes unconditionally.
-        .bind::<Text, _>(keep_hash.unwrap_or(""))
+        .bind::<Text, _>(hash)
         .execute(conn)
         .await
         .map_err(AutumnError::from)?;
     Ok(())
 }
 
-/// The stored hash for `name`, read fresh rather than from the boot's snapshot.
-async fn state_hash(conn: &mut RuntimeConnection, name: &str) -> AutumnResult<Option<String>> {
-    #[derive(diesel::QueryableByName)]
-    struct HashRow {
-        #[diesel(sql_type = Text)]
-        definition_hash: String,
-    }
-    let sql = format!(
-        "SELECT definition_hash FROM {STATE_TABLE} WHERE name = {}",
-        ph(1)
-    );
-    let rows: Vec<HashRow> = diesel::sql_query(sql)
-        .bind::<Text, _>(name)
-        .load::<HashRow>(conn)
-        .await
-        .map_err(AutumnError::from)?;
-    Ok(rows.into_iter().next().map(|row| row.definition_hash))
-}
-
 /// Carry the state row `from` over to the derivation now named `to`.
 ///
-/// Guarded by the hash, and reported as `false` when no row moved: another
-/// replica may have adopted (or re-enqueued) the row between the read and this
-/// write, and then the caller enqueues rather than trusting a rename that did
-/// not happen.
+/// Guarded by the hash, and reported as `false` when no row moved, in which
+/// case the caller enqueues rather than trusting a rename that did not happen.
 async fn rename_state(
     conn: &mut RuntimeConnection,
     from: &str,
