@@ -256,7 +256,9 @@ answers `503` rather than `404`.
 pool, or a shard's name. A sharded app maintains its derivations on every
 shard primary, so each shard is reported after the control database, and a
 shard that cannot be read contributes one `{ "target": ..., "error": ... }`
-row instead of hiding the others.
+row instead of hiding the others. A shard-only deployment (no control role)
+reports its shards alone; only a process with no database at all answers
+`503`.
 
 `stored_hash` and `backfill_state` are `null` when no state row exists yet.
 `backfill_state` is otherwise `pending`, `running` or `complete`, plus a

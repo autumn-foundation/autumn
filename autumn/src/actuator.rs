@@ -3594,7 +3594,41 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
 pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> axum::response::Response {
-    let Some(pool) = state.pool() else {
+    // The control pool is one target among several: a shard-only deployment
+    // (`[[database.shards]]` with no control role, which the config accepts)
+    // has none, and its derivations live on the shards. Only a process with
+    // no database at all is a 503.
+    let mut report = Vec::new();
+    if let Some(pool) = state.pool() {
+        let mut conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "could not acquire a database connection",
+                        "target": "control",
+                        "detail": error.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        match crate::derivation::derivation_status(&mut conn).await {
+            Ok(statuses) => report.extend(derivation_report("control", statuses)),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "could not read derivation state",
+                        "target": "control",
+                        "detail": error.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else if state.shards().is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -3604,40 +3638,12 @@ pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync +
             })),
         )
             .into_response();
-    };
-    let mut conn = match pool.get().await {
-        Ok(conn) => conn,
-        Err(error) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "could not acquire a database connection",
-                    "detail": error.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-    let mut report = match crate::derivation::derivation_status(&mut conn).await {
-        Ok(statuses) => derivation_report("control", statuses),
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "could not read derivation state",
-                    "target": "control",
-                    "detail": error.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
+    }
     // A sharded app maintains its derivations on every shard primary (that is
     // where the tenant rows live, and where startup reconciles and sweeps), so
     // the control database alone would report a clean slate while a shard sat
     // pending or drifted. One shard that cannot answer is reported as such
     // rather than hiding the rest.
-    #[cfg(feature = "db")]
     if let Some(shards) = state.shards() {
         for shard in shards.iter() {
             let target = shard.name();
