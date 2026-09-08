@@ -656,7 +656,7 @@ single most valuable section of the guide — keep it factual and short.
 
 | Error message (truncated) | Where you see it | Fix |
 |---------------------------|------------------|-----|
-| `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::bar;` |
+| `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 
 ## Configuration changes

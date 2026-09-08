@@ -272,7 +272,7 @@ violation, naming the offending state(s).
 
 ```bash
 autumn lifecycle check                 # check lifecycles in the current crate
-autumn lifecycle check --path .        # explicit project path
+autumn lifecycle check ./crates/app    # explicit project path (a positional)
 autumn lifecycle check --format json   # machine-readable output for tooling
 ```
 

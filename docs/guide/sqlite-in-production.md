@@ -24,28 +24,20 @@ networked server collapse to their **single-host** form, and the genuinely
 distributed features are **refused at boot** rather than silently degraded. This
 guide is the published contract for exactly which is which.
 
-> **Status.** The SQLite production tier lands in slices under issue #1614.
-> Postgres remains the default for `autumn new`; SQLite is an opt-in target. The
-> **Status** column in the matrix below reflects the rollout — a row marked
-> *planned* names the slice that delivers it and is **not available in this
-> build**. The boot-refuse guarantees (the "fails fast" rows) are part of the
-> contract from the first SQLite-enabled release, so an unsupported
-> configuration never boots into a surprise at first query.
+> **Status.** The SQLite runtime has landed (#1614 / #1905). Build the app with
+> the `sqlite` cargo feature and a `sqlite://` target boots, runs its startup
+> migrations, and serves, on a working connection pool with repository CRUD.
+> Postgres remains the default for `autumn new`; SQLite is an opt-in target.
 >
-> **The SQLite runtime has landed** (#1614). A `sqlite://` app now boots, runs
-> its startup migrations, and serves, with a working connection pool and
-> repository CRUD. The **Status** column below marks each capability
-> **Available** when it is verified in this build, or **Planned — #NNNN** when
-> that subsystem's SQLite support is still landing in a follow-on slice — a
-> *Planned* row no longer means the app refuses to boot, only that the named
-> subsystem is not yet wired for SQLite. This guide is
-> the published support contract for the rollout; rows are marked by the slice
-> that delivers them. What ships *today* is listed under
-> [What ships in this slice](#what-ships-in-this-slice).
+> The **Status** column in the matrix below is per capability: **Available now**
+> means verified in this build, **Planned — #NNNN** names the follow-on slice
+> that wires that subsystem for SQLite. A *Planned* row does **not** mean the
+> app refuses to boot — the runtime boots and serves; that one subsystem is
+> simply not wired yet. The boot-refuse guarantees (the "fails fast" rows) hold
+> from the first SQLite-enabled release, so an unsupported configuration never
+> boots into a surprise at first query.
 
 ---
-
-> **Update (this release):** the SQLite *runtime* has now landed behind the `sqlite` cargo feature. The sections further down that describe SQLite being *refused at boot* or list runtime rows as *planned* predate that work; the runtime now boots, migrates, and serves against a `sqlite://` database as described immediately below.
 
 ## Runtime (behind the `sqlite` feature)
 
@@ -143,7 +135,9 @@ buckets on SQLite:
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | `jobs.backend = "sqlite"`: a single-writer claim on the `autumn_jobs` table in the app's own file — durable and restart-safe, **no Redis required**. Retries, backoff, dead-lettering, uniqueness windows, concurrency limits, and the job dashboard match Postgres. | ✅ **Available now** (#1907) |
 | `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
 | Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ | `autumn_web::lock::Lock` takes a lease row in `autumn_locks` instead of a session lock, so the processes on the host contend. A live holder renews; a dead one's lock frees at the lease expiry. | ⚠️ **Available now** (#1907) — single-host scope, lease not session, not re-entrant |
-| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (single host has nothing to notify). | ⛔ **Planned — #1905** |
+| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (a single host has nothing to notify). `PgFlagStore` / `PgExperimentStore` are Postgres-only (they open a `PgConnection` and use `pg_notify`), so `from_database_config` returns `None` on a SQLite target rather than building a store that cannot connect. Autumn never picks a store for you — the app passes one to `with_flag_store`, so on SQLite pass `InMemoryFlagStore` (an `.expect()` on the `None` now fails at boot instead of at the first flag read). | ⚠️ **Available now — in-process only** |
+| Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target; pass `InMemoryConfigStore` or a custom `ConfigStore` instead. | ⚠️ **Available now — no DB-backed store** |
+| ISR regeneration coordinator (`static_gen`) | ✅ `pg_try_advisory_lock` | ⚠️ | `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite build's app state cannot produce — it is unreachable under the flip rather than refused. Single-host ISR uses the in-process coordinator, which is what one host needs. | ⚠️ **Available now — in-process coordinator** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file (safe against a live app). Backup tooling is still `pg_dump`/`pg_restore`-shaped today. | ⛔ **Planned — #1909** |
 | `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
 | Retention sweeps | ✅ | ✅ | Runs against the SQLite file. | ⛔ **Planned — #1909** |
@@ -177,16 +171,17 @@ published support contract**. Available **today**:
   migrated schema lives only on the transient migration connection and is gone
   before the runtime pool anchors it, so a durable deploy must be
   **file-backed**. Postgres-only
-  settings (read replicas, shard directory, Postgres-only job/scheduler
-  backends, multi-replica locks) are **refused at boot** with an actionable
-  message rather than silently at first query.
+  *settings* (read replicas, shard directory, Postgres-only job/scheduler
+  backends) are **refused at boot** with an actionable message rather than
+  silently at first query. A Postgres-only *API* has no config key to screen,
+  so it refuses where it is called instead — see the distributed lock below.
 - **Backend-aware DDL generator** — `autumn generate` emits SQLite column types
   for the supported field kinds (see
   [field-type support](#sqlite-field-type-support)).
 - **Generate-time rejections**, each naming its tracking issue:
   - `Uuid` / `Decimal` / `Attachment` / `DateTime<Utc>` / `Enum` field kinds —
     #1924.
-  - `--id uuid` primary keys — #1905.
+  - `--id uuid` primary keys — #2555.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
   - `DROP INDEX` emitted before `DROP COLUMN` on the forward **and** rollback
@@ -207,11 +202,10 @@ published support contract**. Available **today**:
   missing `pg_dump` or a non-`postgres://` URL.
 
 **Not in this slice — scaffold smoke tests on SQLite.** A scaffolded app still
-carries the **Postgres-shaped** (`#[ignore]`d) smoke test. A SQLite-native
-scaffold smoke harness needs the SQLite `TestDb` (a testcontainer) that lands
-with the runtime slice — until then there is no SQLite backend to run
-SQLite-dialect smoke SQL against, so the generated smoke test remains
-Postgres-shaped. Tracked under the runtime slice #1905.
+carries the **Postgres-shaped** (`#[ignore]`d) smoke test: it uses the
+Postgres-only `TestDb` testcontainer and `TRUNCATE … RESTART IDENTITY`. The
+runtime landed without a SQLite-native scaffold smoke harness; that is tracked
+in #2555.
 
 The support-matrix rows still marked **Planned** name follow-on subsystem slices
 whose SQLite support has not landed yet
@@ -580,7 +574,7 @@ Additional generator shapes are refused on SQLite:
 
 - **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
   key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
-  working conversion yet. Tracked in #1905.
+  working conversion yet. Tracked in #2555.
 > **`generate auth` / `generate mailer` now generate on SQLite (#1927 / #1908).**
 > Historically refused at generate time, both now scaffold SQLite-dialect
 > migrations on a SQLite app (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
@@ -604,10 +598,9 @@ Additional generator shapes are refused on SQLite:
 > test (including the duplicate-`unique` rejection) uses
 > `autumn_web::test::TestDb`, a **Postgres-only** testcontainer, and
 > `TRUNCATE … RESTART IDENTITY`, and runs only under `cargo test -- --ignored`
-> (it is `#[ignore]`d). There is no SQLite `TestDb` yet — it lands with the
-> runtime slice (#1905) — so a scaffolded SQLite app still carries the
-> Postgres-shaped smoke test rather than a SQLite-native one. A backend-aware
-> scaffold smoke harness is deferred to the runtime slice #1905.
+> (it is `#[ignore]`d). There is no SQLite `TestDb` yet, so a scaffolded SQLite
+> app still carries the Postgres-shaped smoke test rather than a SQLite-native
+> one. A backend-aware scaffold smoke harness is tracked in #2555.
 
 ### Migration mechanics on SQLite
 
@@ -681,8 +674,15 @@ never as a runtime surprise on some unlucky code path days later.
   silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is
-configured to use is supported on SQLite. There is no third state where an
-unsupported feature lurks until first use.
+**configured** to use is supported on SQLite. There is no third state where an
+unsupported *configuration* lurks until first use.
+
+The bound on that rule is the word *configured*. A Postgres-only API that no
+config key selects — `Lock::from_state`, `PgFlagStore::from_database_config`
+and its siblings — cannot be screened at boot, because nothing at boot knows
+the app will call it. Those refuse at the call, with a named error rather than
+a silent no-op: `PoolUnavailable` for the lock, `None` for the stores. Both are
+listed in the support matrix above.
 
 ---
 

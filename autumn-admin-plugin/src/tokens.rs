@@ -102,16 +102,7 @@ impl AdminModel for TokenAdminModel {
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
             let per_page = params.per_page;
-            let offset = if per_page == 0 {
-                0
-            } else {
-                params.page.saturating_sub(1) * per_page
-            };
-            let limit = if per_page == 0 {
-                i64::MAX
-            } else {
-                i64::try_from(per_page).unwrap_or(i64::MAX)
-            };
+            let (offset, limit) = params.sql_offset_limit();
             let search_pattern = format!("%{}%", params.search.as_deref().unwrap_or(""));
 
             let total: i64 = diesel::sql_query(
@@ -133,7 +124,7 @@ impl AdminModel for TokenAdminModel {
             )
             .bind::<diesel::sql_types::Text, _>(&search_pattern)
             .bind::<diesel::sql_types::BigInt, _>(limit)
-            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
+            .bind::<diesel::sql_types::BigInt, _>(offset)
             .load::<TokenRow>(&mut conn)
             .await
             .map(|rows| rows.into_iter().map(TokenRow::into_json).collect())
@@ -310,13 +301,12 @@ impl AdminModel for TokenAdminModel {
         // `TokenAdminModel` never declares soft delete (`supports_soft_delete`
         // is the trait default, `false`), so `actions()` (traits.rs) only
         // ever offers `"delete"` — the admin UI can't reach `"restore"` or
-        // `"purge"` for this model. Those two branches below are unchanged
-        // copies of the trait default's per-id loop: kept only so a
-        // direct/out-of-band `execute_action` call gets the exact same
-        // "unhandled action" (or soft-delete-unsupported) error it always
-        // did, not because they need batching — `self.restore`/`self.purge`
-        // already return `Err` on their first id via the trait's default
-        // `restore`/`purge`, so there is no N+1 to eliminate there.
+        // `"purge"` for this model. Only `"delete"` needs the batched fast
+        // path below; `"restore"`, `"purge"`, and any other action name fall
+        // through to the shared `dispatch_restore_purge_or_unhandled` helper
+        // (traits.rs), which a direct or out-of-band `execute_action` call
+        // still reaches for the same "unhandled action" (or
+        // soft-delete-unsupported) error it always got.
         if action == "delete" {
             let pool = pool.clone();
             return Box::pin(async move {
@@ -350,32 +340,7 @@ impl AdminModel for TokenAdminModel {
             });
         }
 
-        let action = action.to_owned();
-        let pool = pool.clone();
-        Box::pin(async move {
-            match action.as_str() {
-                "restore" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.restore(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                "purge" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.purge(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                other => Err(AdminError::Other(format!(
-                    "unhandled bulk action '{other}'; \
-                     override AdminModel::execute_action to support it"
-                ))),
-            }
-        })
+        crate::traits::dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }
 }
 
@@ -572,5 +537,67 @@ mod tests {
         assert_eq!(json["scopes"], serde_json::json!(["posts:read"]));
         assert!(json.get("token_hash").is_none());
         assert!(json.get("token").is_none());
+    }
+
+    // ── execute_action fallthrough (restore/purge/unhandled) ──────────
+    //
+    // TokenAdminModel never supports soft delete, so these three branches
+    // always error on the first id without touching the pool —
+    // characterizing them pins the exact error text ahead of routing them
+    // through the shared trait helper (Echo merge with FeatureFlagAdminModel).
+
+    fn dummy_pool()
+    -> diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection> {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+        let mgr = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(
+            "postgresql://test",
+        );
+        Pool::builder(mgr).build().expect("build pool")
+    }
+
+    #[tokio::test]
+    async fn execute_action_restore_errors_soft_delete_unsupported() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "restore", vec![1, 2])
+            .await
+            .expect_err("restore must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_purge_errors_soft_delete_unsupported() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "purge", vec![1])
+            .await
+            .expect_err("purge must fail: model does not support soft delete");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("does not support soft delete"));
+    }
+
+    #[tokio::test]
+    async fn execute_action_unhandled_action_errors_with_action_name() {
+        let model = TokenAdminModel;
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "archive", vec![1])
+            .await
+            .expect_err("unknown action must error");
+        assert!(
+            matches!(err, AdminError::Other(_)),
+            "must be AdminError::Other: {err:?}"
+        );
+        assert!(format!("{err:?}").contains("unhandled bulk action 'archive'"));
     }
 }
