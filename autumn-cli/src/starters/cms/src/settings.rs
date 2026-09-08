@@ -178,10 +178,14 @@ fn parse_bool(value: &str) -> bool {
 /// `#[cached]` requires `key(...)` to name at least one parameter, and the
 /// repository handle cannot be it — it is a per-request extractor, not part of
 /// the value's identity, so keying on it would miss on every request. A
-/// single-site install therefore keys on a constant. It is not a placeholder:
-/// this is exactly the parameter a multisite deployment replaces with the site
-/// id, and having it here means that change is a call-site edit rather than a
-/// re-plumbing of the cache.
+/// single-site install therefore keys on a constant.
+///
+/// It is not a placeholder for tenancy. Since #2528 the macro folds the
+/// ambient tenant into every generated key by itself, so an app that put this
+/// CMS behind Autumn's row-level multi-tenancy would get per-tenant settings
+/// without touching this constant. What it *is* for is a site discriminator
+/// that is not a tenant — a multisite install serving several sites from one
+/// tenant — where the parameter is the thing to replace.
 pub const SITE_SCOPE: &str = "site";
 
 #[autumn_web::cached(ttl = "60s", key(scope), reads(crate::models::SiteOption), result)]
