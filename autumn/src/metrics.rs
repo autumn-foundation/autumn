@@ -2586,20 +2586,31 @@ mod tests {
     }
 
     #[test]
-    fn set_limits_clamps_a_zero_cap_up_to_one() {
+    fn a_zero_cap_clamps_up_to_one() {
         // Not reachable through `autumn.toml` — `validate` rejects a 0 there —
         // but a binary building its own `Limits` must not end up with a cap
         // that silently drops every labeled sample.
-        set_limits(Limits {
-            max_series_per_metric: 0,
-            max_instruments: 0,
-            max_labels_per_series: 0,
-        });
-        let clamped = Limits::current();
-        set_limits(Limits::default());
-
+        //
+        // Asserted against `Limits::clamped` rather than by installing the
+        // zero through `set_limits`, and NOT because the lock would be
+        // inconvenient: holding `LIMITS_LOCK` would not make that safe. The
+        // lock serializes this test only against the handful that take it,
+        // while every ordinary metrics test records without it — and a
+        // process-global `max_instruments` of 1 hands *those* an inert handle
+        // for the whole window, since the registry is long past one
+        // instrument by the time this runs. A floor value is the one setting
+        // that cannot be published globally at all, so the floor is checked
+        // where it is decided. `set_limits`'s own clamping is covered by
+        // `set_limits_clamps_a_value_outside_the_accepted_range`, whose
+        // values clamp *down to the ceilings* — above every default, so the
+        // window it opens can only admit more.
         assert_eq!(
-            clamped,
+            Limits {
+                max_series_per_metric: 0,
+                max_instruments: 0,
+                max_labels_per_series: 0,
+            }
+            .clamped(),
             Limits {
                 max_series_per_metric: 1,
                 max_instruments: 1,
