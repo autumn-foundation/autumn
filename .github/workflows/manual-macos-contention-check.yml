@@ -24,14 +24,27 @@ env:
   RUST_MIN_STACK: 8388608
 
 jobs:
+  # jobs.<job_id>.if only sees the github/inputs/needs/vars contexts (no
+  # matrix), so the sample count can't gate matrix.n at the job level -
+  # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability.
+  # Compute the exact-length matrix here instead, so choosing 5 samples
+  # dispatches 5 fresh VMs, not 20 with 15 short-circuited.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        run: |
+          echo "matrix=$(seq 1 "${{ inputs.samples }}" | jq -R . | jq -cs '{n: .}')" >> "$GITHUB_OUTPUT"
+
   # Job id must stay "test" to reuse ci.yml's cache entry.
   test:
+    needs: plan
     strategy:
       fail-fast: false
-      matrix:
-        n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: macos-latest
-    if: fromJSON(inputs.samples) >= matrix.n
     steps:
       - uses: actions/checkout@v7
         with:
