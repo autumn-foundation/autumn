@@ -226,7 +226,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `derivation::resweep` re-enqueues one derivation for the settling pass a
   rolling deployment that changed a definition needs (see the guide). The
   collision check also covers the column a `#[commentable(counter_cache)]`
-  parent keeps, `BackfillReport::batches_run` lets a paced caller tell "more
+  parent keeps and a `#[votable]` model's aggregate column, `sum(...)` rejects
+  anything after its one field name, `BackfillReport::batches_run` lets a paced caller tell "more
   to do" from "stuck" (the boot sweep now stops on no progress rather than
   after a fixed number of rounds), a tenant-scoped leg orders each parent's
   deltas so no intermediate value overflows, and `/actuator/derivations`

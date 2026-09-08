@@ -1078,6 +1078,15 @@ fn parse_derivation_transform(input: syn::parse::ParseStream) -> syn::Result<Der
         let inner;
         syn::parenthesized!(inner in input);
         let field: syn::Ident = inner.parse()?;
+        // `sum(score + bonus)` or `sum(score, bonus)` must not be read as
+        // `sum(score)`: the maintained aggregate would differ from what the
+        // source says, silently.
+        if !inner.is_empty() {
+            return Err(inner.error(
+                "`sum(...)` takes exactly one field name: an expression, a second field or \
+                 anything else after it is not part of the derivation grammar",
+            ));
+        }
         return Ok(DerivationTransform::Sum {
             // The unraw name: `r#match` is the Rust spelling of column
             // `match`, and the contribution SQL names the column.
@@ -3258,6 +3267,9 @@ fn emit_votable_items(
     let reactor_fk = format_ident!("{}", spec.reactor_fk);
     let target_fk = format_ident!("{}", spec.target_fk);
     let agg_column = format_ident!("{}", spec.column);
+    let edge_table_name = spec.table.as_str();
+    let table_name_str = table_ident.to_string();
+    let agg_column_name = spec.column.as_str();
     // The target projection must name the model's real primary-key column:
     // `react()` locks and updates `WHERE #pk_column = $target_id`, and a
     // hard-coded `id` would miss (or worse, hit an unrelated column on) a
@@ -3806,6 +3818,20 @@ fn emit_votable_items(
     );
 
     quote! {
+        // The aggregate column this model keeps from its reaction edges is a
+        // framework-maintained column like a counter cache's, so it is
+        // registered as a claim: a `#[derivation]` on another model naming
+        // the same `(table, column)` would discard this aggregate on every
+        // mutation and backfill, and the boot refuses the pair (#1769).
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::derivation::CounterCacheClaim {
+                model: ::core::stringify!(#model_ident),
+                child_table: #edge_table_name,
+                parent_table: #table_name_str,
+                column: #agg_column_name,
+                module_path: ::core::module_path!(),
+            }
+        }
         #hidden_module
 
         #pk_guard
@@ -10449,6 +10475,22 @@ mod tests {
             vec![syn::parse_quote!(#[derivation(Post, column = "s", transform = sum(score))])];
         let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
         assert_eq!(decls[0].transform.as_source(), "sum(score)");
+    }
+
+    #[test]
+    fn derivation_sum_transform_rejects_anything_after_the_field() {
+        // `sum(score + bonus)` must not be read as `sum(score)`: the maintained
+        // aggregate would silently differ from what the source says.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        for attr in [
+            quote! { #[derivation(Post, column = "s", transform = sum(score + bonus))] },
+            quote! { #[derivation(Post, column = "s", transform = sum(score, bonus))] },
+        ] {
+            let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#attr)];
+            let err = resolve_derivations(&model, &attrs, &[])
+                .expect_err("extra tokens inside sum(...) are an error");
+            assert!(err.to_string().contains("exactly one field name"), "{err}");
+        }
     }
 
     #[test]

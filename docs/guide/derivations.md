@@ -180,9 +180,10 @@ well as on the control primary.
 
 A registry collision stops the boot, because double counting is data
 corruption: two derivations sharing a name, two maintaining one parent column,
-or a derivation maintaining a column that a plain `counter_cache` on another
-model already maintains (every `counter_cache` registers the column it claims
-for exactly this check). A database failure does not: it is logged, the sweep for that target
+or a derivation maintaining a column that something else already maintains: a
+plain `counter_cache` on another model, a `#[votable]` model's aggregate
+column, or a `#[commentable(counter_cache = ...)]` parent's count (each
+registers the column it claims for exactly this check). A database failure does not: it is logged, the sweep for that target
 is skipped, and a derivation whose backfill has not run yet is stale rather than
 broken, which the actuator reports exactly.
 

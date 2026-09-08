@@ -259,15 +259,19 @@ pub struct DerivationDescriptor {
 
 inventory::collect!(DerivationDescriptor);
 
-/// Link-time registration of one plain `counter_cache` (#1325), emitted by
-/// `#[model]` for every `#[belongs_to(..., counter_cache)]`.
+/// Link-time registration of a column something other than a `#[derivation]`
+/// maintains: a plain `counter_cache` (#1325), emitted by `#[model]` for every
+/// `#[belongs_to(..., counter_cache)]`, and the aggregate column a
+/// `#[votable]` model keeps from its reaction edges. (A
+/// `#[commentable(counter_cache = ...)]` parent's column is read from its own
+/// descriptor instead.)
 ///
-/// A plain counter cache has no state row and no backfill, so it is not a
-/// [`DerivationDef`]; it is registered only so [`check_registered_derivations`]
-/// can see the parent column it maintains. A `#[derivation]` on another model
-/// claiming that same column would count it twice on every mutation and then
-/// have its backfill overwrite the counter cache's rows with a total over the
-/// derivation's source alone, so the pair is rejected at boot like two
+/// None of these has a state row or a backfill, so they are not
+/// [`DerivationDef`]s; they are registered only so [`check_registered_derivations`]
+/// can see the columns they maintain. A `#[derivation]` on another model
+/// claiming such a column would count it twice on every mutation and then
+/// have its backfill overwrite the other maintainer's rows with a total over
+/// the derivation's source alone, so the pair is rejected at boot like two
 /// derivations on one column.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
@@ -287,10 +291,11 @@ pub struct CounterCacheClaim {
 inventory::collect!(CounterCacheClaim);
 
 /// Every parent column something other than a `#[derivation]` maintains in
-/// this binary, in a stable order: the plain `counter_cache` claims, and the
-/// `comment_count`-style column a `#[commentable(counter_cache = ...)]` parent
-/// keeps, which is registered through the commentable descriptor and builds
-/// its counter spec at run time rather than through `#[model]`.
+/// this binary, in a stable order: the plain `counter_cache` and `#[votable]`
+/// aggregate claims, and the `comment_count`-style column a
+/// `#[commentable(counter_cache = ...)]` parent keeps, which is registered
+/// through the commentable descriptor and builds its counter spec at run time
+/// rather than through `#[model]`.
 fn registered_column_claims() -> Vec<CounterCacheClaim> {
     let mut claims: Vec<CounterCacheClaim> = inventory::iter::<CounterCacheClaim>
         .into_iter()
