@@ -100,15 +100,19 @@ pub struct ExportPost {
     pub featured_media: Option<String>,
 }
 
-/// An attachment's metadata row.
+/// An attachment's row, including the handle that locates its bytes.
 ///
-/// The bytes are not in here and cannot be: a blob lives in the blob store,
-/// which is backed up separately (it is object storage in a real deployment).
-/// What the export carries is the row that gives those bytes a name, a type and
-/// an accessible description — without it a restored site cannot resolve
-/// `/media/{slug}` at all, so the separately-backed-up blob has nothing
-/// pointing at it. With it, restoring the store's contents is enough to make
-/// the media whole.
+/// The bytes themselves are not in here and cannot be: a blob lives in the blob
+/// store, which is backed up separately (it is object storage in a real
+/// deployment). But the *handle* — the provider id and the stable key — must
+/// be, or restoring those bytes accomplishes nothing: the database would have
+/// no way to name them, `Attachment::blob()` would fail, and `/media/{slug}`
+/// would answer 500 rather than serving the file that is sitting right there.
+///
+/// So this carries both halves: the display metadata a human needs and the
+/// `file` handle the store needs. Restore the blob store's contents and the
+/// media is whole; restore only the database and every image is a 500 — which
+/// is why `file` is `Option` and why the importer says so when it is absent.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExportAttachment {
     pub slug: String,
@@ -125,6 +129,10 @@ pub struct ExportAttachment {
     pub alt_text: String,
     #[serde(default)]
     pub caption: String,
+    /// The stored blob handle: provider id, key, content type, size, etag.
+    /// Absent only for a row whose file was already missing.
+    #[serde(default)]
+    pub file: Option<autumn_web::storage::Blob>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -310,6 +318,7 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
             height: attachment.height,
             alt_text: attachment.alt_text.clone(),
             caption: attachment.caption.clone(),
+            file: attachment.file.clone(),
         });
     }
 
@@ -428,11 +437,11 @@ pub async fn import(
     // parent references follow. A row already present is left alone rather than
     // overwritten: the site's own metadata is more current than the file's.
     //
-    // The blob is deliberately absent. The bytes live in the blob store and are
-    // backed up with it; restoring the row is what gives those bytes something
-    // to be found by, and `Attachment::blob()` already answers `None` for a row
-    // whose file has not been restored yet, so `/media/{slug}` degrades to a
-    // 404 on the file rather than an error on the page.
+    // The blob *handle* comes with the row. Restoring only the display metadata
+    // was not enough: the handle is what names the bytes in the store, so
+    // without it `Attachment::blob()` fails and `/media/{slug}` answers 500 —
+    // restoring the separately backed-up store would not have fixed a single
+    // image, because nothing in the database could point at it.
     let mut media_ids: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for attachment in &payload.attachments {
         let existing = repos
@@ -449,7 +458,7 @@ pub async fn import(
                     .save(&crate::models::NewAttachment {
                         title: attachment.title.clone(),
                         slug: attachment.slug.clone(),
-                        file: None,
+                        file: attachment.file.clone(),
                         mime_type: attachment.mime_type.clone(),
                         byte_size: attachment.byte_size,
                         width: attachment.width,

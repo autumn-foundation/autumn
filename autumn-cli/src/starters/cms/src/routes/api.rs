@@ -66,7 +66,7 @@ impl PostView {
             post_type: post.post_type.clone(),
             title: post.title.clone(),
             slug: post.slug.clone(),
-            excerpt: post.display_excerpt(),
+            excerpt: crate::theme::render_excerpt(post),
             body: if post.is_password_protected() {
                 None
             } else {

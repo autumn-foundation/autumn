@@ -41,6 +41,8 @@ pub struct ListFilters {
 }
 
 /// What the editor submits.
+///
+/// Decoded by [`PostForm::from_body`] rather than the `Form` extractor.
 #[derive(Debug, Deserialize)]
 pub struct PostForm {
     pub title: String,
@@ -66,6 +68,14 @@ pub struct PostForm {
     #[serde(default)]
     pub featured_media_id: Option<String>,
     /// Category ids, one per checked box.
+    ///
+    /// Decoded by `PostForm::from_body` rather than the `Form` extractor: a
+    /// checkbox group posts the same key repeatedly, and `Form<T>` decodes
+    /// bodies through `serde_urlencoded`, which has no repeated-key-to-sequence
+    /// rule. Submitting *any* category through the editor therefore failed the
+    /// whole save with "invalid type: string, expected a sequence" — the
+    /// feature did not work at all, and no test noticed because none of them
+    /// ever ticked a box.
     #[serde(default)]
     pub categories: Vec<i64>,
     /// A comma-separated tag list, as WordPress's tag box takes.
@@ -78,6 +88,27 @@ pub struct PostForm {
     /// detection. Absent on the create form, which has no row yet.
     #[serde(default)]
     pub lock_version: Option<String>,
+}
+
+impl PostForm {
+    /// Decode a submitted editor form.
+    ///
+    /// `autumn_web::query_string::from_query_str` is the framework's superset
+    /// parser: a flat body of unique scalar keys decodes exactly as
+    /// `serde_urlencoded` would, and on top of that a repeated key becomes a
+    /// sequence — which is precisely what an HTML checkbox group posts.
+    ///
+    /// The framework applies that parser to query strings only; `Form<T>` is
+    /// documented as decoding bodies through `serde_urlencoded`, which has no
+    /// repeated-key rule. So the category checkboxes made every save fail with
+    /// "invalid type: string, expected a sequence" — checking a single box was
+    /// enough. The feature did not work at all, and no test noticed because
+    /// none of them ever ticked one.
+    fn from_body(body: &str) -> AutumnResult<Self> {
+        autumn_web::query_string::from_query_str(body).map_err(|err| {
+            AutumnError::unprocessable_msg(format!("Failed to deserialize form body: {err}"))
+        })
+    }
 }
 
 /// Parse an optional numeric form field. An empty string means "not set",
@@ -402,8 +433,14 @@ impl EditorContext {
             Vec::new()
         };
 
+        // Propagated, not swallowed. An empty library renders a form whose
+        // featured-image select has only "(none)" selected — so saving that
+        // otherwise-valid form silently clears the post's existing image, and
+        // the error that caused it never surfaces. Failing the page is the
+        // honest outcome: the editor cannot be saved from a state it was not
+        // shown correctly.
         let media = if registered.supports_thumbnail {
-            repos.attachments.find_all().await.unwrap_or_default()
+            repos.attachments.find_all().await?
         } else {
             Vec::new()
         };
@@ -668,9 +705,10 @@ pub async fn create(
     session: Session,
     csrf: Csrf,
     Path(post_type): Path<String>,
-    Form(form): Form<PostForm>,
+    body: String,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
+    let form = PostForm::from_body(&body)?;
     let registered = resolve_type(&post_type)?;
 
     // A Contributor may only create drafts and submissions, whatever the form
@@ -758,6 +796,10 @@ pub async fn create(
                 content::transition_status(conn, created.id, &status, Some(user.id)).await
             })
             .await?;
+        // The same action the update, explicit-transition, API and scheduler
+        // paths fire. Without it a plugin indexing or invalidating on this hook
+        // missed exactly the admin-created private and scheduled posts.
+        do_action(Action::PostTransitioned, created.id);
     }
     do_action(Action::PostSaved, created.id);
 
@@ -774,9 +816,10 @@ pub async fn update(
     session: Session,
     csrf: Csrf,
     Path((post_type, id)): Path<(String, i64)>,
-    Form(form): Form<PostForm>,
+    body: String,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
+    let form = PostForm::from_body(&body)?;
     let registered = resolve_type(&post_type)?;
     let existing = repos
         .posts
@@ -941,7 +984,26 @@ async fn apply_terms(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResul
 
     let mut term_ids: Vec<i64> = Vec::new();
     if taxonomies.iter().any(|t| t.slug == "category") {
-        term_ids.extend(form.categories.iter().copied());
+        // Resolved and filtered, not trusted. The ids come from a form, and
+        // `set_post_terms` checks neither the term's taxonomy nor whether that
+        // taxonomy applies to this post type — so a crafted submission could
+        // file a post under a custom taxonomy registered for something else
+        // entirely, after which that taxonomy's public archive listed it.
+        //
+        // The rule is the registration's: a term may be attached only if its
+        // taxonomy names this post type.
+        let applicable: std::collections::HashSet<&str> =
+            taxonomies.iter().map(|taxonomy| taxonomy.slug).collect();
+        for id in form.categories.iter().copied() {
+            let allowed = repos
+                .terms
+                .find_by_id(id)
+                .await?
+                .is_some_and(|term| applicable.contains(term.taxonomy.as_str()));
+            if allowed {
+                term_ids.push(id);
+            }
+        }
     }
 
     if taxonomies.iter().any(|t| t.slug == "post_tag") {

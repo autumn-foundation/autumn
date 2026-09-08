@@ -40,6 +40,22 @@ pub fn render_content(markdown: &str) -> PreEscaped<String> {
     PreEscaped(apply_filters(Filter::TheContent, expanded))
 }
 
+/// A post's excerpt, passed through the `the_excerpt` filter. Escaped on
+/// render, like `render_title` and unlike `render_content`.
+///
+/// The filter had no call site at all outside its own unit test, so a plugin
+/// registering `Filter::TheExcerpt` — a documented hook — silently did nothing
+/// for visitors. Every surface that shows an excerpt goes through here now: the
+/// post card, the feeds and the REST projection.
+///
+/// Plain text in, plain text out. `display_excerpt` strips markup, so a filter
+/// here is transforming words rather than producing HTML, and the caller
+/// escapes what comes back.
+#[must_use]
+pub fn render_excerpt(post: &crate::models::Post) -> String {
+    apply_filters(Filter::TheExcerpt, post.display_excerpt())
+}
+
 /// A post title, passed through the `the_title` filter. Escaped on render.
 #[must_use]
 pub fn render_title(title: &str) -> String {
@@ -390,7 +406,7 @@ fn default_post_card(post: &Post, url: &str, settings: &Settings) -> Markup {
                     " · " (autumn_web::format::pluralize(post.comment_count, "comment"))
                 }
             }
-            p class="text-gray-700" { (post.display_excerpt()) }
+            p class="text-gray-700" { (render_excerpt(post)) }
         }
     }
 }

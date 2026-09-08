@@ -3652,8 +3652,11 @@ async fn an_export_round_trip_keeps_featured_media() {
     let db = TestDb::shared().await;
     try_execute(
         db,
-        "INSERT INTO attachments (title, slug, mime_type, byte_size, alt_text, caption) \
-         VALUES ('Cover', 'cover-image', 'image/png', 1234, 'A cover', '')",
+        "INSERT INTO attachments (title, slug, file, mime_type, byte_size, alt_text, caption) \
+         VALUES ('Cover', 'cover-image', \
+                 '{\"provider_id\":\"default\",\"key\":\"media/cover-image\",\
+                   \"content_type\":\"image/png\",\"byte_size\":1234}'::jsonb, \
+                 'image/png', 1234, 'A cover', '')",
     )
     .await
     .expect("insert attachment");
@@ -3681,6 +3684,15 @@ async fn an_export_round_trip_keeps_featured_media() {
     assert_eq!(
         payload["attachments"][0]["slug"],
         serde_json::json!("cover-image")
+    );
+    // The handle, not just the display metadata: without the provider and key
+    // a restored row cannot name its bytes, so restoring the separately
+    // backed-up blob store would fix nothing and `/media/{slug}` would 500.
+    assert_eq!(
+        payload["attachments"][0]["file"]["key"],
+        serde_json::json!("media/cover-image"),
+        "the export must carry the blob handle: {}",
+        payload["attachments"][0]
     );
     let post = payload["posts"]
         .as_array()
@@ -3713,4 +3725,251 @@ async fn an_export_round_trip_keeps_featured_media() {
         editor.contains("cover-image") || editor.contains("Cover"),
         "the restored post must still name its featured image:\n{editor}"
     );
+
+    // And the restored row points at the same bytes it always did.
+    let restored = fresh
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let restored: serde_json::Value = serde_json::from_str(&restored).expect("valid JSON");
+    assert_eq!(
+        restored["attachments"][0]["file"]["key"],
+        serde_json::json!("media/cover-image"),
+        "the import must restore the handle, not only the metadata: {}",
+        restored["attachments"][0]
+    );
+}
+
+/// A crafted `categories` value cannot file a post under an unrelated taxonomy.
+///
+/// The ids went straight into `set_post_terms`, which checks neither the term's
+/// taxonomy nor whether that taxonomy applies to this post type — so an Author
+/// could attach a post to a taxonomy registered for something else, after which
+/// that taxonomy's public archive listed it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_crafted_category_id_from_another_taxonomy_is_ignored() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Ordinary", "Body.", "publish").await;
+
+    // A term in a taxonomy that does not apply to `post`.
+    let db = TestDb::shared().await;
+    try_execute(
+        db,
+        "INSERT INTO terms (taxonomy, name, slug, description) \
+         VALUES ('shelf', 'Reference', 'reference', '')",
+    )
+    .await
+    .expect("insert the foreign term");
+
+    // A real category, so the test proves filtering rather than refusal.
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "News"),
+            ("slug", ""),
+            ("description", ""),
+            ("parent_id", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let categories: serde_json::Value = client
+        .get("/api/v1/terms?taxonomy=category")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let news_id = categories.as_array().expect("array")[0]["id"]
+        .as_i64()
+        .expect("id")
+        .to_string();
+    let foreign_id = (news_id.parse::<i64>().expect("id") + 1).to_string();
+
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Ordinary"),
+            ("slug", "ordinary"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+            ("categories", news_id.as_str()),
+            ("categories", foreign_id.as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The legitimate category stuck; the foreign one did not.
+    let filed = try_execute(
+        db,
+        &format!(
+            "SELECT 1/COUNT(*) FROM post_terms pt JOIN terms t ON t.id = pt.term_id \
+             WHERE pt.post_id = {id} AND t.taxonomy = 'category'"
+        ),
+    )
+    .await;
+    assert!(filed.is_ok(), "the real category must have been applied");
+
+    let foreign = try_execute(
+        db,
+        &format!(
+            "SELECT 1/COUNT(*) FROM post_terms pt JOIN terms t ON t.id = pt.term_id \
+             WHERE pt.post_id = {id} AND t.taxonomy = 'shelf'"
+        ),
+    )
+    .await;
+    assert!(
+        foreign.is_err(),
+        "a term from a taxonomy that does not apply to `post` must be ignored"
+    );
+}
+
+/// The `the_excerpt` filter reaches actual output.
+///
+/// The hook is documented and was applied nowhere outside its own unit test, so
+/// a plugin registering it silently did nothing for visitors.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_excerpt_filter_reaches_rendered_output() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(
+        &client,
+        &cookie,
+        "Filtered",
+        "The body that becomes an excerpt.",
+        "publish",
+    )
+    .await;
+
+    // `bootstrap` registers a `TheContent` filter turning ` -- ` into an em
+    // dash; the excerpt hook needs its own evidence, so register one here. The
+    // registry is process-global, so this deliberately uses a marker no other
+    // test asserts the absence of.
+    cms::plugins::add_filter(
+        cms::plugins::Filter::TheExcerpt,
+        cms::plugins::DEFAULT_PRIORITY,
+        |excerpt| format!("{excerpt} [EXCERPT-FILTER-RAN]"),
+    );
+
+    sign_out(&client);
+    // The listing card…
+    client
+        .get("/")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("[EXCERPT-FILTER-RAN]");
+    // …the feed…
+    client
+        .get("/feed")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("[EXCERPT-FILTER-RAN]");
+    // …and the REST projection.
+    let api: serde_json::Value = client.get("/api/v1/posts").send().await.assert_ok().json();
+    assert!(
+        api.as_array().expect("array")[0]["excerpt"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[EXCERPT-FILTER-RAN]"),
+        "the API projection must apply the filter too: {api}"
+    );
+}
+
+/// Ticking a category box saves the post.
+///
+/// The editor's category checkboxes post the same key repeatedly, and `Form<T>`
+/// decodes bodies through `serde_urlencoded`, which has no repeated-key rule —
+/// so checking a single box failed the whole save with "invalid type: string,
+/// expected a sequence". Category assignment did not work at all through the
+/// admin UI, and none of the suite's other tests ever ticked a box.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn checking_a_category_box_saves_the_post() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Categorised", "Body.", "publish").await;
+
+    for name in ["News", "Reviews"] {
+        client
+            .post("/admin/terms/category")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("name", name),
+                ("slug", ""),
+                ("description", ""),
+                ("parent_id", ""),
+            ]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    let categories: serde_json::Value = client
+        .get("/api/v1/terms?taxonomy=category")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let ids: Vec<String> = categories
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|t| t["id"].as_i64().expect("id").to_string())
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    // One box…
+    let mut fields = vec![
+        ("title", "Categorised"),
+        ("slug", "categorised"),
+        ("excerpt", ""),
+        ("body", "Body."),
+        ("status", "publish"),
+        ("password", ""),
+        ("tags", ""),
+        ("comment_status", "open"),
+        ("categories", ids[0].as_str()),
+    ];
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&fields))
+        .send()
+        .await
+        .assert_status(303);
+
+    // …and two, which is the shape a checkbox group actually posts.
+    fields.push(("categories", ids[1].as_str()));
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&fields))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Both archives list it.
+    sign_out(&client);
+    for slug in ["news", "reviews"] {
+        client
+            .get(&format!("/category/{slug}"))
+            .send()
+            .await
+            .assert_ok()
+            .assert_body_contains("Categorised");
+    }
 }

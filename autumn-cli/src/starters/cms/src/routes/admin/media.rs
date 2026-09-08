@@ -283,7 +283,14 @@ pub async fn serve(
         .extension::<BlobStoreState>()
         .ok_or_else(|| AutumnError::internal_server_error_msg("storage is not configured"))?;
 
-    let blob = attachment.blob()?;
+    // A row whose file is absent is a *missing file*, not a broken server:
+    // that is what a version-2 import (which carried no handles) leaves behind,
+    // and what a hand-written row looks like. 404 says so; the 500
+    // `Attachment::blob()` raises is for callers that have no better answer.
+    let blob = attachment
+        .file
+        .as_ref()
+        .ok_or_else(|| AutumnError::not_found_msg("No such file"))?;
     let mut download = Download::from_blob(blobs.store(), blob.key.clone())
         .await?
         .content_type(attachment.mime_type.clone())

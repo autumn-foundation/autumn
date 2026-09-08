@@ -139,8 +139,8 @@ async fn build(
         // An absolute URL: a feed item's link is dereferenced far from the site
         // that served it, so a relative path is useless.
         let url = format!("{base}{}", repos.permalink(post, settings).await?);
-        let mut entry =
-            FeedEntry::new(url.clone(), post.title.clone(), url).summary(post.display_excerpt());
+        let mut entry = FeedEntry::new(url.clone(), post.title.clone(), url)
+            .summary(crate::theme::render_excerpt(post));
 
         // Password-protected posts appear in the feed by title only. Putting the
         // body in the feed would hand out exactly what the password withholds.
