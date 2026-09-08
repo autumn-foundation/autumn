@@ -247,6 +247,35 @@ for entry in "${entries[@]}"; do
   pairs+=("$version $entry")
 done
 
+# A built-in starter under `autumn-cli/src/starters/<name>/migrations/` is a
+# TEMPLATE, and each one is a byte-for-byte mirror of its committed example
+# (pinned by `embedded_<name>_matches_example_<name>` in
+# `autumn-cli/src/starters/mod.rs`). The two are the same migration, and they
+# never coexist in one database: scaffolding copies the template into a new
+# project which then owns the only instance. So a starter/example pair sharing
+# a version is the intended state, not the collision this check exists to
+# catch — the `saas` pair predates this and is grandfathered on both sides in
+# the baseline instead, which is why it never surfaced here before.
+#
+# The exemption is narrow on purpose: it covers UNIQUENESS only. A starter
+# migration still has to satisfy the shape, real-time and precision rules
+# above, because the scaffolded project inherits its version verbatim.
+is_starter_mirror_of() {
+  local a="$1" b="$2" a_name b_name
+  a_name="$(basename "$a")"
+  b_name="$(basename "$b")"
+  [[ "$a_name" == "$b_name" ]] || return 1
+  # Entries may or may not carry a `./` prefix depending on how the tree was
+  # walked, so strip it before matching.
+  a="${a#./}"
+  b="${b#./}"
+  case "$a:$b" in
+    autumn-cli/src/starters/*:examples/*) return 0 ;;
+    examples/*:autumn-cli/src/starters/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 collisions=()
 prev_version=""
 prev_entry=""
@@ -258,6 +287,8 @@ while IFS=' ' read -r version entry; do
     # gate exists to catch.
     if is_legacy "$entry" && is_legacy "$prev_entry"; then
       : # both pre-existing — already-shipped debt, recorded in the baseline
+    elif is_starter_mirror_of "$entry" "$prev_entry"; then
+      : # a starter template and the example it mirrors — one migration, two copies
     else
       collisions+=("$version — $prev_entry and $entry")
     fi

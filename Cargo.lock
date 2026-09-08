@@ -2130,6 +2130,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "cms"
+version = "0.7.0"
+dependencies = [
+ "autumn-web",
+ "chrono",
+ "diesel",
+ "diesel-async",
+ "diesel_migrations",
+ "example-e2e",
+ "maud",
+ "pq-sys",
+ "scoped-futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "validator",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

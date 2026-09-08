@@ -1,0 +1,363 @@
+//! The REST API — WordPress's `/wp-json/wp/v2`, typed.
+//!
+//! Read endpoints are public and serve only published content, so they can back
+//! a static-site build or a mobile client with no credentials. Writes require a
+//! session and the same capabilities the admin screens check — there is one
+//! authorization model, not an admin one and an API one that drift apart.
+
+use autumn_web::AutumnResult;
+use autumn_web::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use crate::capabilities::Capability;
+use crate::content_types;
+use crate::models::{NewPost, Post};
+use crate::repositories::{
+    CommentRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
+};
+
+use super::site::Repos;
+
+/// A post as the API returns it.
+///
+/// A hand-written projection rather than the model itself: `Post` carries
+/// `password` (the plaintext gate for protected content) and `body` (which a
+/// protected post must not hand out), and serializing the model directly would
+/// publish both.
+#[derive(Debug, Serialize)]
+pub struct PostView {
+    pub id: i64,
+    pub post_type: String,
+    pub title: String,
+    pub slug: String,
+    pub excerpt: String,
+    /// Absent for password-protected posts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub status: String,
+    pub author_id: i64,
+    pub comment_count: i64,
+    pub published_at: Option<chrono::NaiveDateTime>,
+    pub url: String,
+    pub password_protected: bool,
+}
+
+impl PostView {
+    fn from(post: &Post, url: String) -> Self {
+        Self {
+            id: post.id,
+            post_type: post.post_type.clone(),
+            title: post.title.clone(),
+            slug: post.slug.clone(),
+            excerpt: post.display_excerpt(),
+            body: if post.is_password_protected() {
+                None
+            } else {
+                Some(post.body.clone())
+            },
+            status: post.status.clone(),
+            author_id: post.author_id,
+            comment_count: post.comment_count,
+            published_at: post.published_at,
+            url,
+            password_protected: post.is_password_protected(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PostQuery {
+    #[serde(default)]
+    pub post_type: Option<String>,
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub per_page: Option<usize>,
+}
+
+/// `GET /api/v1/posts` — published content only.
+#[get("/api/v1/posts")]
+pub async fn list_posts(
+    repos: Repos,
+    Query(query): Query<PostQuery>,
+) -> AutumnResult<Json<Vec<PostView>>> {
+    let settings = repos.settings().await?;
+    let post_type = query.post_type.unwrap_or_else(|| "post".to_owned());
+    if content_types::find_post_type(&post_type).is_none() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Unknown post type `{post_type}`"
+        )));
+    }
+
+    let mut posts = match query.search.as_deref().map(str::trim) {
+        Some(term) if !term.is_empty() => repos
+            .posts
+            .search(term)
+            .await?
+            .into_iter()
+            .filter(|p| p.post_type == post_type && p.is_public())
+            .collect(),
+        _ => repos.published_posts(&post_type, i64::MAX).await?,
+    };
+    // A caller-supplied page size is clamped: an unbounded `per_page` is a
+    // denial-of-service by query string.
+    posts.truncate(query.per_page.unwrap_or(20).clamp(1, 100));
+
+    let mut out = Vec::with_capacity(posts.len());
+    for post in &posts {
+        out.push(PostView::from(
+            post,
+            repos.permalink(post, &settings).await?,
+        ));
+    }
+    Ok(Json(out))
+}
+
+/// `GET /api/v1/posts/{id}`.
+#[get("/api/v1/posts/{id}")]
+pub async fn get_post(repos: Repos, Path(id): Path<i64>) -> AutumnResult<Json<PostView>> {
+    let settings = repos.settings().await?;
+    let post = repos
+        .posts
+        .find_by_id(id)
+        .await?
+        // Unpublished content is a 404 on the public API, not a 403: a 403
+        // would confirm that a draft exists at that id.
+        .filter(Post::is_public)
+        .ok_or_else(|| AutumnError::not_found_msg("No such post"))?;
+    let url = repos.permalink(&post, &settings).await?;
+    Ok(Json(PostView::from(&post, url)))
+}
+
+/// What `POST /api/v1/posts` accepts.
+#[derive(Debug, Deserialize)]
+pub struct CreatePostBody {
+    pub title: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub excerpt: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub post_type: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// `POST /api/v1/posts` — create content.
+///
+/// Requires a session; the API deliberately has no second credential type,
+/// because a token system that bypasses the capability checks is how an API
+/// becomes the weak side of an application's authorization.
+#[post("/api/v1/posts")]
+pub async fn create_post(
+    repos: Repos,
+    session: Session,
+    Json(body): Json<CreatePostBody>,
+) -> AutumnResult<(StatusCode, Json<PostView>)> {
+    let user = repos.require_user(&session).await?;
+    if !user.role().can(Capability::EditPosts) {
+        return Err(AutumnError::forbidden_msg(
+            "Your role cannot create content",
+        ));
+    }
+
+    let requested = body.status.unwrap_or_else(|| "draft".to_owned());
+    // Same clamp the admin editor applies: without `publish_posts`, the API
+    // cannot publish either.
+    let status = if user.role().can(Capability::PublishPosts) {
+        requested
+    } else if requested == "pending" {
+        "pending".to_owned()
+    } else {
+        "draft".to_owned()
+    };
+
+    let settings = repos.settings().await?;
+    let created = repos
+        .posts
+        .save(&NewPost {
+            post_type: body.post_type.unwrap_or_else(|| "post".to_owned()),
+            title: body.title,
+            slug: body.slug,
+            excerpt: body.excerpt,
+            body: body.body,
+            status,
+            author_id: user.id,
+            parent_id: None,
+            featured_media_id: None,
+            menu_order: 0,
+            comment_status: settings.default_comment_status.clone(),
+            password: String::new(),
+            sticky: false,
+            published_at: None,
+        })
+        .await?;
+
+    let url = repos.permalink(&created, &settings).await?;
+    Ok((StatusCode::CREATED, Json(PostView::from(&created, url))))
+}
+
+/// A term as the API returns it.
+#[derive(Debug, Serialize)]
+pub struct TermView {
+    pub id: i64,
+    pub taxonomy: String,
+    pub name: String,
+    pub slug: String,
+    pub description: String,
+    pub parent_id: Option<i64>,
+    pub post_count: i64,
+    pub url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TermQuery {
+    #[serde(default)]
+    pub taxonomy: Option<String>,
+}
+
+/// `GET /api/v1/terms`.
+#[get("/api/v1/terms")]
+pub async fn list_terms(
+    repos: Repos,
+    Query(query): Query<TermQuery>,
+) -> AutumnResult<Json<Vec<TermView>>> {
+    let taxonomy = query.taxonomy.unwrap_or_else(|| "category".to_owned());
+    if content_types::find_taxonomy(&taxonomy).is_none() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Unknown taxonomy `{taxonomy}`"
+        )));
+    }
+    let terms = repos.terms.find_by_taxonomy(taxonomy).await?;
+    Ok(Json(
+        terms
+            .iter()
+            .map(|term| TermView {
+                id: term.id,
+                taxonomy: term.taxonomy.clone(),
+                name: term.name.clone(),
+                slug: term.slug.clone(),
+                description: term.description.clone(),
+                parent_id: term.parent_id,
+                post_count: term.post_count,
+                url: crate::theme::term_url(term),
+            })
+            .collect(),
+    ))
+}
+
+/// A comment as the API returns it — approved only, and never with the
+/// commenter's email address or IP.
+#[derive(Debug, Serialize)]
+pub struct CommentView {
+    pub id: i64,
+    pub post_id: i64,
+    pub parent_id: Option<i64>,
+    pub author: String,
+    pub body: String,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// `GET /api/v1/posts/{id}/comments`.
+#[get("/api/v1/posts/{id}/comments")]
+pub async fn list_comments(
+    repos: Repos,
+    Path(id): Path<i64>,
+) -> AutumnResult<Json<Vec<CommentView>>> {
+    // Only for content the public can see — otherwise the comment endpoint
+    // would leak the existence of, and the discussion on, an unpublished post.
+    repos
+        .posts
+        .find_by_id(id)
+        .await?
+        .filter(Post::is_public)
+        .ok_or_else(|| AutumnError::not_found_msg("No such post"))?;
+
+    let mut rows = repos.comments.find_by_post_id(id).await?;
+    rows.retain(|c| c.status == "approved");
+    rows.sort_by_key(|c| (c.created_at, c.id));
+
+    Ok(Json(
+        rows.iter()
+            .map(|comment| CommentView {
+                id: comment.id,
+                post_id: comment.post_id,
+                parent_id: comment.parent_id,
+                author: comment.display_name().to_owned(),
+                body: comment.body.clone(),
+                created_at: comment.created_at,
+            })
+            .collect(),
+    ))
+}
+
+/// A public author profile.
+#[derive(Debug, Serialize)]
+pub struct AuthorView {
+    pub id: i64,
+    pub username: String,
+    pub name: String,
+    pub bio: String,
+    pub website: String,
+    pub url: String,
+}
+
+/// `GET /api/v1/authors` — accounts that have published something.
+///
+/// Deliberately **not** "every user": listing subscriber accounts would publish
+/// the site's membership, and the email column would be one careless
+/// serialization away from going with it.
+#[get("/api/v1/authors")]
+pub async fn list_authors(repos: Repos) -> AutumnResult<Json<Vec<AuthorView>>> {
+    let published = repos.published_posts("post", i64::MAX).await?;
+    let mut author_ids: Vec<i64> = published.iter().map(|p| p.author_id).collect();
+    author_ids.sort_unstable();
+    author_ids.dedup();
+
+    let mut out = Vec::with_capacity(author_ids.len());
+    for id in author_ids {
+        if let Some(user) = repos.users.find_by_id(id).await.ok().flatten() {
+            out.push(AuthorView {
+                id: user.id,
+                username: user.username.clone(),
+                name: user.public_name().to_owned(),
+                bio: user.bio.clone(),
+                website: user.website.clone(),
+                url: format!("/author/{}", user.username),
+            });
+        }
+    }
+    Ok(Json(out))
+}
+
+/// The site's public metadata — WordPress's `/wp-json` root document.
+#[derive(Debug, Serialize)]
+pub struct SiteInfo {
+    pub name: String,
+    pub description: String,
+    pub post_types: Vec<String>,
+    pub taxonomies: Vec<String>,
+    pub permalink_structure: String,
+}
+
+/// `GET /api/v1` — what this site is and what it exposes.
+#[get("/api/v1")]
+pub async fn site_info(repos: Repos) -> AutumnResult<Json<SiteInfo>> {
+    let settings = repos.settings().await?;
+    Ok(Json(SiteInfo {
+        name: settings.site_title.clone(),
+        description: settings.tagline.clone(),
+        post_types: content_types::all_post_types()
+            .into_iter()
+            .filter(|t| t.public)
+            .map(|t| t.slug.to_owned())
+            .collect(),
+        taxonomies: content_types::all_taxonomies()
+            .into_iter()
+            .map(|t| t.slug.to_owned())
+            .collect(),
+        permalink_structure: settings.permalink_structure.as_str().to_owned(),
+    }))
+}

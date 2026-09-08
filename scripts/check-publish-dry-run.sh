@@ -55,6 +55,10 @@ REQUIRED_ASSETS=(
   # include_dir!("$CARGO_MANIFEST_DIR/src/starters/saas") in starters/builtin.rs
   "autumn-cli:src/starters/saas/Cargo.toml.tmpl"
   "autumn-cli:src/starters/saas/src/main.rs"
+  # …and the same for the `cms` starter, embedded by
+  # include_dir!("$CARGO_MANIFEST_DIR/src/starters/cms").
+  "autumn-cli:src/starters/cms/Cargo.toml.tmpl"
+  "autumn-cli:src/starters/cms/src/main.rs"
   # include_dir!("$CARGO_MANIFEST_DIR/static") / i18n in lib.rs macros
   "autumn-web:static/"
   "autumn-web:i18n/"

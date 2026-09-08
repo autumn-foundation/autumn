@@ -85,6 +85,21 @@ The island crate that produces the wasm lives in `examples/island-flock`
 
 ---
 
+### `examples/cms` — WordPress-Parity Content Management
+
+<!-- catalog:example name=cms tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer replacing a WordPress install, or starting a content site |
+| **Journey** | Full CMS: register → author → publish → moderate, with roles, themes and plugins |
+| **Key capabilities** | `#[state_machine]` post lifecycle, `#[searchable]`, `#[cached]` + `invalidates`, `MutationHooks`, `storage::BlobStore`, `#[scheduled]`, capability-based authorization, typed action/filter hooks |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL 12+ (stored generated column), Docker for the full test suite |
+| **Run command** | `cargo run -p cms` |
+| **Success proof** | `curl http://localhost:3000/register` returns the registration screen |
+
+---
+
 ### `examples/bookmarks` — Profiles, Repository Macro, and Scheduled Tasks
 
 <!-- catalog:example name=bookmarks tier=supported -->

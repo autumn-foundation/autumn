@@ -1,0 +1,407 @@
+//! The shared request context: repositories, settings, the signed-in user, and
+//! the theme chrome every front-end page renders inside.
+
+use autumn_web::AutumnResult;
+use autumn_web::prelude::*;
+use autumn_web::reexports::axum::extract::FromRequestParts;
+use autumn_web::reexports::http::request::Parts;
+use autumn_web::security::{CsrfFormField, CsrfToken};
+
+use crate::models::{MenuItem, Post, Term, User};
+use crate::repositories::{
+    MenuItemRepository as _, MenuRepository as _, PgAttachmentRepository, PgCommentRepository,
+    PgMenuItemRepository, PgMenuRepository, PgPostMetaRepository, PgPostRepository,
+    PgSiteOptionRepository, PgTermRepository, PgUserRepository, PgWidgetRepository,
+    PostRepository as _, TermRepository as _, UserRepository as _, WidgetRepository as _,
+};
+use crate::settings::{SITE_SCOPE, Settings, cached_settings};
+use crate::taxonomy::{PgPostTermLinkRepository, PostTermLinkRepository as _};
+use crate::theme::{self, Chrome, NavNode, SidebarData};
+
+/// Every repository a page might need, in one extractor.
+///
+/// A repository holds the connection **pool**, not a connection — it acquires
+/// one per call and returns it — so bundling nine of them costs nothing at
+/// request time. This is the reason the front end resolves the current user and
+/// the settings through repositories rather than through a `Db` extractor:
+/// `Db` pins a connection for the whole request, and a page that also touched a
+/// repository would hold two at once, halving effective concurrency and
+/// deadlocking at pool saturation. Handlers take `Db` only for the
+/// [`crate::content`] operations that genuinely need one transaction.
+pub struct Repos {
+    pub users: PgUserRepository,
+    pub posts: PgPostRepository,
+    pub post_meta: PgPostMetaRepository,
+    pub terms: PgTermRepository,
+    pub comments: PgCommentRepository,
+    pub attachments: PgAttachmentRepository,
+    pub options: PgSiteOptionRepository,
+    pub menus: PgMenuRepository,
+    pub menu_items: PgMenuItemRepository,
+    pub widgets: PgWidgetRepository,
+    pub post_term_links: PgPostTermLinkRepository,
+}
+
+impl FromRequestParts<AppState> for Repos {
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            users: PgUserRepository::from_request_parts(parts, state).await?,
+            posts: PgPostRepository::from_request_parts(parts, state).await?,
+            post_meta: PgPostMetaRepository::from_request_parts(parts, state).await?,
+            terms: PgTermRepository::from_request_parts(parts, state).await?,
+            comments: PgCommentRepository::from_request_parts(parts, state).await?,
+            attachments: PgAttachmentRepository::from_request_parts(parts, state).await?,
+            options: PgSiteOptionRepository::from_request_parts(parts, state).await?,
+            menus: PgMenuRepository::from_request_parts(parts, state).await?,
+            menu_items: PgMenuItemRepository::from_request_parts(parts, state).await?,
+            widgets: PgWidgetRepository::from_request_parts(parts, state).await?,
+            post_term_links: PgPostTermLinkRepository::from_request_parts(parts, state).await?,
+        })
+    }
+}
+
+impl Repos {
+    /// The resolved site settings (memoized for 60 seconds).
+    pub async fn settings(&self) -> AutumnResult<Settings> {
+        cached_settings(SITE_SCOPE, &self.options).await
+    }
+
+    /// The signed-in user, if any.
+    ///
+    /// A session naming a user that no longer exists resolves to `None` rather
+    /// than an error: deleting an account must log its holder out, not 500
+    /// every page they load.
+    pub async fn current_user(&self, session: &Session) -> AutumnResult<Option<User>> {
+        let Some(raw) = session.get("user_id").await else {
+            return Ok(None);
+        };
+        let Ok(user_id) = raw.parse::<i64>() else {
+            return Ok(None);
+        };
+        Ok(self.users.find_by_id(user_id).await.ok().flatten())
+    }
+
+    /// The signed-in user, or a 401.
+    pub async fn require_user(&self, session: &Session) -> AutumnResult<User> {
+        self.current_user(session)
+            .await?
+            .ok_or_else(|| AutumnError::unauthorized_msg("You must be signed in"))
+    }
+
+    /// The permalink for a post, resolving a page's ancestry when it has one.
+    pub async fn permalink(&self, post: &Post, settings: &Settings) -> AutumnResult<String> {
+        let ancestry = if post.post_type == "page" {
+            self.page_ancestry(post).await?
+        } else {
+            Vec::new()
+        };
+        Ok(settings.permalink_structure.permalink(post, &ancestry))
+    }
+
+    /// The slugs of a page's ancestors, outermost first.
+    ///
+    /// The walk is bounded: a `parent_id` cycle is only reachable by a direct
+    /// write, but a page render must not hang on one.
+    pub async fn page_ancestry(&self, post: &Post) -> AutumnResult<Vec<String>> {
+        const MAX_DEPTH: usize = 8;
+        let mut slugs = Vec::new();
+        let mut cursor = post.parent_id;
+        let mut seen = vec![post.id];
+        while let Some(parent_id) = cursor {
+            if slugs.len() >= MAX_DEPTH || seen.contains(&parent_id) {
+                break;
+            }
+            seen.push(parent_id);
+            match self.posts.find_by_id(parent_id).await.ok().flatten() {
+                Some(parent) => {
+                    slugs.push(parent.slug.clone());
+                    cursor = parent.parent_id;
+                }
+                None => break,
+            }
+        }
+        slugs.reverse();
+        Ok(slugs)
+    }
+
+    /// Build the site chrome: the primary nav, the sidebar and the viewer.
+    pub async fn chrome(
+        &self,
+        session: &Session,
+        settings: &Settings,
+        csrf: &Csrf,
+    ) -> AutumnResult<Chrome> {
+        Ok(Chrome {
+            nav: self.primary_nav(settings).await?,
+            sidebar: Some(self.sidebar(settings).await?),
+            current_user: self.current_user(session).await?,
+            settings: settings.clone(),
+            csrf: csrf.input(),
+        })
+    }
+
+    /// The menu assigned to the `primary` theme location, resolved to URLs.
+    async fn primary_nav(&self, settings: &Settings) -> AutumnResult<Vec<NavNode>> {
+        let Some(menu) = self
+            .menus
+            .find_by_location("primary".to_owned())
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(Vec::new());
+        };
+        let items = self.menu_items.find_by_menu_id(menu.id).await?;
+
+        // Resolve every post- and term-targeted item up front, so building the
+        // tree is a pure function and needs no database access per node.
+        let mut resolved: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+        for item in &items {
+            resolved.insert(item.id, self.menu_item_url(item, settings).await?);
+        }
+        Ok(theme::build_nav(&items, &|item: &MenuItem| {
+            resolved
+                .get(&item.id)
+                .cloned()
+                .unwrap_or_else(|| "/".to_owned())
+        }))
+    }
+
+    /// A menu item's target: its post, its term, or its raw URL — in that
+    /// order, matching the three link kinds the menu editor offers.
+    async fn menu_item_url(&self, item: &MenuItem, settings: &Settings) -> AutumnResult<String> {
+        if let Some(post_id) = item.post_id
+            && let Some(post) = self.posts.find_by_id(post_id).await.ok().flatten()
+        {
+            return self.permalink(&post, settings).await;
+        }
+        if let Some(term_id) = item.term_id
+            && let Some(term) = self.terms.find_by_id(term_id).await.ok().flatten()
+        {
+            return Ok(theme::term_url(&term));
+        }
+        Ok(if item.url.trim().is_empty() {
+            "/".to_owned()
+        } else {
+            item.url.clone()
+        })
+    }
+
+    /// Render the primary sidebar.
+    pub async fn sidebar(&self, settings: &Settings) -> AutumnResult<Markup> {
+        let widgets = self.widgets.find_by_sidebar("primary".to_owned()).await?;
+        if widgets.is_empty() {
+            return Ok(html! {});
+        }
+
+        // Only load what the placed widgets actually need. A sidebar with one
+        // text widget must not cost a posts query and two term queries.
+        let kinds: Vec<crate::theme::WidgetKind> = widgets
+            .iter()
+            .filter_map(|w| crate::theme::WidgetKind::parse(&w.kind))
+            .collect();
+        let needs = |kind: crate::theme::WidgetKind| kinds.contains(&kind);
+
+        let recent_posts = if needs(crate::theme::WidgetKind::RecentPosts) {
+            let posts = self.published_posts("post", 20).await?;
+            let mut out = Vec::with_capacity(posts.len());
+            for post in &posts {
+                out.push((post.title.clone(), self.permalink(post, settings).await?));
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        let categories = if needs(crate::theme::WidgetKind::Categories) {
+            self.terms.find_by_taxonomy("category".to_owned()).await?
+        } else {
+            Vec::new()
+        };
+        let tags = if needs(crate::theme::WidgetKind::TagCloud) {
+            self.terms.find_by_taxonomy("post_tag".to_owned()).await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(theme::render_sidebar(&SidebarData {
+            widgets,
+            recent_posts,
+            categories,
+            tags,
+        }))
+    }
+
+    /// Published posts of one type, newest first.
+    ///
+    /// `publish` only — `private`, `future`, `draft`, `pending` and `trash` are
+    /// all excluded, so this is the one query every public listing is built
+    /// from and no screen has to remember the filter.
+    pub async fn published_posts(&self, post_type: &str, limit: i64) -> AutumnResult<Vec<Post>> {
+        let mut posts: Vec<Post> = self
+            .posts
+            .find_by_post_type_and_status(post_type.to_owned(), "publish".to_owned())
+            .await?;
+        // Sticky posts first, then newest — WordPress's blog-index ordering.
+        posts.sort_by(|a, b| {
+            b.sticky
+                .cmp(&a.sticky)
+                .then(b.published_at.cmp(&a.published_at))
+                .then(b.id.cmp(&a.id))
+        });
+        posts.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
+        Ok(posts)
+    }
+
+    /// The terms a post is filed under, across every taxonomy.
+    ///
+    /// Two queries: the filings, then the terms. A post carries a handful of
+    /// terms, so loading them individually is bounded by the editor's patience
+    /// rather than by the size of the site.
+    pub async fn post_terms(&self, post_id: i64) -> AutumnResult<Vec<Term>> {
+        let links = self.post_term_links.find_by_post_id(post_id).await?;
+        let mut terms = Vec::with_capacity(links.len());
+        for link in links {
+            if let Some(term) = self.terms.find_by_id(link.term_id).await.ok().flatten() {
+                terms.push(term);
+            }
+        }
+        Ok(terms)
+    }
+
+    /// The published posts filed under a term, newest first, for one page of an
+    /// archive.
+    ///
+    /// The filings are read first and paginated *before* the posts are loaded,
+    /// so the per-post lookups are bounded by the page size (at most 100) and
+    /// not by how much content the term has accumulated. A derived finder
+    /// taking a list of ids would collapse this to two queries; the repository
+    /// codegen has no `IN`-shaped finder, and reaching for a raw connection
+    /// here would mean holding a `Db` alongside these pool-backed repositories.
+    pub async fn posts_in_term(
+        &self,
+        term_id: i64,
+        offset: usize,
+        limit: usize,
+    ) -> AutumnResult<(Vec<Post>, usize)> {
+        let links = self.post_term_links.find_by_term_id(term_id).await?;
+        let mut posts = Vec::new();
+        for link in &links {
+            if let Some(post) = self.posts.find_by_id(link.post_id).await.ok().flatten()
+                && post.is_public()
+            {
+                posts.push(post);
+            }
+        }
+        posts.sort_by(|a, b| b.published_at.cmp(&a.published_at).then(b.id.cmp(&a.id)));
+        let total = posts.len();
+        Ok((posts.into_iter().skip(offset).take(limit).collect(), total))
+    }
+}
+
+/// Render a page inside the active theme's chrome.
+pub async fn render(
+    repos: &Repos,
+    session: &Session,
+    csrf: &Csrf,
+    title: &str,
+    content: Markup,
+) -> AutumnResult<Markup> {
+    let settings = repos.settings().await?;
+    let chrome = repos.chrome(session, &settings, csrf).await?;
+    Ok(theme::active_theme(&settings).layout(&chrome, title, content))
+}
+
+/// The CSRF token plus the configured field name to submit it under.
+///
+/// Bundled because every form needs both and getting either wrong fails the
+/// same way: `CsrfLayer` scans the request body for the **configured** field
+/// name (`security.csrf.form_field`, default `_csrf`), so a form that hardcodes
+/// a different name submits a token the layer never looks for and 403s on its
+/// first POST.
+pub struct Csrf {
+    /// `None` when `CsrfLayer` is not mounted — see the extractor below.
+    token: Option<CsrfToken>,
+    field: Option<CsrfFormField>,
+}
+
+impl FromRequestParts<AppState> for Csrf {
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // Both underlying extractors reject when `CsrfLayer` is not mounted,
+        // which is exactly what `security.csrf.enabled = false` produces — a
+        // supported configuration, and the default in `TestApp`. Failing here
+        // would make every page in the application 500 under that setting,
+        // which is a far worse outcome than rendering forms without a token
+        // that nothing is going to check. So the absence is represented, not
+        // treated as an error.
+        Ok(Self {
+            token: CsrfToken::from_request_parts(parts, state).await.ok(),
+            field: CsrfFormField::from_request_parts(parts, state).await.ok(),
+        })
+    }
+}
+
+impl Csrf {
+    /// The hidden input every `POST` form must carry.
+    ///
+    /// Renders nothing when CSRF is disabled, so a form is never asked to
+    /// submit a field the layer is not there to validate.
+    #[must_use]
+    pub fn input(&self) -> Markup {
+        match (&self.token, &self.field) {
+            (Some(token), Some(field)) => html! {
+                input type="hidden" name=(field.0) value=(token.token());
+            },
+            _ => html! {},
+        }
+    }
+
+    /// The raw token, for a form that builds its own field. Empty when CSRF is
+    /// disabled.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        self.token.as_ref().map_or("", CsrfToken::token)
+    }
+}
+
+/// The one-time submit token, absent when `SubmitTokenLayer` is not mounted.
+///
+/// Same reasoning as [`Csrf`]: `security.submit_token.enabled = false` is a
+/// supported configuration, and a hard failure there would make the
+/// registration screen 500 rather than simply render without an at-most-once
+/// guard it was told not to enforce.
+pub struct Submit(Option<autumn_web::security::SubmitToken>);
+
+impl FromRequestParts<AppState> for Submit {
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            autumn_web::security::SubmitToken::from_request_parts(parts, state)
+                .await
+                .ok(),
+        ))
+    }
+}
+
+impl Submit {
+    /// The token, or an empty string when the layer is not mounted.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        self.0
+            .as_ref()
+            .map_or("", autumn_web::security::SubmitToken::token)
+    }
+}

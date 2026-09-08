@@ -1215,6 +1215,26 @@ jobs:
             --skip remember_me_rotates_across_restart_and_detects_theft
           cargo test -p teams -- --ignored --test-threads=1 --exact \
             signup_and_login_failures_redisplay_the_form_with_email_preserved
+          # `examples/cms` — the WordPress-parity CMS starter. Same story as
+          # `saas` and `teams` above: example apps are not auto-swept, so
+          # without this line its Docker-gated `tests/integration_test.rs`
+          # (register -> author -> publish -> moderate, the post state machine,
+          # comment-counter arithmetic, capability limits, password protection,
+          # permalink-structure changes, revision restore, export/import
+          # idempotence, and a CSRF round trip) runs nowhere in CI. Unlike
+          # those two, this suite has been run green as a whole from the start,
+          # so it is NOT narrowed with `--skip`: a new test added to the file
+          # runs here automatically.
+          #
+          # `--test-threads=1` because the suite shares one
+          # `TestDb::shared()` container and each test truncates it, exactly as
+          # the file's own doc comment says.
+          #
+          # The `--test integration_test` filter excludes the crate's other
+          # `#[ignore]`d target, `tests/system/smoke.rs`, which needs Chromium
+          # this job does not provide (it is `system-tests`-gated and so does
+          # not even compile here).
+          cargo test -p cms --test integration_test -- --ignored --test-threads=1
 
 
   test-gate:

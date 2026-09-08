@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
+  management system.** `autumn new <name> --starter cms` now scaffolds a
+  complete CMS, joining `saas` as the second curated built-in. The rendered
+  form is committed at `examples/cms/` and pinned to the starter byte-for-byte
+  by `embedded_cms_matches_example_cms`, so the two cannot diverge.
+
+  What it covers: posts, pages and custom post types over one `posts` table
+  keyed by `post_type`; hierarchical categories, flat tags and custom
+  taxonomies; the six WordPress post statuses as a `#[state_machine]` (so an
+  undeclared edge like `publish -> future` is refused rather than merely
+  discouraged); scheduled publishing on a real `#[scheduled]` timer rather than
+  wp-cron's visitor-triggered one; revisions with restore; a `BlobStore`-backed
+  media library with a server-side MIME allowlist; threaded comments with the
+  approved/pending/spam/trash moderation queue and guest commenters; the five
+  core roles and their capability matrix, derived from the stored role at check
+  time rather than copied into usermeta; menus, widgets and switchable themes;
+  a typed action/filter plugin API whose hook names are enum variants, so a
+  misspelled hook is a compile error; shortcodes; all five permalink structures;
+  Atom/RSS feeds site-wide and per-term; a permalink-aware sitemap; a REST API;
+  and idempotent JSON import/export.
+
+  Deliberately excluded, with reasons in the example's README: multisite (Autumn's
+  row-level tenancy is the better answer, see `examples/saas`), XML-RPC, the block
+  editor, pingbacks, and runtime plugin/theme installation.
+
+  Requires PostgreSQL 12+ — the full-text `search_vector` is a stored generated
+  column. The Docker suite covers the flows most likely to rot: draft
+  invisibility, the state machine refusing an undeclared edge, comment-counter
+  arithmetic across moderation transitions, contributor capability limits,
+  password protection across page/feed/API, permalink-structure changes not
+  404ing existing URLs, revision restore, export/import idempotence, and a CSRF
+  round trip.
+
+### Changed
+
+- **Migration version gate: starter templates no longer collide with their
+  examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror
+  of its committed example and the two never coexist in one database, so
+  `scripts/check-migration-versions.sh` now exempts a starter/example pair from
+  the **uniqueness** check only — shape, real-time and precision still apply,
+  since a scaffolded project inherits the version verbatim. Previously the only
+  such pair (`saas`) passed by accident, because both sides happened to be
+  grandfathered in the baseline.
+
+- **Starter drift gate: one implementation for every starter.**
+  `embedded_saas_matches_example_saas` was a single hard-coded test body; it is
+  now `assert_starter_matches_example(starter, project_name)`, called by both
+  the `saas` and `cms` gates. No behavior change for `saas`.
+
 ### Changed
 
 - **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.** [no-plugin]
