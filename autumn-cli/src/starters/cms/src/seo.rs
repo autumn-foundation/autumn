@@ -42,7 +42,17 @@ pub async fn sitemap(repos: Repos, State(state): State<AppState>) -> AutumnResul
         if !post_type.public {
             continue;
         }
-        for post in repos.published_posts(post_type.slug, i64::MAX).await? {
+        // Ask for at most what is still needed. Loading every published row and
+        // truncating afterwards bounds the response but not the database,
+        // memory or per-post ancestry work — on an unauthenticated endpoint.
+        let remaining = MAX_URLS.saturating_sub(urls.len());
+        if remaining == 0 {
+            break;
+        }
+        for post in repos
+            .published_posts(post_type.slug, i64::try_from(remaining).unwrap_or(i64::MAX))
+            .await?
+        {
             let path = repos.permalink(&post, &settings).await?;
             // The `plain` structure yields `/?p=1`. That is a valid URL but a
             // poor sitemap entry, and it duplicates the canonical one.
@@ -73,6 +83,8 @@ pub async fn sitemap(repos: Repos, State(state): State<AppState>) -> AutumnResul
         }
     }
 
+    // A belt to the per-type budget above: term archives are appended after
+    // the posts and have no budget of their own.
     urls.truncate(MAX_URLS);
 
     let mut body = String::from(

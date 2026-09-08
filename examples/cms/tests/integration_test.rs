@@ -1370,6 +1370,170 @@ async fn tags_typed_into_the_editor_are_created_and_archived() {
     assert_eq!(rust["post_count"], serde_json::json!(1));
 }
 
+/// Search paginates the *visible* set, not the whole match set.
+///
+/// Filtering after `search_page` returned meant drafts could occupy the first
+/// page — leaving it blank while public results sat on page two — and the total
+/// disclosed how many hidden matches existed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn search_counts_and_paginates_only_visible_matches() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Three drafts and one published post, all matching the same term.
+    for n in 0..3 {
+        create_post(
+            &client,
+            &cookie,
+            &format!("Hidden {n}"),
+            "kumquat marmalade recipe",
+            "draft",
+        )
+        .await;
+    }
+    create_post(
+        &client,
+        &cookie,
+        "Visible",
+        "kumquat marmalade recipe",
+        "publish",
+    )
+    .await;
+
+    sign_out(&client);
+    let body = client
+        .get("/search?s=kumquat")
+        .send()
+        .await
+        .assert_ok()
+        .text();
+
+    assert!(body.contains("Visible"), "the published match must appear");
+    assert!(
+        !body.contains("Hidden"),
+        "a draft must not appear in public search results"
+    );
+    assert!(
+        body.contains("1 result"),
+        "the total must count only visible matches, not disclose hidden ones; body: {}",
+        &body[..body.len().min(2000)]
+    );
+}
+
+/// Once an editor publishes a Contributor's draft, the Contributor can no
+/// longer edit it — nor trash it, which is the more destructive of the two.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_contributor_cannot_trash_their_published_post() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+
+    client
+        .post("/admin/users")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("username", "carla"),
+            ("email", "carla@example.com"),
+            ("password", "correct-horse-battery-staple"),
+            ("role", "contributor"),
+            ("display_name", "Carla"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let login = client
+        .post("/login")
+        .form(&form(&[
+            ("username", "carla"),
+            ("password", "correct-horse-battery-staple"),
+        ]))
+        .send()
+        .await;
+    let carla = session_cookie(&login);
+    sign_out(&client);
+    let id = create_post(&client, &carla, "Carla Draft", "Body.", "draft").await;
+
+    // The owner publishes it.
+    sign_out(&client);
+    client
+        .post(&format!("/admin/content/post/{id}/status?to=publish"))
+        .header("cookie", &owner)
+        .send()
+        .await
+        .assert_status(303);
+
+    // Confirm it really published — a 303 alone would also be the guard's
+    // redirect to /login, which is how the first draft of this test passed
+    // while the transition silently never happened.
+    sign_out(&client);
+    let published: serde_json::Value = client.get("/api/v1/posts").send().await.json();
+    assert_eq!(
+        published.as_array().map(Vec::len),
+        Some(1),
+        "the owner's publish must have taken effect: {published}"
+    );
+
+    // Carla can no longer trash it.
+    sign_out(&client);
+    let refused = client
+        .post(&format!("/admin/content/post/{id}/status?to=trash"))
+        .header("cookie", &carla)
+        .send()
+        .await;
+    assert_eq!(
+        refused.status, 403,
+        "a contributor must not be able to trash content they can no longer edit"
+    );
+
+    sign_out(&client);
+    client.get("/carla-draft").send().await.assert_ok();
+}
+
+/// A slug shaped like a year would otherwise be swallowed by the date archive.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_year_shaped_slug_stays_reachable() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "2026"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A year in review."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(resp.status, 303);
+
+    sign_out(&client);
+    // `/2026` is still the date archive. It legitimately *lists* the post
+    // (published in 2026), so assert on the archive's own heading rather than
+    // on the absence of the post — the listing showing it is correct.
+    let archive = client.get("/2026").send().await;
+    archive.assert_ok().assert_body_contains("Archive: 2026");
+
+    // The post itself is reachable at the slug it was given, which is what the
+    // reservation is for: without it the slug would be `2026`, whose canonical
+    // URL the archive owns, leaving the post unreachable.
+    let single = client.get("/2026-2").send().await;
+    single.assert_ok().assert_body_contains("A year in review.");
+    assert!(
+        !single.text().contains("Archive: 2026"),
+        "/2026-2 must be the post, not the archive"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn full_text_search_finds_a_post_by_its_body() {

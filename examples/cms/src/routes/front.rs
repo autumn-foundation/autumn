@@ -87,9 +87,13 @@ pub async fn front_page(
 
     // A configured static front page replaces the blog index, as in
     // Settings → Reading.
+    // `single_post` enforces status *and* registered-type visibility, so a
+    // front page whose type was later registered `public: false` falls through
+    // to the blog index rather than being served at `/`.
     if let Some(page_id) = settings.front_page_id
         && let Some(page) = repos.posts.find_by_id(page_id).await.ok().flatten()
         && page.is_public()
+        && is_publicly_routable(&page)
     {
         return single_post(&repos, &session, &csrf, page).await;
     }
@@ -114,30 +118,31 @@ pub async fn search(
     // endpoint. The page size is the site's own `posts_per_page`.
     let per_page = u32::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
     let page_number = u32::try_from(params.page_number()).unwrap_or(1);
+    // Visibility is a predicate of the SQL, not a filter applied to the page
+    // that comes back. Filtering afterwards paginates the *unrestricted* result
+    // set: a page can come back empty while public matches sit on later pages,
+    // and `total_elements` would count — and so disclose the number of — draft
+    // and non-public-type matches.
+    let public_types: Vec<String> = content_types::all_post_types()
+        .into_iter()
+        .filter(|registered| registered.public)
+        .map(|registered| registered.slug.to_owned())
+        .collect();
     let (results, total) = if trimmed.is_empty() {
         (Vec::new(), 0usize)
     } else {
-        // The repository's search runs against the `search_vector` GIN index
-        // (see the model's `#[searchable]` columns), so this is a real ranked
-        // full-text query rather than a table scan of `LIKE '%…%'`.
-        let page = repos
-            .posts
-            .search_page(
-                trimmed,
-                &autumn_web::pagination::PageRequest::new(page_number, per_page),
-            )
-            .await?;
-        let total = usize::try_from(page.total_elements).unwrap_or(0);
-        (
-            page.content
-                .into_iter()
-                // Status *and* type visibility, same as everywhere else — a
-                // result card exposes the title and a derived excerpt, which
-                // is exactly what a non-public type must not publish.
-                .filter(|post: &Post| post.is_public() && is_publicly_routable(post))
-                .collect::<Vec<Post>>(),
-            total,
+        let mut conn = repos.conn().await?;
+        // Runs against the `search_vector` GIN index (see the model's
+        // `#[searchable]` columns), so this is a real ranked full-text query
+        // rather than a table scan of `LIKE '%…%'`.
+        crate::content::search_published(
+            &mut conn,
+            trimmed,
+            &public_types,
+            i64::from(page_number.saturating_sub(1)) * i64::from(per_page),
+            i64::from(per_page),
         )
+        .await?
     };
 
     let mut cards = Vec::with_capacity(results.len());
@@ -323,14 +328,10 @@ async fn blog_index(
     settings: &Settings,
     params: &ListQueryParams,
 ) -> AutumnResult<Response> {
-    let all = repos.published_posts("post", i64::MAX).await?;
-    let total = all.len();
     let per_page = usize::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
-    let page_posts: Vec<Post> = all
-        .into_iter()
-        .skip(params.offset(settings.posts_per_page))
-        .take(per_page)
-        .collect();
+    let (page_posts, total) = repos
+        .published_posts_page("post", params.offset(settings.posts_per_page), per_page)
+        .await?;
 
     let body = listing(
         repos,
@@ -499,6 +500,17 @@ async fn single_post(
 ) -> AutumnResult<Response> {
     let settings = repos.settings().await?;
     let viewer = repos.current_user(session).await?;
+
+    // Type visibility is checked HERE rather than at each entry point. It was
+    // a caller's job before, which is exactly why it kept being missed one
+    // route at a time — `/?p=`, `/archives/<id>`, search, and the configured
+    // front page each reach a row without passing through the resolver's
+    // type-aware branches. A type registered `public: false` has no public
+    // route by definition, so no caller of this function should be able to
+    // render one, whatever path it arrived by.
+    if !is_publicly_routable(&post) {
+        return not_found(repos, session, csrf).await;
+    }
 
     // Visibility. `publish` is public; everything else needs a reason.
     if !post.is_public() {

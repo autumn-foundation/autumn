@@ -48,6 +48,8 @@ pub enum Capability {
     DeletePosts,
     /// Trash content authored by somebody else.
     DeleteOthersPosts,
+    /// Trash content that is already published.
+    DeletePublishedPosts,
     /// See content in `private` status that somebody else authored.
     ReadPrivatePosts,
     /// Create, rename and delete terms in any taxonomy.
@@ -82,6 +84,7 @@ impl Capability {
             Self::PublishPosts => "publish_posts",
             Self::DeletePosts => "delete_posts",
             Self::DeleteOthersPosts => "delete_others_posts",
+            Self::DeletePublishedPosts => "delete_published_posts",
             Self::ReadPrivatePosts => "read_private_posts",
             Self::ManageCategories => "manage_categories",
             Self::ModerateComments => "moderate_comments",
@@ -105,6 +108,7 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::PublishPosts,
     Capability::DeletePosts,
     Capability::DeleteOthersPosts,
+    Capability::DeletePublishedPosts,
     Capability::ReadPrivatePosts,
     Capability::ManageCategories,
     Capability::ModerateComments,
@@ -187,6 +191,7 @@ impl Role {
                     | C::PublishPosts
                     | C::DeletePosts
                     | C::DeleteOthersPosts
+                    | C::DeletePublishedPosts
                     | C::ReadPrivatePosts
                     | C::ManageCategories
                     | C::ModerateComments
@@ -199,6 +204,7 @@ impl Role {
                     | C::EditPublishedPosts
                     | C::PublishPosts
                     | C::DeletePosts
+                    | C::DeletePublishedPosts
                     | C::UploadFiles
             ),
             // The defining constraint of a Contributor: they may write and
@@ -252,13 +258,27 @@ pub fn can_edit_post(role: Role, actor_id: i64, author_id: i64, status: &str) ->
 }
 
 /// Whether `role`, acting as `actor_id`, may trash the post authored by
-/// `author_id`.
+/// `author_id` in `status`.
+///
+/// Deletion carries the same published-content distinction as editing, and for
+/// the same reason. A Contributor holds `delete_posts` but not
+/// `delete_published_posts`, so once an editor publishes their draft they can
+/// no longer touch it — and trashing it is *more* destructive than editing it,
+/// not less. Checking ownership alone would let them remove content the
+/// capability model has deliberately taken out of their hands.
 #[must_use]
-pub fn can_delete_post(role: Role, actor_id: i64, author_id: i64) -> bool {
+pub fn can_delete_post(role: Role, actor_id: i64, author_id: i64, status: &str) -> bool {
     if !role.can(Capability::DeletePosts) {
         return false;
     }
-    author_id == actor_id || role.can(Capability::DeleteOthersPosts)
+    if author_id != actor_id && !role.can(Capability::DeleteOthersPosts) {
+        return false;
+    }
+    let is_live = matches!(status, "publish" | "private" | "future");
+    if is_live && !role.can(Capability::DeletePublishedPosts) {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -282,6 +302,11 @@ mod tests {
         // Their own draft: editable. Their own published post: not.
         assert!(can_edit_post(role, 7, 7, "draft"));
         assert!(!can_edit_post(role, 7, 7, "publish"));
+        // …and deletion follows editing: once an editor publishes their draft,
+        // a Contributor can no longer trash it either. Trashing is more
+        // destructive than editing, so it cannot be the looser check.
+        assert!(can_delete_post(role, 7, 7, "draft"));
+        assert!(!can_delete_post(role, 7, 7, "publish"));
         // Somebody else's draft: not, either.
         assert!(!can_edit_post(role, 7, 8, "draft"));
     }
@@ -291,8 +316,8 @@ mod tests {
         let role = Role::Author;
         assert!(can_edit_post(role, 7, 7, "publish"));
         assert!(!can_edit_post(role, 7, 8, "draft"));
-        assert!(can_delete_post(role, 7, 7));
-        assert!(!can_delete_post(role, 7, 8));
+        assert!(can_delete_post(role, 7, 7, "publish"));
+        assert!(!can_delete_post(role, 7, 8, "publish"));
         // An Author publishes but does not moderate.
         assert!(role.can(Capability::PublishPosts));
         assert!(!role.can(Capability::ModerateComments));

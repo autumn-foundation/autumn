@@ -133,7 +133,11 @@ impl Repos {
     /// The walk is bounded: a `parent_id` cycle is only reachable by a direct
     /// write, but a page render must not hang on one.
     pub async fn page_ancestry(&self, post: &Post) -> AutumnResult<Vec<String>> {
-        const MAX_DEPTH: usize = 8;
+        // Shares the constant with the write-path check in
+        // `content::MAX_PAGE_DEPTH`, so the editor cannot store a hierarchy
+        // deeper than the permalink builder will render — which would emit a
+        // URL starting mid-tree that resolves to a 404.
+        const MAX_DEPTH: usize = crate::content::MAX_PAGE_DEPTH;
         let mut slugs = Vec::new();
         let mut cursor = post.parent_id;
         let mut seen = vec![post.id];

@@ -56,6 +56,11 @@ pub struct ExportPost {
     #[serde(default)]
     pub body: String,
     pub status: String,
+    /// `open` or `closed`. Carried because forcing every restored post to
+    /// `open` silently reverses an author's decision to close discussion —
+    /// a restore must not change the content's policy.
+    #[serde(default = "default_comment_status")]
+    pub comment_status: String,
     /// The post's password, empty when the post is not protected.
     ///
     /// Carried so a restore does not silently publish content that was
@@ -85,6 +90,11 @@ pub struct ExportPost {
 pub struct ExportTermRef {
     pub taxonomy: String,
     pub slug: String,
+}
+
+/// `open`, matching the column default, for a file that predates the field.
+fn default_comment_status() -> String {
+    "open".to_owned()
 }
 
 /// The current export schema version.
@@ -207,6 +217,7 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 excerpt: post.excerpt.clone(),
                 body: post.body.clone(),
                 status: post.status.clone(),
+                comment_status: post.comment_status.clone(),
                 password: post.password.clone(),
                 author,
                 parent: parent_slug,
@@ -381,7 +392,7 @@ pub async fn import(
                 parent_id: None,
                 featured_media_id: None,
                 menu_order: 0,
-                comment_status: "open".to_owned(),
+                comment_status: post.comment_status.clone(),
                 password: post.password.clone(),
                 sticky: false,
                 published_at: post.published_at,

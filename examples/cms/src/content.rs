@@ -644,6 +644,7 @@ pub async fn would_create_cycle(
     candidate_parent_id: i64,
 ) -> AutumnResult<bool> {
     const MAX_DEPTH: usize = 64;
+
     if candidate_parent_id == post_id {
         return Ok(true);
     }
@@ -992,6 +993,16 @@ pub async fn published_posts_by_author(
     Ok((rows, total))
 }
 
+/// Whether a single-segment slug would be resolved as a date archive.
+///
+/// `permalinks::resolve` treats a lone four-digit numeric segment as a year.
+/// See `ensure_unique_slug` for why that shape is reserved rather than
+/// resolved by fallback.
+#[must_use]
+pub fn reads_as_date_archive(slug: &str) -> bool {
+    slug.len() == 4 && slug.chars().all(|c| c.is_ascii_digit())
+}
+
 /// A slug that is free across every post type sharing the bare URL path.
 ///
 /// `posts` is unique on `(post_type, slug)`, so a post and a page may both be
@@ -1013,7 +1024,17 @@ pub async fn ensure_unique_slug(
         return Ok(desired.to_owned());
     }
 
-    let mut candidate = desired.to_owned();
+    // A four-digit slug is the shape the resolver reads as a year archive
+    // (`/2026`), and it checks that before content — so a post slugged `2026`
+    // would be unreachable at its own canonical URL. Reserving the shape is
+    // the fix that keeps both features working; making the archive fall back
+    // to content would instead make `/2026` mean different things depending on
+    // what happens to exist.
+    let mut candidate = if reads_as_date_archive(desired) {
+        format!("{desired}-2")
+    } else {
+        desired.to_owned()
+    };
     for suffix in 2..=200u32 {
         let mut query = posts::table
             .filter(posts::slug.eq(candidate.clone()))
@@ -1035,6 +1056,38 @@ pub async fn ensure_unique_slug(
     ))
 }
 
+/// The deepest page hierarchy the site will address.
+///
+/// The permalink builder walks a page's ancestors to construct its path, and
+/// the resolver walks back down from a row whose parent is `NULL`. Both have to
+/// agree on a bound, or a page deeper than the walker's limit gets a URL
+/// starting mid-tree that resolves to nothing. Enforcing it where a parent is
+/// *assigned* is what keeps every stored page addressable, rather than
+/// truncating at render time and emitting a 404 link.
+pub const MAX_PAGE_DEPTH: usize = 8;
+
+/// How many ancestors a page would have under `candidate_parent_id`.
+pub async fn depth_under(db: &mut Db, candidate_parent_id: i64) -> AutumnResult<usize> {
+    let mut depth = 1usize;
+    let mut cursor = Some(candidate_parent_id);
+    while let Some(current) = cursor {
+        if depth > MAX_PAGE_DEPTH + 2 {
+            break;
+        }
+        cursor = posts::table
+            .find(current)
+            .select(posts::parent_id)
+            .first::<Option<i64>>(&mut **db)
+            .await
+            .optional()?
+            .flatten();
+        if cursor.is_some() {
+            depth += 1;
+        }
+    }
+    Ok(depth)
+}
+
 /// Re-parent a post. Used by the importer's ancestry pass.
 pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> AutumnResult<()> {
     if would_create_cycle(db, post_id, parent_id).await? {
@@ -1045,4 +1098,117 @@ pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> Autum
         .execute(&mut **db)
         .await?;
     Ok(())
+}
+
+/// One page of published, publicly-routable content matching a full-text query.
+///
+/// The visibility predicates are part of the query and the count, not a filter
+/// applied to the page that comes back. Filtering afterwards paginates the
+/// unrestricted result set: a page can return empty while public matches sit on
+/// later pages, and the total would count — and so disclose the number of —
+/// draft and non-public-type matches.
+///
+/// Two statements: the ranked ids (bounded by `LIMIT`), then the rows for those
+/// ids. `#[model]` derives `Queryable`, not `QueryableByName`, so the rows
+/// cannot be loaded by `sql_query` directly — and the `search_vector` generated
+/// column is deliberately absent from `crate::schema::posts` (the
+/// `#[searchable]` codegen owns it), so the match predicate has to be raw SQL.
+/// Every value is bound, never interpolated.
+///
+/// `websearch_to_tsquery` rather than `plainto_tsquery`: it accepts what a
+/// person actually types into a search box — quoted phrases, `or`, `-term` —
+/// instead of erroring on it.
+pub async fn search_published(
+    conn: &mut AsyncPgConnection,
+    query: &str,
+    public_types: &[String],
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<(Vec<Post>, usize)> {
+    use diesel::sql_types::{Array, BigInt, Text};
+
+    if public_types.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct Total {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MatchedId {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+
+    const MATCH_PREDICATE: &str = "status = 'publish' \
+         AND search_vector @@ websearch_to_tsquery('english', $1) \
+         AND post_type = ANY($2)";
+
+    let total: i64 = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM posts WHERE {MATCH_PREDICATE}"
+    ))
+    .bind::<Text, _>(query)
+    .bind::<Array<Text>, _>(public_types.to_vec())
+    .get_result::<Total>(conn)
+    .await?
+    .count;
+
+    let matched: Vec<i64> = diesel::sql_query(format!(
+        "SELECT id FROM posts WHERE {MATCH_PREDICATE} \
+         ORDER BY ts_rank(search_vector, websearch_to_tsquery('english', $1)) DESC, \
+                  published_at DESC NULLS LAST, id DESC \
+         LIMIT $3 OFFSET $4"
+    ))
+    .bind::<Text, _>(query)
+    .bind::<Array<Text>, _>(public_types.to_vec())
+    .bind::<BigInt, _>(limit.max(0))
+    .bind::<BigInt, _>(offset.max(0))
+    .load::<MatchedId>(conn)
+    .await?
+    .into_iter()
+    .map(|row| row.id)
+    .collect();
+
+    if matched.is_empty() {
+        return Ok((Vec::new(), usize::try_from(total).unwrap_or(0)));
+    }
+
+    let mut rows: Vec<Post> = posts::table
+        .filter(posts::id.eq_any(&matched))
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+
+    // Restore the rank order the id query established; `eq_any` does not
+    // preserve it.
+    rows.sort_by_key(|post| {
+        matched
+            .iter()
+            .position(|id| *id == post.id)
+            .unwrap_or(usize::MAX)
+    });
+
+    Ok((rows, usize::try_from(total).unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod slug_shape_tests {
+    use super::reads_as_date_archive;
+
+    #[test]
+    fn only_a_lone_four_digit_slug_reads_as_a_year() {
+        // `permalinks::resolve` reads this shape as a year archive, before it
+        // ever looks for content.
+        assert!(reads_as_date_archive("2026"));
+        assert!(reads_as_date_archive("1999"));
+        // Everything else is ordinary content.
+        assert!(!reads_as_date_archive("202"));
+        assert!(!reads_as_date_archive("20260"));
+        assert!(!reads_as_date_archive("2026-review"));
+        assert!(!reads_as_date_archive("about"));
+        assert!(!reads_as_date_archive(""));
+    }
 }

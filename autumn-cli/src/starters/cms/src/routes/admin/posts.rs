@@ -543,7 +543,7 @@ fn editor(
                             a href=(format!("/admin/content/{}/{}/revisions", registered.slug, post.id))
                               class="text-indigo-700 hover:underline" { "Revisions" }
                             @if post.status != "trash"
-                                && can_delete_post(user.role(), user.id, post.author_id) {
+                                && can_delete_post(user.role(), user.id, post.author_id, &post.status) {
                                 span class="text-gray-300" { "·" }
                                 button type="submit" formmethod="post"
                                        formaction=(format!(
@@ -832,12 +832,21 @@ pub async fn update(
     // A page cannot be parented to itself or to one of its own descendants:
     // that closes a cycle, and page resolution walks down from a NULL parent,
     // so every page in the cycle becomes unreachable at its own permalink.
-    if let Some(parent_id) = optional_id(form.parent_id.as_ref())
-        && content::would_create_cycle(&mut db, id, parent_id).await?
-    {
-        return Err(AutumnError::unprocessable_msg(
-            "A page cannot be placed under itself or one of its own children",
-        ));
+    if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
+        if content::would_create_cycle(&mut db, id, parent_id).await? {
+            return Err(AutumnError::unprocessable_msg(
+                "A page cannot be placed under itself or one of its own children",
+            ));
+        }
+        // The permalink builder walks a bounded number of ancestors; a page
+        // stored deeper than that would render a URL starting mid-tree, which
+        // resolves to nothing. Refuse at assignment rather than emit a 404 link.
+        if content::depth_under(&mut db, parent_id).await? >= content::MAX_PAGE_DEPTH {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "Pages can be nested at most {} levels deep",
+                content::MAX_PAGE_DEPTH
+            )));
+        }
     }
 
     let slug = {
@@ -1022,7 +1031,7 @@ pub async fn transition(
 
     // Trashing is a delete capability; every other move is an edit.
     let allowed = if query.to == "trash" {
-        can_delete_post(user.role(), user.id, post.author_id)
+        can_delete_post(user.role(), user.id, post.author_id, &post.status)
     } else if matches!(query.to.as_str(), "publish" | "private" | "future") {
         user.role().can(Capability::PublishPosts)
             && can_edit_post(user.role(), user.id, post.author_id, &post.status)
