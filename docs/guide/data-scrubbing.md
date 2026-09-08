@@ -418,6 +418,28 @@ and quoted values with escapes), the run **refuses** rather than print a
 destructive block with no boundary above it. Configure such a target as a URI to
 use `--dry-run` on it; scrubbing it without `--dry-run` is unaffected.
 
+That boundary is checked rather than trusted. `\connect` does **not** close the
+existing connection when the new one fails: psql prints `Previous connection
+kept` and the session carries on, so the block below it would run against the
+previous target. Removing the password from the printed conninfo is what makes
+that failure likely rather than remote. So each block opens with
+`\set ON_ERROR_STOP on` — which covers running the file with `psql -f`, where a
+failed `\connect` already halts — and, as its first statement inside the
+transaction, one that aborts unless `current_database()` is the target the block
+names:
+
+```text
+ERROR:  this block is for database app_copy, but the session is on app_shard_1
+        — the \connect above did not take effect (psql keeps the previous
+        connection when one fails)
+```
+
+An interactive paste ignores `ON_ERROR_STOP`, but it cannot ignore an aborted
+transaction: every following statement is refused with `current transaction is
+aborted`, and the closing `COMMIT` rolls back. That guard is printed and never
+executed by `autumn db scrub` itself, which opens its own connection and cannot
+be on the wrong database.
+
 The walk prints as the loop it is — a `DO` block that repeats the pass and stops on one
 that selects nothing — rather than as a single pass with a comment saying to
 repeat it. The difference is not cosmetic: within a pass the statements run in
