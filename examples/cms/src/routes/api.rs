@@ -238,6 +238,18 @@ pub async fn create_post(
             "Scheduling is not available through the API; create a draft and publish it",
         ));
     }
+    // A deferred transition is checked *before* the insert. `private` is
+    // reached by transitioning a draft, and that edge carries the `can_publish`
+    // guard — so a request with an empty title used to commit a draft and then
+    // fail, leaving a row behind that the client never asked for and did not
+    // learn about, with each retry allocating another suffixed slug. The guard
+    // depends only on the content being submitted, so asking first costs
+    // nothing and makes the failure clean.
+    if status == "private" && body.title.trim().is_empty() {
+        return Err(AutumnError::unprocessable_msg(
+            "A private post must have a title",
+        ));
+    }
     let deferred_transition = (status == "private").then(|| status.clone());
     let initial_status = if deferred_transition.is_some() {
         "draft".to_owned()

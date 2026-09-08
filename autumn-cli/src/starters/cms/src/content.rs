@@ -225,11 +225,25 @@ pub async fn restore_revision(
         // alone: restoring the text of a draft must not silently republish
         // it, and restoring a published post's older text must not
         // unpublish it.
+        //
+        // Which is exactly why the merged row has to be revalidated. A revision
+        // captured while the post was an untitled draft is a legitimate
+        // snapshot; restoring it onto the *live* post keeps the live status and
+        // would write the empty title straight past the invariant every other
+        // edit path now enforces.
+        let mut merged = post.clone();
+        merged.title.clone_from(&revision.title);
+        merged.excerpt.clone_from(&revision.excerpt);
+        merged.body.clone_from(&revision.body);
+        crate::hooks::validate_post_update(&post, &mut merged)?;
+
         let saved: Post = diesel::update(posts::table.find(post_id))
             .set((
-                posts::title.eq(&revision.title),
-                posts::excerpt.eq(&revision.excerpt),
-                posts::body.eq(&revision.body),
+                posts::title.eq(&merged.title),
+                posts::slug.eq(&merged.slug),
+                posts::excerpt.eq(&merged.excerpt),
+                posts::body.eq(&merged.body),
+                posts::published_at.eq(merged.published_at),
                 posts::lock_version.eq(post.lock_version + 1),
                 posts::updated_at.eq(chrono::Utc::now().naive_utc()),
             ))
@@ -1789,6 +1803,24 @@ pub async fn publish_due_post(
 
         if updated == 0 {
             return Ok(false);
+        }
+
+        // The same bookkeeping `transition_status` does, because this *is* a
+        // status transition — it only takes a different shape because the
+        // sweep needs the claim to be conditional. Without it a scheduled
+        // publication was missing from the history the editor advertises as
+        // recording every change, and left `lock_version` untouched, so an
+        // editor holding a form rendered before the post went live could save
+        // over it without the stale-edit check noticing.
+        let published: Post = diesel::update(posts::table.find(post_id))
+            .set(posts::lock_version.eq(posts::lock_version + 1))
+            .returning(Post::as_returning())
+            .get_result(conn)
+            .await?;
+        if type_supports_revisions(&published.post_type) {
+            published
+                .record_revision(conn, &format!("Status: future → {new_status}"))
+                .await?;
         }
 
         // The post was `future` when its terms were last counted, so every

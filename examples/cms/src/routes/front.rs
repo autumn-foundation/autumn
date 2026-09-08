@@ -584,7 +584,7 @@ async fn single_post(
                 p class="text-sm text-gray-500 flex flex-wrap gap-2" {
                     @if let Some(published) = post.published_at {
                         time datetime=(published.and_utc().to_rfc3339()) {
-                            (published.format(&settings.date_format).to_string())
+                            (settings.format_date(published))
                         }
                     }
                     @if let Some(author) = &author {

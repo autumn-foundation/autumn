@@ -536,6 +536,36 @@ async fn register(client: &TestClient, username: &str) -> String {
     session_cookie(&resp)
 }
 
+/// The settings form, filled with the shipped defaults, with `overrides` applied.
+///
+/// Posting a partial settings form is a trap: `comment_moderation` and
+/// `allow_guest_comments` are `Option<String>`, so a browser omits them when
+/// unchecked and the handler reads *absent* as *off*. A test that names only
+/// the field it cares about therefore silently disables guest comments — and
+/// because the settings read is memoized per process, it does so for every test
+/// that runs after it, in a way that looks like an unrelated failure. Building
+/// from the defaults here means a test can only change what it names.
+fn settings_form(overrides: &[(&str, &str)]) -> String {
+    let mut fields: Vec<(&str, &str)> = vec![
+        ("site_title", "Test Site"),
+        ("tagline", ""),
+        ("permalink_structure", "day_and_name"),
+        ("posts_per_page", "10"),
+        ("default_comment_status", "open"),
+        ("comment_moderation", "on"),
+        ("allow_guest_comments", "on"),
+        ("active_theme", "default"),
+        ("date_format", "%B %-d, %Y"),
+    ];
+    for (key, value) in overrides {
+        match fields.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value,
+            None => fields.push((key, value)),
+        }
+    }
+    form(&fields)
+}
+
 /// Create a post through the admin editor and return its id.
 async fn create_post(
     client: &TestClient,
@@ -1427,14 +1457,9 @@ async fn changing_the_permalink_structure_does_not_break_existing_urls() {
     client
         .post("/admin/settings")
         .header("cookie", &cookie)
-        .form(&form(&[
+        .form(&settings_form(&[
             ("site_title", "Autumn CMS"),
-            ("tagline", ""),
-            ("posts_per_page", "10"),
             ("permalink_structure", "day_and_name"),
-            ("default_comment_status", "open"),
-            ("active_theme", "default"),
-            ("date_format", "%B %-d, %Y"),
             ("front_page_id", ""),
         ]))
         .send()
@@ -2526,15 +2551,7 @@ async fn the_sitemap_carries_plain_permalinks() {
     client
         .post("/admin/settings")
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("site_title", "Test Site"),
-            ("tagline", ""),
-            ("permalink_structure", "plain"),
-            ("posts_per_page", "10"),
-            ("default_comment_status", "open"),
-            ("active_theme", "default"),
-            ("date_format", "%B %-d, %Y"),
-        ]))
+        .form(&settings_form(&[("permalink_structure", "plain")]))
         .send()
         .await
         .assert_status(303);
@@ -2925,4 +2942,198 @@ async fn the_posts_api_pages_through_the_corpus() {
         .assert_ok()
         .json();
     assert_eq!(authors.as_array().map(Vec::len), Some(1));
+}
+
+/// A malformed date format must not take the site down.
+///
+/// `format()` defers everything to `Display`, a bad directive makes `Display`
+/// return an error, and `to_string()` turns that into a panic — so `%` in the
+/// settings form would 500 every dated listing and every single-post page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_malformed_date_format_is_refused_rather_than_crashing_the_site() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Dated", "Body.", "publish").await;
+
+    let settings = |date_format: &str| settings_form(&[("date_format", date_format)]);
+
+    // A pattern chrono cannot render.
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings("%"))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Every dated surface still renders.
+    sign_out(&client);
+    client.get("/").send().await.assert_ok();
+    let dated = client
+        .get("/api/v1/posts")
+        .send()
+        .await
+        .assert_ok()
+        .json::<serde_json::Value>();
+    let url = dated.as_array().expect("array")[0]["url"]
+        .as_str()
+        .expect("url")
+        .to_owned();
+    client.get(&url).send().await.assert_ok();
+
+    // A valid pattern is still accepted and applied.
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings("%Y/%m/%d"))
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client
+        .get(&url)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains(&chrono::Utc::now().format("%Y/%m/%d").to_string());
+}
+
+/// A failed private creation leaves nothing behind.
+///
+/// `private` is reached by transitioning a draft, and that edge carries the
+/// `can_publish` guard — so an empty title committed the draft, then failed,
+/// leaving a row the client never asked for and each retry allocating another
+/// suffixed slug.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_private_api_creation_persists_nothing() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for _ in 0..3 {
+        let refused = client
+            .post("/api/v1/posts")
+            .header("cookie", &cookie)
+            .json(&serde_json::json!({
+                "title": "",
+                "body": "No title here.",
+                "status": "private",
+            }))
+            .send()
+            .await;
+        assert_eq!(refused.status, 422, "body: {}", refused.text());
+    }
+
+    // Nothing was written by any of the three attempts.
+    let listing = client
+        .get("/admin/content/post")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        !listing.contains("No title here."),
+        "a refused creation must persist nothing:\n{listing}"
+    );
+}
+
+/// Restoring an untitled revision onto a live post is refused.
+///
+/// A revision captured while the post was an untitled draft is legitimate;
+/// restoring it keeps the live status, so it would write the empty title past
+/// the invariant every other edit path enforces.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restoring_an_untitled_revision_onto_a_live_post_is_refused() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // An untitled draft. Legal: the title invariant applies to live content.
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", ""),
+            ("slug", "work-in-progress"),
+            ("excerpt", ""),
+            ("body", "First body."),
+            ("status", "draft"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "body: {}", created.text());
+    let id: i64 = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .parse()
+        .expect("numeric id");
+
+    // Its initial revision therefore carries an empty title. Now give it one
+    // and publish.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Final Title"),
+            ("slug", "work-in-progress"),
+            ("excerpt", ""),
+            ("body", "Second body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The oldest revision is the untitled snapshot.
+    let history = client
+        .get(&format!("/admin/content/post/{id}/revisions"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let untitled_revision = history
+        .match_indices("/revisions/")
+        .filter_map(|(at, _)| {
+            history[at + "/revisions/".len()..]
+                .split('/')
+                .next()
+                .and_then(|id| id.parse::<i64>().ok())
+        })
+        .min()
+        .expect("at least one revision");
+
+    let refused = client
+        .post(&format!(
+            "/admin/content/post/{id}/revisions/{untitled_revision}/restore"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "restoring an untitled revision onto a live post must be refused: {}",
+        refused.text()
+    );
+
+    // The live post is untouched.
+    let post: serde_json::Value = client
+        .get(&format!("/api/v1/posts/{id}"))
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(post["title"], serde_json::json!("Final Title"));
 }

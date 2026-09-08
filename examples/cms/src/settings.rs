@@ -76,6 +76,21 @@ pub mod keys {
     pub const FRONT_PAGE_ID: &str = "front_page_id";
 }
 
+/// Whether a strftime pattern can actually be rendered.
+///
+/// `NaiveDateTime::format` parses nothing eagerly — it hands back a
+/// `DelayedFormat` whose `Display` does the work and returns `Err` on a bad
+/// directive. `write!` surfaces that as a `Result`; `to_string()` panics on it.
+/// The probe date carries a value for every field a pattern might name.
+fn is_renderable_date_format(pattern: &str) -> bool {
+    use std::fmt::Write as _;
+    let probe = chrono::NaiveDate::from_ymd_opt(2026, 1, 31)
+        .and_then(|date| date.and_hms_opt(13, 45, 6))
+        .expect("the probe timestamp is a valid date and time");
+    let mut out = String::new();
+    write!(out, "{}", probe.format(pattern)).is_ok()
+}
+
 impl Settings {
     /// Build a settings struct from raw `(name, value)` option rows.
     ///
@@ -111,7 +126,22 @@ impl Settings {
                 keys::ACTIVE_THEME if !value.is_empty() => {
                     settings.active_theme = value.to_owned();
                 }
-                keys::DATE_FORMAT if !value.is_empty() => settings.date_format = value.to_owned(),
+                // Only a pattern that actually renders. An unrenderable one
+                // is not a cosmetic mistake: `format()` defers everything to
+                // `Display`, a malformed directive makes `Display` return an
+                // error, and `to_string()` turns that into a *panic* — so a
+                // single typo in the settings form (`%` is enough) takes down
+                // every dated listing and every single-post page at once.
+                //
+                // Checked here rather than only in the form handler because
+                // this is the one funnel every source goes through: the form,
+                // an import, a direct write to `options`. A value that fails is
+                // ignored, leaving the previous (or default) format in place —
+                // a wrong-looking date is survivable, a 500 on every public
+                // page is not.
+                keys::DATE_FORMAT if !value.is_empty() && is_renderable_date_format(value) => {
+                    settings.date_format = value.to_owned();
+                }
                 keys::FRONT_PAGE_ID => {
                     settings.front_page_id = value.parse::<i64>().ok().filter(|id| *id > 0);
                 }
@@ -119,6 +149,23 @@ impl Settings {
             }
         }
         settings
+    }
+
+    /// Render a timestamp with the configured pattern, without the panic.
+    ///
+    /// `format(..).to_string()` is the obvious spelling and it panics on a
+    /// malformed pattern. `from_rows` refuses to store one, so this should
+    /// never see it — but the line is short enough to copy into new code, and
+    /// this makes the copied version safe by construction.
+    #[must_use]
+    pub fn format_date(&self, when: chrono::NaiveDateTime) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if write!(out, "{}", when.format(&self.date_format)).is_ok() {
+            return out;
+        }
+        // Unreachable via `from_rows`; ISO-8601 rather than an empty cell.
+        when.format("%Y-%m-%d").to_string()
     }
 
     /// The `(name, value)` pairs that persist this struct.

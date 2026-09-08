@@ -345,7 +345,7 @@ impl Theme for MinimalTheme {
                 @if let Some(published) = post.published_at {
                     time datetime=(published.and_utc().to_rfc3339())
                          class="text-xs text-gray-400 shrink-0" {
-                        (published.format(&settings.date_format).to_string())
+                        (settings.format_date(published))
                     }
                 }
             }
@@ -383,7 +383,7 @@ fn default_post_card(post: &Post, url: &str, settings: &Settings) -> Markup {
             p class="text-xs text-gray-500 mb-2" {
                 @if let Some(published) = post.published_at {
                     time datetime=(published.and_utc().to_rfc3339()) {
-                        (published.format(&settings.date_format).to_string())
+                        (settings.format_date(published))
                     }
                 }
                 @if post.comment_count > 0 {

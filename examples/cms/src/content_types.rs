@@ -202,22 +202,24 @@ fn claim_on(field: &'static str, segment: &str) -> Result<(), RegistrationError>
 /// good. Only a *new* registration is checked; replacing a built-in keeps its
 /// existing segments by definition.
 pub fn register_post_type(post_type: PostType) -> Result<(), RegistrationError> {
-    let mut types = post_types().write().expect("post type registry poisoned");
-    if let Some(existing) = types.iter_mut().find(|t| t.slug == post_type.slug) {
-        *existing = post_type;
-        return Ok(());
-    }
-    drop(types);
-
+    // Checked before the registry is touched, and for a replacement as well as
+    // a new registration. Adjusting an existing type is the documented way to
+    // change it — which means it is also the way to *move* it onto a claimed
+    // prefix, and a replacement that skipped the check could set
+    // `archive_base` to `search` or `category` and make the archive
+    // permanently unreachable. Neither check can trip on the type's own
+    // registration: they look at application routes and taxonomy bases, and a
+    // post type is neither.
     claim_on("slug", post_type.slug)?;
     if post_type.has_archive {
         claim_on("archive_base", post_type.archive_base)?;
     }
 
-    post_types()
-        .write()
-        .expect("post type registry poisoned")
-        .push(post_type);
+    let mut types = post_types().write().expect("post type registry poisoned");
+    match types.iter_mut().find(|t| t.slug == post_type.slug) {
+        Some(existing) => *existing = post_type,
+        None => types.push(post_type),
+    }
     Ok(())
 }
 
@@ -228,13 +230,8 @@ pub fn register_post_type(post_type: PostType) -> Result<(), RegistrationError> 
 /// Refuses a `rewrite_base` an application route already claims, for the same
 /// reason.
 pub fn register_taxonomy(taxonomy: Taxonomy) -> Result<(), RegistrationError> {
-    let mut taxes = taxonomies().write().expect("taxonomy registry poisoned");
-    if let Some(existing) = taxes.iter_mut().find(|t| t.slug == taxonomy.slug) {
-        *existing = taxonomy;
-        return Ok(());
-    }
-    drop(taxes);
-
+    // Before the registry is touched, and for replacements too — see
+    // `register_post_type`.
     if crate::content::is_reserved_path(taxonomy.rewrite_base) {
         return Err(RegistrationError::ReservedPath {
             field: "rewrite_base",
@@ -242,10 +239,11 @@ pub fn register_taxonomy(taxonomy: Taxonomy) -> Result<(), RegistrationError> {
         });
     }
 
-    taxonomies()
-        .write()
-        .expect("taxonomy registry poisoned")
-        .push(taxonomy);
+    let mut taxes = taxonomies().write().expect("taxonomy registry poisoned");
+    match taxes.iter_mut().find(|t| t.slug == taxonomy.slug) {
+        Some(existing) => *existing = taxonomy,
+        None => taxes.push(taxonomy),
+    }
     Ok(())
 }
 
