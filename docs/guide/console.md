@@ -68,7 +68,9 @@ autumn console
 
 `--profile` also selects which `[profile.<name>.database]` section of
 `autumn.toml` supplies the URL, so `autumn console --profile demo` talks to the
-same database `autumn dev --profile demo` would.
+same database `AUTUMN_ENV=demo autumn dev` would. (`autumn dev` has no
+`--profile` of its own — it reads the profile from the environment, which is
+what `--profile` sets here.)
 
 `autumn c` is a shorthand alias for `autumn console`.
 

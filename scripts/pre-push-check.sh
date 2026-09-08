@@ -38,7 +38,12 @@
 # NOT run here (need Docker / a backend-flip feature / a browser — out of scope
 # for a fast, disk-cheap compile-only gate; CI runs them in dedicated jobs):
 #   - the Docker/testcontainer `#[ignore]`d sweep (ci.yml "Run Docker-dependent tests")
-#   - the `sqlite-runtime` lane (`--features sqlite`, a backend-flip feature)
+#   - the `sqlite-runtime` lane (`--features sqlite`, a backend-flip feature).
+#     Note what that costs since #1905: that lane now runs a BARE `--lib`, so a
+#     fixture that only panics under the flip (an inline `postgres://` target,
+#     say) is invisible here and surfaces on the PR. Reproduce it with
+#     `cargo test -p autumn-web --features sqlite --lib` when touching a test
+#     fixture that names a database target.
 #   - the `system-tests` (Chromium) browser suite
 #
 # Usage (runnable from anywhere in the tree):
@@ -87,6 +92,15 @@ step "./scripts/check-determinism-gate.sh   (self-test + seam gate; no toolchain
 # ---------------------------------------------------------------------------
 step "./scripts/check-plugin-surface.sh   (self-test + plugin API contract; no toolchain)"
 ./scripts/check-plugin-surface.sh
+
+# --- 1d. SQLite feature-unification gate (issue #1905) -----------------------
+# Mirrors ci.yml `lint` job: `./scripts/check-sqlite-unification.sh`. Same shape
+# as the gates above — seconds, no toolchain, self-testing — and it covers the
+# one invariant this script otherwise cannot: the legs below never enable
+# `sqlite`, so a dependency edge that turns the backend flip on for the whole
+# graph would compile here and break the Postgres lane in CI.
+step "./scripts/check-sqlite-unification.sh   (self-test + manifest gate; no toolchain)"
+./scripts/check-sqlite-unification.sh
 
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.

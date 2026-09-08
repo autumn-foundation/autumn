@@ -1,0 +1,45 @@
+# cargo-deny configuration for the `fuzz` satellite workspace.
+#
+# `fuzz` is its own workspace root (see the root `Cargo.toml`'s `[workspace]
+# exclude` and this crate's own `[workspace]` table) with its own `Cargo.lock`,
+# so nothing in the root `deny.toml` ever sees its dependency graph — yet it is
+# a real, CI-built artifact: `.github/workflows/fuzz.yml` compiles and runs
+# every fuzz target on every push/PR to trunk & trunk-dev. `scripts/
+# check-advisories.sh` audits this graph the same way it audits the main
+# workspace (see "advisory gate (issue #1600, #2565)" there).
+#
+# Scope, deliberately narrower than the root policy: only `advisories` and
+# `sources` are gated here. `licenses` is NOT run against this graph yet —
+# `libfuzzer-sys` carries `(MIT OR Apache-2.0) AND NCSA`, an unconditional
+# (not OR-satisfied) NCSA component that is not on the root allow-list and
+# is a new license class for this tree. Accepting a new license class is an
+# "ask before" decision (see the repo's dependency-hygiene charter), not
+# something this config should decide unilaterally. Until a human accepts
+# NCSA for this satellite graph (or the crate is dropped), `licenses` stays
+# ungated here — tracked in docs/reports/2026-09-07-ballast-dependency-
+# ledger-audit.md.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "warn"
+ignore = [
+    # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
+    # Same ingress and same verdict as the root `deny.toml`: rsa 0.9.10 ->
+    # jsonwebtoken -> autumn-web -> autumn-fuzz (this crate pulls in the same
+    # autumn-web JWT surface the main workspace does). No patched rsa release
+    # exists; Autumn exposes no network-reachable attacker-timed RSA
+    # private-key decryption oracle. None of the fuzz targets exercise the
+    # JWT sign/verify path specifically. Review-by: 2026-10-01, matching the
+    # root policy's own review-by for this same advisory.
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken, same as root deny.toml; not exercised by any fuzz target; review-by 2026-10-01" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
