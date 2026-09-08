@@ -497,6 +497,53 @@ fn an_optional_colliding_value_still_gets_its_null_branch() {
     );
 }
 
+// ── A scalar name collision must be verified, not assumed (issue #802) ─
+
+/// An application type whose last path segment is `Uuid` but which serializes
+/// as an OBJECT, and which derives no schema of its own.
+pub struct Uuid {
+    pub raw: String,
+}
+
+/// Written as the bare `Uuid`, exactly as a colliding import would be.
+// `uuid::Uuid` carries no serde impls in this crate's feature set, so the
+// fixture derives the schema alone — which is all this test exercises.
+#[derive(autumn_web::openapi::OpenApiSchema)]
+pub struct HoldsCollidingUuid {
+    pub id: Uuid,
+    /// The genuine external scalar, for contrast.
+    pub real: uuid::Uuid,
+}
+
+/// The scalar table matches the LAST PATH SEGMENT, so a colliding application
+/// type reaches it. The inventory check alone could not catch this one — an
+/// underived type has nothing registered to find — so the FULL runtime identity
+/// is checked too. Advertising this object as a uuid string would have a
+/// generated client fail to decode every response carrying it.
+#[test]
+fn a_colliding_scalar_name_is_not_inlined_as_a_scalar() {
+    let schema = <HoldsCollidingUuid as autumn_web::openapi::OpenApiSchema>::schema();
+
+    let colliding = &schema["properties"]["id"];
+    assert!(
+        colliding.get("format").is_none(),
+        "an application `Uuid` that serializes as an object must not be \
+         advertised as a uuid string: {colliding}"
+    );
+    assert!(
+        colliding["$ref"]
+            .as_str()
+            .is_some_and(|r| r.contains("Uuid")),
+        "it falls through to a $ref carrying its full identity: {colliding}"
+    );
+
+    // The genuine `uuid::Uuid` still takes the scalar branch — the guard must
+    // not cost the mapping it exists to protect.
+    let real = &schema["properties"]["real"];
+    assert_eq!(real["type"], "string", "{real}");
+    assert_eq!(real["format"], "uuid", "{real}");
+}
+
 // ── New* datetime matches its own deserializer (issue #802) ────────────
 
 mod schema_datetime {

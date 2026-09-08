@@ -652,24 +652,49 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         });
         // Matching is on the type's LAST PATH SEGMENT, because a proc macro sees
         // only the tokens as written and `use chrono::NaiveDateTime;` is the
-        // normal spelling. An application type that happens to share one of
-        // these names would otherwise be described as the external scalar, so
-        // check the derived-schema inventory FIRST at runtime: a colliding type
-        // carrying `#[derive(OpenApiSchema)]` resolves to its own real schema,
-        // and only a type nothing registered falls through to the scalar. (The
-        // same last-segment limitation already governs `primitive_json_type`
-        // for `String`, `bool` and the numerics.)
+        // normal spelling. Two runtime checks then establish that the type
+        // really IS the external scalar before it is described as one:
+        //
+        //   1. The derived-schema inventory. A colliding application type
+        //      carrying `#[derive(OpenApiSchema)]` resolves to its own schema.
+        //   2. Its FULL runtime path. An application `Uuid` or `DateTime` that
+        //      derives NOTHING used to fall through to the scalar and be
+        //      advertised as a uuid/date-time string even though it serializes
+        //      as an object — check (1) alone could not see it, because there
+        //      was nothing registered to find. `type_name` gives the
+        //      fully-qualified path, so only the genuine `chrono::`/`uuid::`
+        //      types take this branch; anything else falls through to the same
+        //      `$ref` the fallback below emits, where it is either resolved or
+        //      honestly reported as opaque.
+        //
+        // (The same last-segment limitation still governs `primitive_json_type`
+        // for `String`, `bool` and the numerics, where the stakes are lower: a
+        // colliding `String` would have to be a non-string-serializing type of
+        // that exact name.)
         return quote! {{
             match ::autumn_web::openapi::registered_derived_schema(
                 ::core::any::type_name::<#ty>()
             ) {
                 ::core::option::Option::Some(__derived) => __derived,
                 ::core::option::Option::None => {
-                    let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
-                    __scalar.insert("type".to_owned(), #json_type.into());
-                    #format_insert
-                    #description_insert
-                    ::autumn_web::reexports::serde_json::Value::Object(__scalar)
+                    let __identity = ::core::any::type_name::<#ty>();
+                    let __is_external_scalar = __identity.starts_with("chrono::")
+                        || __identity.starts_with("uuid::");
+                    if __is_external_scalar {
+                        let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
+                        __scalar.insert("type".to_owned(), #json_type.into());
+                        #format_insert
+                        #description_insert
+                        ::autumn_web::reexports::serde_json::Value::Object(__scalar)
+                    } else {
+                        // Same full-identity `$ref` shape the fallback below
+                        // emits, so the finalize collision index can rewrite it.
+                        let __ref_path = ::std::format!(
+                            "#/components/schemas/{}",
+                            __identity
+                        );
+                        ::autumn_web::reexports::serde_json::json!({ "$ref": __ref_path })
+                    }
                 }
             }
         }};
