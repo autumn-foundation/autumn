@@ -12456,7 +12456,7 @@ pub struct Vault {
         );
     }
 
-    fn probe(status: &str, dns: DnsPointsHere) -> CustomDomainProbe {
+    fn probe(status: &str, dns: CustomDomainDns) -> CustomDomainProbe {
         CustomDomainProbe {
             hostname: "app.clientco.com".to_owned(),
             tenant: "tenant-a".to_owned(),
@@ -12491,8 +12491,8 @@ pub struct Vault {
     fn a_live_custom_domain_whose_dns_moved_away_fails() {
         let moved = probe(
             "active",
-            DnsPointsHere::ResolvesElsewhere {
-                resolved: vec!["198.51.100.7".to_owned()],
+            CustomDomainDns::PointsElsewhere {
+                seen: vec!["198.51.100.7".to_owned()],
             },
         );
         let result = check_custom_domain_dns_impl(&moved);
@@ -12504,7 +12504,7 @@ pub struct Vault {
 
         // Gone entirely is just as bad.
         assert_eq!(
-            check_custom_domain_dns_impl(&probe("active", DnsPointsHere::Unresolved)).status,
+            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::Unresolved)).status,
             CheckStatus::Fail
         );
     }
@@ -12513,14 +12513,15 @@ pub struct Vault {
     fn a_pending_custom_domain_that_does_not_point_here_yet_is_only_a_warning() {
         // Not yet published is the ordinary state right after registration.
         assert_eq!(
-            check_custom_domain_dns_impl(&probe("pending_dns", DnsPointsHere::Unresolved)).status,
+            check_custom_domain_dns_impl(&probe("pending_dns", CustomDomainDns::Unresolved))
+                .status,
             CheckStatus::Warn
         );
         assert_eq!(
             check_custom_domain_dns_impl(&probe(
                 "pending_dns",
-                DnsPointsHere::ResolvesElsewhere {
-                    resolved: vec!["198.51.100.7".to_owned()],
+                CustomDomainDns::PointsElsewhere {
+                    seen: vec!["198.51.100.7".to_owned()],
                 }
             ))
             .status,
@@ -12528,12 +12529,13 @@ pub struct Vault {
         );
         // Pointing here is a Pass whatever the state.
         assert_eq!(
-            check_custom_domain_dns_impl(&probe("active", DnsPointsHere::Matches)).status,
+            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::PointsHere)).status,
             CheckStatus::Pass
         );
         // Unknowable from inside a NAT is never a hard failure.
         assert_eq!(
-            check_custom_domain_dns_impl(&probe("active", DnsPointsHere::LocalIpsUnknown)).status,
+            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::IngressUnknown))
+                .status,
             CheckStatus::Warn
         );
     }
