@@ -224,6 +224,15 @@ pub struct Renderer<'a> {
     pub ctx: &'a RenderContext,
     nodes: usize,
     portals: Vec<RenderedPortal>,
+    /// Bytes an expression may still allocate, for the **whole render**.
+    ///
+    /// Render-scoped, not per expression, and that distinction is the entire
+    /// point. A per-expression allowance bounds each value on its own and
+    /// nothing in aggregate, so a document with a few thousand expressions —
+    /// handler payload entries, `route.meta` keys, attributes — each get the
+    /// full allowance and together retain gigabytes. Every expression in the
+    /// render draws from this one pool, so the aggregate is what is bounded.
+    budget: Cell<usize>,
     /// Bytes of output that are not in the buffer currently being written:
     /// finished portals, plus — while a portal is being rendered — the caller's
     /// body up to that point.
@@ -251,6 +260,7 @@ pub fn render(
         ctx,
         nodes: 0,
         portals: Vec::new(),
+        budget: Cell::new(ctx.limits.max_output_bytes),
         committed_bytes: 0,
     };
     let env = Env::default();
@@ -300,12 +310,13 @@ impl Renderer<'_> {
         path: &str,
         depth: usize,
     ) -> Result<Value, ConstelaError> {
-        // One expression's result feeds one attribute or one text node, so the
-        // output budget is the right ceiling for what building it may allocate.
-        // Fresh per expression: this bounds a single value's construction, and
-        // `reserve` bounds what reaches the buffer.
-        let budget = Cell::new(self.ctx.limits.max_output_bytes);
-        eval(expr, &self.eval_ctx(env, depth, &budget), path)
+        // `&self.budget`, deliberately: the pool is shared by every expression
+        // in the render, so a thousand expressions cannot each spend the whole
+        // allowance. Values that are built and dropped (an attribute that
+        // evaluates to `false`, say) still consume from it — an approximation
+        // that errs toward refusing work, which is the right direction on a
+        // hostile path.
+        eval(expr, &self.eval_ctx(env, depth, &self.budget), path)
     }
 
     /// Evaluate `route.title` and `route.meta`.
@@ -318,13 +329,22 @@ impl Renderer<'_> {
         };
         let depth = self.ctx.limits.max_depth;
         let title = match &route.title {
-            Some(expr) => Some(text_of(&self.eval(expr, env, "route.title", depth)?)),
+            Some(expr) => {
+                let text = text_of(&self.eval(expr, env, "route.title", depth)?);
+                self.charge_budget(text.len(), "route.title")?;
+                Some(text)
+            }
             None => None,
         };
         let mut meta = BTreeMap::new();
         for (key, expr) in &route.meta {
             let value = self.eval(expr, env, &format!("route.meta.{key}"), depth)?;
-            meta.insert(key.clone(), text_of(&value));
+            let text = text_of(&value);
+            // `meta` is retained and handed back, so it is output like any
+            // other — but it never passes through a buffer, so `reserve` would
+            // never see it. Charge it here.
+            self.charge_budget(text.len(), &format!("route.meta.{key}"))?;
+            meta.insert(key.clone(), text);
         }
         Ok((title, meta))
     }
@@ -353,6 +373,26 @@ impl Renderer<'_> {
                 ),
             )));
         }
+        Ok(())
+    }
+
+    /// Spend `bytes` from the render-wide allocation budget.
+    ///
+    /// For output that is retained rather than written to a buffer — route
+    /// metadata, an event payload — which `reserve` therefore never sees.
+    fn charge_budget(&self, bytes: usize, path: &str) -> Result<(), ConstelaError> {
+        let remaining = self.budget.get();
+        if bytes > remaining {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path,
+                codes::RENDER_LIMIT,
+                format!(
+                    "render would allocate more than {} bytes",
+                    self.ctx.limits.max_output_bytes
+                ),
+            )));
+        }
+        self.budget.set(remaining.saturating_sub(bytes));
         Ok(())
     }
 
@@ -612,7 +652,8 @@ impl Renderer<'_> {
         // duration, and restore afterwards so it is not counted twice — the
         // caller's own checks add its live length back.
         let outer = self.committed_bytes;
-        self.committed_bytes = outer.saturating_add(caller_bytes);
+        let entry = outer.saturating_add(caller_bytes);
+        self.committed_bytes = entry;
 
         let mut inner = String::new();
         let rendered = (|renderer: &mut Self| {
@@ -628,7 +669,13 @@ impl Renderer<'_> {
             }
             Ok::<(), ConstelaError>(())
         })(self);
-        self.committed_bytes = outer;
+        // Restore by *delta*, not by absolute value. A nested portal inside
+        // this one commits its own bytes while the render runs, and assigning
+        // `outer` back would discard them — an `each` over a portal-wrapping-a-
+        // portal would then forget the inner content on every iteration and
+        // emit unbounded output under a bounded-looking counter.
+        let nested = self.committed_bytes.saturating_sub(entry);
+        self.committed_bytes = outer.saturating_add(nested);
         rendered?;
 
         self.committed_bytes = self.committed_bytes.saturating_add(inner.len());
@@ -941,9 +988,14 @@ impl Renderer<'_> {
                     Value::Object(map)
                 }
             };
+            let serialized = value.to_string();
+            // The map above is assembled here, not inside the evaluator, so
+            // only the individual entries were charged. The serialized whole
+            // is what is retained.
+            self.charge_budget(serialized.len(), &format!("{path}.payload"))?;
             attrs.push((
                 format!("data-constela-payload-{event}"),
-                Some(escape_attr(&value.to_string())),
+                Some(escape_attr(&serialized)),
             ));
         }
         if let Some(ms) = handler.debounce {

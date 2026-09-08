@@ -302,6 +302,7 @@ impl Document {
         env.vars
             .extend(payload.iter().map(|(k, v)| (k.clone(), v.clone())));
 
+        let budget = std::cell::Cell::new(RenderLimits::default().max_output_bytes);
         let ctx = dispatch::DispatchCtx {
             route,
             styles: &self.program.styles,
@@ -311,7 +312,8 @@ impl Document {
             // document's nesting at parse time, and this is the backstop for
             // the case where that was raised.
             depth: RenderLimits::default().max_depth,
-            max_value_bytes: RenderLimits::default().max_output_bytes,
+            // One pool for the whole dispatch; see `DispatchCtx::budget`.
+            budget: &budget,
         };
         let mut outcome = Dispatched::default();
         dispatch::run_steps(

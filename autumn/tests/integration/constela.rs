@@ -1282,3 +1282,135 @@ fn two_handlers_binding_the_same_event_are_rejected() {
     );
     assert!(codes.contains(&codes::DUPLICATE), "{codes:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Regressions from the fourth Codex round on #2623
+// ---------------------------------------------------------------------------
+//
+// All three were the same root cause: the allocation budget was created fresh
+// **per expression**, so N expressions each received the full allowance and
+// nothing bounded the aggregate. It is now one pool per render and one per
+// dispatch. These tests pin the aggregate, which is the property that was
+// missing — bounding each value alone never implied it.
+
+/// Thousands of `route.meta` entries, each a separate expression, each
+/// referencing the same large state value. Every one fit its own allowance;
+/// together they retained gigabytes, and metadata never passes through an
+/// output buffer so `reserve` could not see it either.
+#[test]
+fn route_metadata_is_bounded_in_aggregate() {
+    let entries: Vec<String> = (0..2_000)
+        .map(|i| format!(r#""k{i}":{{"expr":"state","name":"blob"}}"#))
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+            "route":{{"meta":{{{}}}}},
+            "state":{{"blob":{{"type":"string","initial":""}}}},
+            "view":{{"kind":"element","tag":"div"}}}}"#,
+        entries.join(",")
+    );
+
+    let document = Document::parse(&source, &Limits::unbounded()).expect("validates");
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(32 * 1024)));
+
+    let ctx = RenderContext {
+        state,
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("metadata over the budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// The same shape through a handler payload map, which is assembled outside the
+/// evaluator and retained as a serialized attribute.
+#[test]
+fn handler_payloads_are_bounded_in_aggregate() {
+    let entries: Vec<String> = (0..2_000)
+        .map(|i| format!(r#""k{i}":{{"expr":"state","name":"blob"}}"#))
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+            "state":{{"blob":{{"type":"string","initial":""}}}},
+            "actions":[{{"name":"go","steps":[]}}],
+            "view":{{"kind":"element","tag":"button","props":{{
+              "onClick":{{"event":"click","action":"go","payload":{{{}}}}}}}}}}}"#,
+        entries.join(",")
+    );
+
+    let document = Document::parse(&source, &Limits::unbounded()).expect("validates");
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(32 * 1024)));
+
+    let ctx = RenderContext {
+        state,
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("payload over the budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// A portal nested inside a portal, repeated by an `each`. The fix for the
+/// earlier portal finding restored `committed_bytes` by absolute value, which
+/// discarded whatever a *child* portal had committed during the nested render —
+/// so every iteration forgot the inner content and the counter stayed small
+/// while the output did not.
+#[test]
+fn nested_portal_bytes_survive_the_enclosing_portals_return() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"blob":{"type":"string","initial":""},
+                     "rows":{"type":"list","initial":[]}},
+            "view":{"kind":"each","items":{"expr":"state","name":"rows"},"as":"r",
+              "body":{"kind":"portal","target":"head","children":[
+                {"kind":"portal","target":"body","children":[
+                  {"kind":"text","value":{"expr":"state","name":"blob"}}]}]}}}"#,
+    );
+
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(16 * 1024)));
+    state.insert("rows".into(), Value::Array(vec![json!(1); 200]));
+
+    let ctx = RenderContext {
+        state,
+        limits: RenderLimits {
+            max_output_bytes: 256 * 1024,
+            ..RenderLimits::default()
+        },
+        ..RenderContext::default()
+    };
+    let err = document
+        .render(&ctx)
+        .expect_err("nested portal content must still be counted");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// Dispatch had the identical per-expression reset. An action with many steps
+/// each building a large value must be bounded in aggregate, not step by step.
+#[test]
+fn dispatch_allocation_is_bounded_in_aggregate() {
+    let steps: Vec<String> = (0..2_000)
+        .map(|_| {
+            r#"{"do":"set","target":"sink","value":{"expr":"concat","items":[
+                 {"expr":"state","name":"blob"},{"expr":"state","name":"blob"}]}}"#
+                .to_string()
+        })
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+            "state":{{"blob":{{"type":"string","initial":""}},
+                     "sink":{{"type":"string","initial":""}}}},
+            "actions":[{{"name":"grind","steps":[{}]}}],
+            "view":{{"kind":"element","tag":"div"}}}}"#,
+        steps.join(",")
+    );
+
+    let document = Document::parse(&source, &Limits::unbounded()).expect("validates");
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(32 * 1024)));
+
+    let err = document
+        .dispatch("grind", &mut state, &Map::new())
+        .expect_err("dispatch over the budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}

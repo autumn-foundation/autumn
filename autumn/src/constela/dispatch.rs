@@ -161,11 +161,15 @@ pub struct DispatchCtx<'a> {
     pub route: &'a RouteValues,
     pub styles: &'a std::collections::BTreeMap<String, super::ast::StylePreset>,
     pub depth: usize,
-    /// Bytes one expression may allocate while building its value. Dispatch
-    /// writes results into state rather than into a buffer, so it has no
-    /// output budget to borrow — this is the only thing bounding what a
-    /// `concat` or `array` in an action step can construct.
-    pub max_value_bytes: usize,
+    /// Bytes the **whole dispatch** may allocate while building values.
+    ///
+    /// Shared across every expression in the action, not reset per step: a
+    /// per-expression allowance bounds each value alone and nothing in
+    /// aggregate, so an action with a few thousand steps each get the full
+    /// allowance and together retain gigabytes. Dispatch writes results into
+    /// state rather than into a buffer, so there is no output budget to borrow
+    /// and this is the only thing bounding construction.
+    pub budget: &'a std::cell::Cell<usize>,
 }
 
 /// Run `steps` against `state`.
@@ -207,14 +211,13 @@ fn run_step(
     // later step in the same action sees what an earlier one wrote.
     macro_rules! eval_in {
         ($expr:expr, $sub:expr) => {{
-            let budget = ::std::cell::Cell::new(ctx.max_value_bytes);
             let eval_ctx = EvalCtx {
                 state,
                 env,
                 route: ctx.route,
                 styles: ctx.styles,
                 depth: ctx.depth,
-                budget: &budget,
+                budget: ctx.budget,
             };
             eval($expr, &eval_ctx, $sub)?
         }};
@@ -335,14 +338,13 @@ fn record_effect(
 ) -> Result<(), ConstelaError> {
     macro_rules! eval_in {
         ($expr:expr, $sub:expr) => {{
-            let budget = ::std::cell::Cell::new(ctx.max_value_bytes);
             let eval_ctx = EvalCtx {
                 state,
                 env,
                 route: ctx.route,
                 styles: ctx.styles,
                 depth: ctx.depth,
-                budget: &budget,
+                budget: ctx.budget,
             };
             eval($expr, &eval_ctx, $sub)?
         }};
