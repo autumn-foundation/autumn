@@ -29,6 +29,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The metrics facade's three cardinality caps are now configurable
+  (`[metrics]`, revisits the limits #1378 shipped in 0.7.0):** the call-site
+  facade caps labeled series per instrument (100), instruments in the registry
+  (256) and labels per series (8), and those numbers were compile-time
+  constants. They are the right defaults, but the line between "a
+  label-cardinality mistake" and "a large but deliberate label space" is a
+  property of the app, not of the framework: an app with 150 routes recording a
+  per-route histogram lost 50 series to a cap it had no way to raise, saw one
+  warning and a climbing `autumn_metrics_series_dropped_total`, and had no
+  remedy short of forking. A new `[metrics]` section sets the three:
+
+  ```toml
+  [metrics]
+  max_series_per_metric = 500
+  max_instruments = 512
+  max_labels_per_series = 12
+  ```
+
+  with the usual `AUTUMN_METRICS__MAX_SERIES_PER_METRIC` (and siblings)
+  environment overrides. Every key defaults to the value 0.7.0 shipped, so an
+  app with no `[metrics]` section behaves exactly as before.
+
+  **Only the cardinality caps moved.** The caps that protect the exposition
+  format rather than memory — metric- and label-name length, label-value and
+  help-text length, bucket count — stay fixed, because raising one lets an app
+  emit a scrape body a stricter parser may reject without letting it express
+  anything it could not express already.
+
+  Applied once in `load_config_and_telemetry`, before anything is built from
+  the config and therefore before any call site can record; every `run_*` mode
+  reaches that function, so no path boots with the defaults silently in force.
+  The caps are read at each decision rather than baked in at registration, so
+  the semantics are stated and tested: **lowering a cap never evicts** what is
+  already retained (evicting a counter would reset it, and a reset is
+  indistinguishable from a restart to `rate()`) — it only refuses further
+  series; **raising one takes effect at once**, including on an instrument
+  already at its old cap.
+
+  An out-of-range value (`0`, or above the ceilings of 100 000 / 100 000 / 64)
+  is **rejected** by `AutumnConfig::validate` naming the key, so it fails the
+  boot and `autumn check`, rather than being clamped into something the
+  operator did not ask for — a cap of `0` would otherwise silently drop every
+  labeled sample the app records. `metrics::set_limits`, the programmatic entry
+  point, has no boot to fail and clamps instead, warning when it does.
+
+  `metrics::{MAX_SERIES_PER_METRIC, MAX_INSTRUMENTS, MAX_LABELS_PER_SERIES}`
+  are **deprecated, not removed** — they now read as
+  `DEFAULT_MAX_SERIES_PER_METRIC` and friends, with
+  `metrics::max_series_per_metric()` and siblings returning the effective
+  value. The three keys also appear on `/actuator/configprops`.
+  `docs/guide/metrics.md` documents the split between configurable and fixed
+  caps, and both warnings about raising one. `[metrics]` is declared before
+  `database` in `AutumnConfig` so strict unknown-key validation descends into
+  it — a typo like `max_serie_per_metric` is rejected rather than silently
+  leaving the cap the operator meant to raise at its default; the new
+  `metrics_child_keys_are_strictly_validated` guard fails if that ordering
+  breaks.
+
+
 - **🧭 Wayfinder: `examples/invoice`'s on-screen detail page is now a real
   HTML document (a11y `html-has-lang`/`bypass` Serious 2→0,
   `landmark-one-main` Moderate 1→0) [no-plugin]:** `autumn check --a11y`, run against the

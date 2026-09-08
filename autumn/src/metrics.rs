@@ -34,7 +34,7 @@
 //! Label values must come from a small, fixed set the code controls. Never
 //! label with user input, IDs, or anything else unbounded: each distinct
 //! combination of label values is a separate time series, and the facade caps
-//! an instrument at [`MAX_SERIES_PER_METRIC`](crate::metrics::MAX_SERIES_PER_METRIC)
+//! an instrument at [`max_series_per_metric`](crate::metrics::max_series_per_metric)
 //! labeled series (samples carrying excess label sets are dropped and counted
 //! in [`InstrumentSnapshot::dropped_series`](crate::metrics::InstrumentSnapshot::dropped_series)).
 //!
@@ -54,30 +54,82 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-/// Maximum number of distinct **labeled** series retained per instrument.
+/// Default maximum number of distinct **labeled** series retained per
+/// instrument; the effective value is [`max_series_per_metric`].
 ///
 /// The unlabeled series — what a handle with no `with_label` call records
 /// into — is separate and does not count towards this cap. Once an instrument
 /// holds this many labeled series, samples carrying a label set it has not
 /// seen before are dropped and counted in
 /// [`InstrumentSnapshot::dropped_series`].
-pub const MAX_SERIES_PER_METRIC: usize = 100;
+pub const DEFAULT_MAX_SERIES_PER_METRIC: usize = 100;
 
-/// Maximum number of distinct instruments the process-global registry holds.
-pub const MAX_INSTRUMENTS: usize = 256;
+/// Default maximum number of distinct instruments the process-global registry
+/// holds; the effective value is [`max_instruments`].
+pub const DEFAULT_MAX_INSTRUMENTS: usize = 256;
 
-/// Maximum number of labels retained on a single series; extras are dropped.
+/// Default maximum number of labels retained on a single series; extras are
+/// dropped. The effective value is [`max_labels_per_series`].
 ///
 /// The retained subset is the one with the lexicographically smallest label
 /// names, so which labels survive never depends on the order `with_label` was
 /// called in.
-pub const MAX_LABELS_PER_SERIES: usize = 8;
+pub const DEFAULT_MAX_LABELS_PER_SERIES: usize = 8;
+
+/// Largest value [`Limits::max_series_per_metric`] accepts.
+///
+/// A ceiling exists because the cap bounds *memory an app cannot otherwise
+/// see*: every retained series is a live allocation that is never evicted, so
+/// an unbounded setting turns a label-cardinality mistake back into the
+/// unbounded growth the cap was introduced to stop. It is set far above any
+/// legitimate per-instrument cardinality rather than near it.
+pub const MAX_SERIES_PER_METRIC_CEILING: usize = 100_000;
+
+/// Largest value [`Limits::max_instruments`] accepts. See
+/// [`MAX_SERIES_PER_METRIC_CEILING`] for why a ceiling exists at all.
+pub const MAX_INSTRUMENTS_CEILING: usize = 100_000;
+
+/// Largest value [`Limits::max_labels_per_series`] accepts.
+///
+/// Much lower than the other two ceilings, because labels are not merely
+/// stored: every recorded sample sorts its label set to build the series key,
+/// so this bound is on per-sample hot-path work rather than on retained
+/// memory. Prometheus itself has no label-count limit, but a series carrying
+/// dozens of labels is a modelling mistake in any case.
+pub const MAX_LABELS_PER_SERIES_CEILING: usize = 64;
+
+/// Deprecated alias for [`DEFAULT_MAX_SERIES_PER_METRIC`].
+#[deprecated(
+    since = "0.8.0",
+    note = "the cap is configurable ([metrics] max_series_per_metric); read the \
+            effective value with metrics::max_series_per_metric(), or this \
+            constant's replacement DEFAULT_MAX_SERIES_PER_METRIC for the default"
+)]
+pub const MAX_SERIES_PER_METRIC: usize = DEFAULT_MAX_SERIES_PER_METRIC;
+
+/// Deprecated alias for [`DEFAULT_MAX_INSTRUMENTS`].
+#[deprecated(
+    since = "0.8.0",
+    note = "the cap is configurable ([metrics] max_instruments); read the \
+            effective value with metrics::max_instruments(), or this \
+            constant's replacement DEFAULT_MAX_INSTRUMENTS for the default"
+)]
+pub const MAX_INSTRUMENTS: usize = DEFAULT_MAX_INSTRUMENTS;
+
+/// Deprecated alias for [`DEFAULT_MAX_LABELS_PER_SERIES`].
+#[deprecated(
+    since = "0.8.0",
+    note = "the cap is configurable ([metrics] max_labels_per_series); read the \
+            effective value with metrics::max_labels_per_series(), or this \
+            constant's replacement DEFAULT_MAX_LABELS_PER_SERIES for the default"
+)]
+pub const MAX_LABELS_PER_SERIES: usize = DEFAULT_MAX_LABELS_PER_SERIES;
 
 /// Maximum length of a label value, **in characters** (not bytes).
 ///
@@ -125,6 +177,208 @@ const RESERVED_LABEL_NAMES: [&str; 2] = ["le", "quantile"];
 /// renders a histogram so a plugin source cannot shadow one of them.
 pub(crate) const HISTOGRAM_SUFFIXES: [&str; 3] = ["_bucket", "_sum", "_count"];
 
+// ── Configurable limits ────────────────────────────────────────
+
+/// The three cardinality caps, as one value.
+///
+/// These are the caps that bound how much an app's *own* label choices can
+/// grow the registry, so an app whose legitimate cardinality does not fit the
+/// defaults can raise them — see the `[metrics]` section of `autumn.toml`
+/// ([`MetricsConfig`](crate::config::MetricsConfig)) or [`set_limits`].
+///
+/// The caps that are **not** configurable are the ones that protect the
+/// exposition format rather than memory: metric- and label-name length
+/// ([`MAX_METRIC_NAME_LEN`], [`MAX_LABEL_NAME_LEN`]), label value and help
+/// text length ([`MAX_LABEL_VALUE_LEN`], [`MAX_HELP_LEN`]) and bucket count
+/// ([`MAX_BUCKET_BOUNDS`]). Raising those does not let an app express
+/// something it could not otherwise express; it only lets it emit a scrape
+/// body that a stricter downstream parser may reject.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::metrics::Limits;
+///
+/// let limits = Limits {
+///     max_series_per_metric: 1_000,
+///     ..Limits::default()
+/// };
+/// assert!(limits.validate().is_ok());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Distinct **labeled** series retained per instrument. Beyond this,
+    /// samples carrying an unseen label set are dropped and counted in
+    /// `autumn_metrics_series_dropped_total`.
+    pub max_series_per_metric: usize,
+    /// Distinct instruments the process-global registry holds. Beyond this, a
+    /// new metric name gets an inert handle.
+    pub max_instruments: usize,
+    /// Labels retained on a single series. Extras are dropped (lexicographic
+    /// order decides which survive); the sample is still recorded.
+    pub max_labels_per_series: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_series_per_metric: DEFAULT_MAX_SERIES_PER_METRIC,
+            max_instruments: DEFAULT_MAX_INSTRUMENTS,
+            max_labels_per_series: DEFAULT_MAX_LABELS_PER_SERIES,
+        }
+    }
+}
+
+impl Limits {
+    /// The limits currently in effect process-wide.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            max_series_per_metric: max_series_per_metric(),
+            max_instruments: max_instruments(),
+            max_labels_per_series: max_labels_per_series(),
+        }
+    }
+
+    /// Check every cap against its floor of 1 and its documented ceiling.
+    ///
+    /// Called by [`AutumnConfig::validate`](crate::config::AutumnConfig::validate)
+    /// so an out-of-range `[metrics]` key fails the boot — and `autumn check`
+    /// — by name, rather than being silently clamped into something the
+    /// operator did not ask for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `autumn.toml` key at fault and the range it must sit in.
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, value, ceiling) in [
+            (
+                "max_series_per_metric",
+                self.max_series_per_metric,
+                MAX_SERIES_PER_METRIC_CEILING,
+            ),
+            (
+                "max_instruments",
+                self.max_instruments,
+                MAX_INSTRUMENTS_CEILING,
+            ),
+            (
+                "max_labels_per_series",
+                self.max_labels_per_series,
+                MAX_LABELS_PER_SERIES_CEILING,
+            ),
+        ] {
+            if value == 0 || value > ceiling {
+                return Err(format!(
+                    "[metrics] {key} must be between 1 and {ceiling}, got {value} \
+                     (see docs/guide/metrics.md)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Clamp every cap into its accepted range.
+    fn clamped(self) -> Self {
+        Self {
+            max_series_per_metric: self
+                .max_series_per_metric
+                .clamp(1, MAX_SERIES_PER_METRIC_CEILING),
+            max_instruments: self.max_instruments.clamp(1, MAX_INSTRUMENTS_CEILING),
+            max_labels_per_series: self
+                .max_labels_per_series
+                .clamp(1, MAX_LABELS_PER_SERIES_CEILING),
+        }
+    }
+}
+
+/// The limits in effect, read on every capped decision.
+///
+/// Plain atomics rather than a lock: every reader is either already holding
+/// the registry lock or on a path that allocates anyway, and no decision needs
+/// two caps to be read together. Each cap is read **once** per decision and
+/// reused for both the read-lock and write-lock halves of a
+/// check-then-register, so a concurrent [`set_limits`] cannot make the two
+/// halves of one registration disagree.
+static LIMITS: EffectiveLimits = EffectiveLimits {
+    series_per_metric: AtomicUsize::new(DEFAULT_MAX_SERIES_PER_METRIC),
+    instruments: AtomicUsize::new(DEFAULT_MAX_INSTRUMENTS),
+    labels_per_series: AtomicUsize::new(DEFAULT_MAX_LABELS_PER_SERIES),
+};
+
+/// Backing storage for [`LIMITS`].
+#[derive(Debug)]
+struct EffectiveLimits {
+    series_per_metric: AtomicUsize,
+    instruments: AtomicUsize,
+    labels_per_series: AtomicUsize,
+}
+
+/// Labeled series retained per instrument, as currently configured.
+#[must_use]
+pub fn max_series_per_metric() -> usize {
+    LIMITS.series_per_metric.load(Ordering::Relaxed)
+}
+
+/// Instruments the registry holds, as currently configured.
+#[must_use]
+pub fn max_instruments() -> usize {
+    LIMITS.instruments.load(Ordering::Relaxed)
+}
+
+/// Labels retained per series, as currently configured.
+#[must_use]
+pub fn max_labels_per_series() -> usize {
+    LIMITS.labels_per_series.load(Ordering::Relaxed)
+}
+
+/// Install `limits` process-wide.
+///
+/// An app never needs to call this: `AppBuilder::run` applies the `[metrics]`
+/// section of `autumn.toml` before it builds anything, which is the supported
+/// way to change these. It is public for a binary that builds its own
+/// configuration, and for tests.
+///
+/// # Semantics
+///
+/// Limits are consulted at each decision, not baked in at registration, so a
+/// change takes effect immediately — but **only going forward**:
+///
+/// * **Lowering a cap never evicts** what is already registered. Dropping an
+///   existing series would reset its counter, and a counter that resets is
+///   indistinguishable from a restart to `rate()`. An instrument already
+///   holding more than the new cap simply accepts no *further* series.
+/// * **Raising a cap takes effect at once**, including on an instrument or a
+///   registry that is already full: the next new label set or metric name is
+///   admitted rather than dropped.
+/// * Changing `max_labels_per_series` changes **series identity** — the same
+///   twelve labels canonicalize to a different key under a cap of 8 than
+///   under 12 — so a mid-flight change splits an instrument's history across
+///   two series. Set it once, at startup, before anything records.
+///
+/// Values outside the accepted range are clamped rather than rejected, since
+/// there is no boot to fail here; a clamp logs a warning naming the value.
+/// Prefer [`Limits::validate`] to reject the setting where it was written.
+pub fn set_limits(limits: Limits) {
+    let clamped = limits.clamped();
+    if clamped != limits {
+        tracing::warn!(
+            requested = ?limits,
+            applied = ?clamped,
+            "app metric limits clamped into the accepted range"
+        );
+    }
+    LIMITS
+        .series_per_metric
+        .store(clamped.max_series_per_metric, Ordering::Relaxed);
+    LIMITS
+        .instruments
+        .store(clamped.max_instruments, Ordering::Relaxed);
+    LIMITS
+        .labels_per_series
+        .store(clamped.max_labels_per_series, Ordering::Relaxed);
+}
+
 // ── Registry internals ─────────────────────────────────────────
 
 /// The process-global instrument registry.
@@ -171,12 +425,15 @@ impl Registry {
     /// The set of warned names is capped like the registry itself so a call
     /// site generating unbounded names cannot grow it without bound.
     fn warn_once(&self, name: &str, reason: &'static str) {
+        // Read the cap once: a concurrent `set_limits` must not let the
+        // read-lock half admit a name the write-lock half then rejects.
+        let cap = max_instruments();
         {
             let seen = self
                 .warned_names
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            if seen.contains(name) || seen.len() >= MAX_INSTRUMENTS {
+            if seen.contains(name) || seen.len() >= cap {
                 return;
             }
         }
@@ -185,7 +442,7 @@ impl Registry {
                 .warned_names
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            if seen.len() >= MAX_INSTRUMENTS || !seen.insert(name.into()) {
+            if seen.len() >= cap || !seen.insert(name.into()) {
                 return;
             }
         }
@@ -202,7 +459,7 @@ impl Registry {
         if !self.over_capacity_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 metric = %sanitize_for_log(name),
-                cap = MAX_INSTRUMENTS,
+                cap = max_instruments(),
                 "app metric registry is at capacity; further new metric names are ignored"
             );
         }
@@ -217,7 +474,7 @@ impl Registry {
         {
             tracing::warn!(
                 metric = %sanitize_for_log(name),
-                cap = MAX_INSTRUMENTS,
+                cap = max_instruments(),
                 "too many histograms have bucket bounds configured but were never registered; \
                  ignoring further `set_histogram_buckets` calls for unregistered names"
             );
@@ -230,7 +487,7 @@ impl Registry {
         if !self.pending_help_full_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 metric = %sanitize_for_log(name),
-                cap = MAX_INSTRUMENTS,
+                cap = max_instruments(),
                 "too many app metrics have been described but were never registered; \
                  ignoring further `describe_*` calls for unregistered names"
             );
@@ -341,14 +598,20 @@ impl Instrument {
     /// Look up (or register) the series for `key`, honouring the cardinality
     /// cap. Returns `None` when the cap dropped this label set.
     fn series_for(&self, key: &SeriesKey) -> Option<Arc<Series>> {
+        // Read the cap once and reuse it for both halves of the
+        // check-then-register: reading it twice would let a concurrent
+        // `set_limits` admit the label set under the read lock and then drop
+        // it under the write lock, counting a drop for a series that the
+        // configuration in force at either instant would have kept.
+        let cap = max_series_per_metric();
         {
             let series = self.series.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(existing) = series.get(key) {
                 return Some(Arc::clone(existing));
             }
-            if series.len() >= MAX_SERIES_PER_METRIC {
+            if series.len() >= cap {
                 drop(series);
-                self.note_dropped();
+                self.note_dropped(cap);
                 return None;
             }
         }
@@ -358,9 +621,9 @@ impl Instrument {
             if let Some(existing) = series.get(key) {
                 return Some(Arc::clone(existing));
             }
-            if series.len() >= MAX_SERIES_PER_METRIC {
+            if series.len() >= cap {
                 drop(series);
-                self.note_dropped();
+                self.note_dropped(cap);
                 return None;
             }
             series.insert(key.clone(), Arc::clone(&fresh));
@@ -369,12 +632,15 @@ impl Instrument {
     }
 
     /// Count one dropped sample and warn about it at most once.
-    fn note_dropped(&self) {
+    ///
+    /// Takes `cap` rather than re-reading it so the warning names the value
+    /// that actually rejected this sample.
+    fn note_dropped(&self, cap: usize) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
         if !self.cap_warned.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 metric = %self.name,
-                cap = MAX_SERIES_PER_METRIC,
+                cap,
                 "app metric hit its series cardinality cap; samples carrying a new label set \
                  are dropped. Label values must come from a small closed set — never user \
                  input or IDs"
@@ -385,7 +651,7 @@ impl Instrument {
     /// Canonicalize a handle's pending labels into a series key: invalid,
     /// reserved and over-long names dropped, duplicates resolved first-wins,
     /// values sanitized, sorted by key, then cut to
-    /// [`MAX_LABELS_PER_SERIES`].
+    /// [`max_labels_per_series`].
     fn canonical_key(&self, labels: &[(String, String)]) -> SeriesKey {
         let mut kept: Vec<(Box<str>, Box<str>)> = Vec::with_capacity(labels.len());
         for (key, value) in labels {
@@ -404,8 +670,9 @@ impl Instrument {
         // — depend on the order `with_label` happened to be called in, so the
         // same ten labels applied in two orders would land in two series.
         kept.sort_by(|(a, _), (b, _)| a.cmp(b));
-        if kept.len() > MAX_LABELS_PER_SERIES {
-            kept.truncate(MAX_LABELS_PER_SERIES);
+        let cap = max_labels_per_series();
+        if kept.len() > cap {
+            kept.truncate(cap);
             self.warn_labels("too many labels");
         }
         kept.into_boxed_slice()
@@ -808,6 +1075,12 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
         return None;
     }
 
+    // One read for the whole registration. The fast path's capacity check and
+    // the slow path's re-check under the write lock must agree, or a
+    // concurrent `set_limits` could refuse a name the fast path had already
+    // decided there was room for.
+    let instrument_cap = max_instruments();
+
     // Fast path: already registered. Clone the `Arc` out before releasing the
     // lock so nothing (including `tracing`) runs while it is held.
     {
@@ -820,7 +1093,7 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
             drop(registered);
             return matching_kind(existing, kind);
         }
-        if registered.len() >= MAX_INSTRUMENTS {
+        if registered.len() >= instrument_cap {
             drop(registered);
             REGISTRY.warn_over_capacity(name);
             return None;
@@ -842,7 +1115,7 @@ fn instrument(name: &str, kind: InstrumentKind) -> Option<Arc<Instrument>> {
         // Decided (never acted on) under the lock; the guard is released
         // before any warning is emitted.
         let existing = registered.get(name).map(Arc::clone);
-        let at_capacity = registered.len() >= MAX_INSTRUMENTS;
+        let at_capacity = registered.len() >= instrument_cap;
         let collides = collides_with_registered(&registered, name, kind);
         let outcome = match existing {
             Some(existing) => Registration::Existing(existing),
@@ -1057,7 +1330,7 @@ fn describe(name: &str, kind: InstrumentKind, help: &str) {
                     .pending_help
                     .write()
                     .unwrap_or_else(PoisonError::into_inner);
-                if pending.len() >= MAX_INSTRUMENTS && !pending.contains_key(name) {
+                if pending.len() >= max_instruments() && !pending.contains_key(name) {
                     Description::Full
                 } else {
                     pending.insert(name.into(), (kind, help));
@@ -1141,7 +1414,7 @@ pub fn set_histogram_buckets(name: &str, upper_bounds: &[f64]) {
                 .pending_buckets
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            if pending.len() >= MAX_INSTRUMENTS && !pending.contains_key(name) {
+            if pending.len() >= max_instruments() && !pending.contains_key(name) {
                 BucketOverride::Full
             } else {
                 pending.insert(name.into(), upper_bounds.into());
@@ -1616,6 +1889,9 @@ pub fn reset_for_tests() {
     REGISTRY
         .pending_help_full_warned
         .store(false, Ordering::Relaxed);
+    // Restore the shipped caps too: a test that raised one must not leave the
+    // next test running under a limit it never asked for.
+    set_limits(Limits::default());
 }
 
 /// Helpers for testing code that records metrics.
@@ -1634,7 +1910,7 @@ pub mod testing {
     /// metric name fragment.
     ///
     /// Those names are never reclaimed, and they share the process-wide
-    /// [`MAX_INSTRUMENTS`](super::MAX_INSTRUMENTS) budget with every other
+    /// [`max_instruments`](super::max_instruments) budget with every other
     /// test in the same binary. A test that registers a *handful* of unique
     /// names is fine; one that registers hundreds in a loop will exhaust the
     /// registry for whatever runs after it. Cap the loop, or reuse one name
@@ -1649,6 +1925,53 @@ pub mod testing {
 mod tests {
     use super::testing::unique_name;
     use super::*;
+
+    /// Serializes every test that changes — or asserts against — the
+    /// process-global [`Limits`].
+    ///
+    /// The registry is process-global and these tests run concurrently, so a
+    /// test that raises a cap would otherwise be visible to one asserting the
+    /// default. Two rules keep that safe, and both are enforced by using this
+    /// guard rather than calling [`set_limits`] directly:
+    ///
+    /// 1. Every limits-sensitive test takes the same lock.
+    /// 2. A test only ever raises a cap **above** its shipped default, never
+    ///    below it. A raised cap can only admit more, so a test that somehow
+    ///    ran without the lock still could not fail because of one; a lowered
+    ///    cap could drop an unrelated test's series.
+    static LIMITS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds [`LIMITS_LOCK`] and restores the defaults on drop.
+    struct LimitsGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl LimitsGuard {
+        /// Pin the limits to their shipped defaults for this test.
+        fn pinned() -> Self {
+            Self::raised_to(Limits::default())
+        }
+
+        /// Install `limits`, which must not lower any cap below its default.
+        fn raised_to(limits: Limits) -> Self {
+            let guard = LIMITS_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let default = Limits::default();
+            assert!(
+                limits.max_series_per_metric >= default.max_series_per_metric
+                    && limits.max_instruments >= default.max_instruments
+                    && limits.max_labels_per_series >= default.max_labels_per_series,
+                "a test must never lower a cap below its default: {limits:?}"
+            );
+            set_limits(limits);
+            Self(guard)
+        }
+    }
+
+    impl Drop for LimitsGuard {
+        fn drop(&mut self) {
+            set_limits(Limits::default());
+        }
+    }
 
     /// Look up one instrument in the process-global snapshot by exact name.
     fn find(name: &str) -> Option<InstrumentSnapshot> {
@@ -2124,8 +2447,9 @@ mod tests {
 
     #[test]
     fn cardinality_cap_drops_series_beyond_the_limit() {
+        let _limits = LimitsGuard::pinned();
         let name = unique_name("facade_cardinality_cap");
-        for i in 0..=MAX_SERIES_PER_METRIC {
+        for i in 0..=DEFAULT_MAX_SERIES_PER_METRIC {
             counter(&name)
                 .with_label("shard", i.to_string())
                 .increment(1);
@@ -2134,13 +2458,190 @@ mod tests {
         let instrument = expect_instrument(&name);
         assert_eq!(
             instrument.series.len(),
-            MAX_SERIES_PER_METRIC,
-            "the cap must hold the series count at {MAX_SERIES_PER_METRIC}"
+            DEFAULT_MAX_SERIES_PER_METRIC,
+            "the cap must hold the series count at {DEFAULT_MAX_SERIES_PER_METRIC}"
         );
         assert_eq!(
             instrument.dropped_series, 1,
             "the one over-cap label set must be counted as dropped"
         );
+    }
+
+    // ── Configurable limits ────────────────────────────────────
+
+    #[test]
+    fn limits_default_to_the_values_the_facade_shipped_with() {
+        let _limits = LimitsGuard::pinned();
+        assert_eq!(
+            Limits::current(),
+            Limits::default(),
+            "an app that sets no [metrics] section must see the 0.7.0 caps"
+        );
+        assert_eq!(max_series_per_metric(), DEFAULT_MAX_SERIES_PER_METRIC);
+        assert_eq!(max_instruments(), DEFAULT_MAX_INSTRUMENTS);
+        assert_eq!(max_labels_per_series(), DEFAULT_MAX_LABELS_PER_SERIES);
+    }
+
+    #[test]
+    fn a_raised_series_cap_retains_more_series() {
+        let raised = DEFAULT_MAX_SERIES_PER_METRIC + 50;
+        let _limits = LimitsGuard::raised_to(Limits {
+            max_series_per_metric: raised,
+            ..Limits::default()
+        });
+
+        let name = unique_name("facade_raised_series_cap");
+        for i in 0..raised {
+            counter(&name)
+                .with_label("shard", i.to_string())
+                .increment(1);
+        }
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(
+            instrument.series.len(),
+            raised,
+            "the configured cap, not the default, decides what is retained"
+        );
+        assert_eq!(
+            instrument.dropped_series, 0,
+            "nothing is dropped below the configured cap"
+        );
+    }
+
+    #[test]
+    fn lowering_the_series_cap_stops_new_series_without_evicting_old_ones() {
+        // Eviction is the one thing a cardinality cap must never do: dropping
+        // a retained counter resets it, and a reset is indistinguishable from
+        // a process restart to `rate()`.
+        let raised = DEFAULT_MAX_SERIES_PER_METRIC + 20;
+        let _limits = LimitsGuard::raised_to(Limits {
+            max_series_per_metric: raised,
+            ..Limits::default()
+        });
+
+        let name = unique_name("facade_lowered_series_cap");
+        for i in 0..raised {
+            counter(&name)
+                .with_label("shard", i.to_string())
+                .increment(1);
+        }
+        assert_eq!(expect_instrument(&name).series.len(), raised);
+
+        // Back to the default — still above every other test's needs, so no
+        // concurrent test can see a cap below the one it was written against.
+        // Still under `_limits`, which holds the lock and restores the
+        // defaults on drop; lowering *to* the default is the floor the guard
+        // enforces, so no concurrent test can see a cap below the one it was
+        // written against.
+        set_limits(Limits::default());
+        counter(&name).with_label("shard", "late").increment(1);
+
+        let instrument = expect_instrument(&name);
+        assert_eq!(
+            instrument.series.len(),
+            raised,
+            "lowering the cap must not evict already-retained series"
+        );
+        assert_eq!(
+            instrument.dropped_series, 1,
+            "the sample arriving after the cap dropped is refused and counted"
+        );
+    }
+
+    #[test]
+    fn a_raised_label_cap_retains_more_labels() {
+        let raised = DEFAULT_MAX_LABELS_PER_SERIES + 4;
+        let _limits = LimitsGuard::raised_to(Limits {
+            max_labels_per_series: raised,
+            ..Limits::default()
+        });
+
+        let name = unique_name("facade_raised_label_cap");
+        let mut handle = counter(&name);
+        for i in 0..raised {
+            handle = handle.with_label(&format!("k{i:02}"), i.to_string());
+        }
+        handle.increment(1);
+
+        let instrument = expect_instrument(&name);
+        let series = only_series(&instrument);
+        assert_eq!(series.labels.len(), raised);
+        assert_eq!(counter_value(series), 1);
+    }
+
+    #[test]
+    fn set_limits_clamps_a_value_outside_the_accepted_range() {
+        // `set_limits` has no boot to fail, so it clamps; `Limits::validate`
+        // is what refuses the same value where an operator wrote it.
+        let _limits = LimitsGuard::raised_to(Limits {
+            max_series_per_metric: MAX_SERIES_PER_METRIC_CEILING + 1,
+            max_instruments: usize::MAX,
+            max_labels_per_series: MAX_LABELS_PER_SERIES_CEILING + 1,
+        });
+
+        assert_eq!(max_series_per_metric(), MAX_SERIES_PER_METRIC_CEILING);
+        assert_eq!(max_instruments(), MAX_INSTRUMENTS_CEILING);
+        assert_eq!(max_labels_per_series(), MAX_LABELS_PER_SERIES_CEILING);
+    }
+
+    #[test]
+    fn set_limits_clamps_a_zero_cap_up_to_one() {
+        // Not reachable through `autumn.toml` — `validate` rejects a 0 there —
+        // but a binary building its own `Limits` must not end up with a cap
+        // that silently drops every labeled sample.
+        set_limits(Limits {
+            max_series_per_metric: 0,
+            max_instruments: 0,
+            max_labels_per_series: 0,
+        });
+        let clamped = Limits::current();
+        set_limits(Limits::default());
+
+        assert_eq!(
+            clamped,
+            Limits {
+                max_series_per_metric: 1,
+                max_instruments: 1,
+                max_labels_per_series: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_names_the_key_and_range_it_rejects() {
+        for (field, limits) in [
+            (
+                "max_series_per_metric",
+                Limits {
+                    max_series_per_metric: 0,
+                    ..Limits::default()
+                },
+            ),
+            (
+                "max_instruments",
+                Limits {
+                    max_instruments: MAX_INSTRUMENTS_CEILING + 1,
+                    ..Limits::default()
+                },
+            ),
+            (
+                "max_labels_per_series",
+                Limits {
+                    max_labels_per_series: MAX_LABELS_PER_SERIES_CEILING + 1,
+                    ..Limits::default()
+                },
+            ),
+        ] {
+            let error = limits
+                .validate()
+                .expect_err("an out-of-range cap must not validate");
+            assert!(
+                error.contains(field) && error.contains("[metrics]"),
+                "the error must name the autumn.toml key at fault; got {error}"
+            );
+        }
+        assert!(Limits::default().validate().is_ok());
     }
 
     #[test]
@@ -2149,8 +2650,9 @@ mod tests {
         // site hammering one over-cap label set is the signal an operator
         // needs, and counting distinct sets would mean remembering exactly the
         // label sets the cap exists to stop remembering.
+        let _limits = LimitsGuard::pinned();
         let name = unique_name("facade_dropped_counts_samples");
-        for i in 0..MAX_SERIES_PER_METRIC {
+        for i in 0..DEFAULT_MAX_SERIES_PER_METRIC {
             counter(&name)
                 .with_label("shard", i.to_string())
                 .increment(1);
@@ -2160,7 +2662,7 @@ mod tests {
         }
 
         let instrument = expect_instrument(&name);
-        assert_eq!(instrument.series.len(), MAX_SERIES_PER_METRIC);
+        assert_eq!(instrument.series.len(), DEFAULT_MAX_SERIES_PER_METRIC);
         assert_eq!(
             instrument.dropped_series, 3,
             "three samples for one over-cap label set must count as three"
@@ -2169,9 +2671,10 @@ mod tests {
 
     #[test]
     fn label_count_beyond_the_cap_is_dropped_not_the_sample() {
+        let _limits = LimitsGuard::pinned();
         let name = unique_name("facade_label_cap");
         let mut handle = counter(&name);
-        for i in 0..=MAX_LABELS_PER_SERIES {
+        for i in 0..=DEFAULT_MAX_LABELS_PER_SERIES {
             handle = handle.with_label(&format!("k{i}"), i.to_string());
         }
         handle.increment(1);
@@ -2179,7 +2682,7 @@ mod tests {
         let instrument = expect_instrument(&name);
         let series = only_series(&instrument);
         assert_eq!(counter_value(series), 1, "the sample is still recorded");
-        assert_eq!(series.labels.len(), MAX_LABELS_PER_SERIES);
+        assert_eq!(series.labels.len(), DEFAULT_MAX_LABELS_PER_SERIES);
     }
 
     #[test]
@@ -2187,6 +2690,7 @@ mod tests {
         // Which labels survive the cap must be a function of the label *set*,
         // never of the order `with_label` happened to be called in — otherwise
         // the same ten labels applied two ways land in two distinct series.
+        let _limits = LimitsGuard::pinned();
         let name = unique_name("facade_label_cap_order");
         let keys: Vec<String> = (0..10).map(|i| format!("k{i}")).collect();
 
@@ -2215,7 +2719,8 @@ mod tests {
         assert_eq!(
             kept,
             vec!["k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"],
-            "the retained subset is the lexicographically smallest {MAX_LABELS_PER_SERIES}"
+            "the retained subset is the lexicographically smallest \
+             {DEFAULT_MAX_LABELS_PER_SERIES}"
         );
     }
 
