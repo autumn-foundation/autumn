@@ -237,9 +237,12 @@ for. Such a row reports `definition_hash: null` and stays in place, because only
 an operator can tell a removed derivation from a rolling deploy. `checkpoint`
 stays populated after the sweep completes, and `backfilled_rows` counts parents
 visited rather than written. `drift: 0` is the healthy answer; a nonzero one
-names the derivation to repair. The scan stops at `DRIFT_SCAN_LIMIT` (10,000
-rows), so a figure equal to it means "at least that many", and a scan that could
-not run reports `drift: null` with the reason in `drift_error`. That last case
+names the derivation to repair. The scan examines at most `DRIFT_SCAN_LIMIT`
+(10,000) parents, newest ids first, so it is bounded on a table of any size:
+a figure equal to the limit means every parent examined drifted, and drift
+confined to older rows beyond that window is not seen by it (`recompute`
+repairs the whole table regardless). A scan that could not run reports
+`drift: null` with the reason in `drift_error`. That last case
 is usually a derived column whose migration has not been applied yet, and the
 other derivations are still reported.
 

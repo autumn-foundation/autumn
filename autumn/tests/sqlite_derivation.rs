@@ -827,3 +827,29 @@ async fn a_renamed_derivation_keeps_its_finished_backfill() {
         "a row with another definition's hash is left for the unregistered report"
     );
 }
+
+#[tokio::test]
+async fn a_zero_batch_size_is_an_error_rather_than_a_silent_completion() {
+    // `LIMIT 0` yields an empty page, and an empty page is how a sweep learns
+    // it has reached the end of the table: a zero batch would mark every
+    // derivation complete having repaired nothing. Refused at run time, not
+    // only by a debug assertion.
+    let pool = boot_pool("sd_zero_batch").await;
+    let mut conn = pool.get().await.expect("conn");
+    ensure_derivations(&mut conn).await.expect("first boot");
+    let error = run_backfill(
+        &mut conn,
+        &BackfillOptions {
+            batch_size: 0,
+            max_batches: None,
+        },
+    )
+    .await
+    .expect_err("a zero batch must be refused");
+    assert!(error.to_string().contains("batch_size"), "{error}");
+    assert_eq!(
+        state_of(&pool, COUNT_DERIVATION).await.backfill_state,
+        "pending",
+        "nothing was marked complete"
+    );
+}

@@ -17,10 +17,10 @@
 //!
 //! # Why this is the counter cache
 //!
-//! A derivation is a [counter cache](crate::counter_cache) with two extra
+//! A derivation is a counter cache (`counter_cache`, #1325) with two extra
 //! pieces: a per-row *contribution* (1 for a count, the field for a sum, 0 for a
 //! row the filter rejects) and a *filter* lowered to SQL. `#[model]` emits both
-//! into the same [`CounterCacheSpec`](crate::counter_cache::CounterCacheSpec),
+//! into the same [`CounterCacheSpec`](crate::repository::CounterCacheSpec),
 //! so the fifteen mutation paths the repository macro already dispatches to keep
 //! derivations current with no new dispatch point. A plain counter cache is the
 //! unfiltered special case, and its generated SQL is unchanged.
@@ -32,18 +32,18 @@
 //! a table that already holds data, so the existing rows have to be repaired.
 //! This module owns that part:
 //!
-//! * **Content addressing.** [`DerivationDef::definition_hash`] hashes the
+//! * **Content addressing.** [`DerivationDef::definition_hash`](crate::derivation::DerivationDef::definition_hash) hashes the
 //!   lowered shape: tables, columns, transform, filter SQL. A changed filter
 //!   changes the hash. A rename or a reformat does not.
-//! * **Reconciliation.** [`ensure_derivations`] compares each registered
+//! * **Reconciliation.** [`ensure_derivations`](crate::derivation::ensure_derivations) compares each registered
 //!   derivation's hash against `_autumn_derivations` and enqueues a backfill for
 //!   the ones that changed. It leaves the rest alone.
-//! * **Resumable repair.** [`run_backfill`] rebuilds parents in checkpointed
+//! * **Resumable repair.** [`run_backfill`](crate::derivation::run_backfill) rebuilds parents in checkpointed
 //!   batches. Each batch is one transaction that locks the state row, pages from
 //!   the checkpoint it finds there, repairs the page and advances the
 //!   checkpoint. A killed process resumes, and several replicas cooperate on one
 //!   sweep instead of racing.
-//! * **Observability.** [`derivation_status`] reports each derivation's state
+//! * **Observability.** [`derivation_status`](crate::derivation::derivation_status) reports each derivation's state
 //!   and its drift from the source of truth. `/actuator/derivations` serves it.
 
 use std::collections::{HashMap, HashSet};
@@ -94,7 +94,7 @@ fn ph(_n: usize) -> String {
     "?".to_owned()
 }
 
-/// NULL-safe inequality, as [`crate::counter_cache`] spells it. Only the SQL
+/// NULL-safe inequality, as `counter_cache` spells it. Only the SQL
 /// builder assertions need it here; the statements themselves come from there.
 #[cfg(all(test, not(feature = "sqlite")))]
 const IS_DISTINCT_FROM: &str = "IS DISTINCT FROM";
@@ -201,7 +201,7 @@ impl DerivationDef {
         hex_lower(hasher.finalize())
     }
 
-    /// The derivation as the SQL builders in [`crate::counter_cache`] see it.
+    /// The derivation as the SQL builders in `counter_cache` see it.
     ///
     /// The repair paths (recompute, backfill, drift) are set-based and need no
     /// model type, so they run the *same* builders the delta paths do. One
@@ -510,8 +510,10 @@ pub struct DerivationStatus {
     /// How many parent rows disagree with the source of truth right now. `0` is
     /// the healthy value; anything else is drift [`recompute`] repairs.
     ///
-    /// The scan stops at [`DRIFT_SCAN_LIMIT`], so a value equal to that limit
-    /// means "at least that many". `None` when the scan could not run
+    /// The scan examines at most [`DRIFT_SCAN_LIMIT`] parents, newest ids
+    /// first, so it is bounded on a table of any size: a value equal to that
+    /// limit means "every parent examined", and drift confined to older rows
+    /// beyond the window is not seen by it. `None` when the scan could not run
     /// (see [`Self::drift_error`]) or when the derivation is unregistered.
     pub drift: Option<i64>,
     /// Why the drift scan did not run, when it did not.
@@ -631,10 +633,16 @@ pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Ve
                     .values()
                     .filter(|row| !registered.contains(row.name.as_str()))
                     .filter(|row| row.definition_hash == hash);
-                if let (Some(orphan), None) = (orphans.next(), orphans.next())
-                    && rename_state(conn, &orphan.name, def.name, &hash).await?
-                {
-                    continue;
+                if let (Some(orphan), None) = (orphans.next(), orphans.next()) {
+                    if rename_state(conn, &orphan.name, def.name, &hash).await? {
+                        continue;
+                    }
+                    // Another replica may have adopted the row first. Then the
+                    // destination now carries this hash, and enqueuing would
+                    // reset the state that replica just preserved.
+                    if state_hash(conn, def.name).await?.as_deref() == Some(hash.as_str()) {
+                        continue;
+                    }
                 }
             }
         }
@@ -642,6 +650,25 @@ pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Ve
         enqueued.push(def.name);
     }
     Ok(enqueued)
+}
+
+/// The stored hash for `name`, read fresh rather than from the boot's snapshot.
+async fn state_hash(conn: &mut RuntimeConnection, name: &str) -> AutumnResult<Option<String>> {
+    #[derive(diesel::QueryableByName)]
+    struct HashRow {
+        #[diesel(sql_type = Text)]
+        definition_hash: String,
+    }
+    let sql = format!(
+        "SELECT definition_hash FROM {STATE_TABLE} WHERE name = {}",
+        ph(1)
+    );
+    let rows: Vec<HashRow> = diesel::sql_query(sql)
+        .bind::<Text, _>(name)
+        .load::<HashRow>(conn)
+        .await
+        .map_err(AutumnError::from)?;
+    Ok(rows.into_iter().next().map(|row| row.definition_hash))
 }
 
 /// Carry the state row `from` over to the derivation now named `to`.
@@ -866,7 +893,7 @@ async fn run_one_batch(
 ///
 /// Each batch is **one** transaction that locks the derivation's state row,
 /// re-reads its hash, state and checkpoint, pages the parents after that
-/// checkpoint, repairs them and advances the checkpoint. See [`run_one_batch`]
+/// checkpoint, repairs them and advances the checkpoint. See `run_one_batch`
 /// for the exact sequence.
 ///
 /// The state-row lock is the cross-process mutex. Several replicas booting a new
@@ -894,7 +921,16 @@ pub async fn run_backfill(
     conn: &mut RuntimeConnection,
     options: &BackfillOptions,
 ) -> AutumnResult<BackfillReport> {
-    debug_assert!(options.batch_size > 0, "a backfill batch must hold a row");
+    // A runtime check, not an assertion: `LIMIT 0` returns an empty page, and
+    // an empty page is how a sweep learns it has reached the end of the table,
+    // so a zero batch would mark every derivation complete having repaired
+    // nothing.
+    if options.batch_size <= 0 {
+        return Err(AutumnError::from(std::io::Error::other(format!(
+            "a backfill batch must hold at least one parent row; `batch_size` is {}",
+            options.batch_size
+        ))));
+    }
     let defs = registered_derivations();
     check_registry(&defs)?;
 
@@ -1017,6 +1053,12 @@ pub async fn derivation_status(
     conn: &mut RuntimeConnection,
 ) -> AutumnResult<Vec<DerivationStatus>> {
     let defs = registered_derivations();
+    // A binary with no derivation never applies the state-table migration
+    // (see `has_derivations`), so there is nothing to read and no table to
+    // read it from: the report is empty rather than a missing-table error.
+    if defs.is_empty() {
+        return Ok(Vec::new());
+    }
     check_registry(&defs)?;
 
     let state = load_state(conn).await?;
@@ -1207,7 +1249,7 @@ mod tests {
     fn drift_is_one_aggregate_over_the_parent_table() {
         let sql = crate::counter_cache::drift_sql(&sum_def().sql_view(), DRIFT_SCAN_LIMIT);
         assert!(
-            sql.starts_with("SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"dv_posts\""),
+            sql.starts_with("SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM "),
             "{sql}"
         );
         assert!(
@@ -1215,9 +1257,12 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.ends_with(&format!(" LIMIT {DRIFT_SCAN_LIMIT}) AS __autumn_cc_drift")),
-            "the scan is capped, so the actuator cannot hang on a huge table: {sql}"
+            sql.contains(&format!(
+                "(SELECT * FROM \"dv_posts\" ORDER BY \"dv_posts\".\"id\" DESC LIMIT {DRIFT_SCAN_LIMIT}) AS \"dv_posts\""
+            )),
+            "the parents examined are capped, so the actuator cannot hang on a huge table: {sql}"
         );
+        assert!(sql.ends_with(") AS __autumn_cc_drift"), "{sql}");
     }
 
     #[test]

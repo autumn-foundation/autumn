@@ -1596,26 +1596,34 @@ pub fn recompute_update_sql(view: &SqlView, ids: &str) -> String {
     )
 }
 
-/// How many parent rows disagree with the source of truth, up to `limit`.
+/// How many of the newest `limit` parent rows disagree with the source of
+/// truth.
 ///
 /// One aggregate statement per derivation, so it is a single round trip. The
-/// `LIMIT` inside the derived table is what bounds the work: the question an
-/// operator asks is "is this derivation drifting", not "by exactly how much on
-/// a billion-row table", and a count that reaches `limit` answers it. Without
-/// the cap this is a full scan of the parent table with a correlated aggregate
-/// per row.
+/// `LIMIT` bounds the **input**: the `limit` highest-id parents are the window,
+/// materialised under the parent table's own name so the correlated ground
+/// truth needs no rewriting, and only those rows pay for a correlated
+/// aggregate. A `LIMIT` on the matching output alone would not do it: on a
+/// healthy table nothing matches, so the engine would evaluate the aggregate
+/// for every parent before proving there is nothing left to find. The question
+/// an operator asks is "is this derivation drifting", not "by exactly how much
+/// on a billion-row table", and newest-first is where live writes, and so live
+/// drift, concentrate.
 pub fn drift_sql(view: &SqlView, limit: i64) -> String {
     let Quoted {
         parent_table,
+        parent_pk,
         counter_column,
         ..
     } = quoted(view);
     let ground_truth = ground_truth_sql(view);
     format!(
         "SELECT COUNT(*) AS count FROM \
-         (SELECT 1 AS drifted FROM {parent_table} \
-          WHERE {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth} \
-          LIMIT {limit}) AS __autumn_cc_drift"
+         (SELECT 1 AS drifted FROM \
+           (SELECT * FROM {parent_table} ORDER BY {parent_table}.{parent_pk} DESC LIMIT {limit}) \
+           AS {parent_table} \
+          WHERE {parent_table}.{counter_column} {IS_DISTINCT_FROM} {ground_truth}) \
+         AS __autumn_cc_drift"
     )
 }
 
@@ -2321,14 +2329,20 @@ mod tests {
     fn drift_is_one_aggregate_over_the_parent_table() {
         let sql = drift_sql(&view(&sum_spec()), 10_000);
         assert!(
-            sql.starts_with("SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM \"posts\""),
+            sql.starts_with("SELECT COUNT(*) AS count FROM (SELECT 1 AS drifted FROM "),
             "{sql}"
         );
         assert!(sql.contains(IS_DISTINCT_FROM), "{sql}");
+        // The cap is on the parents examined, not on the matches: a healthy
+        // table has no match, so an output-side LIMIT would still evaluate the
+        // correlated aggregate for every parent before giving up.
         assert!(
-            sql.ends_with(" LIMIT 10000) AS __autumn_cc_drift"),
-            "the scan is capped, so a huge table cannot make this endpoint hang: {sql}"
+            sql.contains(
+                "FROM (SELECT * FROM \"posts\" ORDER BY \"posts\".\"id\" DESC LIMIT 10000) AS \"posts\" WHERE"
+            ),
+            "the window is materialised under the table's own name: {sql}"
         );
+        assert!(sql.ends_with(") AS __autumn_cc_drift"), "{sql}");
     }
 
     #[test]

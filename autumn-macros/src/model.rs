@@ -2250,23 +2250,18 @@ fn emit_counter_caches_impl(
                 derivation: ::core::option::Option::None,
             }
         });
-        let claim_ident = format_ident!("__AUTUMN_COUNTER_CACHE_CLAIM_{index}");
+        // Submitted as a literal rather than through a named `static`: the
+        // claim is all `&'static str`, so it is const-constructible in place,
+        // and a name would have to be unique across every model in a module.
         claim_items.push(quote! {
-            /// Registered parent column of one plain `counter_cache` on this
-            /// model (#1769): framework plumbing, not a public API.
-            #[doc(hidden)]
-            #[allow(non_upper_case_globals)]
-            pub static #claim_ident: ::autumn_web::derivation::CounterCacheClaim =
+            ::autumn_web::reexports::inventory::submit! {
                 ::autumn_web::derivation::CounterCacheClaim {
                     model: ::core::stringify!(#model_ident),
                     child_table: #table_name,
                     parent_table: #parent_table,
                     column: #column,
                     module_path: ::core::module_path!(),
-                };
-
-            ::autumn_web::reexports::inventory::submit! {
-                &#claim_ident
+                }
             }
         });
     }
