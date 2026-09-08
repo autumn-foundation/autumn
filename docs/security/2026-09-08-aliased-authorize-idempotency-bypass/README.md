@@ -15,7 +15,8 @@ and `autumn_macros::route::has_authorize_guard` × `#[authorize]` ×
 `#[authorize]` together with `.idempotent()`
 **Status:** fixed — `autumn-macros/src/authorize.rs`,
 `autumn-macros/src/secured.rs`, `autumn-macros/src/step_up.rs`,
-`autumn-macros/src/throttle.rs`, `autumn-macros/src/route.rs`
+`autumn-macros/src/throttle.rs`, `autumn-macros/src/route.rs`,
+`autumn-macros/src/feature_flag.rs`, `autumn-macros/src/param_helpers.rs`
 
 ## 🎯 Surface
 
@@ -272,6 +273,34 @@ full-repo grep before landing) every example — is unaffected. No public
 signature, config default, or route status-code change. `CHANGELOG.md`
 `## [Unreleased] > ### Security` entry documents the compile-time refusal
 and its migration (spell `#[authorize]` by its real name). No version bump.
+
+## Round 3: `#[feature_flag]`'s gate never consulted replay ownership at all
+
+While reviewing the round-2 fix, Codex found a fourth pre-body gate macro,
+`#[feature_flag]`, whose `FromRequestParts` gate served a cached idempotency
+reply **unconditionally** whenever the flag was enabled — it never called
+`idempotency_guard::should_own_replay` at all, unlike `#[secured]`/
+`#[step_up]`/`#[throttle]`. With `#[feature_flag(...)] #[authorize(...)]
+#[post(...)]` (feature flag topmost, so its gate ends up leftmost and runs
+first), the gate would serve a stale cached response before `#[authorize]`'s
+policy re-check ever ran — reachable with a **literal** `#[authorize]`, not
+only an aliased one, since `#[feature_flag]` never checked by name, shape,
+or ownership in the first place. Separately, `param_helpers::GUARD_GATE_TYPE_PREFIXES`
+never listed `__AutumnFlagGate_`, so `#[secured]`/`#[step_up]`/`#[throttle]`
+couldn't detect an earlier `#[feature_flag]` gate either and could
+wrongly double-claim ownership on top of it.
+
+Fixed by making `feature_flag_macro`'s gate wrap its replay check in
+`should_own_replay(&input_fn)` (the exact pattern the other three gates
+use), wiring `reject_if_ambiguous_authorize_shape` into it too, and adding
+`__AutumnFlagGate_` to `GUARD_GATE_TYPE_PREFIXES`. A sweep of every
+`FromRequestParts` impl generator in `autumn-macros/src/` (`grep -rl "impl.*FromRequestParts"`)
+confirmed these four gate macros (`secured`, `step_up`, `throttle`,
+`feature_flag`) are the complete set with this shape; `repository.rs`'s and
+`service.rs`'s `FromRequestParts` impls are for unrelated, self-contained
+extractors (a repository's own generated policy-check-then-replay sequence,
+already correctly ordered within one macro's own output; DI-only service
+extraction) with no cross-macro ordering ambiguity to exploit.
 
 ## 🗂 Ledger
 
