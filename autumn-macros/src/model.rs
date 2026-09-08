@@ -10487,9 +10487,8 @@ mod tests {
             quote! { #[derivation(Post, column = "s", transform = sum(score, bonus))] },
         ] {
             let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#attr)];
-            let err = match resolve_derivations(&model, &attrs, &[]) {
-                Ok(_) => panic!("extra tokens inside sum(...) must be an error"),
-                Err(err) => err,
+            let Err(err) = resolve_derivations(&model, &attrs, &[]) else {
+                panic!("extra tokens inside sum(...) must be an error")
             };
             assert!(err.to_string().contains("exactly one field name"), "{err}");
         }
