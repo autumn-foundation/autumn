@@ -66,31 +66,10 @@ use serde::{Deserialize, Serialize};
 /// Declare a `TEXT`-backed `SQLite` newtype over a foreign `$inner` type.
 ///
 /// `$encode` renders the wrapped value; `FromStr` on `$inner` parses it back.
-macro_rules! text_backed_newtype {
+macro_rules! text_backed_newtype_impls {
     (
-        $(#[$meta:meta])*
         $name:ident($inner:ty), encode = |$value:ident| $encode:expr $(,)?
     ) => {
-        $(#[$meta])*
-        #[derive(
-            Debug,
-            Clone,
-            Copy,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Hash,
-            Default,
-            Serialize,
-            Deserialize,
-            diesel::AsExpression,
-            diesel::FromSqlRow,
-        )]
-        #[diesel(sql_type = Text)]
-        #[serde(transparent)]
-        pub struct $name(pub $inner);
-
         impl $name {
             /// The wrapped value.
             #[must_use]
@@ -158,30 +137,70 @@ macro_rules! text_backed_newtype {
     };
 }
 
-text_backed_newtype!(
-    /// A `uuid::Uuid` model field on the `SQLite` backend, stored as `TEXT`
-    /// (issue #1924).
-    ///
-    /// ```rust,ignore
-    /// # use autumn_web::db::sqlite_types::SqliteUuid;
-    /// # fn demo(id: uuid::Uuid) {
-    /// let wrapped: SqliteUuid = id.into();
-    /// assert_eq!(wrapped.to_string(), id.to_string());
-    /// assert_eq!(*wrapped, id);
-    /// # }
-    /// ```
-    SqliteUuid(uuid::Uuid),
-    encode = |value| value.to_string(),
-);
+/// A `uuid::Uuid` model field on the `SQLite` backend, stored as `TEXT`
+/// (issue #1924).
+///
+/// ```rust,ignore
+/// # use autumn_web::db::sqlite_types::SqliteUuid;
+/// # fn demo(id: uuid::Uuid) {
+/// let wrapped: SqliteUuid = id.into();
+/// assert_eq!(wrapped.to_string(), id.to_string());
+/// assert_eq!(*wrapped, id);
+/// # }
+/// ```
+//
+// Declared literally rather than inside `text_backed_newtype_impls!`: the docs
+// name `autumn_web::db::sqlite_types::SqliteUuid` in front of readers, and
+// `scripts/check-docs-symbols.sh` resolves such a path by reading the source
+// surface. A type whose `pub struct` line only exists as a macro metavariable
+// is invisible to that scan — and to anyone grepping for the name.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    diesel::AsExpression,
+    diesel::FromSqlRow,
+)]
+#[diesel(sql_type = Text)]
+#[serde(transparent)]
+pub struct SqliteUuid(pub uuid::Uuid);
 
-text_backed_newtype!(
-    /// A `rust_decimal::Decimal` model field on the `SQLite` backend, stored as
-    /// `TEXT` (issue #1924).
-    ///
-    /// Written normalized — trailing fractional zeros dropped — so one value has
-    /// one spelling and `SQLite`'s byte-wise `=` and `UNIQUE` agree with Rust
-    /// equality. The value stays numerically exact. See the module docs for the
-    /// lexicographic-ordering limit, which normalizing does not fix.
+/// A `rust_decimal::Decimal` model field on the `SQLite` backend, stored as
+/// `TEXT` (issue #1924).
+///
+/// Written normalized — trailing fractional zeros dropped — so one value has
+/// one spelling and `SQLite`'s byte-wise `=` and `UNIQUE` agree with Rust
+/// equality. The value stays numerically exact. See the module docs for the
+/// lexicographic-ordering limit, which normalizing does not fix.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Serialize,
+    Deserialize,
+    diesel::AsExpression,
+    diesel::FromSqlRow,
+)]
+#[diesel(sql_type = Text)]
+#[serde(transparent)]
+pub struct SqliteDecimal(pub rust_decimal::Decimal);
+
+text_backed_newtype_impls!(SqliteUuid(uuid::Uuid), encode = |value| value.to_string());
+text_backed_newtype_impls!(
     SqliteDecimal(rust_decimal::Decimal),
     encode = |value| value.normalize().to_string(),
 );
