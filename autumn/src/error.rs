@@ -219,6 +219,17 @@ where
             status = push_err.status();
         }
 
+        // A Constela document that fails to parse, validate or render is
+        // malformed input, not a server fault: `?` on one in a handler should
+        // produce the same 422 a `#[validate(...)]` rejection does rather than
+        // a 500. Mapped here, by downcast, because `AutumnError`'s blanket
+        // `From<E: Error>` impl above forecloses a dedicated `From` impl on
+        // any concrete error type in this crate.
+        #[cfg(feature = "constela")]
+        if let Some(constela_err) = any_err.downcast_ref::<crate::constela::ConstelaError>() {
+            status = constela_err.http_status();
+        }
+
         if matches!(
             any_err.downcast_ref::<crate::lock::LockError>(),
             Some(

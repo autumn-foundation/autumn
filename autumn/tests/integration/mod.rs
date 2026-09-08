@@ -63,6 +63,8 @@ mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
+#[cfg(feature = "constela")]
+mod constela;
 mod custom_layer;
 #[cfg(feature = "db")]
 mod data_classification;

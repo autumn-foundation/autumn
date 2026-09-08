@@ -151,6 +151,16 @@ pub mod classify;
 pub mod cluster;
 pub mod config;
 pub mod consent;
+// Parse, validate and server-render Constela documents: the constrained JSON UI
+// language (https://github.com/yuuichieguchi/constela), for serving interfaces
+// a language model generated. Enable with the Cargo feature `constela`.
+//
+// A plain comment, not a doc comment, for the same reason `agent_authority` and
+// `classify` carry one: an outer `///` here is merged with the module's own
+// `//!` docs, and the whole block then resolves its intra-doc links in *this*
+// scope — where `policy`, `eval` and `Document` do not exist.
+#[cfg(feature = "constela")]
+pub mod constela;
 pub mod credentials;
 pub mod current;
 #[cfg(feature = "db")]

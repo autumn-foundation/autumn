@@ -182,13 +182,20 @@ a panic there would take down the very request they exist to record), and the
 sandboxed-plugin runtime (`autumn/src/plugin_sandbox/host.rs`, `wire.rs`,
 `plugin.rs`: they run an artifact the operator explicitly did not audit, and the
 lane's whole promise is that nothing a hostile guest does can abort the host
-process). These are the files listed in the `REQUEST_PATH_MODULES` array in
+process), and the generated-UI pipeline (`autumn/src/constela/*`: it parses,
+validates, evaluates and renders a document a language model wrote, so every
+panic in it is reachable by whoever can shape that model's prompt — an
+out-of-range index there is a 500 on demand, not an injection, but just as much
+a vulnerability). These are the files listed in the `REQUEST_PATH_MODULES` array in
 `scripts/check-panic-gate.sh`, each entry carrying the Cargo feature that gates
 its `mod` declaration.
 
 **Honest scoping — the manifest is the *enforced* subset, not the whole request
-path.** The 37 modules are the files the gate enforces today, not a claim that
-they are the *only* per-request code. Other unambiguously per-request or
+path.** The modules in that array are the files the gate enforces today, not a
+claim that they are the *only* per-request code. (Stated without a count on
+purpose: the manifest grows every time a batch is audited, and a number written
+here goes stale the first time it does — `check-panic-gate.sh` prints the live
+one on every run.) Other unambiguously per-request or
 framework-owned modules are **not yet gated** and still contain production-path
 panics — known examples include `router.rs`, `etag.rs`, `security/rate_limit.rs`,
 `security/headers.rs`, `sse.rs`, and the `csrf` / `negotiate` / `range` /

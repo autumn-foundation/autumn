@@ -38,6 +38,19 @@ mcp = ["openapi"]
 # allowlist HTML sanitizer `markdown::render_user_content` runs its output
 # through, so a content app can accept user Markdown without stored XSS.
 markdown = ["dep:pulldown-cmark", "dep:ammonia"]
+# Parse, validate and server-render Constela documents — the constrained JSON
+# UI language (https://github.com/yuuichieguchi/constela) — so an app can serve
+# an interface a language model generated without ever handing it a code path.
+# See `constela::policy` for the safety guarantee and `docs/guide/constela.md`
+# for the htmx wiring.
+#
+# Implies `maud`: the module's whole output is a `maud::Markup`, so there is no
+# build where parsing a document is useful and rendering it is not. Adds NO new
+# dependencies — `serde`, `serde_json` and `maud` are already in the graph. The
+# `markdown` node kind additionally requires the `markdown` feature; without it
+# a document containing one fails validation with `constela.feature_required`
+# rather than rendering nothing.
+constela = ["maud"]
 # `reqwest?/blocking` powers the replication S3 destination (#1628), which needs
 # BOTH `db` and `http-client`. The `?` means it is enabled only when something
 # else already pulled reqwest in, so an app on `http-client` alone (no database,
@@ -491,6 +504,12 @@ features = [
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
   "plugin-sandbox",
+  # Generated UI. Pure Rust over dependencies already in the graph, so it
+  # builds in the docs.rs sandbox — and without it the whole `constela` module
+  # (Document, the policy allowlists, dispatch) is missing from the published
+  # docs. Listed alongside `markdown`, which is what makes its `markdown` node
+  # kind reachable.
+  "constela",
   # Direct HTTPS termination (#1603). Pure Rust (rustls/ring), no system
   # libraries, so it builds in the docs.rs sandbox — and without it the whole
   # `tls` module (TlsListener, CertReloader, load_certified_key) is missing
