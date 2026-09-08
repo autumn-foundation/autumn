@@ -264,6 +264,21 @@ pub enum ScrubError {
         /// The target labels, sorted.
         targets: Vec<String>,
     },
+    /// `--dry-run` cannot print a runnable script because the plan rewrites an
+    /// `#[encrypted]` column, and that rewrite has no SQL form: the replacement
+    /// is an AEAD envelope sealed per row under the target's key, which cannot
+    /// be printed without printing the key.
+    ///
+    /// The script is withheld whole rather than printed with the one statement
+    /// missing. A printed stream is pasted into an interactive psql, and there
+    /// is no marker that stops one: measured on psql 16.13, a `RAISE EXCEPTION`
+    /// aborts its own transaction only — the `COMMIT` below it clears the
+    /// aborted state, and every later statement, including the next target's
+    /// `\connect` and its deletes, runs for real.
+    UnprintableEncryptedRewrite {
+        /// The columns that cannot be printed, as `target: table.column`, sorted.
+        columns: Vec<String>,
+    },
     /// A table this run promises to empty carries a user-defined trigger or
     /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
     /// write, so anything it writes lands after every rewrite and is never
@@ -531,6 +546,23 @@ impl std::fmt::Display for ScrubError {
                  target as a URI (`postgres://user@host/db`), or run without `--dry-run`.",
                 targets.len(),
                 bullet_list(targets),
+            ),
+            Self::UnprintableEncryptedRewrite { columns } => write!(
+                f,
+                "`--dry-run` cannot print a runnable script: {} column(s) are \
+                 #[encrypted]:\n{}\n  \
+                 The scrub replaces each of these with an AEAD envelope sealed per row \
+                 under the target's key, so there is no SQL text for it that does not \
+                 embed the key. Printing the rest and omitting these is worse than \
+                 printing nothing: the script is meant to be pasted into psql, and \
+                 nothing in a pasted stream can stop it partway — an aborted \
+                 transaction ends at the next `COMMIT`, after which the following \
+                 target's `\\connect` and its DELETEs run for real. So the whole \
+                 script is withheld, not just the statements that cannot be written. \
+                 The plan above is complete and accurate — run `autumn db scrub` \
+                 without --dry-run to apply it.",
+                columns.len(),
+                bullet_list(columns),
             ),
             Self::ReplicaSessionRole { role } => write!(
                 f,
@@ -2565,6 +2597,45 @@ fn classify_and_apply(
                 targets: unprintable,
             });
         }
+        // And refuse, the same way, if any target rewrites an #[encrypted]
+        // column. That rewrite has no SQL form — the replacement is sealed per
+        // row under the target's key — so the script could only be printed with
+        // that one statement missing, and a script missing its rewrites empties
+        // and samples exactly as advertised while leaving every kept row's
+        // production ciphertext in place. Measured: pasting such a script left
+        // `users` sampled 200 -> 100 with every address rewritten AND all 100
+        // kept rows still holding their original ciphertext, committed without
+        // an error.
+        //
+        // A marker in the stream does not close this. A `RAISE EXCEPTION` aborts
+        // its own transaction, and that much works — the deletes below it are
+        // refused. But the `COMMIT` this script prints turns the abort into a
+        // ROLLBACK and clears the state, and measured on psql 16.13 the pasted
+        // lines after it run: the out-of-transaction `VACUUM (FULL)`s, then the
+        // next target's `\connect` and its whole block. On two clusters, a
+        // stopped first target still took the second from 200 comments to 0,
+        // committed. `\quit` is not an answer either: psql exits and the rest
+        // of the paste is read by the shell that launched it, which executed a
+        // trailing `echo` in the same measurement. Fail closed instead, exactly
+        // as above: the plan is still reported in full, only the runnable script
+        // is withheld.
+        let mut encrypted_rewrites: Vec<String> = plans
+            .iter()
+            .flat_map(|(label, _, plan, _, _)| {
+                plan.tables.iter().flat_map(move |table| {
+                    table
+                        .encrypted
+                        .iter()
+                        .map(move |rewrite| format!("{label}: {}.{}", table.table, rewrite.column))
+                })
+            })
+            .collect();
+        encrypted_rewrites.sort();
+        if !encrypted_rewrites.is_empty() {
+            return Err(ScrubError::UnprintableEncryptedRewrite {
+                columns: encrypted_rewrites,
+            });
+        }
         // Printed in the order `execute` runs them: purges, then the sample,
         // then the rewrites — and, like `execute`, holding back the purges the
         // plan defers until after the sample. The order is load-bearing (a
@@ -2630,25 +2701,11 @@ fn classify_and_apply(
             for (_, statement) in &phases.after_sample {
                 eprintln!("  {statement};");
             }
+            // No `table.encrypted` arm here: a plan with any encrypted rewrite
+            // is refused above, before a line of this script is printed.
             for table in &plan.tables {
                 if let Some(sql) = &table.sql {
                     eprintln!("  {sql};");
-                }
-                for rewrite in &table.encrypted {
-                    eprintln!(
-                        "  -- {}.{}: re-encrypted per row under the target's key ({} mode)",
-                        sample::comment_safe(&table.table),
-                        sample::comment_safe(&rewrite.column),
-                        if rewrite.deterministic {
-                            "deterministic"
-                        } else {
-                            "randomized"
-                        }
-                    );
-                    eprintln!(
-                        "  {}",
-                        encrypted_rewrite_stop(&table.table, &rewrite.column)
-                    );
                 }
             }
             // Last, exactly as `execute` runs it: the pass that makes "emptied"
@@ -3989,40 +4046,6 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
     )
 }
 
-/// Stop a pasted script where an encrypted column would be rewritten.
-///
-/// The rewrite is done per row in Rust: a fabricated value encrypted under the
-/// TARGET's key. Expressing it as SQL would mean embedding that key in a script
-/// meant to be pasted and shared, which is the one thing the printed conninfo
-/// goes out of its way not to do. So this is the one statement the dry run
-/// cannot print truthfully.
-///
-/// Printing a comment there and committing anyway is what the previous version
-/// did, and it produced exactly the state this command promises is impossible.
-/// Measured: pasting the advertised script against a schema with one
-/// `#[encrypted]` column left `users` sampled 200 -> 100 with every address
-/// rewritten AND all 100 kept rows still holding their original production
-/// ciphertext — a sampled-but-unscrubbed copy, committed without a single error.
-///
-/// So the block is made to fail where it cannot tell the truth. The whole script
-/// still prints and still reads, which is what `--dry-run` is for; pasting it
-/// now aborts the transaction here and rolls everything back rather than
-/// committing a copy that looks scrubbed and is not.
-fn encrypted_rewrite_stop(table: &str, column: &str) -> String {
-    let body = format!(
-        " BEGIN RAISE EXCEPTION {message}, {table}, {column}; END ",
-        table = quote_literal(table),
-        column = quote_literal(column),
-        message = quote_literal(
-            "%.% is #[encrypted]: the scrub re-encrypts it per row under the target's key, \
-             which cannot be printed as SQL without embedding that key. This script cannot \
-             be run to completion — run `autumn db scrub` without --dry-run to apply it."
-        ),
-    );
-    let tag = sample::dollar_tag(&body);
-    format!("DO {tag}{body}{tag};")
-}
-
 /// Abort the transaction unless the session is on the target this block is for.
 ///
 /// `\connect` does NOT close the old connection when the new one fails. Measured
@@ -4544,43 +4567,50 @@ mod tests {
 
     // ── The dry run's session and connection preamble ──────────────────────
 
-    /// The one statement the dry run cannot print truthfully makes the script
-    /// stop, instead of committing a copy that looks scrubbed and is not.
+    /// The statement the dry run cannot print truthfully withholds the whole
+    /// script, because nothing in a pasted stream can stop it partway.
     ///
-    /// Measured: before this, pasting the advertised script against a schema
-    /// with one `#[encrypted]` column left `users` sampled 200 -> 100 with every
-    /// address rewritten AND all 100 kept rows still holding their original
-    /// production ciphertext, committed without a single error. After, the same
-    /// paste aborts and rolls back: 200 users, 200 original ciphertexts, 200
-    /// original addresses.
+    /// Measured: printing the script with the rewrite replaced by a comment left
+    /// `users` sampled 200 -> 100 with every address rewritten AND all 100 kept
+    /// rows still holding their original production ciphertext, committed
+    /// without a single error. Replacing the comment with a `RAISE EXCEPTION`
+    /// fixed only that target: on psql 16.13 the abort ends at the printed
+    /// `COMMIT`, and the following `VACUUM (FULL)`s and the NEXT target's
+    /// `\connect` and DELETEs ran for real — a second cluster went from 200
+    /// comments to 0. `\quit` fares no better: psql exits and the shell that
+    /// launched it reads the rest of the paste, executing a trailing `echo` in
+    /// the same measurement. So the script is refused before it is printed.
     #[test]
-    fn an_encrypted_rewrite_stops_a_pasted_script() {
-        let stop = super::encrypted_rewrite_stop("users", "api_token");
+    fn an_encrypted_rewrite_withholds_the_whole_printed_script() {
+        let refusal = ScrubError::UnprintableEncryptedRewrite {
+            columns: vec!["control: users.api_token".to_owned()],
+        }
+        .to_string();
         assert!(
-            stop.contains("RAISE EXCEPTION"),
-            "it must abort the transaction, not merely say something: {stop}"
+            refusal.contains("cannot print a runnable script"),
+            "it must refuse the script, not annotate it: {refusal}"
         );
         assert!(
-            stop.contains("'users'") && stop.contains("'api_token'"),
-            "and name the column that cannot be printed: {stop}"
+            refusal.contains("users.api_token"),
+            "and name the column that cannot be printed: {refusal}"
         );
         assert!(
-            stop.contains("without --dry-run"),
-            "and say what to run instead: {stop}"
+            refusal.contains("without --dry-run"),
+            "and say what to run instead: {refusal}"
+        );
+        // Withholding the SQL is the point; the plan report above it still
+        // stands, so the refusal must not read as "nothing was analysed".
+        assert!(
+            refusal.contains("plan above is complete"),
+            "and keep the reported plan standing: {refusal}"
         );
         // The key is the reason this cannot be printed as SQL, so it must not
         // appear in the reason either.
         assert!(
-            !stop.to_lowercase().contains("primary_key")
-                && !stop.contains("deterministic_key")
-                && !stop.contains("key_derivation_salt"),
-            "no key material may reach the printed script: {stop}"
-        );
-        // Identifiers reach SQL as literals here like everywhere else.
-        let hostile = super::encrypted_rewrite_stop("it's", "c'ol");
-        assert!(
-            hostile.contains("'it''s'") && hostile.contains("'c''ol'"),
-            "a quote must not break out of the literal: {hostile}"
+            !refusal.to_lowercase().contains("primary_key")
+                && !refusal.contains("deterministic_key")
+                && !refusal.contains("key_derivation_salt"),
+            "no key material may reach the refusal: {refusal}"
         );
     }
 

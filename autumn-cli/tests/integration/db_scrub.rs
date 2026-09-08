@@ -578,17 +578,27 @@ async fn scrub_anonymizes_a_resolved_database_url_in_place() {
         .get(0);
     assert_eq!(outbox_before, 1, "--check must not empty a purged table");
 
-    // `--dry-run` prints the statement and still writes nothing.
+    // `--dry-run` reports the plan, withholds the script, and writes nothing.
+    //
+    // `User::api_token` is `#[encrypted]`, and that rewrite has no SQL text: the
+    // replacement is sealed per row under this target's key. A script printed
+    // without it samples and empties exactly as advertised while leaving every
+    // kept row's production ciphertext in place, and nothing in a pasted stream
+    // can stop it partway — an aborted transaction ends at the next `COMMIT`.
+    // So the runnable script is refused whole. The plan report above it still
+    // has to stand: that is what `--dry-run` is for.
     let (_o, dry_err) = run_autumn_ok(dir, &["db", "scrub", "--dry-run"], &envs);
-    // Schema-qualified on purpose — do not "simplify" this to a bare
-    // `UPDATE "users"`. Every catalog read that built the plan is scoped to
-    // `public`, so the writes are too: under a database- or role-level
-    // `search_path` (which Autumn supports for tenant schemas) a bare
-    // identifier would resolve to a DIFFERENT table than the one classified,
-    // leaving the classified rows unscrubbed. This assertion pins that.
     assert!(
-        dry_err.contains("UPDATE \"public\".\"users\" SET"),
-        "dry run should print the schema-qualified statement: {dry_err}"
+        dry_err.contains("cannot print a runnable script") && dry_err.contains("users.api_token"),
+        "the dry run must refuse the script and name the column: {dry_err}"
+    );
+    assert!(
+        !dry_err.contains("UPDATE \"public\".\"users\" SET"),
+        "and withhold the script whole, not print it minus the rewrite: {dry_err}"
+    );
+    assert!(
+        dry_err.contains("users.email") && dry_err.contains("autumn_sync_rows"),
+        "while still reporting the classification and the purge: {dry_err}"
     );
     assert!(
         !occurrences(&client, "Alice Realname").await.is_empty(),
@@ -2756,6 +2766,18 @@ async fn sample_check_and_dry_run_write_nothing() {
     assert!(
         dry_err.contains("DELETE FROM \"public\".\"audit_logs\""),
         "the dry run must print the sample's own statements: {dry_err}"
+    );
+    // Schema-qualified on purpose — do not "simplify" this to a bare
+    // `UPDATE "users"`. Every catalog read that built the plan is scoped to
+    // `public`, so the writes are too: under a database- or role-level
+    // `search_path` (which Autumn supports for tenant schemas) a bare
+    // identifier would resolve to a DIFFERENT table than the one classified,
+    // leaving the classified rows unscrubbed. This assertion pins that, and
+    // lives here rather than on the main fixture because that fixture's
+    // `#[encrypted]` column makes its script unprintable by design.
+    assert!(
+        dry_err.contains("UPDATE \"public\".\"users\" SET"),
+        "and print the column rewrite schema-qualified: {dry_err}"
     );
 
     assert_eq!(

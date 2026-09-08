@@ -471,12 +471,28 @@ be on the wrong database.
 One statement the dry run cannot print truthfully is the rewrite of an
 `#[encrypted]` column: the scrub encrypts a fabricated value per row under the
 **target's** key, and expressing that as SQL would mean embedding that key in a
-script meant to be pasted and shared. The script therefore stops there. It still
-prints in full and still reads in full — which is what `--dry-run` is for — but
-pasting it aborts the transaction at that point and rolls everything back, rather
-than committing a copy whose other columns are scrubbed and whose encrypted ones
-still hold the original production ciphertext. Run without `--dry-run` to apply
-it for real.
+script meant to be pasted and shared. Where a plan contains one, `--dry-run`
+reports the plan as usual and then refuses to print the script at all:
+
+```
+✗ `--dry-run` cannot print a runnable script: 1 column(s) are #[encrypted]:
+    - control: users.api_token
+```
+
+Printing the rest and omitting that one line is not an option, and neither is
+marking it. A script missing its encrypted rewrites samples and empties exactly
+as advertised, then commits a copy whose other columns are scrubbed and whose
+encrypted ones still hold the original production ciphertext. And nothing placed
+in the stream stops a paste partway: a `RAISE EXCEPTION` aborts its own
+transaction — which does refuse the statements below it — but the `COMMIT` the
+script prints turns that into a `ROLLBACK` and clears the state, after which the
+out-of-transaction `VACUUM (FULL)` statements and the *next* target's `\connect`
+and `DELETE`s execute for real. A `\quit` is worse still: `psql` exits and the
+shell that launched it reads the remainder of the paste.
+
+So the boundary is the same one the keyword-form conninfo gets below — the plan
+above is complete and accurate, and the executable stream is withheld. Run
+without `--dry-run` to apply it for real.
 
 The walk prints as the loop it is — a `DO` block that repeats the pass and stops on one
 that selects nothing — rather than as a single pass with a comment saying to
