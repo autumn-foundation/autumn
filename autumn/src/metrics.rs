@@ -107,17 +107,18 @@ pub const MAX_LABELS_PER_SERIES_CEILING: usize = 64;
 /// Deprecated alias for [`DEFAULT_MAX_SERIES_PER_METRIC`].
 #[deprecated(
     since = "0.8.0",
-    note = "the cap is configurable ([metrics] max_series_per_metric); read the \
-            effective value with metrics::max_series_per_metric(), or this \
-            constant's replacement DEFAULT_MAX_SERIES_PER_METRIC for the default"
+    note = "the cap is configurable as metrics.max_series_per_metric in \
+            autumn.toml; read the effective value with \
+            metrics::max_series_per_metric(), or this constant's replacement \
+            DEFAULT_MAX_SERIES_PER_METRIC for the default"
 )]
 pub const MAX_SERIES_PER_METRIC: usize = DEFAULT_MAX_SERIES_PER_METRIC;
 
 /// Deprecated alias for [`DEFAULT_MAX_INSTRUMENTS`].
 #[deprecated(
     since = "0.8.0",
-    note = "the cap is configurable ([metrics] max_instruments); read the \
-            effective value with metrics::max_instruments(), or this \
+    note = "the cap is configurable as metrics.max_instruments in autumn.toml; \
+            read the effective value with metrics::max_instruments(), or this \
             constant's replacement DEFAULT_MAX_INSTRUMENTS for the default"
 )]
 pub const MAX_INSTRUMENTS: usize = DEFAULT_MAX_INSTRUMENTS;
@@ -125,9 +126,10 @@ pub const MAX_INSTRUMENTS: usize = DEFAULT_MAX_INSTRUMENTS;
 /// Deprecated alias for [`DEFAULT_MAX_LABELS_PER_SERIES`].
 #[deprecated(
     since = "0.8.0",
-    note = "the cap is configurable ([metrics] max_labels_per_series); read the \
-            effective value with metrics::max_labels_per_series(), or this \
-            constant's replacement DEFAULT_MAX_LABELS_PER_SERIES for the default"
+    note = "the cap is configurable as metrics.max_labels_per_series in \
+            autumn.toml; read the effective value with \
+            metrics::max_labels_per_series(), or this constant's replacement \
+            DEFAULT_MAX_LABELS_PER_SERIES for the default"
 )]
 pub const MAX_LABELS_PER_SERIES: usize = DEFAULT_MAX_LABELS_PER_SERIES;
 
