@@ -203,8 +203,19 @@ pub async fn post_comment(
         .ok_or_else(|| AutumnError::not_found_msg("No such post"))?;
 
     // Never accept a comment on content the commenter cannot see, or on a post
-    // whose author closed the thread.
-    if !post.is_public() || post.comment_status != "open" {
+    // whose author closed the thread. "Cannot see" is the same three questions
+    // the render path asks — status, registered type, and the password gate —
+    // not just the first. A signed-in caller is assigned `approved`
+    // immediately, so accepting one here would inject visible discussion into
+    // a thread the front end deliberately withholds.
+    let type_is_public = crate::content_types::find_post_type(&post.post_type)
+        .is_some_and(|registered| registered.public);
+    let unlocked = !post.is_password_protected()
+        || session
+            .get(&format!("post_unlock_{}", post.id))
+            .await
+            .is_some_and(|stored| stored == post.password);
+    if !post.is_public() || !type_is_public || !unlocked || post.comment_status != "open" {
         return Err(AutumnError::forbidden_msg(
             "Comments are closed on this post",
         ));

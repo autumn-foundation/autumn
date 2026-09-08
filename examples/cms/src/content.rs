@@ -14,7 +14,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
 
 use crate::models::{Comment, NewRevision, Post, Revision, Term, User};
-use crate::schema::{comments, post_terms, posts, revisions, terms, users};
+use crate::schema::{comments, menus, post_terms, posts, revisions, terms, users};
 
 /// The maximum reply nesting a comment thread accepts.
 ///
@@ -822,9 +822,15 @@ pub async fn update_user(
 /// Returns the terms its cascaded posts were filed under, so the caller can
 /// rebuild their counts — the cascade reaches `post_terms` and nothing in it
 /// maintains `terms.post_count`.
-pub async fn delete_user(db: &mut Db, target_id: i64) -> AutumnResult<Vec<i64>> {
+pub async fn delete_user(db: &mut Db, target_id: i64) -> AutumnResult<()> {
+    // Collected before the delete: the cascade takes the `post_terms` rows
+    // with it, so afterwards nothing names the terms that need rebuilding.
     let affected_terms = term_ids_for_author(db, target_id).await?;
     // Deleting is a demotion to "no role at all", so it takes the same guard.
+    // The recounts run inside the same transaction as the cascade: doing them
+    // afterwards means a transient failure leaves the account and its posts
+    // permanently gone with the counts stale, and a retry finds no user to
+    // delete, so nothing ever repairs them.
     with_administrator_guard(
         db,
         target_id,
@@ -834,13 +840,15 @@ pub async fn delete_user(db: &mut Db, target_id: i64) -> AutumnResult<Vec<i64>> 
                 diesel::delete(users::table.find(target_id))
                     .execute(conn)
                     .await?;
+                for term_id in affected_terms {
+                    recount_term(conn, term_id).await?;
+                }
                 Ok(())
             }
             .scope_boxed()
         },
     )
-    .await?;
-    Ok(affected_terms)
+    .await
 }
 
 /// The post types that are reachable on the public front end.
@@ -985,6 +993,12 @@ pub async fn published_posts_in_period(
     offset: i64,
     limit: i64,
 ) -> AutumnResult<(Vec<Post>, i64)> {
+    // Same guard as every other listing: naming a type is not the same as
+    // establishing it has a public route.
+    if !is_public_type(post_type) {
+        return Ok((Vec::new(), 0));
+    }
+
     let total: i64 = posts::table
         .filter(posts::post_type.eq(post_type))
         .filter(posts::status.eq("publish"))
@@ -1128,10 +1142,19 @@ pub async fn ensure_unique_slug(
     desired: &str,
     exclude_id: Option<i64>,
 ) -> AutumnResult<String> {
+    // Which rows this slug must be unique against. `post` and `page` share the
+    // bare URL path, so they compete with each other; a custom type is
+    // addressed under its own prefix (`/product/widget`) and competes only with
+    // itself — but it still has to compete, because `idx_posts_type_slug`
+    // requires uniqueness within a type. Returning early for custom types made
+    // a second item with the same title fail with a constraint error instead of
+    // getting the usual `-2`.
     const BARE_PATH_TYPES: &[&str] = &["post", "page"];
-    if !BARE_PATH_TYPES.contains(&post_type) {
-        return Ok(desired.to_owned());
-    }
+    let competing_types: Vec<&str> = if BARE_PATH_TYPES.contains(&post_type) {
+        BARE_PATH_TYPES.to_vec()
+    } else {
+        vec![post_type]
+    };
 
     // Two shapes are reserved because a literal route already owns the bare
     // path they would mint, so content given one is unreachable at its own
@@ -1143,7 +1166,9 @@ pub async fn ensure_unique_slug(
     // Reserving is what keeps both features working. Falling back to content
     // when the archive or route "has nothing" would instead make `/2026` or
     // `/search` mean different things depending on what happens to exist.
-    let mut candidate = if reads_as_date_archive(desired) || is_reserved_path(desired) {
+    let shadowed_by_a_route = BARE_PATH_TYPES.contains(&post_type)
+        && (reads_as_date_archive(desired) || is_reserved_path(desired));
+    let mut candidate = if shadowed_by_a_route {
         format!("{desired}-2")
     } else {
         desired.to_owned()
@@ -1151,7 +1176,7 @@ pub async fn ensure_unique_slug(
     for suffix in 2..=200u32 {
         let mut query = posts::table
             .filter(posts::slug.eq(candidate.clone()))
-            .filter(posts::post_type.eq_any(BARE_PATH_TYPES))
+            .filter(posts::post_type.eq_any(&competing_types))
             .into_boxed();
         if let Some(id) = exclude_id {
             query = query.filter(posts::id.ne(id));
@@ -1354,6 +1379,40 @@ pub async fn search_published(
     });
 
     Ok((rows, usize::try_from(total).unwrap_or(0)))
+}
+
+/// Assign a theme location to a new menu, clearing the previous holder — in one
+/// transaction.
+///
+/// Only one menu can hold a location, so creating a replacement has to detach
+/// the incumbent. Doing that as two statements means a failed insert (a
+/// duplicate slug is the easy way to get one) leaves the site with *no* menu at
+/// that location — the navigation simply disappears, from a request that
+/// reported an error.
+pub async fn replace_menu_at_location(db: &mut Db, name: &str, location: &str) -> AutumnResult<()> {
+    let name = name.to_owned();
+    let location = location.to_owned();
+    db.tx(move |conn| {
+        async move {
+            if !location.is_empty() {
+                diesel::update(menus::table.filter(menus::location.eq(&location)))
+                    .set(menus::location.eq(""))
+                    .execute(conn)
+                    .await?;
+            }
+            diesel::insert_into(menus::table)
+                .values((
+                    menus::name.eq(&name),
+                    menus::slug.eq(autumn_web::slugify(&name)),
+                    menus::location.eq(&location),
+                ))
+                .execute(conn)
+                .await?;
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 /// Terms of a taxonomy that have at least one published post, bounded.

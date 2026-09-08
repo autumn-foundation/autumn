@@ -985,6 +985,85 @@ async fn a_protected_post_withholds_its_excerpt_and_comments_everywhere() {
     );
 }
 
+/// Commenting is gated by the same rules as reading.
+///
+/// The read side was covered; the *write* side was not, which is how a fix for
+/// this was twice reported as landed while the tree was unchanged. A signed-in
+/// caller's comment is approved immediately, so accepting one on locked content
+/// puts visible discussion under a post whose thread the front end withholds.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_protected_post_refuses_comments_until_unlocked() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Sealed Thread"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", "letmein"),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(resp.status, 303);
+    let post_id: i64 = resp
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .parse()
+        .expect("numeric id");
+
+    // Signed in, but the session has not unlocked the post. This is the sharp
+    // case: a signed-in comment is stored `approved`.
+    let refused = client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "SHOULD-NOT-BE-STORED")]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status, 403,
+        "a comment on a locked post must be refused, not stored approved"
+    );
+
+    // Unlock, then the same submission is accepted.
+    client
+        .post(&format!("/unlock/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("password", "letmein")]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "ALLOWED-AFTER-UNLOCK")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Nothing from the refused attempt reached the database.
+    let comments: serde_json::Value = client
+        .get(&format!("/api/v1/posts/{post_id}/comments"))
+        .send()
+        .await
+        .json();
+    let rendered = comments.to_string();
+    assert!(
+        !rendered.contains("SHOULD-NOT-BE-STORED"),
+        "the refused comment must not have been persisted: {rendered}"
+    );
+}
+
 /// A post and a page may both be slugged `about`; both mint `/about`, and only
 /// one can be served there. The loser is suffixed rather than left unreachable.
 #[tokio::test]

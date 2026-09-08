@@ -272,8 +272,11 @@ pub async fn delete(
     // reaches `post_terms`, and nothing in it maintains `terms.post_count`, so
     // without the rebuild every archive those posts appeared in keeps counting
     // them forever.
-    let affected_terms = crate::content::delete_user(&mut db, id).await?;
-    crate::content::recount_terms(&mut db, &affected_terms).await?;
+    // The delete and the recounts share one transaction. Recounting afterwards
+    // means a transient failure leaves the account and its posts permanently
+    // gone with the counts stale — and a retry finds no user to delete, so
+    // nothing ever repairs them.
+    crate::content::delete_user(&mut db, id).await?;
 
     Ok(Redirect::to("/admin/users").into_response())
 }

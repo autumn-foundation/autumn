@@ -85,14 +85,24 @@ pub async fn publish_scheduled(state: AppState) -> AutumnResult<()> {
             // public, and the guarded `UPDATE` above is deliberately not
             // `transition_status` (which recounts), so recount here or every
             // affected archive shows a count one short of what it lists.
+            //
+            // A failure here is returned, not logged and dropped. The row is
+            // already `publish`, so no later sweep selects it again —
+            // swallowing the error would leave those counts wrong permanently
+            // with the task reporting success. Returning it lets the
+            // scheduler retry the whole sweep, which is idempotent: the
+            // guarded update matches nothing for rows already published, and a
+            // recount assigns rather than increments.
             if let Err(error) =
                 crate::content::recount_terms_for_post_public(&mut conn, post.id).await
             {
-                autumn_web::reexports::tracing::warn!(
+                autumn_web::reexports::tracing::error!(
                     post_id = post.id,
                     %error,
-                    "published a scheduled post but could not rebuild its term counts"
+                    "published a scheduled post but could not rebuild its term counts; \
+                     failing the sweep so it is retried"
                 );
+                return Err(error);
             }
             autumn_web::reexports::tracing::info!(
                 post_id = post.id,

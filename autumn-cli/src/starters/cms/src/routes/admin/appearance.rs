@@ -1,13 +1,12 @@
 //! Appearance — navigation menus and sidebar widgets.
 
 use autumn_web::AutumnResult;
-use autumn_web::hooks::Patch;
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
 use serde::Deserialize;
 
 use crate::capabilities::Capability;
-use crate::models::{NewMenu, NewMenuItem, NewWidget, UpdateWidget};
+use crate::models::{NewMenuItem, NewWidget, UpdateWidget};
 use crate::repositories::{
     MenuItemRepository as _, MenuRepository as _, TermRepository as _, WidgetRepository as _,
 };
@@ -297,6 +296,7 @@ pub async fn create_menu(
     repos: Repos,
     session: Session,
     csrf: Csrf,
+    mut db: autumn_web::Db,
     Form(form): Form<MenuForm>,
 ) -> AutumnResult<Response> {
     let _user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
@@ -305,31 +305,13 @@ pub async fn create_menu(
     // Only one menu can hold a given theme location, so assigning this one
     // clears the previous holder rather than leaving two menus both claiming
     // "primary" and the nav picking whichever the query returned first.
+    //
+    // Clearing and inserting share one transaction. Separately, a failed insert
+    // — a duplicate slug is the easy way to get one — would leave the previous
+    // menu detached and the site's navigation simply gone, from a request that
+    // reported an error.
     let location = form.location.trim().to_owned();
-    if !location.is_empty() {
-        for existing in repos.menus.find_by_location(location.clone()).await? {
-            repos
-                .menus
-                .update(
-                    existing.id,
-                    &crate::models::UpdateMenu {
-                        name: Patch::Unchanged,
-                        slug: Patch::Unchanged,
-                        location: Patch::Set(String::new()),
-                    },
-                )
-                .await?;
-        }
-    }
-
-    repos
-        .menus
-        .save(&NewMenu {
-            slug: autumn_web::slugify(&name),
-            name,
-            location,
-        })
-        .await?;
+    crate::content::replace_menu_at_location(&mut db, &name, &location).await?;
     Ok(Redirect::to("/admin/appearance").into_response())
 }
 

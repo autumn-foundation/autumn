@@ -17,7 +17,6 @@ use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
 
 use crate::models::Post;
-use crate::repositories::TermRepository as _;
 use crate::routes::site::Repos;
 
 /// How many URLs one sitemap carries.
@@ -70,16 +69,24 @@ pub async fn sitemap(repos: Repos, State(state): State<AppState>) -> AutumnResul
     }
 
     // Term archives that actually have published content. Listing empty ones is
-    // how a sitemap earns a reputation for noise.
+    // how a sitemap earns a reputation for noise — and the `post_count > 0`
+    // filter and the remaining budget are both applied in SQL, so a site whose
+    // posts already filled the cap does not load every term just to discard
+    // them.
     for taxonomy in crate::content_types::all_taxonomies() {
-        for term in repos
-            .terms
-            .find_by_taxonomy(taxonomy.slug.to_owned())
-            .await?
+        let remaining = MAX_URLS.saturating_sub(urls.len());
+        if remaining == 0 {
+            break;
+        }
+        let mut conn = repos.conn().await?;
+        for term in crate::content::populated_terms(
+            &mut conn,
+            taxonomy.slug,
+            i64::try_from(remaining).unwrap_or(i64::MAX),
+        )
+        .await?
         {
-            if term.post_count > 0 {
-                urls.push((format!("{base}{}", crate::theme::term_url(&term)), None));
-            }
+            urls.push((format!("{base}{}", crate::theme::term_url(&term)), None));
         }
     }
 

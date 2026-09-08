@@ -217,7 +217,17 @@ pub async fn create_post(
     // allows and the admin editor supports. Create as a draft and transition,
     // exactly as the admin path does, keeping the state machine the single
     // authority on which statuses are reachable how.
-    let deferred_transition = (status == "private" || status == "future").then(|| status.clone());
+    // `future` is rejected rather than accepted: `CreatePostBody` carries no
+    // publish date, so the row would be created with `published_at = NULL` and
+    // the sweep — which selects `published_at <= now` — could never see it.
+    // Returning 201 for a post that can never publish itself is worse than
+    // refusing the status.
+    if status == "future" {
+        return Err(AutumnError::unprocessable_msg(
+            "Scheduling is not available through the API; create a draft and publish it",
+        ));
+    }
+    let deferred_transition = (status == "private").then(|| status.clone());
     let initial_status = if deferred_transition.is_some() {
         "draft".to_owned()
     } else {
