@@ -1008,8 +1008,5 @@ fn a_fragment_link_is_prefixed_to_match_the_id_it_targets() {
     assert!(rendered.contains(r##"href="#c-section""##), "{rendered}");
     assert!(rendered.contains(r#"id="c-section""#), "{rendered}");
     // A cross-document fragment points at ids this render did not write.
-    assert!(
-        rendered.contains(r##"href="/other#section""##),
-        "{rendered}"
-    );
+    assert!(rendered.contains(r#"href="/other#section""#), "{rendered}");
 }
