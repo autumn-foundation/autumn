@@ -27,9 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-application, no ordering change for direct requests). See
   `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
 
-- **`#[authorize]` is now detected by shape, not by literal attribute name,
-  closing a stale-authorization gap when it is imported under an alias (🛡
-  Warden):** `idempotency_guard::has_pending_authorize_attr` (used by
+- **BREAKING: `#[authorize]` reached through a `use ... as ...` alias is now
+  a compile error instead of a silent stale-authorization gap (🛡 Warden):**
+  `idempotency_guard::has_pending_authorize_attr` (used by
   `#[secured]`/`#[step_up]`/`#[throttle]`'s pre-body gates to decide who
   owns serving a cached idempotency replay) and `route::has_authorize_guard`
   (used to decide whether the route macro keeps the standalone
@@ -46,11 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker who legitimately obtained one cached response could replay the
   same `Idempotency-Key` after their authorization was revoked (role
   change, resource-ownership transfer, policy update) and keep receiving
-  the stale allow. `autumn_macros::authorize::attr_is_authorize_shaped` now
-  falls back to parsing an attribute's argument tokens through
-  `#[authorize]`'s own grammar whenever the literal name doesn't match, and
-  is wired into both checks plus `api_doc::extract_authorize_bindings` (the
-  OpenAPI metadata extractor, same blind spot, lower stakes). See
+  the stale allow. A shape-based detection heuristic (parsing the
+  attribute's arguments through `#[authorize]`'s own grammar when the name
+  doesn't match) was tried and found unsafe in the *other* direction during
+  review: it misclassified an unrelated attribute sharing the same argument
+  shape as `#[authorize]`, which — with no real `#[authorize]` anywhere —
+  left nothing to serve a cached replay at all, silently breaking
+  `.idempotent()`'s dedup guarantee instead. No syntactic heuristic can
+  resolve the ambiguity safely in both directions (a proc macro cannot see
+  `use` aliases), so `autumn_macros::authorize::reject_if_ambiguous_authorize_shape`
+  now refuses to compile any attribute matching `#[authorize]`'s argument
+  grammar (`"action", resource = Type[, from = ident]`) under a different
+  name, wired into `#[secured]`/`#[step_up]`/`#[throttle]`/the route macros.
+  **Migration:** spell `#[authorize(...)]` by its real name at the call site
+  (no other Autumn macro's aliasing is affected); if the compile error fires
+  on an unrelated attribute that happens to share the same argument shape,
+  rename that attribute. See
   `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
 
 ### Changed

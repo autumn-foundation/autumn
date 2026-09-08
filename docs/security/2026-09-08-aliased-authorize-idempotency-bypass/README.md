@@ -14,8 +14,8 @@ and `autumn_macros::route::has_authorize_guard` × `#[authorize]` ×
 **Affected:** `autumn-web` 0.7.0 and every earlier release that shipped
 `#[authorize]` together with `.idempotent()`
 **Status:** fixed — `autumn-macros/src/authorize.rs`,
-`autumn-macros/src/idempotency_guard.rs`, `autumn-macros/src/route.rs`,
-`autumn-macros/src/api_doc.rs`
+`autumn-macros/src/secured.rs`, `autumn-macros/src/step_up.rs`,
+`autumn-macros/src/throttle.rs`, `autumn-macros/src/route.rs`
 
 ## 🎯 Surface
 
@@ -92,20 +92,22 @@ per-request re-check exists to catch.
 
 ## 🧪 Reproduction
 
-Test: `integration::authorization_integration::idempotent_replay_bypasses_aliased_authorize_policy_changes`
-(`autumn/tests/integration/authorization_integration.rs`)
+The reproduction evolved across three commits as PR review (Codex, two
+rounds) found the first two fix attempts still unsafe. All three runs are
+preserved below since each is evidence for why the final design looks the
+way it does.
 
-Command:
+**Round 0 — the original bypass (RED, `autumn/tests/integration/authorization_integration.rs`):**
+
 ```
 cargo test -p autumn-web --test integration_tests idempotent_replay_bypasses_aliased_authorize_policy_changes -- --nocapture
 ```
 
-Scenario: admin session mutates `/notes-attr-alias/1` (handler reached via
+Admin session mutates `/notes-attr-alias/1` (handler reached via
 `use autumn_web::authorize as authz_alias; #[authz_alias("update", resource
-= Note)]`, `.idempotent()` on) → `200 OK`, cached under
-`idempotency-key: policy-recheck-key-alias`. The session's `admin` role is
-then revoked. A retry with the identical body and idempotency key must get
-`403 Forbidden` from `AdminOrOwnerPolicy`'s current re-check.
+= Note)]`, `.idempotent()` on) → `200 OK`, cached under an idempotency key.
+The session's `admin` role is revoked. A retry with the identical body and
+idempotency key must get `403 Forbidden`.
 
 Failure output on trunk (`trunk-failure.txt`):
 ```
@@ -113,104 +115,166 @@ assertion `left == right` failed: cached idempotency replay must not skip the cu
   left: 200
  right: 403
 ```
-The stale `200 OK` — the cached response from before the role was
-revoked — was returned instead of a fresh `403`.
+The stale `200 OK` was returned instead of a fresh `403` — confirmed fixed
+by the round-1 attempt (`after.txt`), which made `attr_is_authorize_shaped`
+fall back to parsing the attribute's argument tokens through
+`#[authorize]`'s own grammar whenever the literal name didn't match.
+
+**Round 1 → Codex P1 (fresh false positive, not caught by the round-0 test):**
+the round-1 shape fallback classified *any* attribute sharing
+`#[authorize]`'s exact grammar (`"action", resource = Type`) as
+authorize-like, including an unrelated `#[audit("update", resource =
+Note)]` with no real `#[authorize]` anywhere. With nothing left to serve a
+cached reply, a retried mutation would re-execute instead of replaying —
+losing `.idempotent()`'s dedup guarantee, not "merely an optimization" as
+the round-1 doc comment claimed. Fixed in round 2 by also requiring a
+parameter binding matching `#[authorize]`'s calling convention
+(`from`/snake_case(`resource`)).
+
+**Round 2 → Codex P1 again (the parameter check doesn't close the gap):**
+Codex correctly pointed out that a handler stacked with an
+`#[audit(...)]`-shaped attribute routinely *does* have a resource parameter
+matching that name (that's the natural shape for an audit/logging
+attribute), so the round-2 narrowing didn't materially reduce the
+false-positive rate — `#[audit("update", resource = Note)]` on
+`async fn h(note: Note)` still collided.
+
+**Final design:** no shape-based guess is safe in both directions, so
+disambiguation moved to compile time. `attr_is_authorize_shaped` reverted to
+exact-name-only matching; a new `authorize::reject_if_ambiguous_authorize_shape`
+refuses to compile a handler carrying an attribute that matches
+`#[authorize]`'s grammar under any other name, wired into `secured_macro`,
+`step_up_macro`, `throttle_macro`, and `route_macro`. Proven by two trybuild
+`compile_fail` fixtures instead of a runtime test, since the vulnerable
+pattern (and the round-1/round-2 false positive) no longer compile at all:
+
+```
+cargo test -p autumn-web --test integration_tests integration::compile_fail::compile_fail_tests -- --exact --nocapture
+```
+
+- `tests/compile-fail/authorize_ambiguous_shape_alias.rs` — the original
+  aliased-`#[authorize]` case now refused at compile time.
+- `tests/compile-fail/authorize_ambiguous_shape_unrelated.rs` — the exact
+  Codex-reported false positive (`#[audit("update", resource = Note)]` on a
+  handler with a matching `note` parameter, no real `#[authorize]`) also
+  refused, rather than silently accepted in either direction.
 
 ## 🔎 Root cause
 
-- `autumn-macros/src/idempotency_guard.rs:33` — `has_pending_authorize_attr`
+- `autumn-macros/src/idempotency_guard.rs` — `has_pending_authorize_attr`
   compared `attr.path().segments.last() == "authorize"` only.
-- `autumn-macros/src/route.rs:611` — `has_authorize_guard`, same literal
+- `autumn-macros/src/route.rs` — `has_authorize_guard`, same literal
   comparison, gating `body_guarded_replay` (whether the route keeps the
   standalone `IdempotencyReplayLayer`).
 
 Neither control covers an attribute reached through a `use ... as ...`
 alias, because a proc-macro attribute has no visibility into the module's
-`use` declarations — this is a hard Rust limitation, not a fixable oversight
-in the name-matching itself, hence the fix changes what property is
-checked rather than how the name is compared.
+`use` declarations. That is a hard Rust limitation — not a fixable
+oversight in the name-matching itself — which is also why no purely
+syntactic *heuristic* (shape of the arguments, with or without a parameter
+check) can resolve it safely in both directions. The fix therefore doesn't
+try to guess right; it refuses to guess at all.
 
 ## 🩹 Fix
 
-`autumn-macros/src/authorize.rs` gains `attr_is_authorize_shaped`: falls
-back, when the literal name doesn't match, to parsing the attribute's
-argument tokens through `#[authorize]`'s own grammar
-(`parse_with_leading_literal` — already used for the same purpose by
-`api_doc`'s OpenAPI metadata extractor, so this reuses an existing,
-already-tested parser rather than adding a new one). Only an attribute that
-supplies both the required `action` and `resource` parses successfully, so
-the check stays targeted to `#[authorize]`'s actual shape instead of
-deferring for every unrecognized attribute on a handler. A false positive
-here only costs an optimization — the route becomes ineligible for
-gate/layer-level replay caching, while `#[authorize]`'s own in-body
-`replay_stop` still serves the cached response correctly *after* the policy
-re-check — never a security property, so the check deliberately errs toward
-over-matching rather than under-matching.
+`autumn-macros/src/authorize.rs`:
 
-Wired into all three name-based scans that share this root cause:
+- `attr_is_authorize_shaped(attr, input_fn) -> bool` — exact-name-only
+  (`attr.path()` ends in `"authorize"`). No shape or parameter fallback.
+- `reject_if_ambiguous_authorize_shape(input_fn) -> Option<TokenStream>` —
+  for every attribute that is *not* literally `#[authorize]`, parses its
+  argument tokens through `#[authorize]`'s own grammar
+  (`parse_with_leading_literal`, already used for the same purpose by
+  `api_doc`'s OpenAPI metadata extractor). If it supplies both the required
+  `action` and `resource`, returns a `compile_error!` explaining the
+  ambiguity and how to resolve it (spell `#[authorize(...)]` by its real
+  name, or rename the colliding attribute).
 
-- `idempotency_guard::has_pending_authorize_attr`
-- `route::has_authorize_guard`
-- `api_doc::extract_authorize_bindings` (the OpenAPI metadata extractor —
-  same blind spot, lower stakes: an aliased route's authorize binding was
-  silently missing from the generated API doc rather than misrepresenting
-  a security property)
+Wired into the four macro entry points whose idempotency-replay-ownership
+decision depends on knowing whether a not-yet-expanded `#[authorize]` is
+present: `secured_macro`, `step_up_macro`, `throttle_macro` (all three via
+`idempotency_guard::should_own_replay`'s `has_pending_authorize_attr`), and
+`route_macro` (via `has_authorize_guard`).
+
+`api_doc::extract_authorize_bindings` (the OpenAPI metadata extractor) keeps
+its own exact-name-only scan — it was never security-relevant (a missing
+binding just omits API-doc metadata) and doesn't need the compile-time
+refusal, since a route that fails to compile obviously has no metadata to
+extract either way.
 
 ## ✅ Verification
 
 - `cargo test -p autumn-web --test integration_tests -- authorization_integration`:
-  28/28 pass (`after.txt`), including the new red test and every existing
-  sibling — stacked `#[secured]` + `#[authorize]`, reversed attribute order,
-  the non-aliased replay-vs-policy-change cases, and
-  `idempotent_replay_does_not_bypass_authorize_policy_check_when_secured_gate_runs_first`.
-- `cargo test -p autumn-macros --lib`: 1177/1177 pass, including every
+  27/27 pass — every pre-existing sibling unaffected (stacked `#[secured]` +
+  `#[authorize]`, reversed attribute order, non-aliased replay-vs-policy-
+  change cases, `idempotent_replay_does_not_bypass_authorize_policy_check_when_secured_gate_runs_first`).
+- `cargo test -p autumn-web --test integration_tests integration::compile_fail::compile_fail_tests`:
+  both new fixtures pass. 8 of the other 79 registered fixtures fail in this
+  sandbox (`lifecycle_undeclared_transition`, `lifecycle_terminal_has_no_exit`,
+  `lifecycle_start_only_on_initial`, `repository_ledgered_purge_rejected`,
+  `classified_json_model_leak`, `classified_json_field_leak`,
+  `classified_wrong_boundary`, `classified_column_wrapper_cannot_retype`) —
+  confirmed pre-existing/environmental: none of their macros, fixtures, or
+  goldens were touched by this change (`git diff --name-only` touches only
+  `authorize`/`secured`/`step_up`/`throttle`/`route` and this PR's own new
+  fixtures), consistent with a rustc/dependency version drift between this
+  sandbox and whichever environment last generated those goldens.
+- `cargo test -p autumn-macros --lib`: 1182/1182 pass, including every
   golden-expansion test pinning `#[secured]`/`#[step_up]`/`#[throttle]`/
-  `#[authorize]`'s exact generated output — unchanged by this fix, since it
-  only touches the *detection* helpers, not what any guard itself emits.
+  `#[authorize]`'s exact generated output (unaffected — the fix only adds an
+  early rejection, never changes what a guard emits when it does compile)
+  and five new tests covering the name-only detector and the compile-time
+  refusal in both directions (aliased-authorize and unrelated-attribute
+  collision).
 - `cargo fmt --all -- --check`: clean.
-- `cargo clippy -p autumn-macros -p autumn-web --all-targets -- -D warnings`:
-  run as part of this change (see PR for output).
+- `cargo clippy -p autumn-macros --all-targets -- -D warnings`: clean.
+- `cargo clippy -p autumn-web --all-targets -- -D warnings`: clean.
+  (All three: only the pre-existing, unrelated `clippy::unused_async_trait_impl`
+  unknown-lint warning documented at `Cargo.toml:163-178`.)
 
 ## 📡 Blast radius
 
 Swept every other name-based "is guard X present" scan in
 `autumn-macros/src/` for the same anti-pattern:
 
-- `secured`/`step_up`/`throttle`'s own literal-name self-checks (e.g.
-  `param_helpers::reject_if_incompatible_route_marker`,
-  `has_any_guard_gate_param`) are **not** affected: they detect an
+- `param_helpers::has_any_guard_gate_param` and friends detect an
   *already-expanded* gate by its framework-generated parameter-type prefix
   (`__AutumnSecuredGate_`/`__AutumnStepUpGate_`/`__AutumnThrottleGate_`),
-  which is never derived from a user-chosen alias.
-- `has_step_up_guard`/`has_throttle_guard` (`route.rs`) have the identical
+  never derived from a user alias — not affected.
+- `route::has_step_up_guard`/`has_throttle_guard` have the identical
   literal-name blind spot for their *own* pending-attribute half of the
   check, but — unlike `#[authorize]` — `#[step_up]`/`#[throttle]` are
   themselves pre-body `FromRequestParts` gates once expanded, and a gate
   parameter is always detectable by its framework-controlled name regardless
   of how the attribute itself was spelled. An aliased `#[step_up]`/
-  `#[throttle]` therefore only risks the same lower-stakes
-  `IdempotencyReplayLayer`-not-suppressed shape as `#[authorize]` alone (no
+  `#[throttle]` therefore only risks the lower-stakes "standalone
+  `IdempotencyReplayLayer` redundantly retained" correctness shape (no
   in-body policy re-check to bypass, since these two enforce entirely inside
-  their gate) — logged here, not fixed in this PR, since it needs its own
-  reproduction and is a narrower, "replay-layer redundantly retained"
-  correctness gap rather than an authorization bypass. Worth a follow-up.
-- `api_doc::extract_authorize_bindings` — fixed in this PR alongside the two
-  security-relevant call sites, since it shares the exact same root cause
-  and the shared helper closes all three in one change.
+  their own gate) — logged here, not fixed in this PR, since it needs its
+  own reproduction and is a narrower correctness gap rather than an
+  authorization bypass. Worth a follow-up.
+- `api_doc::extract_authorize_bindings` — deliberately left as exact-name-
+  only (see Fix); not a security-relevant gap.
 - Feature matrix: this bug lives entirely in `autumn-macros` (proc-macro
   expansion, not runtime), so it is feature-independent — it reproduces
   identically under every feature combination that compiles `#[authorize]`
   and `.idempotent()` together, which is the default feature set already
-  exercised by `autumn/tests/integration/authorization_integration.rs`.
+  exercised here.
 
 ## 📜 Compatibility
 
-Pure bugfix at the macro-expansion layer: no public signature, config
-default, or route status code changes. Existing tests (golden-expansion and
-integration) pass unchanged. No `CHANGELOG.md` version bump — landing under
-`## [Unreleased]` per `CLAUDE.md`.
+This is a real, intentional breaking change, not a pure bugfix: an app that
+reaches `#[authorize]` through `use ::autumn_web::authorize as x;` compiled
+successfully (and was vulnerable) before this change; it gets a compile
+error after. No other Autumn macro's aliasing is affected, and the literal
+`#[authorize(...)]` spelling — every known caller, in this repo and (per a
+full-repo grep before landing) every example — is unaffected. No public
+signature, config default, or route status-code change. `CHANGELOG.md`
+`## [Unreleased] > ### Security` entry documents the compile-time refusal
+and its migration (spell `#[authorize]` by its real name). No version bump.
 
 ## 🗂 Ledger
 
-- `trunk-failure.txt` — the RED run
-- `after.txt` — the GREEN run
+- `trunk-failure.txt` — round-0 RED run (the original runtime bypass)
+- `after.txt` — round-0 GREEN run (round-1 fix attempt, later found
+  insufficient — see Reproduction)
