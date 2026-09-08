@@ -9886,6 +9886,17 @@ async fn load_config_and_telemetry(
     // `[retention]` section is untouched.
     config.apply_retention_caps();
 
+    // Install the `[metrics]` cardinality caps before anything can record
+    // through the call-site facade. The registry is process-global and its
+    // caps are read at each decision rather than baked in at registration, so
+    // this must land before the first `metrics::counter(...)` call — otherwise
+    // an early instrument would be admitted (or refused) under the defaults
+    // and, for `max_labels_per_series`, would canonicalize its label set to a
+    // different series key than every later sample. Every `run_*` mode reaches
+    // this function, so there is no path that boots with the defaults silently
+    // in force.
+    crate::metrics::set_limits(config.metrics.limits());
+
     // 2. Initialize logging/telemetry via the installed provider, falling
     //    back to the default `tracing-subscriber + OTLP` initializer.
     let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
@@ -15111,7 +15122,27 @@ mod tests {
 
     #[cfg(feature = "i18n")]
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard must span the `load_config_and_telemetry` await — that \
+                  await is what mutates the limits, so dropping the lock before it \
+                  would serialize nothing. Same shape, and the same reason, as \
+                  `config_runtime_drift_actuator_prefix_is_mounted`'s circuit-breaker \
+                  guard: the contending holders are sibling libtest threads, not \
+                  tasks on this runtime, so blocking here cannot starve the future \
+                  that would release it."
+    )]
     async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
+        // `load_config_and_telemetry` installs the `[metrics]` section, so
+        // calling it here resets the process-global metric limits as a side
+        // effect. Take the same lock the metrics tests use, or this can land
+        // between a limits test raising a cap and the loop that depends on it
+        // — dropping samples at the default while that test expects the
+        // raised value. See `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let project = tempfile::tempdir().expect("project dir");
         let i18n_dir = project.path().join("custom-i18n");
         std::fs::create_dir_all(&i18n_dir).expect("i18n dir");
