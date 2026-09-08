@@ -172,6 +172,13 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_derivation_ambiguous_fk.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_derivation_tenant_non_field.rs");
+    // `sum(...)` takes exactly one field name, and `tenant` cannot name a field
+    // renamed by `#[diesel(column_name = ...)]` (the lowering spells the
+    // discriminator after the Rust field).
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_sum_extra_tokens.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_tenant_renamed.rs");
 
     // Model-declared dependent cascades (#1702): `dependent = <action>` /
     // `on_delete = <action>` is a `has_many`/`has_one` option, only the four
