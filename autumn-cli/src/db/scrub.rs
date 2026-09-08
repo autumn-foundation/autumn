@@ -2579,6 +2579,12 @@ fn classify_and_apply(
         // autocommit, each one would be committed and dropped before the seed
         // INSERT that follows it. Without the envelope the advertised "exact
         // SQL" is not runnable.
+        // Non-interactive is the supported way to run this, and there a failed
+        // `\connect` already stops processing. This makes every OTHER error stop
+        // it too, which a stream of destructive blocks wants. It does nothing for
+        // an interactive paste — measured, psql ignores it there — which is what
+        // the per-target guard below is for.
+        eprintln!("  \\set ON_ERROR_STOP on");
         for (label, url, plan, facts, sampling) in &plans {
             let no_deferral = BTreeSet::new();
             let deferred: &BTreeSet<String> =
@@ -2594,6 +2600,16 @@ fn classify_and_apply(
                 eprintln!("  {line}");
             }
             eprintln!("  BEGIN;");
+            // Inside the transaction, so a `\connect` that silently failed
+            // aborts this block instead of running it against the previous
+            // target. First statement after BEGIN: nothing destructive may
+            // precede the proof that we are where we think we are.
+            if let Some(guard) = password_free_conninfo(url)
+                .as_deref()
+                .and_then(target_guard)
+            {
+                eprintln!("  {guard}");
+            }
             // The same session pins `execute` sets, before anything reads or
             // writes: without them a role-level `search_path` resolves the
             // generated calls somewhere else entirely.
@@ -3897,6 +3913,76 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
     )
 }
 
+/// The database the printed `\connect` line actually asks for.
+///
+/// Read back out of the SAME password-free conninfo the boundary prints, not
+/// re-derived from the original URL's parts: re-deriving is what once printed a
+/// host the run never touched, because a query parameter overrides the
+/// authority component it duplicates. `?dbname=` wins over the path for the
+/// same reason, which `pg::sanitize_prefers_query_user_password_dbname_over_url_structure`
+/// pins.
+fn expected_database(conninfo: &str) -> Option<String> {
+    let url = url::Url::parse(conninfo).ok()?;
+    // Last wins, as libpq takes the last occurrence of a repeated keyword.
+    let from_query = url
+        .query_pairs()
+        .filter(|(key, _)| key == "dbname")
+        .map(|(_, value)| value.into_owned())
+        .last();
+    // `query_pairs()` decodes; `path()` does NOT. Comparing the raw path against
+    // `current_database()` would make the guard fire on a CORRECT run for any
+    // name that needs encoding — `it's` arrives as `it%27s` and never matches —
+    // turning a safety check into a false refusal.
+    let name = from_query.unwrap_or_else(|| {
+        percent_encoding::percent_decode_str(url.path().trim_start_matches('/'))
+            .decode_utf8_lossy()
+            .into_owned()
+    });
+    (!name.is_empty()).then_some(name)
+}
+
+/// Abort the transaction unless the session is on the target this block is for.
+///
+/// `\connect` does NOT close the old connection when the new one fails. Measured
+/// on psql 16.13: a failed `\connect -reuse-previous=off` prints "Previous
+/// connection kept" and the session carries on against the PREVIOUS database —
+/// so a pasted stream runs this target's `BEGIN` and its deletes against the
+/// preceding target. `\set ON_ERROR_STOP on` does not help; measured, an
+/// interactive session ignores it and keeps going.
+///
+/// It is also the likely case rather than a remote one, because the printed
+/// conninfo has its password removed on purpose: a password-authenticated
+/// target fails to connect exactly this way.
+///
+/// So the promise is verified rather than assumed, inside the transaction where
+/// a failure is contained: the `RAISE` aborts it, every following statement is
+/// refused with "current transaction is aborted", and `COMMIT` becomes a
+/// rollback. Measured: the guarded block left all 10 rows of its victim table.
+///
+/// This statement is printed and never executed. `execute` opens its own
+/// connection to a URL it was given and cannot be on the wrong database, so
+/// there is nothing here for it to run — the guard exists for the paste, which
+/// is the only path that can land on the wrong target.
+fn target_guard(conninfo: &str) -> Option<String> {
+    let database = expected_database(conninfo)?;
+    // `RAISE` substitutes bare `%` in argument order; it has no `%1$s`
+    // positional form. Writing one puts the databases in the message the wrong
+    // way round and leaves `2$s` in the text — measured, before this was fixed:
+    // "this block is for database cifix_prev2$s, but the session is on
+    // cifix_stmt1$s", naming each database as the other.
+    let body = format!(
+        " BEGIN IF current_database() <> {name} THEN \
+         RAISE EXCEPTION {message}, {name}, current_database(); END IF; END ",
+        name = quote_literal(&database),
+        message = quote_literal(
+            "this block is for database %, but the session is on % — the \\connect \
+             above did not take effect (psql keeps the previous connection when one fails)"
+        ),
+    );
+    let tag = sample::dollar_tag(&body);
+    Some(format!("DO {tag}{body}{tag};"))
+}
+
 /// Connection-string keywords whose value is a credential.
 ///
 /// A URI carries these two ways — `postgres://user:secret@host/db` and
@@ -4352,6 +4438,103 @@ mod tests {
     use super::{emptiness_assertion, integrity_assertion, rules_reaching, triggers_reaching};
 
     // ── The dry run's session and connection preamble ──────────────────────
+
+    /// The guard names the database the `\connect` line actually asks for.
+    ///
+    /// Read back out of the printed conninfo rather than re-derived from the
+    /// original URL's parts, because a query parameter overrides the authority
+    /// component it duplicates — `?dbname=` wins over the path.
+    #[test]
+    fn the_expected_database_comes_from_the_printed_conninfo() {
+        assert_eq!(
+            super::expected_database("postgres://bob@db.internal:6543/app"),
+            Some("app".to_owned())
+        );
+        assert_eq!(
+            super::expected_database("postgres://bob@db.internal/app?dbname=copy"),
+            Some("copy".to_owned()),
+            "the query form is the one that authenticates, so it is the one to assert on"
+        );
+        assert_eq!(
+            super::expected_database("postgres://db/app?dbname=first&dbname=second"),
+            Some("second".to_owned()),
+            "libpq takes the last occurrence of a repeated keyword"
+        );
+        assert_eq!(
+            super::expected_database("postgres://db.internal:6543"),
+            None,
+            "no database named means nothing to assert, so no guard is emitted"
+        );
+        // `query_pairs()` decodes and `path()` does not. Comparing the raw path
+        // would make the guard fire on a CORRECT run for any name needing
+        // encoding, turning the safety check into a false refusal.
+        assert_eq!(
+            super::expected_database("postgres://db/it%27s"),
+            Some("it's".to_owned()),
+            "the path is percent-encoded and has to be decoded before comparison"
+        );
+        assert_eq!(
+            super::expected_database("postgres://db/a%20b"),
+            Some("a b".to_owned())
+        );
+    }
+
+    /// A failed `\connect` leaves psql on the PREVIOUS database, so the block
+    /// proves where it is before it writes.
+    ///
+    /// Measured on psql 16.13: a failed `\connect -reuse-previous=off` prints
+    /// "Previous connection kept" and the session carries on; `ON_ERROR_STOP`
+    /// does not stop an interactive paste. Pasting a real generated script whose
+    /// connect failed, into a session on another database, left that database at
+    /// 200/400/500 rows with all 11 destructive statements refused.
+    #[test]
+    fn the_target_guard_aborts_the_block_on_the_wrong_database() {
+        let guard = super::target_guard("postgres://bob@db/app_copy")
+            .expect("a conninfo naming a database gets a guard");
+        assert!(
+            guard.contains("current_database() <> 'app_copy'"),
+            "the guard must compare against the target it is for: {guard}"
+        );
+        assert!(
+            guard.contains("RAISE EXCEPTION"),
+            "and abort the transaction rather than merely print: {guard}"
+        );
+        // `RAISE` substitutes bare `%` in argument order and has no `%1$s`
+        // form. Writing one named each database as the other and left `2$s` in
+        // the text; the live message read "this block is for database
+        // cifix_prev2$s, but the session is on cifix_stmt1$s".
+        assert!(
+            !guard.contains("$s"),
+            "RAISE has no positional format specifiers: {guard}"
+        );
+        assert_eq!(
+            guard.matches('%').count(),
+            2,
+            "one placeholder for the target, one for the session: {guard}"
+        );
+        assert!(
+            guard.find("'app_copy'").unwrap() < guard.find("current_database();").unwrap(),
+            "and the arguments must be in the order the message reads them: {guard}"
+        );
+
+        assert_eq!(
+            super::target_guard("postgres://db.internal:6543"),
+            None,
+            "a conninfo with no database gets no guard rather than a vacuous one"
+        );
+
+        // The database name reaches SQL as a literal, so it is quoted like every
+        // other identifier-shaped value this module prints.
+        let hostile = super::target_guard("postgres://db/it%27s").expect("guard");
+        assert!(
+            !hostile.contains("%27"),
+            "the name must be compared decoded, or a correct run is refused: {hostile}"
+        );
+        assert!(
+            hostile.contains("'it''s'"),
+            "a quote in the database name must not break out of the literal: {hostile}"
+        );
+    }
 
     /// Both sides of the size ratio measure the same set of relations.
     ///

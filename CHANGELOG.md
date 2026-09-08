@@ -99,8 +99,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scrubbed. No ordering avoids it and no postcondition catches it — a trigger
   body can write anywhere — so a `DELETE` trigger, or an `ON DELETE` rewrite
   rule, on a table the run empties is now refused before anything is written,
-  `--check` and `--dry-run` included. Drop or disable it on the copy. `--dry-run`
-  also refuses a target configured with a keyword-form connection string
+  `--check` and `--dry-run` included. Drop or disable it on the copy.
+  Each printed target block now opens with `\set ON_ERROR_STOP on` and, inside
+  its transaction, a guard that aborts unless `current_database()` is the target
+  the block is for: `\connect` does **not** close the old connection when the new
+  one fails — psql prints `Previous connection kept` and carries on — so a pasted
+  stream would otherwise run one target's deletes against the previous one, which
+  the deliberately password-free conninfo makes likely rather than remote.
+  `ON_ERROR_STOP` alone does not help an interactive paste; the guard aborts the
+  transaction, so every following statement is refused and `COMMIT` rolls back.
+  `--dry-run` also refuses a target configured with a keyword-form connection string
   (`host=... password=...`): each printed block is destructive and the `\connect`
   line above it is what points `psql` at the right database, but a keyword-form
   string cannot be printed with its password removed for certain, so the
