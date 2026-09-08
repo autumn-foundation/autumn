@@ -707,6 +707,38 @@ impl AutumnError {
         self.status
     }
 
+    /// The per-field validation messages, when this is a validation error.
+    ///
+    /// [`AutumnError::validation`] carries a field → messages map, and an HTTP
+    /// response renders it as the `errors` object of a 422 Problem Details
+    /// body. A consumer that is not an HTTP response — a GraphQL resolver, a
+    /// job, a CLI — sees only [`Display`](std::fmt::Display), which is the
+    /// summary `"Validation failed"`. This is how such a caller reaches the
+    /// detail and renders it in whatever shape its own transport uses
+    /// (issue #2586).
+    ///
+    /// Returns `None` for every error that carries no field map.
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use std::collections::HashMap;
+    ///
+    /// let err = AutumnError::validation(HashMap::from([(
+    ///     "title".to_owned(),
+    ///     vec!["must not be blank".to_owned()],
+    /// )]));
+    /// let detail = err.details().expect("a validation error carries a map");
+    /// assert_eq!(detail["title"], vec!["must not be blank".to_owned()]);
+    ///
+    /// assert!(AutumnError::bad_request_msg("nope").details().is_none());
+    /// ```
+    #[must_use]
+    pub const fn details(
+        &self,
+    ) -> ::core::option::Option<&std::collections::HashMap<String, Vec<String>>> {
+        self.details.as_ref()
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub(crate) const fn cache_idempotency_response(mut self) -> Self {
