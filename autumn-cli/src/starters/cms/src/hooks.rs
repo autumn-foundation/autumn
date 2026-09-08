@@ -53,6 +53,10 @@ pub fn normalize_slug(slug: &str, title: &str) -> String {
 /// every move into them.
 const CREATABLE_STATUSES: &[&str] = &["draft", "pending", "publish"];
 
+/// The largest comment body accepted, matching the `#[validate]` cap declared
+/// on the `Comment` model.
+pub const MAX_COMMENT_BODY_BYTES: usize = 10_000;
+
 /// Comment moderation states.
 pub const COMMENT_STATUSES: &[&str] = &["approved", "pending", "spam", "trash"];
 
@@ -69,6 +73,16 @@ pub fn validate_comment(new: &mut NewComment) -> AutumnResult<()> {
     new.body = new.body.trim().to_owned();
     if new.body.is_empty() {
         return Err(AutumnError::unprocessable_msg("Comment cannot be empty"));
+    }
+    // The model declares `#[validate(length(max = 10000))]`, but the direct
+    // insert never runs the derived validator — and the form's `maxlength` is a
+    // browser convenience a crafted request ignores. Without this, bodies grow
+    // to the global request-body limit and make moderation and thread rendering
+    // unexpectedly expensive.
+    if new.body.len() > MAX_COMMENT_BODY_BYTES {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "Comment must be at most {MAX_COMMENT_BODY_BYTES} characters"
+        )));
     }
     if new.status.trim().is_empty() {
         new.status = "pending".to_owned();

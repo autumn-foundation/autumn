@@ -13,7 +13,7 @@ use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
 
-use crate::models::{Comment, NewRevision, Post, Revision, User};
+use crate::models::{Comment, NewRevision, Post, Revision, Term, User};
 use crate::schema::{comments, post_terms, posts, revisions, terms, users};
 
 /// The maximum reply nesting a comment thread accepts.
@@ -47,6 +47,7 @@ pub async fn update_post_with_revision(
     editor_id: i64,
     summary: &str,
     expected_lock_version: Option<i32>,
+    record_revision: bool,
     apply: impl for<'a> FnOnce(&'a mut Post) + Send + 'static,
 ) -> AutumnResult<Post> {
     let summary = summary.to_owned();
@@ -76,7 +77,11 @@ pub async fn update_post_with_revision(
                 ));
             }
 
-            post.record_revision(conn, &summary).await?;
+            // `supports_revisions: false` on the registered type means exactly
+            // that — no snapshot, rather than a flag the editor ignores.
+            if record_revision {
+                post.record_revision(conn, &summary).await?;
+            }
 
             apply(&mut post);
             post.updated_at = chrono::Utc::now().naive_utc();
@@ -844,6 +849,12 @@ pub async fn delete_user(db: &mut Db, target_id: i64) -> AutumnResult<Vec<i64>> 
 /// and "publicly routable" are two different questions, and answering only the
 /// first — once per query, in whichever query was written most recently — is
 /// how the same defect kept reappearing on a new screen each review round.
+/// Whether one named post type is reachable on the public front end.
+#[must_use]
+pub fn is_public_type(post_type: &str) -> bool {
+    crate::content_types::find_post_type(post_type).is_some_and(|registered| registered.public)
+}
+
 #[must_use]
 pub fn public_type_slugs() -> Vec<String> {
     crate::content_types::all_post_types()
@@ -874,6 +885,14 @@ pub async fn published_posts_page(
     offset: i64,
     limit: i64,
 ) -> AutumnResult<(Vec<Post>, i64)> {
+    // A named type still has to *be* public. `post` and `page` are registered
+    // like any other and can be re-registered `public: false` through the
+    // supported replacement mechanism, so naming the type is not the same as
+    // establishing it has a public route.
+    if !is_public_type(post_type) {
+        return Ok((Vec::new(), 0));
+    }
+
     let total: i64 = posts::table
         .filter(posts::post_type.eq(post_type))
         .filter(posts::status.eq("publish"))
@@ -904,6 +923,11 @@ pub async fn recent_published_posts(
     post_type: &str,
     limit: i64,
 ) -> AutumnResult<Vec<Post>> {
+    // See `published_posts_page`: naming a type is not the same as
+    // establishing it is publicly routable.
+    if !is_public_type(post_type) {
+        return Ok(Vec::new());
+    }
     Ok(posts::table
         .filter(posts::post_type.eq(post_type))
         .filter(posts::status.eq("publish"))
@@ -1054,6 +1078,40 @@ pub fn reads_as_date_archive(slug: &str) -> bool {
     slug.len() == 4 && slug.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Bare paths the application's own routes claim.
+///
+/// Kept beside the reservation rather than derived from the router: the route
+/// table is built from typed handlers with no runtime list of first segments,
+/// and a wrong answer here is a silently unreachable page. The integration
+/// suite's `every_reserved_prefix_has_a_literal_route` covers the same names
+/// from the other direction, so a route added without updating this list is
+/// visible there.
+const RESERVED_PATHS: &[&str] = &[
+    "admin",
+    "api",
+    "comments",
+    "feed",
+    "login",
+    "logout",
+    "media",
+    "register",
+    "search",
+    "unlock",
+    "sitemap.xml",
+    "robots.txt",
+    "static",
+    "archives",
+    "author",
+    "category",
+    "tag",
+];
+
+/// Whether a slug would be shadowed by one of the application's own routes.
+#[must_use]
+pub fn is_reserved_path(slug: &str) -> bool {
+    RESERVED_PATHS.contains(&slug)
+}
+
 /// A slug that is free across every post type sharing the bare URL path.
 ///
 /// `posts` is unique on `(post_type, slug)`, so a post and a page may both be
@@ -1075,13 +1133,17 @@ pub async fn ensure_unique_slug(
         return Ok(desired.to_owned());
     }
 
-    // A four-digit slug is the shape the resolver reads as a year archive
-    // (`/2026`), and it checks that before content — so a post slugged `2026`
-    // would be unreachable at its own canonical URL. Reserving the shape is
-    // the fix that keeps both features working; making the archive fall back
-    // to content would instead make `/2026` mean different things depending on
-    // what happens to exist.
-    let mut candidate = if reads_as_date_archive(desired) {
+    // Two shapes are reserved because a literal route already owns the bare
+    // path they would mint, so content given one is unreachable at its own
+    // canonical URL:
+    //
+    //   * a four-digit slug, which the resolver reads as a year archive; and
+    //   * the names of the application's own literal routes.
+    //
+    // Reserving is what keeps both features working. Falling back to content
+    // when the archive or route "has nothing" would instead make `/2026` or
+    // `/search` mean different things depending on what happens to exist.
+    let mut candidate = if reads_as_date_archive(desired) || is_reserved_path(desired) {
         format!("{desired}-2")
     } else {
         desired.to_owned()
@@ -1150,8 +1212,29 @@ pub async fn depth_under(db: &mut Db, candidate_parent_id: i64) -> AutumnResult<
 pub async fn validate_parent(
     db: &mut Db,
     post_id: Option<i64>,
+    post_type: &str,
     candidate_parent_id: i64,
 ) -> AutumnResult<()> {
+    // The parent must be a live row of the SAME hierarchical type. The foreign
+    // key only says "some post", so a crafted form could name a normal post:
+    // `page_ancestry` would then put that row's slug in the canonical URL while
+    // `resolve_page_path` requires every ancestor to be a page, leaving the
+    // child permanently unreachable.
+    let parent: Option<Post> = posts::table
+        .find(candidate_parent_id)
+        .select(Post::as_select())
+        .first(&mut **db)
+        .await
+        .optional()?;
+    let Some(parent) = parent else {
+        return Err(AutumnError::unprocessable_msg("That parent does not exist"));
+    };
+    if parent.post_type != post_type || parent.status == "trash" {
+        return Err(AutumnError::unprocessable_msg(
+            "A parent must be another item of the same type, and not in the trash",
+        ));
+    }
+
     if let Some(post_id) = post_id
         && would_create_cycle(db, post_id, candidate_parent_id).await?
     {
@@ -1271,6 +1354,26 @@ pub async fn search_published(
     });
 
     Ok((rows, usize::try_from(total).unwrap_or(0)))
+}
+
+/// Terms of a taxonomy that have at least one published post, bounded.
+///
+/// The `post_count > 0` filter and the limit are both applied in SQL. The
+/// sitemap is an unauthenticated endpoint whose advertised cap has to bound the
+/// work, not only the response.
+pub async fn populated_terms(
+    conn: &mut AsyncPgConnection,
+    taxonomy: &str,
+    limit: i64,
+) -> AutumnResult<Vec<Term>> {
+    Ok(terms::table
+        .filter(terms::taxonomy.eq(taxonomy))
+        .filter(terms::post_count.gt(0))
+        .order((terms::post_count.desc(), terms::id.asc()))
+        .limit(limit.max(0))
+        .select(Term::as_select())
+        .load(conn)
+        .await?)
 }
 
 #[cfg(test)]

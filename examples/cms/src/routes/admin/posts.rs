@@ -523,8 +523,10 @@ fn editor(
                     }
                     @if let Some(post) = post {
                         div class="flex flex-wrap gap-2 pt-2 border-t border-gray-100 text-sm" {
-                            a href=(format!("/admin/content/{}/{}/revisions", registered.slug, post.id))
-                              class="text-indigo-700 hover:underline" { "Revisions" }
+                            @if registered.supports_revisions {
+                                a href=(format!("/admin/content/{}/{}/revisions", registered.slug, post.id))
+                                  class="text-indigo-700 hover:underline" { "Revisions" }
+                            }
                             @if post.status != "trash"
                                 && can_delete_post(user.role(), user.id, post.author_id, &post.status) {
                                 span class="text-gray-300" { "·" }
@@ -692,7 +694,7 @@ pub async fn create(
     // permalink builder renders — producing a canonical URL that starts
     // mid-tree and resolves to nothing.
     if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
-        content::validate_parent(&mut db, None, parent_id).await?;
+        content::validate_parent(&mut db, None, registered.slug, parent_id).await?;
     }
 
     // Slug allocation and the retry it needs live on `Repos` so the importer
@@ -730,8 +732,12 @@ pub async fn create(
         .await?;
 
     // The first revision records the content as created, so the history has a
-    // starting point rather than beginning at the first *edit*.
-    content::record_initial_revision(&mut db, &created).await?;
+    // starting point rather than beginning at the first *edit* — for types that
+    // asked for revisions. `supports_revisions: false` is a registration the
+    // storage should honour, not a flag the editor ignores.
+    if registered.supports_revisions {
+        content::record_initial_revision(&mut db, &created).await?;
+    }
 
     apply_terms(&repos, &mut db, &created, &form).await?;
     if status == "future" || status == "private" {
@@ -796,7 +802,7 @@ pub async fn update(
     // that closes a cycle, and page resolution walks down from a NULL parent,
     // so every page in the cycle becomes unreachable at its own permalink.
     if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
-        content::validate_parent(&mut db, Some(id), parent_id).await?;
+        content::validate_parent(&mut db, Some(id), &post_type, parent_id).await?;
     }
 
     let slug = {
@@ -836,6 +842,7 @@ pub async fn update(
             user.id,
             "Edited",
             expected_lock_version,
+            registered.supports_revisions,
             move |post| {
                 let (
                     title,

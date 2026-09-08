@@ -87,7 +87,15 @@ pub async fn login_form(repos: Repos, session: Session, csrf: Csrf) -> AutumnRes
     auth_page(&repos, &session, &csrf, "Log in", form).await
 }
 
+// Every failed attempt runs a bcrypt verification — deliberately, so the
+// response time does not reveal whether an account exists (see `DUMMY_HASH`).
+// That makes the endpoint expensive by design, and this starter ships with the
+// global limiter off, so without a per-route bound an unauthenticated client
+// can drive arbitrary concurrent cost-12 hashes: credential stuffing and CPU
+// exhaustion from the same request loop. A per-IP throttle belongs on the
+// route rather than in an operator's checklist.
 #[post("/login")]
+#[throttle(limit = 10, per = "1m", key = "ip")]
 pub async fn login(
     repos: Repos,
     session: Session,
@@ -212,7 +220,11 @@ pub async fn register_form(
     auth_page(&repos, &session, &csrf, "Register", form).await
 }
 
+// Registration hashes a password on every request, so it is expensive for the
+// same reason as `login` and takes the same per-IP bound. It is also the
+// account-creation endpoint, which is worth rate-limiting on its own.
 #[post("/register")]
+#[throttle(limit = 5, per = "1m", key = "ip")]
 pub async fn register(
     repos: Repos,
     session: Session,

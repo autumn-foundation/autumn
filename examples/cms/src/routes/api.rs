@@ -175,6 +175,7 @@ pub struct CreatePostBody {
 pub async fn create_post(
     repos: Repos,
     session: Session,
+    mut db: autumn_web::Db,
     Json(body): Json<CreatePostBody>,
 ) -> AutumnResult<(StatusCode, Json<PostView>)> {
     let user = repos.require_user(&session).await?;
@@ -210,6 +211,19 @@ pub async fn create_post(
         "closed".to_owned()
     };
 
+    // `private` is only reachable through a `draft -> private` transition, so
+    // creating it directly is refused by `PostHooks::before_create` — which
+    // left the API unable to perform a creation its own capability check
+    // allows and the admin editor supports. Create as a draft and transition,
+    // exactly as the admin path does, keeping the state machine the single
+    // authority on which statuses are reachable how.
+    let deferred_transition = (status == "private" || status == "future").then(|| status.clone());
+    let initial_status = if deferred_transition.is_some() {
+        "draft".to_owned()
+    } else {
+        status.clone()
+    };
+
     let created = repos
         .posts
         .save(&NewPost {
@@ -218,7 +232,7 @@ pub async fn create_post(
             slug: body.slug,
             excerpt: body.excerpt,
             body: body.body,
-            status,
+            status: initial_status,
             author_id: user.id,
             parent_id: None,
             featured_media_id: None,
@@ -229,6 +243,11 @@ pub async fn create_post(
             published_at: None,
         })
         .await?;
+
+    let created = match deferred_transition {
+        Some(target) => crate::content::transition_status(&mut db, created.id, &target).await?,
+        None => created,
+    };
 
     let url = repos.permalink(&created, &settings).await?;
     Ok((StatusCode::CREATED, Json(PostView::from(&created, url))))
