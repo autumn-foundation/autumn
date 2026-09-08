@@ -1282,8 +1282,16 @@ The one-time migration, on the host (the deploy prints these paths for you):
 ```sh
 autumn db backup                      # first, from the project dir
 systemctl stop myapp-blue.service myapp-green.service
-mv /srv/autumn/myapp/current/app.db* /srv/autumn/myapp/shared/data/
+mv /srv/autumn/myapp/current/app.db /srv/autumn/myapp/shared/data/app.db
+for s in -wal -shm -journal; do
+  [ -e /srv/autumn/myapp/current/app.db$s ] &&
+    mv /srv/autumn/myapp/current/app.db$s /srv/autumn/myapp/shared/data/app.db$s
+done
 ```
+
+Each file moves by name rather than through `app.db*`: that glob also matches an
+unrelated `app.db.backup` and would move it, possibly over a file of that name
+already in `shared/data`.
 
 Then re-run `autumn deploy up`. From that point on nothing is ever relocated: the
 file stays in `shared/data` and each release is linked at it.

@@ -1757,6 +1757,13 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
 ///
 /// Three steps, in order:
 ///
+/// A **dangling** symlink at `current` counts as occupied too — unless it points
+/// at the shared file, which is the deploy's own link before the migration
+/// creates that file. A link to an operator database on a temporarily
+/// unavailable mount fails `-e`, and treating that as "nothing here" linked past
+/// it, migrated an empty database into place, and orphaned their data when the
+/// mount came back.
+///
 /// 1. **Refuse to relocate a live database.** An app deployed before this
 ///    contract holds a real file in the release that is still serving. Moving it
 ///    is not safe while that app runs: `SQLite` derives the `-wal` name from the
@@ -1855,7 +1862,8 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
         "link-data",
         format!(
             "mkdir -p {shared_parent_q} {release_parent_q} && \
-             if [ ! -e {shared_q} ] && [ -e {current_q} ]; then \
+             if [ ! -e {shared_q} ] && {{ [ -e {current_q} ] || [ -L {current_q} ]; }} && \
+             ! {{ [ -L {current_q} ] && [ \"$(readlink {current_q})\" = {shared_q} ]; }}; then \
              if [ -L {current_q} ]; then \
              echo {linked_refusal_q} >&2; echo {linked_recovery_q} >&2; \
              else echo {refusal_q} >&2; echo {recovery_q} >&2; fi; exit 1; \
@@ -7457,17 +7465,29 @@ mod tests {
     fn the_data_link_op_never_expands_a_configured_path() {
         let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
         let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
-        // A double quote may appear only INSIDE a single-quoted word. The
-        // hazard is a shell-quoted path sitting in an expandable position, not
-        // the character itself — the symlink recovery prints a deliberate
-        // `"$(readlink -f '…')"` for the operator, inert until they paste it.
-        for (index, _) in op.shell.match_indices('"') {
+        // The hazard is a shell-quoted path sitting in an expandable position,
+        // not the double-quote character itself. Two constructs legitimately
+        // use one: the printed symlink recovery (inert until pasted) and the
+        // dangling-link guard's `"$(readlink '…')"`. Both wrap a path that is
+        // ALREADY single-quoted, so nothing configured can expand. Every other
+        // double quote must sit inside a single-quoted word.
+        let guard = format!(
+            r#""$(readlink {})""#,
+            shell_quote("/srv/autumn/myapp/current/$(touch pwned).db")
+        );
+        let elsewhere = op.shell.replace(&guard, "");
+        for (index, _) in elsewhere.match_indices('"') {
             assert!(
-                inside_single_quotes(&op.shell, index),
-                "a double quote outside single quotes makes paths expandable: {}",
-                op.shell
+                inside_single_quotes(&elsewhere, index),
+                "a double quote outside single quotes makes paths expandable: {elsewhere}"
             );
         }
+        // The guard really is present, and its path really is single-quoted.
+        assert!(
+            op.shell.contains(&guard),
+            "the dangling-link guard must quote its path: {}",
+            op.shell
+        );
         // The substitution survives only inside single quotes, where it is inert.
         for (index, _) in op.shell.match_indices("$(touch pwned)") {
             assert!(
@@ -7544,15 +7564,26 @@ mod tests {
     #[test]
     fn the_data_link_op_refuses_a_legacy_symlinked_database() {
         let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
-        // The guard turns only on the shared file being absent and `current`
-        // resolving to something. A link pointing at the shared file dangles
-        // here, so it fails `-e` and never reaches the refusal.
+        // `current` counts as occupied if it EXISTS or is a symlink at all —
+        // a dangling link to an unavailable mount fails `-e`, and treating that
+        // as "nothing here" linked past an operator database and orphaned it.
+        // The one exemption is our own link to the shared file, which dangles
+        // until the migration creates that file.
         assert!(
             op.shell.contains(
                 "if [ ! -e '/srv/autumn/myapp/shared/data/app.db' ] && \
-                 [ -e '/srv/autumn/myapp/current/app.db' ]; then"
+                 { [ -e '/srv/autumn/myapp/current/app.db' ] || \
+                 [ -L '/srv/autumn/myapp/current/app.db' ]; }"
             ),
-            "an existing `current` must be refused whether or not it is a link: {}",
+            "a dangling `current` symlink must count as occupied: {}",
+            op.shell
+        );
+        assert!(
+            op.shell.contains(
+                "[ \"$(readlink '/srv/autumn/myapp/current/app.db')\" = \
+                 '/srv/autumn/myapp/shared/data/app.db' ]"
+            ),
+            "our own link to the shared file must stay exempt: {}",
             op.shell
         );
         assert!(
