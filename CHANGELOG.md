@@ -27,6 +27,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-application, no ordering change for direct requests). See
   `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
 
+- **authorize:** **Breaking:** `#[authorize]` reached through a
+  `use ... as ...` alias is now a compile error instead of a silent
+  stale-authorization gap (🛡 Warden).
+  `idempotency_guard::has_pending_authorize_attr` (used by
+  `#[secured]`/`#[step_up]`/`#[throttle]`'s pre-body gates to decide who
+  owns serving a cached idempotency replay) and `route::has_authorize_guard`
+  (used to decide whether the route macro keeps the standalone
+  `IdempotencyReplayLayer`) both detected `#[authorize]` by comparing an
+  attribute's last path segment against the literal string `"authorize"`. A
+  proc-macro attribute never sees the enclosing module's `use` declarations,
+  so `use ::autumn_web::authorize as authz;` defeated both checks even
+  though the identical `authorize_macro` still ran. With no
+  `#[secured]`/`#[step_up]`/`#[throttle]` also stacked, that let the
+  standalone `IdempotencyReplayLayer` serve a cached response as Tower
+  middleware, entirely before the handler (and `#[authorize]`'s in-body
+  policy re-check inside it) ever ran; with one of those gates stacked, the
+  gate wrongly claimed replay ownership for the same reason. Either way, an
+  attacker who legitimately obtained one cached response could replay the
+  same `Idempotency-Key` after their authorization was revoked (role
+  change, resource-ownership transfer, policy update) and keep receiving
+  the stale allow. A shape-based detection heuristic (parsing the
+  attribute's arguments through `#[authorize]`'s own grammar when the name
+  doesn't match) was tried and found unsafe in the *other* direction during
+  review: it misclassified an unrelated attribute sharing the same argument
+  shape as `#[authorize]`, which — with no real `#[authorize]` anywhere —
+  left nothing to serve a cached replay at all, silently breaking
+  `.idempotent()`'s dedup guarantee instead. No syntactic heuristic can
+  resolve the ambiguity safely in both directions (a proc macro cannot see
+  `use` aliases), so `autumn_macros::authorize::reject_if_ambiguous_authorize_shape`
+  now refuses to compile any attribute matching `#[authorize]`'s argument
+  grammar (`"action", resource = Type[, from = ident]`) under a different
+  name, wired into `#[secured]`/`#[step_up]`/`#[throttle]`/the route macros.
+  **Migration:** spell `#[authorize(...)]` by its real name at the call site
+  (no other Autumn macro's aliasing is affected); if the compile error fires
+  on an unrelated attribute that happens to share the same argument shape,
+  rename that attribute. See the
+  [migration guide](docs/migrations/next.md#authorize-aliased-authorize-and-ambiguous-attribute-shapes-are-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
+- **static_get:** **Breaking:** `#[feature_flag]` combined with
+  `#[static_get]` is now a compile error, in either attribute order (🛡
+  Warden). Found during review of the `#[authorize]` fix above: none of
+  `#[secured]`/`#[step_up]`/`#[throttle]`/`#[feature_flag]`'s pre-body
+  `FromRequestParts` gates run on a cached SSG/ISR hit, since the
+  static-first middleware serves it before the inner router — and the
+  handler along with it — is ever reached; the first three were already
+  rejected for exactly this reason, but `#[feature_flag]` never was. A
+  disabled feature flag on a `#[static_get]` route therefore never actually
+  hid the pre-rendered page: the cache would keep serving it regardless of
+  the flag's live value. **Migration:** use `AppBuilder::static_gate`
+  instead, which runs before a cache hit. See the
+  [migration guide](docs/migrations/next.md#static_get-feature_flag-is-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
 ### Performance
 
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
