@@ -2549,7 +2549,9 @@ fn api_token_error_response<ResBody: From<String> + Default>(
     instance: Option<String>,
 ) -> Response<ResBody> {
     let status = err.status();
-    let message = err.to_string();
+    // `message`, not `Display`: this string becomes the response `detail`,
+    // which stays the wrapped error even when the error carries a field map.
+    let message = err.message();
     let body = crate::error::problem_details_json_string(
         status,
         message.clone(),
@@ -4932,6 +4934,23 @@ mod api_token_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn api_token_error_response_detail_omits_the_field_map() {
+        // This builds its own body rather than rendering the error, so it
+        // must take `message()`. With `Display` a store returning a
+        // validation error would put the field list in `detail` (issue
+        // #2587).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+        assert_eq!(err.to_string(), "Validation failed: token: Malformed");
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(json["detail"], "Validation failed");
     }
 
     #[tokio::test]

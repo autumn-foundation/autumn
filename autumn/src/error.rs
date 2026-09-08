@@ -792,9 +792,13 @@ impl AutumnError {
     /// The stable problem code the rendered response carries.
     ///
     /// Same value as the `code` member of the `application/problem+json`
-    /// body — both come from one derivation — so a non-HTTP caller can
-    /// branch on it without building a response. It is borrowed for every
-    /// code the framework names today.
+    /// body Autumn renders for this error — both come from one derivation —
+    /// so a non-HTTP caller can branch on it without building a response. It
+    /// is borrowed for every code the framework names today.
+    ///
+    /// Middleware that builds its own body from [`status`](Self::status)
+    /// alone, rather than rendering the error, can still carry a different
+    /// code.
     ///
     /// A cancelled database statement is reclassified here as it is in the
     /// response, so this can read `autumn.query_timeout` where
