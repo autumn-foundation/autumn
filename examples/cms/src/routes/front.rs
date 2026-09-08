@@ -148,6 +148,23 @@ pub async fn search(
 
 // ── The catch-all ───────────────────────────────────────────────────────────
 
+/// Absorb the browser's automatic favicon request.
+///
+/// The framework already answers `/favicon.ico` with `204 No Content` from its
+/// fallback 404 handler, exactly so an unconfigured site does not log a console
+/// error on every page load. A catch-all defeats that: `/{*path}` matches every
+/// unmatched path, so the fallback never runs and the request lands in the
+/// front controller, which resolves it as content, finds none, and renders a
+/// themed 404.
+///
+/// A literal route wins over the wildcard and restores the framework's own
+/// answer. Replace it with a real icon when the site has one — the point here
+/// is that the catch-all must not silently swallow this.
+#[get("/favicon.ico")]
+pub async fn favicon() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 /// Everything that is not a reserved prefix.
 ///
 /// Registered **last** so `/admin`, `/api`, `/feed`, `/login` and the static

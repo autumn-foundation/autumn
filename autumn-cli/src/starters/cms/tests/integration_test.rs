@@ -91,6 +91,11 @@ fn every_reserved_prefix_has_a_literal_route() {
         "/feed",
         "/api/v1",
         "/media/{slug}",
+        // The browser asks for this on every page load. Without a literal
+        // route the catch-all answers it with a themed 404, which the
+        // headless-Chromium smoke sees as a console error — and which
+        // shadows the framework's own `204 No Content` fallback.
+        "/favicon.ico",
     ] {
         assert!(
             paths.contains(&reserved),

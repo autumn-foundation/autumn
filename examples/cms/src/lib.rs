@@ -107,6 +107,7 @@ pub fn all_routes() -> Vec<autumn_web::Route> {
         routes::feed::atom,
         routes::feed::rss,
         routes::comments::post_comment,
+        routes::front::favicon,
         routes::front::unlock,
         routes::front::search,
         routes::front::front_page,
