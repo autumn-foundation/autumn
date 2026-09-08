@@ -9,6 +9,7 @@
 //! 4. A custom `forbidden_response = "403"` round-trips correctly.
 
 use autumn_web::authorization::{BoxFuture, ForbiddenResponse, Policy, PolicyContext};
+use autumn_web::authorize as authz_alias;
 use autumn_web::prelude::*;
 use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 use autumn_web::test::TestApp;
@@ -255,6 +256,27 @@ async fn update_note_anonymous_touch(
     Ok("anonymous-touched")
 }
 
+/// Same handler shape as [`update_note_attr`], but reached through
+/// `use autumn_web::authorize as authz_alias;` instead of the fully-qualified
+/// `#[autumn_web::authorize(...)]` path every other handler in this file
+/// uses. Ordinary, unremarkable Rust — nothing the framework's docs tell an
+/// app author not to do — and it changes nothing about which macro actually
+/// runs: the compiler resolves `#[authz_alias(...)]` to the exact same
+/// `autumn_macros::authorize_macro` function. It exists to prove that the
+/// gate-ownership detection in `idempotency_guard::has_pending_authorize_attr`
+/// (and `route::has_authorize_guard`), which both scan for the literal
+/// attribute-path segment `"authorize"`, is blind to this alias.
+#[autumn_web::post("/notes-attr-alias/{id}")]
+#[authz_alias("update", resource = Note)]
+async fn update_note_attr_alias(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    Ok("ok")
+}
+
 fn build_attr_app(
     store: MemoryStore,
     forbidden_response: ForbiddenResponse,
@@ -273,6 +295,19 @@ fn build_idempotent_attr_app(
 ) -> autumn_web::test::TestClient {
     TestApp::new()
         .routes(routes![update_note_attr])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .idempotent()
+        .build()
+}
+
+fn build_idempotent_attr_alias_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_attr_alias])
         .policy::<Note, _>(AdminOrOwnerPolicy)
         .forbidden_response(forbidden_response)
         .layer(SessionLayer::new(store, SessionConfig::default()))
@@ -409,6 +444,59 @@ async fn idempotent_replay_does_not_bypass_authorize_policy_changes() {
         retry.status,
         StatusCode::FORBIDDEN,
         "cached idempotency replay must not skip the current #[authorize] policy check"
+    );
+    assert_eq!(retry.header("x-idempotent-replayed"), None);
+}
+
+/// Sibling of [`idempotent_replay_does_not_bypass_authorize_policy_changes`]:
+/// same scenario (an admin's mutation is cached under an idempotency key,
+/// their role is revoked, they replay the identical request), but through a
+/// handler that reaches `#[authorize]` via `use ... as authz_alias;` instead
+/// of the literal `#[autumn_web::authorize(...)]` spelling.
+///
+/// `idempotency_guard::has_pending_authorize_attr` (used by `#[secured]` and
+/// its siblings to decide whether a pre-body gate should also serve cached
+/// idempotency replays) and `route::has_authorize_guard` (used by the route
+/// macro to decide whether to keep the standalone `IdempotencyReplayLayer` on
+/// a route) both detect `#[authorize]` by comparing the last path segment of
+/// each attribute against the literal string `"authorize"`. An aliased
+/// import compiles to an attribute whose last path segment is the alias, not
+/// `"authorize"`, so both scans report "no `#[authorize]` here" even though
+/// the exact same `authorize_macro` runs. With no `#[secured]`/`#[step_up]`/
+/// `#[throttle]` stacked on this handler, that makes the route macro keep the
+/// standalone `IdempotencyReplayLayer`, which serves a cached response as
+/// Tower middleware, entirely outside the handler `#[authorize]` expands
+/// into — before `#[authorize]`'s own re-check (which lives inside the
+/// handler body) ever runs.
+#[tokio::test]
+async fn idempotent_replay_bypasses_aliased_authorize_policy_changes() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-policy-alias", "999", Some("admin")).await;
+    let client = build_idempotent_attr_alias_app(store.clone(), ForbiddenResponse::Forbidden403);
+
+    let first = client
+        .post("/notes-attr-alias/1")
+        .header("Cookie", "autumn.sid=sess-policy-alias")
+        .header("idempotency-key", "policy-recheck-key-alias")
+        .send()
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+
+    // Revoke the admin role the policy granted access on. A fresh request
+    // with this session must now be denied by `AdminOrOwnerPolicy`.
+    seed_session(&store, "sess-policy-alias", "999", None).await;
+
+    let retry = client
+        .post("/notes-attr-alias/1")
+        .header("Cookie", "autumn.sid=sess-policy-alias")
+        .header("idempotency-key", "policy-recheck-key-alias")
+        .send()
+        .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::FORBIDDEN,
+        "cached idempotency replay must not skip the current #[authorize] policy check, even \
+         when #[authorize] is imported under an alias"
     );
     assert_eq!(retry.header("x-idempotent-replayed"), None);
 }
