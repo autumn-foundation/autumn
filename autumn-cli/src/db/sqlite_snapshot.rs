@@ -241,11 +241,30 @@ fn staging_path(db: &Path) -> PathBuf {
 /// The staged copy is verified again, not just the source: a short write or a
 /// full disk must not survive as far as the rename.
 fn stage(artifact: &Path, staged: &Path, db: &Path) -> Result<(), SnapshotError> {
-    std::fs::copy(artifact, staged).map_err(SnapshotError::io(format!(
+    // `create_new` is `O_CREAT | O_EXCL`, which FAILS if anything already sits at
+    // this path and never follows a symlink there. `std::fs::copy` does follow
+    // one, and the staging name is predictable, so between the caller's
+    // `remove_file` and this create an account that can write the database
+    // directory could plant a link and have a privileged restore truncate an
+    // arbitrary file it points at — before `verify` ever runs. Failing closed on
+    // an occupied path closes that window; the copy then goes through this
+    // handle, so it cannot be redirected afterwards either.
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged)
+        .map_err(SnapshotError::io(format!(
+            "creating the staging file {}",
+            staged.display()
+        )))?;
+    let mut source = std::fs::File::open(artifact)
+        .map_err(SnapshotError::io(format!("opening {}", artifact.display())))?;
+    std::io::copy(&mut source, &mut out).map_err(SnapshotError::io(format!(
         "copying {} to {}",
         artifact.display(),
         staged.display()
     )))?;
+    drop(out);
     inherit_target_permissions(db, staged)?;
     verify(staged)?;
     flush(staged)
@@ -674,6 +693,39 @@ mod tests {
         assert!(
             !stale_wal.exists(),
             "the sidecars must be cleared beside the REAL file"
+        );
+    }
+
+    /// A symlink planted at the staging path must NOT be followed.
+    ///
+    /// The staging name is predictable and `restore` removes it before copying,
+    /// so an account that can write the database directory has a window to plant
+    /// a link there. `std::fs::copy` follows one, which under a privileged
+    /// restore truncates whatever it points at — before verification runs. The
+    /// exclusive create must fail instead.
+    #[cfg(unix)]
+    #[test]
+    fn staging_never_follows_a_symlink_planted_at_its_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.db");
+        drop(seeded(&source));
+        let artifact = dir.path().join("control.sqlite");
+        snapshot(&format!("sqlite://{}", source.display()), &artifact).expect("snapshot");
+
+        let target = dir.path().join("target.db");
+        drop(seeded(&target));
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"MUST NOT BE TRUNCATED").expect("write victim");
+
+        // Plant the link exactly where the stage will be created.
+        let staged = staging_path(&target);
+        std::os::unix::fs::symlink(&victim, &staged).expect("plant symlink");
+
+        stage(&artifact, &staged, &target).expect_err("staging must refuse an occupied path");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim readable"),
+            b"MUST NOT BE TRUNCATED",
+            "the symlink target must be untouched"
         );
     }
 
