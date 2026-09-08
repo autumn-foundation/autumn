@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row-level tenancy is the better answer, see `examples/saas`), XML-RPC, the block
   editor, pingbacks, and runtime plugin/theme installation.
 
+  The `new` skill now documents `--starter` at all, which it did not before:
+  the flag has been stable CLI surface since #993, but no skill or agent file
+  mentioned it, so an agent scaffolding a project would never offer either
+  archetype. It now carries a starter table, when to reach for each, the
+  `cms` starter's Postgres 12 requirement and first-account-owns-the-site
+  flow, and the provenance caveat for community starters.
+
   Requires PostgreSQL 12+ — the full-text `search_vector` is a stored generated
   column. The Docker suite covers the flows most likely to rot: draft
   invisibility, the state machine refusing an undeclared edge, comment-counter
