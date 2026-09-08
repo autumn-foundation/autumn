@@ -1323,3 +1323,112 @@ async fn a_certificate_issued_for_a_hostname_that_changed_hands_is_discarded() {
         "a certificate nobody owns must not be left on disk"
     );
 }
+
+/// An issuer that hands the hostname to another tenant and then fails, so the
+/// error belongs to a tenant that no longer owns the domain.
+#[derive(Debug)]
+struct FailingTakeoverIssuer {
+    registry: Arc<CustomDomainRegistry>,
+}
+
+impl DomainIssuer for FailingTakeoverIssuer {
+    fn issue<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+        Box::pin(async move {
+            self.registry.remove(hostname).await.unwrap();
+            self.registry
+                .register(hostname, "tenant-b", NOW)
+                .await
+                .unwrap();
+            Err("the CA rejected the order".to_owned())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_failed_order_for_a_hostname_that_changed_hands_spares_the_new_tenant() {
+    // The mirror of the discard case: the order fails after the takeover.
+    // Charging the failure to whatever record holds the hostname would give
+    // tenant B tenant A's error message and a backoff it never earned.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(4));
+    let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&alerts);
+    let mut task = task_over(
+        Arc::clone(&registry),
+        cache,
+        certs,
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::new(FailingTakeoverIssuer {
+            registry: Arc::clone(&registry),
+        }) as Arc<dyn DomainIssuer>,
+    );
+    task.reporter = Arc::new(move |message: String| sink.lock().unwrap().push(message));
+
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    task.tick(NOW).await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-b");
+    assert_eq!(record.status, DomainStatus::PendingDns);
+    assert!(
+        record.failure_reason.is_none(),
+        "the new tenant must not show the previous owner's error: {record:?}"
+    );
+    assert_eq!(record.consecutive_failures, 0);
+    assert!(
+        record.next_attempt_unix.is_none(),
+        "the new tenant must not wait out a backoff it did not earn"
+    );
+    assert!(
+        alerts.lock().unwrap().is_empty(),
+        "a failure nobody owns must not page an operator"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname() {
+    let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
+    registry.load().await.unwrap();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry.remove("app.clientco.com").await.unwrap();
+    registry
+        .register("app.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    assert!(
+        !registry
+            .record_failure_for("app.clientco.com", "tenant-a", NOW, "stale", 300)
+            .await
+            .unwrap()
+    );
+    assert!(
+        registry
+            .get("app.clientco.com")
+            .unwrap()
+            .failure_reason
+            .is_none()
+    );
+
+    assert!(
+        registry
+            .record_failure_for("app.clientco.com", "tenant-b", NOW, "mine", 300)
+            .await
+            .unwrap()
+    );
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.failure_reason.as_deref(), Some("mine"));
+    assert_eq!(record.next_attempt_unix, Some(NOW + 300));
+}

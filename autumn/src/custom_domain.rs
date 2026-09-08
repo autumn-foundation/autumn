@@ -832,6 +832,15 @@ impl CustomDomainRegistry {
             return Err(RegisterError::Reserved { pattern });
         }
 
+        // Taken BEFORE the index is inspected, so the whole registration —
+        // claim and save — is serialised against an offboard of the same
+        // hostname. Claiming first and gating afterwards let a concurrent
+        // `remove` erase the fresh entry and delete nothing, after which this
+        // save still landed: the domain was absent from the running process but
+        // came back at the next restart.
+        let gate = self.write_gate(&host).await;
+        let _write = gate.lock().await;
+
         // Claim the hostname in the index FIRST, under one write lock, and only
         // then persist. Writing the store first let a losing racer's record
         // reach disk anyway: the winner served in memory while the loser's
@@ -856,10 +865,6 @@ impl CustomDomainRegistry {
             record
         };
 
-        // Held until the store write commits, so an offboard for this hostname
-        // cannot delete the file and then be overtaken by this save.
-        let gate = self.write_gate(&host).await;
-        let _write = gate.lock().await;
         if let Err(e) = self.store.save(&record).await {
             // Roll the claim back: a hostname that is not durable must not
             // route, or it would disappear on the next restart with no record
@@ -1092,18 +1097,59 @@ impl CustomDomainRegistry {
         reason: impl Into<String>,
         backoff_secs: i64,
     ) -> io::Result<()> {
+        self.fail(hostname, None, now_unix, reason, backoff_secs)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`record_failure`](Self::record_failure), but only while `tenant` still
+    /// owns the hostname. Returns whether it applied.
+    ///
+    /// An order runs across several `.await`s. If the owner is offboarded and
+    /// the hostname re-registered in that window, an unconditional failure
+    /// would stamp one tenant's error and backoff onto the NEW tenant's record:
+    /// a domain that has done nothing wrong would show someone else's reason
+    /// and wait out a backoff it did not earn.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_failure_for(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
+        self.fail(hostname, Some(tenant), now_unix, reason, backoff_secs)
+            .await
+    }
+
+    async fn fail(
+        &self,
+        hostname: &str,
+        tenant: Option<&str>,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
         let reason = reason.into();
-        self.mutate(hostname, move |d| {
-            if d.status == DomainStatus::Issuing {
-                // An order that failed goes back to `Verified`, not to
-                // `PendingDns`: DNS was already proven, and re-verifying would
-                // add a needless round trip to every retry.
-                d.status = DomainStatus::Verified;
-            }
-            d.failure_reason = Some(reason.clone());
-            d.consecutive_failures = d.consecutive_failures.saturating_add(1);
-            d.next_attempt_unix = Some(now_unix.saturating_add(backoff_secs));
-        })
+        self.mutate_if(
+            hostname,
+            |d| tenant.is_none_or(|t| d.tenant == t),
+            move |d| {
+                if d.status == DomainStatus::Issuing {
+                    // An order that failed goes back to `Verified`, not to
+                    // `PendingDns`: DNS was already proven, and re-verifying
+                    // would add a needless round trip to every retry.
+                    d.status = DomainStatus::Verified;
+                }
+                d.failure_reason = Some(reason.clone());
+                d.consecutive_failures = d.consecutive_failures.saturating_add(1);
+                d.next_attempt_unix = Some(now_unix.saturating_add(backoff_secs));
+            },
+        )
         .await
     }
 

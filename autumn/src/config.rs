@@ -7363,6 +7363,38 @@ impl Default for CustomDomainsConfig {
 }
 
 impl CustomDomainsConfig {
+    /// A scheme, a port or a path in `ingress_hostname` reaches tenants
+    /// verbatim as their CNAME target. The record would be invalid, the
+    /// ingress would never resolve, and every subdomain domain would sit at
+    /// `pending_dns` with nothing to explain why.
+    fn validate_ingress_hostname(&self) -> Result<(), String> {
+        if let Some(raw) = self
+            .ingress_hostname
+            .as_ref()
+            .filter(|h| !h.trim().is_empty())
+        {
+            let canonical = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+            match crate::custom_domain::normalize_hostname(raw) {
+                Ok(host) if host == canonical => {}
+                Ok(host) => {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] ingress_hostname `{raw}` must be a bare \
+                     DNS name (`{host}`): a scheme, port or path cannot be a CNAME target, so \
+                     tenants would be given a record that never resolves"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] ingress_hostname `{raw}` is not a usable \
+                     DNS name: {e}. Tenants are given it as their CNAME target, so every \
+                     subdomain would stay at pending_dns"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the custom-domain wiring.
     ///
     /// # Errors
@@ -7387,6 +7419,7 @@ impl CustomDomainsConfig {
                     .to_owned(),
             );
         }
+        self.validate_ingress_hostname()?;
         for (key, values) in [
             ("ingress_ipv4", &self.ingress_ipv4),
             ("ingress_ipv6", &self.ingress_ipv6),
@@ -7455,17 +7488,16 @@ impl CustomDomainsConfig {
 
     /// The ingress this deployment tells tenants to point at.
     ///
-    /// An address that does not parse is dropped here; [`validate`](Self::validate)
-    /// has already refused the configuration, so the app never reaches this
-    /// with a bad value.
+    /// A hostname or address that does not parse is dropped here;
+    /// [`validate`](Self::validate) has already refused the configuration, so
+    /// the app never reaches this with a bad value.
     #[must_use]
     pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
         crate::custom_domain::ExpectedIngress {
             hostname: self
                 .ingress_hostname
                 .as_ref()
-                .map(|h| h.trim().to_owned())
-                .filter(|h| !h.is_empty()),
+                .and_then(|h| crate::custom_domain::normalize_hostname(h).ok()),
             ipv4: self
                 .ingress_ipv4
                 .iter()

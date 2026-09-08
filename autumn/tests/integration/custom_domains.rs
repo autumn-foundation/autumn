@@ -796,3 +796,154 @@ async fn an_offboard_is_not_overtaken_by_an_in_flight_save() {
          the app offboarded (or lose one it kept)"
     );
 }
+
+/// A store whose `delete` blocks until released, so an offboard can be held
+/// mid-flight while another task registers the same hostname.
+#[derive(Debug)]
+struct PausingDeleteStore {
+    inner: MemoryCustomDomainStore,
+    release: tokio::sync::Notify,
+    paused: std::sync::atomic::AtomicBool,
+}
+
+impl PausingDeleteStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryCustomDomainStore::new(),
+            release: tokio::sync::Notify::new(),
+            paused: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Hold the next `delete` until [`release`](Self::release).
+    fn pause_next_delete(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for PausingDeleteStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        self.inner.load_all()
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.save(domain)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            if self.paused.swap(false, Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+            self.inner.delete(hostname).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_registration_racing_an_offboard_of_the_same_hostname_stays_durable() {
+    // A registration that returns success must be in the index AND in the
+    // store. Claiming the hostname before taking the write gate let the
+    // offboard erase the claim while the save still landed — or, as here,
+    // report success for a record the offboard was about to delete.
+    let store = Arc::new(PausingDeleteStore::new());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    ));
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    store.pause_next_delete();
+    let offboard = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.remove("app.clientco.com").await.unwrap() }
+    });
+    // Let the offboard take the write gate and reach the held delete.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let reconnect = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move {
+            registry
+                .register("app.clientco.com", "tenant-a", NOW + 1)
+                .await
+        }
+    });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    store.release();
+
+    assert!(offboard.await.unwrap());
+    reconnect
+        .await
+        .unwrap()
+        .expect("the reconnect must succeed");
+
+    assert!(
+        registry.get("app.clientco.com").is_some(),
+        "the hostname must still route in this process"
+    );
+    let restarted = CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    );
+    assert_eq!(restarted.load().await.unwrap(), 1);
+    assert!(
+        restarted.get("app.clientco.com").is_some(),
+        "and must survive a restart"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_ingress_hostname_is_refused_at_startup() {
+    // The value reaches tenants verbatim as their CNAME target, so a scheme or
+    // a port leaves every subdomain domain stuck at pending_dns with nothing
+    // to explain why.
+    let base = |hostname: &str| autumn_web::config::CustomDomainsConfig {
+        enabled: true,
+        ingress_hostname: Some(hostname.to_owned()),
+        ..Default::default()
+    };
+    for bad in [
+        "https://ingress.myapp.com",
+        "ingress.myapp.com:443",
+        "ingress.myapp.com/connect",
+        "ingress",
+        "*.myapp.com",
+    ] {
+        let error = base(bad)
+            .validate()
+            .expect_err(&format!("`{bad}` must be refused"));
+        assert!(error.contains("ingress_hostname"), "{error}");
+    }
+
+    // A bare name passes, and case and a trailing dot are normalised rather
+    // than refused.
+    base("ingress.myapp.com").validate().unwrap();
+    let config = base("Ingress.MyApp.com.");
+    config.validate().unwrap();
+    assert_eq!(
+        config.ingress().hostname.as_deref(),
+        Some("ingress.myapp.com")
+    );
+}

@@ -584,15 +584,32 @@ impl CustomDomainTask {
         let failures = self
             .registry
             .get(hostname)
+            .filter(|d| d.tenant == tenant)
             .map_or(0, |d| d.consecutive_failures)
             .saturating_add(1);
         let backoff = i64::try_from(self.limiter.backoff_for(failures)).unwrap_or(i64::MAX);
-        if let Err(e) = self
+        // Only while this tenant still owns the hostname. An order runs across
+        // several awaits: if the domain was offboarded and re-registered
+        // meanwhile, charging the failure here would put one tenant's reason
+        // and backoff on the next tenant's record.
+        match self
             .registry
-            .record_failure(hostname, now_unix, reason.clone(), backoff)
+            .record_failure_for(hostname, tenant, now_unix, reason.clone(), backoff)
             .await
         {
-            tracing::warn!(hostname, "failed to persist custom-domain failure: {e}");
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    hostname,
+                    tenant,
+                    "discarded a custom-domain failure: the hostname no longer belongs to this \
+                     tenant"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(hostname, "failed to persist custom-domain failure: {e}");
+            }
         }
         // Naming the domain AND the tenant is what lets an operator act on the
         // alert without a lookup — one tenant's broken domain among a thousand.
