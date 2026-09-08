@@ -475,19 +475,31 @@ both PR CI and the **Publish Gate**, so a release cannot be tagged while an
 unwaived advisory sits in the tree being published:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite graph, scaffold graph
+./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
-The third graph is the interesting one: it audits `autumn-web`'s dependency
-tree against the `deny.toml` that `autumn new` writes, with every feature any
-scaffold flavor can enable turned on — so "your day-one CI is green" is a
-checked property of every release rather than a hope. Being precise about what
-that covers: it is the autumn-web half of your tree, audited generously (a
-superset of what your app compiles from autumn-web), resolved against Autumn's
-own lockfile. Your app's own direct dependencies, and the exact versions your
-lockfile resolves, are what *your* CI audits — which is why the gate ships with
-your app rather than only living here.
+Five graphs, because "the dependency tree" means five different things here.
+The scaffold graph is the interesting one of the first three: it audits
+`autumn-web`'s dependency tree against the `deny.toml` that `autumn new`
+writes, with every feature any scaffold flavor can enable turned on — so "your
+day-one CI is green" is a checked property of every release rather than a
+hope. Being precise about what that covers: it is the autumn-web half of your
+tree, audited generously (a superset of what your app compiles from
+autumn-web), resolved against Autumn's own lockfile. Your app's own direct
+dependencies, and the exact versions your lockfile resolves, are what *your*
+CI audits — which is why the gate ships with your app rather than only living
+here.
+
+The other two are satellite graphs *inside this repo*, not your app's
+concern: `fuzz/` and `examples/island-flock/` are each their own excluded
+workspace root with their own `Cargo.lock` (own build reasons — a
+nightly/ASAN toolchain and a wasm32-only target, respectively), so nothing in
+the three graphs above ever resolves them, and each carries its own narrower
+`fuzz/deny.toml` / `examples/island-flock/deny.toml` (advisories + sources
+only — see each file's header for why licenses aren't gated there yet). If a
+satellite check fails, triage it against that satellite's own `deny.toml`,
+not the root one.
 
 `--self-test` is the negative proof, and it runs in Autumn's CI on every pull
 request: it audits a throwaway crate carrying a deliberately injected
