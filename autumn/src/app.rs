@@ -15123,6 +15123,16 @@ mod tests {
     #[cfg(feature = "i18n")]
     #[tokio::test]
     async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
+        // `load_config_and_telemetry` installs the `[metrics]` section, so
+        // calling it here resets the process-global metric limits as a side
+        // effect. Take the same lock the metrics tests use, or this can land
+        // between a limits test raising a cap and the loop that depends on it
+        // — dropping samples at the default while that test expects the
+        // raised value. See `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let project = tempfile::tempdir().expect("project dir");
         let i18n_dir = project.path().join("custom-i18n");
         std::fs::create_dir_all(&i18n_dir).expect("i18n dir");

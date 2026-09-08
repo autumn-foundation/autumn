@@ -54,7 +54,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -221,25 +221,55 @@ pub struct Limits {
     pub max_labels_per_series: usize,
 }
 
+/// The shipped caps, as a `const` so [`LIMITS`] can be initialized from them.
+const DEFAULT_LIMITS: Limits = Limits {
+    max_series_per_metric: DEFAULT_MAX_SERIES_PER_METRIC,
+    max_instruments: DEFAULT_MAX_INSTRUMENTS,
+    max_labels_per_series: DEFAULT_MAX_LABELS_PER_SERIES,
+};
+
 impl Default for Limits {
     fn default() -> Self {
-        Self {
-            max_series_per_metric: DEFAULT_MAX_SERIES_PER_METRIC,
-            max_instruments: DEFAULT_MAX_INSTRUMENTS,
-            max_labels_per_series: DEFAULT_MAX_LABELS_PER_SERIES,
-        }
+        DEFAULT_LIMITS
     }
 }
 
 impl Limits {
+    /// Bits each cap occupies in the packed word. The three must sum to 64,
+    /// and each must hold its ceiling: `100_000` < 2^24 and 64 < 2^16.
+    const SERIES_BITS: u32 = 24;
+    const INSTRUMENTS_BITS: u32 = 24;
+    const LABELS_BITS: u32 = 16;
+
+    /// Pack into the single word [`LIMITS`] publishes.
+    ///
+    /// Callers pass already-clamped values ([`set_limits`] is the only one),
+    /// so every field fits its slot; a value that somehow did not would be
+    /// masked rather than corrupt a neighbour.
+    const fn pack(self) -> u64 {
+        let series = (self.max_series_per_metric as u64) & ((1 << Self::SERIES_BITS) - 1);
+        let instruments = (self.max_instruments as u64) & ((1 << Self::INSTRUMENTS_BITS) - 1);
+        let labels = (self.max_labels_per_series as u64) & ((1 << Self::LABELS_BITS) - 1);
+        series
+            | (instruments << Self::SERIES_BITS)
+            | (labels << (Self::SERIES_BITS + Self::INSTRUMENTS_BITS))
+    }
+
+    /// Inverse of [`Self::pack`].
+    const fn unpack(bits: u64) -> Self {
+        Self {
+            max_series_per_metric: (bits & ((1 << Self::SERIES_BITS) - 1)) as usize,
+            max_instruments: ((bits >> Self::SERIES_BITS) & ((1 << Self::INSTRUMENTS_BITS) - 1))
+                as usize,
+            max_labels_per_series: ((bits >> (Self::SERIES_BITS + Self::INSTRUMENTS_BITS))
+                & ((1 << Self::LABELS_BITS) - 1)) as usize,
+        }
+    }
+
     /// The limits currently in effect process-wide.
     #[must_use]
     pub fn current() -> Self {
-        Self {
-            max_series_per_metric: max_series_per_metric(),
-            max_instruments: max_instruments(),
-            max_labels_per_series: max_labels_per_series(),
-        }
+        limits()
     }
 
     /// Check every cap against its floor of 1 and its documented ceiling.
@@ -294,44 +324,73 @@ impl Limits {
     }
 }
 
-/// The limits in effect, read on every capped decision.
+/// The limits in effect, packed into **one** word.
 ///
-/// Plain atomics rather than a lock: every reader is either already holding
-/// the registry lock or on a path that allocates anyway, and no decision needs
-/// two caps to be read together. Each cap is read **once** per decision and
-/// reused for both the read-lock and write-lock halves of a
-/// check-then-register, so a concurrent [`set_limits`] cannot make the two
-/// halves of one registration disagree.
-static LIMITS: EffectiveLimits = EffectiveLimits {
-    series_per_metric: AtomicUsize::new(DEFAULT_MAX_SERIES_PER_METRIC),
-    instruments: AtomicUsize::new(DEFAULT_MAX_INSTRUMENTS),
-    labels_per_series: AtomicUsize::new(DEFAULT_MAX_LABELS_PER_SERIES),
-};
+/// One word rather than three atomics because recording a labeled sample
+/// makes *two* capped decisions — how many labels the series keeps, then
+/// whether the instrument has room for that series — and they must agree on
+/// one configuration. With a cap per atomic, a recorder could read the label
+/// cap before a [`set_limits`] and the series cap after it: going from
+/// `{series: 100, labels: 8}` to `{series: 200, labels: 12}` would then admit
+/// an eight-label 101st series, which neither configuration on its own would
+/// ever have produced — and a retained series is never evicted, so that
+/// mistake is permanent. [`Instrument::record`] takes a single [`limits`]
+/// snapshot and hands both caps down from it.
+///
+/// A lock would serve too, but this is the hot path: an atomic load is free
+/// where a lock is not.
+static LIMITS: AtomicU64 = AtomicU64::new(DEFAULT_LIMITS.pack());
 
-/// Backing storage for [`LIMITS`].
-#[derive(Debug)]
-struct EffectiveLimits {
-    series_per_metric: AtomicUsize,
-    instruments: AtomicUsize,
-    labels_per_series: AtomicUsize,
+/// Serializes every **test** that changes — or asserts against — the
+/// process-global [`Limits`].
+///
+/// Declared here rather than inside `mod tests` because the limits are not
+/// only mutated by the metrics tests: `AppBuilder`'s own
+/// `load_config_and_telemetry` installs the `[metrics]` section, so any test
+/// exercising that helper resets these globals as a side effect and has to
+/// join the same discipline. `metrics.rs` cannot see `app.rs`'s test module,
+/// so the lock lives next to the state it guards.
+///
+/// Two rules keep concurrent tests safe, both enforced by the `LimitsGuard`
+/// wrapper in `mod tests`:
+///
+/// 1. Every test that changes or depends on the limits takes this lock.
+/// 2. A test only ever raises a cap **above** its shipped default, never
+///    below it. A raised cap can only admit more, so a test that somehow ran
+///    without the lock still could not fail because of one; a lowered cap
+///    could drop an unrelated test's series.
+///
+/// `set_limits` itself deliberately does **not** take this lock: it is
+/// production code, and a test legitimately calls it while already holding
+/// the guard, which a non-reentrant `Mutex` would deadlock on.
+#[cfg(test)]
+pub(crate) static LIMITS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The limits currently in effect, read as one consistent snapshot.
+#[must_use]
+pub fn limits() -> Limits {
+    Limits::unpack(LIMITS.load(Ordering::Relaxed))
 }
 
 /// Labeled series retained per instrument, as currently configured.
+///
+/// Reads the same snapshot as its siblings; a decision that needs more than
+/// one cap must call [`limits`] once rather than these in sequence.
 #[must_use]
 pub fn max_series_per_metric() -> usize {
-    LIMITS.series_per_metric.load(Ordering::Relaxed)
+    limits().max_series_per_metric
 }
 
 /// Instruments the registry holds, as currently configured.
 #[must_use]
 pub fn max_instruments() -> usize {
-    LIMITS.instruments.load(Ordering::Relaxed)
+    limits().max_instruments
 }
 
 /// Labels retained per series, as currently configured.
 #[must_use]
 pub fn max_labels_per_series() -> usize {
-    LIMITS.labels_per_series.load(Ordering::Relaxed)
+    limits().max_labels_per_series
 }
 
 /// Install `limits` process-wide.
@@ -383,15 +442,8 @@ pub fn set_limits(limits: Limits) {
             "app metric limits clamped into the accepted range"
         );
     }
-    LIMITS
-        .series_per_metric
-        .store(clamped.max_series_per_metric, Ordering::Relaxed);
-    LIMITS
-        .instruments
-        .store(clamped.max_instruments, Ordering::Relaxed);
-    LIMITS
-        .labels_per_series
-        .store(clamped.max_labels_per_series, Ordering::Relaxed);
+    // One store, so no reader can observe a half-applied configuration.
+    LIMITS.store(clamped.pack(), Ordering::Relaxed);
 }
 
 // ── Registry internals ─────────────────────────────────────────
@@ -604,13 +656,18 @@ impl Instrument {
             self.record_unlabeled(update);
             return;
         }
-        let key = self.canonical_key(labels);
+        // ONE snapshot for both capped decisions below. Reading the label cap
+        // and the series cap separately could straddle a `set_limits` and
+        // admit a series that neither configuration would have produced — and
+        // a retained series is never evicted, so it would stay wrong forever.
+        let limits = limits();
+        let key = self.canonical_key(labels, limits.max_labels_per_series);
         if key.is_empty() {
             // Every label was rejected; the sample still belongs somewhere.
             self.record_unlabeled(update);
             return;
         }
-        if let Some(series) = self.series_for(&key) {
+        if let Some(series) = self.series_for(&key, limits.max_series_per_metric) {
             update(&series);
         }
     }
@@ -628,13 +685,12 @@ impl Instrument {
 
     /// Look up (or register) the series for `key`, honouring the cardinality
     /// cap. Returns `None` when the cap dropped this label set.
-    fn series_for(&self, key: &SeriesKey) -> Option<Arc<Series>> {
-        // Read the cap once and reuse it for both halves of the
-        // check-then-register: reading it twice would let a concurrent
-        // `set_limits` admit the label set under the read lock and then drop
-        // it under the write lock, counting a drop for a series that the
-        // configuration in force at either instant would have kept.
-        let cap = max_series_per_metric();
+    fn series_for(&self, key: &SeriesKey, cap: usize) -> Option<Arc<Series>> {
+        // `cap` comes from the caller's single snapshot and is reused for both
+        // halves of the check-then-register: re-reading it would let a
+        // concurrent `set_limits` admit the label set under the read lock and
+        // then drop it under the write lock, counting a drop for a series that
+        // the configuration in force at either instant would have kept.
         {
             let series = self.series.read().unwrap_or_else(PoisonError::into_inner);
             if let Some(existing) = series.get(key) {
@@ -683,7 +739,7 @@ impl Instrument {
     /// reserved and over-long names dropped, duplicates resolved first-wins,
     /// values sanitized, sorted by key, then cut to
     /// [`max_labels_per_series`].
-    fn canonical_key(&self, labels: &[(String, String)]) -> SeriesKey {
+    fn canonical_key(&self, labels: &[(String, String)], cap: usize) -> SeriesKey {
         let mut kept: Vec<(Box<str>, Box<str>)> = Vec::with_capacity(labels.len());
         for (key, value) in labels {
             if !is_acceptable_label_name(key) {
@@ -701,7 +757,6 @@ impl Instrument {
         // — depend on the order `with_label` happened to be called in, so the
         // same ten labels applied in two orders would land in two series.
         kept.sort_by(|(a, _), (b, _)| a.cmp(b));
-        let cap = max_labels_per_series();
         if kept.len() > cap {
             kept.truncate(cap);
             self.warn_labels("too many labels");
@@ -1957,20 +2012,7 @@ mod tests {
     use super::testing::unique_name;
     use super::*;
 
-    /// Serializes every test that changes — or asserts against — the
-    /// process-global [`Limits`].
-    ///
-    /// The registry is process-global and these tests run concurrently, so a
-    /// test that raises a cap would otherwise be visible to one asserting the
-    /// default. Two rules keep that safe, and both are enforced by using this
-    /// guard rather than calling [`set_limits`] directly:
-    ///
-    /// 1. Every limits-sensitive test takes the same lock.
-    /// 2. A test only ever raises a cap **above** its shipped default, never
-    ///    below it. A raised cap can only admit more, so a test that somehow
-    ///    ran without the lock still could not fail because of one; a lowered
-    ///    cap could drop an unrelated test's series.
-    static LIMITS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::LIMITS_TEST_LOCK as LIMITS_LOCK;
 
     /// Holds [`LIMITS_LOCK`] and restores the defaults on drop.
     struct LimitsGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
@@ -2654,6 +2696,43 @@ mod tests {
             "described before the config was installed",
             "a description stashed past the default cap, before the configured \
              cap was installed, must still apply"
+        );
+    }
+
+    #[test]
+    fn limits_survive_a_pack_unpack_round_trip() {
+        // The three caps share one 64-bit word so a recorder reads them
+        // together; a slot too narrow for its ceiling would silently truncate
+        // a configured cap into a different one.
+        for limits in [
+            Limits::default(),
+            Limits {
+                max_series_per_metric: MAX_SERIES_PER_METRIC_CEILING,
+                max_instruments: MAX_INSTRUMENTS_CEILING,
+                max_labels_per_series: MAX_LABELS_PER_SERIES_CEILING,
+            },
+            Limits {
+                max_series_per_metric: 1,
+                max_instruments: 1,
+                max_labels_per_series: 1,
+            },
+            Limits {
+                max_series_per_metric: 500,
+                max_instruments: 512,
+                max_labels_per_series: 12,
+            },
+        ] {
+            assert_eq!(
+                Limits::unpack(limits.pack()),
+                limits,
+                "every accepted value must survive the packed representation"
+            );
+        }
+
+        assert_eq!(
+            Limits::SERIES_BITS + Limits::INSTRUMENTS_BITS + Limits::LABELS_BITS,
+            64,
+            "the three fields must exactly fill the word they are published in"
         );
     }
 
