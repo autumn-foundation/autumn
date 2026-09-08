@@ -1010,3 +1010,117 @@ fn a_fragment_link_is_prefixed_to_match_the_id_it_targets() {
     // A cross-document fragment points at ids this render did not write.
     assert!(rendered.contains(r#"href="/other#section""#), "{rendered}");
 }
+
+/// The byte budget has to be enforced *before* a write, not only on node
+/// entry. A one-node document renders `RenderContext::state`, which the **app**
+/// owns and can fill from a database — so "one node's output is bounded by the
+/// document" was simply false, and an entry-only check let a single text node
+/// return markup arbitrarily over the budget.
+#[test]
+fn a_single_oversized_node_cannot_exceed_the_byte_budget() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"blob":{"type":"string","initial":""}},
+            "view":{"kind":"text","value":{"expr":"state","name":"blob"}}}"#,
+    );
+
+    let mut state = document.initial_state();
+    // Bigger than the budget below, in ONE node — nothing accumulates.
+    state.insert("blob".into(), Value::String("x".repeat(200_000)));
+
+    let ctx = RenderContext {
+        state,
+        limits: RenderLimits {
+            max_output_bytes: 64 * 1024,
+            ..RenderLimits::default()
+        },
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("over the byte budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// The same, for the other two nodes that write an unbounded value.
+#[test]
+fn oversized_code_content_cannot_exceed_the_byte_budget() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"blob":{"type":"string","initial":""}},
+            "view":{"kind":"code","language":{"expr":"lit","value":"rust"},
+                    "content":{"expr":"state","name":"blob"}}}"#,
+    );
+
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(200_000)));
+
+    let ctx = RenderContext {
+        state,
+        limits: RenderLimits {
+            max_output_bytes: 64 * 1024,
+            ..RenderLimits::default()
+        },
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("over the byte budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+/// A `slot` among a component *invocation's* children fills the **caller's**
+/// slot, because those children render in the caller's scope through
+/// `SlotCtx::outer`. Two of them therefore render the caller's children twice —
+/// the exact thing the at-most-one-slot rule exists to prevent — while each
+/// component passes the rule on its own view.
+#[test]
+fn two_slots_reached_through_an_invocations_children_are_rejected() {
+    let codes = codes_of(
+        r#"{"version":"1.0",
+            "components":{
+              "Inner":{"view":{"kind":"element","tag":"div","children":[{"kind":"slot"}]}},
+              "Outer":{"view":{"kind":"component","name":"Inner","children":[
+                {"kind":"slot"},
+                {"kind":"slot"}]}}},
+            "view":{"kind":"component","name":"Outer",
+                    "children":[{"kind":"text","value":{"expr":"lit","value":"x"}}]}}"#,
+    );
+    assert!(codes.contains(&codes::MISPLACED), "{codes:?}");
+}
+
+/// One slot reached that way is still fine — the fix must not reject the legal
+/// shape it exists to count.
+#[test]
+fn one_slot_through_an_invocations_children_is_allowed() {
+    assert!(
+        codes_of(
+            r#"{"version":"1.0",
+                "components":{
+                  "Inner":{"view":{"kind":"element","tag":"div","children":[{"kind":"slot"}]}},
+                  "Outer":{"view":{"kind":"component","name":"Inner","children":[
+                    {"kind":"slot"}]}}},
+                "view":{"kind":"component","name":"Outer",
+                        "children":[{"kind":"text","value":{"expr":"lit","value":"x"}}]}}"#
+        )
+        .is_empty()
+    );
+}
+
+/// An event name that is non-empty but reduces to nothing cannot be written as
+/// a `data-constela-on-*` attribute. Accepting it meant a validated document
+/// silently lost its handler at render time, with no diagnostic anywhere.
+#[test]
+fn an_event_name_that_cannot_be_emitted_is_rejected() {
+    for event in ["_", "🎉", "!!!", "   "] {
+        let source = format!(
+            r#"{{"version":"1.0",
+                "state":{{"n":{{"type":"number","initial":0}}}},
+                "actions":[{{"name":"bump","steps":[
+                  {{"do":"update","target":"n","operation":"increment"}}]}}],
+                "view":{{"kind":"element","tag":"button","props":{{
+                  "onX":{{"event":"{event}","action":"bump"}}}}}}}}"#
+        );
+        let codes = codes_of(&source);
+        assert!(
+            codes.contains(&codes::STEP_SHAPE),
+            "event {event:?} must be rejected, got {codes:?}"
+        );
+    }
+}

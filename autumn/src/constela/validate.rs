@@ -924,11 +924,19 @@ impl<'a> Validator<'a> {
         match prop {
             Prop::Handler(handler) => {
                 self.check_action_ref(&handler.action, &format!("{path}.action"));
-                if handler.event.is_empty() {
+                // Judged by the same reduction the renderer will apply, so a
+                // name that survives validation is a name that reaches the
+                // page. `"_"` and an emoji are non-empty but reduce to
+                // nothing, and would have vanished silently at render time.
+                if policy::canonical_event(&handler.event).is_empty() {
                     self.error(
                         format!("{path}.event"),
                         codes::STEP_SHAPE,
-                        "an event binding needs a non-empty `event` name",
+                        format!(
+                            "event name {:?} has no letters, digits or `-`, so it cannot be written as a `{}on-*` attribute; name the DOM event, e.g. \"click\"",
+                            handler.event,
+                            policy::RESERVED_ATTR_PREFIX
+                        ),
                     );
                 }
                 match &handler.payload {
@@ -1174,10 +1182,16 @@ fn count_slots(node: &Node) -> usize {
         | Node::ErrorBoundary { fallback, content } => {
             count_slots(fallback).saturating_add(count_slots(content))
         }
-        // A nested component's children are slot content for *that*
-        // invocation, so they count against its component, not this one.
-        // The rest hold no nodes at all.
-        Node::Component { .. } | Node::Text { .. } | Node::Markdown { .. } | Node::Code { .. } => 0,
+        // A nested invocation's *children* count against THIS component, not
+        // the one being invoked. They are rendered in the caller's slot scope
+        // (`SlotCtx::outer`), so a `slot` among them fills this component's
+        // slot — two of them would render this component's children twice,
+        // which is exactly what the at-most-one rule exists to prevent. The
+        // invoked component's own `view` is counted separately, when
+        // `check_components` reaches it.
+        Node::Component { children, .. } => children.iter().map(count_slots).sum(),
+        // These hold no nodes at all.
+        Node::Text { .. } | Node::Markdown { .. } | Node::Code { .. } => 0,
     }
 }
 

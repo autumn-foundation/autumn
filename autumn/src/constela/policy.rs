@@ -170,6 +170,25 @@ pub fn is_void_tag(tag: &str) -> bool {
     VOID_TAGS.contains(&lower.as_str())
 }
 
+/// Reduce an event name to the characters an attribute name can carry.
+///
+/// An event binding is emitted as `data-constela-on-{event}`, so the name has
+/// to survive into an attribute name. This is the single definition of that
+/// reduction: [`validate`](super::validate) rejects a name that comes back
+/// empty and the renderer emits what comes back, so the two cannot disagree
+/// about which bindings exist. Before it lived here, an event called `"_"` or
+/// an emoji passed validation and then vanished at render time — a validated
+/// document quietly losing its handler, with no diagnostic.
+#[must_use]
+pub fn canonical_event(event: &str) -> String {
+    event
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .map(|c| c.to_ascii_lowercase())
+        .take(32)
+        .collect()
+}
+
 /// The attribute-name prefix the renderer owns.
 ///
 /// Event bindings, element refs and island wrappers are emitted under this
@@ -364,6 +383,17 @@ mod tests {
         assert!(!is_allowed_attr("aria-"));
         assert!(!is_allowed_attr("data-a b"));
         assert!(!is_allowed_attr("data-a\"b"));
+    }
+
+    #[test]
+    fn event_names_reduce_to_attribute_safe_text_or_to_nothing() {
+        assert_eq!(canonical_event("click"), "click");
+        assert_eq!(canonical_event("Click"), "click");
+        assert_eq!(canonical_event("a b=\"c\""), "abc");
+        // These come back empty, which is what `validate` rejects on: emitting
+        // nothing would silently drop the binding.
+        assert_eq!(canonical_event("_"), "");
+        assert_eq!(canonical_event("🎉"), "");
     }
 
     #[test]

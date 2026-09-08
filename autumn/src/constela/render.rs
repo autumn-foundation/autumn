@@ -312,12 +312,53 @@ impl Renderer<'_> {
         Ok((title, meta))
     }
 
+    /// Refuse a write *before* making it, if it would push the output past
+    /// [`RenderLimits::max_output_bytes`].
+    ///
+    /// Checking on node entry alone is not enough, and the reasoning that said
+    /// it was does not hold: it assumed one node's emission is bounded by the
+    /// document, but a node renders `RenderContext::state`, which the **app**
+    /// owns and can fill from a database. A single text node can therefore emit
+    /// arbitrarily much, and a one-node document would sail past the budget and
+    /// allocate the escaped copy on the way. Reserving the projected length
+    /// first bounds both the output and the allocation.
+    fn reserve(&self, emitted: usize, extra: usize, path: &str) -> Result<(), ConstelaError> {
+        let projected = emitted
+            .saturating_add(self.portal_bytes)
+            .saturating_add(extra);
+        if projected > self.ctx.limits.max_output_bytes {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path,
+                codes::RENDER_LIMIT,
+                format!(
+                    "render would produce more than {} bytes of markup",
+                    self.ctx.limits.max_output_bytes
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Append `text` to `out`, escaped, refusing the write if it would breach
+    /// the byte budget.
+    ///
+    /// Reserves twice on purpose: once on the raw length, which stops the
+    /// escaped copy from being allocated at all when the value is already
+    /// oversized, and once on the escaped length, which is what actually lands
+    /// in the buffer and can be up to six times larger.
+    fn push_escaped(&self, out: &mut String, text: &str, path: &str) -> Result<(), ConstelaError> {
+        self.reserve(out.len(), text.len(), path)?;
+        let escaped = escape_text(text);
+        self.reserve(out.len(), escaped.len(), path)?;
+        out.push_str(&escaped);
+        Ok(())
+    }
+
     /// Charge one node, and the output produced so far, against the budgets.
     ///
     /// `emitted` is the live buffer's length; the bytes already committed to
-    /// finished portals are added here. Checking on *entry* to each node means
-    /// the overshoot past the budget is at most one node's own output, which
-    /// the document size already bounds.
+    /// finished portals are added here. This catches accumulation across many
+    /// small nodes; [`Self::reserve`] catches a single large one.
     fn charge(&mut self, path: &str, emitted: usize) -> Result<(), ConstelaError> {
         self.nodes = self.nodes.saturating_add(1);
         if self.nodes > self.ctx.limits.max_nodes {
@@ -370,7 +411,7 @@ impl Renderer<'_> {
         match node {
             Node::Text { value } => {
                 let value = self.eval(value, env, &format!("{path}.value"), depth)?;
-                out.push_str(&escape_text(&text_of(&value)));
+                self.push_escaped(out, &text_of(&value), path)?;
             }
             Node::Element {
                 tag,
@@ -429,11 +470,20 @@ impl Renderer<'_> {
             Node::Code { language, content } => {
                 let language = self.eval(language, env, &format!("{path}.language"), depth)?;
                 let content = self.eval(content, env, &format!("{path}.content"), depth)?;
-                write_code_block(&text_of(&language), &text_of(&content), out);
+                open_code_block(&text_of(&language), out);
+                self.push_escaped(out, &text_of(&content), path)?;
+                out.push_str("</code></pre>");
             }
             Node::Markdown { content } => {
                 let content = self.eval(content, env, &format!("{path}.content"), depth)?;
-                render_markdown(&text_of(&content), out);
+                let source = text_of(&content);
+                // Reserved on the source before rendering: the sanitizer would
+                // otherwise build the whole HTML string first.
+                self.reserve(out.len(), source.len(), path)?;
+                let mut rendered = String::new();
+                render_markdown(&source, &mut rendered);
+                self.reserve(out.len(), rendered.len(), path)?;
+                out.push_str(&rendered);
             }
             Node::Portal { target, children } => {
                 self.portal(target, children, env, slot, path, depth)?;
@@ -706,9 +756,12 @@ impl Renderer<'_> {
                         )));
                     }
                     let value = self.eval(expr, env, &format!("{path}.props.{raw_name}"), depth)?;
-                    if let Some(rendered) =
-                        self.attribute_value(&name, &value, &format!("{path}.props.{raw_name}"))?
-                    {
+                    if let Some(rendered) = self.attribute_value(
+                        &name,
+                        &value,
+                        out.len(),
+                        &format!("{path}.props.{raw_name}"),
+                    )? {
                         attrs.push((name, Some(rendered)));
                     }
                 }
@@ -722,6 +775,16 @@ impl Renderer<'_> {
             self.push_handler_attrs(handler, env, path, depth, &mut attrs)?;
         }
         harden_blank_target(&mut attrs);
+
+        let attr_bytes: usize = attrs
+            .iter()
+            .map(|(name, value)| {
+                name.len()
+                    .saturating_add(value.as_ref().map_or(0, String::len))
+                    .saturating_add(4) // ` name=""`
+            })
+            .sum();
+        self.reserve(out.len(), attr_bytes.saturating_add(tag.len()), path)?;
 
         let _ = write!(out, "<{tag}");
         for (name, value) in &attrs {
@@ -770,6 +833,7 @@ impl Renderer<'_> {
         &self,
         name: &str,
         value: &Value,
+        emitted: usize,
         path: &str,
     ) -> Result<Option<String>, ConstelaError> {
         let is_data = name.starts_with("data-");
@@ -788,6 +852,13 @@ impl Renderer<'_> {
                 format!("computed URL {text:?} uses a scheme that is not allowed"),
             )));
         }
+
+        // The raw value, before escaping allocates a copy of it. `emitted` is
+        // the buffer length as it stands before this element is written, which
+        // is the right baseline: the attributes are assembled first and
+        // written together, and that assembled total is reserved separately in
+        // `element`.
+        self.reserve(emitted, text.len(), path)?;
 
         let text = if policy::is_id_ref_attr(name) {
             prefix_id_refs(&self.ctx.id_prefix, &text)
@@ -809,7 +880,7 @@ impl Renderer<'_> {
         depth: usize,
         attrs: &mut Vec<(String, Option<String>)>,
     ) -> Result<(), ConstelaError> {
-        let event = sanitize_event(&handler.event);
+        let event = policy::canonical_event(&handler.event);
         if event.is_empty() {
             return Ok(());
         }
@@ -854,9 +925,12 @@ impl Renderer<'_> {
     }
 }
 
-/// Write a `<pre><code>` block, with the language hint reduced to something
-/// safe to put in a class name.
-fn write_code_block(language: &str, content: &str, out: &mut String) {
+/// Write the opening `<pre><code …>` of a code block, with the language hint
+/// reduced to something safe to put in a class name.
+///
+/// The content is appended separately, through the budget-checked path: it
+/// comes from state and is the unbounded part.
+fn open_code_block(language: &str, out: &mut String) {
     out.push_str("<pre><code");
     let language = sanitize_language(language);
     if !language.is_empty() {
@@ -865,8 +939,6 @@ fn write_code_block(language: &str, content: &str, out: &mut String) {
         let _ = write!(out, " class=\"language-{}\"", escape_attr(&language));
     }
     out.push('>');
-    out.push_str(&escape_text(content));
-    out.push_str("</code></pre>");
 }
 
 /// Render a Markdown node through the sanitizing user-content path — the same
@@ -889,16 +961,6 @@ fn sanitize_language(language: &str) -> String {
     language
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '+' || *c == '#')
-        .take(32)
-        .collect()
-}
-
-/// Reduce an event name to the `[a-z0-9-]` an attribute name can carry.
-fn sanitize_event(event: &str) -> String {
-    event
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .map(|c| c.to_ascii_lowercase())
         .take(32)
         .collect()
 }
@@ -977,13 +1039,6 @@ mod tests {
         assert_eq!(sanitize_language("rust"), "rust");
         assert_eq!(sanitize_language("c++"), "c++");
         assert_eq!(sanitize_language("a\" onload=\"x"), "aonloadx");
-    }
-
-    #[test]
-    fn event_names_are_reduced_to_attribute_safe_text() {
-        assert_eq!(sanitize_event("click"), "click");
-        assert_eq!(sanitize_event("Click"), "click");
-        assert_eq!(sanitize_event("a b=\"c\""), "abc");
     }
 
     #[test]
