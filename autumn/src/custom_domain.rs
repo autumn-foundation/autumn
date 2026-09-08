@@ -716,9 +716,17 @@ impl CustomDomainRegistry {
     /// it verifies and issues — and from then on every request for that host
     /// resolves to the tenant that registered it.
     ///
-    /// A pattern matches the name itself and, unless it is a bare apex, every
-    /// name below it: `myapp.com` reserves `myapp.com` and `acme.myapp.com`
-    /// alike. `*.myapp.com` reserves the subtree but not the apex.
+    /// A pattern reserves the name itself AND every name below it, wildcard or
+    /// not: `myapp.com` and `*.myapp.com` each reserve `myapp.com` and
+    /// `acme.myapp.com` alike.
+    ///
+    /// A wildcard covering its own apex is deliberate, and deliberately wider
+    /// than the certificate: `*.myapp.com` does not cover `myapp.com` in TLS,
+    /// but an operator who put that pattern here owns the zone, and letting a
+    /// tenant claim the apex under it would hand away the operator's own name.
+    /// Over-reserving costs an operator nothing — no tenant has a legitimate
+    /// claim on a host the deployment already answers for — while
+    /// under-reserving is a tenant-isolation hole.
     #[must_use]
     pub fn with_reserved(mut self, patterns: impl IntoIterator<Item = String>) -> Self {
         self.reserved = patterns
@@ -739,6 +747,11 @@ impl CustomDomainRegistry {
                     // operator listing `myapp.com` means the whole zone, not
                     // just the apex.
                     || host == *pattern || host.ends_with(&format!(".{pattern}")),
+                    // `host == suffix` is intentional: a wildcard reserves its
+                    // own apex too. Wider than the certificate `*.myapp.com`
+                    // covers, and that is the point — the operator owns the
+                    // zone, so a tenant must not be able to claim `myapp.com`
+                    // just because only the wildcard was listed.
                     |suffix| host == suffix || host.ends_with(&format!(".{suffix}")),
                 )
             })
@@ -984,7 +997,44 @@ impl CustomDomainRegistry {
         now_unix: i64,
         cert_not_after_unix: i64,
     ) -> io::Result<()> {
-        self.mutate(hostname, |d| {
+        self.activate(hostname, None, now_unix, cert_not_after_unix)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`record_active`](Self::record_active), but only while `tenant` still
+    /// owns the hostname. Returns whether it applied.
+    ///
+    /// An issuance suspends at every `.await` between checking who owns a
+    /// hostname and installing the certificate. If the owner is offboarded and
+    /// the hostname re-registered in that window, an unconditional activation
+    /// would stamp `Active` onto the NEW tenant's record — carrying it from
+    /// `pending_dns` straight to serving, on a certificate issued for someone
+    /// else and without its own DNS ever being verified. The owner is therefore
+    /// re-asserted inside the write lock, not before the await.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_active_for(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        now_unix: i64,
+        cert_not_after_unix: i64,
+    ) -> io::Result<bool> {
+        self.activate(hostname, Some(tenant), now_unix, cert_not_after_unix)
+            .await
+    }
+
+    async fn activate(
+        &self,
+        hostname: &str,
+        tenant: Option<&str>,
+        now_unix: i64,
+        cert_not_after_unix: i64,
+    ) -> io::Result<bool> {
+        self.mutate_if(hostname, |d| tenant.is_none_or(|t| d.tenant == t), |d| {
             d.status = DomainStatus::Active;
             if d.verified_at_unix.is_none() {
                 d.verified_at_unix = Some(now_unix);
@@ -1093,20 +1143,39 @@ impl CustomDomainRegistry {
 
     /// Apply `f` to a record and persist it. A missing hostname is a no-op.
     async fn mutate(&self, hostname: &str, f: impl FnOnce(&mut CustomDomain)) -> io::Result<()> {
+        self.mutate_if(hostname, |_| true, f).await.map(|_| ())
+    }
+
+    /// Apply `f` to a record and persist it, but only while `guard` accepts the
+    /// record as it stands under the write lock. Returns whether it applied.
+    ///
+    /// The guard is what makes a check-then-write atomic against the registry:
+    /// a caller that verified something about the record BEFORE an `.await`
+    /// re-asserts it here, inside the lock, rather than trusting a fact that
+    /// may have expired while it was suspended.
+    async fn mutate_if(
+        &self,
+        hostname: &str,
+        guard: impl FnOnce(&CustomDomain) -> bool,
+        f: impl FnOnce(&mut CustomDomain),
+    ) -> io::Result<bool> {
         let Ok(host) = normalize_hostname(hostname) else {
-            return Ok(());
+            return Ok(false);
         };
         let updated = {
             let mut index = write_lock(&self.index);
             let Some(record) = index.get_mut(&host) else {
-                return Ok(());
+                return Ok(false);
             };
+            if !guard(record) {
+                return Ok(false);
+            }
             f(record);
             let updated = record.clone();
             drop(index);
             updated
         };
-        self.store.save(&updated).await
+        self.store.save(&updated).await.map(|()| true)
     }
 }
 

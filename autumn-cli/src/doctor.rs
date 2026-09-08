@@ -1589,8 +1589,34 @@ pub struct CustomDomainProbe {
     pub tenant: String,
     /// Its lifecycle state, as the registry recorded it.
     pub status: String,
-    /// Where DNS says it points now.
-    pub dns: DnsPointsHere,
+    /// Where DNS says it points, judged against the CONFIGURED ingress.
+    pub dns: CustomDomainDns,
+}
+
+/// Where a registered custom domain points, relative to the configured ingress.
+///
+/// Deliberately not [`DnsPointsHere`]: that grades against the addresses THIS
+/// process can discover for itself, which is the right question for the
+/// deployment's own certificate and the wrong one here. `autumn doctor` usually
+/// runs from an operator's laptop or a deploy runner, and the ingress a tenant
+/// is told to point at is a load balancer or an elastic IP — so a correctly
+/// connected domain would grade as "resolves elsewhere" and fail the run.
+/// Grading against `[server.tls.acme.custom_domains]`'s ingress asks what the
+/// runtime verifier asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomDomainDns {
+    /// Every resolved address is a configured ingress address.
+    PointsHere,
+    /// The name resolves, but not to the ingress.
+    PointsElsewhere {
+        /// The addresses that are not the ingress.
+        seen: Vec<String>,
+    },
+    /// The name does not resolve.
+    Unresolved,
+    /// The ingress itself could not be resolved to any address, so there is
+    /// nothing to compare against — inconclusive, never a hard failure.
+    IngressUnknown,
 }
 
 /// Grade the `[server.tls.acme.custom_domains]` section (offline, pure).
@@ -1677,24 +1703,27 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
     } = probe;
     let settled = status == "active" || status == "verified";
     match dns {
-        DnsPointsHere::Matches => CheckResult {
+        CustomDomainDns::PointsHere => CheckResult {
             name: "custom_domain_dns",
             status: CheckStatus::Pass,
             detail: Some(format!(
-                "{hostname} (tenant {tenant}) resolves to this host"
+                "{hostname} (tenant {tenant}) resolves to this deployment's ingress"
             )),
             hint: None,
         },
-        DnsPointsHere::LocalIpsUnknown => CheckResult {
+        CustomDomainDns::IngressUnknown => CheckResult {
             name: "custom_domain_dns",
             status: CheckStatus::Warn,
             detail: Some(format!(
-                "cannot tell where {hostname} (tenant {tenant}) points: this host has no \
-                 discoverable public address, which is normal behind NAT or in a container"
+                "cannot tell where {hostname} (tenant {tenant}) points: the configured ingress \
+                 does not resolve to any address from here"
             )),
-            hint: Some("Check the domain from outside the deployment"),
+            hint: Some(
+                "Check [server.tls.acme.custom_domains] ingress_hostname / ingress_ipv4 / \
+                 ingress_ipv6",
+            ),
         },
-        DnsPointsHere::Unresolved if settled => CheckResult {
+        CustomDomainDns::Unresolved if settled => CheckResult {
             name: "custom_domain_dns",
             status: CheckStatus::Fail,
             detail: Some(format!(
@@ -1705,7 +1734,7 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
                 "Ask the tenant to restore the record, or offboard the domain so renewals stop",
             ),
         },
-        DnsPointsHere::Unresolved => CheckResult {
+        CustomDomainDns::Unresolved => CheckResult {
             name: "custom_domain_dns",
             status: CheckStatus::Warn,
             detail: Some(format!(
@@ -1713,8 +1742,7 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
             )),
             hint: Some("The tenant has not published the DNS record yet"),
         },
-        DnsPointsHere::PartialMatch { unmatched: seen }
-        | DnsPointsHere::ResolvesElsewhere { resolved: seen } => CheckResult {
+        CustomDomainDns::PointsElsewhere { seen } => CheckResult {
             name: "custom_domain_dns",
             status: if settled {
                 CheckStatus::Fail
@@ -1723,7 +1751,7 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
             },
             detail: Some(format!(
                 "{hostname} (tenant {tenant}) is {status} but resolves to {}, which {} not this \
-                 host",
+                 deployment's ingress",
                 seen.join(", "),
                 if seen.len() == 1 { "is" } else { "are" }
             )),
@@ -1732,6 +1760,58 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
             ),
         },
     }
+}
+
+/// Resolve `hostname` and grade it against the configured ingress, through the
+/// SAME grader the runtime verifier uses — so doctor and the running app can
+/// never disagree about whether a domain points here.
+#[must_use]
+pub fn resolve_custom_domain_dns(
+    hostname: &str,
+    ingress: &autumn_web::custom_domain::ExpectedIngress,
+) -> CustomDomainDns {
+    use autumn_web::custom_domain::{ObservedTarget, VerificationOutcome, grade_dns_verification};
+
+    // A resolver reports the addresses a name ends at and follows CNAMEs
+    // silently, so an ingress configured only as a hostname is resolved to its
+    // addresses first — exactly what `CustomDomainTask::effective_ingress`
+    // does at runtime.
+    let mut expected = ingress.clone();
+    if expected.ipv4.is_empty() && expected.ipv6.is_empty() {
+        let Some(host) = expected.hostname.clone() else {
+            return CustomDomainDns::IngressUnknown;
+        };
+        for addr in resolve_addresses(&host) {
+            match addr {
+                std::net::IpAddr::V4(v4) => expected.ipv4.push(v4),
+                std::net::IpAddr::V6(v6) => expected.ipv6.push(v6),
+            }
+        }
+        if expected.ipv4.is_empty() && expected.ipv6.is_empty() {
+            return CustomDomainDns::IngressUnknown;
+        }
+    }
+
+    let observed = resolve_addresses(hostname);
+    if observed.is_empty() {
+        return CustomDomainDns::Unresolved;
+    }
+    match grade_dns_verification(&ObservedTarget::Addresses(observed), &expected) {
+        VerificationOutcome::PointsHere => CustomDomainDns::PointsHere,
+        VerificationOutcome::Unresolved => CustomDomainDns::Unresolved,
+        VerificationOutcome::PointsElsewhere { detail } => CustomDomainDns::PointsElsewhere {
+            seen: vec![detail.trim_start_matches("resolves to ").to_owned()],
+        },
+    }
+}
+
+/// Every address `host` resolves to, or an empty list.
+fn resolve_addresses(host: &str) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs as _;
+    (host, 0_u16)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|s| s.ip()).collect())
+        .unwrap_or_default()
 }
 
 /// Read the custom-domain registry off disk, where the runtime store writes it.
@@ -8839,6 +8919,7 @@ pub fn run(opts: DoctorOptions) {
                 .filter(|cd| cd.enabled)
                 .map(|cd| read_custom_domain_registry(&cd.store_dir))
                 .unwrap_or_default();
+            let cd_ingress = cd_cfg.as_ref().filter(|cd| cd.enabled).map(|cd| cd.ingress());
             let registered_count = registered.len();
             tasks.push(Box::new(move || {
                 check_custom_domains_config_impl(
@@ -8867,13 +8948,17 @@ pub fn run(opts: DoctorOptions) {
             // deployment". Bounded, and the bound is reported.
             if opts.online {
                 let total = registered.len();
+                // The ingress every registered domain is graded against — the
+                // deployment's, not this CLI host's.
+                let probe_ingress = cd_ingress.clone().unwrap_or_default();
                 for (index, (hostname, tenant, status)) in registered
                     .into_iter()
                     .take(MAX_CUSTOM_DOMAIN_PROBES)
                     .enumerate()
                 {
+                    let probe_ingress = probe_ingress.clone();
                     tasks.push(Box::new(move || {
-                        let dns = resolve_dns_points_here(&hostname);
+                        let dns = resolve_custom_domain_dns(&hostname, &probe_ingress);
                         let mut result = check_custom_domain_dns_impl(&CustomDomainProbe {
                             hostname,
                             tenant,

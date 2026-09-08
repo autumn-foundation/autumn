@@ -482,11 +482,28 @@ impl CustomDomainTask {
             .save_cert(&cert_id_for(hostname), &stored)
             .await
             .map_err(|e| format!("failed to persist the certificate for {hostname}: {e}"))?;
-        self.cache.insert(hostname, certified);
-        self.registry
-            .record_active(hostname, now_unix, not_after)
+        // Activate only while `tenant` STILL owns the hostname. The ownership
+        // check above ran before `save_cert` awaited; an offboard plus a
+        // re-registration in that window would otherwise stamp `Active` onto
+        // the new tenant's record, carrying it from `pending_dns` to serving on
+        // a certificate issued for someone else. Losing the race means the
+        // certificate belongs to nobody: drop it rather than leave a private
+        // key on disk for a hostname its owner never verified.
+        let activated = self
+            .registry
+            .record_active_for(hostname, tenant, now_unix, not_after)
             .await
             .map_err(|e| format!("failed to persist the active state for {hostname}: {e}"))?;
+        if !activated {
+            self.cache.remove(hostname);
+            if let Err(e) = self.certs.delete_cert(&cert_id_for(hostname)).await {
+                tracing::warn!(hostname, "failed to delete a superseded certificate: {e}");
+            }
+            return Err(format!(
+                "discarding the certificate: {hostname} changed hands while it was being issued"
+            ));
+        }
+        self.cache.insert(hostname, certified);
         tracing::info!(hostname, not_after, "custom domain is active");
         // Backstop: a certificate already inside its renew-before window the
         // moment it is issued — a CA issuing a shorter lifetime than

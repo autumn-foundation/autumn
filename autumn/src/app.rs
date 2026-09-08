@@ -4952,6 +4952,8 @@ impl AppBuilder {
                 dns01,
                 custom_domains,
             } = bind_state;
+            // Read before `custom_domains` is moved into the spawn below.
+            let custom_domains_enabled = custom_domains.is_some();
 
             // The `:80` challenge/redirect listener, bound dual-stack so the CA
             // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
@@ -4970,7 +4972,13 @@ impl AppBuilder {
             let challenge_listeners =
                 match crate::acme::challenge::bind_challenge_listeners(http_challenge_port).await {
                     Ok(listeners) => listeners,
-                    Err(e) if dns01 => {
+                    // Only DNS-01 WITHOUT custom domains can live without this
+                    // listener. Tenant certificates are always ordered over
+                    // HTTP-01 — the record lives in the tenant's zone, where
+                    // this deployment holds no DNS credential — so continuing
+                    // here would verify every tenant domain and then burn its
+                    // issuance budget into permanent backoff, never activating.
+                    Err(e) if dns01 && !custom_domains_enabled => {
                         tracing::warn!(
                             port = http_challenge_port,
                             error = %e,
@@ -4983,6 +4991,21 @@ impl AppBuilder {
                         Vec::new()
                     }
                     Err(e) => {
+                        if dns01 {
+                            tracing::error!(
+                                port = http_challenge_port,
+                                "Failed to bind the ACME HTTP-01 challenge listener: {e}. This \
+                                 deployment issues its own certificate over DNS-01, which does \
+                                 not need the listener — but [server.tls.acme.custom_domains] is \
+                                 enabled, and a tenant's domain can only be validated over \
+                                 HTTP-01. Grant CAP_NET_BIND_SERVICE, set [server.tls.acme] \
+                                 http_challenge_port to a port a front-end forwards :80 to, or \
+                                 disable custom domains"
+                            );
+                            #[cfg(feature = "managed-pg")]
+                            crate::managed_pg::emergency_stop_async().await;
+                            std::process::exit(1);
+                        }
                         tracing::error!(
                             port = http_challenge_port,
                             "Failed to bind the ACME HTTP-01 challenge listener: {e}. Port \

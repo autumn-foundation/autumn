@@ -1193,3 +1193,133 @@ async fn a_thousand_domains_serve_the_right_certificate_through_a_cache_of_two_h
     // An unregistered name is still refused, at scale.
     assert!(resolver.certificate_for("attacker.example.net").is_none());
 }
+
+// ── Codex round 1 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_certificate_cannot_activate_a_tenant_that_took_over_mid_order() {
+    // The ownership check runs before `save_cert` awaits. If the owner is
+    // offboarded and the hostname re-registered in that window, an
+    // unconditional activation would carry the NEW tenant from pending_dns
+    // straight to active on someone else's certificate, without its DNS ever
+    // being verified.
+    let h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .record_verified("app.clientco.com", NOW)
+        .await
+        .unwrap();
+
+    // Tenant B takes the hostname over while tenant A's order is in flight.
+    h.registry.remove("app.clientco.com").await.unwrap();
+    h.registry
+        .register("app.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    // Activating for the ORIGINAL owner must not apply.
+    let applied = h
+        .registry
+        .record_active_for("app.clientco.com", "tenant-a", NOW, NOW + 86_400)
+        .await
+        .unwrap();
+    assert!(!applied, "activation must not cross tenants");
+
+    let record = h.registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-b");
+    assert_eq!(
+        record.status,
+        DomainStatus::PendingDns,
+        "the new tenant must still prove its own DNS"
+    );
+    assert!(record.cert_not_after_unix.is_none());
+    assert!(!h.registry.is_servable("app.clientco.com"));
+
+    // And the same call for the CURRENT owner does apply.
+    assert!(
+        h.registry
+            .record_active_for("app.clientco.com", "tenant-b", NOW, NOW + 86_400)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Active
+    );
+}
+
+/// An issuer that hands the hostname to another tenant mid-order, reproducing
+/// the window between `install`'s ownership check and its activation.
+#[derive(Debug)]
+struct TakeoverIssuer {
+    registry: Arc<CustomDomainRegistry>,
+}
+
+impl DomainIssuer for TakeoverIssuer {
+    fn issue<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+        Box::pin(async move {
+            self.registry.remove(hostname).await.unwrap();
+            self.registry
+                .register(hostname, "tenant-b", NOW)
+                .await
+                .unwrap();
+            Ok(IssuedCertificate {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_certificate_issued_for_a_hostname_that_changed_hands_is_discarded() {
+    // End to end through `install`: the takeover happens between the ownership
+    // check and activation, so the certificate belongs to nobody and must not
+    // be left on disk or in the cache.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(4));
+    let task = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&certs),
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::new(TakeoverIssuer {
+            registry: Arc::clone(&registry),
+        }) as Arc<dyn DomainIssuer>,
+    );
+
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    task.tick(NOW).await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-b");
+    assert_eq!(
+        record.status,
+        DomainStatus::PendingDns,
+        "the tenant that took the hostname over must still prove its own DNS"
+    );
+    assert!(cache.get("app.clientco.com").is_none());
+    assert!(
+        certs
+            .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_none(),
+        "a certificate nobody owns must not be left on disk"
+    );
+}
