@@ -3141,10 +3141,22 @@ pub struct ServerEndpoint {
     /// emitted no guard at all, leaving 19 destructive statements unprotected.
     /// The connection already knows the answer.
     pub database: String,
-    /// `inet_server_addr()`, e.g. `10.0.0.2/32`.
+    /// `inet_server_addr()`, e.g. `10.0.0.2/32`. `None` over a Unix socket.
     pub address: Option<String>,
-    /// `inet_server_port()`.
+    /// `inet_server_port()`. `None` over a Unix socket.
     pub port: Option<String>,
+    /// The cluster's `system_identifier`, from `pg_control_system()`.
+    ///
+    /// Address and port are `None` for EVERY Unix-socket connection, so two
+    /// socket clusters holding the same database name are indistinguishable by
+    /// them — measured, both reported `<null>/<null>` while their identifiers
+    /// differed. This one is generated at initdb, survives the socket path, and
+    /// is readable by an ordinary `LOGIN` role (verified against a non-superuser
+    /// on `PostgreSQL` 16.13).
+    ///
+    /// It does not distinguish a primary from its physical replica, which share
+    /// one — hence kept alongside address and port rather than replacing them.
+    pub system_identifier: Option<String>,
 }
 
 /// they are probed here rather than assumed.
@@ -3665,6 +3677,12 @@ fn probe_database_facts(
             .unwrap_or_default(),
         address: (!address.is_empty()).then_some(address),
         port: (!port.is_empty()).then_some(port),
+        system_identifier: names(
+            "SELECT system_identifier::text AS name FROM pg_catalog.pg_control_system()",
+            &mut conn,
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next()),
     };
 
     // Rules are the other way a `DELETE` runs code the plan never saw. Unlike a
@@ -4049,16 +4067,21 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
     let body = format!(
         " BEGIN IF pg_catalog.current_database() <> {name} \
          OR pg_catalog.inet_server_addr()::text IS DISTINCT FROM {addr} \
-         OR pg_catalog.inet_server_port()::text IS DISTINCT FROM {port} THEN \
-         RAISE EXCEPTION {message}, {name}, {addr}, {port}, \
+         OR pg_catalog.inet_server_port()::text IS DISTINCT FROM {port} \
+         OR (SELECT system_identifier::text FROM pg_catalog.pg_control_system()) \
+         IS DISTINCT FROM {sysid} THEN \
+         RAISE EXCEPTION {message}, {name}, {addr}, {port}, {sysid}, \
          pg_catalog.current_database(), pg_catalog.inet_server_addr()::text, \
-         pg_catalog.inet_server_port()::text; END IF; END ",
+         pg_catalog.inet_server_port()::text, \
+         (SELECT system_identifier::text FROM pg_catalog.pg_control_system()); END IF; END ",
         name = quote_literal(&endpoint.database),
         addr = literal(endpoint.address.as_ref()),
         port = literal(endpoint.port.as_ref()),
+        sysid = literal(endpoint.system_identifier.as_ref()),
         message = quote_literal(
-            "this block is for % at %:%, but the session is on % at %:% — the \\connect \
-             above did not take effect (psql keeps the previous connection when one fails)"
+            "this block is for % at %:% (cluster %), but the session is on % at %:% \
+             (cluster %) — the \\connect above did not take effect (psql keeps the \
+             previous connection when one fails)"
         ),
     );
     let tag = sample::dollar_tag(&body);
@@ -4576,6 +4599,7 @@ mod tests {
             database: "app_copy".to_owned(),
             address: Some("10.0.0.2/32".to_owned()),
             port: Some("5432".to_owned()),
+            system_identifier: Some("7682669380557907941".to_owned()),
         };
         let guard = super::target_guard(&here);
         assert!(
@@ -4584,6 +4608,15 @@ mod tests {
                     .contains("pg_catalog.inet_server_addr()::text IS DISTINCT FROM '10.0.0.2/32'")
                 && guard.contains("pg_catalog.inet_server_port()::text IS DISTINCT FROM '5432'"),
             "the guard must pin the whole endpoint: {guard}"
+        );
+        // Address and port are None for EVERY Unix-socket connection, so two
+        // socket clusters holding the same database name are identical by them.
+        // Measured: both reported `<null>/<null>` while their system identifiers
+        // differed (7682669380557907941 vs 7683257673996527196).
+        assert!(
+            guard.contains("IS DISTINCT FROM '7682669380557907941'"),
+            "the cluster identity must be pinned too, or two socket clusters are \
+             indistinguishable: {guard}"
         );
         // Unqualified, these resolve through the PASTING session's search_path.
         // Measured on a database configured `public, pg_catalog`, a shadowing
@@ -4594,6 +4627,7 @@ mod tests {
             "current_database()",
             "inet_server_addr()",
             "inet_server_port()",
+            "pg_control_system()",
         ] {
             for (at, _) in guard.match_indices(call) {
                 assert!(
@@ -4608,8 +4642,8 @@ mod tests {
         );
         assert_eq!(
             guard.matches('%').count(),
-            6,
-            "three placeholders for the target endpoint, three for the session's: {guard}"
+            8,
+            "four placeholders for the target endpoint, four for the session's: {guard}"
         );
 
         // Over a Unix socket the server reports neither, and the guard compares
@@ -4621,6 +4655,11 @@ mod tests {
         assert!(
             socket.contains("IS DISTINCT FROM NULL"),
             "a socket target pins NULL explicitly: {socket}"
+        );
+        assert_eq!(
+            socket.matches("IS DISTINCT FROM NULL").count(),
+            3,
+            "address, port and cluster are all unknown for a default endpoint: {socket}"
         );
 
         // The database name comes from the target connection, so a quote in it

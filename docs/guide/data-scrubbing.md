@@ -445,7 +445,15 @@ untouched. Both are compared with `IS DISTINCT FROM`, because the server reports
 neither over a Unix socket and `NULL <> NULL` would let the check pass by
 failing to be false.
 
-All three values are asked of the target connection while the run plans, never
+Identity also carries the cluster's `system_identifier`. Address and port are
+NULL for *every* Unix-socket connection, so two socket clusters holding the same
+database name look identical by them — measured, both reported `<null>/<null>`
+while their identifiers differed. It is generated at initdb, survives the socket
+path, and an ordinary `LOGIN` role can read it. It does not distinguish a primary
+from its physical replica, which share one, so it sits alongside address and port
+rather than replacing them.
+
+Every value is asked of the target connection while the run plans, never
 parsed out of its URL: libpq defaults an omitted database name to the user name,
 which defaults to the OS user, and the connection already knows the answer those
 rules produce. The guard is emitted after the session pins and every call in it

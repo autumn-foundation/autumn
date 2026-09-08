@@ -110,8 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the deliberately password-free conninfo makes likely rather than remote.
   `ON_ERROR_STOP` alone does not help an interactive paste; the guard aborts the
   transaction, so every following statement is refused and `COMMIT` rolls back.
-  Its values are asked of the target connection rather than parsed out of its
-  URL — libpq defaults an omitted database name to the user name, so deriving it
+  Identity includes the cluster's `system_identifier`: address and port are NULL
+  for every Unix-socket connection, so two socket clusters holding the same
+  database name were indistinguishable without it. Its values are asked of the
+  target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and
   emitted after the session pins, so a `public.current_database()` in the pasting
   session's `search_path` cannot answer for the catalog.
