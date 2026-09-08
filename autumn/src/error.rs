@@ -765,11 +765,14 @@ impl AutumnError {
     /// this and is for a human reader. Use `message` where the string is
     /// stored, broadcast, or compared across versions.
     ///
-    /// **Not redacted.** For a `4xx` this is the `application/problem+json`
-    /// `detail`, but a `5xx` response outside a dev profile replaces that
-    /// `detail` with a generic line, and this still returns the wrapped
-    /// error — a database or infrastructure message. Check
-    /// [`status`](Self::status) before you send it to a client.
+    /// **Not redacted, and never assume it is.** A response outside a dev
+    /// profile replaces a server-error `detail` with a generic line; this
+    /// still returns the wrapped error — a database or infrastructure
+    /// message. [`status`](Self::status) does not tell you which case you
+    /// are in: it reports the assigned status, and the renderer reclassifies
+    /// a cancelled database statement to a redacted `503`, so a `4xx` here
+    /// can still be a redacted response. Render the error when you need a
+    /// client-safe string.
     ///
     /// # Examples
     ///
@@ -2116,5 +2119,25 @@ mod tests {
             assert_eq!(json["code"], &*expected);
         }
         Ok(())
+    }
+
+    #[test]
+    fn the_assigned_status_is_not_a_redaction_guard() {
+        // `status()` is the assigned status. The renderer reclassifies a
+        // cancelled statement to a redacted 503, so a caller that gates on
+        // `status()` being a 4xx would publish a message the response hides.
+        // `message()` documents this rather than recommending that gate.
+        let err = AutumnError::bad_request_msg(
+            "db: canceling statement due to statement timeout (dsn password=hunter2)",
+        );
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+
+        let (status, problem_type) = err.rendered_problem();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let rendered =
+            problem_details(status, err.message(), None, problem_type, None, None, false);
+        assert_eq!(rendered.detail, "Service unavailable");
+        assert!(err.message().contains("password=hunter2"));
     }
 }
