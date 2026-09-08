@@ -1,7 +1,9 @@
 //! Database connection pool and extractor.
 //!
-//! This module provides async Postgres connectivity via `diesel-async` with
-//! the `deadpool` connection pool. The pool is created at startup by
+//! This module provides async connectivity via `diesel-async` with the
+//! `deadpool` connection pool. The backend is whichever [`RuntimeConnection`]
+//! resolves to — Postgres by default, `SQLite` under the crate's `sqlite`
+//! feature. The pool is created at startup by
 //! [`AppBuilder::run`](crate::app::AppBuilder::run) and stored in
 //! [`crate::state::AppState`].
 //!
@@ -1147,10 +1149,11 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
 ///
 /// Returned by [`create_pool`] (and the other topology builders) when a pool
 /// cannot be constructed. Historically this was a bare alias for deadpool's
-/// `BuildError`; it now also carries the boot-time refusal emitted for a
-/// recognized-but-not-yet-wired backend (`SQLite`, issue #1614), so callers fail
-/// fast at pool construction with an actionable message instead of at the first
-/// query. The [`Build`](PoolError::Build) variant delegates its `Display` to the
+/// `BuildError`; it now also carries the boot-time refusal emitted when the
+/// configured backend is not the one this build serves — a `SQLite` target in a
+/// default build, or a Postgres target under `--features sqlite` (issue #1614)
+/// — so callers fail fast at pool construction with an actionable message
+/// instead of at the first query. The [`Build`](PoolError::Build) variant delegates its `Display` to the
 /// underlying `BuildError`, so the Postgres path's error text is unchanged.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1160,8 +1163,8 @@ pub enum PoolError {
     #[error(transparent)]
     Build(#[from] diesel_async::pooled_connection::deadpool::BuildError),
 
-    /// A database backend that Autumn recognizes but whose runtime pool is not
-    /// available in this build was configured. See
+    /// A recognized backend that this build does not serve was configured. The
+    /// message names the feature that serves it. See
     /// [`DatabaseBackend`](crate::config::DatabaseBackend).
     #[error("{0}")]
     UnsupportedBackend(String),
@@ -1371,7 +1374,7 @@ fn build_pool(
             "SQLite is a recognized database backend but its runtime pool is only available in \
              a build of autumn-web compiled with `--features sqlite`; this is a default \
              (Postgres) build (target: {target:?})",
-            target = redact_pool_target(url)
+            target = crate::db_url::redact_target(url)
         )));
     }
 
@@ -1410,8 +1413,15 @@ fn build_pool(
 /// token — but **not** a `sqlite:` URL scheme. Strip the recognized `SQLite` URL
 /// spellings down to that: `sqlite::memory:`, `sqlite://:memory:`, and an empty
 /// `sqlite://` all become an in-memory database; `sqlite:///path` /
-/// `sqlite://path` / `sqlite:path` reduce to their path; a `file:` URI or a
-/// bare path passes through unchanged.
+/// `sqlite://path` / `sqlite:path` reduce to their path; a `file:` URI passes
+/// through unchanged.
+///
+/// A bare path passes through this function unchanged too, but no configured
+/// target reaches it that way: [`build_sqlite_pool`] refuses anything
+/// [`DatabaseBackend::detect`](crate::config::DatabaseBackend::detect) does not
+/// classify as `SQLite`, and a bare path is deliberately unclassified. The two
+/// scheme-less in-memory spellings (`:memory:` and the empty string) are the
+/// exception the pool admits explicitly.
 #[cfg(feature = "sqlite")]
 fn normalize_sqlite_target(url: &str) -> String {
     if url.starts_with("file:") {
@@ -1440,20 +1450,6 @@ fn normalize_sqlite_target(url: &str) -> String {
 /// A **shared-cache** in-memory database (`cache=shared`) is the deliberate
 /// exception: it IS shareable across the pool's connections within one process,
 /// so it must NOT be forced single-slot and returns `false` here.
-/// Whether `url` is one of the two scheme-less spellings
-/// [`normalize_sqlite_target`] maps to `:memory:` — the bare `:memory:` token
-/// and the empty string.
-///
-/// [`crate::config::DatabaseBackend::detect`] classifies by scheme, so it
-/// returns `None` for both even though the pool has always accepted them (and
-/// `run_pending_sqlite` still lists `:memory:` among the spellings it takes).
-/// Kept adjacent to `normalize_sqlite_target`'s matching branch so the two
-/// cannot drift. Not feature-gated: `redact_pool_target` consults it on both
-/// builds so a target is classified the same way in either.
-fn sqlite_target_is_bare_in_memory(url: &str) -> bool {
-    url.is_empty() || url == ":memory:"
-}
-
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_memory(target: &str) -> bool {
     if target.contains("cache=shared") {
@@ -1540,98 +1536,6 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// database (so migrations applied on one would be invisible on another).
 /// In-memory targets are therefore forced to a single slot; file targets
 /// respect the configured size (still small by convention).
-/// Mask credentials in a database target before it goes into an error message.
-///
-/// Pool-construction failures are surfaced verbatim at boot — `setup_database`
-/// wraps them as `"Failed to create database pool: {e}"` and the run path logs
-/// that through `tracing::error!`, so under `log.format = "json"` the text lands
-/// in whatever ships the structured log stream. The messages below name the
-/// offending target to stay actionable, and that target is whatever string the
-/// configuration supplied. `format_config_summary` already masks the same URL
-/// one line earlier (`mask_database_url`), so leaving it raw here undoes that a
-/// line later.
-///
-/// **A `SQLite` target passes through whole.** Its query string is not a place
-/// credentials live — it is a local file URI — and the query string is exactly
-/// the diagnostic detail that matters (`mode=ro`, `mode=memory`,
-/// `cache=shared`); `reject_unusable_sqlite_replica` names two of them and is
-/// useless without it.
-///
-/// **Anything else keeps only what identifies WHICH target was misconfigured.**
-/// Userinfo is not the only place a secret rides: `?password=`,
-/// `?sslpassword=`, `?api_key=` are all real spellings, and `Url::password()`
-/// sees none of them. For a target that named no backend we cannot even
-/// enumerate the keys that matter, so rather than guess at key names the whole
-/// query string is replaced — scheme, host and path are enough to tell an
-/// operator which URL to go fix. A string that does not parse as a URL is
-/// passed through unless it carries `@` or `?`, so a bare filesystem path
-/// (`/var/lib/app.db`) — where naming the target is the entire value of the
-/// message and there is no credential to protect — stays legible.
-fn redact_pool_target(url: &str) -> String {
-    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Sqlite)
-        || sqlite_target_is_bare_in_memory(url)
-    {
-        return url.to_owned();
-    }
-    if let Ok(mut parsed) = url::Url::parse(url) {
-        let has_password = parsed.password().is_some();
-        if has_password {
-            let _ = parsed.set_password(Some("****"));
-        }
-        let has_query = parsed.query().is_some();
-        if has_query {
-            parsed.set_query(Some("****"));
-        }
-        // Re-rendering a parsed URL normalizes it, so only hand back the
-        // rewritten form when something actually had to be hidden.
-        if has_password || has_query {
-            return parsed.to_string();
-        }
-        return url.to_owned();
-    }
-    // A libpq keyword/value connection string (`host=db user=app
-    // password=hunter2`) is an explicitly supported Postgres target that
-    // `Url::parse` rejects and that carries no `@` or `?` — so the bare-path
-    // fallback below would hand the password straight back (Codex P2 on
-    // #2537). Rebuild it from an ALLOWLIST of the keys that merely identify
-    // which target this is. An allowlist, not a `password`/`sslpassword`
-    // denylist: the same reason the query string above goes wholesale — a key
-    // this code has never heard of must not default to being printed.
-    if let Some(pairs) = crate::pg_conn_str::keyword_value_pairs(url) {
-        const IDENTIFYING: [&str; 5] = ["host", "hostaddr", "port", "dbname", "user"];
-        let kept: Vec<String> = pairs
-            .iter()
-            .filter(|(key, _)| IDENTIFYING.contains(&key.as_str()))
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
-        return if kept.is_empty() {
-            "****".to_owned()
-        } else {
-            format!("{} ****", kept.join(" "))
-        };
-    }
-    // FAIL CLOSED. Everything above identified the target positively — a SQLite
-    // target, a URL `Url::parse` accepted, a keyword/value string
-    // `keyword_value_pairs` accepted. What reaches here could not be
-    // classified at all, and that includes a MALFORMED keyword/value string
-    // such as `host=db user=app password='hunter2`, which the parser rejects
-    // for the unterminated quote and which carries neither `@` nor `?`.
-    //
-    // A default of "hand it back verbatim" has now been wrong three times over
-    // (userinfo, then the query string, then keyword/value — each a shape this
-    // code did not anticipate), so the default is to mask. The exception is
-    // narrow and positive rather than a list of things to look out for: a
-    // single path-shaped token with no `=` (so it cannot carry a key/value
-    // pair), no `@` (no userinfo), no `?` (no query) and no whitespace (so it
-    // is one token, not a keyword/value string). A bare filesystem path is
-    // exactly that, and is the case where naming the target is the entire
-    // value of the message.
-    if !url.is_empty() && !url.contains(['=', '@', '?']) && !url.contains(char::is_whitespace) {
-        return url.to_owned();
-    }
-    "****".to_owned()
-}
-
 #[cfg(feature = "sqlite")]
 fn build_sqlite_pool(
     url: &str,
@@ -1674,14 +1578,14 @@ fn build_sqlite_pool(
     // cannot become a stray file, which is the failure this guard exists to
     // prevent. Refusing them would be a regression, not a tightening.
     match crate::config::DatabaseBackend::detect(url) {
-        _ if sqlite_target_is_bare_in_memory(url) => {}
+        _ if crate::db_url::is_bare_in_memory_sqlite(url) => {}
         Some(crate::config::DatabaseBackend::Sqlite) => {}
         Some(crate::config::DatabaseBackend::Postgres) => {
             return Err(PoolError::UnsupportedBackend(format!(
                 "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but \
                  the configured database URL is a Postgres target; configure a `sqlite:` URL \
                  instead (target: {target:?})",
-                target = redact_pool_target(url)
+                target = crate::db_url::redact_target(url)
             )));
         }
         None => {
@@ -1690,7 +1594,7 @@ fn build_sqlite_pool(
                  the configured database URL names no recognized database backend; configure a \
                  SQLite target spelled `sqlite:<path>`, `sqlite://<path>`, or `file:<path>` — a \
                  bare filesystem path is not accepted (target: {target:?})",
-                target = redact_pool_target(url)
+                target = crate::db_url::redact_target(url)
             )));
         }
     }
@@ -1875,8 +1779,8 @@ fn reject_unusable_sqlite_replica(primary_url: &str, replica_url: &str) -> Resul
             "SQLite does not support a separate read replica: replica_url {replica:?} \
              is in-memory or differs from primary_url {primary:?}. Configure only a \
              primary, or point the replica at the same database file as the primary.",
-            replica = redact_pool_target(replica_url),
-            primary = redact_pool_target(primary_url)
+            replica = crate::db_url::redact_target(replica_url),
+            primary = crate::db_url::redact_target(primary_url)
         )));
     }
     Ok(())
@@ -2581,14 +2485,15 @@ impl Drop for TxDepthGuard<'_> {
 
 /// Async database connection extractor.
 ///
-/// Declare `db: Db` in a handler signature to get a pooled connection to
-/// Postgres. The connection is returned to the pool when `Db` is dropped
+/// Declare `db: Db` in a handler signature to get a pooled database
+/// connection. The connection is returned to the pool when `Db` is dropped
 /// at the end of the request.
 ///
 /// `Db` implements [`Deref`](std::ops::Deref) and
-/// [`DerefMut`](std::ops::DerefMut) to
-/// `diesel_async::AsyncPgConnection`, so you can use it directly with
-/// Diesel query methods.
+/// [`DerefMut`](std::ops::DerefMut) to [`RuntimeConnection`], so you can use it
+/// directly with Diesel query methods. That alias is
+/// `diesel_async::AsyncPgConnection` by default and a `SQLite` connection under
+/// the crate's `sqlite` feature — one extractor, two backends.
 ///
 /// If no database is configured (i.e., `database.primary_url` and legacy
 /// `database.url` are absent),
@@ -2602,7 +2507,7 @@ impl Drop for TxDepthGuard<'_> {
 ///
 /// #[get("/ping-db")]
 /// async fn ping_db(db: Db) -> AutumnResult<&'static str> {
-///     // `db` dereferences to AsyncPgConnection
+///     // `db` dereferences to the active RuntimeConnection
 ///     Ok("database is reachable")
 /// }
 /// ```
@@ -4380,27 +4285,11 @@ mod tests {
     // The pool/topology mechanics below — max_size, the connect-timeout →
     // wait/create mapping, replica retention, the read-pool fallback — are
     // backend-independent, so they must hold on whichever backend
-    // `RuntimeConnection` resolves to. They used to hard-code
-    // `postgres://…`, which `build_sqlite_pool` refuses outright, so under
-    // `--features sqlite` every one of them panicked. Nothing noticed,
-    // because no CI lane ran the lib tests under that feature (fixed in the
-    // `sqlite-runtime` job alongside this change). Routing them through these
-    // helpers runs the same assertions on both backends instead of silencing
-    // them on one.
-    //
-    // The SQLite spelling is a SHARED-CACHE in-memory target on purpose: it is
-    // in-memory (no files, no cleanup) but `sqlite_target_is_memory` exempts
-    // `cache=shared` from the single-slot rule, so the configured `max_size`
-    // still reaches the pool and the sizing assertions stay meaningful.
-    // deadpool is lazy, so no connection is ever opened by these tests.
-    #[cfg(not(feature = "sqlite"))]
-    fn test_primary_url(name: &str) -> String {
-        format!("postgres://localhost/{name}")
-    }
-    #[cfg(feature = "sqlite")]
-    fn test_primary_url(name: &str) -> String {
-        format!("sqlite:file:{name}?mode=memory&cache=shared")
-    }
+    // `RuntimeConnection` resolves to. `crate::test_urls::primary` spells the
+    // target per backend; before it, an inline `postgres://…` made every one
+    // of them panic in `build_sqlite_pool` under `--features sqlite`, unseen
+    // because no CI lane ran the lib tests there.
+    use crate::test_urls::primary as test_primary_url;
 
     /// A replica target to pair with `primary`.
     ///
@@ -4517,85 +4406,6 @@ mod tests {
             panic!("a Postgres url must refuse under the sqlite feature");
         };
         assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
-    }
-
-    // A refusal names the offending target to stay actionable, and that target
-    // is whatever the configuration supplied — on the `None` arm, by
-    // definition not something this backend understands, so quite possibly a
-    // credential-bearing URL for another system. The message is logged at boot
-    // through `tracing::error!`, one line after `format_config_summary` masked
-    // the very same URL, so it must not hand the password back.
-    #[test]
-    fn redact_pool_target_masks_credentials_but_keeps_plain_targets_legible() {
-        assert_eq!(
-            redact_pool_target("mysql://user:secret@host/db"),
-            "mysql://user:****@host/db"
-        );
-        assert_eq!(
-            redact_pool_target("postgres://user:secret@localhost:5432/app"),
-            "postgres://user:****@localhost:5432/app"
-        );
-        // A secret does not have to sit in userinfo: `Url::password()` sees
-        // nothing in `?password=`, `?sslpassword=`, `?api_key=`. For a target
-        // that named no backend the interesting key names cannot be
-        // enumerated, so the whole query goes — scheme/host/path still say
-        // which URL to go fix (Codex P2 on #2537).
-        assert_eq!(
-            redact_pool_target("mysql://host/db?password=hunter2"),
-            "mysql://host/db?****"
-        );
-        assert_eq!(
-            redact_pool_target("postgres://host/app?sslpassword=hunter2&sslmode=require"),
-            "postgres://host/app?****"
-        );
-        assert_eq!(
-            redact_pool_target("mysql://user:secret@host/db?api_key=hunter2"),
-            "mysql://user:****@host/db?****"
-        );
-        // No credential to protect: naming the target IS the message's value.
-        assert_eq!(redact_pool_target("/var/lib/app.db"), "/var/lib/app.db");
-        // A SQLite target passes through whole: a local file URI carries no
-        // credentials, and its query string IS the diagnostic detail —
-        // `reject_unusable_sqlite_replica` is useless without it.
-        assert_eq!(
-            redact_pool_target("sqlite:///var/lib/app.db"),
-            "sqlite:///var/lib/app.db"
-        );
-        assert_eq!(redact_pool_target("sqlite::memory:"), "sqlite::memory:");
-        assert_eq!(
-            redact_pool_target("sqlite://file:app.db?mode=ro"),
-            "sqlite://file:app.db?mode=ro"
-        );
-        assert_eq!(
-            redact_pool_target("file::memory:?cache=shared"),
-            "file::memory:?cache=shared"
-        );
-        assert_eq!(redact_pool_target(":memory:"), ":memory:");
-        // The libpq keyword/value form: a supported Postgres target that
-        // `Url::parse` rejects and that carries neither `@` nor `?`, so the
-        // bare-path fallback would have returned it whole (Codex P2 on #2537).
-        // Only the identifying keys survive.
-        assert_eq!(
-            redact_pool_target("host=db user=app password=hunter2"),
-            "host=db user=app ****"
-        );
-        assert_eq!(
-            redact_pool_target("host=db port=5432 dbname=app sslmode=require password=hunter2"),
-            "host=db port=5432 dbname=app ****"
-        );
-        // Nothing identifying left to show.
-        assert_eq!(redact_pool_target("password=hunter2"), "****");
-        // Unclassifiable: mask rather than guess. A MALFORMED keyword/value
-        // string is the case that keeps finding this fallback — the parser
-        // rejects it for the unterminated quote, and it carries neither `@`
-        // nor `?`, so a fail-open default handed the password back.
-        assert_eq!(
-            redact_pool_target("host=db user=app password='hunter2"),
-            "****"
-        );
-        assert_eq!(redact_pool_target("://user:secret@host/db"), "****");
-        assert_eq!(redact_pool_target("not-a-url?password=hunter2"), "****");
-        assert_eq!(redact_pool_target("garbage password=hunter2 more"), "****");
     }
 
     // The end-to-end contract the helper exists for: no refusal this module
@@ -5091,6 +4901,41 @@ mod tests {
             5,
             "a shared-cache in-memory target must respect the configured size"
         );
+    }
+
+    // The runtime landed (#1905); the tree described it as pending for another
+    // release. Each phrase below is one a reader takes as the current contract,
+    // and each was false under `--features sqlite`. This is a ratchet, not a
+    // style rule: a "planned"/"not yet wired" claim about a SUBSYSTEM (sessions
+    // #1908, jobs #1907, backup #1909) is still accurate and is not matched.
+    #[test]
+    fn no_source_doc_still_calls_the_sqlite_runtime_unwired() {
+        let sources = [
+            ("autumn/src/db.rs", include_str!("db.rs")),
+            ("autumn/src/config.rs", include_str!("config.rs")),
+            ("autumn/Cargo.toml", include_str!("../Cargo.toml")),
+            (
+                "docs/guide/sqlite-in-production.md",
+                include_str!("../../docs/guide/sqlite-in-production.md"),
+            ),
+        ];
+        // Split, because this file is one of the files scanned: a phrase
+        // written whole here would be a finding against itself.
+        let stale = [
+            ["until the pool", "rework lands"].join(" "),
+            ["the runtime pool", "is not yet wired"].join(" "),
+            ["recognized-but", "not-yet-wired"].join("-"),
+            ["PR1 is", "a no-op refactor"].join(" "),
+            ["Update (this", "release)"].join(" "),
+        ];
+        for (name, text) in sources {
+            for phrase in &stale {
+                assert!(
+                    !text.contains(phrase.as_str()),
+                    "{name} still says {phrase:?}: the SQLite runtime is wired"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "sqlite")]
