@@ -530,49 +530,28 @@ pub trait AdminModel: Send + Sync + 'static {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        // Default implementation: dispatch the built-in `"delete"`, `"restore"`,
-        // and `"purge"` actions. Any other action name returns an error so it
-        // doesn't silently no-op — overriders that declare custom actions must
-        // implement them here.
-        //
-        // We clone the pool (deadpool::Pool is Arc-backed, cheap) so the
-        // returned future only borrows from `&self` and avoids the
-        // lifetime mismatch between `&self` and `&pool` that would
-        // otherwise show up in the trait's elided `'_` return signature.
-        let action = action.to_owned();
-        let pool = pool.clone();
-        Box::pin(async move {
-            match action.as_str() {
-                "delete" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.delete(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
+        // Default implementation: dispatch the built-in `"delete"` action
+        // here; `"restore"`, `"purge"`, and anything else go through
+        // `dispatch_restore_purge_or_unhandled`, shared with models (e.g.
+        // `TokenAdminModel`, `FeatureFlagAdminModel`) that override this
+        // method to batch `"delete"` into one query but still need the same
+        // restore/purge/unhandled-action fallback.
+        if action == "delete" {
+            // Clone the pool (deadpool::Pool is Arc-backed, cheap) so the
+            // returned future only borrows from `&self` and avoids the
+            // lifetime mismatch between `&self` and `&pool` that would
+            // otherwise show up in the trait's elided `'_` return signature.
+            let pool = pool.clone();
+            return Box::pin(async move {
+                let mut count: u64 = 0;
+                for id in ids {
+                    self.delete(&pool, id).await?;
+                    count += 1;
                 }
-                "restore" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.restore(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                "purge" => {
-                    let mut count: u64 = 0;
-                    for id in ids {
-                        self.purge(&pool, id).await?;
-                        count += 1;
-                    }
-                    Ok(count)
-                }
-                other => Err(AdminError::Other(format!(
-                    "unhandled bulk action '{other}'; \
-                     override AdminModel::execute_action to support it"
-                ))),
-            }
-        })
+                Ok(count)
+            });
+        }
+        dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }
 
     /// Return a display string for a record (used in breadcrumbs, titles).
@@ -726,6 +705,45 @@ pub trait AdminModel: Send + Sync + 'static {
     }
 }
 
+/// Dispatch the built-in `"restore"`/`"purge"` bulk actions (and the
+/// fallback error for anything else). Shared by `AdminModel::execute_action`'s
+/// default and by models that override it to special-case `"delete"` with a
+/// batched query — see `TokenAdminModel` and `FeatureFlagAdminModel` — so
+/// that fallthrough behaves identically without copying the loop.
+pub fn dispatch_restore_purge_or_unhandled<'a>(
+    model: &'a (impl AdminModel + ?Sized),
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+    action: &str,
+    ids: Vec<i64>,
+) -> AdminFuture<'a, u64> {
+    let action = action.to_owned();
+    let pool = pool.clone();
+    Box::pin(async move {
+        match action.as_str() {
+            "restore" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.restore(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            "purge" => {
+                let mut count: u64 = 0;
+                for id in ids {
+                    model.purge(&pool, id).await?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            other => Err(AdminError::Other(format!(
+                "unhandled bulk action '{other}'; \
+                 override AdminModel::execute_action to support it"
+            ))),
+        }
+    })
+}
+
 // ── VersionPage → AdminHistoryPage conversion ──────────────────────
 
 impl From<autumn_web::version_history::VersionEntry> for AdminHistoryEntry {
@@ -807,6 +825,24 @@ pub struct ListParams {
     pub sort_dir: SortDirection,
     /// Active filters (`field_name` → value).
     pub filters: Vec<(String, String)>,
+}
+
+impl ListParams {
+    /// SQL `OFFSET`/`LIMIT` for this page, ready to bind directly.
+    ///
+    /// `per_page == 0` means "no limit": offset 0, limit `i64::MAX`. Every
+    /// built-in `AdminModel::list()` shares this convention.
+    #[must_use]
+    pub fn sql_offset_limit(&self) -> (i64, i64) {
+        if self.per_page == 0 {
+            return (0, i64::MAX);
+        }
+        let offset = self.page.saturating_sub(1) * self.per_page;
+        (
+            i64::try_from(offset).unwrap_or(0),
+            i64::try_from(self.per_page).unwrap_or(i64::MAX),
+        )
+    }
 }
 
 /// Sort direction for list queries.
@@ -1699,5 +1735,37 @@ mod tests {
         assert_eq!(row[4], "true");
         assert_eq!(row[5], "", "null becomes empty string");
         assert_eq!(row[6], "", "missing column becomes empty string");
+    }
+
+    fn list_params(page: u64, per_page: u64) -> ListParams {
+        ListParams {
+            page,
+            per_page,
+            search: None,
+            sort_by: None,
+            sort_dir: SortDirection::default(),
+            filters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sql_offset_limit_treats_per_page_zero_as_unlimited() {
+        assert_eq!(list_params(1, 0).sql_offset_limit(), (0, i64::MAX));
+        // Even on page 3 — "no limit" ignores paging entirely.
+        assert_eq!(list_params(3, 0).sql_offset_limit(), (0, i64::MAX));
+    }
+
+    #[test]
+    fn sql_offset_limit_paginates_from_page_one() {
+        assert_eq!(list_params(1, 25).sql_offset_limit(), (0, 25));
+        assert_eq!(list_params(2, 25).sql_offset_limit(), (25, 25));
+        assert_eq!(list_params(3, 10).sql_offset_limit(), (20, 10));
+    }
+
+    #[test]
+    fn sql_offset_limit_treats_page_zero_like_page_one() {
+        // `page.saturating_sub(1)` — page 0 behaves like page 1 rather than
+        // underflowing.
+        assert_eq!(list_params(0, 25).sql_offset_limit(), (0, 25));
     }
 }

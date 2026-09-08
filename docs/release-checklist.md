@@ -111,7 +111,7 @@ RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh
 
 A release must not ship a known-vulnerable dependency. `scripts/check-advisories.sh`
 runs in both PR CI and the Publish Gate (`advisories` job, a `prepare-release`
-dependency), auditing three graphs against the RustSec database with cargo-deny:
+dependency), auditing five graphs against the RustSec database with cargo-deny:
 
 - the workspace (`deny.toml`) and the SQLite backend graph (`deny-sqlite.toml`);
 - **the scaffold's day-one graph** — `autumn-web`'s tree with every feature any
@@ -119,14 +119,19 @@ dependency), auditing three graphs against the RustSec database with cargo-deny:
   writes into a generated app. That is a superset of the autumn-web half of a
   real app's tree (not its own direct dependencies, and resolved against this
   workspace's lockfile), and it is what keeps "a scaffolded app's CI is green on
-  day one" true release over release rather than a claim that decays.
+  day one" true release over release rather than a claim that decays;
+- **two satellite graphs**, each its own excluded workspace root with its own
+  `Cargo.lock` and its own narrower `deny.toml` (advisories + sources only):
+  `fuzz/` (compiled and run by every `fuzz.yml` CI job) and
+  `examples/island-flock/` (never built in CI, but its compiled wasm/js bundle
+  is committed and served by the `flock` example).
 
 An advisory with no fix is accepted by adding an `ignore` entry (id, `reason`,
 review-by date) — never by weakening or removing the gate. `--self-test` proves
 the gate can still go red by auditing an injected known-vulnerable dependency.
 
 ```bash
-./scripts/check-advisories.sh              # the gate, all three graphs
+./scripts/check-advisories.sh              # the gate, all five graphs
 ./scripts/check-advisories.sh --self-test  # the negative proof
 ```
 

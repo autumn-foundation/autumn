@@ -285,7 +285,8 @@ If you are building a custom app without `autumn_web::app()`, register it
 explicitly:
 
 ```rust,no_run
-use autumn_web::middleware::{MaintenanceLayer, MaintenanceState};
+use autumn_web::maintenance::MaintenanceState;
+use autumn_web::middleware::MaintenanceLayer;
 
 let state = MaintenanceState::default();
 
