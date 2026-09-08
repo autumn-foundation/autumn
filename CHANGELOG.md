@@ -113,6 +113,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves
+  every **option** a documented `autumn …` line passes, not only its command.
+  A flag the command does not declare is the same dead end as a phantom
+  subcommand — `autumn build --release` is `error: unexpected argument
+  '--release' found`, exit 2, because the flag is `--debug` and release is the
+  default — and until now the walk stopped at such an option in silence. The
+  baseline found five, all fixed here: `autumn build --release` in
+  `docs/guide/wasm-islands.md` and `examples/blog/README.md`; `autumn dev
+  --profile demo` in `docs/guide/console.md` (`dev` reads the profile from the
+  environment: `AUTUMN_ENV=demo autumn dev`); `autumn setup --tailwind` in
+  `docs/guide/deployment.md` (`autumn setup` *is* the Tailwind install and
+  takes only `--force`); and, inside a copyable fence commented "explicit
+  project path", `autumn lifecycle check --path .` in `docs/guide/lifecycle.md`,
+  where `path` is a positional. Gating flags needs clap forms the command walk
+  did not: `#[command(flatten)]`; `trailing_var_arg` (so the task arguments the
+  guide documents are seen as forwarded, not judged); `allow_hyphen_values` on
+  a positional (so `autumn config set retries -1` is read as the correct line
+  it is); clap's own `--help`/`-h` on every command, and `--version` on the
+  root ALONE, since nothing sets `propagate_version`; and a bracket-balanced
+  read of `#[arg(…)]`. That last one was also a latent bug in the shipped gate:
+  the attribute body was matched with a character class that cannot cross a
+  `]`, so every option whose attribute carries a list — `sbom --binary`,
+  `upgrade --accept`, `db scrub --check`, `db scrub --dry-run`, `generate admin
+  --select` — was missing from the option map, and the walk silently stopped at
+  each of them. Options passed to the root itself are resolved too, so
+  `autumn --helpp` no longer reads like the `autumn --help` the guide runs. A
+  token starting with `-` is judged unless it carries prose punctuation, so
+  arrows and slash-joined shorthand are not reported while a misspelling like
+  `--show_config` is. Corpus-wide noise: zero. `--list-options` prints the
+  parsed option surface. [no-plugin] — a CI gate
+  over this repo's own docs, with no surface an agent reaches for. The plugin
+  needed no correction either: it names none of the five dead flags, and its one
+  `build --release` is a genuine `cargo build --release` in the image builder.
 - **`scripts/check-sqlite-unification.sh`** — the `sqlite` feature is a backend
   flip, so one dependency edge enabling it (`autumn-web = { …, features =
   ["sqlite"] }`, or a feature forwarding `autumn-web/sqlite` under another

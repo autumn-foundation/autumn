@@ -232,6 +232,15 @@ jobs:
         # checked-in snapshot, so a rename moves the gate with it in the same
         # commit and there is nothing to regenerate.
         #
+        # Since #2498 it also resolves every OPTION those lines pass, which is
+        # the same dead end reached by the same reader: `autumn build --release`
+        # is `error: unexpected argument '--release' found`, exit 2 (the flag is
+        # `--debug`; release is the default). That half was left out originally
+        # on the grounds that a source-parsed flag set would be too noisy to
+        # gate; measured, with clap's `flatten`, `trailing_var_arg` and builtin
+        # flags understood, corpus-wide noise was zero and the baseline found
+        # five real defects across five pages.
+        #
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-cli.sh --self-test && ./scripts/check-docs-cli.sh
