@@ -1241,6 +1241,66 @@ async fn ac5_only_the_changed_derivation_is_enqueued() {
     assert_eq!(entry.stored_hash, entry.definition_hash);
 }
 
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ac5_a_renamed_derivation_keeps_its_finished_backfill() {
+    // The hash leaves the name out so that a rename does not enqueue a
+    // backfill; for that to hold, the state row has to follow the name. A row
+    // under the old name with this exact hash is the same derivation, so it is
+    // adopted rather than rebuilt.
+    let (_guard, _pg, pool) = setup().await;
+    let mut conn = pool.get().await.expect("conn");
+    mark_all_complete(&mut conn).await;
+
+    diesel::sql_query(
+        "UPDATE _autumn_derivations SET name = 'dv_posts.legacy_name', backfilled_rows = 7 \
+         WHERE name = $1",
+    )
+    .bind::<Text, _>(COUNT_DERIVATION)
+    .execute(&mut conn)
+    .await
+    .expect("rename the row as an older binary would have spelled it");
+
+    assert!(
+        ensure_derivations(&mut conn)
+            .await
+            .expect("boot after the rename")
+            .is_empty(),
+        "a rename must not enqueue a backfill"
+    );
+    let adopted = state_of(&mut conn, COUNT_DERIVATION).await;
+    assert_eq!(adopted.backfill_state, "complete");
+    assert_eq!(
+        adopted.backfilled_rows, 7,
+        "the old row's progress is carried over, not rebuilt"
+    );
+    let status = derivation_status(&mut conn).await.expect("status");
+    assert!(
+        !status.iter().any(|entry| entry.name == "dv_posts.legacy_name"),
+        "the old row IS the new row, so nothing is left unregistered: {status:?}"
+    );
+
+    // A stale hash under the old name is not a rename: the derivation is
+    // enqueued fresh and the old row is left for the unregistered report.
+    diesel::sql_query(
+        "UPDATE _autumn_derivations SET name = 'dv_posts.legacy_name', definition_hash = 'stale' \
+         WHERE name = $1",
+    )
+    .bind::<Text, _>(COUNT_DERIVATION)
+    .execute(&mut conn)
+    .await
+    .expect("leave a row with a foreign hash");
+    assert_eq!(
+        ensure_derivations(&mut conn).await.expect("boot"),
+        vec![COUNT_DERIVATION]
+    );
+    assert_eq!(state_of(&mut conn, COUNT_DERIVATION).await.backfill_state, "pending");
+    assert_eq!(
+        state_of(&mut conn, "dv_posts.legacy_name").await.backfill_state,
+        "complete"
+    );
+}
+
 // ── AC6: resumable backfill ────────────────────────────────────────────────
 
 /// AC6: a backfill stopped mid-sweep keeps its checkpoint, and resuming

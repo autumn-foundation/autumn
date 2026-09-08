@@ -206,7 +206,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unfiltered special case with byte-identical SQL. Each derivation is
   content-addressed by a `definition_hash` over its lowered shape, so a changed
   filter enqueues a resumable, checkpointed, idempotent backfill (`run_backfill`,
-  `BackfillOptions`) and a rename or reformat does not; the framework-owned
+  `BackfillOptions`) and a rename or reformat does not (a renamed derivation
+  adopts its old state row, finished backfill included); the framework-owned
   `_autumn_derivations` state table ships as a framework migration, applied
   automatically when a derivation is registered (on every shard primary too).
   Each batch locks its state row, so replicas take turns on one sweep.
@@ -216,7 +217,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state for a leftover row), and `recompute(conn, name)` repairs it. Beyond
   `column`, `transform` and `filter`, the attribute takes `fk`, `parent_table`,
   `tenant` and `name`; a duplicate parent column or derivation name stops the
-  boot before it opens a connection. `CounterCacheSpec`
+  boot before it opens a connection, and so does a derivation on a column a
+  plain `counter_cache` on another model already maintains. A string filter
+  compares bytewise on both sides (`COLLATE "C"` / `COLLATE BINARY`), so a
+  `NOCASE` column cannot make the SQL and Rust lowerings disagree. `CounterCacheSpec`
   gains four plumbing fields `#[model]` fills in (`contrib_of`, `contrib_sql`,
   `filter_sql`, `derivation`), so a hand-written spec literal needs four more
   lines; it is framework plumbing and not constructed by hand. The one other

@@ -1766,9 +1766,14 @@ fn lower_filter_comparison(
                     quote! { __r.#ident.as_deref().is_some_and(|__v| __v != #lit) }
                 }
             };
+            // `{bin}` resolves to the backend's bytewise collation (`COLLATE
+            // "C"`, `COLLATE BINARY`): Rust compares bytes, and a `NOCASE` or
+            // `citext`-style column would otherwise make SQL call `"PUB"` and
+            // `'pub'` equal where the Rust lowering of the same filter does
+            // not, so the record paths and the set-based paths would disagree.
             Ok(LoweredFilter {
                 rust,
-                sql: format!("{{c}}.\"{column}\" {sql_op} {sql_literal}"),
+                sql: format!("{{c}}.\"{column}\" {sql_op} {sql_literal} {{bin}}"),
             })
         }
         (kind, literal) => {
@@ -2165,6 +2170,11 @@ fn emit_counter_caches_impl(
         });
     }
     let mut spec_entries: Vec<TokenStream> = Vec::new();
+    // One link-time claim per plain counter cache, so the derivation registry
+    // can refuse a `#[derivation]` on another model that maintains the same
+    // parent column (#1769): the two would double count, and the backfill
+    // would then overwrite the counter cache's rows.
+    let mut claim_items: Vec<TokenStream> = Vec::new();
     for (index, assoc) in cached.iter().enumerate() {
         let decl = assoc
             .counter_cache
@@ -2240,6 +2250,25 @@ fn emit_counter_caches_impl(
                 derivation: ::core::option::Option::None,
             }
         });
+        let claim_ident = format_ident!("__AUTUMN_COUNTER_CACHE_CLAIM_{index}");
+        claim_items.push(quote! {
+            /// Registered parent column of one plain `counter_cache` on this
+            /// model (#1769): framework plumbing, not a public API.
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            pub static #claim_ident: ::autumn_web::derivation::CounterCacheClaim =
+                ::autumn_web::derivation::CounterCacheClaim {
+                    model: ::core::stringify!(#model_ident),
+                    child_table: #table_name,
+                    parent_table: #parent_table,
+                    column: #column,
+                    module_path: ::core::module_path!(),
+                };
+
+            ::autumn_web::reexports::inventory::submit! {
+                &#claim_ident
+            }
+        });
     }
 
     // ── Derivation legs (#1769) ───────────────────────────────────────────
@@ -2289,10 +2318,10 @@ fn emit_counter_caches_impl(
         // Unlike `counter_cache_tenant`, a derivation's tenant column is read
         // from the CHILD row (`child.tenant`), so the macro can check it.
         if let Some(tenant) = decl.tenant_column.as_deref() {
-            let known = all_fields
+            let Some(tenant_field) = all_fields
                 .iter()
-                .any(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant));
-            if !known {
+                .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant))
+            else {
                 return Err(syn::Error::new(
                     decl.span,
                     format!(
@@ -2300,6 +2329,25 @@ fn emit_counter_caches_impl(
                          field of model `{model_ident}`: the maintenance \
                          scopes its statements by `{table_name}.{tenant}`, so \
                          it must be a column of the child"
+                    ),
+                ));
+            };
+            // The name is spliced into SQL as the physical column of both
+            // tables, so a Rust field that is not the column's name would scope
+            // every statement by a column the child table does not have — and
+            // naming the database column instead fails the lookup above.
+            if field_has_diesel_column_name(tenant_field) {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` names a field \
+                         carrying `#[diesel(column_name = ...)]`: the \
+                         maintenance scopes its statements by \
+                         `{table_name}.{tenant}` and by the same column of the \
+                         parent, spelled after the Rust field, so a renamed \
+                         database column would be spliced under a name the \
+                         tables do not have. Name the Rust field after the \
+                         column instead"
                     ),
                 ));
             }
@@ -2482,6 +2530,7 @@ fn emit_counter_caches_impl(
     }
 
     Ok(quote! {
+        #(#claim_items)*
         #(#derivation_items)*
 
         impl #model_ident {
@@ -10190,7 +10239,7 @@ mod tests {
             lowered.rust.to_string(),
             quote! { __r.f == "pub" }.to_string()
         );
-        assert_eq!(lowered.sql, "{c}.\"f\" = 'pub'");
+        assert_eq!(lowered.sql, "{c}.\"f\" = 'pub' {bin}");
     }
 
     #[test]
@@ -10201,7 +10250,7 @@ mod tests {
             lowered.rust.to_string(),
             quote! { __r.f.as_deref() == ::core::option::Option::Some("pub") }.to_string()
         );
-        assert_eq!(lowered.sql, "{c}.\"f\" = 'pub'");
+        assert_eq!(lowered.sql, "{c}.\"f\" = 'pub' {bin}");
     }
 
     #[test]
@@ -10212,14 +10261,14 @@ mod tests {
             lowered.rust.to_string(),
             quote! { __r.f.as_deref().is_some_and(|__v| __v != "pub") }.to_string()
         );
-        assert_eq!(lowered.sql, "{c}.\"f\" <> 'pub'");
+        assert_eq!(lowered.sql, "{c}.\"f\" <> 'pub' {bin}");
     }
 
     #[test]
     fn filter_string_literal_quote_is_escaped_for_sql() {
         let lowered =
             lower_one(&quote!(String), &syn::parse_quote!(f == "o'brien")).expect("lower");
-        assert_eq!(lowered.sql, "{c}.\"f\" = 'o''brien'");
+        assert_eq!(lowered.sql, "{c}.\"f\" = 'o''brien' {bin}");
     }
 
     #[test]
@@ -10497,7 +10546,7 @@ mod tests {
         let model: syn::Ident = syn::parse_quote!(C);
         let filter: syn::Expr = syn::parse_quote!(r#type == "post");
         let lowered = lower_filter(&filter, &model, &map).expect("lower");
-        assert_eq!(lowered.sql, "{c}.\"type\" = 'post'");
+        assert_eq!(lowered.sql, "{c}.\"type\" = 'post' {bin}");
     }
 
     #[test]

@@ -46,7 +46,7 @@
 //! * **Observability.** [`derivation_status`] reports each derivation's state
 //!   and its drift from the source of truth. `/actuator/derivations` serves it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use diesel::sql_types::{BigInt, Nullable, Text};
@@ -259,6 +259,48 @@ pub struct DerivationDescriptor {
 
 inventory::collect!(DerivationDescriptor);
 
+/// Link-time registration of one plain `counter_cache` (#1325), emitted by
+/// `#[model]` for every `#[belongs_to(..., counter_cache)]`.
+///
+/// A plain counter cache has no state row and no backfill, so it is not a
+/// [`DerivationDef`]; it is registered only so [`check_registered_derivations`]
+/// can see the parent column it maintains. A `#[derivation]` on another model
+/// claiming that same column would count it twice on every mutation and then
+/// have its backfill overwrite the counter cache's rows with a total over the
+/// derivation's source alone, so the pair is rejected at boot like two
+/// derivations on one column.
+#[doc(hidden)]
+pub struct CounterCacheClaim {
+    /// The child model declaring the counter cache.
+    pub model: &'static str,
+    /// The child's table.
+    pub child_table: &'static str,
+    /// The parent table and the column maintained on it.
+    pub parent_table: &'static str,
+    /// The maintained column.
+    pub column: &'static str,
+    /// Where the declaration lives, for the boot error.
+    pub module_path: &'static str,
+}
+
+inventory::collect!(CounterCacheClaim);
+
+/// Every plain `counter_cache` linked into this binary, in a stable order.
+fn registered_counter_cache_claims() -> Vec<&'static CounterCacheClaim> {
+    let mut claims: Vec<&'static CounterCacheClaim> = inventory::iter::<CounterCacheClaim>
+        .into_iter()
+        .collect();
+    claims.sort_unstable_by_key(|claim| {
+        (
+            claim.parent_table,
+            claim.column,
+            claim.module_path,
+            claim.model,
+        )
+    });
+    claims
+}
+
 /// Every `#[derivation]` linked into this binary, sorted by name.
 ///
 /// Sorted so the reconciliation order, the backfill order and the actuator
@@ -297,7 +339,7 @@ fn find(name: &str) -> Option<&'static DerivationDef> {
 /// every entry point checks them rather than only the boot path.
 fn check_registry(defs: &[&DerivationDef]) -> AutumnResult<()> {
     check_unique_names(defs)?;
-    check_unique_columns(defs)
+    check_unique_columns(defs, &registered_counter_cache_claims())
 }
 
 /// Reject two derivations claiming one name.
@@ -327,9 +369,31 @@ fn check_unique_names(defs: &[&DerivationDef]) -> AutumnResult<()> {
 /// Every mutation path applies each derivation's own delta, so one column with
 /// two derivations counts twice. No repair can fix that: the two definitions
 /// disagree on what the column means, so each sweep would undo the other.
-fn check_unique_columns(defs: &[&DerivationDef]) -> AutumnResult<()> {
+fn check_unique_columns(defs: &[&DerivationDef], claims: &[&CounterCacheClaim]) -> AutumnResult<()> {
     let mut seen: HashMap<(&str, &str), &DerivationDef> = HashMap::new();
     for def in defs {
+        // A plain counter cache on the same column is the same double count,
+        // and worse: the derivation's backfill would then overwrite every
+        // parent with a total over its own source alone.
+        if let Some(claim) = claims
+            .iter()
+            .find(|claim| (claim.parent_table, claim.column) == (def.parent_table, def.column))
+        {
+            return Err(AutumnError::from(std::io::Error::other(format!(
+                "derivation `{}` on {}::{} maintains `{}.{}`, which the `counter_cache` on \
+                 {}::{} ({}) already maintains. The column would count twice, and the \
+                 derivation's backfill would overwrite the counter cache's rows, so remove \
+                 one or point it at another column",
+                def.name,
+                def.module_path,
+                def.model,
+                def.parent_table,
+                def.column,
+                claim.module_path,
+                claim.model,
+                claim.child_table,
+            ))));
+        }
         if let Some(first) = seen.insert((def.parent_table, def.column), def) {
             return Err(AutumnError::from(std::io::Error::other(format!(
                 "two derivations both maintain `{}.{}`: `{}` on {}::{} and `{}` on \
@@ -531,6 +595,12 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 /// derivation whose hash matches is left exactly as it is, which is what keeps a
 /// boot from re-backfilling everything it already backfilled.
 ///
+/// A derivation with no row under its name but exactly one row that no
+/// registered derivation claims and whose hash is this derivation's is a
+/// rename: `definition_hash` leaves the name out on purpose, so the old row's
+/// state (a finished backfill included) is carried over under the new name
+/// rather than rebuilt from the start.
+///
 /// Returns the names enqueued, in name order.
 ///
 /// # Errors
@@ -545,19 +615,60 @@ pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Ve
     check_registry(&defs)?;
 
     let state = load_state(conn).await?;
+    let registered: HashSet<&str> = defs.iter().map(|def| def.name).collect();
     let mut enqueued = Vec::new();
     for def in defs {
         let hash = def.definition_hash();
-        if state
-            .get(def.name)
-            .is_some_and(|row| row.definition_hash == hash)
-        {
-            continue;
+        match state.get(def.name) {
+            Some(row) if row.definition_hash == hash => continue,
+            Some(_) => {}
+            None => {
+                // Two unregistered rows with one hash cannot both be this
+                // derivation, so only an unambiguous match is adopted.
+                let mut orphans = state
+                    .values()
+                    .filter(|row| !registered.contains(row.name.as_str()))
+                    .filter(|row| row.definition_hash == hash);
+                if let (Some(orphan), None) = (orphans.next(), orphans.next())
+                    && rename_state(conn, &orphan.name, def.name, &hash).await?
+                {
+                    continue;
+                }
+            }
         }
         enqueue(conn, def).await?;
         enqueued.push(def.name);
     }
     Ok(enqueued)
+}
+
+/// Carry the state row `from` over to the derivation now named `to`.
+///
+/// Guarded by the hash, and reported as `false` when no row moved: another
+/// replica may have adopted (or re-enqueued) the row between the read and this
+/// write, and then the caller enqueues rather than trusting a rename that did
+/// not happen.
+async fn rename_state(
+    conn: &mut RuntimeConnection,
+    from: &str,
+    to: &str,
+    hash: &str,
+) -> AutumnResult<bool> {
+    let sql = format!(
+        "UPDATE {STATE_TABLE} SET name = {}, updated_at = {NOW} \
+         WHERE name = {} AND definition_hash = {}",
+        ph(1),
+        ph(2),
+        ph(3)
+    );
+    let moved = diesel::sql_query(sql)
+        .bind::<Text, _>(to)
+        .bind::<Text, _>(from)
+        .bind::<Text, _>(hash)
+        .execute(conn)
+        .await
+        .map_err(AutumnError::from)?;
+    Ok(moved == 1)
 }
 
 // ── Backfill ────────────────────────────────────────────────────────────────
@@ -1152,7 +1263,7 @@ mod tests {
         second.model = "DvOtherComment";
         second.module_path = "other::module";
         second.filter_sql = "";
-        let err = check_unique_columns(&[&first, &second])
+        let err = check_unique_columns(&[&first, &second], &[])
             .expect_err("one column cannot carry two derivations");
         let message = err.to_string();
         assert!(
@@ -1166,10 +1277,41 @@ mod tests {
         let mut sibling = count_def();
         sibling.name = "dv_posts.visible_score";
         sibling.column = "visible_score";
-        check_unique_columns(&[&first, &sibling]).expect("two columns, two derivations");
+        check_unique_columns(&[&first, &sibling], &[]).expect("two columns, two derivations");
 
         // `check_registry` runs both checks, so it catches this one too.
         check_registry(&[&first, &second]).expect_err("the registry check covers columns");
+    }
+
+    #[test]
+    fn a_derivation_on_a_plain_counter_cache_column_is_rejected() {
+        // A plain `counter_cache` has no `DerivationDef`, so without its claim
+        // the column check would see one derivation and pass. Both would then
+        // apply their own delta, and the derivation's backfill would overwrite
+        // the counter cache's rows with a total over the derivation's source
+        // alone: corruption on every boot, not a stale figure.
+        let def = count_def();
+        let claim = CounterCacheClaim {
+            model: "DvLike",
+            child_table: "dv_likes",
+            parent_table: def.parent_table,
+            column: def.column,
+            module_path: "likes::module",
+        };
+        let err = check_unique_columns(&[&def], &[&claim])
+            .expect_err("a counter cache and a derivation cannot share a column");
+        let message = err.to_string();
+        assert!(message.contains("dv_posts.published_comment_count"), "{message}");
+        assert!(message.contains("likes::module"), "{message}");
+        assert!(message.contains("dv_likes"), "{message}");
+        assert!(message.contains("counter_cache"), "{message}");
+
+        // A counter cache on another column of the same parent is fine.
+        let other = CounterCacheClaim {
+            column: "like_count",
+            ..claim
+        };
+        check_unique_columns(&[&def], &[&other]).expect("different columns coexist");
     }
 
     #[test]

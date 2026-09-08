@@ -44,7 +44,7 @@ argument is the parent model type. Every other key follows in any order.
 | `filter` | none | the predicate deciding which child rows contribute |
 | `fk` | the one `#[belongs_to]` leg to that parent, else `{snake(Parent)}_id` | the child column naming the parent. Required when two legs point at one parent |
 | `parent_table` | inferred from the parent type (`Post` gives `posts`) | the parent's table, for a parent that overrides its own |
-| `tenant` | none | tenant-discriminator column, as `counter_cache_tenant`. Must name a field of the child |
+| `tenant` | none | tenant-discriminator column, as `counter_cache_tenant`. Must name a field of the child, not renamed with `#[diesel(column_name)]` |
 | `name` | `{parent_table}.{column}` | the registry name, used by the state table and the actuator |
 
 Each key may appear once. A repeated key is a compile error rather than a
@@ -96,10 +96,13 @@ literal `{`, `}`, `\`, NUL or other control character in a string is
 rejected: a brace could forge the `{c}` placeholder, and the others have
 backend-specific escape rules. Ordering comparisons on a string field are
 rejected too: Rust compares bytes and SQL compares by collation, so
-`status > "b"` would mean two different things in the two lowerings. Compare a
-string with `==` or `!=`, and keep the column on a deterministic, case-sensitive
-collation: on a `citext` or `NOCASE` column SQL matches `"PUB"` and Rust does
-not.
+`status > "b"` would mean two different things in the two lowerings. `==` and
+`!=` are lowered with the backend's bytewise collation (`COLLATE "C"` on
+Postgres, `COLLATE BINARY` on SQLite), so a column declared `NOCASE` or with a
+case-folding collation still compares the way Rust does: `"PUB"` is not
+`"pub"` on either side. A Postgres `citext` column is the one exception, since
+the type has no collation to override; a filter on one is rejected by Postgres
+at run time rather than silently disagreeing with the record path.
 
 Everything else is a compile error whose message lists the grammar: `||`,
 arithmetic, any method call other than the two NULL probes, float literals, a
@@ -168,12 +171,18 @@ At startup, after migrations, the framework checks the registry and then calls
 `_autumn_derivations`. A derivation whose hash matches is left alone, which
 keeps a boot from re-backfilling what it already backfilled. A derivation with
 no row, or with a different hash, is enqueued as `pending` with its checkpoint
-cleared. The framework then sweeps it in a background task, a few batches per
-pooled connection. A sharded app reconciles and sweeps on every shard primary as
+cleared. A derivation with no row under its name, when exactly one row that no
+registered derivation claims carries its hash, has been renamed: that row is
+carried over under the new name, state and checkpoint included, so a rename
+really does cost nothing. The framework then sweeps what was enqueued in a
+background task, a few batches per pooled connection. A sharded app reconciles and sweeps on every shard primary as
 well as on the control primary.
 
 A registry collision stops the boot, because double counting is data
-corruption. A database failure does not: it is logged, the sweep for that target
+corruption: two derivations sharing a name, two maintaining one parent column,
+or a derivation maintaining a column that a plain `counter_cache` on another
+model already maintains (every `counter_cache` registers the column it claims
+for exactly this check). A database failure does not: it is logged, the sweep for that target
 is skipped, and a derivation whose backfill has not run yet is stale rather than
 broken, which the actuator reports exactly.
 
@@ -293,9 +302,10 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
 - **A single primary key, and one database.** The child needs a scalar `#[id]`,
   and the parent `UPDATE` runs on the child's connection, so a sharded setup
   must keep parent and child on the same shard.
-- **Column names come from field names.** A filter field or summed field
-  renamed with `#[diesel(column_name = "...")]` is rejected. A foreign-key
-  field renamed that way is not detected, so keep `fk` fields unrenamed.
+- **Column names come from field names.** A filter field, summed field or
+  `tenant` field renamed with `#[diesel(column_name = "...")]` is rejected. A
+  foreign-key field renamed that way is not detected, so keep `fk` fields
+  unrenamed.
 - **Self-referential derivations are untested.** A child that derives onto its
   own table (a comment's `reply_count`) takes the same lock order as any other
   parent, but no test in this release covers it.

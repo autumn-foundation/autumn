@@ -389,13 +389,30 @@ fn quoted(view: &SqlView) -> Quoted {
     }
 }
 
-/// Resolve the `{c}` child-alias placeholder in a lowered SQL fragment.
+/// What the `{bin}` placeholder in a lowered string comparison resolves to.
+///
+/// A derivation filter compares a string field with `==` or `!=`, and the Rust
+/// lowering compares bytes. SQL compares by the column's collation, which on a
+/// `NOCASE` or otherwise case-folding column would call `"PUB"` and `'pub'`
+/// equal where Rust does not, so the record paths and the set-based paths of
+/// one derivation would disagree. Pinning the comparison to the backend's
+/// bytewise collation makes both sides mean the same thing whatever the column
+/// was declared with.
+#[cfg(not(feature = "sqlite"))]
+const BINARY_COLLATION: &str = "COLLATE \"C\"";
+#[cfg(feature = "sqlite")]
+const BINARY_COLLATION: &str = "COLLATE BINARY";
+
+/// Resolve the `{c}` child-alias and `{bin}` collation placeholders in a
+/// lowered SQL fragment.
 ///
 /// One lowered filter has to serve statements that alias the child table
 /// differently (`__autumn_cc_child`, `__autumn_cc_child_t`), so `#[model]`
 /// emits the alias as a placeholder and each statement substitutes its own.
+/// The collation is a placeholder for the same reason in the other direction:
+/// the fragment is lowered once, and which backend runs it is a feature flag.
 fn with_alias(sql: &str, alias: &str) -> String {
-    let out = sql.replace("{c}", alias);
+    let out = sql.replace("{c}", alias).replace("{bin}", BINARY_COLLATION);
     assert!(
         !out.contains('{'),
         "a lowered fragment carries an unresolved placeholder: {out}"
@@ -856,11 +873,17 @@ fn fold_and_order<M: 'static>(
             folded.push((spec_index, parent_id, delta, witness));
             continue;
         }
-        if let Some(&at) = seen.get(&(spec_index, parent_id)) {
-            folded[at].2 += delta;
-        } else {
-            seen.insert((spec_index, parent_id), folded.len());
-            folded.push((spec_index, parent_id, delta, witness));
+        // A running total that would leave `i64` is not wrapped: the delta
+        // that overflows it starts a second statement on the same parent, so
+        // the column receives every weight even when no single delta could.
+        match seen.get(&(spec_index, parent_id)) {
+            Some(&at) if folded[at].2.checked_add(delta).is_some() => {
+                folded[at].2 += delta;
+            }
+            _ => {
+                seen.insert((spec_index, parent_id), folded.len());
+                folded.push((spec_index, parent_id, delta, witness));
+            }
         }
     }
     // Zero deltas are dropped rather than issued as `+ 0`.
@@ -1264,21 +1287,43 @@ fn push_diff(
     if let (Some((old_id, old_contrib)), Some((new_id, new_contrib))) = (old, new)
         && old_id == new_id
     {
-        let delta = new_contrib - old_contrib;
-        if delta != 0 {
-            out.push((index, old_id, delta, witness));
+        // Two representable weights need not have a representable difference
+        // (`i64::MIN` edited to `i64::MAX`). Then the move goes out as the old
+        // weight off and the new weight on, which reach the same total.
+        if let Some(delta) = new_contrib.checked_sub(old_contrib) {
+            if delta != 0 {
+                out.push((index, old_id, delta, witness));
+            }
+            return;
         }
+        push_removal(index, old_id, old_contrib, witness, out);
+        out.push((index, new_id, new_contrib, witness));
         return;
     }
     if let Some((old_id, old_contrib)) = old
         && old_contrib != 0
     {
-        out.push((index, old_id, -old_contrib, witness));
+        push_removal(index, old_id, old_contrib, witness, out);
     }
     if let Some((new_id, new_contrib)) = new
         && new_contrib != 0
     {
         out.push((index, new_id, new_contrib, witness));
+    }
+}
+
+/// Take `contrib` off `parent`.
+///
+/// `-i64::MIN` is not an `i64`, so that one weight leaves as two halves that
+/// are. Every other weight negates in place.
+fn push_removal(index: usize, parent: i64, contrib: i64, witness: i64, out: &mut Vec<Contribution>) {
+    match contrib.checked_neg() {
+        Some(negated) => out.push((index, parent, negated, witness)),
+        None => {
+            let half = contrib / 2;
+            out.push((index, parent, -half, witness));
+            out.push((index, parent, -(contrib - half), witness));
+        }
     }
 }
 
@@ -1930,6 +1975,66 @@ mod tests {
             ],
         );
         assert_eq!(ordered, vec![(1, 7, 2, 12), (0, 4, -1, 14)]);
+    }
+
+    #[test]
+    fn a_running_total_that_would_overflow_starts_a_second_statement() {
+        // Two children each weighing `i64::MAX` onto one parent: the sum is
+        // not an `i64`, so folding them would wrap to `-2` and apply a delta
+        // with the wrong sign. Each weight goes out on its own instead.
+        let specs = two_legs();
+        let ordered = fold_and_order(&specs, vec![(1, 2, i64::MAX, 10), (1, 2, i64::MAX, 11)]);
+        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, i64::MAX, 11)]);
+        // …while everything that does fit still folds, and the sum of every
+        // delta issued is the sum of every delta requested.
+        let ordered = fold_and_order(
+            &specs,
+            vec![(1, 2, i64::MAX, 10), (1, 2, -5, 11), (1, 2, 5, 12), (1, 2, 1, 13)],
+        );
+        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, 1, 13)]);
+    }
+
+    #[test]
+    fn a_weight_edit_whose_difference_does_not_fit_goes_out_as_two_deltas() {
+        // `i64::MIN` edited to `i64::MAX` on the same parent: the mathematical
+        // difference is 2^64 - 1, which is no `i64`, so the old weight comes
+        // off and the new one goes on as separate statements. Folding keeps
+        // them apart for the same reason.
+        let mut out = Vec::new();
+        push_diff(0, Some((7, i64::MIN)), Some((7, i64::MAX)), 1, &mut out);
+        assert_eq!(
+            out,
+            vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX, 1)]
+        );
+        let specs = two_legs();
+        assert_eq!(fold_and_order(&specs, out.clone()), out);
+
+        // An ordinary edit is still one delta for the difference.
+        let mut out = Vec::new();
+        push_diff(0, Some((7, 3)), Some((7, 10)), 1, &mut out);
+        assert_eq!(out, vec![(0, 7, 7, 1)]);
+    }
+
+    #[test]
+    fn removing_the_one_unnegatable_weight_splits_it_in_two() {
+        // `-i64::MIN` does not exist. Deleting (or re-parenting) a child that
+        // weighs exactly that much takes it off the old parent as two halves
+        // whose sum is the whole, rather than wrapping to `i64::MIN` again and
+        // moving the parent the wrong way by 2^63.
+        let mut out = Vec::new();
+        push_diff(0, Some((7, i64::MIN)), None, 1, &mut out);
+        assert_eq!(out, vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1)]);
+        assert_eq!(
+            out.iter().map(|&(_, _, delta, _)| i128::from(delta)).sum::<i128>(),
+            -i128::from(i64::MIN)
+        );
+
+        let mut out = Vec::new();
+        push_diff(0, Some((7, i64::MIN)), Some((8, 4)), 1, &mut out);
+        assert_eq!(
+            out,
+            vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1), (0, 8, 4, 1)]
+        );
     }
 
     #[test]

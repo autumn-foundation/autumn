@@ -52,6 +52,15 @@ mod schema {
             title -> Text,
             published_comment_count -> Int8,
             visible_score -> Int8,
+            wanted_tag_count -> Int8,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
+        sd_tags (id) {
+            id -> Int8,
+            post_id -> Int8,
+            label -> Text,
         }
     }
 
@@ -65,7 +74,7 @@ mod schema {
     }
 }
 
-use schema::{sd_comments, sd_posts};
+use schema::{sd_comments, sd_posts, sd_tags};
 
 #[autumn_web::model(table = "sd_posts")]
 pub struct SdPost {
@@ -76,6 +85,8 @@ pub struct SdPost {
     pub published_comment_count: i64,
     #[default]
     pub visible_score: i64,
+    #[default]
+    pub wanted_tag_count: i64,
 }
 
 #[autumn_web::repository(SdPost, table = "sd_posts")]
@@ -99,8 +110,26 @@ pub struct SdComment {
 #[autumn_web::repository(SdComment, table = "sd_comments")]
 pub trait SdCommentRepository {}
 
+/// A string filter over a `COLLATE NOCASE` column: the one shape where SQL's
+/// idea of equality and Rust's would part ways unless the lowering pins the
+/// comparison to a bytewise collation.
+#[autumn_web::model(table = "sd_tags")]
+#[derivation(SdPost, column = "wanted_tag_count", fk = post_id, filter = label == "wanted")]
+pub struct SdTag {
+    #[id]
+    pub id: i64,
+    pub post_id: i64,
+    pub label: String,
+}
+
+#[autumn_web::repository(SdTag, table = "sd_tags")]
+pub trait SdTagRepository {}
+
 const COUNT_DERIVATION: &str = "sd_posts.published_comment_count";
 const SUM_DERIVATION: &str = "sd_posts.visible_score";
+// Named so it sorts after the other two: the backfill tests below rely on
+// the count derivation being the first one a sweep reaches.
+const TAG_DERIVATION: &str = "sd_posts.wanted_tag_count";
 
 /// The framework's own `SQLite` state-table DDL, so this suite proves the
 /// shipped migration rather than a copy of it.
@@ -114,13 +143,21 @@ const DDL: &[&str] = &[
          id INTEGER PRIMARY KEY, \
          title TEXT NOT NULL, \
          published_comment_count BIGINT NOT NULL DEFAULT 0, \
-         visible_score BIGINT NOT NULL DEFAULT 0\
+         visible_score BIGINT NOT NULL DEFAULT 0, \
+         wanted_tag_count BIGINT NOT NULL DEFAULT 0\
      )",
     "CREATE TABLE sd_comments (\
          id INTEGER PRIMARY KEY, \
          post_id BIGINT NOT NULL REFERENCES sd_posts(id), \
          published BOOLEAN NOT NULL DEFAULT 0, \
          score BIGINT NOT NULL DEFAULT 0\
+     )",
+    // `NOCASE`: the collation under which SQL alone would call `'WANTED'`
+    // equal to `'wanted'`.
+    "CREATE TABLE sd_tags (\
+         id INTEGER PRIMARY KEY, \
+         post_id BIGINT NOT NULL REFERENCES sd_posts(id), \
+         label TEXT NOT NULL COLLATE NOCASE\
      )",
 ];
 
@@ -395,7 +432,7 @@ async fn reconciliation_enqueues_only_the_derivation_whose_definition_changed() 
     // First boot: nothing is recorded, so every derivation is enqueued.
     let mut first = ensure_derivations(&mut conn).await.expect("first boot");
     first.sort_unstable();
-    assert_eq!(first, vec![COUNT_DERIVATION, SUM_DERIVATION]);
+    assert_eq!(first, vec![COUNT_DERIVATION, SUM_DERIVATION, TAG_DERIVATION]);
     assert_eq!(
         state_of(&pool, COUNT_DERIVATION).await.backfill_state,
         "pending"
@@ -478,7 +515,11 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
     // named. A `return` here would have hidden the second.
     assert_eq!(
         first.in_progress,
-        vec![COUNT_DERIVATION.to_owned(), SUM_DERIVATION.to_owned()],
+        vec![
+            COUNT_DERIVATION.to_owned(),
+            SUM_DERIVATION.to_owned(),
+            TAG_DERIVATION.to_owned()
+        ],
         "{first:?}"
     );
 
@@ -509,11 +550,15 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
     );
     assert_eq!(
         second.completed,
-        vec![COUNT_DERIVATION.to_owned(), SUM_DERIVATION.to_owned()],
+        vec![
+            COUNT_DERIVATION.to_owned(),
+            SUM_DERIVATION.to_owned(),
+            TAG_DERIVATION.to_owned()
+        ],
         "{second:?}"
     );
     assert!(second.in_progress.is_empty(), "{second:?}");
-    for name in [COUNT_DERIVATION, SUM_DERIVATION] {
+    for name in [COUNT_DERIVATION, SUM_DERIVATION, TAG_DERIVATION] {
         let done = state_of(&pool, name).await;
         assert_eq!(done.backfill_state, "complete", "{name}");
         assert_eq!(
@@ -563,7 +608,12 @@ async fn a_state_row_with_no_derivation_is_reported_as_unregistered() {
     let names: Vec<&str> = status.iter().map(|entry| entry.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["sd_posts.gone", COUNT_DERIVATION, SUM_DERIVATION],
+        vec![
+            "sd_posts.gone",
+            COUNT_DERIVATION,
+            SUM_DERIVATION,
+            TAG_DERIVATION
+        ],
         "every row is reported, sorted by name"
     );
 
@@ -651,4 +701,116 @@ async fn status_reports_state_and_recompute_clears_the_drift() {
         0
     );
     assert!(recompute(&mut conn, "nope.nope").await.is_err());
+}
+
+#[tokio::test]
+async fn a_string_filter_compares_bytes_whatever_the_column_collation() {
+    // `sd_tags.label` is `COLLATE NOCASE`, so a bare `label = 'wanted'` in SQL
+    // would accept `'WANTED'`. The Rust lowering of the same filter compares
+    // bytes and rejects it. Unless the SQL side is pinned to a bytewise
+    // collation the record path contributes 0 while the drift scan, the
+    // backfill and `recompute` all count the row — a derivation disagreeing
+    // with itself.
+    let pool = boot_pool("sd_collation").await;
+    let repo = PgSdTagRepository::with_pool_untracked(pool.clone());
+    let post = seed_post(&pool, "tagged").await;
+
+    for label in ["WANTED", "Wanted", "wanted", "unwanted"] {
+        repo.save(&NewSdTag {
+            post_id: post,
+            label: label.to_owned(),
+        })
+        .await
+        .expect("save tag");
+    }
+    assert_eq!(
+        derived(&pool, "wanted_tag_count", post).await,
+        1,
+        "the record path counts the one byte-equal label"
+    );
+
+    let mut conn = pool.get().await.expect("conn");
+    assert_eq!(
+        drift(&mut conn, def(TAG_DERIVATION)).await.expect("drift"),
+        0,
+        "the set-based scan must agree with the record path on a NOCASE column"
+    );
+    assert_eq!(
+        recompute(&mut conn, TAG_DERIVATION).await.expect("recompute"),
+        0,
+        "nothing to repair: SQL counted the same row Rust did"
+    );
+    assert_eq!(derived(&pool, "wanted_tag_count", post).await, 1);
+
+    // The inequality form is pinned the same way: `!=` under NOCASE would
+    // reject `'WANTED'`, Rust accepts it.
+    let lowered = def(TAG_DERIVATION).filter_sql;
+    assert!(
+        lowered.contains("{bin}"),
+        "the lowered filter carries the collation placeholder: {lowered}"
+    );
+}
+
+#[tokio::test]
+async fn a_renamed_derivation_keeps_its_finished_backfill() {
+    // `definition_hash` leaves the name out so that a rename does not enqueue a
+    // backfill. That promise needs the state row to follow the name: a row
+    // under the old name with this exact hash is the same derivation.
+    let pool = boot_pool("sd_rename").await;
+    let mut conn = pool.get().await.expect("conn");
+    ensure_derivations(&mut conn).await.expect("first boot");
+    run_backfill(&mut conn, &BackfillOptions::default())
+        .await
+        .expect("finish every backfill");
+    assert_eq!(state_of(&pool, COUNT_DERIVATION).await.backfill_state, "complete");
+
+    // The binary that wrote this row called the derivation something else.
+    diesel::sql_query(
+        "UPDATE _autumn_derivations SET name = 'sd_posts.legacy_name', backfilled_rows = 7 \
+         WHERE name = ?",
+    )
+    .bind::<Text, _>(COUNT_DERIVATION)
+    .execute(&mut conn)
+    .await
+    .expect("rename the row as an older binary would have spelled it");
+
+    assert!(
+        ensure_derivations(&mut conn)
+            .await
+            .expect("boot after the rename")
+            .is_empty(),
+        "a rename must not enqueue a backfill"
+    );
+    let adopted = state_of(&pool, COUNT_DERIVATION).await;
+    assert_eq!(adopted.backfill_state, "complete");
+    assert_eq!(
+        adopted.backfilled_rows, 7,
+        "the old row's progress is carried over, not rebuilt"
+    );
+    let status = derivation_status(&mut conn).await.expect("status");
+    assert!(
+        !status.iter().any(|entry| entry.name == "sd_posts.legacy_name"),
+        "no unregistered leftover: the old row IS the new row: {status:?}"
+    );
+
+    // A stale hash under the old name is not a rename, so it is not adopted:
+    // the derivation is enqueued fresh and the old row stays as a leftover.
+    diesel::sql_query(
+        "UPDATE _autumn_derivations SET name = 'sd_posts.legacy_name', definition_hash = 'stale' \
+         WHERE name = ?",
+    )
+    .bind::<Text, _>(COUNT_DERIVATION)
+    .execute(&mut conn)
+    .await
+    .expect("leave a row with a foreign hash");
+    assert_eq!(
+        ensure_derivations(&mut conn).await.expect("boot"),
+        vec![COUNT_DERIVATION]
+    );
+    assert_eq!(state_of(&pool, COUNT_DERIVATION).await.backfill_state, "pending");
+    assert_eq!(
+        state_of(&pool, "sd_posts.legacy_name").await.backfill_state,
+        "complete",
+        "a row with another definition's hash is left for the unregistered report"
+    );
 }
