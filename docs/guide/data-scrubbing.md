@@ -494,6 +494,30 @@ aborted`, and the closing `COMMIT` rolls back. That guard is printed and never
 executed by `autumn db scrub` itself, which opens its own connection and cannot
 be on the wrong database.
 
+That protection ends at the `COMMIT`, though, and one part of a target's plan
+runs past it: `VACUUM (FULL)` cannot run inside a transaction block, so the
+compaction is emitted outside the envelope. The `COMMIT` turns the guard's abort
+into a `ROLLBACK` and clears the aborted state, leaving the server nothing to
+refuse with — measured, a clone's script pasted at its origin had all 64
+destructive statements refused and then ran six `VACUUM (FULL, ANALYZE)`
+statements on the origin, each taking an `ACCESS EXCLUSIVE` lock and rewriting
+the table. So psql decides that part instead of the server:
+
+```
+SET search_path = pg_catalog, public;
+SELECT NOT (...the same predicate the guard uses...) AS autumn_on_target \gset
+\if :autumn_on_target
+SET lock_timeout = '30s';
+VACUUM (FULL, ANALYZE) "public"."users";
+\endif
+```
+
+Both failure modes are closed, measured on psql 16.13: a false value prints
+`query ignored` for every statement in the block, and a `\gset` whose query
+*errored* leaves the variable unset, which `\if` reports as `Boolean expected`
+and still skips. The `search_path` is re-pinned first because the run's own pins
+are `SET LOCAL` — they belonged to the transaction that just rolled back.
+
 One statement the dry run cannot print truthfully is the rewrite of an
 `#[encrypted]` column: the scrub encrypts a fabricated value per row under the
 **target's** key, and expressing that as SQL would mean embedding that key in a

@@ -125,7 +125,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denied to examine ...` for a role without it: the view omits the row, both
   sides compare NULL, and an ordinary role loses the discriminator rather than
   the run — verified with a plain `LOGIN` role, which still refuses the clone on
-  the port alone. Its values are asked of the
+  the port alone.
+  The compaction that runs AFTER the transaction — `VACUUM (FULL)` cannot run
+  inside one — is fenced by psql rather than by the guard, because the guard
+  cannot reach it: the printed `COMMIT` turns its abort into a `ROLLBACK` and
+  clears the aborted state. Measured, that gap was reachable — a clone's script
+  pasted at its origin had all 64 destructive statements refused and then ran six
+  `VACUUM (FULL, ANALYZE)` statements on the origin, each taking an `ACCESS
+  EXCLUSIVE` lock. The script now emits the same predicate through `\gset` and
+  wraps the compaction in `\if`; both failure modes are closed (a false value
+  prints `query ignored`, and a `\gset` whose query errored leaves the variable
+  unset, which `\if` reports and still skips).
+  Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and
   emitted after the session pins, so a `public.current_database()` in the pasting

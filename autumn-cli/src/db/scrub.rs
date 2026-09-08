@@ -2727,11 +2727,22 @@ fn classify_and_apply(
             // still occupies the source's disk, so an operator running the
             // printed sequence without them does not get the laptop-sized copy
             // the command promises.
+            //
+            // Being outside the envelope also puts them outside the target
+            // guard, and that gap was reachable: the `COMMIT` just printed turns
+            // the guard's abort into a ROLLBACK and clears the aborted state, so
+            // on a clone pasted at its origin every DELETE was refused and six
+            // VACUUM (FULL, ANALYZE) statements still ran on the ORIGIN, each
+            // taking an ACCESS EXCLUSIVE lock. psql fences them instead.
             if let Some(sampling) = sampling {
+                for line in post_commit_fence(&facts.endpoint) {
+                    eprintln!("  {line}");
+                }
                 eprintln!("  SET lock_timeout = '{COMPACT_LOCK_TIMEOUT}';");
                 for table in compacted_tables(sampling, &purged_tables(&purges)) {
                     eprintln!("  VACUUM (FULL, ANALYZE) {};", qualified_ident(table));
                 }
+                eprintln!("  \\endif");
             }
         }
         eprintln!("\n\u{2713} Dry run only \u{2014} nothing was written.");
@@ -4149,17 +4160,13 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
     let datadir = setting("data_directory");
     let sysid_call = "(SELECT system_identifier::text FROM pg_catalog.pg_control_system())";
     let body = format!(
-        " BEGIN IF pg_catalog.current_database() <> {name} \
-         OR pg_catalog.inet_server_addr()::text IS DISTINCT FROM {addr} \
-         OR pg_catalog.inet_server_port()::text IS DISTINCT FROM {port} \
-         OR {sysid_call} IS DISTINCT FROM {sysid} \
-         OR pg_catalog.current_setting('port') IS DISTINCT FROM {server_port} \
-         OR nullif({datadir}, '') IS DISTINCT FROM {datadir_want} THEN \
+        " BEGIN IF {mismatch} THEN \
          RAISE EXCEPTION {message}, {name}, {addr}, {port}, {sysid}, {server_port}, \
          {datadir_want}, \
          pg_catalog.current_database(), pg_catalog.inet_server_addr()::text, \
          pg_catalog.inet_server_port()::text, {sysid_call}, \
          pg_catalog.current_setting('port'), nullif({datadir}, ''); END IF; END ",
+        mismatch = endpoint_mismatch(endpoint),
         name = quote_literal(&endpoint.database),
         addr = literal(endpoint.address.as_ref()),
         port = literal(endpoint.port.as_ref()),
@@ -4175,6 +4182,67 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
     );
     let tag = sample::dollar_tag(&body);
     format!("DO {tag}{body}{tag};")
+}
+
+/// The boolean that is TRUE when the session is NOT on the endpoint this block
+/// was planned for.
+///
+/// Shared by the in-transaction guard and by the psql conditional that fences
+/// the post-`COMMIT` compaction, so the two cannot come to disagree about what
+/// counts as the right server.
+fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
+    let literal =
+        |value: Option<&String>| value.map_or_else(|| "NULL".to_owned(), |v| quote_literal(v));
+    format!(
+        "pg_catalog.current_database() <> {name} \
+         OR pg_catalog.inet_server_addr()::text IS DISTINCT FROM {addr} \
+         OR pg_catalog.inet_server_port()::text IS DISTINCT FROM {port} \
+         OR (SELECT system_identifier::text FROM pg_catalog.pg_control_system()) \
+         IS DISTINCT FROM {sysid} \
+         OR pg_catalog.current_setting('port') IS DISTINCT FROM {server_port} \
+         OR nullif(coalesce((SELECT setting FROM pg_catalog.pg_settings \
+         WHERE name = 'data_directory'), ''), '') IS DISTINCT FROM {datadir}",
+        name = quote_literal(&endpoint.database),
+        addr = literal(endpoint.address.as_ref()),
+        port = literal(endpoint.port.as_ref()),
+        sysid = literal(endpoint.system_identifier.as_ref()),
+        server_port = literal(endpoint.server_port.as_ref()),
+        datadir = literal(endpoint.data_directory.as_ref()),
+    )
+}
+
+/// The psql conditional that fences everything a target block does AFTER its
+/// `COMMIT`.
+///
+/// `VACUUM (FULL)` cannot run inside a transaction block, so the compaction is
+/// the one part of a target's plan the in-transaction guard cannot cover — and
+/// measured, that gap was reachable. When a `\connect` fails psql keeps the
+/// previous connection; the guard aborts the transaction, every `DELETE` below
+/// it is refused, and the printed `COMMIT` then turns that abort into a
+/// `ROLLBACK` and clears the aborted state. On a `pg_basebackup` clone pasted
+/// at its origin, all 64 destructive statements were refused and six
+/// `VACUUM (FULL, ANALYZE)` statements then ran on the ORIGIN — each taking an
+/// `ACCESS EXCLUSIVE` lock and rewriting the table.
+///
+/// So psql decides instead of the server. `\gset` reads the same predicate the
+/// guard uses, and `\if` skips the block when it is false. Both failure modes
+/// are closed, measured on psql 16.13: a false value prints `query ignored`, and
+/// a `\gset` whose query ERRORED leaves the variable unset, which `\if` reports
+/// as `Boolean expected` and still skips.
+///
+/// The `search_path` pin is re-applied first because the run's own pins are
+/// `SET LOCAL` — they belong to the transaction that just rolled back, so the
+/// operators in this predicate would otherwise resolve through whatever the
+/// pasting session's path happens to be.
+fn post_commit_fence(endpoint: &ServerEndpoint) -> Vec<String> {
+    vec![
+        "SET search_path = pg_catalog, public;".to_owned(),
+        format!(
+            "SELECT NOT ({}) AS autumn_on_target \\gset",
+            endpoint_mismatch(endpoint),
+        ),
+        "\\if :autumn_on_target".to_owned(),
+    ]
 }
 
 /// Connection-string keywords whose value is a credential.
@@ -4677,6 +4745,57 @@ mod tests {
                 && !refusal.contains("deterministic_key")
                 && !refusal.contains("key_derivation_salt"),
             "no key material may reach the refusal: {refusal}"
+        );
+    }
+
+    /// `VACUUM (FULL)` cannot run inside a transaction, so the compaction is the
+    /// one part of a target's plan the in-transaction guard cannot cover — and
+    /// that gap was reachable, not theoretical.
+    ///
+    /// Measured against a `pg_basebackup` clone pasted at its origin: the guard
+    /// refused all 64 destructive statements, and then six
+    /// `VACUUM (FULL, ANALYZE)` statements ran on the ORIGIN, each taking an
+    /// `ACCESS EXCLUSIVE` lock and rewriting the table. The printed `COMMIT`
+    /// turns the guard's abort into a `ROLLBACK` and clears the aborted state,
+    /// so the server has nothing left to refuse with.
+    ///
+    /// psql decides instead. With the fence, the same paste ran zero VACUUMs on
+    /// the origin (seven `query ignored` lines) and the legitimate paste still
+    /// ran all six against the clone, 200 -> 100 users, zero errors.
+    #[test]
+    fn the_compaction_after_commit_is_fenced_by_psql() {
+        let endpoint = super::ServerEndpoint {
+            database: "app".to_owned(),
+            address: None,
+            port: None,
+            system_identifier: Some("7682669380557907941".to_owned()),
+            server_port: Some("5435".to_owned()),
+            data_directory: Some("/tmp/pgd3".to_owned()),
+        };
+        let fence = super::post_commit_fence(&endpoint);
+        // The run's own pins are SET LOCAL, so they belong to the transaction
+        // that just rolled back. Without re-pinning, the operators below resolve
+        // through the pasting session's own search_path.
+        assert_eq!(
+            fence.first().map(String::as_str),
+            Some("SET search_path = pg_catalog, public;"),
+            "the fence must re-pin the path it needs: {fence:?}"
+        );
+        assert!(
+            fence.iter().any(|line| line.contains("\\gset"))
+                && fence.iter().any(|line| line == "\\if :autumn_on_target"),
+            "psql, not the server, has to decide this one: {fence:?}"
+        );
+        // The same predicate as the guard, so the two cannot come to disagree
+        // about what counts as the right server.
+        let mismatch = super::endpoint_mismatch(&endpoint);
+        assert!(
+            fence.iter().any(|line| line.contains(&mismatch)),
+            "the fence must ask exactly what the guard asks: {fence:?}"
+        );
+        assert!(
+            super::target_guard(&endpoint).contains(&mismatch),
+            "and the guard must ask it too: {mismatch}"
         );
     }
 
