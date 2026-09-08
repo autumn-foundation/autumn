@@ -222,13 +222,19 @@ answers `503` rather than `404`.
 
 ```json
 [
-  { "name": "posts.published_comment_count",
+  { "target": "control", "name": "posts.published_comment_count",
     "definition_hash": "3f0a...", "stored_hash": "3f0a...",
     "backfill_state": "complete", "checkpoint": 4200,
     "backfilled_rows": 4200, "updated_at": "2026-09-07 12:00:00+00",
     "drift": 0, "drift_error": null }
 ]
 ```
+
+`target` names the database a row was read from: `"control"` for the control
+pool, or a shard's name. A sharded app maintains its derivations on every
+shard primary, so each shard is reported after the control database, and a
+shard that cannot be read contributes one `{ "target": ..., "error": ... }`
+row instead of hiding the others.
 
 `stored_hash` and `backfill_state` are `null` when no state row exists yet.
 `backfill_state` is otherwise `pending`, `running` or `complete`, plus a

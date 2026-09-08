@@ -3618,17 +3618,70 @@ pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync +
                 .into_response();
         }
     };
-    match crate::derivation::derivation_status(&mut conn).await {
-        Ok(statuses) => (StatusCode::OK, Json(statuses)).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "could not read derivation state",
-                "detail": error.to_string(),
-            })),
-        )
-            .into_response(),
+    let mut report = match crate::derivation::derivation_status(&mut conn).await {
+        Ok(statuses) => derivation_report("control", statuses),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "could not read derivation state",
+                    "target": "control",
+                    "detail": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    // A sharded app maintains its derivations on every shard primary (that is
+    // where the tenant rows live, and where startup reconciles and sweeps), so
+    // the control database alone would report a clean slate while a shard sat
+    // pending or drifted. One shard that cannot answer is reported as such
+    // rather than hiding the rest.
+    #[cfg(feature = "db")]
+    if let Some(shards) = state.shards() {
+        for shard in shards.iter() {
+            let target = shard.name();
+            let statuses = match shard.primary_pool().get().await {
+                Ok(mut conn) => crate::derivation::derivation_status(&mut conn).await,
+                Err(error) => Err(crate::AutumnError::from(std::io::Error::other(
+                    error.to_string(),
+                ))),
+            };
+            match statuses {
+                Ok(statuses) => report.extend(derivation_report(target, statuses)),
+                Err(error) => report.push(serde_json::json!({
+                    "target": target,
+                    "error": "could not read derivation state",
+                    "detail": error.to_string(),
+                })),
+            }
+        }
     }
+    (StatusCode::OK, Json(report)).into_response()
+}
+
+/// One database's derivation statuses as the endpoint's rows, each naming the
+/// `target` it was read from (`"control"`, or a shard's name).
+#[cfg(feature = "db")]
+fn derivation_report(
+    target: &str,
+    statuses: Vec<crate::derivation::DerivationStatus>,
+) -> Vec<serde_json::Value> {
+    statuses
+        .into_iter()
+        .map(|status| {
+            let mut row = serde_json::to_value(status).unwrap_or_else(
+                |error| serde_json::json!({ "error": format!("unserialisable status: {error}") }),
+            );
+            if let serde_json::Value::Object(ref mut map) = row {
+                map.insert(
+                    "target".to_owned(),
+                    serde_json::Value::String(target.to_owned()),
+                );
+            }
+            row
+        })
+        .collect()
 }
 
 /// `GET <actuator-prefix>/graph` -- the application's architecture graph
@@ -5727,9 +5780,12 @@ mod tests {
                 drift_error: Some("column does not exist".to_owned()),
             },
         ];
-        let body = serde_json::to_value(&statuses).expect("serialize the 200 body");
+        let body = serde_json::Value::Array(derivation_report("control", statuses));
         let rows = body.as_array().expect("the body is a JSON array");
         assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["target"], "control", "every row names its database");
+        }
         for row in rows {
             let mut keys: Vec<&str> = row
                 .as_object()
@@ -5749,6 +5805,7 @@ mod tests {
                     "drift_error",
                     "name",
                     "stored_hash",
+                    "target",
                     "updated_at",
                 ],
                 "{row}"

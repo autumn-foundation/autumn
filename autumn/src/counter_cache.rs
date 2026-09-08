@@ -865,29 +865,38 @@ fn fold_and_order<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     contributions: Vec<Contribution>,
 ) -> Vec<Contribution> {
-    let mut folded: Vec<Contribution> = Vec::with_capacity(contributions.len());
-    // `(spec, parent)` -> where that parent's running total lives in `folded`.
+    // The running total is an `i128`, so weights that cancel do cancel even
+    // when no `i64` could hold an intermediate sum (`[MAX, MAX, -MAX, -MAX]`
+    // is zero, not two statements the database would refuse).
+    let mut totals: Vec<(usize, i64, i128, i64)> = Vec::with_capacity(contributions.len());
+    // `(spec, parent)` -> where that parent's running total lives in `totals`.
     let mut seen: HashMap<(usize, i64), usize> = HashMap::new();
     for (spec_index, parent_id, delta, witness) in contributions {
         if specs[spec_index].tenant_column.is_some() {
-            folded.push((spec_index, parent_id, delta, witness));
+            totals.push((spec_index, parent_id, i128::from(delta), witness));
             continue;
         }
-        // A running total that would leave `i64` is not wrapped: the delta
-        // that overflows it starts a second statement on the same parent, so
-        // the column receives every weight even when no single delta could.
         match seen.get(&(spec_index, parent_id)) {
-            Some(&at) if folded[at].2.checked_add(delta).is_some() => {
-                folded[at].2 += delta;
-            }
-            _ => {
-                seen.insert((spec_index, parent_id), folded.len());
-                folded.push((spec_index, parent_id, delta, witness));
+            Some(&at) => totals[at].2 += i128::from(delta),
+            None => {
+                seen.insert((spec_index, parent_id), totals.len());
+                totals.push((spec_index, parent_id, i128::from(delta), witness));
             }
         }
     }
-    // Zero deltas are dropped rather than issued as `+ 0`.
-    folded.retain(|&(_, _, delta, _)| delta != 0);
+    // A net total that no single `i64` delta can carry goes out as several
+    // deltas of the same sign, so the parent moves monotonically from where it
+    // is to where it ends: when both are representable, so is every step.
+    // Zero totals are dropped rather than issued as `+ 0`.
+    let mut folded: Vec<Contribution> = Vec::with_capacity(totals.len());
+    for (spec_index, parent_id, mut total, witness) in totals {
+        while total != 0 {
+            let chunk = total.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+            #[allow(clippy::cast_possible_truncation)]
+            folded.push((spec_index, parent_id, chunk as i64, witness));
+            total -= chunk;
+        }
+    }
     folded
         .sort_by_key(|&(spec_index, parent_id, _, _)| (specs[spec_index].parent_table, parent_id));
     folded
@@ -1991,15 +2000,15 @@ mod tests {
     }
 
     #[test]
-    fn a_running_total_that_would_overflow_starts_a_second_statement() {
+    fn a_net_total_no_single_delta_can_carry_goes_out_in_same_sign_pieces() {
         // Two children each weighing `i64::MAX` onto one parent: the sum is
-        // not an `i64`, so folding them would wrap to `-2` and apply a delta
-        // with the wrong sign. Each weight goes out on its own instead.
+        // not an `i64`, so a wrapping fold would apply `-2`. The net total is
+        // carried by two deltas of the same sign instead.
         let specs = two_legs();
         let ordered = fold_and_order(&specs, vec![(1, 2, i64::MAX, 10), (1, 2, i64::MAX, 11)]);
-        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, i64::MAX, 11)]);
-        // …while everything that does fit still folds, and the sum of every
-        // delta issued is the sum of every delta requested.
+        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, i64::MAX, 10)]);
+        // …and a total one past `i64::MAX` is `MAX` then `1`, never a wrapped
+        // negative: the sum of every delta issued is the sum requested.
         let ordered = fold_and_order(
             &specs,
             vec![
@@ -2009,7 +2018,37 @@ mod tests {
                 (1, 2, 1, 13),
             ],
         );
-        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, 1, 13)]);
+        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, 1, 10)]);
+    }
+
+    #[test]
+    fn weights_that_cancel_across_an_overflowing_intermediate_issue_nothing() {
+        // `[MAX, MAX, -MAX, -MAX]` nets to zero. Segmenting at the overflow
+        // point would have issued `+MAX` then `-MAX`, and a parent sitting at
+        // `1` would have aborted the whole mutation on the first statement
+        // even though its final value is exactly where it started.
+        let specs = two_legs();
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (1, 2, i64::MAX, 10),
+                (1, 2, i64::MAX, 11),
+                (1, 2, -i64::MAX, 12),
+                (1, 2, -i64::MAX, 13),
+            ],
+        );
+        assert!(ordered.is_empty(), "{ordered:?}");
+        // The same shape netting to a representable value is one delta.
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (1, 2, i64::MAX, 10),
+                (1, 2, i64::MAX, 11),
+                (1, 2, -i64::MAX, 12),
+                (1, 2, -7, 13),
+            ],
+        );
+        assert_eq!(ordered, vec![(1, 2, i64::MAX - 7, 10)]);
     }
 
     #[test]
@@ -2028,8 +2067,13 @@ mod tests {
                 (0, 7, i64::MAX, 1)
             ]
         );
+        // Folded, the three pieces net to 2^64 - 1 and go out as same-sign
+        // deltas: the parent climbs monotonically to its final value.
         let specs = two_legs();
-        assert_eq!(fold_and_order(&specs, out.clone()), out);
+        assert_eq!(
+            fold_and_order(&specs, out.clone()),
+            vec![(0, 7, i64::MAX, 1), (0, 7, i64::MAX, 1), (0, 7, 1, 1)]
+        );
 
         // An ordinary edit is still one delta for the difference.
         let mut out = Vec::new();
