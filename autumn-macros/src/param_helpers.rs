@@ -236,6 +236,36 @@ pub fn extract_fn_item(tokens: proc_macro2::TokenStream, name: &str) -> ItemFn {
         .unwrap_or_else(|| panic!("fn `{name}` not found among the generated items"))
 }
 
+/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
+///
+/// Rust forbids `impl Trait` in local variable type annotations (E0562), so
+/// every `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]` expansion
+/// that binds a handler's awaited output to an explicit local type
+/// (`let __autumn_inner: #ty = …`) must skip that annotation when `ty`
+/// contains `impl Trait` at any depth — not just when `ty` itself is
+/// `impl Trait`, since the common shape is a wrapper like
+/// `AutumnResult<impl IntoResponse>` with `impl Trait` only nested inside.
+pub fn type_contains_impl_trait(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::ImplTrait(_) => true,
+        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
+            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
+                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
+                _ => false,
+            }),
+            syn::PathArguments::Parenthesized(args) => {
+                args.inputs.iter().any(type_contains_impl_trait)
+                    || matches!(&args.output,
+                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
+            }
+            syn::PathArguments::None => false,
+        }),
+        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
+        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

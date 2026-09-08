@@ -269,11 +269,16 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let __autumn_inner: () = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
         },
-        syn::ReturnType::Type(_, ty) if matches!(ty.as_ref(), syn::Type::ImplTrait(_)) => quote! {
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                (async move #original_body).await
-            )
-        },
+        // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
+        // Rust rejects `impl Trait` in local variable type annotations; drop
+        // the annotation and let type inference handle it instead.
+        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    (async move #original_body).await
+                )
+            }
+        }
         syn::ReturnType::Type(_, ty) => quote! {
             let __autumn_inner: #ty = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
@@ -558,7 +563,7 @@ mod tests {
     /// Echo clone-class regression (missed-fix half): see
     /// `secured::tests::secured_handles_nested_impl_trait_return_type` for
     /// the full rationale. `authorize_macro` ships the same shallow
-    /// `matches!(ty.as_ref(), syn::Type::ImplTrait(_))` guard secured_macro
+    /// `matches!(ty.as_ref(), syn::Type::ImplTrait(_))` guard `secured_macro`
     /// did before its fix, so it emits the same uncompilable
     /// `let __autumn_inner: Result<impl IntoResponse, _> = …` for a handler
     /// shaped like this.
