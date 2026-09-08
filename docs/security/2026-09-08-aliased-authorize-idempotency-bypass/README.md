@@ -220,7 +220,7 @@ extract either way.
   `authorize`/`secured`/`step_up`/`throttle`/`route` and this PR's own new
   fixtures), consistent with a rustc/dependency version drift between this
   sandbox and whichever environment last generated those goldens.
-- `cargo test -p autumn-macros --lib`: 1190/1190 pass, including every
+- `cargo test -p autumn-macros --lib`: 1192/1192 pass, including every
   golden-expansion test pinning `#[secured]`/`#[step_up]`/`#[throttle]`/
   `#[authorize]`'s exact generated output (unaffected — the fix only adds an
   early rejection, never changes what a guard emits when it does compile)
@@ -335,6 +335,58 @@ New tests: `rejects_an_aliased_authorize_shape_behind_cfg_attr`,
 `rejects_an_unrelated_shape_behind_cfg_attr`,
 `accepts_the_literal_name_behind_cfg_attr_without_ambiguity`,
 `attr_is_authorize_shaped_recognizes_the_literal_name_behind_cfg_attr`.
+
+## Round 5: even a literal, correctly-spelled `cfg_attr`-conditional `#[authorize]` is unsafe to resolve — plus nested `cfg_attr`
+
+Round 4 landed on: recognize a `cfg_attr`-wrapped attribute (name or shape)
+the same way a plain one is recognized. Codex review found two further gaps
+in that same commit.
+
+**Finding A — presence ambiguity, not just name ambiguity.** Round 4 treated
+`#[cfg_attr(feature = "auth", authorize(...))]` as an unconditionally
+*present* `#[authorize]` guard, on the reasoning that the literal name is
+never ambiguous. That reasoning only holds for a plainly-written attribute,
+which always applies. A `cfg_attr`-wrapped one might not: Autumn cannot
+evaluate the cfg predicate at macro-expansion time, so whether this
+`#[authorize]` will actually be present in the compiled handler is unknown.
+Guessing either way is unsafe, in the same shape as the original
+aliasing problem but about *presence* instead of *name*:
+
+- Guess "present" (round 4's behavior): `has_authorize_guard`/
+  `should_own_replay` suppress the standalone `IdempotencyReplayLayer` (or an
+  earlier gate's own replay-serving) on the assumption `#[authorize]`'s
+  in-body check will own it. If the predicate is actually false at build
+  time, `#[authorize]` never runs, nothing ends up owning replay, and a
+  retried mutation re-executes instead of replaying — the idempotency
+  guarantee silently disappears.
+- Guess "absent": if the predicate is actually true, the standalone replay
+  layer stays active and can serve a stale cached response before
+  `#[authorize]`'s in-body policy re-check ever gets a chance to run — the
+  original stale-authorization bypass, reopened.
+
+**Finding B — nested `cfg_attr` isn't recursed into.** The round-4
+`for_each_conditionally_applied_meta` only unwrapped one level of `cfg_attr`,
+so `#[cfg_attr(a, cfg_attr(b, authorize(...)))]` tested the inner
+`cfg_attr(b, authorize(...))` meta itself (whose path is `cfg_attr`, not
+`authorize`) against the check function and never reached the real
+`authorize` meta underneath.
+
+**Fix:** `for_each_conditionally_applied_meta`'s walk (used by
+`attr_is_authorize_shaped`) is now genuinely recursive — any nested meta
+whose own path is `cfg_attr` is unwrapped the same way, at any depth (closes
+Finding B, and applies to every caller of `attr_is_authorize_shaped`).
+`reject_if_ambiguous_authorize_shape` now refuses **any** `#[authorize]`-
+shaped attribute reached through `cfg_attr` — including the literal,
+correctly-spelled name — via a new `find_unsafe_cfg_attr_authorize_meta`
+helper and `conditionally_applied_meta_is_unsafe_to_resolve` predicate
+(closes Finding A). Outside `cfg_attr`, a plainly-written `#[authorize(...)]`
+is still accepted without ambiguity, since it always applies and has no
+presence question to answer.
+
+New tests: `rejects_the_literal_name_behind_cfg_attr_since_presence_is_unknowable`
+(replaces the now-incorrect `accepts_the_literal_name_behind_cfg_attr_without_ambiguity`),
+`rejects_an_aliased_authorize_shape_behind_nested_cfg_attr`,
+`attr_is_authorize_shaped_recognizes_the_literal_name_behind_nested_cfg_attr`.
 
 ## 🗂 Ledger
 
