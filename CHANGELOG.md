@@ -86,6 +86,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pdf_route_renders_the_same_content_as_the_html_view` and
   `pdf_rendering_is_deterministic_given_a_fixed_clock` still pass unchanged,
   confirming the PDF output is untouched.
+- **🧭 Wayfinder: `examples/flock`'s island page gets a `<main>` landmark
+  (a11y `bypass` Serious 1→0, `landmark-one-main` Moderate 1→0)
+  [no-plugin]:** `autumn check --a11y`, run against the live `/` route (its
+  own `tests/system/smoke.rs` says it "mirrors the other supported
+  examples"), found the whole page — the server-rendered heading/paragraph
+  *and* the WASM-island mount point — had no `<main>` landmark, and (since
+  the page carries no other link either) no skip-to-content link. This is
+  not a static-shell artifact of a client-rendered app the way, say,
+  `examples/react-graphql`'s pre-hydration shell would be: neither the maud
+  page nor the Yew `Flock` component that later mounts into `<div
+  data-autumn-island="flock">` (`examples/island-flock/src/lib.rs`'s `view`)
+  emits any landmark, so the gap holds both before and after the island
+  boots — a real end state, not a curl-only false positive.
+  Baseline (`autumn check --a11y --url http://127.0.0.1:3000/`, built
+  binary, live server, pre-fix): 1 Serious (`bypass`) + 1 Moderate
+  (`landmark-one-main`).
+  Fix: wrap the existing content in `main id="main-content"` as the literal
+  first child of `<body>` — matching `todo-app`/`media-room`'s convention —
+  moving nothing else. The deferred module `<script>` moves to after
+  `</main>` (rather than into `<head>`) so `<main>` stays first; a `defer`
+  script's execution order is unaffected by its position in the document.
+  No skip link was added: with `<main>` first in `<body>` there is nothing
+  to bypass, the same reasoning `todo-app`/`media-room` established in
+  #2483 — `autumn check --a11y`'s `bypass` rule already exempts this shape.
+  After (same live-server check, post-fix): 0 violations. `cargo test -p
+  flock`: 1 passed (a new `index_wraps_content_in_a_main_landmark_first_in_body`
+  regression test asserting the `<main id="main-content">` landmark is
+  present, that nothing precedes it in `<body>`, and that the island mount
+  point stays inside it); the existing Chromium smoke test is unaffected.
+  `cargo fmt -p flock -- --check` and `cargo clippy -p flock --all-targets
+  -- -D warnings` both clean.
 - **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.** [no-plugin]
   `TokenAdminModel` and `FeatureFlagAdminModel` each override
   `AdminModel::execute_action` to batch their `"delete"` bulk action into one
