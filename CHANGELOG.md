@@ -120,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refreshes: a view is rebuilt from whatever survives the sample, so one over
   reference data does not shrink, and measuring the sampled base tables alone
   reported `488.0 kB → 232.0 kB` on a database still holding a 44 MB view.
+  An excluded partition leaf's outgoing foreign key is still ignored for the
+  walk and the re-count — emptying its top-level parent takes every leaf row, so
+  it cannot dangle — but it now keeps its say over removal ORDER: a leaf pointing
+  into a `[framework] purge` table defers that purge, instead of letting it run
+  first against rows the leaf has not lost yet and failing the run.
   A `--sample` spec splits at its LAST `=`, so a table whose quoted name
   contains one (`events=2026`) can be named as a root, and the table portion is
   taken verbatim rather than trimmed — a quoted name may begin or end with a

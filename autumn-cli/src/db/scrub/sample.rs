@@ -867,6 +867,40 @@ enum PartitionVerdict {
     Ignore,
 }
 
+/// `child -> parent (constraint)`, the shape every refusal here names an edge by.
+fn describe(edge: &ForeignKeyConstraint) -> String {
+    format!(
+        "{} -> {} ({})",
+        edge.child_table, edge.parent_table, edge.name
+    )
+}
+
+/// Keep an ignored leaf edge's say over removal order.
+///
+/// Every row on the child side goes — its top-level parent is `never_include`,
+/// and emptying that takes the leaf with it — so the edge cannot dangle and has
+/// nothing to tell the walk or the re-count. It still has something to say about
+/// ORDER: if the leaf points into a `[framework] purge` table, that purge
+/// otherwise runs first, against rows the leaf has not lost yet. Measured on
+/// `PostgreSQL` 16.13, `audit_logs_p0.job_id -> autumn_jobs` failed the run with
+/// `update or delete on table "autumn_jobs" violates foreign key constraint
+/// "audit_p0_job_fk"`. Dropping the edge for walking was right; dropping it for
+/// ordering was not.
+fn defer_purge_for_excluded_leaf(
+    inputs: &SampleInputs<'_>,
+    edge: &ForeignKeyConstraint,
+    purge_after: &mut BTreeSet<String>,
+    purged_after_edges: &mut BTreeMap<String, Vec<String>>,
+) {
+    if inputs.purged.contains(&edge.parent_table) {
+        purge_after.insert(edge.parent_table.clone());
+        purged_after_edges
+            .entry(edge.parent_table.clone())
+            .or_default()
+            .push(describe(edge));
+    }
+}
+
 /// Whether an edge naming a partition can be planned, must be refused, or is
 /// moot.
 ///
@@ -910,13 +944,6 @@ fn classify_edges(
     roles: &BTreeMap<String, SampleRole>,
 ) -> Result<ClassifiedEdges, SampleError> {
     check_key_arity(inputs.foreign_keys)?;
-    let describe = |edge: &ForeignKeyConstraint| {
-        format!(
-            "{} -> {} ({})",
-            edge.child_table, edge.parent_table, edge.name
-        )
-    };
-
     let mut outside_refs = Vec::new();
     let mut dangling = Vec::new();
     let mut partition_local = Vec::new();
@@ -933,7 +960,15 @@ fn classify_edges(
                 partition_local.push(describe(edge));
                 continue;
             }
-            PartitionVerdict::Ignore => continue,
+            PartitionVerdict::Ignore => {
+                defer_purge_for_excluded_leaf(
+                    inputs,
+                    edge,
+                    &mut purge_after,
+                    &mut purged_after_edges,
+                );
+                continue;
+            }
             PartitionVerdict::Classify => {}
         }
         let child = roles.get(&edge.child_table);
@@ -3536,6 +3571,55 @@ mod tests {
         assert!(
             plan.walk_edges.iter().all(|e| e.name != "countries_job_fk"),
             "but it must not enter the walk"
+        );
+    }
+
+    /// Ignoring an excluded leaf's key for the WALK does not mean ignoring it
+    /// for ORDER.
+    ///
+    /// Its rows all go, so nothing can dangle — but the `[framework] purge` it
+    /// points into still runs before the sample unless something defers it.
+    /// Measured against `PostgreSQL` 16.13 before this was fixed, on a partitioned
+    /// `never_include` `audit_logs` whose leaf carried a partition-local key
+    /// into a purged `autumn_jobs`:
+    ///
+    /// ```text
+    /// ✗ update or delete on table "autumn_jobs" violates foreign key
+    ///   constraint "audit_p0_job_fk" on table "audit_logs_p0"
+    /// ```
+    ///
+    /// After: the run completes, audit 20 -> 0, jobs 20 -> 0, users 200 -> 100.
+    #[test]
+    fn an_excluded_partition_leaf_still_defers_the_purge_it_references() {
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_p0_job_fk",
+            "audit_logs_p0",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let partitions = BTreeMap::from([("audit_logs_p0".to_owned(), "audit_logs".to_owned())]);
+        let purged = BTreeSet::from(["autumn_jobs".to_owned()]);
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &purged,
+            purged: &purged,
+            partitions: &partitions,
+        })
+        .expect("an excluded leaf's key into a purged table must not refuse the run");
+        assert!(
+            plan.purge_after.contains("autumn_jobs"),
+            "the purge must wait until the sample has emptied the leaf: {:?}",
+            plan.purge_after
+        );
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "audit_p0_job_fk"),
+            "and the edge still has nothing to say to the walk"
         );
     }
 
