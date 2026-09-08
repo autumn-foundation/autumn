@@ -87,8 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pdf_rendering_is_deterministic_given_a_fixed_clock` still pass unchanged,
   confirming the PDF output is untouched.
 - **🧭 Wayfinder: `examples/flock`'s island page gets a `<main>` landmark
-  (a11y `bypass` Serious 1→0, `landmark-one-main` Moderate 1→0)
-  [no-plugin]:** `autumn check --a11y`, run against the live `/` route (its
+  (a11y `bypass` Serious 1→0, `landmark-one-main` Moderate 1→0) [no-plugin]:**
+  `autumn check --a11y`, run against the live `/` route (its
   own `tests/system/smoke.rs` says it "mirrors the other supported
   examples"), found the whole page — the server-rendered heading/paragraph
   *and* the WASM-island mount point — had no `<main>` landmark, and (since
