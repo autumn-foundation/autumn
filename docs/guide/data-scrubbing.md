@@ -449,9 +449,35 @@ Identity also carries the cluster's `system_identifier`. Address and port are
 NULL for *every* Unix-socket connection, so two socket clusters holding the same
 database name look identical by them — measured, both reported `<null>/<null>`
 while their identifiers differed. It is generated at initdb, survives the socket
-path, and an ordinary `LOGIN` role can read it. It does not distinguish a primary
-from its physical replica, which share one, so it sits alongside address and port
-rather than replacing them.
+path, and an ordinary `LOGIN` role can read it.
+
+It is not identity on its own, though: a **physical copy** of a cluster carries
+the identifier of the cluster it was cloned from, so a production primary and a
+promoted staging clone of it report the same one. Measured against a
+`pg_basebackup` clone of a live cluster, both reached over `/tmp`, the guard saw
+the same database name, the same identifier and `<null>/<null>` on both sides.
+So identity also carries the server's configured `port` — which answers over a
+socket, where `inet_server_port()` is NULL — and its `data_directory`, the value
+two postmasters on one machine cannot share:
+
+```
+ERROR:  this block is for app at <NULL>:<NULL> (cluster 7682669380557907941, port 5435,
+        data directory /tmp/pgd3), but the session is on app at <NULL>:<NULL>
+        (cluster 7682669380557907941, port 5433, data directory /tmp/pgd)
+```
+
+`data_directory` is restricted to `pg_read_all_settings`. The guard reads it out
+of `pg_settings` rather than with `current_setting`, because that view simply
+omits the row for a role without the privilege while `current_setting` raises
+`permission denied to examine ...` — which, inside the guard, would abort a
+*correct* paste. Both sides then compare `NULL`, so an ordinary role loses that
+one discriminator rather than the run, and still refuses the clone above on the
+port alone (verified with a plain `LOGIN` role).
+
+What remains is a copy running on a *different machine* at the same port and
+data directory. A pasted script reaches a Unix socket only on the machine it is
+pasted on, so that case needs the operator to paste on a host other than the one
+they configured the target for.
 
 Every value is asked of the target connection while the run plans, never
 parsed out of its URL: libpq defaults an omitted database name to the user name,

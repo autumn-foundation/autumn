@@ -3211,9 +3211,30 @@ pub struct ServerEndpoint {
     /// is readable by an ordinary `LOGIN` role (verified against a non-superuser
     /// on `PostgreSQL` 16.13).
     ///
-    /// It does not distinguish a primary from its physical replica, which share
-    /// one — hence kept alongside address and port rather than replacing them.
+    /// It does NOT distinguish a cluster from a physical copy of itself: a
+    /// replica, or a promoted staging clone, carries the identifier of the
+    /// cluster it was cloned from. Hence the three fields below.
     pub system_identifier: Option<String>,
+    /// `current_setting('port')` — the port the SERVER is configured on.
+    ///
+    /// Not the same question as `inet_server_port()`, which is the port this
+    /// client reached and is NULL over a Unix socket. This one answers over a
+    /// socket too (verified: 5433 and 5434 read back from two socket-only
+    /// clusters), and unlike `data_directory` it is readable by an ordinary
+    /// `LOGIN` role, so it discriminates even where the scrub role cannot
+    /// examine restricted settings.
+    pub server_port: Option<String>,
+    /// `data_directory`, or `None` where the role may not read it.
+    ///
+    /// The value a physical clone cannot share with its origin while both run on
+    /// the same machine: two postmasters cannot hold one data directory. It is
+    /// restricted to `pg_read_all_settings`, so it is read out of `pg_settings`
+    /// rather than with `current_setting` — that view omits the row entirely for
+    /// a role without the privilege, and the scalar subquery yields NULL instead
+    /// of raising `permission denied to examine ...`, which `current_setting`
+    /// does raise, `missing_ok` or not (that flag covers unknown parameters, not
+    /// forbidden ones). Verified both ways on `PostgreSQL` 16.13.
+    pub data_directory: Option<String>,
 }
 
 /// they are probed here rather than assumed.
@@ -3727,6 +3748,23 @@ fn probe_database_facts(
     .into_iter()
     .next()
     .unwrap_or_default();
+    // A value the target may not be able to answer for. `coalesce` to the empty
+    // string rather than letting a NULL fail to deserialize, so "the role may
+    // not read this" and "this connection has no such value" arrive the same
+    // way: as `None`, which the guard compares as NULL.
+    let optional = |query: &str, conn: &mut PgConnection| -> Option<String> {
+        names(query, conn)
+            .ok()
+            .and_then(|rows| rows.into_iter().next())
+            .filter(|value| !value.is_empty())
+    };
+    let setting_of = |parameter: &str| {
+        format!(
+            "SELECT coalesce((SELECT setting FROM pg_catalog.pg_settings \
+             WHERE name = {}), '') AS name",
+            quote_literal(parameter),
+        )
+    };
     let endpoint = ServerEndpoint {
         database: names("SELECT pg_catalog.current_database() AS name", &mut conn)?
             .into_iter()
@@ -3734,12 +3772,23 @@ fn probe_database_facts(
             .unwrap_or_default(),
         address: (!address.is_empty()).then_some(address),
         port: (!port.is_empty()).then_some(port),
-        system_identifier: names(
+        system_identifier: optional(
             "SELECT system_identifier::text AS name FROM pg_catalog.pg_control_system()",
             &mut conn,
-        )
-        .ok()
-        .and_then(|rows| rows.into_iter().next()),
+        ),
+        server_port: optional(
+            "SELECT pg_catalog.current_setting('port') AS name",
+            &mut conn,
+        ),
+        // Through `pg_settings`, not `current_setting`: the parameter is
+        // restricted to `pg_read_all_settings`, and `current_setting` raises
+        // `permission denied to examine ...` for a role without it — which
+        // would abort the introspection an ordinary scrub role has to complete.
+        // The view simply omits the row, so the scalar subquery answers NULL and
+        // the guard compares NULL to NULL, losing the discriminator rather than
+        // the run. Verified both ways on PostgreSQL 16.13: as a non-superuser,
+        // `current_setting` errored and this returned empty.
+        data_directory: optional(&setting_of("data_directory"), &mut conn),
     };
 
     // Rules are the other way a `DELETE` runs code the plan never saw. Unlike a
@@ -4087,24 +4136,41 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
         |value: Option<&String>| value.map_or_else(|| "NULL".to_owned(), |v| quote_literal(v));
     // `RAISE` substitutes bare `%` in argument order and has no `%1$s` form.
     // Writing one named each database as the other and left `2$s` in the text.
+    // Every parameter is read the same way the introspection read it, so a value
+    // the pasting role may not examine answers NULL on BOTH sides rather than
+    // raising inside the guard: `pg_settings` omits a restricted row, where
+    // `current_setting` would raise `permission denied to examine ...`.
+    let setting = |parameter: &str| {
+        format!(
+            "coalesce((SELECT setting FROM pg_catalog.pg_settings WHERE name = {}), '')",
+            quote_literal(parameter),
+        )
+    };
+    let datadir = setting("data_directory");
+    let sysid_call = "(SELECT system_identifier::text FROM pg_catalog.pg_control_system())";
     let body = format!(
         " BEGIN IF pg_catalog.current_database() <> {name} \
          OR pg_catalog.inet_server_addr()::text IS DISTINCT FROM {addr} \
          OR pg_catalog.inet_server_port()::text IS DISTINCT FROM {port} \
-         OR (SELECT system_identifier::text FROM pg_catalog.pg_control_system()) \
-         IS DISTINCT FROM {sysid} THEN \
-         RAISE EXCEPTION {message}, {name}, {addr}, {port}, {sysid}, \
+         OR {sysid_call} IS DISTINCT FROM {sysid} \
+         OR pg_catalog.current_setting('port') IS DISTINCT FROM {server_port} \
+         OR nullif({datadir}, '') IS DISTINCT FROM {datadir_want} THEN \
+         RAISE EXCEPTION {message}, {name}, {addr}, {port}, {sysid}, {server_port}, \
+         {datadir_want}, \
          pg_catalog.current_database(), pg_catalog.inet_server_addr()::text, \
-         pg_catalog.inet_server_port()::text, \
-         (SELECT system_identifier::text FROM pg_catalog.pg_control_system()); END IF; END ",
+         pg_catalog.inet_server_port()::text, {sysid_call}, \
+         pg_catalog.current_setting('port'), nullif({datadir}, ''); END IF; END ",
         name = quote_literal(&endpoint.database),
         addr = literal(endpoint.address.as_ref()),
         port = literal(endpoint.port.as_ref()),
         sysid = literal(endpoint.system_identifier.as_ref()),
+        server_port = literal(endpoint.server_port.as_ref()),
+        datadir_want = literal(endpoint.data_directory.as_ref()),
         message = quote_literal(
-            "this block is for % at %:% (cluster %), but the session is on % at %:% \
-             (cluster %) — the \\connect above did not take effect (psql keeps the \
-             previous connection when one fails)"
+            "this block is for % at %:% (cluster %, port %, data directory %), but the \
+             session is on % at %:% (cluster %, port %, data directory %) — the \
+             \\connect above did not take effect (psql keeps the previous connection \
+             when one fails)"
         ),
     );
     let tag = sample::dollar_tag(&body);
@@ -4630,6 +4696,8 @@ mod tests {
             address: Some("10.0.0.2/32".to_owned()),
             port: Some("5432".to_owned()),
             system_identifier: Some("7682669380557907941".to_owned()),
+            server_port: Some("5432".to_owned()),
+            data_directory: Some("/var/lib/postgresql/16/main".to_owned()),
         };
         let guard = super::target_guard(&here);
         assert!(
@@ -4647,6 +4715,28 @@ mod tests {
             guard.contains("IS DISTINCT FROM '7682669380557907941'"),
             "the cluster identity must be pinned too, or two socket clusters are \
              indistinguishable: {guard}"
+        );
+        // And the identifier alone is not identity either: a physical copy —
+        // a replica, or a promoted staging clone — carries the identifier of
+        // the cluster it was cloned from. The configured port answers over a
+        // socket where `inet_server_port()` is NULL, and the data directory is
+        // the value two postmasters on one machine cannot share.
+        assert!(
+            guard.contains("pg_catalog.current_setting('port') IS DISTINCT FROM '5432'"),
+            "the server's configured port must be pinned: {guard}"
+        );
+        assert!(
+            guard.contains("IS DISTINCT FROM '/var/lib/postgresql/16/main'"),
+            "the data directory must be pinned, or a clone passes: {guard}"
+        );
+        // Read through `pg_settings`, never `current_setting`: the parameter is
+        // restricted to `pg_read_all_settings`, and `current_setting` raises
+        // `permission denied to examine ...` for a role without it — inside the
+        // guard, that failure would abort a CORRECT paste.
+        assert!(
+            !guard.contains("current_setting('data_directory')")
+                && guard.contains("FROM pg_catalog.pg_settings WHERE name = 'data_directory'"),
+            "a restricted setting must degrade to NULL, not raise: {guard}"
         );
         // Unqualified, these resolve through the PASTING session's search_path.
         // Measured on a database configured `public, pg_catalog`, a shadowing
@@ -4672,8 +4762,8 @@ mod tests {
         );
         assert_eq!(
             guard.matches('%').count(),
-            8,
-            "four placeholders for the target endpoint, four for the session's: {guard}"
+            12,
+            "six placeholders for the target endpoint, six for the session's: {guard}"
         );
 
         // Over a Unix socket the server reports neither, and the guard compares
@@ -4688,8 +4778,9 @@ mod tests {
         );
         assert_eq!(
             socket.matches("IS DISTINCT FROM NULL").count(),
-            3,
-            "address, port and cluster are all unknown for a default endpoint: {socket}"
+            5,
+            "address, port, cluster, configured port and data directory are all \
+             unknown for a default endpoint: {socket}"
         );
 
         // The database name comes from the target connection, so a quote in it

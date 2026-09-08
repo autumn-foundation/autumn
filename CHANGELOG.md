@@ -112,7 +112,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction, so every following statement is refused and `COMMIT` rolls back.
   Identity includes the cluster's `system_identifier`: address and port are NULL
   for every Unix-socket connection, so two socket clusters holding the same
-  database name were indistinguishable without it. Its values are asked of the
+  database name were indistinguishable without it. It also includes the server's
+  configured `port` and its `data_directory`, because a *physical copy* of a
+  cluster — a replica, or a promoted staging clone — carries the identifier of
+  the cluster it was cloned from. Measured with a `pg_basebackup` clone of a live
+  cluster, both reached over `/tmp`: same database name, same identifier, both
+  address and port NULL, and the clone's block would have scrubbed the origin.
+  `current_setting('port')` answers over a socket where `inet_server_port()` is
+  NULL, and two postmasters on one machine cannot hold one data directory. The
+  data directory is restricted to `pg_read_all_settings`, so it is read out of
+  `pg_settings` rather than with `current_setting`, which raises `permission
+  denied to examine ...` for a role without it: the view omits the row, both
+  sides compare NULL, and an ordinary role loses the discriminator rather than
+  the run — verified with a plain `LOGIN` role, which still refuses the clone on
+  the port alone. Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and
   emitted after the session pins, so a `public.current_database()` in the pasting
