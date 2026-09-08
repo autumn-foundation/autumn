@@ -352,10 +352,16 @@ async fn repository_dependent_destroy_leaf_batch_profile() {
 
     let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder(config).build().expect("pool");
-    let post_repo = PgLedgerDdPostRepository { pool: pool.clone() };
+    let post_repo = PgLedgerDdPostRepository {
+        pool,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
+        __autumn_statement_timeout_ms: 0,
+        __autumn_slow_threshold: std::time::Duration::from_millis(500),
+        __autumn_route: None,
+    };
 
     reset_stats(&mut conn);
-    with_actor(None, async {
+    with_actor("system", async {
         post_repo
             .delete_by_id(VIRAL_POST_ID)
             .await
