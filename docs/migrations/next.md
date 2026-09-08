@@ -544,6 +544,24 @@ async fn update_note(note: Note) -> AutumnResult<&'static str> {
 This compiled — and, with `AppBuilder::idempotent()` turned on, was
 vulnerable to the stale-replay bypass above.
 
+This refusal fires when the aliased or shape-alike attribute is still
+present, unexpanded, at the point a route/guard macro (`#[post]`,
+`#[secured]`, `#[step_up]`, `#[throttle]`, `#[feature_flag]`) expands and
+scans for it — which is always true for the documented, natural attribute
+order shown above (`#[post(...)]` above `#[authz(...)]`, so `#[post]`
+expands first and sees the alias still raw below it). Written the other way
+around — the aliased or shape-alike attribute *above* the route macro — it
+expands first on its own and is gone from the attribute list by the time
+any Autumn macro runs, so this specific refusal never fires for it. That
+ordering doesn't reopen a gap, though: a genuine aliased `#[authorize]`
+positioned there still runs for real and leaves its own recognizable
+in-body check, which every route/guard macro's fallback body-scan already
+detects (the same mechanism that makes a *literal* `#[authorize]` above
+`#[post]` work correctly); an unrelated, non-Autumn attribute positioned
+there just expands as whatever it actually is and leaves nothing
+authorize-shaped behind, so the route is correctly treated as unguarded
+rather than falsely protected.
+
 **After (`{X.Z}`):**
 
 ```rust
