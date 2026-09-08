@@ -437,6 +437,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `on_thread_start` has fired. Documented in the getting-started guide under
   "Tuning the Tokio runtime".
 
+- **A TOML config-key drift gate for the docs corpus [no-plugin]:** the
+  `AUTUMN_*` gate (`scripts/check-docs-config.sh`, this same release) covers the
+  config a reader **sets**; this covers the config they **write** — a key in
+  `autumn.toml` itself. Same silent-failure
+  class, one layer over, and the two do not overlap: the env layer is written
+  field by field, so a schema leaf can exist with no environment spelling at all
+  (90 of 397 have none), and a `[section] key` in a fence is never an `AUTUMN_*`
+  name. `server.strict_config` and `autumn check --config` *do* reject an
+  unknown `autumn.toml` key — but strict_config is **off by default**, so on a
+  default app serde drops the key with no warning: the app boots, the setting
+  the reader believed they changed keeps its default, and nothing anywhere says
+  so.
+  `scripts/check-docs-toml.sh` resolves every key in every `autumn.toml` fence
+  in the reader-facing corpus (171 of the corpus's 251 TOML fences) against the
+  484-leaf schema, using the same walk semantics as the framework's own
+  `AutumnConfig::validate_toml` — including the rule that a section with no
+  schema entry (`jobs.queues`, `auth.oauth2`, `http.client.base_urls`,
+  `resilience.circuit_breaker.hosts`) is opaque, since those take arbitrary
+  valid children. It runs in CI's docs-only job beside the other three gates.
+  Its baseline found **4 live defects**, all fixed here: `[session] ttl_seconds`
+  in `wizards.md` under "consider increasing the session TTL" — there is no
+  `ttl_seconds`, the key is `session.max_age_secs`, and its default is `86400`,
+  so the documented "increase" to 3600 was also a 24x *decrease*; an impossible
+  `[app] profile = "production"` in `dev-error-overlay.md`, where `AutumnConfig`
+  has no `[app]` section and `profile` is `#[serde(skip)]` (it traces to ADR
+  0006, which proposed that opt-out; the implementation went another way and the
+  guide shipped the proposal); a duplicate `read_your_writes` key in
+  `cloud-native.md`, which makes the whole fence a TOML parse error under prose
+  telling the reader to add it; and `[logging] level` for the root that is
+  `[log]` on `examples/wiki/content/configuration.md`, which is `include_str!`'d
+  into the wiki example and served at `/docs/configuration`. The truth set needs
+  no regeneration: `autumn/tests/fixtures/schema_keys.snapshot`, which
+  `schema_keys_snapshot_guard` already asserts both ways against the compiled
+  schema, plus the workspace's `config_section()` calls (with Rust comments
+  stripped, so a call written in prose registers nothing) and the `[dev]` fields
+  parsed from `autumn-cli`'s own `DevConfig`. Values are deliberately out of
+  scope — only whether the key exists — with one exception: an identified
+  `autumn.toml` fence that does not **parse** is itself a gate failure, with no
+  waiver, since a fence is copyable and TOML that does not parse fails at boot
+  for whoever copies it. Archive trees (`docs/plans/`, `docs/adr/`,
+  `docs/design/`, `CHANGELOG.md`, …) are out of scope; their 13 out-of-schema
+  keys are accurate records of superseded proposals rather than instructions a
+  reader follows today.
 - **macros:** closes out the residual long tail of partial-patch (`Patch<T>`)
   update validation left after #1719/#1742/#1778/#1801 (issue #1751).
   `must_match` — like `custom`, `ip` on `Option<_>` fields, and
