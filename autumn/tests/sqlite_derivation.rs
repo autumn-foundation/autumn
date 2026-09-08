@@ -664,7 +664,7 @@ async fn status_reports_state_and_recompute_clears_the_drift() {
         .expect("inflate");
 
     let drifted = derivation_status(&mut conn).await.expect("status");
-    assert_eq!(drifted.len(), 2, "both derivations are reported");
+    assert_eq!(drifted.len(), 3, "every derivation is reported");
     let count = drifted
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)
