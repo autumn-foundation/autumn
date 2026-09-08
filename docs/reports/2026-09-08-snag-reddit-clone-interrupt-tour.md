@@ -64,7 +64,13 @@ session, since Docker is unavailable in this sandbox too — ~15 min build,
 
 - **`POST /submit` under true concurrency.** Five identical POST requests
   (same session cookie, same CSRF token, same title/body/subreddit_id) fired
-  from one synchronization point (`for i in 1..5; do curl ... & done; wait`)
+  from one synchronization point (`for i in $(seq 1 5); do curl ... & done;
+  wait` — note the `$(seq 1 5)`/brace-expansion is load-bearing: a bare
+  `for i in 1..5` is one literal word in POSIX `sh`/`bash` and launches a
+  single request, not five — flagged by an automated PR reviewer
+  (`chatgpt-codex-connector`) on an earlier revision of this report that
+  mistranscribed the command that way; the session's actual commands used
+  `$(seq 1 5)` throughout, confirmed against the session transcript)
   all returned `303` — all five succeeded, none replayed, none conflicted.
   Queried directly: **5 distinct `posts` rows**, same title, slugs
   `double-click-race-test` through `-5` (the `unique_slug`/retry-on-conflict
