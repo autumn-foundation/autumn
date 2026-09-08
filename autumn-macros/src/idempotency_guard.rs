@@ -31,12 +31,10 @@ pub fn should_own_replay(input_fn: &syn::ItemFn) -> bool {
 }
 
 fn has_pending_authorize_attr(input_fn: &syn::ItemFn) -> bool {
-    input_fn.attrs.iter().any(|attr| {
-        attr.path()
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "authorize")
-    })
+    input_fn
+        .attrs
+        .iter()
+        .any(crate::authorize::attr_is_authorize_shaped)
 }
 
 fn block_has_generated_replay_guard(block: &Block) -> bool {

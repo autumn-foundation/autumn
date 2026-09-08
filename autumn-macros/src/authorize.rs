@@ -381,6 +381,42 @@ pub fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArg
     Ok(parsed)
 }
 
+/// Whether `attr` is `#[authorize(...)]`, spelled either under its real name
+/// or through a `use ::autumn_web::authorize as X;` alias — which a proc
+/// macro cannot resolve to `"authorize"` by name, since attribute macros are
+/// only ever handed the tokens of the item they annotate, never the
+/// enclosing module's `use` declarations (issue: gate-ownership and
+/// idempotency-replay-layer detection silently missed an aliased
+/// `#[authorize]`, letting a stacked `#[secured]`/`#[step_up]`/`#[throttle]`
+/// gate — or, with none of those stacked, the standalone
+/// `IdempotencyReplayLayer` — serve a cached response without ever running
+/// `#[authorize]`'s policy re-check).
+///
+/// Falls back to parsing `attr`'s argument tokens through `#[authorize]`'s
+/// own grammar (the same parser `authorize_macro` itself uses): only a
+/// genuine `#[authorize(...)]` — or a hypothetical unrelated attribute that
+/// happens to share its exact `"action", resource = Type[, from = ident]`
+/// shape — parses successfully with both the required `action` and
+/// `resource` present. A caller that treats a false positive here as "an
+/// authorize check might still run" only loses an optimization (the gate or
+/// outer layer stops serving a cached replay), never a security property, so
+/// this errs toward over-matching rather than under-matching.
+pub fn attr_is_authorize_shaped(attr: &syn::Attribute) -> bool {
+    if attr
+        .path()
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "authorize")
+    {
+        return true;
+    }
+    let syn::Meta::List(list) = &attr.meta else {
+        return false;
+    };
+    parse_with_leading_literal(list.tokens.clone())
+        .is_ok_and(|args| args.action.is_some() && args.resource.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

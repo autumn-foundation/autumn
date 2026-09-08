@@ -1054,13 +1054,7 @@ pub fn extract_authorize_bindings(input_fn: &syn::ItemFn) -> Vec<(String, String
     collect_authorize_markers_in_stmts(&input_fn.block.stmts, &mut bindings);
 
     for attr in &input_fn.attrs {
-        if attr.path().is_ident("authorize")
-            || attr
-                .path()
-                .segments
-                .last()
-                .is_some_and(|s| s.ident == "authorize")
-        {
+        if crate::authorize::attr_is_authorize_shaped(attr) {
             bindings.extend(authorize_binding_from_attr(attr));
         }
     }

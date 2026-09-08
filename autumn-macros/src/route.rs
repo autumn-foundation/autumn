@@ -609,12 +609,11 @@ fn build_handler_expr(
 }
 
 fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
-    input_fn.attrs.iter().any(|attr| {
-        attr.path()
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "authorize")
-    }) || block_has_replay_guard(&input_fn.block)
+    input_fn
+        .attrs
+        .iter()
+        .any(crate::authorize::attr_is_authorize_shaped)
+        || block_has_replay_guard(&input_fn.block)
         || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
 }
 
