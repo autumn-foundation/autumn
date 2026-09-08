@@ -671,33 +671,19 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         // for `String`, `bool` and the numerics, where the stakes are lower: a
         // colliding `String` would have to be a non-string-serializing type of
         // that exact name.)
-        return quote! {{
-            match ::autumn_web::openapi::registered_derived_schema(
-                ::core::any::type_name::<#ty>()
-            ) {
-                ::core::option::Option::Some(__derived) => __derived,
-                ::core::option::Option::None => {
-                    let __identity = ::core::any::type_name::<#ty>();
-                    let __is_external_scalar = __identity.starts_with("chrono::")
-                        || __identity.starts_with("uuid::");
-                    if __is_external_scalar {
-                        let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
-                        __scalar.insert("type".to_owned(), #json_type.into());
-                        #format_insert
-                        #description_insert
-                        ::autumn_web::reexports::serde_json::Value::Object(__scalar)
-                    } else {
-                        // Same full-identity `$ref` shape the fallback below
-                        // emits, so the finalize collision index can rewrite it.
-                        let __ref_path = ::std::format!(
-                            "#/components/schemas/{}",
-                            __identity
-                        );
-                        ::autumn_web::reexports::serde_json::json!({ "$ref": __ref_path })
-                    }
-                }
-            }
-        }};
+        return emit_identity_guarded(
+            ty,
+            &quote! {
+                __identity.starts_with("chrono::") || __identity.starts_with("uuid::")
+            },
+            &quote! {{
+                let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
+                __scalar.insert("type".to_owned(), #json_type.into());
+                #format_insert
+                #description_insert
+                ::autumn_web::reexports::serde_json::Value::Object(__scalar)
+            }},
+        );
     }
 
     crate::api_doc::primitive_json_type(&name).map_or_else(
@@ -716,7 +702,27 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
             }}
         },
         |json_type| {
-            quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }
+            // Guarded like every other last-segment table. `String` is the
+            // realistic collision — it is a std type, not a language primitive,
+            // so `struct String { .. }` in an application is ordinary code and
+            // used to be advertised as a JSON string however it serialized. The
+            // language primitives are listed too so the rule has no exceptions
+            // to remember; their `type_name` is just the bare name.
+            let expected: &[&str] = match json_type {
+                "string" => &["alloc::string::String", "str", "&str"],
+                "boolean" => &["bool"],
+                "number" => &["f32", "f64"],
+                _ => &[
+                    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize",
+                ],
+            };
+            emit_identity_guarded(
+                ty,
+                &quote! { [#(#expected),*].contains(&__identity) },
+                &quote! {
+                    ::autumn_web::reexports::serde_json::json!({ "type": #json_type })
+                },
+            )
         },
     )
 }
@@ -739,7 +745,55 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// description is less specific but true. `NaiveDate` keeps `date`, whose RFC
 /// 3339 production (`full-date`) has no offset to begin with, and `DateTime<Tz>`
 /// keeps `date-time` because chrono does write an offset for it.
-/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?
+/// Emit a runtime-guarded mapping for a type matched by its LAST PATH SEGMENT.
+///
+/// Every table in this module matches on the last segment, because a proc macro
+/// sees only the tokens as written and `use serde_json::Value;` is the ordinary
+/// spelling. A name match is therefore a HYPOTHESIS, not a fact: an application
+/// type of the same name is indistinguishable at expansion time.
+///
+/// So the emitted code checks two things at runtime before committing to the
+/// mapping, and falls back to the full-identity `$ref` otherwise:
+///
+///   1. The derived-schema inventory — a colliding type carrying
+///      `#[derive(OpenApiSchema)]` resolves to its own real schema.
+///   2. `type_name`, against the genuine type's fully-qualified path — which
+///      catches the colliding type that derives NOTHING, where check (1) has
+///      nothing to find and silently says "not a collision".
+///
+/// Both checks are needed: (1) alone let an underived `domain::Uuid` be
+/// advertised as a uuid string, and (2) alone would ignore an application type
+/// that had correctly registered itself. Written once here so a new table
+/// cannot be added with only half the guard (issue #802).
+fn emit_identity_guarded(
+    ty: &syn::Type,
+    identity_predicate: &TokenStream,
+    matched: &TokenStream,
+) -> TokenStream {
+    quote! {{
+        match ::autumn_web::openapi::registered_derived_schema(
+            ::core::any::type_name::<#ty>()
+        ) {
+            ::core::option::Option::Some(__derived) => __derived,
+            ::core::option::Option::None => {
+                let __identity = ::core::any::type_name::<#ty>();
+                if #identity_predicate {
+                    #matched
+                } else {
+                    // Same full-identity `$ref` the general fallback emits, so
+                    // the finalize collision index can rewrite it.
+                    let __ref_path = ::std::format!(
+                        "#/components/schemas/{}",
+                        __identity
+                    );
+                    ::autumn_web::reexports::serde_json::json!({ "$ref": __ref_path })
+                }
+            }
+        }
+    }}
+}
+
+/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?
 ///
 /// Matched on the LAST PATH SEGMENT for the same reason the scalar table is: a
 /// proc macro sees only the tokens as written, and `use serde_json::Value;` is
@@ -757,16 +811,15 @@ fn is_serde_json_value(name: &str) -> bool {
 /// some rows. Emitting only a description leaves the schema unconstrained,
 /// which is the honest answer and is true of BOTH directions (issue #802).
 fn unconstrained_json_tokens(ty: &syn::Type) -> TokenStream {
-    quote! {{
-        match ::autumn_web::openapi::registered_derived_schema(
-            ::core::any::type_name::<#ty>()
-        ) {
-            ::core::option::Option::Some(__derived) => __derived,
-            ::core::option::Option::None => ::autumn_web::reexports::serde_json::json!({
+    emit_identity_guarded(
+        ty,
+        &quote! { __identity == "serde_json::value::Value" },
+        &quote! {
+            ::autumn_web::reexports::serde_json::json!({
                 "description": "Arbitrary JSON: an object, array, string, number, boolean or null.",
-            }),
-        }
-    }}
+            })
+        },
+    )
 }
 
 fn scalar_json_schema(

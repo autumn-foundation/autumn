@@ -499,28 +499,55 @@ fn an_optional_colliding_value_still_gets_its_null_branch() {
 
 // ── A scalar name collision must be verified, not assumed (issue #802) ─
 
-/// An application type whose last path segment is `Uuid` but which serializes
-/// as an OBJECT, and which derives no schema of its own.
-#[allow(
-    dead_code,
-    reason = "the fields exist so the derive has a shape to describe; nothing reads them"
-)]
-pub struct Uuid {
-    pub raw: String,
-}
+/// The colliding fixtures live in their own module: defining `String` at file
+/// scope would shadow the real one for every other test here.
+mod collision {
+    /// Last segment `Uuid`, serializes as an object, derives nothing.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct Uuid {
+        pub raw: ::std::string::String,
+    }
 
-/// Written as the bare `Uuid`, exactly as a colliding import would be.
-// `uuid::Uuid` carries no serde impls in this crate's feature set, so the
-// fixture derives the schema alone — which is all this test exercises.
-#[derive(autumn_web::openapi::OpenApiSchema)]
-#[allow(
-    dead_code,
-    reason = "the fields exist so the derive has a shape to describe; nothing reads them"
-)]
-pub struct HoldsCollidingUuid {
-    pub id: Uuid,
-    /// The genuine external scalar, for contrast.
-    pub real: uuid::Uuid,
+    /// Last segment `Value`, derives nothing.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct Value {
+        pub inner: i64,
+    }
+
+    /// Last segment `String`. `String` is a std type, not a language primitive,
+    /// so this is ordinary application code.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct String {
+        pub raw: i64,
+    }
+
+    // `uuid::Uuid` carries no serde impls in this crate's feature set, so the
+    // fixture derives the schema alone — which is all these tests exercise.
+    // Every field below is written as the BARE name, exactly as a colliding
+    // import would be, so the macro sees the same tokens an application gives it.
+    #[derive(autumn_web::openapi::OpenApiSchema)]
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct HoldsCollisions {
+        pub id: Uuid,
+        pub payload: Value,
+        pub label: String,
+        /// The genuine external scalar, for contrast.
+        pub real: ::uuid::Uuid,
+        /// The genuine `String`, for contrast.
+        pub real_label: ::std::string::String,
+    }
 }
 
 /// The scalar table matches the LAST PATH SEGMENT, so a colliding application
@@ -530,7 +557,7 @@ pub struct HoldsCollidingUuid {
 /// generated client fail to decode every response carrying it.
 #[test]
 fn a_colliding_scalar_name_is_not_inlined_as_a_scalar() {
-    let schema = <HoldsCollidingUuid as autumn_web::openapi::OpenApiSchema>::schema();
+    let schema = <collision::HoldsCollisions as autumn_web::openapi::OpenApiSchema>::schema();
 
     let colliding = &schema["properties"]["id"];
     assert!(
@@ -550,6 +577,41 @@ fn a_colliding_scalar_name_is_not_inlined_as_a_scalar() {
     let real = &schema["properties"]["real"];
     assert_eq!(real["type"], "string", "{real}");
     assert_eq!(real["format"], "uuid", "{real}");
+}
+
+/// Round 21 guarded the chrono/uuid scalar table and left the two SIBLING
+/// last-segment tables — `serde_json::Value` and `primitive_json_type` — with
+/// the identical hole, which is the "fixed one site of three" shape this branch
+/// has repeated. All three now share `emit_identity_guarded`, and this pins each
+/// remaining one in both directions.
+#[test]
+fn every_last_segment_table_verifies_identity() {
+    let schema = <collision::HoldsCollisions as autumn_web::openapi::OpenApiSchema>::schema();
+
+    // An application `Value` that derives nothing must NOT be published as
+    // arbitrary JSON — that would pass `--strict` while a client still gets
+    // `unknown`.
+    let payload = &schema["properties"]["payload"];
+    assert!(
+        payload["$ref"]
+            .as_str()
+            .is_some_and(|r| r.contains("Value")),
+        "an underived application `Value` falls through to a $ref: {payload}"
+    );
+
+    // An application `String` that derives nothing must NOT be published as a
+    // JSON string — it serializes as an object here.
+    let label = &schema["properties"]["label"];
+    assert!(
+        label["$ref"].as_str().is_some_and(|r| r.contains("String")),
+        "an underived application `String` falls through to a $ref: {label}"
+    );
+
+    // ...while the genuine `String` still maps to a JSON string.
+    assert_eq!(
+        schema["properties"]["real_label"]["type"], "string",
+        "the real String must keep its mapping: {schema}"
+    );
 }
 
 // ── New* datetime matches its own deserializer (issue #802) ────────────
