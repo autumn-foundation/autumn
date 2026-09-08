@@ -11,11 +11,12 @@
 # (dropped silently), and `scripts/check-docs-orphans.sh` asserts the page can
 # be reached at all. Nothing gated the thing the guide is mostly MADE of: Rust.
 #
-# The reader-facing corpus carries 874 `rust` fences naming 1,218
-# `autumn_web::…` paths across 389 distinct spellings — a larger copy-surface
-# than the env layer (689 occurrences) and the `autumn.toml` layer (172 fences)
-# combined. A renamed or never-shipped item leaves behind a line that looks
-# exactly like a working one, and nothing in the tree could tell the difference.
+# The reader-facing corpus names 1,495 `autumn_web::…` paths — 864 of them
+# inside `rust` fences, the rest in prose a reader reads as authoritative — a
+# larger copy-surface than the env layer (689 occurrences) and the `autumn.toml`
+# layer (172 fences) combined. A renamed or never-shipped item leaves behind a
+# line that looks exactly like a working one, and nothing in the tree could tell
+# the difference.
 #
 # WHERE IT SITS ON THE VISIBILITY SCALE: both ends of it, which is the reason
 # to gate the whole surface rather than the import lines alone.
@@ -50,7 +51,9 @@
 #   1. Every `autumn_web::a::b::C` path a reader-facing page names resolves
 #      through the crate's real module tree to an item that exists — including
 #      when the page writes it brace-grouped (`autumn_web::{get, post}`), which
-#      is how most import lines in the guide are written.
+#      is how most import lines in the guide are written — including the 14
+#      groups that nest (`storage::{BlobStoreState, variant::{Transform, …}}`)
+#      or run across lines, whose symbols a line-at-a-time reader never sees.
 #   2. Resolution follows what Rust actually does, not what the source looks
 #      like, because a documented path is almost never a path to where the item
 #      is DEFINED:
@@ -69,6 +72,13 @@
 #        - paths that leave the crate into a sibling in this workspace
 #          (`autumn_macros`, `autumn_edge`, `autumn_search`), which is where
 #          every attribute macro a handler is decorated with actually lives.
+#   3. VISIBILITY, which is the difference between an item existing and a reader
+#      being able to name it. Only bare `pub` counts: `autumn/src/lib.rs` has 49
+#      `pub(crate)`/`pub(super)` modules, and a path through one is E0603 in the
+#      reader's crate however public the item inside it is. `route` is
+#      `pub(crate) mod` while `Route` is re-exported at the crate root, so
+#      `::autumn_web::Route` is right and `::autumn_web::route::Route` — which
+#      `macro-transparency.md` showed as the macro's own output — is not.
 #
 # WHAT IT DELIBERATELY DOES NOT CHECK:
 #   - Anything past the first item segment. `AutumnError::not_found_msg` is
@@ -79,7 +89,7 @@
 #     `autumn_web::PreEscaped` (maud) and `autumn_web::db::Pool` (diesel) are
 #     real re-exports of crates whose source is not in this tree, so the gate
 #     records them as OPAQUE and says so rather than pretending to have checked
-#     them. 38 of the 1,218 occurrences land here; `--list` prints all of them,
+#     them. 48 of the 1,495 occurrences land here; `--list` prints all of them,
 #     because an opaque count that grows quietly is how a gate goes hollow.
 #   - Feature gates. The surface is read as a superset with every `#[cfg]`
 #     ignored, so a path that only exists under `--features ws` still resolves.
@@ -95,17 +105,32 @@
 # and nothing to keep in sync — a rename lands in the same commit as the
 # surface it renames, which is the property that makes this gate cheap to keep.
 #
-# WAIVER — one rule, not a list. A path quoted inside a COMPILER ERROR MESSAGE
-# is being shown as broken on purpose: `docs/migrations/TEMPLATE.md` and
-# `docs/migrations/next.md` both carry the migration-guide cheat-sheet row
+# WAIVERS — rules, not a list of paths. A page SHOWS a path as often as it tells
+# someone to write one, and in output a module path is a label to read rather
+# than a line to copy. Two shapes are read as output:
 #
-#     | `error[E0432]: unresolved import `autumn_web::foo`` | … | `use autumn_web::bar;` |
+#   - A line carrying a compiler error code. `docs/migrations/TEMPLATE.md` and
+#     `docs/migrations/next.md` both carry the migration cheat-sheet row
 #
-# whose entire job is to display a path that does not resolve. So a line
-# carrying an `error[E1234]` code is read as illustrating a failure rather than
-# recommending a path, and its occurrences are counted as waived rather than
-# suppressed by name. A named waiver list would have to grow every time a
-# migration guide quotes a real rename; this rule does not.
+#       | `error[E0432]: unresolved import `autumn_web::foo`` | … | `use autumn_web::bar;` |
+#
+#     whose entire job is to display a path that does not resolve.
+#   - A log line (`INFO`, `WARN`, …). The path in one is the tracing TARGET that
+#     emitted it — the module's real position in the crate, routinely a private
+#     one. `docs/guide/bot-protection.md` quotes the crate's own startup log,
+#     `INFO  autumn_web::router: bot_protection provider=…`, and `router` is
+#     `pub(crate) mod`: correct as output, unwritable as a path.
+#
+# A third shape is not a path claim at all and is dropped before resolution
+# rather than waived: a brace group containing `(`. A `use` group never does,
+# and the skill's api-reference writes
+# `autumn_web::widgets::{localized_path(path, locale), locale_switcher(path,
+# current_locale, …)}` — prose listing SIGNATURES. Splitting that on commas
+# invents `autumn_web::widgets::current_locale` out of an argument name, so the
+# module prefix is kept as the claim and the group is discarded.
+#
+# All three are rules because a named list would have to grow every time a guide
+# quotes a real rename or a real log line; these do not.
 #
 # USAGE:
 #   scripts/check-docs-symbols.sh              # gate the corpus
@@ -141,12 +166,18 @@ CRATES = {
 
 # ------------------------------------------------------------------ parsing
 
+# Bare `pub` ONLY. `pub(crate)`, `pub(super)` and `pub(in …)` are not visible to
+# a reader's crate, so an item or module carrying one cannot appear in a path a
+# reader writes. `autumn/src/lib.rs` has 49 restricted modules, and treating
+# them as public blessed `::autumn_web::route::Route` in macro-transparency.md
+# — `route` is `pub(crate) mod`, so that path is E0603 downstream even though
+# `Route` itself is re-exported at the crate root.
 PUB_ITEM = re.compile(
-    r'^[ \t]*pub(?:\s*\([^)]*\))?\s+'
+    r'^[ \t]*pub(?!\s*\()\s+'
     r'(?:async\s+|unsafe\s+|extern\s+"[^"]*"\s+|const\s+)*'
     r'(?:struct|enum|trait|fn|type|const|static|union)\s+([a-zA-Z_]\w*)', re.M)
 PUB_MOD_DECL = re.compile(
-    r'^[ \t]*pub(?:\s*\([^)]*\))?\s+mod\s+([a-zA-Z_]\w*)\s*;', re.M)
+    r'^[ \t]*pub(?!\s*\()\s+mod\s+([a-zA-Z_]\w*)\s*;', re.M)
 # Every `mod x;`, public or not. A private module is not itself public surface,
 # but it is routinely the FILE a public facade re-exports out of, so the tree
 # has to contain it or the re-export target cannot be followed.
@@ -155,7 +186,7 @@ ANY_MOD_DECL = re.compile(
 PUB_USE = re.compile(
     r'^[ \t]*pub(?:\s*\([^)]*\))?\s+use\s+(.+?);[ \t]*$', re.M | re.S)
 INLINE_MOD = re.compile(
-    r'^([ \t]*)(pub(?:\s*\([^)]*\))?\s+)?mod\s+([a-zA-Z_]\w*)\s*\{', re.M)
+    r'^([ \t]*)(pub(\s*\([^)]*\))?\s+)?mod\s+([a-zA-Z_]\w*)\s*\{', re.M)
 MACRO_RULES = re.compile(r'macro_rules!\s+([a-zA-Z_]\w*)')
 # A derive macro is EXPORTED under the name in the attribute, which is not the
 # name of the function carrying it (`#[proc_macro_derive(OpenApiSchema)] pub fn
@@ -193,7 +224,10 @@ def split_inline_mods(text):
                     break
             i += 1
         out.append(text[pos:m.start()])
-        mods.append((m.group(3), bool(m.group(2)), text[brace + 1:i]))
+        # Bare `pub` only: group(2) is the `pub…` prefix, group(3) its
+        # `(crate)`/`(super)` restriction when present.
+        is_pub = bool(m.group(2)) and not m.group(3)
+        mods.append((m.group(4), is_pub, text[brace + 1:i]))
         pos = i + 1
     out.append(text[pos:])
     return ''.join(out), mods
@@ -457,9 +491,12 @@ class Surface:
         segs = path.split('::')
         c, cur = self.crates['autumn_web'], ()
         for i, s in enumerate(segs):
-            if (cur + (s,)) in c.mods:
-                cur = cur + (s,)
-                continue
+            # Deliberately NOT the structural `(cur + (s,)) in c.mods` shortcut
+            # used for re-export targets below: that tree contains private and
+            # `pub(crate)` modules (it has to, to follow a facade re-export out
+            # of one), and walking it here blesses a path a reader's crate
+            # cannot name. Only what `names_of` publishes — bare-`pub` items and
+            # submodules, plus re-exports — is externally nameable.
             names = self.names_of(c, cur)
             v = names.get(s)
             if v is None:
@@ -470,6 +507,9 @@ class Surface:
                 return 'opaque'
             if isinstance(v, tuple) and v[0] == 'modref':
                 c, cur = self.crates[v[1]], v[2]
+                continue
+            if v == 'mod':
+                cur = cur + (s,)
                 continue
             # A leaf item: everything after it is an associated item, which
             # this gate does not claim to check.
@@ -482,14 +522,14 @@ class Surface:
         segs = path.split('::')
         c, cur = self.crates['autumn_web'], ()
         for s in segs:
-            if (cur + (s,)) in c.mods:
-                cur = cur + (s,)
-                continue
             names = self.names_of(c, cur)
             if s in names:
                 v = names[s]
                 if isinstance(v, tuple) and v[0] == 'modref':
                     c, cur = self.crates[v[1]], v[2]
+                    continue
+                if v == 'mod':
+                    cur = cur + (s,)
                     continue
                 return None
             pool = [n for n in names if not n.startswith('*')]
@@ -522,13 +562,81 @@ def corpus(root):
             if f and (reader_facing(f) or f.endswith('.md.tmpl'))]
 
 
-# `autumn_web::` followed by a path, optionally brace-grouped at any depth --
-# `autumn_web::{get, post}` and `autumn_web::db::{TxOptions, IsolationLevel}`
-# are how most import lines in the guide are actually written.
-PATH_RE = re.compile(
-    r'\bautumn_web::((?:[a-zA-Z_]\w*::)*(?:\{[^{}]*\}|[a-zA-Z_]\w*))')
-# A line quoting a compiler error is displaying a path that does NOT resolve.
-ILLUSTRATIVE = re.compile(r'error\[E\d{4}\]')
+PREFIX_RE = re.compile(r'\bautumn_web::')
+IDENT_RE = re.compile(r'[a-zA-Z_]\w*')
+# A path claim, once braces are expanded: identifiers separated by `::` and
+# nothing else. The guide also writes brace groups that are PROSE rather than
+# imports — `autumn_web::widgets::{localized_path(path, locale),
+# locale_switcher(path, current_locale, …)}` in the skill's api-reference lists
+# signatures, not names — and an expansion of one is not a path anybody can
+# write. Those are skipped rather than reported.
+PATH_SHAPE = re.compile(r'[a-zA-Z_]\w*(?:::[a-zA-Z_]\w*)*\Z')
+# Lines that SHOW a path rather than tell a reader to write one. Both are
+# output, and in output a module path is a label, not something to copy.
+#   - a compiler error quotes a path precisely because it does not resolve
+#     (`docs/migrations/TEMPLATE.md`'s migration cheat-sheet row exists to
+#     display one);
+#   - a log line names the tracing target that emitted it, which is the
+#     module's real position in the crate and routinely a private one --
+#     `INFO  autumn_web::router: bot_protection provider=…` in
+#     `docs/guide/bot-protection.md` is the crate's own log output, and
+#     `router` is `pub(crate)`.
+# Counted as waived rather than suppressed by name, so the number stays visible.
+ILLUSTRATIVE = re.compile(
+    r'error\[E\d{4}\]|^\s*(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR)\b')
+
+
+def scan_paths(text):
+    """Yield (raw path spelling, offset) for every `autumn_web::…` in `text`.
+
+    Scans the whole document rather than line by line, and matches braces by
+    counting them, because the guide writes grouped imports BOTH nested
+    (`storage::{BlobStoreState, variant::{Transform, VariantBudget}}`) and
+    across lines (`push::{\\n    MemoryPushSubscriptionStore, …\\n}`). A
+    single-line `\\{[^{}]*\\}` pattern silently degrades to the module prefix on
+    all 14 of those in this corpus: the symbols a reader copies off them were
+    never audited at all, which is the failure this gate exists to prevent.
+    """
+    for m in PREFIX_RE.finditer(text):
+        i, parts = m.end(), []
+        while True:
+            if i < len(text) and text[i] == '{':
+                depth, j = 0, i
+                while j < len(text):
+                    if text[j] == '{':
+                        depth += 1
+                    elif text[j] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if j >= len(text):
+                    break          # unbalanced; not a path claim
+                group = text[i:j + 1]
+                if '(' in group:
+                    # Not an import list: a `use` group never contains
+                    # parentheses. The skill's api-reference writes
+                    # `autumn_web::widgets::{localized_path(path, locale),
+                    # locale_switcher(path, current_locale, …)}` -- prose
+                    # listing SIGNATURES. Splitting it on commas invents
+                    # `autumn_web::widgets::current_locale` out of an argument
+                    # name. Keep the module prefix, which is a real claim, and
+                    # drop the group.
+                    break
+                parts.append(group)
+                i = j + 1
+                break
+            im = IDENT_RE.match(text, i)
+            if not im:
+                break
+            parts.append(im.group(0))
+            i = im.end()
+            if text[i:i + 2] == '::':
+                i += 2
+                continue
+            break
+        if parts:
+            yield '::'.join(parts), m.start()
 
 
 def occurrences(root, files):
@@ -538,16 +646,25 @@ def occurrences(root, files):
         full = os.path.join(root, rel)
         try:
             with open(full, encoding='utf8', errors='replace') as fh:
-                lines = fh.readlines()
+                text = fh.read()
         except OSError:
             continue
-        for n, line in enumerate(lines, 1):
+        for raw, offset in scan_paths(text):
+            line_no = text.count('\n', 0, offset) + 1
+            line_end = text.find('\n', offset)
+            line = text[text.rfind('\n', 0, offset) + 1:
+                        line_end if line_end != -1 else len(text)]
             waived = bool(ILLUSTRATIVE.search(line))
-            for m in PATH_RE.finditer(line):
-                for path in expand_braces(m.group(1)):
-                    path = path.strip()
-                    if path:
-                        found.append((path, rel, n, waived))
+            spec = re.sub(r'\s+', ' ', raw).strip()
+            spec = re.sub(r'\s*::\s*', '::', spec)
+            spec = re.sub(r'\s*([{},])\s*', r'\1', spec)
+            for path in expand_braces(spec):
+                path = path.strip()
+                m = re.match(r'^(.*?)\s+as\s+\w+$', path)
+                if m:
+                    path = m.group(1)
+                if path and PATH_SHAPE.match(path):
+                    found.append((path, rel, line_no, waived))
     return found
 
 
@@ -581,7 +698,7 @@ def main():
     print(f'  resolved: {ok}')
     print(f'  opaque (re-export of a crate outside this workspace): '
           f'{sum(opaque.values())}')
-    print(f'  waived (quoted inside a compiler error message): {waived}')
+    print(f'  waived (shown as output: compiler error or log line): {waived}')
     print('')
     if dead:
         for (path, rel, line, broke, near) in sorted(dead,
@@ -648,6 +765,8 @@ pub mod lock;
 pub mod prelude;
 pub mod openapi;
 pub mod storage;
+pub(crate) mod route;
+pub use route::Route;
 pub use fake_macros::get;
 pub mod reexports {
     pub use axum;
@@ -657,7 +776,10 @@ pub mod include_dir {
     pub use ::include_dir::*;
 }
 ''')
-        _write(tmp, 'fake/src/app.rs', 'pub struct AppBuilder;\npub struct ApiVersion;\n')
+        _write(tmp, 'fake/src/app.rs',
+               'pub struct AppBuilder;\npub struct ApiVersion;\n'
+               'pub(crate) struct InternalOnly;\n')
+        _write(tmp, 'fake/src/route.rs', 'pub struct Route;\n')
         # A public facade re-exporting out of a PRIVATE module.
         _write(tmp, 'fake/src/ui/mod.rs',
                'mod widgets_css;\npub use widgets_css::WIDGETS_CSS_PATH;\n')
@@ -741,6 +863,16 @@ macro_rules! declassify { () => {} }
               s.resolve('AutumnError::not_found_msg'), 'ok')
         check('suggestion for a near-miss', s.suggest('app::AppBuildr'),
               'AppBuilder')
+        # A `pub(crate) mod` is not nameable from a reader's crate even when the
+        # items inside it are `pub` and re-exported at the crate root. This
+        # blessed `::autumn_web::route::Route` until the gate distinguished bare
+        # `pub` from a restricted one.
+        check('path through a pub(crate) module is dead',
+              s.resolve('route::Route'), 'dead:route')
+        check('…while its crate-root re-export resolves',
+              s.resolve('Route'), 'ok')
+        check('pub(crate) item is not externally nameable',
+              s.resolve('app::InternalOnly'), 'dead:app::InternalOnly')
 
         # -- brace expansion, as the guide actually writes imports ------------
         check('brace group', sorted(expand_braces('a::{b,c}')), ['a::b', 'a::c'])
@@ -813,9 +945,13 @@ Fix each one where it lives:
                       (`autumn_web::http::Client`, not
                       `autumn_web::http_client::Client`)
   - never existed  -> drop it, or name the item that does the job
-  - shown broken   -> a path quoted inside an `error[E1234]` message is already
-                      waived; if you are illustrating a failure, quote the
-                      compiler error with it
+  - shown, not written -> a path inside a compiler-error line or a log line is
+                      already waived as output; if you are illustrating a
+                      failure, quote the compiler error with it
+  - non-public     -> a `pub(crate)`/`pub(super)` module is E0603 for a reader
+                      even when the item inside is re-exported at the crate
+                      root: name the re-export (`::autumn_web::Route`, not
+                      `::autumn_web::route::Route`)
 
 Inspect what the gate read:  scripts/check-docs-symbols.sh --list
 EOF

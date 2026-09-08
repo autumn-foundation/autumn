@@ -340,10 +340,9 @@ jobs:
         # The four gates above cover the link a reader clicks, the command they
         # run, the variable they set and the config key they write. None of them
         # looks at what the guide is mostly MADE of: Rust. The reader-facing
-        # corpus carries 874 `rust` fences naming 1,436 `autumn_web::…` paths —
-        # a larger copy-surface than the env layer and the `autumn.toml` layer
-        # together — and nothing in the tree could tell a live path from a
-        # renamed one.
+        # corpus names 1,495 `autumn_web::…` paths — a larger copy-surface than
+        # the env layer and the `autumn.toml` layer together — and nothing in
+        # the tree could tell a live path from a renamed one.
         #
         # It catches both ends of the visibility scale, which is why gating the
         # whole surface beats gating import lines alone. Loud:
@@ -366,8 +365,11 @@ jobs:
         # private-facade ones, globs, `#[macro_export]` hoisting to the crate
         # root, inline `mod` blocks, proc-macro derive names, and hops into
         # sibling workspace crates), because a documented path is almost never
-        # a path to where the item is defined. Paths that leave the workspace
-        # are reported as OPAQUE and counted rather than guessed at.
+        # a path to where the item is defined. It also checks VISIBILITY: only
+        # bare `pub` counts, since a path through one of lib.rs's 49
+        # `pub(crate)` modules is E0603 in the reader's crate however public the
+        # item inside it is. Paths that leave the workspace are reported as
+        # OPAQUE and counted rather than guessed at.
         #
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.

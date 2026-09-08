@@ -172,15 +172,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
   variable they set (`check-docs-config.sh`) and the config key they write
   (`check-docs-toml.sh`). None of them looks at what the guide is mostly *made*
-  of. The reader-facing corpus carries 874 `rust` fences naming **1,436
-  `autumn_web::…` paths** — a larger copy-surface than the env layer (689
-  occurrences) and the `autumn.toml` layer (172 fences) together — and nothing
-  in the tree could tell a live path from a renamed one.
+  of. The reader-facing corpus names **1,495 `autumn_web::…` paths** — 864 of
+  them inside `rust` fences, the rest in prose a reader reads as authoritative
+  — a larger copy-surface than the env layer (689 occurrences) and the
+  `autumn.toml` layer (172 fences) together — and nothing in the tree could
+  tell a live path from a renamed one.
   `scripts/check-docs-symbols.sh` resolves every one of them against the crate
   sources, and it runs in CI's docs-only job beside the other four.
   It catches **both** ends of the visibility scale, which is the reason to gate
-  the whole surface rather than import lines alone. Its baseline found **2 live
-  defects**, one of each kind, both fixed here. Loud:
+  the whole surface rather than import lines alone. It found **3 live
+  defects**, all fixed here. Loud:
   `docs/guide/maintenance-mode.md` handed over
   `use autumn_web::middleware::{MaintenanceLayer, MaintenanceState};` where only
   the first name is there — `MaintenanceState` lives in
@@ -196,6 +197,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not exist (the crate root exports `AutumnError` and `AutumnResult`), and it
   **still built**. Nothing reported it, and the reader carried away the wrong
   name for the framework's error type with nothing anywhere to correct them.
+  And unnameable: `docs/guide/macro-transparency.md` showed the route macro
+  emitting `::autumn_web::route::Route`, but `route` is a `pub(crate) mod`, so
+  that path is E0603 in a reader's crate — the macro itself emits the crate-root
+  re-export `::autumn_web::Route`, which the same page already used correctly
+  forty lines further down.
   The truth set is the crate sources themselves — no snapshot to regenerate,
   because a rename lands in the same commit as the surface it renames.
   Resolution follows what Rust *does* rather than what the source looks like,
@@ -209,18 +215,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again, inline `mod x { … }` blocks, `#[proc_macro_derive(Name)]` exporting
   under its attribute's name rather than its function's, a leading `::` naming
   the external crate over a local module of the same name, and hops into sibling
-  workspace crates. Deliberately out of scope: anything past the first item
+  workspace crates. Visibility is part of resolution, not an afterthought: only
+  bare `pub` counts, because a path through one of `lib.rs`'s 49
+  `pub(crate)`/`pub(super)` modules is E0603 for a reader however public the
+  item inside it is. Grouped imports are matched by counting braces over the
+  whole document rather than per line, so the 14 groups that nest
+  (`storage::{BlobStoreState, variant::{Transform, …}}`) or run across lines
+  have their symbols audited instead of silently collapsing to the module
+  prefix. Deliberately out of scope: anything past the first item
   segment (`AutumnError::not_found_msg` is checked as far as `AutumnError`;
   associated items need type resolution, and guessing at them is how a gate
   starts reporting confident nonsense), feature gates (the surface is read as a
   superset so a path behind `--features ws` still resolves), and bare
   identifiers after a prelude glob. Paths that leave the workspace —
   `reexports::axum::…`, maud's `PreEscaped`, diesel's `db::Pool`: 57 of the
-  1,436 — are reported as **opaque** and counted rather than guessed at, because
-  an opaque count that grows quietly is how a gate goes hollow. One waiver rule,
-  not a list: a path quoted inside an `error[E1234]` message is being shown as
-  broken on purpose, which is what the migration-guide cheat-sheet row in
-  `docs/migrations/TEMPLATE.md` exists to do. 32 self-tests:
+  1,495 — are reported as **opaque** and counted rather than guessed at, because
+  an opaque count that grows quietly is how a gate goes hollow. Waivers are
+  rules, not a list of paths: a page *shows* a path as often as it tells someone
+  to write one, so a path inside a compiler-error line (the migration-guide
+  cheat-sheet row in `docs/migrations/TEMPLATE.md` exists to display one) or a
+  log line (`INFO  autumn_web::router: …` is the crate's own tracing target,
+  and `router` is private) is read as output. A brace group containing `(` is
+  not a path claim at all — the skill's api-reference lists *signatures* that
+  way — so its prefix is kept and the group dropped, rather than inventing
+  `autumn_web::widgets::current_locale` out of an argument name. 35 self-tests:
   `./scripts/check-docs-symbols.sh --self-test`.
 
 - **docs/ci:** the CLI drift gate (`scripts/check-docs-cli.sh`) now resolves
