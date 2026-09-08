@@ -1036,6 +1036,15 @@ pub async fn revisions(
         ));
     }
 
+    // A type registered `supports_revisions: false` has no history to show, and
+    // the editor hides the link — but a hidden link is not a closed route. This
+    // is the same 404 an unknown type gets.
+    if !content::type_supports_revisions(&post.post_type) {
+        return Err(AutumnError::not_found_msg(
+            "This content type does not keep revisions",
+        ));
+    }
+
     let history = content::revisions_for(&mut db, id).await?;
     let body = html! {
         p class="text-sm text-gray-500 mb-4" {
@@ -1109,6 +1118,12 @@ pub async fn restore(
     if !can_edit_post(user.role(), user.id, post.author_id, &post.status) {
         return Err(AutumnError::forbidden_msg(
             "You do not have permission to edit this content",
+        ));
+    }
+
+    if !content::type_supports_revisions(&post.post_type) {
+        return Err(AutumnError::not_found_msg(
+            "This content type does not keep revisions",
         ));
     }
 

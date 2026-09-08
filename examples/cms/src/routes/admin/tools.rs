@@ -345,6 +345,7 @@ pub async fn import(
 
     let mut imported = 0_usize;
     let mut skipped = 0_usize;
+    let mut orphaned = 0_i64;
     // (created id, post type, the slug AS WRITTEN IN THE FILE, parent slug).
     // The written slug is the key the file's `parent` references use; the row
     // may have been given a different one to avoid colliding with content
@@ -459,8 +460,17 @@ pub async fn import(
         };
         if let Some(parent_id) = parent_id
             && parent_id != *child_id
+            && !content::set_post_parent(&mut db, *child_id, parent_id).await?
         {
-            content::set_post_parent(&mut db, *child_id, parent_id).await?;
+            // `set_post_parent` applies the editor's own parent rules — a live
+            // row of the same type, no cycle, within `MAX_PAGE_DEPTH` — and
+            // declines rather than raising. A resolved-by-slug parent can fail
+            // any of them when importing into a partly-populated site, and
+            // writing the link anyway produced a child the resolver could not
+            // reach at its own canonical URL. The child lands at the top level
+            // instead, and the run says how often that happened rather than
+            // aborting half-restored.
+            orphaned += 1;
         }
     }
 
@@ -469,6 +479,14 @@ pub async fn import(
             h2 class="font-semibold mb-2" { "Import complete" }
             p class="text-sm text-gray-700" {
                 (imported) " imported, " (skipped) " already present."
+            }
+            @if orphaned > 0 {
+                p class="text-sm text-amber-700 mt-2" {
+                    (autumn_web::format::pluralize(orphaned, "item"))
+                    " could not keep its parent — the named parent is missing, \
+                     trashed, of another type, or already nested as deeply as \
+                     pages go. They were imported at the top level."
+                }
             }
             p class="mt-4" {
                 a href="/admin/tools" class="text-indigo-700 hover:underline text-sm" {

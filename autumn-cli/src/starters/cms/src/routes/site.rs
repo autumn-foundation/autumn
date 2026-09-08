@@ -74,6 +74,13 @@ impl FromRequestParts<AppState> for Repos {
     }
 }
 
+/// The most terms a sidebar widget renders.
+///
+/// A widget is a glance at the taxonomy, not a listing of it, and it renders on
+/// every public page — so the bound belongs in the query rather than in the
+/// template.
+const WIDGET_TERM_LIMIT: i64 = 50;
+
 impl Repos {
     /// Borrow a pooled connection for one query.
     pub async fn conn(
@@ -246,13 +253,20 @@ impl Repos {
         } else {
             Vec::new()
         };
+        // Bounded in SQL, and populated terms only. The sidebar renders on
+        // every public page, so an unbounded finder here made otherwise
+        // paginated pages cost the whole category table — and listed empty
+        // terms whose archives have nothing to show. `populated_terms` applies
+        // both the `post_count > 0` filter and the limit in the query.
         let categories = if needs(crate::theme::WidgetKind::Categories) {
-            self.terms.find_by_taxonomy("category".to_owned()).await?
+            let mut conn = self.conn().await?;
+            crate::content::populated_terms(&mut conn, "category", WIDGET_TERM_LIMIT).await?
         } else {
             Vec::new()
         };
         let tags = if needs(crate::theme::WidgetKind::TagCloud) {
-            self.terms.find_by_taxonomy("post_tag".to_owned()).await?
+            let mut conn = self.conn().await?;
+            crate::content::populated_terms(&mut conn, "post_tag", WIDGET_TERM_LIMIT).await?
         } else {
             Vec::new()
         };
@@ -321,17 +335,26 @@ impl Repos {
             };
             match self.posts.save(&attempt).await {
                 Ok(post) => return Ok(post),
-                // Only the bare-path index is retried: a `(post_type, slug)`
-                // clash or a primary-key conflict is a different problem and a
-                // suffix would not fix it.
+                // Both slug indexes are retried, because either can be the one
+                // a lost race reports. `ensure_unique_slug` picked a slug that
+                // was free when it looked; a concurrent create that took it
+                // first violates `idx_posts_type_slug` for a custom type and
+                // may report either index for a `post`/`page`. Re-running
+                // allocation is exactly the right response to both — the next
+                // pass finds the taken slug and returns the `-2`. A conflict on
+                // anything else (a primary key, say) is a different problem
+                // that a suffix would not fix, and still propagates.
                 Err(error)
                     if autumn_web::error::unique_violation_field(
                         &error,
-                        &[(
-                            "idx_posts_bare_path_slug",
-                            "slug",
-                            "That URL is already taken",
-                        )],
+                        &[
+                            (
+                                "idx_posts_bare_path_slug",
+                                "slug",
+                                "That URL is already taken",
+                            ),
+                            ("idx_posts_type_slug", "slug", "That URL is already taken"),
+                        ],
                     )
                     .is_some() =>
                 {

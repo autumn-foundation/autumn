@@ -139,8 +139,15 @@ pub async fn transition_status(db: &mut Db, post_id: i64, target: &str) -> Autum
             // failed guard is a 400 and nothing is written.
             let new_status = post.transition_status_to(&target)?;
 
-            post.record_revision(conn, &format!("Status: {} → {new_status}", post.status))
-                .await?;
+            // Same rule the editor's save path follows: a type registered
+            // `supports_revisions: false` gets no snapshot, from any path.
+            // Publishing, trashing, restoring and importing all land here, so
+            // leaving it out made the flag cosmetic — the link was hidden while
+            // the rows accumulated anyway.
+            if type_supports_revisions(&post.post_type) {
+                post.record_revision(conn, &format!("Status: {} → {new_status}", post.status))
+                    .await?;
+            }
 
             // Stamp the first publish date, and never move it afterwards — an
             // unpublish/republish cycle must not reorder the blog index.
@@ -331,10 +338,16 @@ pub async fn recount_terms_for_post_public(
 
 /// Rebuild one term's published-post count from ground truth.
 pub async fn recount_term(conn: &mut AsyncPgConnection, term_id: i64) -> AutumnResult<i64> {
+    // The same registered-type predicate the archive queries use. Counting rows
+    // of a `public: false` type made the number disagree with the archive it
+    // labels: the category widget advertised a count the visibility-aware term
+    // query could not produce a single post for, and the sitemap published the
+    // archive URL as populated when it renders empty.
     let count: i64 = post_terms::table
         .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
         .filter(post_terms::term_id.eq(term_id))
         .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(public_type_slugs()))
         .count()
         .get_result(conn)
         .await?;
@@ -863,6 +876,29 @@ pub fn is_public_type(post_type: &str) -> bool {
     crate::content_types::find_post_type(post_type).is_some_and(|registered| registered.public)
 }
 
+/// Whether a registered post type takes comments at all.
+///
+/// Separate from the row's `comment_status`: the flag is the *type's* answer
+/// and the column is the *item's*. A `page` registers `supports_comments:
+/// false`, so a row that somehow carries `comment_status = "open"` — a crafted
+/// editor submission, an import, a direct write — must still refuse comments.
+#[must_use]
+pub fn type_supports_comments(post_type: &str) -> bool {
+    crate::content_types::find_post_type(post_type)
+        .is_some_and(|registered| registered.supports_comments)
+}
+
+/// Whether a registered post type keeps revision history.
+///
+/// `supports_revisions: false` means no snapshots are written and none are
+/// reachable — not a flag the editor hides the link for while the storage grows
+/// anyway.
+#[must_use]
+pub fn type_supports_revisions(post_type: &str) -> bool {
+    crate::content_types::find_post_type(post_type)
+        .is_some_and(|registered| registered.supports_revisions)
+}
+
 #[must_use]
 pub fn public_type_slugs() -> Vec<String> {
     crate::content_types::all_post_types()
@@ -1276,15 +1312,77 @@ pub async fn validate_parent(
 }
 
 /// Re-parent a post. Used by the importer's ancestry pass.
-pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> AutumnResult<()> {
-    if would_create_cycle(db, post_id, parent_id).await? {
-        return Ok(());
+///
+/// Returns whether the link was applied. The importer resolves a parent by slug
+/// against rows already on the site, which can name a trashed row, a row of
+/// another type, or one already at `MAX_PAGE_DEPTH` — none of which the editor
+/// would accept. Writing the link anyway produced a child whose generated
+/// ancestry the resolver could not walk, so the imported page was unreachable
+/// at its own canonical URL.
+///
+/// Invalid links are skipped rather than raised: an import that aborts part-way
+/// leaves the site half-restored, which is worse than one page landing at the
+/// top level. The caller reports the count.
+pub async fn set_post_parent(db: &mut Db, post_id: i64, parent_id: i64) -> AutumnResult<bool> {
+    let post: Option<Post> = posts::table
+        .find(post_id)
+        .select(Post::as_select())
+        .first(&mut **db)
+        .await
+        .optional()?;
+    let Some(post) = post else {
+        return Ok(false);
+    };
+    if validate_parent(db, Some(post_id), &post.post_type, parent_id)
+        .await
+        .is_err()
+    {
+        return Ok(false);
     }
     diesel::update(posts::table.find(post_id))
         .set(posts::parent_id.eq(parent_id))
         .execute(&mut **db)
         .await?;
-    Ok(())
+    Ok(true)
+}
+
+/// Delete a comment and rebuild the post's approved-comment counter — in one
+/// transaction.
+///
+/// `comments.parent_id` cascades, so deleting a comment deletes its whole reply
+/// subtree. Decrementing by one for the row named in the request therefore left
+/// every approved descendant permanently included in the post's displayed
+/// count. The counter is recomputed from ground truth rather than adjusted by a
+/// delta, so it is right whatever the cascade removed.
+pub async fn delete_comment(db: &mut Db, comment_id: i64) -> AutumnResult<()> {
+    db.tx(move |conn| {
+        async move {
+            let comment: Comment = comments::table
+                .find(comment_id)
+                .select(Comment::as_select())
+                .first(conn)
+                .await
+                .map_err(AutumnError::not_found)?;
+
+            diesel::delete(comments::table.find(comment_id))
+                .execute(conn)
+                .await?;
+
+            let approved: i64 = comments::table
+                .filter(comments::post_id.eq(comment.post_id))
+                .filter(comments::status.eq("approved"))
+                .count()
+                .get_result(conn)
+                .await?;
+            diesel::update(posts::table.find(comment.post_id))
+                .set(posts::comment_count.eq(approved))
+                .execute(conn)
+                .await?;
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 /// One page of published, publicly-routable content matching a full-text query.

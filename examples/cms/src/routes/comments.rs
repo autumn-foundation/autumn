@@ -77,7 +77,10 @@ pub async fn render_thread(
     let thread = content::assemble_thread(&sorted, None, 0, &name_of);
     let views = content::to_comment_views(&thread);
 
-    let open = post.comment_status == "open";
+    // The type's flag as well as the row's column, so a row carrying a stale
+    // `comment_status = "open"` on a type that disabled comments neither offers
+    // the form nor claims the thread is open.
+    let open = post.comment_status == "open" && content::type_supports_comments(&post.post_type);
     let may_comment = open && (viewer.is_some() || settings.allow_guest_comments);
     let moderated = settings.comment_moderation;
 
@@ -198,7 +201,15 @@ fn comment_form(
 }
 
 /// Accept a comment.
+///
+/// Throttled per IP. With the shipped defaults — `allow_guest_comments = true`
+/// and no global limiter — this is an unauthenticated route that writes a row
+/// on every request, and the CSRF token guarding it is reusable. Moderation
+/// only changes a row's status, so a request loop grows storage without bound
+/// and buries the moderation queue; a per-address bound is the thing that stops
+/// it, and it belongs on the route rather than in an operator's checklist.
 #[post("/comments/{post_id}")]
+#[throttle(limit = 10, per = "1m", key = "ip")]
 pub async fn post_comment(
     repos: Repos,
     session: Session,
@@ -221,14 +232,24 @@ pub async fn post_comment(
     // not just the first. A signed-in caller is assigned `approved`
     // immediately, so accepting one here would inject visible discussion into
     // a thread the front end deliberately withholds.
-    let type_is_public = crate::content_types::find_post_type(&post.post_type)
-        .is_some_and(|registered| registered.public);
+    // `supports_comments` is asked alongside `comment_status`: the flag is the
+    // registered type's answer and the column is the row's. A `page` registers
+    // `supports_comments: false`, so a row that somehow carries
+    // `comment_status = "open"` — a crafted editor submission, an import, a
+    // direct write — must still refuse. A signed-in submission is approved
+    // immediately, so accepting one made `single_post` start rendering a thread
+    // on a type that explicitly disabled comments.
     let unlocked = !post.is_password_protected()
         || session
             .get(&format!("post_unlock_{}", post.id))
             .await
             .is_some_and(|stored| stored == post.password);
-    if !post.is_public() || !type_is_public || !unlocked || post.comment_status != "open" {
+    if !post.is_public()
+        || !content::is_public_type(&post.post_type)
+        || !content::type_supports_comments(&post.post_type)
+        || !unlocked
+        || post.comment_status != "open"
+    {
         return Err(AutumnError::forbidden_msg(
             "Comments are closed on this post",
         ));

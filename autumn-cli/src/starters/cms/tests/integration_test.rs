@@ -334,6 +334,14 @@ async fn db_client() -> TestClient {
     // `SubmitTokenLayer` is the same story: the registration form carries a
     // one-time token that the tests would otherwise have to round-trip.
     config.security.submit_token.enabled = false;
+    // A `TestClient` request has no TCP peer, and `__check_throttle` bypasses a
+    // caller it cannot identify — so a `#[throttle(key = "ip")]` route is
+    // unreachable from a test unless the address arrives in a header. This
+    // makes `X-Forwarded-For` that address. It changes nothing for a request
+    // that sends no such header (still no peer, still bypassed), so only the
+    // test that deliberately sets one is throttled; the global limiter stays
+    // off.
+    config.security.rate_limit.trust_forwarded_headers = true;
 
     TestApp::new()
         .routes(app_routes())
@@ -1976,4 +1984,314 @@ async fn the_public_api_paginates_terms_and_comments() {
         .assert_ok()
         .json();
     assert!(clamped.as_array().expect("array").len() <= 100);
+}
+
+/// `supports_comments: false` on a registered type is a refusal, not a hint.
+///
+/// The gate asked the row's `comment_status` and the type's `public` flag but
+/// never the type's `supports_comments`. A `page` registers it false and the
+/// editor offers no checkbox — but a direct request that sets the column, or an
+/// import carrying it, produced a page that accepted comments. A signed-in
+/// submission is approved immediately, so the thread then rendered on a type
+/// that had explicitly disabled it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_type_that_disables_comments_refuses_them_however_the_row_is_set() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Contact"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Reach us here."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303);
+    let page_id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    // Whatever the editor did with the checkbox, force the column open — this
+    // is the import/crafted-request shape the gate has to survive.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET comment_status = 'open' WHERE id = {page_id}"),
+    )
+    .await
+    .expect("force comment_status");
+
+    // Signed in, so the submission would be approved on the spot if accepted.
+    let refused = client
+        .post(&format!("/comments/{page_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "COMMENT-ON-A-PAGE")]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        403,
+        "a page must refuse comments: {}",
+        refused.text()
+    );
+
+    let page = client.get("/contact").send().await;
+    page.assert_ok();
+    assert!(
+        !page.text().contains("COMMENT-ON-A-PAGE"),
+        "nothing may have been stored"
+    );
+    assert!(
+        !page.text().contains("Post comment"),
+        "and the form must not be offered: {}",
+        page.text()
+    );
+}
+
+/// Deleting a comment takes its replies with it, and the counter has to know.
+///
+/// `comments.parent_id` cascades, so deleting an approved parent removes every
+/// approved descendant — while the handler decremented by one. The post then
+/// advertised comments that no longer existed, permanently.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_a_comment_recounts_the_replies_it_cascades_away() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Threaded", "Body.", "publish").await;
+
+    // Signed in, so all three land approved immediately.
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "Parent comment")]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "Reply one"), ("reply_to", "1")]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "Unrelated comment")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    client
+        .get("/threaded")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("3 comments");
+
+    // Delete the parent; the reply goes with it through the cascade.
+    client
+        .post("/admin/comments/1/delete")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    let page = client.get("/threaded").send().await;
+    page.assert_ok().assert_body_contains("1 comment");
+    assert!(
+        !page.text().contains("Reply one"),
+        "the cascaded reply must be gone"
+    );
+    assert!(
+        page.text().contains("Unrelated comment"),
+        "and the untouched comment must remain"
+    );
+}
+
+/// The public comment endpoint is bounded per address.
+///
+/// Unauthenticated, guest comments on by default, a reusable CSRF token and no
+/// global limiter: without a per-route bound, a request loop writes a database
+/// row per request and buries the moderation queue.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn guest_comment_submissions_are_throttled() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Flooded", "Body.", "publish").await;
+
+    sign_out(&client);
+    let mut throttled = false;
+    for i in 0..25 {
+        let resp = client
+            .post(&format!("/comments/{post_id}"))
+            .header("X-Forwarded-For", "198.51.100.23")
+            .form(&form(&[
+                ("body", &format!("flood {i}")),
+                ("author_name", "Guest"),
+                ("author_email", "guest@example.com"),
+            ]))
+            .send()
+            .await;
+        if resp.status == 429 {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(
+        throttled,
+        "the comment endpoint must stop accepting after its per-minute bound"
+    );
+}
+
+/// Password guesses against protected content are bounded per address.
+///
+/// The route is unauthenticated, each request is one guess, and the redirect
+/// target starts serving the body on success — a free oracle telling a client
+/// when to stop.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn protected_post_password_attempts_are_throttled() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Members Only"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "The protected text."),
+            ("status", "publish"),
+            ("password", "correcthorse"),
+            ("tags", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303);
+    let post_id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    sign_out(&client);
+    let mut throttled = false;
+    for i in 0..25 {
+        let resp = client
+            .post(&format!("/unlock/{post_id}"))
+            .header("X-Forwarded-For", "198.51.100.77")
+            .form(&form(&[("password", &format!("guess{i}"))]))
+            .send()
+            .await;
+        if resp.status == 429 {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(
+        throttled,
+        "unlimited password guesses must not be available to one address"
+    );
+}
+
+/// The importer applies the editor's parent rules, and says when it cannot.
+///
+/// Importing into a partly-populated site resolves a skipped parent by slug
+/// against rows already present. That row can be trashed, of another type, or
+/// already nested as deeply as pages go — none of which the editor would
+/// accept. Writing the link anyway produced a child whose generated ancestry
+/// the resolver cannot walk, leaving the imported page unreachable at its own
+/// canonical URL. Aborting the run instead is worse, so the link is declined
+/// and the child lands at the top level.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn importing_under_a_trashed_parent_keeps_the_child_reachable() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // An existing page the import will name as a parent — then trashed, so it
+    // is exactly the kind of row `validate_parent` refuses.
+    let parent = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Archive"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Old parent."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(parent.status, 303);
+    let parent_id = parent
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+    client
+        .post(&format!("/admin/content/page/{parent_id}/status?to=trash"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "Imported",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {
+                "post_type": "page", "title": "Orphan", "slug": "orphan",
+                "excerpt": "", "body": "Imported child.", "status": "publish",
+                "comment_status": "closed", "password": "", "author": "owner",
+                "published_at": null, "parent": "archive", "terms": []
+            }
+        ]
+    })
+    .to_string();
+
+    let result = client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await;
+    result
+        .assert_ok()
+        .assert_body_contains("1 imported")
+        .assert_body_contains("could not keep its parent");
+
+    // The child is at the top level and reachable there, rather than filed
+    // under a trashed ancestor and reachable nowhere.
+    sign_out(&client);
+    client
+        .get("/orphan")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Imported child.");
 }

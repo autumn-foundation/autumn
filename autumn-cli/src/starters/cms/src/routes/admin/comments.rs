@@ -206,18 +206,13 @@ pub async fn delete(
 ) -> AutumnResult<Response> {
     let _user = require_capability!(repos, session, csrf, Capability::ModerateComments);
 
-    // Move it out of `approved` first so the post's counter is decremented,
-    // then remove the row. Deleting an approved comment directly would leave
-    // the count one too high forever.
-    let comment = repos
-        .comments
-        .find_by_id(id)
-        .await?
-        .ok_or_else(|| AutumnError::not_found_msg("No such comment"))?;
-    if comment.status == "approved" {
-        content::moderate_comment(&mut db, id, "trash").await?;
-    }
-    repos.comments.delete_by_id(id).await?;
+    // Delete and recount together. Decrementing for this row alone was wrong:
+    // `comments.parent_id` cascades, so deleting an approved comment that has
+    // approved replies removes the whole subtree while the counter loses only
+    // one — leaving every deleted reply permanently in the post's displayed
+    // count. `content::delete_comment` recomputes from ground truth in the same
+    // transaction, so it is right whatever the cascade took.
+    content::delete_comment(&mut db, id).await?;
 
     Ok(Redirect::to("/admin/comments?status=trash").into_response())
 }
