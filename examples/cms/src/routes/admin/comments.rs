@@ -188,8 +188,11 @@ pub async fn moderate(
     // status change, so a reader never sees a count that disagrees with the
     // thread.
     let mut conn = repos.conn().await?;
-    let updated = content::moderate_comment(&mut conn, id, &query.to).await?;
-    if updated.status == "approved" {
+    let (updated, changed) = content::moderate_comment(&mut conn, id, &query.to).await?;
+    // Only on a real transition. A retried or double-clicked approval returns
+    // the unchanged row, and firing the action again would have plugins send a
+    // second notification for a request that moved nothing.
+    if changed && updated.status == "approved" {
         do_action(Action::CommentApproved, updated.id);
     }
 

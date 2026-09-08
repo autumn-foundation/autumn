@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::capabilities::Capability;
 use crate::content;
 use crate::models::{NewPost, NewTerm};
+use crate::plugins::{Action, do_action};
 use crate::repositories::{
     AttachmentRepository as _, PostMetaRepository as _, PostRepository as _, TermRepository as _,
     UserRepository as _,
@@ -89,6 +90,11 @@ pub struct ExportPost {
     pub parent: Option<String>,
     #[serde(default)]
     pub published_at: Option<chrono::NaiveDateTime>,
+    /// Whether the post is pinned to the top of the blog index. Carried for the
+    /// same reason as `comment_status`: it is an editorial decision, and a
+    /// restore that silently unpins every sticky post has changed the site.
+    #[serde(default)]
+    pub sticky: bool,
     /// Term slugs, qualified by taxonomy.
     #[serde(default)]
     pub terms: Vec<ExportTermRef>,
@@ -292,6 +298,7 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 author,
                 parent: parent_slug,
                 published_at: post.published_at,
+                sticky: post.sticky,
                 terms: assigned
                     .iter()
                     .map(|t| ExportTermRef {
@@ -559,7 +566,7 @@ pub async fn import(
                 menu_order: 0,
                 comment_status: post.comment_status.clone(),
                 password: post.password.clone(),
-                sticky: false,
+                sticky: post.sticky,
                 published_at: post.published_at,
             })
             .await?;
@@ -599,7 +606,13 @@ pub async fn import(
                     content::transition_status(conn, created.id, &post.status, Some(user.id)).await
                 })
                 .await?;
+            do_action(Action::PostTransitioned, created.id);
         }
+        // The same actions the admin, API and scheduler paths fire. An import
+        // is how a site's content arrives after a restore or a migration, so a
+        // plugin maintaining a search index or a cache being blind to exactly
+        // that content is the worst time for it to be blind.
+        do_action(Action::PostSaved, created.id);
         created_ids.push((
             created.id,
             post.post_type.clone(),

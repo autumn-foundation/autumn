@@ -3973,3 +3973,164 @@ async fn checking_a_category_box_saves_the_post() {
             .assert_body_contains("Categorised");
     }
 }
+
+/// The editor offers only statuses the state machine can actually reach.
+///
+/// The dropdown listed every status, but the graph declares no `publish ->
+/// pending` or `publish -> future` edge — so choosing either was rejected after
+/// the UI had explicitly offered it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_editor_offers_only_reachable_statuses() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Live", "Body.", "publish").await;
+
+    let editor = client
+        .get(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+
+    // From `publish` the graph declares draft, private and trash. The dropdown
+    // shows the reachable ones plus "stay put".
+    assert!(
+        editor.contains(r#"value="publish""#),
+        "staying put is an option"
+    );
+    assert!(
+        editor.contains(r#"value="draft""#),
+        "publish -> draft is declared"
+    );
+    assert!(
+        editor.contains(r#"value="private""#),
+        "publish -> private is declared"
+    );
+    // …and hides the two the graph does not declare.
+    assert!(
+        !editor.contains(r#"value="pending""#),
+        "publish -> pending is not a declared edge:\n{editor}"
+    );
+    assert!(
+        !editor.contains(r#"value="future""#),
+        "publish -> future is not a declared edge:\n{editor}"
+    );
+
+    // A draft still offers the full publisher set.
+    let draft = create_post(&client, &cookie, "Unpublished", "Body.", "draft").await;
+    let editor = client
+        .get(&format!("/admin/content/post/{draft}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    for value in ["draft", "pending", "publish", "private", "future"] {
+        assert!(
+            editor.contains(&format!(r#"value="{value}""#)),
+            "a draft can reach `{value}`"
+        );
+    }
+}
+
+/// Re-approving an already-approved comment fires nothing a second time.
+///
+/// `moderate_comment` returns the unchanged row for an idempotent request, but
+/// the handler checked only the resulting status — so a retry or double-click
+/// dispatched `CommentApproved` again and plugins enqueued duplicate work.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn re_approving_a_comment_is_idempotent() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Discussed", "Body.", "publish").await;
+
+    sign_out(&client);
+    client
+        .post(&format!("/comments/{post_id}"))
+        .form(&form(&[
+            ("body", "Held for review"),
+            ("author_name", "Guest"),
+            ("author_email", "guest@example.com"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Approve it three times; the counter must not drift.
+    for _ in 0..3 {
+        client
+            .post("/admin/comments/1/status?to=approved")
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    sign_out(&client);
+    client
+        .get("/discussed")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("1 comment")
+        .assert_body_contains("Held for review");
+}
+
+/// A sticky post comes back sticky.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_export_round_trip_keeps_the_sticky_flag() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Pinned", "Body.", "publish").await;
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET sticky = true WHERE id = {id}"),
+    )
+    .await
+    .expect("pin the post");
+
+    let exported = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let payload: serde_json::Value = serde_json::from_str(&exported).expect("valid JSON");
+    assert_eq!(
+        payload["posts"][0]["sticky"],
+        serde_json::json!(true),
+        "the export must carry the flag: {}",
+        payload["posts"][0]
+    );
+
+    let fresh = db_client().await;
+    let cookie = register(&fresh, "owner").await;
+    fresh
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", exported.as_str())]))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    let restored = fresh
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let restored: serde_json::Value = serde_json::from_str(&restored).expect("valid JSON");
+    assert_eq!(
+        restored["posts"][0]["sticky"],
+        serde_json::json!(true),
+        "and the import must apply it: {}",
+        restored["posts"][0]
+    );
+}

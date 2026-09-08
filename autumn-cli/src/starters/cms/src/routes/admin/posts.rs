@@ -32,6 +32,33 @@ const STATUS_CHOICES: &[(&str, &str)] = &[
     ("future", "Scheduled"),
 ];
 
+/// Whether the editor should offer `target` for a post currently at `current`.
+///
+/// Read from the state machine's own generated transition table rather than
+/// from a second list kept in step by hand — a hand-maintained copy is exactly
+/// how the dropdown came to offer `publish -> pending` and `publish -> future`,
+/// which the graph does not declare, so choosing either was rejected *after*
+/// the UI had explicitly offered it.
+///
+/// Guards are deliberately not evaluated. `draft -> publish` is guarded on
+/// `can_publish`, which reads the *stored* title; filtering on it would hide
+/// "Published" from an untitled draft even when the same submission supplies a
+/// title. The guard still runs on the write path, where it can see what is
+/// actually being saved.
+fn status_is_offerable(current: Option<&str>, target: &str) -> bool {
+    // A new post has no current state; the create path accepts any status the
+    // author is allowed to choose.
+    let Some(current) = current else {
+        return true;
+    };
+    // Staying put is always an option — it is what "save without changing the
+    // status" looks like in a single dropdown.
+    current == target
+        || crate::models::Post::__AUTUMN_SM_STATUS_TRANSITIONS
+            .iter()
+            .any(|(from, to, _guard)| *from == current && *to == target)
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ListFilters {
     #[serde(default)]
@@ -530,9 +557,14 @@ fn editor(
                         label for="status" class="block text-sm font-medium mb-1" { "Status" }
                         select #status name="status" class="w-full border rounded px-3 py-2" {
                             @for (value, label) in STATUS_CHOICES {
-                                // A Contributor cannot publish, so the option is
-                                // absent rather than present-and-rejected.
-                                @if can_publish || matches!(*value, "draft" | "pending") {
+                                // Two filters, for two different reasons: the
+                                // capability one hides what this author may
+                                // never choose, and the state-machine one hides
+                                // what this *post* cannot reach from where it
+                                // is. Both exist so the dropdown never offers
+                                // something the write path will reject.
+                                @if (can_publish || matches!(*value, "draft" | "pending"))
+                                    && status_is_offerable(post.map(|p| p.status.as_str()), value) {
                                     option value=(value)
                                            selected[post.is_some_and(|p| p.status == *value)
                                                     || (post.is_none() && *value == "draft")] {

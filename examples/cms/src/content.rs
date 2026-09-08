@@ -488,7 +488,7 @@ pub async fn moderate_comment(
     conn: &mut AsyncPgConnection,
     comment_id: i64,
     target: &str,
-) -> AutumnResult<Comment> {
+) -> AutumnResult<(Comment, bool)> {
     if !crate::hooks::COMMENT_STATUSES.contains(&target) {
         return Err(AutumnError::bad_request_msg(format!(
             "Unknown comment status `{target}`"
@@ -506,7 +506,10 @@ pub async fn moderate_comment(
 
         if comment.status == target {
             // Idempotent: a double-clicked Approve must not increment twice.
-            return Ok::<_, AutumnError>(comment);
+            // The `false` is what lets the caller keep its *actions* idempotent
+            // too — firing `CommentApproved` again would have plugins enqueue a
+            // second notification for a request that changed nothing.
+            return Ok::<_, AutumnError>((comment, false));
         }
 
         let saved: Comment = diesel::update(comments::table.find(comment_id))
@@ -553,7 +556,7 @@ pub async fn moderate_comment(
         // the post's row lock before counting, so two moderators working the
         // same post serialize around the snapshot.
         recount_post_comments(conn, comment.post_id).await?;
-        Ok::<_, AutumnError>(saved)
+        Ok::<_, AutumnError>((saved, true))
     })
     .await
 }
