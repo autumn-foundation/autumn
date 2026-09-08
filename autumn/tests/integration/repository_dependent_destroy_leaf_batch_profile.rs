@@ -426,13 +426,20 @@ async fn repository_dependent_destroy_leaf_batch_profile() {
     assert!(
         total_calls < 10,
         "the destroy cascade over a leaf child must issue a small constant \
-         number of statements regardless of fan-out, not one no matter how many \
-         rows are destroyed; got {total_calls} calls for {VIRAL_POST_COMMENTS} rows"
+         number of statements regardless of fan-out, not one per row \
+         destroyed; got {total_calls} calls for {VIRAL_POST_COMMENTS} rows"
     );
+    // Buffers still scale with rows (the batched DELETE reads/writes each row
+    // once), but must land near a single scan's worth, not the pre-fix
+    // shape's ~9 buffers/row (one FOR-UPDATE reload plus one point-delete per
+    // row, on top of the initial id scan) -- measured 45,583 buffers
+    // pre-fix, 5,126 post-fix, for the same 5,000-row cascade. `* 3` leaves
+    // headroom above the measured ~1.03 buffers/row without letting a
+    // regression back toward the old per-row shape pass silently.
     assert!(
-        total_buffers < VIRAL_POST_COMMENTS,
-        "buffers touched must not scale 1:1 (or worse) with rows destroyed; \
-         got {total_buffers} buffers for {VIRAL_POST_COMMENTS} rows"
+        total_buffers < VIRAL_POST_COMMENTS * 3,
+        "buffers touched must not scale like the old per-row reload+delete \
+         shape (~9 buffers/row); got {total_buffers} buffers for {VIRAL_POST_COMMENTS} rows"
     );
 
     conn.transaction::<(), diesel::result::Error, _>(|conn| {
