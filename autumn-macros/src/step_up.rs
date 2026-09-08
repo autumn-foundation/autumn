@@ -221,6 +221,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         return err;
     }
 
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
+    }
+
     let max_age_tokens = max_age_opt.map_or_else(
         || quote! { ::core::option::Option::None },
         |n| {

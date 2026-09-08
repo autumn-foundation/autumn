@@ -42,6 +42,14 @@ pub fn route_macro(
         Err(err) => return err,
     };
 
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at when deciding whether this
+    // route keeps the standalone `IdempotencyReplayLayer` — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
+    }
+
     // Extract #[intercept(LayerType)] attributes from the handler.
     let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
 

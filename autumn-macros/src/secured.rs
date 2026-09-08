@@ -144,6 +144,13 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         return err;
     }
 
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
+    }
+
     // The session/role check is emitted for the classic forms (`#[secured]`,
     // `#[secured("admin")]`) and whenever a role is required. It is OMITTED for
     // a scopes-ONLY gate so a pure service token with no session authorizes on

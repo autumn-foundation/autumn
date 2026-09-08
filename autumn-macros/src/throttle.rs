@@ -277,6 +277,13 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         return err;
     }
 
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
+    }
+
     let fn_name = input_fn.sig.ident.clone();
     let fn_name_str = fn_name.to_string();
     let spec_tokens = build_spec_tokens(&attrs);

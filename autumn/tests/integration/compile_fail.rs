@@ -17,6 +17,15 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
 
+    // An attribute matching #[authorize]'s argument grammar under a
+    // different name is refused rather than guessed at, whether it's really
+    // an aliased #[authorize] or an unrelated attribute that happens to
+    // share the shape — see `authorize::reject_if_ambiguous_authorize_shape`
+    // (Codex review on #2628, two rounds: guessing either direction is
+    // unsafe for idempotency-replay ownership).
+    t.compile_fail("tests/compile-fail/authorize_ambiguous_shape_alias.rs");
+    t.compile_fail("tests/compile-fail/authorize_ambiguous_shape_unrelated.rs");
+
     // Optional tokio runtime arguments on `#[autumn_web::main]`: a typo'd
     // argument, or one the chosen flavor would silently ignore, is a compile
     // error rather than a knob that quietly does nothing. Before these
