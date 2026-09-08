@@ -4269,6 +4269,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls 820 → 1, buffers 9,639 → 6,977 (-27.6%). See
   `docs/reports/2026-09-06-ledger-feature-flag-admin-bulk-delete-batch/`.
 
+- **`ExperimentAdminModel`'s admin panel bulk "delete" action now issues one
+  `DELETE` CTE instead of one per selected experiment:** it never overrode
+  `AdminModel::execute_action`'s trait default either, so it inherited the
+  same per-id loop the `TokenAdminModel`/`FeatureFlagAdminModel` fixes above
+  closed — a full connection checkout plus a single-row `DELETE ... WHERE
+  id = $1 RETURNING name` per id, cascading to that experiment's sticky
+  assignments and staff overrides and feeding the `autumn_experiment_changes`
+  audit insert. It now overrides `execute_action` for `"delete"` to batch
+  every id into one `WHERE id = ANY($1)` round trip; the returned count,
+  final row state (including the cascaded assignment/override deletes), and
+  audit trail are unchanged (an already-deleted or nonexistent id is still a
+  silent no-op, still counted as "applied"). Measured against a 3,000-row
+  fixture (plus ~270k assignment and ~4.5k override rows) with a 615-id bulk
+  action: delete-CTE statement calls 615 → 1, buffers 62,012 → 58,616
+  (-5.5%; batching flips the cascading assignment/override deletes from
+  555 separate bitmap-index probes to one seq-scan-driven hash join per
+  child table — a different, net-cheaper plan, not the same work counted
+  once — but the N+1 elimination on statement count, not that plan
+  change, is what clears the impact floor here). See
+  `docs/reports/2026-09-07-ledger-experiment-admin-bulk-delete-batch/`,
+  including its "Known limitation" section: neither child table has an FK
+  to `autumn_experiments`, so a concurrent `record_assignment`/
+  `set_override` on a `running` experiment being bulk-deleted can still
+  orphan a row (a pre-existing race this change widens the window on, not
+  a new one — not fixed here, flagged for a follow-up decision).
+
 - **scaffolded form helpers no longer re-escape their own constant HTML at
   render time:** `text_input`, `password_input`, `textarea_input`,
   `number_input`, `checkbox_input`, `date_input`/`datetime_input` (and their
