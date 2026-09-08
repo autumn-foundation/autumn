@@ -27,6 +27,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-application, no ordering change for direct requests). See
   `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
 
+- **`#[authorize]` is now detected by shape, not by literal attribute name,
+  closing a stale-authorization gap when it is imported under an alias (🛡
+  Warden):** `idempotency_guard::has_pending_authorize_attr` (used by
+  `#[secured]`/`#[step_up]`/`#[throttle]`'s pre-body gates to decide who
+  owns serving a cached idempotency replay) and `route::has_authorize_guard`
+  (used to decide whether the route macro keeps the standalone
+  `IdempotencyReplayLayer`) both detected `#[authorize]` by comparing an
+  attribute's last path segment against the literal string `"authorize"`. A
+  proc-macro attribute never sees the enclosing module's `use` declarations,
+  so `use ::autumn_web::authorize as authz;` defeated both checks even
+  though the identical `authorize_macro` still ran. With no
+  `#[secured]`/`#[step_up]`/`#[throttle]` also stacked, that let the
+  standalone `IdempotencyReplayLayer` serve a cached response as Tower
+  middleware, entirely before the handler (and `#[authorize]`'s in-body
+  policy re-check inside it) ever ran; with one of those gates stacked, the
+  gate wrongly claimed replay ownership for the same reason. Either way, an
+  attacker who legitimately obtained one cached response could replay the
+  same `Idempotency-Key` after their authorization was revoked (role
+  change, resource-ownership transfer, policy update) and keep receiving
+  the stale allow. `autumn_macros::authorize::attr_is_authorize_shaped` now
+  falls back to parsing an attribute's argument tokens through
+  `#[authorize]`'s own grammar whenever the literal name doesn't match, and
+  is wired into both checks plus `api_doc::extract_authorize_bindings` (the
+  OpenAPI metadata extractor, same blind spot, lower stakes). See
+  `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
 ### Changed
 
 - **🧭 Wayfinder: `examples/invoice`'s on-screen detail page is now a real
