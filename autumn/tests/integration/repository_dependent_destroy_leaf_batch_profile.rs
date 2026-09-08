@@ -366,7 +366,7 @@ async fn repository_dependent_destroy_leaf_batch_profile() {
         post_repo
             .delete_by_id(VIRAL_POST_ID)
             .await
-            .expect("delete_by_id must cascade-destroy the post's comments")
+            .expect("delete_by_id must cascade-destroy the post's comments");
     })
     .await;
 
