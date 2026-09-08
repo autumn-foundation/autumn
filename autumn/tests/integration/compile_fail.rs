@@ -2,6 +2,13 @@
 //! Tests for compile failures using trybuild.
 //!
 #[test]
+#[ignore = "scratch: run manually with TRYBUILD=overwrite to regenerate one golden"]
+fn scratch_generate_one_golden() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile-fail/authorize_ambiguous_shape_alias_behind_cfg_attr.rs");
+}
+
+#[test]
 // A flat registry of trybuild fixtures: one `t.compile_fail(...)` per case, plus
 // the comment explaining why each case must not compile. It grows by a line per
 // guarantee and has no structure worth extracting.
@@ -25,6 +32,11 @@ fn compile_fail_tests() {
     // unsafe for idempotency-replay ownership).
     t.compile_fail("tests/compile-fail/authorize_ambiguous_shape_alias.rs");
     t.compile_fail("tests/compile-fail/authorize_ambiguous_shape_unrelated.rs");
+    // Same ambiguity reached through `#[cfg_attr(predicate, ...)]` -- proof
+    // that this is refused via the ordinary (non-`cfg_attr`) path, since
+    // `cfg_attr` is already resolved by the compiler before the route macro
+    // ever sees this attribute (Codex review on #2628, sixth finding).
+    t.compile_fail("tests/compile-fail/authorize_ambiguous_shape_alias_behind_cfg_attr.rs");
 
     // Optional tokio runtime arguments on `#[autumn_web::main]`: a typo'd
     // argument, or one the chosen flavor would silently ignore, is a compile
