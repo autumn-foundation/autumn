@@ -113,6 +113,16 @@ CREATE TABLE posts (
 -- A slug is unique within its post type, so a page `/about` and a post
 -- `/2026/about` can coexist — the same guarantee WordPress gives.
 CREATE UNIQUE INDEX idx_posts_type_slug ON posts (post_type, slug);
+
+-- ...but `post` and `page` both mint a BARE path (`/about`), and only one row
+-- can be served there. `(post_type, slug)` does not stop them colliding, so
+-- the application de-duplicates on write — and this index is what makes that
+-- hold under concurrency, where two inserts can each check first and each find
+-- the slug free. A custom type is addressed under its own prefix
+-- (`/product/widget`) and so is deliberately excluded.
+CREATE UNIQUE INDEX idx_posts_bare_path_slug
+    ON posts (slug)
+    WHERE post_type IN ('post', 'page');
 CREATE INDEX idx_posts_status_published ON posts (status, published_at DESC);
 CREATE INDEX idx_posts_author ON posts (author_id);
 CREATE INDEX idx_posts_parent ON posts (parent_id);

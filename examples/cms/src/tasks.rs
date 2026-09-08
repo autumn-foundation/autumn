@@ -55,15 +55,22 @@ pub async fn publish_scheduled(state: AppState) -> AutumnResult<()> {
             }
         };
 
-        // Guarded on `status` so two replicas racing this sweep cannot both
-        // claim the same post: the second `UPDATE` matches no rows. The
-        // framework also offers `#[scheduled(cluster = ...)]` leader election
-        // for this, but a conditional update is cheaper and needs no
-        // coordination.
+        // Guarded so two replicas racing this sweep cannot both claim the same
+        // post: the second `UPDATE` matches no rows. The framework also offers
+        // `#[scheduled(cluster = ...)]` leader election, but a conditional
+        // update is cheaper and needs no coordination.
+        //
+        // The guard re-checks `published_at` as well as the status, and against
+        // the value observed by the SELECT. Guarding on status alone would let
+        // an editor who reschedules a post to a later date — between the query
+        // and this update, leaving it `future` — have it published early
+        // anyway, which is the one thing scheduling is for.
         let updated = diesel::update(
             posts::table
                 .find(post.id)
-                .filter(posts::status.eq("future")),
+                .filter(posts::status.eq("future"))
+                .filter(posts::published_at.eq(post.published_at))
+                .filter(posts::published_at.le(now)),
         )
         .set((
             posts::status.eq(&new_status),

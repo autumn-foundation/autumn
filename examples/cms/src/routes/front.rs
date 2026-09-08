@@ -27,6 +27,17 @@ use crate::theme;
 
 use super::site::{Csrf, Repos, render};
 
+/// Whether a post's registered type is reachable on the public front end.
+///
+/// `Post::is_public` answers for the row's *status*; this answers for its
+/// *type*. Both have to hold. The distinction matters on the entry points that
+/// reach a row without going through the resolver's type-aware branches —
+/// `/?p=<id>`, `/archives/<id>` and search — where a type registered
+/// `public: false` would otherwise render in full.
+fn is_publicly_routable(post: &Post) -> bool {
+    content_types::find_post_type(&post.post_type).is_some_and(|registered| registered.public)
+}
+
 /// Query parameters every listing screen understands.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQueryParams {
@@ -67,6 +78,7 @@ pub async fn front_page(
     // working.
     if let Some(post_id) = params.p
         && let Some(post) = repos.posts.find_by_id(post_id).await.ok().flatten()
+        && is_publicly_routable(&post)
     {
         return single_post(&repos, &session, &csrf, post).await;
     }
@@ -96,19 +108,36 @@ pub async fn search(
     let query = params.s.clone().unwrap_or_default();
     let trimmed = query.trim();
 
-    let results: Vec<Post> = if trimmed.is_empty() {
-        Vec::new()
+    // `search_page` rather than `search`: the unpaginated form loads every
+    // matching row, so one broad query on a large site costs memory and
+    // database work proportional to the whole corpus — from an unauthenticated
+    // endpoint. The page size is the site's own `posts_per_page`.
+    let per_page = u32::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
+    let page_number = u32::try_from(params.page_number()).unwrap_or(1);
+    let (results, total) = if trimmed.is_empty() {
+        (Vec::new(), 0usize)
     } else {
-        // The repository's `search()` runs against the `search_vector` GIN
-        // index (see the model's `#[searchable]` columns), so this is a real
-        // ranked full-text query rather than a table scan of `LIKE '%…%'`.
-        repos
+        // The repository's search runs against the `search_vector` GIN index
+        // (see the model's `#[searchable]` columns), so this is a real ranked
+        // full-text query rather than a table scan of `LIKE '%…%'`.
+        let page = repos
             .posts
-            .search(trimmed)
-            .await?
-            .into_iter()
-            .filter(Post::is_public)
-            .collect()
+            .search_page(
+                trimmed,
+                &autumn_web::pagination::PageRequest::new(page_number, per_page),
+            )
+            .await?;
+        let total = usize::try_from(page.total_elements).unwrap_or(0);
+        (
+            page.content
+                .into_iter()
+                // Status *and* type visibility, same as everywhere else — a
+                // result card exposes the title and a derived excerpt, which
+                // is exactly what a non-public type must not publish.
+                .filter(|post: &Post| post.is_public() && is_publicly_routable(post))
+                .collect::<Vec<Post>>(),
+            total,
+        )
     };
 
     let mut cards = Vec::with_capacity(results.len());
@@ -123,7 +152,7 @@ pub async fn search(
         }
         p class="text-sm text-gray-500 mb-6" {
             (autumn_web::format::pluralize(
-                i64::try_from(cards.len()).unwrap_or(i64::MAX), "result"))
+                i64::try_from(total).unwrap_or(i64::MAX), "result"))
         }
         form action="/search" method="get" role="search" class="flex gap-2 mb-8 max-w-md" {
             label for="search-field" class="sr-only" { "Search" }
@@ -185,10 +214,19 @@ pub async fn dispatch(
     match crate::permalinks::resolve(&path) {
         Resolved::FrontPage => blog_index(&repos, &session, &csrf, &settings, &params).await,
 
-        Resolved::SingleById { id } => match repos.posts.find_by_id(id).await.ok().flatten() {
-            Some(post) => single_post(&repos, &session, &csrf, post).await,
-            None => not_found(&repos, &session, &csrf).await,
-        },
+        Resolved::SingleById { id } => {
+            match repos
+                .posts
+                .find_by_id(id)
+                .await
+                .ok()
+                .flatten()
+                .filter(is_publicly_routable)
+            {
+                Some(post) => single_post(&repos, &session, &csrf, post).await,
+                None => not_found(&repos, &session, &csrf).await,
+            }
+        }
 
         Resolved::Single { post_type, slug } => {
             match find_visible(&repos, &post_type, &slug).await? {

@@ -1159,6 +1159,62 @@ async fn export_preserves_password_protection_and_page_ancestry() {
         serde_json::json!("handbook"),
         "the export must carry ancestry, or a restore flattens the page tree"
     );
+
+    // Hierarchical taxonomies are supported, so a restore that flattened the
+    // category tree would quietly change every archive's shape.
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Guides"),
+            ("slug", ""),
+            ("description", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let parent_term: serde_json::Value = client
+        .get("/api/v1/terms?taxonomy=category")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let parent_term_id = parent_term.as_array().expect("array")[0]["id"]
+        .as_i64()
+        .expect("term id")
+        .to_string();
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Deep Dives"),
+            ("slug", ""),
+            ("description", ""),
+            ("parent_id", parent_term_id.as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let payload = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("export is valid JSON");
+    let child_term = parsed["terms"]
+        .as_array()
+        .expect("terms array")
+        .iter()
+        .find(|t| t["slug"] == serde_json::json!("deep-dives"))
+        .expect("the child term is exported");
+    assert_eq!(
+        child_term["parent"],
+        serde_json::json!("guides"),
+        "the export must carry taxonomy ancestry too"
+    );
 }
 
 #[tokio::test]

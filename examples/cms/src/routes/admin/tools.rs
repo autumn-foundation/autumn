@@ -39,6 +39,11 @@ pub struct ExportTerm {
     pub slug: String,
     #[serde(default)]
     pub description: String,
+    /// The parent term's **slug**, for hierarchical taxonomies — same
+    /// reasoning as a page's `parent`. Without it a restore silently flattens
+    /// the category tree.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,16 +143,25 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
 
     let mut terms = Vec::new();
     for taxonomy in crate::content_types::all_taxonomies() {
-        for term in repos
+        let in_taxonomy = repos
             .terms
             .find_by_taxonomy(taxonomy.slug.to_owned())
-            .await?
-        {
+            .await?;
+        for term in &in_taxonomy {
+            // Resolve the parent to a slug now, while the ids still mean
+            // something in this database.
+            let parent = term.parent_id.and_then(|parent_id| {
+                in_taxonomy
+                    .iter()
+                    .find(|candidate| candidate.id == parent_id)
+                    .map(|parent| parent.slug.clone())
+            });
             terms.push(ExportTerm {
                 taxonomy: term.taxonomy.clone(),
                 name: term.name.clone(),
                 slug: term.slug.clone(),
                 description: term.description.clone(),
+                parent,
             });
         }
     }
@@ -227,6 +241,20 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
         .into_response())
 }
 
+/// One term of a taxonomy, by slug.
+async fn term_by_slug(
+    repos: &Repos,
+    taxonomy: &str,
+    slug: &str,
+) -> AutumnResult<Option<crate::models::Term>> {
+    Ok(repos
+        .terms
+        .find_by_slug(slug.to_owned())
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.taxonomy == taxonomy))
+}
+
 #[derive(Deserialize)]
 pub struct ImportForm {
     pub payload: String,
@@ -268,8 +296,38 @@ pub async fn import(
                     name: term.name.clone(),
                     slug: term.slug.clone(),
                     description: term.description.clone(),
+                    // Linked in the second pass below: a child term can appear
+                    // in the file before its parent.
                     parent_id: None,
                 })
+                .await?;
+        }
+    }
+
+    // Re-link taxonomy ancestry. Hierarchical categories are supported, so a
+    // restore that flattened them would quietly change every archive's shape.
+    for term in &payload.terms {
+        let Some(parent_slug) = &term.parent else {
+            continue;
+        };
+        let child = term_by_slug(&repos, &term.taxonomy, &term.slug).await?;
+        let parent = term_by_slug(&repos, &term.taxonomy, parent_slug).await?;
+        let (Some(child), Some(parent)) = (child, parent) else {
+            continue;
+        };
+        if child.id != parent.id && child.parent_id != Some(parent.id) {
+            repos
+                .terms
+                .update(
+                    child.id,
+                    &crate::models::UpdateTerm {
+                        taxonomy: autumn_web::hooks::Patch::Unchanged,
+                        name: autumn_web::hooks::Patch::Unchanged,
+                        slug: autumn_web::hooks::Patch::Unchanged,
+                        description: autumn_web::hooks::Patch::Unchanged,
+                        parent_id: autumn_web::hooks::Patch::Set(Some(parent.id)),
+                    },
+                )
                 .await?;
         }
     }
@@ -370,10 +428,25 @@ pub async fn import(
         let Some(parent_slug) = parent_slug else {
             continue;
         };
-        if let Some(parent_id) = by_file_slug.get(&(post_type.as_str(), parent_slug.as_str()))
-            && *parent_id != *child_id
+        // Prefer a row created by this run; fall back to one already on the
+        // site. Importing into a partly-populated site is the common restore
+        // shape, and there the parent is *skipped* as already-present — so it
+        // is absent from the map, and consulting only the map would drop the
+        // child to the top level and change its canonical path.
+        let parent_id = match by_file_slug.get(&(post_type.as_str(), parent_slug.as_str())) {
+            Some(id) => Some(*id),
+            None => repos
+                .posts
+                .find_by_slug(parent_slug.clone())
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.post_type == *post_type)
+                .map(|parent| parent.id),
+        };
+        if let Some(parent_id) = parent_id
+            && parent_id != *child_id
         {
-            content::set_post_parent(&mut db, *child_id, *parent_id).await?;
+            content::set_post_parent(&mut db, *child_id, parent_id).await?;
         }
     }
 
