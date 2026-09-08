@@ -54,7 +54,7 @@ use diesel_async::RunQueryDsl as _;
 use scoped_futures::ScopedFutureExt as _;
 use serde::{Deserialize, Serialize};
 
-use crate::counter_cache::SqlView;
+use crate::counter_cache::{SqlView, is_lock_contention};
 use crate::db::{RuntimeConnection, scoped_immediate_transaction};
 use crate::{AutumnError, AutumnResult};
 
@@ -1081,16 +1081,6 @@ fn is_missing_state_table(error: &AutumnError) -> bool {
     let message = error.to_string();
     message.contains(STATE_TABLE)
         && (message.contains("does not exist") || message.contains("no such table"))
-}
-
-/// Whether `error` is the database aborting one transaction so that another
-/// can proceed: Postgres's deadlock detector (`40P01`) or a serialisation
-/// failure (`40001`), and `SQLite`'s busy timeout.
-fn is_lock_contention(error: &AutumnError) -> bool {
-    let message = error.to_string();
-    message.contains("deadlock detected")
-        || message.contains("could not serialize access")
-        || message.contains("database is locked")
 }
 
 /// Put one derivation back on the backfill queue under its current definition.

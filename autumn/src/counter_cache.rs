@@ -1799,15 +1799,66 @@ pub async fn recompute_view(
     if let Some(id) = parent_id {
         return recompute_batch(conn, view, &[id]).await;
     }
+    // A self-referential table (a comment's `reply_count`) has rows that are
+    // children and parents at once: a batch holding several parents in id
+    // order could form a lock cycle with a mutation that holds a child row and
+    // wants its parent. One parent per transaction takes one lock and never a
+    // second, so the repair cannot be one side of that cycle.
+    let batch = if view.child_table == view.parent_table {
+        1
+    } else {
+        RECOMPUTE_BATCH
+    };
     let mut touched = 0usize;
     let mut cursor: Option<i64> = None;
     loop {
-        let ids = parent_id_page(conn, view, cursor, RECOMPUTE_BATCH).await?;
+        let ids = parent_id_page(conn, view, cursor, batch).await?;
         let Some(&last) = ids.last() else { break };
         cursor = Some(last);
-        touched += recompute_batch(conn, view, &ids).await?;
+        touched += recompute_batch_retrying(conn, view, &ids).await?;
     }
     Ok(touched)
+}
+
+/// How many times a repair batch that lost a lock race is retried before the
+/// error surfaces. Each batch is its own transaction, so a retry repeats no
+/// committed work.
+const LOCK_CONTENTION_RETRIES: u32 = 5;
+
+/// [`recompute_batch`], retried when the database aborted the batch to break a
+/// lock cycle or a serialisation conflict with a concurrent writer.
+async fn recompute_batch_retrying(
+    conn: &mut RuntimeConnection,
+    view: &SqlView,
+    ids: &[i64],
+) -> AutumnResult<usize> {
+    let mut attempt = 0;
+    loop {
+        match recompute_batch(conn, view, ids).await {
+            Err(error) if attempt < LOCK_CONTENTION_RETRIES && is_lock_contention(&error) => {
+                attempt += 1;
+                tracing::warn!(
+                    parent_table = view.parent_table,
+                    column = view.counter_column,
+                    attempt,
+                    error = %error,
+                    "repair batch lost a lock race; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25 * u64::from(attempt))).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// Whether `error` is the database aborting one transaction so that another
+/// can proceed: Postgres's deadlock detector (`40P01`) or a serialisation
+/// failure (`40001`), and `SQLite`'s busy timeout.
+pub(crate) fn is_lock_contention(error: &AutumnError) -> bool {
+    let message = error.to_string();
+    message.contains("deadlock detected")
+        || message.contains("could not serialize access")
+        || message.contains("database is locked")
 }
 
 /// Recompute counters from the source of truth.

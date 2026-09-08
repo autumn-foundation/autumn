@@ -1807,6 +1807,24 @@ fn lower_filter_comparison(
     }
 }
 
+/// Whether a filter expression names `field` anywhere: as a bare operand, the
+/// receiver of a NULL probe, or a side of a comparison or `&&`.
+fn expr_mentions_field(expr: &syn::Expr, field: &str) -> bool {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .is_some_and(|ident| unraw_ident(ident) == field),
+        syn::Expr::Paren(paren) => expr_mentions_field(&paren.expr, field),
+        syn::Expr::Unary(unary) => expr_mentions_field(&unary.expr, field),
+        syn::Expr::Binary(binary) => {
+            expr_mentions_field(&binary.left, field) || expr_mentions_field(&binary.right, field)
+        }
+        syn::Expr::MethodCall(call) => expr_mentions_field(&call.receiver, field),
+        _ => false,
+    }
+}
+
 /// Lower one filter expression to its Rust and SQL forms.
 ///
 /// Parentheses are transparent: `a && b` already parenthesises both sides in
@@ -2312,6 +2330,47 @@ fn emit_counter_caches_impl(
     for (index, decl) in derivations.iter().enumerate() {
         let column = &decl.column;
         let parent_table = derivation_parent_table(decl);
+        // The parent primary key is `id` (see `parent_pk` below), and a
+        // derivation maintaining it would rewrite the parent's identity on the
+        // first qualifying mutation.
+        if column == "id" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.id`: that is the \
+                     parent's primary key, and a maintained value would rewrite the \
+                     parent's identity. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        let self_referential = parent_table == table_name;
+        // A derivation onto its own table must not read the column it writes:
+        // the parent-side UPDATE runs no repository hook, so a node's new
+        // aggregate would change its own contribution (or its eligibility)
+        // toward its parent without that parent ever hearing about it.
+        if self_referential {
+            let reads_own_column = match &decl.transform {
+                DerivationTransform::Sum { field, .. } => field == column,
+                DerivationTransform::Count => false,
+            } || decl
+                .filter
+                .as_ref()
+                .is_some_and(|expr| expr_mentions_field(expr, column));
+            if reads_own_column {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` onto its own table cannot read the column it \
+                         maintains: `{column}` is both the maintained column and a \
+                         source of the contribution (in `transform` or `filter`), and \
+                         the parent-side update runs no repository hook, so a row's new \
+                         aggregate would change what it contributes to its own parent \
+                         without that parent being maintained. Read another column, or \
+                         maintain another one"
+                    ),
+                ));
+            }
+        }
         let fk = derivation_fk(model_ident, decl, assocs)?;
         let Some(fk_field) = all_fields
             .iter()
@@ -10835,6 +10894,74 @@ mod tests {
         assert!(
             generated.contains("i64 :: from (__r . score)"),
             "the Rust contribution must widen the summed field: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_maintain_the_parent_primary_key() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "id", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.id`"),
+            "the parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_self_referential_derivation_cannot_read_the_column_it_maintains() {
+        // Onto its own table, summing (or filtering on) the maintained column
+        // would make a row's new aggregate change its own contribution to its
+        // parent with no hook to carry that change up.
+        for attr in [
+            quote! { #[derivation(Node, column = "score", fk = parent_id, transform = sum(score))] },
+            quote! { #[derivation(Node, column = "score", fk = parent_id, filter = score > 0)] },
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attr
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub score: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot read the column it maintains"),
+                "{generated}"
+            );
+        }
+        // Reading another column of its own table is fine.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Node, column = "score", fk = parent_id, transform = sum(weight))]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub score: i64,
+                    pub weight: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "a self-referential derivation over another column expands: {generated}"
         );
     }
 

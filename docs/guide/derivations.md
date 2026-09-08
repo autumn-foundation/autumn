@@ -339,13 +339,20 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   `tenant` field renamed with `#[diesel(column_name = "...")]` is rejected. A
   foreign-key field renamed that way is not detected, so keep `fk` fields
   unrenamed.
+- **The parent primary key is not a maintainable column**: `column = "id"`
+  is a compile error.
+- **A self-referential derivation cannot read the column it maintains.** Onto
+  its own table, `sum(<the maintained column>)` or a filter naming it is a
+  compile error: the parent-side update runs no repository hook, so a row's
+  new aggregate would change what it contributes to its own parent without
+  that parent being maintained.
 - **Self-referential derivations sweep one parent per batch.** A child that
   derives onto its own table (a comment's `reply_count`) has rows that are
   children and parents at once, so a batch locking several parents in id order
   could form a lock cycle with a mutation that holds a child row and wants its
   parent. The backfill takes one parent per transaction for such a derivation
-  regardless of `batch_size`, and any batch the database aborts to break a
-  deadlock is retried from its committed checkpoint. No test in this release
+  regardless of `batch_size`, `recompute` does the same, and any batch the
+  database aborts to break a deadlock is retried. No test in this release
   covers the self-referential shape end to end.
 - **Weights are ordinary numbers, not the edges of `i64`.** The delta paths
   never overflow on their own (a difference that does not fit goes out as two
