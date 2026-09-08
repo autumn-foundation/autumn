@@ -2274,11 +2274,32 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
         // app_dir = "/srv/autumn/tmp/../myapp"` names the same directory as
         // `/srv/autumn/myapp`, and comparing the raw spelling would miss a
         // database sitting in the releases dir it resolves to.
-        let app_dir = lexically_normalized(&cfg.app_dir).unwrap_or_default();
-        let shared = lexically_normalized(&cfg.shared_dir()).unwrap_or_default();
-        // An app dir that is not an absolute path grades nothing — `within` on an
-        // empty root would swallow every absolute path.
-        if app_dir.starts_with('/') && within(&text, &app_dir) && !within(&text, &shared) {
+        // FAIL CLOSED. `unwrap_or_default` here graded the database durable
+        // whenever the app dir would not normalize — the containment check was
+        // skipped and the fall-through returned `Persistent`, so a file in the
+        // releases dir was called durable while retention deletes it.
+        let (Some(app_dir), Some(shared)) = (
+            lexically_normalized(&cfg.app_dir),
+            lexically_normalized(&cfg.shared_dir()),
+        ) else {
+            return SqliteDataFile::Refused(format!(
+                "the deploy's app directory ({}) does not name an absolute path, so \
+                 whether the SQLite database {text} sits inside it cannot be decided. \
+                 Set `[deploy] app_dir` to an absolute path.",
+                cfg.app_dir
+            ));
+        };
+        // An app dir that is not absolute grades nothing — `within` on an empty
+        // root would swallow every absolute path.
+        if !app_dir.starts_with('/') {
+            return SqliteDataFile::Refused(format!(
+                "the deploy's app directory ({}) is not an absolute path, so whether \
+                 the SQLite database {text} sits inside it cannot be decided. Set \
+                 `[deploy] app_dir` to an absolute path.",
+                cfg.app_dir
+            ));
+        }
+        if within(&text, &app_dir) && !within(&text, &shared) {
             return SqliteDataFile::Refused(format!(
                 "the configured SQLite database {text} lives inside the deploy's own app \
                  directory ({app_dir}), where only `shared/` survives: `releases/` is \
@@ -2336,13 +2357,16 @@ fn lexically_normalized(path: &str) -> Option<String> {
             "" | "." => {}
             ".." => {
                 // A leading `..` on a RELATIVE path has nothing to cancel and is
-                // kept, so the caller can refuse it; on an absolute path it would
-                // climb above the root.
+                // kept, so the caller can refuse it.
+                //
+                // On an ABSOLUTE path it is simply dropped: POSIX defines `/..`
+                // as `/`, so `/../srv/app` names `/srv/app` and cannot escape.
+                // Returning `None` here instead made a real `app_dir` spelling
+                // ungradable, and the caller then graded a database in the
+                // releases dir as durable while retention deletes it.
                 if names.last().is_some_and(|name| *name != "..") {
                     names.pop();
-                } else if absolute {
-                    return None;
-                } else {
+                } else if !absolute {
                     names.push("..");
                 }
             }
@@ -5811,7 +5835,20 @@ mod tests {
             lexically_normalized("./data//nested/../app.db"),
             Some("data/app.db".to_owned())
         );
-        assert_eq!(lexically_normalized("/a/../.."), None, "climbs above root");
+        // POSIX defines `/..` as `/`, so an ABSOLUTE path cannot climb out —
+        // `/a/../..` is `/`. Returning `None` here made a real `app_dir`
+        // spelling ungradable and the caller then called a database in the
+        // releases dir durable.
+        assert_eq!(
+            lexically_normalized("/a/../.."),
+            Some("/".to_owned()),
+            "an absolute path cannot climb above the root"
+        );
+        assert_eq!(
+            lexically_normalized("/../srv/autumn/myapp"),
+            Some("/srv/autumn/myapp".to_owned()),
+            "a leading `..` on an absolute path is dropped, as POSIX does"
+        );
         assert_eq!(
             lexically_normalized("../app.db"),
             Some("../app.db".to_owned())
@@ -5879,11 +5916,13 @@ mod tests {
             ),
             SqliteDataFile::Persistent("/srv/autumn/shared-data/app.db".to_owned())
         );
-        // A path that climbs above the root is not a path.
-        assert!(matches!(
+        // An absolute path cannot climb above the root: POSIX resolves
+        // `/../../app.db` to `/app.db`, which is outside the app dir and so is
+        // the operator's own file, left alone.
+        assert_eq!(
             classify_sqlite_data_file(Some("sqlite:///../../app.db"), &cfg),
-            SqliteDataFile::Refused(_)
-        ));
+            SqliteDataFile::Persistent("/app.db".to_owned())
+        );
 
         // A run of spaces mid-sentence means a `\\` continuation was dropped when
         // the message was written (same guard as `DeployError`'s own).
@@ -5918,6 +5957,78 @@ mod tests {
     /// `[deploy] app_dir` can carry lexical aliases too. Comparing the raw
     /// spelling would let a database sitting in the releases dir it resolves to
     /// pass as durable, and release retention would then delete it.
+    /// `/..` is `/` in POSIX, so an `app_dir` spelled `/../srv/autumn/myapp`
+    /// names `/srv/autumn/myapp` and must grade exactly like it.
+    ///
+    /// The normalizer used to return `None` for that spelling and the caller
+    /// `unwrap_or_default()`ed it, which skipped the containment check and fell
+    /// through to `Persistent` — calling a database in the releases dir durable
+    /// while release retention deletes it.
+    #[test]
+    fn an_app_dir_that_starts_above_root_still_grades_containment() {
+        let aliased = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("/../srv/autumn/myapp".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+        // Inside the releases dir the alias resolves to: refused, not "durable".
+        let inside = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
+            &aliased,
+        );
+        assert!(
+            matches!(inside, SqliteDataFile::Refused(_)),
+            "a database in the releases dir must be refused, got: {inside:?}"
+        );
+        // The shared dir is still durable through the same alias.
+        assert!(
+            matches!(
+                classify_sqlite_data_file(
+                    Some("sqlite:///srv/autumn/myapp/shared/data/app.db"),
+                    &aliased,
+                ),
+                SqliteDataFile::Persistent(_)
+            ),
+            "the shared dir must stay durable through the aliased app dir"
+        );
+        // And a path genuinely outside is still the operator's own.
+        assert!(
+            matches!(
+                classify_sqlite_data_file(Some("sqlite:///var/lib/app.db"), &aliased),
+                SqliteDataFile::Persistent(_)
+            ),
+            "a path outside the app dir is left alone"
+        );
+    }
+
+    /// An app dir that cannot be graded must FAIL CLOSED. Grading it durable is
+    /// the dangerous direction: it is the answer that lets a deploy delete the
+    /// database it just called safe.
+    #[test]
+    fn an_ungradable_app_dir_refuses_rather_than_claiming_durability() {
+        let relative = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("srv/autumn/myapp".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+        let graded = classify_sqlite_data_file(
+            Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
+            &relative,
+        );
+        assert!(
+            matches!(graded, SqliteDataFile::Refused(_)),
+            "a non-absolute app dir must refuse, never grade Persistent: {graded:?}"
+        );
+    }
+
     #[test]
     fn classify_sqlite_data_file_normalizes_the_app_dir_as_well() {
         let aliased = ResolvedDeployConfig::resolve(
