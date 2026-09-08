@@ -854,3 +854,162 @@ fn a_setpath_deeper_than_the_limit_is_refused_rather_than_written() {
     assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
     assert_eq!(state["tree"], before);
 }
+
+// ---------------------------------------------------------------------------
+// Regressions from the Codex review on #2623
+// ---------------------------------------------------------------------------
+
+/// A long *chain* of components is not bounded by any parse limit that looks at
+/// nesting: components are sibling entries in one shallow map, so `A -> B -> C`
+/// a few thousand deep costs a handful of JSON nodes each and passes the size,
+/// depth and node bounds. Cycle detection therefore has to be iterative — a
+/// recursive DFS would take one stack frame per link and overflow the request
+/// thread during *validation*, before any render guard could see it.
+#[test]
+fn a_long_component_chain_validates_without_overflowing_the_stack() {
+    const LINKS: usize = 4_000;
+
+    let mut components = Vec::with_capacity(LINKS);
+    for i in 0..LINKS {
+        // Each link references the next; the last renders text and stops.
+        let body = if i + 1 < LINKS {
+            format!(r#"{{"kind":"component","name":"C{}"}}"#, i + 1)
+        } else {
+            r#"{"kind":"text","value":{"expr":"lit","value":"end"}}"#.to_string()
+        };
+        components.push(format!(r#""C{i}":{{"view":{body}}}"#));
+    }
+    let source = format!(
+        r#"{{"version":"1.0","components":{{{}}},"view":{{"kind":"component","name":"C0"}}}}"#,
+        components.join(",")
+    );
+
+    // Well inside the parse bounds, which is exactly the point.
+    let document = Document::parse(&source, &Limits::unbounded()).expect("validates");
+    assert_eq!(document.program().components.len(), LINKS);
+}
+
+/// The same chain, closed into a cycle, is still *detected* — making the walk
+/// iterative must not cost the check it exists to perform.
+#[test]
+fn a_long_component_cycle_is_still_detected() {
+    const LINKS: usize = 2_000;
+
+    let mut components = Vec::with_capacity(LINKS);
+    for i in 0..LINKS {
+        let next = (i + 1) % LINKS; // the last one points back at C0
+        components.push(format!(
+            r#""C{i}":{{"view":{{"kind":"component","name":"C{next}"}}}}"#
+        ));
+    }
+    let source = format!(
+        r#"{{"version":"1.0","components":{{{}}},"view":{{"kind":"component","name":"C0"}}}}"#,
+        components.join(",")
+    );
+
+    let err = Document::parse(&source, &Limits::unbounded()).expect_err("cycle");
+    assert_eq!(err.diagnostics()[0].code, codes::CYCLE);
+}
+
+/// Counting nodes does not bound bytes. A handful of nodes can emit gigabytes:
+/// one big string in state, rendered once per iteration of an `each`.
+#[test]
+fn rendered_output_is_capped_in_bytes_not_just_nodes() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"blob":{"type":"string","initial":""},
+                     "rows":{"type":"list","initial":[]}},
+            "view":{"kind":"each","items":{"expr":"state","name":"rows"},"as":"r",
+              "body":{"kind":"text","value":{"expr":"state","name":"blob"}}}}"#,
+    );
+
+    let mut state = document.initial_state();
+    state.insert("blob".into(), Value::String("x".repeat(64 * 1024)));
+    state.insert("rows".into(), Value::Array(vec![json!(1); 1_000]));
+
+    // 1 000 nodes and 1 000 iterations — inside both of those budgets — but
+    // ~64 MiB of markup.
+    let ctx = RenderContext {
+        state,
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("over the byte budget");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    assert!(
+        err.diagnostics()[0].message.contains("bytes"),
+        "{:?}",
+        err.diagnostics()[0].message
+    );
+}
+
+/// Dispatch must not run past an effect it did not perform. The `set` below
+/// reads the `fetch`'s `result`, which the server has no value for — running it
+/// would write `null` over good data and call that a state transition.
+#[test]
+fn dispatch_stops_at_an_effect_rather_than_binding_its_result_to_null() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"data":{"type":"object","initial":{"kept":true}}},
+            "actions":[{"name":"load","steps":[
+              {"do":"fetch","url":{"expr":"lit","value":"/api"},"result":"res"},
+              {"do":"set","target":"data","value":{"expr":"var","name":"res"}}]}],
+            "view":{"kind":"element","tag":"div"}}"#,
+    );
+
+    let mut state = document.initial_state();
+    let outcome = document
+        .dispatch("load", &mut state, &Map::new())
+        .expect("dispatches");
+
+    assert!(outcome.is_suspended(), "{outcome:?}");
+    assert_eq!(outcome.effects.len(), 1);
+    // The critical assertion: the untaken step left the good value alone.
+    assert_eq!(state["data"], json!({"kept": true}));
+}
+
+/// Suspension propagates out of an `if` branch, not just a top-level list.
+#[test]
+fn dispatch_suspension_propagates_out_of_a_branch() {
+    let document = document(
+        r#"{"version":"1.0",
+            "state":{"flag":{"type":"boolean","initial":true},
+                     "note":{"type":"string","initial":"kept"}},
+            "actions":[{"name":"go","steps":[
+              {"do":"if","condition":{"expr":"state","name":"flag"},
+               "then":[{"do":"navigate","url":{"expr":"lit","value":"/next"}}],
+               "else":[]},
+              {"do":"set","target":"note","value":{"expr":"lit","value":"ran anyway"}}]}],
+            "view":{"kind":"element","tag":"div"}}"#,
+    );
+
+    let mut state = document.initial_state();
+    let outcome = document
+        .dispatch("go", &mut state, &Map::new())
+        .expect("dispatches");
+
+    assert!(outcome.is_suspended(), "{outcome:?}");
+    assert_eq!(state["note"], json!("kept"));
+}
+
+/// An `id` and a link to it must stay a matched pair. Prefixing one and not the
+/// other breaks in-fragment navigation and lets `#section` resolve against the
+/// host page instead.
+#[test]
+fn a_fragment_link_is_prefixed_to_match_the_id_it_targets() {
+    // `r##"…"##`: the JSON below contains `"#`, which would close a
+    // single-hash raw string.
+    let rendered = render(
+        r##"{"version":"1.0","view":{"kind":"element","tag":"div","children":[
+            {"kind":"element","tag":"a","props":{"href":{"expr":"lit","value":"#section"}}},
+            {"kind":"element","tag":"section","props":{"id":{"expr":"lit","value":"section"}}},
+            {"kind":"element","tag":"a","props":{"href":{"expr":"lit","value":"/other#section"}}}]}}"##,
+    );
+
+    assert!(rendered.contains(r##"href="#c-section""##), "{rendered}");
+    assert!(rendered.contains(r#"id="c-section""#), "{rendered}");
+    // A cross-document fragment points at ids this render did not write.
+    assert!(
+        rendered.contains(r##"href="/other#section""##),
+        "{rendered}"
+    );
+}

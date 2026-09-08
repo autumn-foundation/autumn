@@ -528,7 +528,8 @@ Safety is an allowlist, not a denylist (`constela::policy`): tags, attributes
 re-checked at render time and all output escaped by construction. Element ids
 are rewritten with `RenderContext::id_prefix` (`c-` by default) so a generated
 fragment cannot clobber the host page — give each fragment its own prefix when a
-page embeds several.
+page embeds several. Same-document fragment links are rewritten to match
+(`href="#x"` → `href="#c-x"`), so in-fragment navigation keeps working.
 
 There is **no client runtime and no generated JavaScript**. Interactivity is
 server-side over htmx: event bindings render as `data-constela-on-{event}`, and
@@ -536,7 +537,10 @@ server-side over htmx: event bindings render as `data-constela-on-{event}`, and
 (`set`, `update`, `setPath`, `if`) against state your app owns. Browser-side
 steps come back on `Dispatched::effects` rather than being performed — running a
 model-authored `fetch` server-side would be SSRF by construction, so your app
-decides against its own allowlist.
+decides against its own allowlist. **Dispatch stops at the first effect**
+(`Dispatched::suspended_at` says where): an effect can bind a `result` later
+steps read, and the server has no value to bind, so running on would write
+`null` over good state.
 
 Bound untrusted input with `Limits` (document: bytes/depth/nodes) and
 `RenderLimits` (expansion: depth/nodes/`max_each_items`, and how deep a

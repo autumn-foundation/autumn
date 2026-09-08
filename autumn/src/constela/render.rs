@@ -79,6 +79,16 @@ pub struct RenderLimits {
     pub max_nodes: usize,
     /// Maximum iterations of a single `each`. Default 5 000.
     pub max_each_items: usize,
+    /// Maximum bytes of markup one render may produce, across the body and
+    /// every portal. Default 4 MiB.
+    ///
+    /// The node and iteration counts do not imply this one, which is why it
+    /// exists separately: a *single* text node can emit as much as the
+    /// document is allowed to be. A 512 KiB document can declare a ~480 KiB
+    /// string in state and render that field from a 5 000-iteration `each` —
+    /// a few dozen nodes, well inside every other bound, and about 2.4 GiB of
+    /// output. Counting nodes does not see that; counting bytes does.
+    pub max_output_bytes: usize,
 }
 
 impl Default for RenderLimits {
@@ -87,6 +97,7 @@ impl Default for RenderLimits {
             max_depth: 128,
             max_nodes: 50_000,
             max_each_items: 5_000,
+            max_output_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -212,6 +223,10 @@ pub struct Renderer<'a> {
     pub ctx: &'a RenderContext,
     nodes: usize,
     portals: Vec<RenderedPortal>,
+    /// Bytes already committed to finished portal buffers. The live buffer's
+    /// own length is added at each check, so the budget covers all output
+    /// rather than whichever buffer happens to be in hand.
+    portal_bytes: usize,
 }
 
 /// Render `document` against `ctx`.
@@ -230,6 +245,7 @@ pub fn render(
         ctx,
         nodes: 0,
         portals: Vec::new(),
+        portal_bytes: 0,
     };
     let env = Env::default();
 
@@ -296,8 +312,13 @@ impl Renderer<'_> {
         Ok((title, meta))
     }
 
-    /// Charge one node against the budget.
-    fn charge(&mut self, path: &str) -> Result<(), ConstelaError> {
+    /// Charge one node, and the output produced so far, against the budgets.
+    ///
+    /// `emitted` is the live buffer's length; the bytes already committed to
+    /// finished portals are added here. Checking on *entry* to each node means
+    /// the overshoot past the budget is at most one node's own output, which
+    /// the document size already bounds.
+    fn charge(&mut self, path: &str, emitted: usize) -> Result<(), ConstelaError> {
         self.nodes = self.nodes.saturating_add(1);
         if self.nodes > self.ctx.limits.max_nodes {
             return Err(ConstelaError::Render(Diagnostic::new(
@@ -306,6 +327,18 @@ impl Renderer<'_> {
                 format!(
                     "render produced more than {} nodes",
                     self.ctx.limits.max_nodes
+                ),
+            )));
+        }
+
+        let produced = emitted.saturating_add(self.portal_bytes);
+        if produced > self.ctx.limits.max_output_bytes {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path,
+                codes::RENDER_LIMIT,
+                format!(
+                    "render produced more than {} bytes of markup",
+                    self.ctx.limits.max_output_bytes
                 ),
             )));
         }
@@ -322,7 +355,7 @@ impl Renderer<'_> {
         depth: usize,
         out: &mut String,
     ) -> Result<(), ConstelaError> {
-        self.charge(path)?;
+        self.charge(path, out.len())?;
         let Some(depth) = depth.checked_sub(1) else {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path,
@@ -511,6 +544,7 @@ impl Renderer<'_> {
                 &mut inner,
             )?;
         }
+        self.portal_bytes = self.portal_bytes.saturating_add(inner.len());
         self.portals.push(RenderedPortal {
             target: target.to_string(),
             content: PreEscaped(inner),
@@ -757,6 +791,8 @@ impl Renderer<'_> {
 
         let text = if policy::is_id_ref_attr(name) {
             prefix_id_refs(&self.ctx.id_prefix, &text)
+        } else if policy::is_url_attr(name) {
+            prefix_fragment_link(&self.ctx.id_prefix, &text)
         } else {
             text
         };
@@ -867,6 +903,26 @@ fn sanitize_event(event: &str) -> String {
         .collect()
 }
 
+/// Prefix the target of a same-document fragment link, so `href="#section"`
+/// still reaches the element the document called `id="section"`.
+///
+/// Without this the two halves disagree: the id is rewritten to `c-section`
+/// and the link is not, so in-fragment navigation silently stops working —
+/// and, worse, `#section` then resolves against whatever the *host* page
+/// happens to call `section`. Prefixing both keeps the pair consistent and
+/// keeps the fragment inside the document, which is the same property
+/// [`RenderContext::id_prefix`] exists to give.
+///
+/// Only a *pure* fragment is rewritten. `href="/other#section"` points into a
+/// different document whose ids this render did not write, and `href="#"` has
+/// no target to prefix.
+fn prefix_fragment_link(prefix: &str, value: &str) -> String {
+    match value.strip_prefix('#') {
+        Some(fragment) if !fragment.is_empty() => format!("#{prefix}{fragment}"),
+        _ => value.to_string(),
+    }
+}
+
 /// Prefix each whitespace-separated id in `value`.
 fn prefix_id_refs(prefix: &str, value: &str) -> String {
     value
@@ -935,6 +991,20 @@ mod tests {
         assert_eq!(prefix_id_refs("c-", "a"), "c-a");
         assert_eq!(prefix_id_refs("c-", "a  b"), "c-a c-b");
         assert_eq!(prefix_id_refs("c-", ""), "");
+    }
+
+    #[test]
+    fn same_document_fragment_links_are_prefixed_like_the_ids_they_target() {
+        assert_eq!(prefix_fragment_link("c-", "#section"), "#c-section");
+        // A bare `#` has no target, and a cross-document fragment points at a
+        // document whose ids this render did not write.
+        assert_eq!(prefix_fragment_link("c-", "#"), "#");
+        assert_eq!(
+            prefix_fragment_link("c-", "/other#section"),
+            "/other#section"
+        );
+        assert_eq!(prefix_fragment_link("c-", "https://x/y#z"), "https://x/y#z");
+        assert_eq!(prefix_fragment_link("c-", ""), "");
     }
 
     #[test]

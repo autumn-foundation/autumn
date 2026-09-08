@@ -126,6 +126,18 @@ pub struct Dispatched {
     /// The effects the server declined to perform, in the order they were
     /// reached. Empty when the action was entirely pure.
     pub effects: Vec<Effect>,
+    /// The step at which execution stopped, if it did — the JSON path of the
+    /// first effectful step reached.
+    ///
+    /// **Everything after that step was not run**, and that is a correctness
+    /// requirement rather than caution. An effect can bind a `result` that
+    /// later steps read; the server did not perform the effect, so it has no
+    /// value to bind, and running on would evaluate those reads as `null` and
+    /// commit the answer to state. A `fetch` that fails to load followed by
+    /// `set data = var(res)` would silently write `null` over good data. More
+    /// generally, once an effect is outstanding the rest of the action belongs
+    /// to whoever performs it, so the server stops and hands back what it has.
+    pub suspended_at: Option<String>,
 }
 
 impl Dispatched {
@@ -134,6 +146,13 @@ impl Dispatched {
     #[must_use]
     pub const fn is_pure(&self) -> bool {
         self.effects.is_empty()
+    }
+
+    /// Whether execution stopped early at an effect, leaving later steps
+    /// un-run. See [`Self::suspended_at`].
+    #[must_use]
+    pub const fn is_suspended(&self) -> bool {
+        self.suspended_at.is_some()
     }
 }
 
@@ -147,9 +166,11 @@ pub struct DispatchCtx<'a> {
 /// Run `steps` against `state`.
 ///
 /// State is mutated in place. When an effectful step is reached it is recorded
-/// and **its nested `onSuccess`/`onError`/`then` branches are not run**: the
-/// server does not know which of them would have been taken, and guessing would
-/// silently apply a state transition the document did not ask for.
+/// and **execution stops** — neither its nested `onSuccess`/`onError`/`then`
+/// branches nor any later sibling step is run. The server does not know which
+/// branch would have been taken, and it cannot bind the `result` the effect was
+/// to produce, so continuing would evaluate later reads of that binding as
+/// `null` and commit the answer to state. See [`Dispatched::suspended_at`].
 pub fn run_steps(
     steps: &[ActionStep],
     state: &mut Map<String, Value>,
@@ -160,6 +181,11 @@ pub fn run_steps(
 ) -> Result<(), ConstelaError> {
     for (i, step) in steps.iter().enumerate() {
         run_step(step, state, env, ctx, &format!("{path}[{i}]"), out)?;
+        // Also catches a suspension inside an `if` branch, which recurses
+        // through this same loop.
+        if out.is_suspended() {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -375,6 +401,7 @@ fn record_effect(
         }
     };
     out.effects.push(effect);
+    out.suspended_at = Some(path.to_string());
     Ok(())
 }
 

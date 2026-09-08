@@ -605,41 +605,65 @@ impl<'a> Validator<'a> {
 
     /// Find a cycle in the component reference graph, returning it as
     /// `a -> b -> a` for the diagnostic.
+    /// Find a cycle in the component reference graph, returning it as
+    /// `a -> b -> a` for the diagnostic.
+    ///
+    /// **Iterative, with an explicit work stack.** The obvious recursive DFS
+    /// takes one Rust stack frame per component in a chain, and chain length
+    /// is not bounded by anything the parse limits check: components are
+    /// *sibling* entries in one shallow map, so `A -> B -> C -> …` a few
+    /// thousand deep costs only a few nodes each and sails under the 512 KiB,
+    /// depth-64 and 20 000-node bounds. That would overflow the request
+    /// thread's stack during validation — before the render depth guard, which
+    /// is the only other thing that would have caught it, ever runs.
     fn find_component_cycle(&self) -> Option<String> {
+        // Standard three-colour DFS. `visited` is black (fully explored),
+        // `on_path` is grey (an ancestor of the node being explored, so
+        // reaching it again is a cycle), and everything else is white.
         let mut visited: BTreeSet<&str> = BTreeSet::new();
-        for start in self.program.components.keys() {
-            let mut stack: Vec<&str> = Vec::new();
-            if let Some(cycle) = self.walk_for_cycle(start, &mut stack, &mut visited) {
-                return Some(cycle);
-            }
-        }
-        None
-    }
+        let mut path: Vec<&str> = Vec::new();
+        let mut on_path: BTreeSet<&str> = BTreeSet::new();
 
-    fn walk_for_cycle<'s>(
-        &'s self,
-        name: &'s str,
-        stack: &mut Vec<&'s str>,
-        visited: &mut BTreeSet<&'s str>,
-    ) -> Option<String> {
-        if let Some(at) = stack.iter().position(|entry| *entry == name) {
-            let mut cycle: Vec<&str> = stack.iter().skip(at).copied().collect();
-            cycle.push(name);
-            return Some(cycle.join(" -> "));
-        }
-        if !visited.insert(name) {
-            return None;
-        }
-        let component = self.program.components.get(name)?;
-        stack.push(name);
-        let mut referenced = Vec::new();
-        collect_component_refs(&component.view, &mut referenced);
-        for next in referenced {
-            if let Some(cycle) = self.walk_for_cycle(next, stack, visited) {
-                return Some(cycle);
+        for start in self.program.components.keys() {
+            if visited.contains(start.as_str()) {
+                continue;
+            }
+            let mut work: Vec<Visit<'_>> = vec![Visit::Enter(start.as_str())];
+
+            while let Some(step) = work.pop() {
+                match step {
+                    // The marker that pops `name` back off the current path
+                    // once every branch below it has been explored. Pushed
+                    // before its children, so it is popped after them.
+                    Visit::Leave(name) => {
+                        path.pop();
+                        on_path.remove(name);
+                    }
+                    Visit::Enter(name) => {
+                        if on_path.contains(name) {
+                            let at = path.iter().position(|entry| *entry == name).unwrap_or(0);
+                            let mut cycle: Vec<&str> = path.iter().skip(at).copied().collect();
+                            cycle.push(name);
+                            return Some(cycle.join(" -> "));
+                        }
+                        if !visited.insert(name) {
+                            continue;
+                        }
+                        path.push(name);
+                        on_path.insert(name);
+                        work.push(Visit::Leave(name));
+
+                        if let Some(component) = self.program.components.get(name) {
+                            let mut referenced = Vec::new();
+                            collect_component_refs(&component.view, &mut referenced);
+                            for next in referenced {
+                                work.push(Visit::Enter(next));
+                            }
+                        }
+                    }
+                }
             }
         }
-        stack.pop();
         None
     }
 
@@ -1079,6 +1103,16 @@ const fn json_type_name(value: &serde_json::Value) -> &'static str {
         serde_json::Value::Array(_) => "list",
         serde_json::Value::Object(_) => "object",
     }
+}
+
+/// One item of [`Validator::find_component_cycle`]'s explicit work stack.
+#[derive(Debug, Clone, Copy)]
+enum Visit<'a> {
+    /// Explore this component.
+    Enter(&'a str),
+    /// Pop this component back off the current path; every branch below it has
+    /// been explored.
+    Leave(&'a str),
 }
 
 /// Collect every name an action binds with a step `result`, at any depth.

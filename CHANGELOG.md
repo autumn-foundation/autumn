@@ -31,7 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   render time**, where its value is finally known. Unlike the rich-text path,
   `id` is not banned but *prefixed*: every element id a document writes, and
   every attribute referencing one (`for`, `aria-labelledby`, …), is rewritten
-  with `RenderContext::id_prefix`, so `<label for>` keeps working inside the
+  with `RenderContext::id_prefix` — as is a same-document fragment link, so
+  `href="#x"` and `id="x"` stay a matched pair rather than the link escaping to
+  a host-page element of that name — so `<label for>` keeps working inside the
   fragment while collision with — or clobbering of — a host-page id becomes
   impossible. `target="_blank"` gets `rel="noopener noreferrer"` whether the
   document asked or not.
@@ -48,8 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the app owns. Browser-side steps are **reported** as `Effect`s rather than
   performed — running a model-authored `fetch` from inside the app would give a
   prompt injection the app's own network position, which is SSRF by
-  construction — and their `onSuccess`/`onError` branches are not run, because
-  the server does not know which the browser would have taken. Autumn ships no
+  construction. Dispatch **stops** at the first effect
+  (`Dispatched::suspended_at` names where): an effect can bind a `result` that
+  later steps read, the server has no value to bind, and running on would
+  evaluate those reads as `null` and commit the answer — a `fetch` followed by
+  `set data = var(res)` would write `null` over good data. Autumn ships no
   Constela client runtime and generates no JavaScript.
 
   Parse bounds (`Limits`: 512 KiB, depth 64, 20 000 nodes) are applied before
@@ -60,7 +65,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not because the walk over it would be deep (it is iterative) but because
   `serde_json::Value` drops *recursively*, so a document that wrote two hundred
   thousand levels down would overflow the stack whenever that state was next
-  freed, with no visible connection to the request that built it. All nine
+  freed, with no visible connection to the request that built it.
+  `RenderLimits::max_output_bytes` (4 MiB) is a separate budget from the node
+  and iteration counts because those do not imply it: one text node can emit as
+  much as the whole document may be, so a ~480 KiB string rendered from a
+  5 000-iteration `each` is a few dozen nodes and ~2.4 GiB of markup. Component
+  cycle detection is iterative for the mirror-image reason — components are
+  sibling map entries, so a chain thousands deep is shallow JSON that clears
+  every parse bound, and a recursive walk would overflow during *validation*.
+  All nine
   modules are enrolled in the #1611 request-path panic gate, so an out-of-range
   index or an unchecked add in this path is a build failure rather than a 500
   someone can trigger with a crafted document.

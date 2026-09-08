@@ -134,8 +134,15 @@ that references one (`for`, `form`, `list`, `headers`, `aria-labelledby`,
 { "kind": "element", "tag": "label", "props": { "for": { "expr": "lit", "value": "email" } } }
 ```
 
-renders as `<label for="c-email">`. Association inside the fragment keeps
-working; collision with the host page becomes impossible. If a page embeds more
+renders as `<label for="c-email">`. A same-document fragment link is rewritten
+to match, so `href="#section"` becomes `href="#c-section"` and still reaches the
+element the document called `id="section"` — prefixing one half and not the
+other would break in-fragment navigation and let `#section` resolve against the
+host page instead. A cross-document fragment (`/other#section`) is left alone;
+it points at ids this render did not write.
+
+Association inside the fragment keeps working; collision with the host page
+becomes impossible. If a page embeds more
 than one document, give each its own prefix:
 
 ```rust
@@ -285,10 +292,23 @@ for effect in outcome.effects {
 }
 ```
 
-When an effectful step is reached, its nested `onSuccess`/`onError` branches are
-**not** run. The server did not make the request and does not know which branch
-the browser would have taken; running either would apply a state transition the
-document never asked for.
+When an effectful step is reached, **execution stops** — neither its nested
+`onSuccess`/`onError` branches nor any later step in the action is run, and
+`Dispatched::suspended_at` names where it stopped.
+
+That is a correctness requirement, not caution. An effect can bind a `result`
+that later steps read; the server did not perform the effect, so it has no value
+to bind, and running on would evaluate those reads as `null` and commit the
+answer to state:
+
+```json
+{ "do": "fetch", "url": {"expr": "lit", "value": "/api"}, "result": "res" },
+{ "do": "set", "target": "data", "value": {"expr": "var", "name": "res"} }
+```
+
+Continuing past the `fetch` would write `null` over whatever `data` held. So
+dispatch stops, hands back the effects it reached, and leaves the rest of the
+action to whoever performs them.
 
 ## Limits
 
@@ -310,6 +330,14 @@ A 2 KB document that loops over a 100 000-element list is small and expensive:
 | `max_depth` | 128 |
 | `max_nodes` | 50 000 |
 | `max_each_items` | 5 000 |
+| `max_output_bytes` | 4 MiB |
+
+`max_output_bytes` is not implied by the node or iteration counts, which is why
+it is its own budget: a *single* text node can emit as much as the document is
+allowed to be. A 512 KiB document can put a ~480 KiB string in state and render
+that field from a 5 000-iteration `each` — a few dozen nodes, inside every other
+bound, and about 2.4 GiB of markup. Counting nodes does not see that; counting
+bytes does.
 
 `max_depth` also caps how deep a `setPath` step may write. That one is worth
 knowing about, because the reason is not the obvious one: the walk over a long

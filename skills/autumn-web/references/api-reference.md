@@ -1235,7 +1235,7 @@ document containing one fails validation with `constela.feature_required`).
 | `parse_program` | `fn(&str, &Limits) -> Result<Program, ConstelaError>` — syntax only, no validation |
 | `validate` | `fn(&Program) -> Result<(), ConstelaError>` |
 | `RenderedUi` | `{ body: Markup, portals: Vec<RenderedPortal>, title: Option<String>, meta: BTreeMap<String, String> }`, plus `portals_for(target)` |
-| `Dispatched` | `{ effects: Vec<Effect> }`, plus `is_pure()` |
+| `Dispatched` | `{ effects: Vec<Effect>, suspended_at: Option<String> }`, plus `is_pure()` / `is_suspended()`; dispatch stops at the first effect |
 | `Effect` | `#[non_exhaustive]` — `Fetch`, `Storage`, `Navigate`, `Delay`, `Interval`, `Focus` |
 | `ConstelaError` | `Limit` / `Syntax` / `Invalid(Vec<Diagnostic>)` / `Render`, plus `diagnostics()` and `to_json()`; maps to **422** |
 | `Diagnostic` | `{ path: String, code: &'static str, message: String }` |
@@ -1248,9 +1248,11 @@ host-page id. Give each fragment its own prefix when a page embeds several.
 
 Limits are two independent sets. `Limits { max_bytes: 512 KiB, max_depth: 64,
 max_nodes: 20_000 }` bounds the **document** and is applied before and around
-deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000,
-max_each_items: 5_000 }` bounds the **expansion** against runtime state, and
-`max_depth` also caps how deep a `setPath` step may write. `Limits::unbounded()`
+deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000, max_each_items: 5_000,
+max_output_bytes: 4 MiB }` bounds the **expansion** against runtime state;
+`max_depth` also caps how deep a `setPath` step may write, and
+`max_output_bytes` is separate because one text node can emit as much as the
+whole document is allowed to be. `Limits::unbounded()`
 exists for trusted, locally-authored documents only.
 
 Safety lives in `constela::policy` — `ALLOWED_TAGS`, `ALLOWED_ATTRS`,
