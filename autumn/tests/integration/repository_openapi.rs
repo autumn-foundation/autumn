@@ -501,6 +501,10 @@ fn an_optional_colliding_value_still_gets_its_null_branch() {
 
 /// An application type whose last path segment is `Uuid` but which serializes
 /// as an OBJECT, and which derives no schema of its own.
+#[allow(
+    dead_code,
+    reason = "the fields exist so the derive has a shape to describe; nothing reads them"
+)]
 pub struct Uuid {
     pub raw: String,
 }
@@ -509,6 +513,10 @@ pub struct Uuid {
 // `uuid::Uuid` carries no serde impls in this crate's feature set, so the
 // fixture derives the schema alone — which is all this test exercises.
 #[derive(autumn_web::openapi::OpenApiSchema)]
+#[allow(
+    dead_code,
+    reason = "the fields exist so the derive has a shape to describe; nothing reads them"
+)]
 pub struct HoldsCollidingUuid {
     pub id: Uuid,
     /// The genuine external scalar, for contrast.
