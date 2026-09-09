@@ -246,6 +246,18 @@ impl autumn_web::hooks::MutationHooks for DvNodeHooks {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         Ok(())
     }
+
+    /// Runs after the update's counter-cache capture took the advisory lock
+    /// and before its `UPDATE`, so the pause holds the lock open for a
+    /// concurrent insert to land in.
+    async fn before_update(
+        &self,
+        _ctx: &mut autumn_web::hooks::MutationContext,
+        _draft: &mut autumn_web::hooks::UpdateDraft<DvNode>,
+    ) -> autumn_web::AutumnResult<()> {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        Ok(())
+    }
 }
 
 #[autumn_web::repository(DvNode, table = "dv_nodes", hooks = DvNodeHooks)]
@@ -1691,6 +1703,120 @@ async fn a_self_referential_derivation_survives_a_delete_crossing_a_reparent() {
     assert_eq!(
         pair.stored, pair.actual,
         "C's count matches the rows under it"
+    );
+}
+
+/// An insert crossing a re-parent. The saver now takes the advisory lock
+/// before its insert, so it queues behind a hooked update that holds the lock
+/// through its `before_update` pause rather than inserting under it. The two
+/// could not deadlock even before that (a referencing update's foreign-key
+/// check runs against a fresh snapshot, so a row another transaction has only
+/// just inserted is a foreign-key failure to it, never a wait); what this pins
+/// is that the crossing completes under the uniform lock-first ordering and
+/// that B's count stays right while D is pointed at ids that are in flight,
+/// committed, or not there yet.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_self_referential_derivation_survives_an_insert_crossing_a_reparent() {
+    #[derive(diesel::QueryableByName)]
+    struct Pair {
+        #[diesel(sql_type = BigInt)]
+        stored: i64,
+        #[diesel(sql_type = BigInt)]
+        actual: i64,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct MaxId {
+        #[diesel(sql_type = BigInt)]
+        max_id: i64,
+    }
+    let (_guard, _pg, pool) = setup().await;
+    let plain = PgDvNodeRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    mark_all_complete(&mut conn).await;
+
+    let b = seed_node(&plain, None).await;
+    let d = seed_node(&plain, None).await;
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // One worker keeps inserting children under B until the other is done.
+    let saver = {
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            while !std::sync::atomic::AtomicBool::load(&done, std::sync::atomic::Ordering::Relaxed)
+            {
+                plain.save(&NewDvNode { parent_id: Some(b) }).await?;
+            }
+            Ok::<(), autumn_web::AutumnError>(())
+        })
+    };
+    // The other points D at the id the saver is about to insert (the next
+    // one after the highest committed id) through a hooked update whose
+    // `before_update` pauses while the advisory lock is held, then detaches
+    // D again. A foreign-key failure means the guess was not a row yet; that
+    // is the race the test sets up, not a deadlock, and is skipped.
+    let mover = {
+        let hooked = PgHookedDvNodeRepository::with_pool_untracked(pool.clone());
+        let pool = pool.clone();
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            let mut conn = pool.get().await?;
+            for _ in 0..20 {
+                let next = diesel::sql_query("SELECT MAX(id) AS max_id FROM dv_nodes")
+                    .get_result::<MaxId>(&mut conn)
+                    .await?
+                    .max_id
+                    + 1;
+                match hooked
+                    .update(
+                        d,
+                        &UpdateDvNode {
+                            parent_id: Patch::Set(Some(next)),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) if format!("{e:?}").contains("ForeignKeyViolation") => {}
+                    Err(e) => {
+                        std::sync::atomic::AtomicBool::store(
+                            &done,
+                            true,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        return Err(e);
+                    }
+                }
+                hooked
+                    .update(
+                        d,
+                        &UpdateDvNode {
+                            parent_id: Patch::Set(None),
+                        },
+                    )
+                    .await?;
+            }
+            std::sync::atomic::AtomicBool::store(&done, true, std::sync::atomic::Ordering::Relaxed);
+            Ok::<(), autumn_web::AutumnError>(())
+        })
+    };
+    let mover_result = mover.await.expect("join");
+    std::sync::atomic::AtomicBool::store(&done, true, std::sync::atomic::Ordering::Relaxed);
+    let saver_result = saver.await.expect("join");
+    mover_result.expect("a re-parent crossing an insert must wait, not deadlock");
+    saver_result.expect("an insert crossing a re-parent must wait, not deadlock");
+    // B counts exactly the rows under it.
+    let pair = diesel::sql_query(
+        "SELECT child_count AS stored, \
+         (SELECT COUNT(*) FROM dv_nodes WHERE parent_id = $1) AS actual \
+         FROM dv_nodes WHERE id = $1",
+    )
+    .bind::<BigInt, _>(b)
+    .get_result::<Pair>(&mut conn)
+    .await
+    .expect("read the count");
+    assert_eq!(
+        pair.stored, pair.actual,
+        "B's count matches the rows under it"
     );
 }
 

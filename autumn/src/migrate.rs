@@ -2847,7 +2847,7 @@ const SQLITE_FRAMEWORK_MIGRATION_TABLES: [(&str, &str); 5] = [
 /// `sets` is every enumerated set, `(version, full name)` pairs, the same
 /// input the map was computed from.
 #[cfg(feature = "sqlite")]
-fn adopt_sqlite_collision_history(
+pub(crate) fn adopt_sqlite_collision_history(
     database_url: &str,
     sets: &[Vec<(String, String)>],
     disambiguated: &HashMap<String, String>,
@@ -2923,6 +2923,22 @@ fn adopt_sqlite_collision_history(
     })
 }
 
+/// The `(version, full name)` pairs of every set in `named_sets`, the input
+/// [`adopt_sqlite_collision_history`] takes, so the application paths (startup
+/// auto-migration and the app binary's own `migrate` subcommand) can adopt
+/// history for the same sets they computed their collision map over. A set
+/// that cannot be enumerated contributes nothing, exactly as it contributes
+/// nothing to [`compute_migration_disambiguation`].
+#[cfg(feature = "sqlite")]
+pub(crate) fn sqlite_collision_pairs(
+    named_sets: &[(&str, &EmbeddedMigrations)],
+) -> Vec<Vec<(String, String)>> {
+    named_sets
+        .iter()
+        .filter_map(|(_, set)| migration_versions_and_names::<diesel::sqlite::Sqlite, _>(*set).ok())
+        .collect()
+}
+
 /// Whether `table` exists in the `SQLite` database behind `conn`.
 #[cfg(feature = "sqlite")]
 fn sqlite_table_exists(
@@ -2992,7 +3008,7 @@ pub fn pending_shard_framework_migrations(
 ///    custom names like `fly`/`staging` (the previous name-gated check silently
 ///    skipped custom profiles, so their opt-in was ignored: the bug).
 /// 4. Otherwise report-only.
-fn should_auto_apply(
+pub(crate) fn should_auto_apply(
     profile: Option<&str>,
     auto_migrate: Option<bool>,
     auto_migrate_in_production: bool,

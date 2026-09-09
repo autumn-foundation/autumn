@@ -411,9 +411,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derivation onto its own table sweeps one parent per batch, a batch the
   database aborts to break a deadlock is retried from its checkpoint, every
   mutation on such a table takes a per-table advisory lock before its first
-  row lock (`upsert_many` before the `FOR UPDATE` load it diffs against, the
-  delete family and retention before theirs) so crossing mutations wait
-  rather than deadlock, and
+  row lock (a save before its insert, `upsert_many` before the `FOR UPDATE`
+  load it diffs against, the delete family and retention before theirs) so
+  crossing mutations wait rather than deadlock, the registry refuses a
+  derivation column that is the parent's primary key under the backend's
+  identifier rules (`"ID"` on SQLite), and
   `derivation::resweep` re-enqueues one derivation for the settling pass a
   rolling deployment that changed a definition needs (see the guide). The
   collision check also covers the column a `#[commentable(counter_cache)]`

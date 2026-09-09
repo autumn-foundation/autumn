@@ -371,6 +371,11 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   `column = "deleted_at"` are compile errors, and a model's `tenant_id` and
   `deleted_at` fields also claim their columns in the registry, so a
   derivation reaching one by another spelling stops the boot.
+- **A derivation never maintains the parent's primary key.** The macro
+  refuses `column = "id"`, and the registry refuses any spelling that is the
+  primary key under the backend's identifier rules (`"ID"` on SQLite, where
+  quoted identifiers fold case), so a boot fails rather than a mutation
+  renumbering a parent.
 - **A self-referential derivation cannot read the column it maintains.** Onto
   its own table, `sum(<the maintained column>)` or a filter naming it is a
   compile error: the parent-side update runs no repository hook, so a row's
@@ -392,11 +397,13 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   same shape (a mutation locks a child row and then a parent row of the same
   table, and two re-parents can want each other's rows), so on Postgres every
   counter-cached mutation on such a table takes a transaction-scoped advisory
-  lock keyed by the table before its first row lock (`upsert_many` before the
-  `FOR UPDATE` load of the rows it is about to diff, a delete before the load
-  for its hook, `delete_many` before its preload, a retention sweep before
-  its batch lock) and they take turns; the price is that writes to that
-  table serialize. SQLite serializes writers already.
+  lock keyed by the table before its first row lock (a save before its
+  insert, since the new row is locked to a foreign-key check from the moment
+  it is inserted; `upsert_many` before the `FOR UPDATE` load of the rows it is
+  about to diff; a delete before the load for its hook; `delete_many` before
+  its preload; a retention sweep before its batch lock) and they take turns;
+  the price is that writes to that table serialize. SQLite serializes writers
+  already.
 - **Weights are ordinary numbers, not the edges of `i64`.** The delta paths
   never overflow on their own (a difference that does not fit goes out as two
   deltas, a bulk mutation's total is netted in `i128`, and a tenant-scoped

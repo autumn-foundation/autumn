@@ -6474,6 +6474,8 @@ impl AppBuilder {
         let disambiguation_sets =
             migration_sets_for_disambiguation(&migrations, config.database.has_shards());
         let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+        #[cfg(feature = "sqlite")]
+        let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
 
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
@@ -6491,6 +6493,22 @@ impl AppBuilder {
                 #[cfg(not(feature = "sqlite"))]
                 let is_sqlite_control = false;
                 if is_sqlite_control {
+                    // A migration this database already ran under a version the
+                    // map now gives a substitute keeps its record, moved to that
+                    // substitute, rather than running twice (same as the CLI's
+                    // SQLite path).
+                    #[cfg(feature = "sqlite")]
+                    if let Err(error) = crate::migrate::adopt_sqlite_collision_history(
+                        url,
+                        &sqlite_history_sets,
+                        &disambiguated,
+                    ) {
+                        eprintln!(
+                            "autumn migrate: could not move an already-applied migration's \
+                             version record (target control): {error}"
+                        );
+                        std::process::exit(1);
+                    }
                     #[cfg(feature = "sqlite")]
                     for (_, mig) in &migrations {
                         total += apply_pending_sqlite_or_exit(
@@ -11030,6 +11048,8 @@ async fn run_startup_migrations(
     let disambiguation_sets =
         migration_sets_for_disambiguation(&migrations, config.database.has_shards());
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+    #[cfg(feature = "sqlite")]
+    let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
     let migration_result = tokio::task::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
@@ -11043,6 +11063,25 @@ async fn run_startup_migrations(
             && crate::config::DatabaseBackend::detect(url)
                 == Some(crate::config::DatabaseBackend::Sqlite)
         {
+            // Only when this boot applies (the same decision `auto_migrate_sqlite`
+            // makes): a migration this database already ran under a version the
+            // map now gives a substitute keeps its record, moved to that
+            // substitute, rather than running twice. A report-only boot touches
+            // nothing.
+            if crate::migrate::should_auto_apply(profile.as_deref(), auto_migrate, auto_in_prod)
+                && let Err(error) = crate::migrate::adopt_sqlite_collision_history(
+                    url,
+                    &sqlite_history_sets,
+                    &disambiguated,
+                )
+            {
+                tracing::error!(
+                    error = %error,
+                    target = "control",
+                    "Could not move an already-applied migration's version record"
+                );
+                std::process::exit(1);
+            }
             for (_, mig) in &migrations {
                 crate::migrate::auto_migrate_sqlite(
                     url,

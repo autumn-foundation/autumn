@@ -374,9 +374,33 @@ fn find(name: &str) -> Option<&'static DerivationDef> {
 /// every entry point checks them rather than only the boot path.
 fn check_registry(defs: &[&DerivationDef]) -> AutumnResult<()> {
     check_unique_names(defs)?;
+    check_primary_key_columns(defs)?;
     let claims = registered_column_claims();
     check_unique_columns(defs, &claims)?;
     check_source_columns(defs, &claims)
+}
+
+/// Reject a derivation that maintains the parent's primary key.
+///
+/// The macro already refuses `column = "id"` by spelling. The primary key is
+/// not a registered claim, so nothing in [`check_unique_columns`] covers it,
+/// and under [`ident_key`] a spelling the macro let through (`"ID"` on
+/// `SQLite`, where quoted identifiers fold case) is still the same column: the
+/// first qualifying mutation would renumber the parent, and a backfill would
+/// write duplicate aggregate values into primary keys.
+fn check_primary_key_columns(defs: &[&DerivationDef]) -> AutumnResult<()> {
+    let primary_key = ident_key("id");
+    for def in defs {
+        if ident_key(def.column) == primary_key {
+            return Err(AutumnError::from(std::io::Error::other(format!(
+                "derivation `{}` on {}::{} maintains `{}.{}`, which is the parent's primary \
+                 key under this backend's identifier rules. A maintained value would rewrite \
+                 the parent's identity, so name a dedicated aggregate column",
+                def.name, def.module_path, def.model, def.parent_table, def.column,
+            ))));
+        }
+    }
+    Ok(())
 }
 
 /// The key an identifier is compared under in the registry checks.
@@ -1707,6 +1731,33 @@ mod tests {
             ..count_def()
         };
         (lower, upper)
+    }
+
+    /// The macro refuses `column = "id"` by spelling; the registry refuses it
+    /// under the backend's identifier rules, so on `SQLite` `"ID"` is the
+    /// primary key too, while on Postgres it is a distinct quoted column.
+    #[test]
+    fn a_derivation_cannot_maintain_the_parent_primary_key_under_any_spelling() {
+        let exact = DerivationDef {
+            name: "dv_posts.id",
+            column: "id",
+            ..count_def()
+        };
+        let message = check_primary_key_columns(&[&exact])
+            .expect_err("the primary key is never a derivation column")
+            .to_string();
+        assert!(message.contains("primary"), "{message}");
+        let upper = DerivationDef {
+            name: "dv_posts.ID",
+            column: "ID",
+            ..count_def()
+        };
+        let folded = check_primary_key_columns(&[&upper]);
+        if cfg!(feature = "sqlite") {
+            folded.expect_err("`\"ID\"` is `id` on SQLite");
+        } else {
+            folded.expect("`\"ID\"` is its own quoted column on Postgres");
+        }
     }
 
     #[cfg(feature = "sqlite")]
