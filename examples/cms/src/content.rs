@@ -233,7 +233,20 @@ pub async fn transition_status(
         // Taken on `target` rather than on the state machine's answer, because
         // the answer needs the row — and `transition_status_to` only ever
         // returns the target or an error, so the two agree.
-        if target == "trash" {
+        // Which of the two hierarchy guards this transition needs is not
+        // knowable before the row is read: trashing needs the child count, and
+        // *leaving* the trash needs the ancestor check, which depends on the
+        // status the row currently holds. So the type decides, read here
+        // without a lock — `posts.post_type` is written once at insert and by
+        // nothing afterwards, so a stale answer is not a possible answer.
+        let hierarchical: bool = posts::table
+            .find(post_id)
+            .select(posts::post_type)
+            .first::<String>(conn)
+            .await
+            .optional()?
+            .is_some_and(|post_type| is_hierarchical_type(&post_type));
+        if target == "trash" || hierarchical {
             lock_page_hierarchy(conn).await?;
         }
 
@@ -302,6 +315,31 @@ pub async fn transition_status(
         // The macro-generated enforcing transition: an undeclared edge or a
         // failed guard is a 400 and nothing is written.
         let new_status = post.transition_status_to(&target)?;
+
+        // The inverse of the guard below, and it was missing. Trashing a parent
+        // is refused while it has a live child, so the only way to get a live
+        // page under a trashed ancestor is to bring the child back first: trash
+        // the child, trash the parent, restore the child. The child then
+        // becomes a draft — and can be published — while `page_ancestry` still
+        // puts the trashed parent's slug in its canonical URL and
+        // `resolve_page_path` refuses that ancestor. Listings and the sitemap
+        // then advertise a URL that always 404s, which is exactly the orphaned
+        // permalink the trash guard exists to prevent, reached from the other
+        // direction.
+        //
+        // Under the hierarchy lock taken above, so a concurrent trash of an
+        // ancestor cannot commit between this check and this transition.
+        if hierarchical
+            && post.status == "trash"
+            && new_status != "trash"
+            && let Some(ancestor) = trashed_ancestor(conn, &post).await?
+        {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "\"{}\" is still in the trash, and this page's URL is built from it. \
+                 Restore it first.",
+                ancestor.title
+            )));
+        }
 
         // A trashed parent takes its children's URLs with it: `page_ancestry`
         // keeps putting its slug in their permalinks while `resolve_page_path`
@@ -1211,6 +1249,46 @@ pub async fn lock_page_hierarchy(conn: &mut AsyncPgConnection) -> AutumnResult<(
 /// while `resolve_page_path` refuses trashed ancestors — every published child
 /// starts 404ing at its own canonical URL, and the sitemap advertises those
 /// dead URLs.
+/// Whether a registered post type nests.
+#[must_use]
+pub fn is_hierarchical_type(post_type: &str) -> bool {
+    crate::content_types::find_post_type(post_type)
+        .is_some_and(|registered| registered.hierarchical)
+}
+
+/// The nearest trashed ancestor of a post, if it has one.
+///
+/// Walks up rather than down, and bounded by `MAX_PAGE_DEPTH` with a seen-set,
+/// for the same reason `page_ancestry` is: the chain is bounded by the tree's
+/// depth, and a cycle from a direct write must terminate the walk rather than
+/// spin.
+async fn trashed_ancestor(conn: &mut AsyncPgConnection, post: &Post) -> AutumnResult<Option<Post>> {
+    let mut cursor = post.parent_id;
+    let mut seen = vec![post.id];
+    let mut steps = 0_usize;
+    while let Some(parent_id) = cursor {
+        steps += 1;
+        if steps > MAX_PAGE_DEPTH || seen.contains(&parent_id) {
+            break;
+        }
+        seen.push(parent_id);
+        let parent: Option<Post> = posts::table
+            .find(parent_id)
+            .select(Post::as_select())
+            .first(&mut *conn)
+            .await
+            .optional()?;
+        let Some(parent) = parent else {
+            break;
+        };
+        if parent.status == "trash" {
+            return Ok(Some(parent));
+        }
+        cursor = parent.parent_id;
+    }
+    Ok(None)
+}
+
 pub async fn live_child_count(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<i64> {
     Ok(posts::table
         .filter(posts::parent_id.eq(post_id))

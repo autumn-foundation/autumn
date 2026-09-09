@@ -10183,6 +10183,94 @@ async fn the_export_reads_one_snapshot() {
     );
 }
 
+/// A page cannot come back out of the trash while an ancestor is still in it.
+///
+/// The trash guard was one-directional: trashing a parent is refused while it
+/// has a live child, but restoring a child under a trashed parent was not. So
+/// trash the child, trash the parent, restore the child — and the child is a
+/// live draft whose canonical URL contains a trashed ancestor, which
+/// `resolve_page_path` refuses. Listings and the sitemap then advertise a URL
+/// that always 404s: the same orphaned permalink, reached from the other side.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_page_cannot_leave_the_trash_under_a_trashed_ancestor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let page = async |title: &str, parent: &str| -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+        ];
+        if !parent.is_empty() {
+            fields.push(("parent_id", parent));
+        }
+        let response = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(response.status, 303, "create: {}", response.text());
+        response
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+    let parent_id = page("Company", "").await;
+    let child_id = page("Team", &parent_id).await;
+
+    let trash = async |id: &str| {
+        client
+            .post(&format!("/admin/content/page/{id}/status?to=trash"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+    };
+    // The child first — trashing the parent while the child is live is already
+    // refused, which is the guard this one is the inverse of.
+    trash(&child_id).await.assert_status(303);
+    trash(&parent_id).await.assert_status(303);
+
+    // Bringing the child back now would leave it live under a trashed ancestor.
+    let restored = client
+        .post(&format!("/admin/content/page/{child_id}/status?to=draft"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    assert_ne!(
+        restored.status, 303,
+        "restoring under a trashed ancestor must be refused, not redirected"
+    );
+    assert!(
+        restored.text().contains("Company"),
+        "and must name the ancestor to restore first:\n{}",
+        restored.text()
+    );
+
+    // The order that works: the ancestor first, then the child.
+    client
+        .post(&format!("/admin/content/page/{parent_id}/status?to=draft"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/admin/content/page/{child_id}/status?to=draft"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+}
+
 /// A file that names the trash restores a draft, not a deletion.
 ///
 /// The exporter excludes trash, so a file carrying it was hand-edited or came
