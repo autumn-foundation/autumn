@@ -755,12 +755,22 @@ fn strip_key_prefix(key: &str) -> &str {
 /// resolved): those either have no tenant-collision-prone identity or are
 /// already inherently un-shared across tenants (a bearer token is a random
 /// unique string; falling back to IP is an existing, accepted limitation).
+///
+/// Joins the tenant and the id with a NUL byte, not `:` — the same
+/// delimiter `resolve_key_and_params` already uses to join `key_ns` and the
+/// bucket key below, for the same reason: tenant ids and principal ids are
+/// arbitrary app-supplied strings, so a `:`-joined `tenant:id` is not
+/// injective (`tenant = "a:b", id = "c"` and `tenant = "a", id = "b:c"` both
+/// render as `"a:b:c"`, letting two distinct tenants share a bucket). `\0`
+/// cannot appear in an HTTP header value (rejected at the `HeaderValue`
+/// layer) and is not a realistic tenant/principal id in practice, matching
+/// the trust already placed in `key_ns`.
 fn tenant_qualify_bucket_key(key_strategy: KeyStrategy, raw_key: &str) -> String {
     if key_strategy == KeyStrategy::AuthenticatedPrincipal
         && let Some(id) = raw_key.strip_prefix("principal:")
         && let Ok(Some(tenant)) = crate::tenancy::CURRENT_TENANT.try_with(Clone::clone)
     {
-        format!("principal:tenant={tenant}:{id}")
+        format!("principal:tenant={tenant}\0{id}")
     } else {
         raw_key.to_owned()
     }
@@ -2420,6 +2430,63 @@ mod tests {
         assert_eq!(
             key_class_label("principal:user-42"),
             "authenticated principal"
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_is_noop_without_tenant() {
+        assert_eq!(
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:user-42"),
+            "principal:user-42"
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_is_noop_for_non_principal_strategies() {
+        crate::tenancy::CURRENT_TENANT.sync_scope(Some("tenant-a".to_owned()), || {
+            assert_eq!(
+                tenant_qualify_bucket_key(KeyStrategy::Ip, "1.2.3.4"),
+                "1.2.3.4"
+            );
+            assert_eq!(
+                tenant_qualify_bucket_key(KeyStrategy::ApiToken, "token:abc"),
+                "token:abc"
+            );
+        });
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_folds_in_tenant() {
+        crate::tenancy::CURRENT_TENANT.sync_scope(Some("tenant-a".to_owned()), || {
+            let key =
+                tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:user-42");
+            assert!(
+                key.starts_with("principal:"),
+                "must stay classifiable as an authenticated-principal key: {key}"
+            );
+            assert_ne!(
+                key, "principal:user-42",
+                "must differ from the unqualified key once a tenant is ambient"
+            );
+        });
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries() {
+        // Regression: a `:`-joined "tenant:id" is not injective — tenant="a:b"
+        // id="c" and tenant="a" id="b:c" both render as "a:b:c". Codex flagged
+        // this on PR #2653; the fix joins with `\0` instead (see
+        // `tenant_qualify_bucket_key`'s doc comment).
+        let key_1 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a:b".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:c")
+        });
+        let key_2 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:b:c")
+        });
+        assert_ne!(
+            key_1, key_2,
+            "tenant \"a:b\" + id \"c\" must not produce the same bucket key as tenant \"a\" + \
+             id \"b:c\""
         );
     }
 
