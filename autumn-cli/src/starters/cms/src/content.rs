@@ -2682,22 +2682,28 @@ pub async fn search_published(
     Ok((rows, usize::try_from(total).unwrap_or(0)))
 }
 
-/// The unique violations a menu insert can raise, and what each one means.
+/// The location index, which is an answer to give the administrator.
 ///
 /// `menus.slug` is `UNIQUE` and `idx_menus_location` is a partial unique index,
-/// so both are `UniqueViolation` and only the constraint name tells them apart.
-const MENU_COLLISION_INDEXES: &[(&str, &str, &str)] = &[
-    (
-        "menus_slug_key",
-        "name",
-        "A menu with that name already exists",
-    ),
-    (
-        "idx_menus_location",
-        "location",
-        "Another menu was just assigned to that location; try again",
-    ),
-];
+/// so both raise `UniqueViolation` and only the constraint name tells them
+/// apart. They want opposite handling: a lost race for a *location* is a real
+/// conflict worth reporting, because resolving it silently would detach a menu
+/// somebody else just attached. A lost race for a *slug* is not a conflict at
+/// all — see [`MENU_SLUG_INDEX`].
+const MENU_LOCATION_INDEX: &[(&str, &str, &str)] = &[(
+    "idx_menus_location",
+    "location",
+    "Another menu was just assigned to that location; try again",
+)];
+
+/// The slug index, which is a signal to allocate again.
+///
+/// Duplicate menu names are supported, so a slug collision is never something
+/// to tell the administrator about: it means another transaction took the
+/// suffix this one had picked, and the answer is to pick the next one. Reported
+/// as an error it claimed the *name* was unavailable — which is both wrong and
+/// unactionable, since the name is fine and only the invisible slug collided.
+const MENU_SLUG_INDEX: &[(&str, &str, &str)] = &[("menus_slug_key", "name", "")];
 
 /// A free slug for a new menu.
 ///
@@ -2754,51 +2760,75 @@ pub async fn replace_menu_at_location(
     name: &str,
     location: &str,
 ) -> AutumnResult<()> {
-    let name = name.to_owned();
-    let location = location.to_owned();
-    conn.transaction(async move |conn| {
-        if !location.is_empty() {
-            // `FOR UPDATE` on the incumbent, so two administrators assigning
-            // the same location serialize here rather than each clearing what
-            // they saw and both inserting. `idx_menus_location` is the backstop
-            // — it makes the invariant the database's, which is what holds when
-            // there is no incumbent to lock and both inserts race.
-            let _: Vec<i64> = menus::table
-                .filter(menus::location.eq(&location))
-                .select(menus::id)
-                .for_update()
-                .load(conn)
-                .await?;
-            diesel::update(menus::table.filter(menus::location.eq(&location)))
-                .set(menus::location.eq(""))
-                .execute(conn)
-                .await?;
-        }
-        let slug = unique_menu_slug(conn, &name).await?;
-        diesel::insert_into(menus::table)
-            .values((
-                menus::name.eq(&name),
-                menus::slug.eq(&slug),
-                menus::location.eq(&location),
-            ))
-            .execute(conn)
-            .await
-            .map_err(|error| {
-                // Which constraint fired decides what to say. Both are unique
-                // violations, and reporting the location race for either of
-                // them told an administrator who had simply reused a menu name
-                // that somebody else was editing at the same moment — a message
-                // that is confidently wrong and sends them to look for a
-                // conflict that is not there.
-                let error = AutumnError::from(error);
-                match autumn_web::error::unique_violation_field(&error, MENU_COLLISION_INDEXES) {
-                    Some((_, message)) => AutumnError::conflict_msg(message),
-                    None => error,
+    // Allocate-then-insert is a read followed by a write, so two administrators
+    // creating same-named menus at once can both read the same `taken` set and
+    // both pick the same suffix. The unique index catches the second one, and
+    // re-running the whole attempt is the answer: the loser now sees the
+    // winner's committed row and takes the next suffix. Same shape as
+    // `insert_post_with_unique_slug`, and for the same reason — the index is
+    // the invariant and the allocator is an optimization over it.
+    //
+    // The retry is the whole transaction, not just the allocation, because the
+    // location clearing and the insert have to stay atomic.
+    for _ in 0..5 {
+        let name = name.to_owned();
+        let location = location.to_owned();
+        let outcome = conn
+            .transaction(async move |conn| {
+                if !location.is_empty() {
+                    // `FOR UPDATE` on the incumbent, so two administrators
+                    // assigning the same location serialize here rather than
+                    // each clearing what they saw and both inserting.
+                    // `idx_menus_location` is the backstop — it makes the
+                    // invariant the database's, which is what holds when there
+                    // is no incumbent to lock and both inserts race.
+                    let _: Vec<i64> = menus::table
+                        .filter(menus::location.eq(&location))
+                        .select(menus::id)
+                        .for_update()
+                        .load(conn)
+                        .await?;
+                    diesel::update(menus::table.filter(menus::location.eq(&location)))
+                        .set(menus::location.eq(""))
+                        .execute(conn)
+                        .await?;
                 }
-            })?;
-        Ok::<_, AutumnError>(())
-    })
-    .await
+                let slug = unique_menu_slug(conn, &name).await?;
+                diesel::insert_into(menus::table)
+                    .values((
+                        menus::name.eq(&name),
+                        menus::slug.eq(&slug),
+                        menus::location.eq(&location),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(|error| {
+                        // Only the location index becomes a message here. A slug
+                        // collision is left as the database error it is, so the
+                        // loop below can recognize it and allocate again.
+                        let error = AutumnError::from(error);
+                        match autumn_web::error::unique_violation_field(&error, MENU_LOCATION_INDEX)
+                        {
+                            Some((_, message)) => AutumnError::conflict_msg(message),
+                            None => error,
+                        }
+                    })?;
+                Ok::<_, AutumnError>(())
+            })
+            .await;
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if autumn_web::error::unique_violation_field(&error, MENU_SLUG_INDEX).is_some() =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AutumnError::conflict_msg(
+        "Could not allocate a name for this menu; try again",
+    ))
 }
 
 /// Terms of a taxonomy that have at least one published, publicly-routable

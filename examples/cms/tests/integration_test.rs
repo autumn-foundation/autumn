@@ -3643,6 +3643,74 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// A menu-slug race allocates the next suffix rather than reporting a conflict.
+///
+/// Allocation is a read followed by a write, so two administrators creating
+/// same-named menus at once can both read the same taken set and pick the same
+/// suffix. The unique index catches the loser — and reporting that told them
+/// the *name* was unavailable, which is wrong (duplicate names are supported)
+/// and unactionable, since only the invisible slug collided.
+///
+/// Held deterministically: a competing row is inserted and left uncommitted, so
+/// the allocator cannot see it but the index still blocks the insert; committing
+/// the competitor then turns that block into the collision.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_menu_slug_race_takes_the_next_suffix() {
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let _cookie = register(&client, "owner").await;
+
+    // The competitor: `main` is taken, but not yet visible to anyone else.
+    let mut competitor = TestDb::shared().await.pool().get().await.expect("conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut competitor)
+        .await
+        .expect("begin");
+    diesel::sql_query("INSERT INTO menus (name, slug, location) VALUES ('Main', 'main', '')")
+        .execute(&mut competitor)
+        .await
+        .expect("the competing insert");
+
+    // This one reads a taken set without `main` in it, picks `main`, and blocks
+    // on the index behind the uncommitted row.
+    let creating = tokio::spawn(async move {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::content::replace_menu_at_location(&mut conn, "Main", "").await
+    });
+
+    wait_for_a_blocked_backend().await;
+    diesel::sql_query("COMMIT")
+        .execute(&mut competitor)
+        .await
+        .expect("commit");
+
+    creating
+        .await
+        .expect("the task")
+        .expect("a lost slug race is not a conflict to report");
+
+    let slugs: Vec<String> = {
+        use diesel::QueryDsl as _;
+        use diesel::prelude::ExpressionMethods as _;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel_async::RunQueryDsl::load(
+            cms::schema::menus::table
+                .order(cms::schema::menus::id.asc())
+                .select(cms::schema::menus::slug),
+            &mut conn,
+        )
+        .await
+        .expect("the menus")
+    };
+    assert_eq!(
+        slugs,
+        vec!["main".to_owned(), "main-2".to_owned()],
+        "the loser takes the next suffix"
+    );
+}
+
 /// Two menus may share a name.
 ///
 /// `menus.slug` is `NOT NULL UNIQUE` and `slugify(name)` was the whole
