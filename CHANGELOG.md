@@ -106,6 +106,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **web:** `AutumnError`'s `Display` now appends the failing fields to a
+  validation error, sorted by field name — `Validation failed: email: Must be
+  a valid email address` instead of the bare `Validation failed` (issue
+  #2587). Exact `Display` output is outside the SemVer surface (see
+  `STABILITY.md`), and the `application/problem+json` body is unaffected: it
+  renders the wrapped error, so `detail` still reads `Validation failed` with
+  the fields in `errors`. Persisted failure strings are unaffected too — the
+  job failure capsule, the job and scheduled-task `last_error` columns, the
+  repository commit-hook `last_error`, alerts and the `sys:tasks` broadcast
+  now record `message()`, so a capsule recorded before this change still
+  replays as a match. Keep untrusted text out of
+  `#[validate(message = "...")]`: `Display` output reaches your logs.
 - **The metrics facade's three cardinality caps are now configurable
   (`[metrics]`, revisits the limits #1378 shipped in 0.7.0):** the call-site
   facade caps labeled series per instrument (100), instruments in the registry
@@ -319,6 +331,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A side effect of the digest being taken over LF-normalised text: a CRLF
   checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
   whether or not a manifest entry backs it.
+- **`autumn migrate check` classifies against the app's own backend** (issue
+  #1906). The safety classifier was Postgres-only and gave SQLite apps incorrect
+  advice: it recommended `CREATE INDEX CONCURRENTLY`, which SQLite has no syntax
+  for; it flagged every `DROP INDEX` as blocking, though on SQLite it is a cheap
+  catalog edit *and* a precondition of `DROP COLUMN`, so the generator's own
+  remove-column migrations failed the gate; and it rated `ADD COLUMN NOT NULL`
+  without a default merely "potentially blocking" where SQLite rejects it
+  outright. `check` now detects the backend and applies SQLite's rules. A new
+  `unsupported` risk level marks statements the backend cannot run at all —
+  `ALTER COLUMN` in any spelling, `TRUNCATE`, `CONCURRENTLY`, inline
+  `UNIQUE`/`PRIMARY KEY` on `ADD COLUMN`, a non-constant `ADD COLUMN` default, a
+  multi-action `ALTER TABLE`, sequences, types, extensions, materialized views,
+  `COMMENT ON`, `GRANT`/`REVOKE`, `MERGE`, a writing CTE and the Postgres-only
+  `CREATE INDEX`/`CREATE TABLE` clauses — and fails the `up.sql` gate, since they
+  cannot apply. Postgres classification is unchanged.
 
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
@@ -502,6 +529,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-check honours each constraint's own NULL rule, so a partly-NULL composite
   reference is skipped under `MATCH SIMPLE` but counted under `MATCH FULL`,
   where it is itself a violation.
+
+- **web:** `AutumnError` now reads back its own validation details (issue
+  #2587). `details()` returns the per-field message map for a validation
+  failure and `None` for anything else, `code()` returns the stable problem
+  code the `application/problem+json` body carries
+  (`autumn.validation_failed`, `autumn.not_found`, …), and `message()`
+  returns the wrapped error's message alone — the string the body's `detail`
+  shows. A consumer with no HTTP response to parse (a GraphQL resolver, a
+  `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl) no longer has to
+  re-run `validator` to say which field failed. The body is unchanged: `code`
+  now comes from one derivation shared with `code()`, so the two cannot
+  disagree. Guide: `docs/guide/forms.md`, "Reading the failure back".
 
 - **A Rust symbol drift gate for the docs corpus [no-plugin]:** the four docs
   gates that came before it cover the link a reader clicks
@@ -779,6 +818,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "autocomplete", "typeahead", "as you type", "outbound webhooks"), none of
   which appeared anywhere in the README before. Wired into the docs-only CI
   job; no toolchain needed.
+- **`Remove…From…` drops a pre-existing index on SQLite** (issue #1906). SQLite
+  refuses `DROP COLUMN` while any index names the column. The generator only
+  knew the conventional `idx_<table>_<col>` name, so a composite, partial,
+  expression or hand-named index from an earlier migration broke the migration
+  at apply time. `generate migration Remove…From…` now replays the project's
+  `migrations/*/up.sql` in timestamp order to recover the indexes live on the
+  table, emits `DROP INDEX IF EXISTS` for each one that names a removed column
+  before the `DROP COLUMN`, and re-creates them in `down.sql` after the column
+  is restored. Indexes created outside `migrations/` stay invisible. Postgres
+  output is unchanged — it cascades index drops with the column.
+
+- **sqlite:** `Uuid`, `decimal{p,s}` and `enum{…}` model fields now work on a
+  SQLite app — the last three field kinds `autumn generate` refused (#1924).
+  `uuid::Uuid` and `rust_decimal::Decimal` belong to other crates, and so does
+  every diesel item their conversion would name, so `autumn-web` can implement
+  nothing for them; they render the new `TEXT`-backed newtypes
+  `autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}` instead, which are
+  `Copy`, deref to the wrapped type, convert with `From`/`Into`, and are
+  `#[serde(transparent)]`. A generated `enum` is local to your app, so the model
+  generator emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. All three
+  store `TEXT`. `SqliteDecimal` writes the normalized value, so it keeps sign and
+  every significant digit but **not** trailing-zero scale: a column holding
+  `0.10` reads back as `0.1`, and one holding `19.9` reads back as `19.9` where
+  Postgres `NUMERIC(10,2)` would give `19.90`. The values are numerically equal —
+  format for display rather than relying on the stored scale. Normalizing is what
+  makes SQLite's byte-wise `=` and `UNIQUE` agree with Rust equality. Note also
+  that a `TEXT` column sorts lexicographically, so `ORDER BY` on a decimal column
+  compares strings — see `docs/guide/sqlite-in-production.md`. Postgres output is
+  unchanged.
+- **sqlite:** a SQLite app's `Cargo.toml` now describes the SQLite backend
+  (#1924): diesel on its `sqlite` feature with the bundled `libsqlite3-sys`,
+  `diesel-async` on the sync-connection wrapper, `autumn-web`'s `sqlite`
+  feature, and no `pq-sys`. Before this a generated SQLite app pulled the
+  Postgres dependency set and could not compile at all.
+- **sqlite:** a `decimal{p,s}` column now carries a generated `CHECK` enforcing
+  the declared precision and scale (#1924). The SQLite column is `TEXT`, so
+  without it the declaration bound nothing and a repository write could persist
+  `123456.789` into a `decimal{5,2}`. Postgres keeps its native `NUMERIC(p,s)`
+  and gains no `CHECK`. Note that Postgres *rounds* a value to `scale` where
+  SQLite rejects it — round before saving if your input can be wider.
+- **sqlite:** a `decimal` `--default` is now written as a quoted, normalized
+  text literal (#1924). Unquoted, SQLite evaluated `DEFAULT 0.10` numerically
+  and TEXT affinity stored `0.1`; a wide default became scientific notation that
+  could not be read back at all. It is normalized through the real `Decimal` so
+  it is byte-identical to what `SqliteDecimal` writes — otherwise a row holding
+  its own default would not match a `find_by_…` for that value, and a unique
+  index would admit both spellings.
+
+### Fixed
+
+- **macros:** the `#[model]` association preloader named `diesel::pg::Pg`
+  directly, so a `--belongs-to … --counter-cache` scaffold did not compile on a
+  SQLite app. It now names `autumn_web::RuntimeBackend`, the alias that already
+  exists for this — the same type on Postgres (#1924).
+- **macros:** `#[model]` recognises the SQLite `Uuid`/`Decimal` newtypes where
+  it previously matched only `Uuid`/`Decimal` by name (#1924), so `.fake()`
+  factories mint distinct values instead of one shared nil UUID (which collided
+  on a `:unique` column), `form_for` renders a decimal as a number input, and a
+  `Uuid` column keeps its sortable index header. A `SqliteDecimal` column is
+  deliberately *not* sortable: its `TEXT` column orders lexicographically, so
+  the header would lie.
+- **schema:** `autumn schema parse` silently dropped every `Uuid` and `decimal`
+  column of a SQLite app, so snapshots and diffs were computed against an
+  incomplete schema (#1924).
+- **cli:** `autumn destroy` no longer strips `autumn-web`'s `sqlite` feature
+  when the last model goes. It is a whole-app backend flip, not a per-resource
+  capability, and without it the app's `sqlite://` URL is refused at boot
+  (#1924).
+
+### Changed
+
+- **cli:** a generated `Scope::list` now takes `autumn_web::RuntimeConnection`
+  instead of a hard-coded `diesel_async::AsyncPgConnection`, matching what
+  `generate auth` already emits. The same type on Postgres, so behaviour is
+  unchanged — but the emitted bytes of `src/policies/<model>.rs` differ, and a
+  SQLite app needs it to compile at all (#1924).
+
+### Added
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
