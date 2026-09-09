@@ -264,10 +264,61 @@ fn stage(artifact: &Path, staged: &Path, db: &Path) -> Result<(), SnapshotError>
         artifact.display(),
         staged.display()
     )))?;
-    drop(out);
-    inherit_target_permissions(db, staged)?;
+    // Everything that can be done to the FILE is done through this handle, never
+    // by reopening the name. Creating it with `O_CREAT | O_EXCL` only proves
+    // nothing was there when we made it; the name stays writable by whoever can
+    // write the directory, so a `set_permissions(path)`/`chown(path)`/reopen
+    // after the handle is dropped can be redirected at a symlink planted in
+    // between — and `chown` through one hands an attacker the mode and owner of
+    // whatever it points at.
+    inherit_target_permissions_via(db, &out, staged)?;
+    out.sync_all()
+        .map_err(SnapshotError::io(format!("flushing {}", staged.display())))?;
+
+    // `verify` and the publishing rename must address the file by NAME —
+    // SQLite opens a path, and `rename(2)` takes one. So confirm the name still
+    // resolves to the file this handle owns, and refuse if it does not.
+    same_file_as_handle(&out, staged)?;
     verify(staged)?;
-    flush(staged)
+    same_file_as_handle(&out, staged)
+}
+
+/// Refuse unless `path` still names the exact file `handle` owns.
+///
+/// `lstat` (`symlink_metadata`), so a symlink planted at the name is compared as
+/// the symlink it is and cannot match. Narrows, and does not eliminate, the race
+/// on the two steps that must use a name: an account able to write the database's
+/// own directory could still swap the entry between this check and SQLite's open
+/// or the rename. Not granting write on that directory is the actual control;
+/// this makes the remaining window a tight race rather than an open door.
+#[cfg(unix)]
+fn same_file_as_handle(handle: &std::fs::File, path: &Path) -> Result<(), SnapshotError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let owned = handle
+        .metadata()
+        .map_err(SnapshotError::io("inspecting the staging file".to_owned()))?;
+    let named = std::fs::symlink_metadata(path)
+        .map_err(SnapshotError::io(format!("inspecting {}", path.display())))?;
+    if owned.dev() == named.dev() && owned.ino() == named.ino() {
+        return Ok(());
+    }
+    Err(SnapshotError::Io {
+        context: format!("publishing the staging file {}", path.display()),
+        detail: "it was replaced while the restore was preparing it, so it is no longer \
+                 the verified copy — refusing to publish it"
+            .to_owned(),
+    })
+}
+
+/// Non-unix: there is no portable inode identity to compare, and the hazard this
+/// guards — a symlink swapped in by an account that can write the database's
+/// directory — is a POSIX deployment concern, as the ownership handling above
+/// already is.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn same_file_as_handle(_handle: &std::fs::File, _path: &Path) -> Result<(), SnapshotError> {
+    Ok(())
 }
 
 /// Flush a file to disk.
@@ -295,30 +346,46 @@ fn flush(path: &Path) -> Result<(), SnapshotError> {
 /// `chown` is ignored rather than failing a restore that is otherwise correct.
 /// A missing target (a first restore onto a fresh path) leaves both alone.
 #[cfg(unix)]
-fn inherit_target_permissions(db: &Path, staged: &Path) -> Result<(), SnapshotError> {
+fn inherit_target_permissions_via(
+    db: &Path,
+    staged: &std::fs::File,
+    staged_path: &Path,
+) -> Result<(), SnapshotError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let Ok(existing) = std::fs::metadata(db) else {
         return Ok(());
     };
-    std::fs::set_permissions(staged, existing.permissions()).map_err(SnapshotError::io(
-        format!("setting the mode of {}", staged.display()),
-    ))?;
-    let _ = std::os::unix::fs::chown(staged, Some(existing.uid()), Some(existing.gid()));
+    // `File::set_permissions` is `fchmod` and `fchown` takes the descriptor, so
+    // neither can be redirected at a symlink planted at `staged_path`. The path
+    // is carried only to name the file in an error.
+    staged
+        .set_permissions(existing.permissions())
+        .map_err(SnapshotError::io(format!(
+            "setting the mode of {}",
+            staged_path.display()
+        )))?;
+    let _ = std::os::unix::fs::fchown(staged, Some(existing.uid()), Some(existing.gid()));
     Ok(())
 }
 
 /// Non-unix mode inheritance: `set_permissions` carries the read-only flag, and
 /// there is no ownership to copy.
 #[cfg(not(unix))]
-fn inherit_target_permissions(db: &Path, staged: &Path) -> Result<(), SnapshotError> {
+fn inherit_target_permissions_via(
+    db: &Path,
+    staged: &std::fs::File,
+    staged_path: &Path,
+) -> Result<(), SnapshotError> {
     let Ok(existing) = std::fs::metadata(db) else {
         return Ok(());
     };
-    std::fs::set_permissions(staged, existing.permissions()).map_err(SnapshotError::io(format!(
-        "setting the mode of {}",
-        staged.display()
-    )))
+    staged
+        .set_permissions(existing.permissions())
+        .map_err(SnapshotError::io(format!(
+            "setting the mode of {}",
+            staged_path.display()
+        )))
 }
 
 /// Resolve a symlink at the configured database path.
@@ -727,6 +794,75 @@ mod tests {
             b"MUST NOT BE TRUNCATED",
             "the symlink target must be untouched"
         );
+    }
+
+    /// The staging file is owned through its HANDLE, so a swap after creation
+    /// cannot redirect the mode, the owner or the publication (#2589 round 18).
+    ///
+    /// `O_CREAT | O_EXCL` proves only that nothing was there when the file was
+    /// made. The name stays writable by whoever can write the directory, so the
+    /// earlier code — which dropped the handle and then reopened the NAME for
+    /// `set_permissions`, `chown`, `verify` and the flush — could be pointed at a
+    /// symlink planted in between, handing an attacker the mode and owner of
+    /// whatever it pointed at and publishing their link as the database.
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_file_swapped_after_creation_is_never_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source.db");
+        drop(seeded(&source));
+        let artifact = dir.path().join("control.sqlite");
+        snapshot(&format!("sqlite://{}", source.display()), &artifact).expect("snapshot");
+
+        let target = dir.path().join("target.db");
+        drop(seeded(&target));
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"MUST NOT BE TOUCHED").expect("write victim");
+        let victim_before = std::fs::metadata(&victim).expect("victim metadata");
+
+        // Simulate the swap the guard exists to catch: the staging file is
+        // created, then replaced by a symlink at the same name before the steps
+        // that must address it by name run.
+        let staged = staging_path(&target);
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .expect("create the staging file");
+        std::fs::remove_file(&staged).expect("unlink it");
+        std::os::unix::fs::symlink(&victim, &staged).expect("plant symlink");
+
+        same_file_as_handle(&handle, &staged).expect_err("a swapped staging name must be refused");
+
+        // And the victim is untouched — mode, owner and bytes.
+        use std::os::unix::fs::PermissionsExt as _;
+        let victim_after = std::fs::metadata(&victim).expect("victim metadata");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim readable"),
+            b"MUST NOT BE TOUCHED"
+        );
+        assert_eq!(
+            victim_before.permissions().mode(),
+            victim_after.permissions().mode(),
+            "the victim's mode must not have been inherited onto it"
+        );
+
+        std::fs::remove_file(&staged).ok();
+    }
+
+    /// The same-file check passes for the file the handle actually owns, so the
+    /// guard above refuses a swap rather than refusing everything.
+    #[cfg(unix)]
+    #[test]
+    fn the_staging_handle_matches_its_own_unswapped_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = dir.path().join("staged.db");
+        let handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .expect("create");
+        same_file_as_handle(&handle, &staged).expect("an unswapped name must pass");
     }
 
     #[test]

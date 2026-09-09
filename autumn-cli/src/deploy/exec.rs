@@ -2036,10 +2036,11 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
     let app_dir = &cfg.app_dir;
     let refusal = format!(
         "autumn deploy: the SQLite database {path} resolves to a path inside the deploy's \
-         own app directory ({app_dir}), where only `shared/` survives: `releases/` is \
-         replaced on every deploy and deleted by release retention. Only the host can see \
-         this, because `{app_dir}` resolves elsewhere there. Move the database to {}, or \
-         outside {app_dir} altogether.",
+         own app directory ({app_dir}), where only {} is yours: `releases/` is replaced on \
+         every deploy and deleted by release retention, and the rest of `shared/` holds \
+         deploy state files that would overwrite it. Only the host can see this, because \
+         `{app_dir}` resolves elsewhere there. Move the database there, or outside \
+         {app_dir} altogether.",
         cfg.shared_data_dir()
     );
     Some(RemoteCommand::new(
@@ -2061,7 +2062,7 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
              db=$(readlink -f {db_q} 2>/dev/null || printf '%s' {db_q}); \
              dir=$(dirname \"$db\"); \
              case \"$dir\" in \
-             \"$app/shared\"|\"$app/shared/\"*) : ;; \
+             \"$app/shared/data\"|\"$app/shared/data/\"*) : ;; \
              \"$app\"|\"$app/\"*) echo {refusal_q} >&2; exit 1 ;; \
              esac",
             app_dir_q = shell_quote(app_dir),

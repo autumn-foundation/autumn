@@ -63,7 +63,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step re-asks the containment question **on the host**, resolving the database
   path itself — so both a symlinked `app_dir` and a database that is *itself* a
   symlink into `releases/` are caught. The CLI cannot see either from here, and
-  release retention would have deleted the file.
+  release retention would have deleted the file. Inside the app directory only
+  `shared/data/` is the app's: the rest of `shared/` holds deploy state
+  (`autumn.env`, `live-slot`, `previous-release`, `proxy-options`, `last-deploy`),
+  and a database configured at one of those paths was overwritten by the deploy
+  step that writes it. A relative database is refused when a release payload is
+  its **leading path component**, not only when it is the whole path — `scp`
+  writes *into* `myapp` when a directory is there, so `sqlite://myapp/myapp` was
+  replaced by the uploaded binary. `autumn db restore` now holds its staging file
+  open and applies the target's mode and owner through that handle, so a symlink
+  swapped in at the predictable staging path after creation can no longer
+  redirect the `chmod`/`chown`; the name is re-checked against the handle's inode
+  before the copy is verified and again before it is published.
 
 ### Fixed
 

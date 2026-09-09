@@ -2389,14 +2389,27 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
         // app_dir = "/srv/autumn/tmp/../myapp"` names the same directory as
         // `/srv/autumn/myapp`, and comparing the raw spelling would miss a
         // database sitting in the releases dir it resolves to.
-        let shared = lexically_normalized(&cfg.shared_dir());
-        if within(&text, &app_dir) && !within(&text, &shared) {
+        // `shared/data`, not all of `shared/`. `shared/` survives a release swap,
+        // but the deploy OWNS it: `autumn.env`, `live-slot`, `previous-release`,
+        // `proxy-options`, `last-deploy`, the maintenance flag and the adoption
+        // marker are all written there, and a database configured at one of those
+        // paths is truncated by the deploy that writes it —
+        // `sqlite:///…/shared/autumn.env` passed every containment check and was
+        // then overwritten by `write-env` before the migration.
+        //
+        // A closed namespace rather than a list of reserved names: enumerating
+        // the control files would have to be revisited every time one is added,
+        // which is the failure mode this whole grader keeps hitting.
+        let shared_data = lexically_normalized(&cfg.shared_data_dir());
+        if within(&text, &app_dir) && !within(&text, &shared_data) {
             return SqliteDataFile::Refused(format!(
                 "the configured SQLite database {text} lives inside the deploy's own app \
-                 directory ({app_dir}), where only `shared/` survives: `releases/` is \
-                 replaced on every deploy and deleted by release retention, and `current` \
-                 is a symlink into it. Move the file to {}, or outside {app_dir} \
+                 directory ({app_dir}), where only {} is yours: `releases/` is replaced on \
+                 every deploy and deleted by release retention, `current` is a symlink into \
+                 it, and the rest of `shared/` holds deploy state files that would \
+                 overwrite the database. Move the file to {}, or outside {app_dir} \
                  altogether.",
+                cfg.shared_data_dir(),
                 cfg.shared_data_dir()
             ));
         }
@@ -2441,11 +2454,18 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
 /// refused even on a project that has no `autumn.toml` YET, since adding one
 /// later would start truncating it.
 fn collides_with_release_payload(text: &str, cfg: &ResolvedDeployConfig) -> Option<String> {
-    // Every payload is written FLAT in the release root, so only a bare name can
-    // collide: `data/app.db` never can.
-    if text.contains('/') {
+    // The FIRST path component, not the whole path. Every payload is written flat
+    // in the release root, but `scp <local> <release>/myapp` with a DIRECTORY at
+    // `<release>/myapp` writes *into* it — so `sqlite://myapp/myapp` has
+    // `link-data` create `myapp/` and put the database link at `myapp/myapp`,
+    // which is exactly where the upload then lands, following the link and
+    // replacing the database with the binary. Requiring the whole path to equal a
+    // payload missed that entirely (a single component is just the one-segment
+    // case of this rule).
+    let Some(first) = text.split('/').next().filter(|c| !c.is_empty()) else {
         return None;
-    }
+    };
+    let text = first;
     if text == cfg.app_name {
         return Some(format!("the {} binary", cfg.app_name));
     }
@@ -6311,6 +6331,113 @@ mod tests {
                     SqliteDataFile::Relative(_)
                 ),
                 "{safe} cannot collide with a release payload and must be kept"
+            );
+        }
+    }
+
+    /// The deploy owns `shared/` — only `shared/data` is the app's (#2589 round 18).
+    ///
+    /// `shared/` survives a release swap, which is why it was allowed, but the
+    /// deploy writes its own state files there: `autumn.env` (the SECRET env
+    /// file), `live-slot`, `previous-release`, `proxy-options`, `last-deploy`,
+    /// the maintenance flag and the adoption marker. A database configured at one
+    /// of those paths passed every containment check and was then truncated by
+    /// the deploy step that writes it, before the migration ran.
+    ///
+    /// Asserted as a CLOSED namespace rather than a list of reserved names: a
+    /// list would need revisiting every time a control file is added, which is
+    /// the failure mode this grader kept hitting.
+    #[test]
+    fn classify_sqlite_data_file_refuses_deploy_owned_paths_under_shared() {
+        let cfg = deploy_cfg();
+        for owned in [
+            "sqlite:///srv/autumn/myapp/shared/autumn.env",
+            "sqlite:///srv/autumn/myapp/shared/live-slot",
+            "sqlite:///srv/autumn/myapp/shared/previous-release",
+            "sqlite:///srv/autumn/myapp/shared/proxy-options",
+            "sqlite:///srv/autumn/myapp/shared/last-deploy",
+            "sqlite:///srv/autumn/myapp/shared/sqlite-data-adopted",
+            // Anything else the deploy might put there later, without this test
+            // or the grader needing to learn its name.
+            "sqlite:///srv/autumn/myapp/shared/some-future-state-file",
+            "sqlite:///srv/autumn/myapp/shared/app.db",
+        ] {
+            let got = classify_sqlite_data_file(Some(owned), &cfg);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("{owned} is a deploy-owned path but graded {got:?}");
+            };
+            assert!(
+                detail.contains("/srv/autumn/myapp/shared/data"),
+                "{owned}: the refusal must name where the database may live: {detail}"
+            );
+        }
+
+        // `shared/data` itself, and anything under it, is still the app's.
+        for ours in [
+            "sqlite:///srv/autumn/myapp/shared/data/app.db",
+            "sqlite:///srv/autumn/myapp/shared/data/nested/app.db",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(ours), &cfg),
+                    SqliteDataFile::Persistent(_)
+                ),
+                "{ours} must still be kept"
+            );
+        }
+        // …and so is anything genuinely outside the app dir.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &cfg),
+            SqliteDataFile::Persistent(_)
+        ));
+    }
+
+    /// A payload as the FIRST path component, not only as the whole path
+    /// (#2589 round 18).
+    ///
+    /// `scp <local> <release>/myapp` writes *into* `<release>/myapp` when a
+    /// directory is there. So `sqlite://myapp/myapp` has `link-data` create
+    /// `myapp/` and put the database link at `myapp/myapp` — exactly where the
+    /// upload lands, following the link and replacing the database with the
+    /// binary. The earlier rule returned `None` for every path containing `/`.
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_payload_as_a_leading_component() {
+        let cfg = deploy_cfg().with_release_payloads(vec!["prod.lock".to_owned()]);
+
+        for url in [
+            "sqlite://myapp/myapp",
+            "sqlite://myapp/app.db",
+            "sqlite://myapp/nested/app.db",
+            "sqlite://autumn.toml/app.db",
+            "sqlite://autumn-prod.toml/app.db",
+            "sqlite://prod.lock/app.db",
+            // The single-component case is just this rule with one segment.
+            "sqlite://myapp",
+            // And a spelling that normalizes onto one.
+            "sqlite://./myapp/app.db",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(url), &cfg),
+                    SqliteDataFile::Refused(_)
+                ),
+                "{url}: a release payload as the leading component is written through"
+            );
+        }
+
+        // A directory that is NOT a payload is still fine, at any depth.
+        for safe in [
+            "sqlite://data/app.db",
+            "sqlite://data/myapp",
+            "sqlite://data/autumn.toml",
+            "sqlite://myapp.db",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(safe), &cfg),
+                    SqliteDataFile::Relative(_)
+                ),
+                "{safe} cannot collide and must be kept"
             );
         }
     }

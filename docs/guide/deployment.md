@@ -1256,9 +1256,9 @@ persistent state:
 | --- | --- |
 | Relative — `sqlite://app.db` | Keeps the real file at `app_dir/shared/data/app.db` and links each release at `app.db`. |
 | Absolute outside the releases dir — `sqlite:///var/lib/myapp/app.db` | Leaves it exactly there; it is already release-independent. |
-| Absolute inside the app dir but outside `shared/` (`releases/…`, `current/…`) | Refused at preflight — retention would delete it. |
+| Absolute inside the app dir but outside `shared/data/` (`releases/…`, `current/…`, `shared/autumn.env`) | Refused at preflight. `releases/` is deleted by retention, and the rest of `shared/` holds deploy state files — `autumn.env`, `live-slot`, `previous-release`, `proxy-options`, `last-deploy` — that would overwrite the database. |
 | Relative but not a plain name — `sqlite://../x.db`, `sqlite://.` | Refused at preflight — it does not name a file inside the release dir. |
-| Relative, but the same name as a file the deploy uploads — `sqlite://myapp`, `sqlite://autumn.toml` | Refused at preflight — the upload writes through the data link and would truncate the database. Put it in a subdirectory (`sqlite://data/app.db`). |
+| Relative, starting with the name of a file the deploy uploads — `sqlite://myapp`, `sqlite://autumn.toml`, `sqlite://myapp/app.db` | Refused at preflight — the upload writes through the data link and would truncate the database. `scp` writes *into* `myapp` when a directory is there, so a payload name is refused as the leading component too, not just as the whole path. Use a name of your own (`sqlite://data/app.db`). |
 | In-memory — `sqlite::memory:` | Refused at preflight — it does not survive a restart, let alone a deploy. |
 
 `[deploy] app_dir` must be absolute for a SQLite app. A relative one makes the
