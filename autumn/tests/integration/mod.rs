@@ -312,6 +312,8 @@ mod repository_replica_routing;
 mod repository_scope_meta;
 #[cfg(feature = "db")]
 mod repository_search;
+#[cfg(feature = "db")]
+mod repository_upsert_many_advisory_lock_batching_profile;
 mod request_timeout;
 #[cfg(feature = "db")]
 mod retention;

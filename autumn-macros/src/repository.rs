@@ -10967,19 +10967,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 records.iter().map(|r| r.id).collect();
                             __autumn_upsert_lock_ids.sort_unstable();
                             __autumn_upsert_lock_ids.dedup();
-                            for __autumn_upsert_lock_id in __autumn_upsert_lock_ids {
-                                let __autumn_upsert_lock_key =
-                                    ::autumn_web::repository::repository_upsert_advisory_lock_key(
-                                        #table_name,
-                                        __autumn_upsert_lock_id,
-                                    );
-                                ::autumn_web::reexports::diesel::sql_query("SELECT pg_advisory_xact_lock($1)")
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(
-                                        __autumn_upsert_lock_key,
-                                    )
-                                    .execute(conn)
-                                    .await
-                                    .map_err(::autumn_web::AutumnError::from)?;
+                            if !__autumn_upsert_lock_ids.is_empty() {
+                                let __autumn_upsert_lock_keys: Vec<i64> = __autumn_upsert_lock_ids
+                                    .iter()
+                                    .map(|id| {
+                                        ::autumn_web::repository::repository_upsert_advisory_lock_key(
+                                            #table_name,
+                                            *id,
+                                        )
+                                    })
+                                    .collect();
+                                // One round trip for the whole batch instead of one
+                                // per unique id: `pg_advisory_xact_lock` is called
+                                // once per row of the unnested array, so the lock
+                                // count and (via `ORDER BY t.ord`) the acquisition
+                                // order are identical to the per-id loop this
+                                // replaces — same technique as `pg_next_versions`'s
+                                // `generate_series ... WITH ORDINALITY ... ORDER BY`
+                                // batching in `autumn/src/sync/server.rs`.
+                                ::autumn_web::reexports::diesel::sql_query(
+                                    "SELECT pg_advisory_xact_lock(t.key) \
+                                     FROM unnest($1::bigint[]) WITH ORDINALITY AS t(key, ord) \
+                                     ORDER BY t.ord",
+                                )
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Array<::autumn_web::reexports::diesel::sql_types::BigInt>, _>(
+                                    __autumn_upsert_lock_keys,
+                                )
+                                .execute(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
                             }
                         },
                         sqlite => {},
