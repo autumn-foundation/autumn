@@ -390,11 +390,15 @@ jobs:
         # than one that was never there — so the reader goes and debugs their
         # own deployment.
         #
-        # The corpus is the reader-facing set its sibling gates define, plus
-        # every `*.md.tmpl` — `new.rs` writes `templates/README.md.tmpl` as
-        # every scaffolded application's README, where it documents
-        # `/actuator/health`, so a stale URL there ships into every new project
-        # rather than sitting on one page someone might notice.
+        # The corpus is every markdown surface a reader can end up holding —
+        # the set its sibling gates define, plus three that reach readers by a
+        # route other than someone opening a page: `*.md.tmpl` (`new.rs` writes
+        # `templates/README.md.tmpl` as every scaffolded application's README,
+        # so a stale URL there ships into every new project), all of
+        # `examples/` (the wiki example compiles `content/*.md` in and serves
+        # them at `/docs/…`), and `.claude/skills/` (a second skill tree the
+        # agent machinery loads by name, whose `run-autumn` drives a real
+        # server with `curl`).
         #
         # The baseline run found four defects over 236 occurrences.
         # `coming-from-other-frameworks.md` is the sharp one: its Spring→Autumn

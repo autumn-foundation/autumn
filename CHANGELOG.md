@@ -376,11 +376,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`check-docs-toml.sh`) and the Rust path they import
   (`check-docs-symbols.sh`). None of them looks at the sixth thing a reader
   copies off a page: the **URL they curl**. `scripts/check-docs-routes.sh`
-  resolves every `/actuator/…` path in the reader-facing corpus — **236
-  occurrences across 195 pages**, plus every `*.md.tmpl`, since `new.rs` writes
-  `templates/README.md.tmpl` as every scaffolded application's README — against
-  the paths the framework actually mounts, and it runs in CI's docs-only job
-  beside the other five.
+  resolves every `/actuator/…` path in the corpus — **249 occurrences across
+  199 files** — against the paths the framework actually mounts, and it runs in
+  CI's docs-only job beside the other five. The corpus is every markdown surface
+  a reader can end up holding, which is wider than a `docs/`-shaped view of one:
+  besides the guide it covers every `*.md.tmpl` (`new.rs` writes
+  `templates/README.md.tmpl` as every scaffolded application's README), all of
+  `examples/` (the wiki example compiles `content/*.md` in and serves them at
+  `/docs/…`), and `.claude/skills/` (a second skill tree the agent machinery
+  loads by name, whose `run-autumn` drives a real server with `curl`).
   It is the only one of the six whose failure lands against a *running app*
   rather than while the reader is still reading, and the actuator is the
   operator surface: `/actuator/health` is what a load balancer probes,
@@ -390,7 +394,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[actuator] sensitive = true`, that 404 reads like an endpoint they failed to
   *enable* rather than one that was never there — so the reader goes and debugs
   their own deployment instead of doubting the page.
-  It found **3 live defects**, all fixed here.
+  It found **4 live defects**, all fixed here.
   `docs/guide/coming-from-other-frameworks.md` is the sharp one: its
   Spring→Autumn actuator table exists for the sole purpose of telling a
   migrating reader what an endpoint is *called* here, and its `scheduledtasks`
@@ -403,7 +407,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/tutorial/07-htmx.md` both told readers that `autumn routes` and
   `/actuator/routes` report the declared method behind an HTMX method override;
   there is no `/actuator/routes`, and the route table with its declared methods
-  is served from `/actuator/graph`.
+  is served from `/actuator/graph`. The fourth is the one worth pausing on:
+  `.claude/skills/run-autumn/SKILL.md` had *already discovered* that
+  `/actuator/routes` 404s — someone hit it driving a real server and wrote the
+  warning down — but concluded "the route table comes from the CLI, not the
+  actuator", which is also wrong. So the corpus held the mistaken claim and its
+  own correction in different files, each stale in its own direction, with
+  nothing connecting them. That is precisely the state a drift gate exists to
+  make impossible.
   The truth set is the string literals passed to `actuator_route_path()` at a
   `.route(…)` **mount**, across non-test workspace Rust source — the one path
   builder every actuator mount goes through, whose own doc comment says why

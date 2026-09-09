@@ -88,22 +88,32 @@
 #   rescue a name that is simply not there, which is the defect class this
 #   exists for.
 #
-# CORPUS SCOPE: the same reader-facing set `check-docs-cli.sh` and
-# `check-docs-config.sh` define — `docs/guide/`, `docs/migrations/`, `skills/`,
-# `agents/`, the root `README.md` / `EXAMPLES.md` / `CONTRIBUTING.md` /
-# `STABILITY.md`, `docs/plugins.md`, and each `examples/*/README.md` — PLUS
-# every `*.md.tmpl`, which `check-docs-config.sh` and `check-docs-symbols.sh`
-# also fold in. These definitions are kept aligned on purpose: a page covered by
-# one gate and not the next is how a page ends up with no owner.
+# CORPUS SCOPE: every markdown surface a reader can end up holding. That is the
+# set `check-docs-cli.sh` and `check-docs-config.sh` define — `docs/guide/`,
+# `docs/migrations/`, `skills/`, `agents/`, the root `README.md` /
+# `EXAMPLES.md` / `CONTRIBUTING.md` / `STABILITY.md`, `docs/plugins.md` — plus
+# three surfaces that a `docs/`-shaped view of a corpus misses, each of which
+# reaches readers by a route other than someone opening a page:
 #
-# The `.md.tmpl` half is not a technicality. `autumn-cli/src/new.rs`
-# `include_str!`s `templates/README.md.tmpl` and writes it as every scaffolded
-# application's `README.md`, where it documents `/health` and
-# `/actuator/health`. A stale URL there ships into every new project rather than
-# sitting on one page someone might eventually notice, so it is the last file in
-# the tree that should be outside a drift gate. An earlier draft of this gate
-# globbed `*.md` alone — copied from `check-docs-cli.sh`, which does the same —
-# and silently dropped it.
+#   - every `*.md.tmpl`. `autumn-cli/src/new.rs` `include_str!`s
+#     `templates/README.md.tmpl` and WRITES it as every scaffolded application's
+#     `README.md`, where it documents `/health` and `/actuator/health`. A stale
+#     URL there ships into every new project. `check-docs-config.sh` and
+#     `check-docs-symbols.sh` glob it for the same reason; `check-docs-cli.sh`,
+#     which this file's corpus function was copied from, does not — so the
+#     siblings were never unanimous and this header once wrongly claimed to
+#     match them all.
+#   - all of `examples/`, not just each `examples/*/README.md`. The wiki example
+#     COMPILES `examples/wiki/content/*.md` in and SERVES them at `/docs/…`
+#     (`check-docs-toml.sh` notes the same), so four actuator paths there are
+#     shown by a running app rather than read from a repo.
+#   - `.claude/skills/`, a SECOND skill tree rather than a copy of `skills/`.
+#     `check-docs-orphans.sh` seeds both as reader entry surfaces because the
+#     agent machinery loads each by name, and `run-autumn` lives only here. Its
+#     SKILL.md drives a real server with `curl`, which makes its actuator paths
+#     the most literally copy-and-run text in the tree — and it is where the
+#     `/actuator/routes` 404 had already been DISCOVERED and written down,
+#     while two guide pages went on telling readers to use it.
 #
 # Deliberately excluded for the same reasons as those gates:
 #   - `CHANGELOG.md` and `docs/releases/` — a historical record. An endpoint
@@ -137,9 +147,10 @@
 #     already carries the `sensitive` caveat where it matters.
 #
 # WAIVERS: a reader-facing page sometimes has to name an actuator path that
-# does not exist here — "Spring calls it `/actuator/scheduledtasks`" is the
-# whole point of a migration table. Waive it with a marker directly below the
-# passage that names it:
+# does not exist here. "Spring calls it `/actuator/scheduledtasks`" is the whole
+# point of a migration table, and "`/actuator/routes` does not exist (404)" is
+# the whole point of a troubleshooting row. Waive it with a marker directly
+# below the passage that names it:
 #
 #     <!-- route-surface-allow: /actuator/scheduledtasks — Spring Boot's name,
 #          shown for comparison; Autumn serves it at /actuator/tasks -->
@@ -160,10 +171,11 @@
 # lets a waiver name the path it exempts without the gate re-reporting its own
 # marker one line down.
 #
-# Unlike `check-docs-cli.sh`, a waiver here DOES apply inside a fenced block: the fence is how a comparison table's
-# sibling page shows a foreign framework's transcript, and a URL in a fence is
-# not a command the reader can be tricked into running blind — they will see
-# the 404 the instant they paste it, which is the same signal the gate gives.
+# Unlike `check-docs-cli.sh`, a waiver here DOES apply inside a fenced block:
+# the fence is how a comparison table's sibling page shows a foreign framework's
+# transcript, and a URL in a fence is not a command the reader can be tricked
+# into running blind — they will see the 404 the instant they paste it, which is
+# the same signal the gate gives.
 #
 # USAGE:
 #   scripts/check-docs-routes.sh              # gate the corpus
@@ -279,16 +291,26 @@ def mounted_paths(root):
 
 # The same reader-facing set `check-docs-cli.sh` and `check-docs-config.sh`
 # define; see the CORPUS SCOPE note in this file's header for why they agree.
-INCLUDE_DIRS = ("docs/guide/", "docs/migrations/", "skills/", "agents/")
+INCLUDE_DIRS = ("docs/guide/", "docs/migrations/", "skills/", "agents/",
+                # `.claude/skills/` is a SECOND skill tree, not a copy of
+                # `skills/`: `check-docs-orphans.sh` seeds both as reader entry
+                # surfaces because the agent machinery loads each by name, and
+                # `run-autumn` lives only here. Its SKILL.md drives a real
+                # server with `curl`, so its actuator paths are the most
+                # literally copy-and-run text in the tree.
+                ".claude/skills/",
+                # `examples/wiki/content/` is EMBEDDED and SERVED: the wiki
+                # example compiles these pages in and renders them at
+                # `/docs/...`, as `check-docs-toml.sh` notes. A stale URL here
+                # is not a page a reader might open — it is a page the running
+                # example shows them.
+                "examples/")
 INCLUDE_FILES = ("README.md", "EXAMPLES.md", "CONTRIBUTING.md", "STABILITY.md",
                  "docs/plugins.md")
-INCLUDE_README_DIRS = ("examples/",)
 
 
 def in_scope(path):
-    return (path.startswith(INCLUDE_DIRS) or path in INCLUDE_FILES
-            or (path.startswith(INCLUDE_README_DIRS)
-                and pathlib.PurePath(path).name == "README.md"))
+    return path.startswith(INCLUDE_DIRS) or path in INCLUDE_FILES
 
 
 def corpus(root):
@@ -327,8 +349,29 @@ def corpus(root):
 # would green-light a URL that 404s, by truncating it down to one that does not.
 # A gate that answers a question the reader did not ask is worse than one that
 # declines to answer.
+#
+# A TRAILING SLASH IS KEPT, not stripped, because axum distinguishes the
+# mounted `/actuator/health` from `/actuator/health/` and mounts no normalizing
+# layer — so a documented trailing slash is a 404 the old pattern silently
+# truncated away. `resolves()` reads it as "the subtree below this", which is
+# what the two shapes the corpus actually writes both mean: `Disallow:
+# /actuator/` in a robots.txt sample, and `/actuator/…` in prose. Under a leaf
+# that has nothing below it, the same reading rejects `/actuator/health/`.
 DOC_PATH = re.compile(
-    r"/actuator(?![A-Za-z0-9_-])(?:/[A-Za-z0-9_*{}-]+(?:\.[A-Za-z0-9_-]+)*)*")
+    r"/actuator(?![A-Za-z0-9_-])(?:/[A-Za-z0-9_*{}-]+(?:\.[A-Za-z0-9_-]+)*)*/?")
+
+# Sentence punctuation stripped from the end of a match. `/` is deliberately
+# ABSENT (it is significant, per above) and so are the three characters a survey
+# of the corpus found genuinely terminating a path, each of which the match must
+# stop at rather than swallow:
+#   `?`  a query string — `GET /actuator/logfile?level=warn` in logging-pii.md.
+#        The PATH ends at the `?`; the query is not part of it.
+#   `>`  a markdown autolink — `<http://localhost:3000/actuator/health>` in
+#        tutorial/01-project-setup.md.
+#   `:`  a `::`-separated logger target — `/actuator/loggers/my_app::orders` in
+#        skills/autumn-web/SKILL.md, a legal `{name}` value.
+# None of the three is a defect, so none is reported; they are listed here
+# because "reject every unrecognized suffix" would report all three.
 TRAILING = ".,;:!?)\"'`]}>"
 
 # `/actuatorhealth` — the separator dropped. Reported on its own, because the
@@ -426,11 +469,21 @@ def resolves(path, mounted):
     Segment-wise, and permissive in the three ways the header lists: a mounted
     `{param}` matches any segment, a documented `*` matches any segment, and a
     documented path that is a strict PREFIX of a mounted one resolves.
+
+    A TRAILING SLASH means "the subtree below this", so it requires something to
+    actually be mounted below — which is the difference between `/actuator/`
+    (a family, and how robots.txt and prose write it) and `/actuator/health/`
+    (a leaf with a stray slash, which axum answers with a 404).
     """
+    subtree = path.endswith("/")
     segs = [s for s in path.strip("/").split("/") if s]
     for target in mounted:
         tsegs = [s for s in target.strip("/").split("/") if s]
         if len(segs) > len(tsegs):
+            continue
+        # Nothing is mounted below a path that IS a mounted path, so a trailing
+        # slash on one names a route the router does not have.
+        if subtree and len(segs) == len(tsegs):
             continue
         if all(t.startswith("{") or s == "*" or s == t
                for s, t in zip(segs, tsegs)):
@@ -616,13 +669,54 @@ def self_test():
         [(1, "/actuator")],
     ))
 
-    # The scaffolded project's README is a page a reader holds. It is a
-    # `.md.tmpl`, so a corpus glob of `*.md` alone silently drops it.
+    # A trailing slash is significant — axum mounts no normalizing layer — so it
+    # is read as "the subtree below this" rather than dropped. That is what the
+    # two shapes the corpus writes both mean, and it rejects the one that 404s.
     cases.append((
-        "the README template is in the corpus",
-        "autumn-cli/src/templates/README.md.tmpl" in corpus(ROOT),
+        "a trailing slash on the prefix names the family",
+        resolves("/actuator/", surface), True,
+    ))
+    cases.append((
+        "a trailing slash on a mounted family resolves",
+        resolves("/actuator/webhooks/", surface), True,
+    ))
+    cases.append((
+        "a trailing slash on a leaf is a defect",
+        resolves("/actuator/health/", surface), False,
+    ))
+    cases.append((
+        "a trailing slash is kept, not stripped",
+        list(documented("Disallow: /actuator/\n")), [(1, "/actuator/")],
+    ))
+
+    # Three suffixes a corpus survey found genuinely terminating a path. Each
+    # must stop the match without being reported, because "reject every
+    # unrecognized suffix" would report all three and every one is correct.
+    cases.append((
+        "a query string is not part of the path",
+        list(documented("GET /actuator/logfile?level=warn\n")),
+        [(1, "/actuator/logfile")],
+    ))
+    cases.append((
+        "a markdown autolink terminates the path",
+        list(documented("<http://localhost:3000/actuator/health>\n")),
+        [(1, "/actuator/health")],
+    ))
+    cases.append((
+        "a `::` logger target resolves as a {name} value",
+        resolves(next(p for _, p in documented(
+            "curl -X PUT .../actuator/loggers/my_app::orders\n")), surface),
         True,
     ))
+
+    # Reader-facing surfaces a `*.md`-under-`docs/` view of the corpus misses.
+    # The scaffolded README is a `.md.tmpl`; `.claude/skills/` is a second skill
+    # tree the agent machinery loads by name; the wiki example compiles its
+    # content pages in and serves them at `/docs/...`.
+    for path in ("autumn-cli/src/templates/README.md.tmpl",
+                 ".claude/skills/run-autumn/SKILL.md",
+                 "examples/wiki/content/configuration.md"):
+        cases.append((f"`{path}` is in the corpus", path in corpus(ROOT), True))
 
     passed = failed = 0
     for label, got, want in cases:
