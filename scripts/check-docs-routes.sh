@@ -88,13 +88,24 @@
 #   rescue a name that is simply not there, which is the defect class this
 #   exists for.
 #
-# CORPUS SCOPE: identical to `check-docs-cli.sh` and `check-docs-config.sh` —
-# `docs/guide/`, `docs/migrations/`, `skills/`, `agents/`, the root
-# `README.md` / `EXAMPLES.md` / `CONTRIBUTING.md` / `STABILITY.md`,
-# `docs/plugins.md`, and each `examples/*/README.md`. The three definitions of
-# "reader-facing" are kept identical on purpose: a page covered by one gate and
-# not the next is how a page ends up with no owner. Deliberately excluded for
-# the same reasons as those gates:
+# CORPUS SCOPE: the same reader-facing set `check-docs-cli.sh` and
+# `check-docs-config.sh` define — `docs/guide/`, `docs/migrations/`, `skills/`,
+# `agents/`, the root `README.md` / `EXAMPLES.md` / `CONTRIBUTING.md` /
+# `STABILITY.md`, `docs/plugins.md`, and each `examples/*/README.md` — PLUS
+# every `*.md.tmpl`, which `check-docs-config.sh` and `check-docs-symbols.sh`
+# also fold in. These definitions are kept aligned on purpose: a page covered by
+# one gate and not the next is how a page ends up with no owner.
+#
+# The `.md.tmpl` half is not a technicality. `autumn-cli/src/new.rs`
+# `include_str!`s `templates/README.md.tmpl` and writes it as every scaffolded
+# application's `README.md`, where it documents `/health` and
+# `/actuator/health`. A stale URL there ships into every new project rather than
+# sitting on one page someone might eventually notice, so it is the last file in
+# the tree that should be outside a drift gate. An earlier draft of this gate
+# globbed `*.md` alone — copied from `check-docs-cli.sh`, which does the same —
+# and silently dropped it.
+#
+# Deliberately excluded for the same reasons as those gates:
 #   - `CHANGELOG.md` and `docs/releases/` — a historical record. An endpoint
 #     that existed at 0.5.0 must stay written as it was.
 #   - `docs/plans/`, `docs/stories/`, `docs/adr/`, `docs/reports/`,
@@ -266,8 +277,8 @@ def mounted_paths(root):
 
 # ── Corpus ───────────────────────────────────────────────────────────────────
 
-# Kept byte-identical to `check-docs-cli.sh` and `check-docs-config.sh`; see
-# the CORPUS SCOPE note in this file's header for why the three agree.
+# The same reader-facing set `check-docs-cli.sh` and `check-docs-config.sh`
+# define; see the CORPUS SCOPE note in this file's header for why they agree.
 INCLUDE_DIRS = ("docs/guide/", "docs/migrations/", "skills/", "agents/")
 INCLUDE_FILES = ("README.md", "EXAMPLES.md", "CONTRIBUTING.md", "STABILITY.md",
                  "docs/plugins.md")
@@ -281,11 +292,25 @@ def in_scope(path):
 
 
 def corpus(root):
+    """The reader-facing pages, including the one written into a new project.
+
+    `*.md.tmpl` is in the glob for the reason `check-docs-config.sh` and
+    `check-docs-symbols.sh` put it in theirs: `autumn-cli/src/new.rs`
+    `include_str!`s `templates/README.md.tmpl` and writes it as every scaffolded
+    application's `README.md`, where it documents `/health` and
+    `/actuator/health`. It is not a guide page, but it is a page a reader holds,
+    and it reaches more of them than most guide pages do. A template excluded
+    from the corpus is a page with no owner — and worse here than elsewhere,
+    because a stale URL in it ships into every new project rather than sitting
+    on one page someone might notice.
+    """
     # NUL-delimited so a path containing whitespace is not split into fragments,
     # and so git does not quote unusual paths.
-    out = subprocess.run(["git", "ls-files", "-z", "*.md"], cwd=root,
-                         capture_output=True, text=True, check=True).stdout
-    return [f for f in out.split("\0") if f and in_scope(f)]
+    out = subprocess.run(["git", "ls-files", "-z", "*.md", "*.md.tmpl"],
+                         cwd=root, capture_output=True, text=True,
+                         check=True).stdout
+    return [f for f in out.split("\0")
+            if f and (in_scope(f) or f.endswith(".md.tmpl"))]
 
 
 # ── Extraction ───────────────────────────────────────────────────────────────
@@ -295,9 +320,29 @@ def corpus(root):
 # trailing run of sentence punctuation is stripped afterwards, so
 # "…probe `/actuator/health`." does not become `/actuator/health.` and get
 # reported as a missing endpoint.
+#
+# The lookahead after the prefix is load-bearing, and its absence was a silent
+# hole rather than a cosmetic one. Without it `/actuatorhealth` matches just
+# `/actuator`, which then RESOLVES against the bare-prefix rule — so the gate
+# would green-light a URL that 404s, by truncating it down to one that does not.
+# A gate that answers a question the reader did not ask is worse than one that
+# declines to answer.
 DOC_PATH = re.compile(
-    r"/actuator(?:/[A-Za-z0-9_*{}-]+(?:\.[A-Za-z0-9_-]+)*)*")
+    r"/actuator(?![A-Za-z0-9_-])(?:/[A-Za-z0-9_*{}-]+(?:\.[A-Za-z0-9_-]+)*)*")
 TRAILING = ".,;:!?)\"'`]}>"
+
+# `/actuatorhealth` — the separator dropped. Reported on its own, because the
+# lookahead above only stops the gate from mis-reading it; something still has
+# to say it is wrong, and a missing slash is the most plausible way a documented
+# actuator URL 404s.
+#
+# A HYPHEN IS NOT A MISSING SEPARATOR, which is why `_` and alphanumerics are
+# matched here but `-` is not. `/actuator-dashboard` is a distinct route a reader
+# may legitimately mount, not a typo of an actuator endpoint — the framework's
+# own router test asserts exactly that, mounting `/actuator-dashboard` to prove
+# the actuator prefix must not swallow it. Reporting it would be this gate
+# claiming a path was meant to be one of ours.
+MISSING_SEPARATOR = re.compile(r"/actuator[A-Za-z0-9_][A-Za-z0-9_./{}-]*")
 
 # `<!-- route-surface-allow: /actuator/x — reason -->`. The reason is required:
 # a waiver without one outlives the sentence it was written for. Matched over
@@ -360,12 +405,17 @@ def waived_lines(text):
 
 
 def documented(text):
-    """Yield (line_no, path) for every `/actuator/…` path a page shows."""
+    """Yield (line_no, path) for every `/actuator/…` path a page shows.
+
+    Missing-separator spellings are yielded too, so they are reported rather
+    than skipped; nothing mounts them, so resolution rejects them on its own.
+    """
     for lineno, line in enumerate(blank_comments(text).splitlines(), 1):
-        for match in DOC_PATH.finditer(line):
-            path = match.group(0).rstrip(TRAILING)
-            if path:
-                yield lineno, path
+        for pattern in (DOC_PATH, MISSING_SEPARATOR):
+            for match in pattern.finditer(line):
+                path = match.group(0).rstrip(TRAILING)
+                if path:
+                    yield lineno, path
 
 
 # ── Resolution ───────────────────────────────────────────────────────────────
@@ -540,6 +590,38 @@ def self_test():
         ROUTE_CALL.findall(strip_test_mods(
             "#[cfg(test)]\nmod tests {\n" + mount_src + "\n}\n")),
         [],
+    ))
+
+    # The prefix boundary. Truncating `/actuatorhealth` down to `/actuator`
+    # would have it RESOLVE against the bare-prefix rule, so the gate would
+    # green-light a URL that 404s. Both the extraction and the verdict are
+    # pinned, since the bug was only visible in their combination.
+    cases.append((
+        "a missing separator is reported, not truncated to the prefix",
+        list(documented("see /actuatorhealth for status\n")),
+        [(1, "/actuatorhealth")],
+    ))
+    cases.append((
+        "a missing separator does not resolve",
+        resolves("/actuatorhealth", surface), False,
+    ))
+    cases.append((
+        "a hyphenated sibling route is out of scope, not a typo",
+        list(documented("mounted at /actuator-dashboard by the app\n")),
+        [],
+    ))
+    cases.append((
+        "the bare prefix still resolves",
+        list(documented("everything under /actuator is gated\n")),
+        [(1, "/actuator")],
+    ))
+
+    # The scaffolded project's README is a page a reader holds. It is a
+    # `.md.tmpl`, so a corpus glob of `*.md` alone silently drops it.
+    cases.append((
+        "the README template is in the corpus",
+        "autumn-cli/src/templates/README.md.tmpl" in corpus(ROOT),
+        True,
     ))
 
     passed = failed = 0

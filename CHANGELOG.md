@@ -377,8 +377,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`check-docs-symbols.sh`). None of them looks at the sixth thing a reader
   copies off a page: the **URL they curl**. `scripts/check-docs-routes.sh`
   resolves every `/actuator/…` path in the reader-facing corpus — **236
-  occurrences across 195 pages** — against the paths the framework actually
-  mounts, and it runs in CI's docs-only job beside the other five.
+  occurrences across 195 pages**, plus every `*.md.tmpl`, since `new.rs` writes
+  `templates/README.md.tmpl` as every scaffolded application's README — against
+  the paths the framework actually mounts, and it runs in CI's docs-only job
+  beside the other five.
   It is the only one of the six whose failure lands against a *running app*
   rather than while the reader is still reading, and the actuator is the
   operator surface: `/actuator/health` is what a load balancer probes,

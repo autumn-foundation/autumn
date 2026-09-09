@@ -390,6 +390,12 @@ jobs:
         # than one that was never there — so the reader goes and debugs their
         # own deployment.
         #
+        # The corpus is the reader-facing set its sibling gates define, plus
+        # every `*.md.tmpl` — `new.rs` writes `templates/README.md.tmpl` as
+        # every scaffolded application's README, where it documents
+        # `/actuator/health`, so a stale URL there ships into every new project
+        # rather than sitting on one page someone might notice.
+        #
         # The baseline run found four defects over 236 occurrences.
         # `coming-from-other-frameworks.md` is the sharp one: its Spring→Autumn
         # actuator table exists precisely to tell a migrating reader what an
