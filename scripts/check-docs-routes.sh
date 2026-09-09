@@ -125,9 +125,17 @@
 # path, separated by `—` or `:`.
 #
 # A waiver covers only its own blank-line-separated block and the one directly
-# above it — the passage it was written for. The same path spelled wrong
-# further down the page is still reported. Unlike `check-docs-cli.sh`, a waiver
-# here DOES apply inside a fenced block: the fence is how a comparison table's
+# above it — the passage it was written for, anchored at the line the marker
+# OPENS on so a reason long enough to wrap is scoped by where it was written.
+# The same path spelled wrong further down the page is still reported.
+#
+# HTML comments are blanked before paths are extracted, on the same
+# visible-vs-invisible line `check-docs-orphans.sh` draws: a comment renders as
+# nothing, so it is not a path a reader can see or paste. That rule is also what
+# lets a waiver name the path it exempts without the gate re-reporting its own
+# marker one line down.
+#
+# Unlike `check-docs-cli.sh`, a waiver here DOES apply inside a fenced block: the fence is how a comparison table's
 # sibling page shows a foreign framework's transcript, and a URL in a fence is
 # not a command the reader can be tricked into running blind — they will see
 # the 404 the instant they paste it, which is the same signal the gate gives.
@@ -259,10 +267,26 @@ DOC_PATH = re.compile(
 TRAILING = ".,;:!?)\"'`]}>"
 
 # `<!-- route-surface-allow: /actuator/x — reason -->`. The reason is required:
-# a waiver without one outlives the sentence it was written for.
+# a waiver without one outlives the sentence it was written for. Matched over
+# the whole page rather than line by line, because a waiver long enough to
+# explain itself wraps — the corpus's first one takes three lines.
 WAIVER = re.compile(
     r"<!--\s*route-surface-allow:\s*(/actuator[^\s—:]*)\s*(?:—|:)\s*(\S[^>]*?)-->",
     re.S)
+
+# Any HTML comment, blanked before paths are extracted.
+#
+# A comment renders as nothing, so it is not a path a reader can see, read or
+# paste — the same visible-vs-invisible line `check-docs-orphans.sh` draws.
+# Without this the gate reads its own waivers: a marker naming the path it
+# exempts re-reports that path one line down, and the waiver can never win.
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
+
+
+def blank_comments(text):
+    """Replace HTML comment bodies with spaces, preserving every line number."""
+    return HTML_COMMENT.sub(
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
 
 
 def waived_lines(text):
@@ -290,18 +314,21 @@ def waived_lines(text):
         block_of.append(block)
 
     covered = {}
-    for lineno, line in enumerate(lines, 1):
-        for path, _reason in WAIVER.findall(line):
-            here = block_of[lineno - 1]
-            scope = {here, here - 1}
-            hits = covered.setdefault(path, set())
-            hits.update(n for n, b in enumerate(block_of, 1) if b in scope)
+    for match in WAIVER.finditer(text):
+        path = match.group(1)
+        # Anchored at the line the marker OPENS on, so a wrapped waiver is
+        # scoped by where it was written rather than by where it happens to end.
+        lineno = text.count("\n", 0, match.start()) + 1
+        here = block_of[lineno - 1]
+        scope = {here, here - 1}
+        hits = covered.setdefault(path, set())
+        hits.update(n for n, b in enumerate(block_of, 1) if b in scope)
     return covered
 
 
 def documented(text):
     """Yield (line_no, path) for every `/actuator/…` path a page shows."""
-    for lineno, line in enumerate(text.splitlines(), 1):
+    for lineno, line in enumerate(blank_comments(text).splitlines(), 1):
         for match in DOC_PATH.finditer(line):
             path = match.group(0).rstrip(TRAILING)
             if path:
@@ -428,6 +455,19 @@ def self_test():
         "a waiver does not reach a distant block",
         1 in waived_lines(far).get("/actuator/gone", set()),
         False,
+    ))
+    wrapped = ("| `/actuator/gone` |\n\n"
+               "<!-- route-surface-allow: /actuator/gone — a reason long\n"
+               "     enough to wrap onto a second line -->\n")
+    cases.append((
+        "a wrapped waiver covers the block above it",
+        1 in waived_lines(wrapped).get("/actuator/gone", set()),
+        True,
+    ))
+    cases.append((
+        "a waiver's own text is not read as a documented path",
+        list(documented(wrapped)),
+        [(1, "/actuator/gone")],
     ))
     cases.append((
         "a waiver without a reason does not parse",

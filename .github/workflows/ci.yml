@@ -374,6 +374,42 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-symbols.sh --self-test && ./scripts/check-docs-symbols.sh
+      - name: Actuator path drift gate
+        # The five gates above cover the link a reader clicks, the command they
+        # run, the variable they set, the config key they write and the Rust
+        # path they import. This one covers the sixth thing they copy off a
+        # page: the URL they curl.
+        #
+        # It is the only one of the six whose failure lands against a RUNNING
+        # APP rather than while the reader is still reading, and the actuator is
+        # the operator surface — `/actuator/health` is what a load balancer
+        # probes, `/actuator/jobs` and `/actuator/tasks` are what someone opens
+        # at 3am. `curl` answers `404 Not Found` with no hint of the right name,
+        # and since most of the surface sits behind `[actuator] sensitive =
+        # true`, that 404 reads like an endpoint they failed to ENABLE rather
+        # than one that was never there — so the reader goes and debugs their
+        # own deployment.
+        #
+        # The baseline run found four defects over 236 occurrences.
+        # `coming-from-other-frameworks.md` is the sharp one: its Spring→Autumn
+        # actuator table exists precisely to tell a migrating reader what an
+        # endpoint is CALLED here, and its `scheduledtasks` row said the name
+        # was unchanged. Autumn serves that payload at `/actuator/tasks`, so
+        # the one page written to prevent the 404 was causing it — and because
+        # the real endpoint shares no token with the word they searched,
+        # searching again could not rescue them. The other two told readers
+        # that `/actuator/routes` lists declared route methods; the route table
+        # is served from `/actuator/graph`.
+        #
+        # Truth set is the string literals passed to `actuator_route_path()`
+        # across non-test workspace Rust source — the one path builder every
+        # actuator mount goes through, whose own doc comment says why ("so
+        # paths match byte-for-byte"). Nothing to regenerate: a renamed
+        # endpoint lands in the same commit as the rename.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-routes.sh --self-test && ./scripts/check-docs-routes.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`

@@ -251,7 +251,17 @@ Both frameworks provide actuator endpoints out of the box:
 | `/actuator/metrics`      | `/actuator/metrics`            |
 | `/actuator/env`          | `/actuator/configprops`        |
 | `/actuator/loggers`      | `/actuator/loggers`            |
-| `/actuator/scheduledtasks` | `/actuator/scheduledtasks`   |
+| `/actuator/scheduledtasks` | `/actuator/tasks`              |
+
+<!-- route-surface-allow: /actuator/scheduledtasks — Spring Boot's name, shown
+     in the left column for comparison; Autumn serves the same payload at
+     /actuator/tasks -->
+
+The last row is the one name that changes: Autumn serves scheduled tasks at
+`/actuator/tasks`, with the payload shape Spring's `scheduledtasks` gives you
+(`{"scheduled_tasks": [...]}`). Like `/actuator/jobs` it is mounted only when
+`[actuator] sensitive = true`, so a `404` there means the profile has not
+enabled it rather than that you have the path wrong.
 
 Like Spring Boot's `loggers` actuator endpoint, Autumn's logger levels reload
 live -- `LogLevels::set_logger_level(name, level)` flips a target's level at

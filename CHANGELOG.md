@@ -369,6 +369,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An actuator path drift gate for the docs corpus [no-plugin]:** the five
+  docs gates that came before it cover the link a reader clicks
+  (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
+  variable they set (`check-docs-config.sh`), the config key they write
+  (`check-docs-toml.sh`) and the Rust path they import
+  (`check-docs-symbols.sh`). None of them looks at the sixth thing a reader
+  copies off a page: the **URL they curl**. `scripts/check-docs-routes.sh`
+  resolves every `/actuator/…` path in the reader-facing corpus — **236
+  occurrences across 195 pages** — against the paths the framework actually
+  mounts, and it runs in CI's docs-only job beside the other five.
+  It is the only one of the six whose failure lands against a *running app*
+  rather than while the reader is still reading, and the actuator is the
+  operator surface: `/actuator/health` is what a load balancer probes,
+  `/actuator/jobs` and `/actuator/tasks` are what someone opens at 3am to find
+  out why a scheduled backup stopped. `curl` answers `404 Not Found` with no
+  hint of the right name, and because most of the surface sits behind
+  `[actuator] sensitive = true`, that 404 reads like an endpoint they failed to
+  *enable* rather than one that was never there — so the reader goes and debugs
+  their own deployment instead of doubting the page.
+  It found **3 live defects**, all fixed here.
+  `docs/guide/coming-from-other-frameworks.md` is the sharp one: its
+  Spring→Autumn actuator table exists for the sole purpose of telling a
+  migrating reader what an endpoint is *called* here, and its `scheduledtasks`
+  row said the name was unchanged. It is not — Autumn serves the same
+  `{"scheduled_tasks": […]}` payload at `/actuator/tasks` — so the one page
+  written to prevent that 404 was the page causing it, and because the real
+  endpoint shares no token with the word the reader searched for, searching
+  again could not rescue them. `docs/guide/generators.md` and
+  `docs/guide/tutorial/07-htmx.md` both told readers that `autumn routes` and
+  `/actuator/routes` report the declared method behind an HTMX method override;
+  there is no `/actuator/routes`, and the route table with its declared methods
+  is served from `/actuator/graph`.
+  The truth set is the string literals passed to `actuator_route_path()` across
+  non-test workspace Rust source — the one path builder every actuator mount
+  goes through, whose own doc comment says why ("so paths match
+  byte-for-byte"). Nothing to regenerate: a renamed endpoint lands in the same
+  commit as the rename, and `#[cfg(test)] mod` bodies are stripped first so a
+  path that exists only in an assertion never confers existence on a documented
+  one. Resolution is deliberately permissive in three ways that each make the
+  gate report *fewer* paths — a mounted `{param}` matches a concrete value
+  (`/actuator/loggers/root`), a documented path that is a prefix of a mounted
+  one resolves (`/actuator/webhooks`), and a `*` segment matches anything
+  (`/actuator/*`) — and none of them can rescue a name that is simply not
+  there. A page that must name a foreign framework's endpoint waives it in
+  place with `<!-- route-surface-allow: /actuator/… — reason -->`, scoped to its
+  own block and the one above it. Run it with
+  `./scripts/check-docs-routes.sh` (`--list` for the mounted surface,
+  `--self-test` for the matcher's own cases).
+
 - **web:** `AutumnError` now reads back its own validation details (issue
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem

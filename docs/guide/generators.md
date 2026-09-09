@@ -1116,7 +1116,7 @@ async fn edit_form(id: Path<i64>, csrf: Option<CsrfToken>) -> Markup {
 }
 ```
 
-`autumn routes` and `/actuator/routes` keep reporting the declared
+`autumn routes` and `/actuator/graph` keep reporting the declared
 method (`PUT`, `PATCH`, or `DELETE`); the rewrite is a transport
 concession, not a routing one. CSRF protection still treats the
 overridden mutation as unsafe and rejects submissions without a valid
