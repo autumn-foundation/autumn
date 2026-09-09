@@ -2502,16 +2502,69 @@ async fn a_view_read_through_an_untracked_function_is_refused() {
         "and that refusal must also precede every write: {refusal}"
     );
 
-    // The same shape through a tracked body is followed, not refused. `z_source`
-    // sorts AFTER `a_report`, so refreshing it first can only come from the
-    // function hop being traversed.
+    // An opaque function reached only THROUGH a tracked one. The outer function
+    // has a relation dependency of its own, so it looks traceable; the body that
+    // actually reads `z_source` is the one nothing can see into. Measured: the
+    // run reported success with all 200 original addresses left in `a_report`.
+    let nested = seed_sample_fixture(&admin, &base, "fn_nested_opaque").await;
+    nested
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION opaque_inner() RETURNS TABLE(id int, email text) \
+                 AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
+             CREATE FUNCTION outer_fn() RETURNS TABLE(id int, email text) LANGUAGE sql \
+                 BEGIN ATOMIC SELECT f.id, f.email FROM opaque_inner() f \
+                     WHERE EXISTS (SELECT 1 FROM countries); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM outer_fn();",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_nested_opaque");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("a_report via opaque_inner"),
+        "the opaque body must be named, not the tracked function that vouches \
+         for it: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&nested, "users", "email").await,
+        200,
+        "and that refusal must precede every write: {refusal}"
+    );
+}
+
+/// A view read through TRACKED functions is ordered by them, not refused.
+///
+/// A `BEGIN ATOMIC` body records what it reads, so the chain is followed —
+/// including function-to-function calls. `z_source` sorts AFTER `a_report`, so
+/// refreshing it first can only come from the hops being traversed. Measured
+/// before the closure covered nested calls: reading only the outer function's
+/// own relation dependencies yielded no edge at all, `a_report` refreshed first
+/// from a stale `z_source`, and the run reported success with all 200 original
+/// addresses still in `a_report`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_read_through_a_tracked_function_is_refreshed_in_order() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
     let atomic = seed_sample_fixture(&admin, &base, "fn_atomic").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // Two tracked functions deep, so the traversal has to close over
+    // function-to-function calls: reading only `atomic_outer`'s own relation
+    // dependencies yields no edge to `z_source` at all.
     atomic
         .batch_execute(
             "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
              CREATE FUNCTION atomic_fn() RETURNS TABLE(id int, email text) LANGUAGE sql \
                  BEGIN ATOMIC SELECT id, email FROM z_source; END; \
-             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM atomic_fn();",
+             CREATE FUNCTION atomic_outer() RETURNS TABLE(id int, email text) LANGUAGE sql \
+                 BEGIN ATOMIC SELECT f.id, f.email FROM atomic_fn() f \
+                     WHERE EXISTS (SELECT 1 FROM countries); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM atomic_outer();",
         )
         .await
         .unwrap();

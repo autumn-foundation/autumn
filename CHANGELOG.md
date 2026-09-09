@@ -615,7 +615,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where only the ordinary view's rule names the function — a check restricted to
   materialized views skipped it, `a_report` refreshed first from a stale
   `z_source`, and the run reported success with all 200 original addresses still
-  in `a_report`.
+  in `a_report`. Both the traversal and the refusal close over function-to-
+  function calls as well. A tracked function that calls another tracked function
+  yielded no edge when only its own relation dependencies were read — measured on
+  `a_report -> outer_fn() -> inner_fn() -> z_source`, `a_report` refreshed first
+  and kept all 200 — and a tracked function calling an OPAQUE one passed the
+  refusal on the strength of its own relation dependency while the body that
+  actually read `z_source` was invisible. Both are now followed to the end of the
+  chain: measured, the tracked pair orders `z_source` first and ends clean, and
+  the opaque one is refused as `a_report via opaque_inner` before a row is
+  written.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the

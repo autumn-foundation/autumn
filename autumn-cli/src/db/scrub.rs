@@ -3466,8 +3466,13 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
 /// touch it — `users` scrubbed to 2 rows with 0 original addresses, `z_source`
 /// clean, and `a_report` holding all 200, under a reported success. So
 /// `rel_edge` takes every rewrite-rule dependency between relations — and the
-/// one function hop `PostgreSQL` records, `rewrite -> pg_proc -> pg_class`,
-/// which a `BEGIN ATOMIC` body produces. `reach` walks that from each
+/// function hops `PostgreSQL` records, `rewrite -> pg_proc -> pg_class`, which a
+/// `BEGIN ATOMIC` body produces. `fn_reach` closes that over function-to-function
+/// calls first, so a tracked function calling another tracked function is
+/// followed the whole way: measured, `a_report -> outer_fn() -> inner_fn() ->
+/// z_source` yielded no edge when only the outer function's own relation
+/// dependencies were read, and `a_report` refreshed first from a stale
+/// `z_source` while keeping all 200 original addresses. `reach` walks that from each
 /// materialized view through anything that is not one, and `edge` keeps the
 /// pairs that land on one. A function whose body is a string literal records no
 /// such dependency at all and cannot be walked; `untraceable_view_functions`
@@ -3500,6 +3505,14 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
      SELECT rel.oid, rel.relispopulated FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind = 'm' \
+ ), fn_reach AS ( \
+     SELECT d.refobjid AS root, d.refobjid AS fn \
+     FROM pg_depend d \
+     WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_proc'::regclass \
+     UNION \
+     SELECT r.root, fd.refobjid FROM fn_reach r \
+     JOIN pg_depend fd ON fd.classid = 'pg_proc'::regclass AND fd.objid = r.fn \
+       AND fd.refclassid = 'pg_proc'::regclass \
  ), rel_edge AS ( \
      SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source \
      FROM pg_depend d \
@@ -3511,8 +3524,9 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
      SELECT DISTINCT r.ev_class AS dependent, fd.refobjid AS source \
      FROM pg_depend d \
      JOIN pg_rewrite r ON r.oid = d.objid \
+     JOIN fn_reach fr ON fr.root = d.refobjid \
      JOIN pg_depend fd ON fd.classid = 'pg_proc'::regclass \
-       AND fd.objid = d.refobjid AND fd.refclassid = 'pg_class'::regclass \
+       AND fd.objid = fr.fn AND fd.refclassid = 'pg_class'::regclass \
      WHERE d.classid = 'pg_rewrite'::regclass \
        AND d.refclassid = 'pg_proc'::regclass \
        AND fd.refobjid <> r.ev_class \
@@ -3752,7 +3766,10 @@ pub struct DatabaseFacts {
     /// Read over every relation REACHABLE from a materialized view, not only the
     /// views themselves: the walk crosses ordinary views, so a function called by
     /// one of those is just as invisible and just as able to reorder the
-    /// refresh.
+    /// refresh. And over every function in the `fn_reach` closure, not only the
+    /// one a rule names directly — a tracked function can call an opaque one,
+    /// and the outer function's own relation dependency would otherwise vouch
+    /// for a body nothing can see into.
     pub untraceable_view_functions: Vec<String>,
     /// Non-system schemas other than `public` that hold base tables. The whole
     /// classification universe is `public`-only, so these are refused.
@@ -4337,7 +4354,8 @@ fn probe_database_facts(
              JOIN pg_rewrite rw ON rw.ev_class = n.relation \
              JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid \
                AND d.refclassid = 'pg_proc'::regclass \
-             JOIN pg_proc p ON p.oid = d.refobjid \
+             JOIN fn_reach fr ON fr.root = d.refobjid \
+             JOIN pg_proc p ON p.oid = fr.fn \
              JOIN pg_namespace pn ON pn.oid = p.pronamespace \
              WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema') \
                AND NOT EXISTS (SELECT 1 FROM pg_depend fd \
