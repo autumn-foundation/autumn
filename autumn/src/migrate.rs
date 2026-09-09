@@ -2256,10 +2256,14 @@ fn resolve_applied_user_migrations_sqlite<C>(
     conn: &mut C,
     all_migrations: &[Box<dyn Migration<diesel::sqlite::Sqlite>>],
     migrations_dir: &Path,
+    identity: &HashMap<String, String>,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError>
 where
     C: MigrationHarness<diesel::sqlite::Sqlite>,
 {
+    // `all_migrations` comes through the identity map, so a version here is
+    // the tracked one (a substitute for a remapped migration) and the name is
+    // still the directory.
     let by_version: std::collections::BTreeMap<String, String> = all_migrations
         .iter()
         .map(|m| (m.name().version().to_string(), m.name().to_string()))
@@ -2268,7 +2272,10 @@ where
     // The framework version strings are backend-independent; enumerate them via
     // the `Sqlite` source so a framework version that somehow landed in
     // `__diesel_schema_migrations` is still excluded from user rollback planning.
-    let framework = framework_migration_versions_for::<diesel::sqlite::Sqlite>()?;
+    // Through the same identity map: a framework migration tracked under a
+    // substitute is excluded under it, and its plain version, which then
+    // belongs to the app migration, is not.
+    let framework = sqlite_framework_tracked_versions(identity)?;
 
     let applied: Vec<String> = conn
         .applied_migrations()
@@ -2309,10 +2316,59 @@ pub fn applied_user_migrations_sqlite(
     })?;
     let source = FileBasedMigrations::from_path(migrations_dir)
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
-    let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
-        .migrations()
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-    resolve_applied_user_migrations_sqlite(&mut conn, &all_migrations, migrations_dir)
+    let identity = sqlite_app_identity_map(&source)?;
+    let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> =
+        DisambiguatedMigrations::new(&source, &identity)
+            .migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    resolve_applied_user_migrations_sqlite(&mut conn, &all_migrations, migrations_dir, &identity)
+}
+
+/// The identity map the `SQLite` apply path
+/// ([`run_pending_sqlite_with_framework_migrations`]) records under: the app
+/// set and the shard-required framework sets enumerated together, every
+/// version collision resolved. Rollback has to plan and revert under the
+/// same identities, or a migration tracked under a substitute reads as
+/// applied with no local `down.sql`, and its plain version as the other
+/// side's.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if a set cannot be enumerated.
+#[cfg(feature = "sqlite")]
+fn sqlite_app_identity_map(
+    app_migrations: &FileBasedMigrations,
+) -> Result<HashMap<String, String>, MigrationError> {
+    use diesel::sqlite::Sqlite;
+
+    let mut sets: Vec<Vec<(String, String)>> =
+        vec![migration_versions_and_names::<Sqlite, _>(app_migrations)?];
+    for set in shard_framework_migration_sets() {
+        sets.push(migration_versions_and_names::<Sqlite, _>(set)?);
+    }
+    Ok(compute_migration_disambiguation_from_names(sets))
+}
+
+/// [`framework_migration_versions_for`] for `SQLite`, with every framework
+/// migration under the version `identity` tracks it as.
+#[cfg(feature = "sqlite")]
+fn sqlite_framework_tracked_versions(
+    identity: &HashMap<String, String>,
+) -> Result<std::collections::BTreeSet<String>, MigrationError> {
+    use diesel::sqlite::Sqlite;
+
+    let mut versions = std::collections::BTreeSet::new();
+    for set in [
+        &FRAMEWORK_MIGRATIONS,
+        &crate::version_history::VERSION_HISTORY_MIGRATIONS,
+        &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+        &crate::derivation::DERIVATION_MIGRATIONS,
+    ] {
+        for (version, name) in migration_versions_and_names::<Sqlite, _>(set)? {
+            versions.insert(identity.get(&name).cloned().unwrap_or(version));
+        }
+    }
+    Ok(versions)
 }
 
 /// `SQLite` counterpart to [`revert_user_migrations_locked`]: plan and execute a
@@ -2356,13 +2412,21 @@ where
     })?;
     let source = FileBasedMigrations::from_path(migrations_dir)
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
-    let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> = source
-        .migrations()
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    // Under the apply path's identities, so a remapped migration is found and
+    // reverted under the substitute version its record carries.
+    let identity = sqlite_app_identity_map(&source)?;
+    let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> =
+        DisambiguatedMigrations::new(&source, &identity)
+            .migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
     with_sqlite_migration_lock(&mut conn, |conn| {
-        let applied_user =
-            resolve_applied_user_migrations_sqlite(conn, &all_migrations, migrations_dir)?;
+        let applied_user = resolve_applied_user_migrations_sqlite(
+            conn,
+            &all_migrations,
+            migrations_dir,
+            &identity,
+        )?;
         let versions = plan(&applied_user)?;
 
         let mut count = 0;
@@ -3585,6 +3649,83 @@ mod tests {
             second.applied.is_empty(),
             "nothing is applied twice: {:?}",
             second.applied
+        );
+    }
+
+    /// Rollback plans and reverts under the identities the apply path
+    /// recorded: the app migration tracked under a substitute is listed
+    /// under it with its directory, the derivation migration under the plain
+    /// version is excluded as framework-owned, and reverting drops the app
+    /// table and the substitute record while the framework side stays.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_rollback_uses_the_apply_paths_identities() {
+        use diesel::RunQueryDsl as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let (migrations_dir, url) = sqlite_scratch("rollback");
+        let older = migrations_dir.join("20260907101530_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app set");
+        run_pending_sqlite_with_framework_migrations(&url, &app).expect("adopt and apply");
+
+        let applied = applied_user_migrations_sqlite(&url, &migrations_dir).expect("list");
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert_eq!(applied[0].name, "20260907101530_zzz_app");
+        assert!(
+            applied[0].version.starts_with("20260907101530+"),
+            "listed under its substitute: {}",
+            applied[0].version
+        );
+        assert_eq!(applied[0].dir.as_deref(), Some(older.as_path()));
+
+        let reverted = revert_user_migrations_sqlite(
+            &url,
+            &migrations_dir,
+            |applied| Ok(applied.iter().map(|m| m.version.clone()).collect()),
+            |_| {},
+        )
+        .expect("revert");
+        assert_eq!(reverted, 1);
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        diesel::sql_query("SELECT 1 FROM zzz LIMIT 1")
+            .execute(&mut conn)
+            .expect_err("the app table is gone");
+        diesel::sql_query("SELECT 1 FROM _autumn_derivations LIMIT 1")
+            .execute(&mut conn)
+            .expect("the derivation state table stays");
+        let substitutes = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM __diesel_schema_migrations \
+             WHERE version LIKE '20260907101530+%'",
+        )
+        .get_result::<Count>(&mut conn)
+        .expect("count")
+        .n;
+        assert_eq!(substitutes, 0, "the substitute record is gone");
+        let plain = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM __diesel_schema_migrations WHERE version = '20260907101530'",
+        )
+        .get_result::<Count>(&mut conn)
+        .expect("count")
+        .n;
+        assert_eq!(plain, 1, "the derivation migration's record stays");
+        assert!(
+            applied_user_migrations_sqlite(&url, &migrations_dir)
+                .expect("list")
+                .is_empty()
         );
     }
 

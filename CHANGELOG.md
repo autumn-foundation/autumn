@@ -394,7 +394,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skipped, version-disambiguated together with the app's own set so a shared
   version masks nothing, and an app migration a database already ran under
   such a version keeps its record under its new tracked version instead of
-  running twice; on a Postgres target, where the app set goes through the
+  running twice, and `autumn migrate down` plans and reverts under the same
+  identities; on a Postgres target, where the app set goes through the
   `diesel` CLI, it refuses to apply or roll back, and says so in `status`,
   while an app migration shares a version with a framework migration that
   target receives, naming both and the rename to make) and as a standalone
