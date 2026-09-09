@@ -106,10 +106,10 @@ Added `tenant_qualify_bucket_key(key_strategy, raw_key)` in
 `rate_limit.rs`: for an `AuthenticatedPrincipal` key that actually resolved
 a principal (`raw_key` starts with `"principal:"`), it reads
 `CURRENT_TENANT` and — when present — rewrites the key to
-`principal:tenant=<tenant>\0<id>` (a NUL byte, not `:`, joins the tenant and
-the id — see "Codex review findings" below), preserving the `"principal:"`
-prefix so `key_class_label` still reports "authenticated principal".
-Applied at both call sites:
+`principal:tenant[<tenant.len()>]=<tenant><id>` (a length prefix on the
+tenant, not a delimiter byte — see "Codex review findings" below),
+preserving the `"principal:"` prefix so `key_class_label` still reports
+"authenticated principal". Applied at both call sites:
 
 ```rust
 // resolve_key_and_params (global tower layer)
@@ -134,14 +134,28 @@ bug.
 
 ## 🤖 Codex review findings (PR #2653)
 
-Codex's automated review left three findings on the fix commit. Disposition:
+Codex's automated review left three findings on the fix commit (`050efa4c`),
+then a fourth follow-up after the round-1 fix landed. Disposition:
 
 1. **P2, key-join ambiguity** (`tenant:id` via `:` is not injective) —
-   **valid, fixed.** Switched the separator to `\0`, matching `key_ns`'s own
-   join in `resolve_key_and_params`. Added
-   `tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries` and
-   three sibling unit tests in `rate_limit.rs`.
-2. **P1, header-sourced tenant not bound to the authenticated session** — a
+   **valid, fixed in round 1**: switched the separator to `\0`, matching
+   `key_ns`'s own join in `resolve_key_and_params`.
+2. **P2 follow-up, `\0` is not excludable either** — Codex correctly
+   pointed out that round 1's fix only proved header-sourced tenants
+   exclude `\0`; `tenancy.rs`'s `"session"` and `"jwt"` source arms only
+   reject an empty-after-trim value, so a session- or JWT-claim-sourced
+   tenant (and the app-supplied `RateLimitPrincipal` id) can contain a
+   literal `\0`, reopening the same non-injectivity one level down.
+   **Valid, fixed in round 2**: replaced the delimiter entirely with a
+   length prefix on the tenant
+   (`principal:tenant[<tenant.len()>]=<tenant><id>`), which is injective
+   regardless of what bytes either component contains — decoding never
+   searches tenant/id content for a separator, so no delimiter to smuggle.
+   Added `tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries_with_nul`
+   reproducing the exact `tenant="a", id="b\0c"` vs `tenant="a\0b", id="c"`
+   collision Codex named, alongside the round-1 colon test (renamed
+   `..._with_colons`).
+3. **P1, header-sourced tenant not bound to the authenticated session** — a
    caller with a valid tenant-A session can send an arbitrary `x-tenant-id`
    header and have `CURRENT_TENANT` (and now the bucket key) resolve to
    whatever tenant that header names, regardless of which tenant issued
@@ -159,7 +173,7 @@ Codex's automated review left three findings on the fix commit. Disposition:
    scope, and out of scope for a "fold the tenant into a cache/bucket key"
    fix specifically. Replied on the review thread; not resolving it (a
    human call, not mine, per the ambiguous/architectural-finding rule).
-3. **P1, `tenancy.public_paths` routes stay unqualified** — correct
+4. **P1, `tenancy.public_paths` routes stay unqualified** — correct
    mechanically (`tenancy_middleware` returns before entering the
    `CURRENT_TENANT` scope for an exempt path, so `tenant_qualify_bucket_key`
    sees `None` and no-ops there, same as before the fix). **Not a gap
@@ -178,10 +192,12 @@ Codex's automated review left three findings on the fix commit. Disposition:
 - Reproduction: both tests FAILED before the fix (`trunk-failure.txt`),
   both PASSED after (`after.txt`).
 - `cargo test -p autumn-web --lib security::rate_limit::tests::tenant_qualify`
-  — 4 passed (no-op cases, tenant fold-in, and the Codex-flagged
-  tenant/id-boundary collision).
+  — 5 passed (no-op cases, tenant fold-in, and both Codex-flagged
+  tenant/id-boundary collisions: the round-1 `:` case and the round-2 `\0`
+  case).
 - `cargo test -p autumn-web --test integration_tests --features
-  test-support -- rate_limit throttle` — 48 passed, 0 failed, including the
+  test-support -- rate_limit throttle` — 48 passed, 0 failed (re-run clean
+  after the round-2 length-prefix fix too), including the
   pre-existing `tier_assignment_hook_selects_correct_limits` (confirms the
   tier-hook contract is unaffected) and every `rate_limit_principal.rs` /
   `throttle_route.rs` test (confirms no behavior change for tenancy-free

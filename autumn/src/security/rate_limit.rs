@@ -756,21 +756,24 @@ fn strip_key_prefix(key: &str) -> &str {
 /// already inherently un-shared across tenants (a bearer token is a random
 /// unique string; falling back to IP is an existing, accepted limitation).
 ///
-/// Joins the tenant and the id with a NUL byte, not `:` — the same
-/// delimiter `resolve_key_and_params` already uses to join `key_ns` and the
-/// bucket key below, for the same reason: tenant ids and principal ids are
-/// arbitrary app-supplied strings, so a `:`-joined `tenant:id` is not
-/// injective (`tenant = "a:b", id = "c"` and `tenant = "a", id = "b:c"` both
-/// render as `"a:b:c"`, letting two distinct tenants share a bucket). `\0`
-/// cannot appear in an HTTP header value (rejected at the `HeaderValue`
-/// layer) and is not a realistic tenant/principal id in practice, matching
-/// the trust already placed in `key_ns`.
+/// Joins the tenant and the id with a length prefix on the tenant, not a
+/// delimiter byte: `principal:tenant[<tenant.len()>]=<tenant><id>`. No
+/// delimiter byte is excludable here — `CURRENT_TENANT` can be sourced from
+/// a header (rejects control bytes at the `HeaderValue` layer) but also from
+/// a session value or a JWT claim (`tenancy.rs`'s `"session"`/`"jwt"` arms
+/// only reject an empty-after-trim value, so a `\0`, `:`, or any other byte
+/// can appear there), and `RateLimitPrincipal` wraps an equally unrestricted
+/// app-supplied `String`. A length prefix sidesteps the question entirely:
+/// decoding never searches the tenant/id bytes for a separator, so no
+/// content either string could contain changes where the boundary falls.
+/// `tenant.len()` is a byte length, matching the byte slice taken below.
 fn tenant_qualify_bucket_key(key_strategy: KeyStrategy, raw_key: &str) -> String {
     if key_strategy == KeyStrategy::AuthenticatedPrincipal
         && let Some(id) = raw_key.strip_prefix("principal:")
         && let Ok(Some(tenant)) = crate::tenancy::CURRENT_TENANT.try_with(Clone::clone)
     {
-        format!("principal:tenant={tenant}\0{id}")
+        let tenant_len = tenant.len();
+        format!("principal:tenant[{tenant_len}]={tenant}{id}")
     } else {
         raw_key.to_owned()
     }
@@ -2472,11 +2475,11 @@ mod tests {
     }
 
     #[test]
-    fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries() {
+    fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries_with_colons() {
         // Regression: a `:`-joined "tenant:id" is not injective — tenant="a:b"
         // id="c" and tenant="a" id="b:c" both render as "a:b:c". Codex flagged
-        // this on PR #2653; the fix joins with `\0` instead (see
-        // `tenant_qualify_bucket_key`'s doc comment).
+        // this on PR #2653; the fix is the length-prefixed encoding in
+        // `tenant_qualify_bucket_key`'s doc comment.
         let key_1 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a:b".to_owned()), || {
             tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:c")
         });
@@ -2487,6 +2490,31 @@ mod tests {
             key_1, key_2,
             "tenant \"a:b\" + id \"c\" must not produce the same bucket key as tenant \"a\" + \
              id \"b:c\""
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries_with_nul() {
+        // A `\0`-joined encoding is only injective if `\0` can never appear in
+        // either component. Header-sourced tenants can't carry one (rejected
+        // at the `HeaderValue` layer), but `tenancy.rs`'s `"session"`/`"jwt"`
+        // arms only reject an empty-after-trim value, so a session- or
+        // JWT-claim-sourced tenant CAN contain `\0` — and so can the
+        // app-supplied `RateLimitPrincipal` id. Codex flagged this as a
+        // follow-up on PR #2653 after the `:` -> `\0` fix; the length-prefix
+        // encoding is injective regardless of what bytes either string
+        // contains, so tenant="a" id="b\0c" must not collide with
+        // tenant="a\0b" id="c".
+        let key_1 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:b\0c")
+        });
+        let key_2 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a\0b".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:c")
+        });
+        assert_ne!(
+            key_1, key_2,
+            "tenant \"a\" + id \"b\\0c\" must not produce the same bucket key as tenant \
+             \"a\\0b\" + id \"c\""
         );
     }
 
