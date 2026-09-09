@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capabilities::Capability;
 use crate::content;
-use crate::models::{NewPost, NewTerm};
+use crate::models::NewPost;
 use crate::plugins::{Action, do_action};
 use crate::repositories::{
     AttachmentRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
@@ -376,20 +376,6 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
         .into_response())
 }
 
-/// One term of a taxonomy, by slug.
-async fn term_by_slug(
-    repos: &Repos,
-    taxonomy: &str,
-    slug: &str,
-) -> AutumnResult<Option<crate::models::Term>> {
-    Ok(repos
-        .terms
-        .find_by_slug(slug.to_owned())
-        .await?
-        .into_iter()
-        .find(|candidate| candidate.taxonomy == taxonomy))
-}
-
 #[derive(Deserialize)]
 pub struct ImportForm {
     pub payload: String,
@@ -416,70 +402,31 @@ pub async fn import(
     // Terms first: posts reference them, and creating them up front means one
     // pass over the posts rather than two.
     //
-    // Which terms this run created, so the ancestry pass below can restrict
-    // itself to them and leave a locally-managed hierarchy alone.
-    let mut created_terms: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for term in &payload.terms {
-        let existing = repos
-            .terms
-            .find_by_slug(term.slug.clone())
-            .await?
-            .into_iter()
-            .any(|t| t.taxonomy == term.taxonomy);
-        if !existing {
-            let created = repos
-                .terms
-                .save(&NewTerm {
-                    taxonomy: term.taxonomy.clone(),
-                    name: term.name.clone(),
-                    slug: term.slug.clone(),
-                    description: term.description.clone(),
-                    // Linked in the second pass below: a child term can appear
-                    // in the file before its parent.
-                    parent_id: None,
-                })
-                .await?;
-            created_terms.insert(created.id);
-        }
-    }
-
-    // Re-link taxonomy ancestry. Hierarchical categories are supported, so a
-    // restore that flattened them would quietly change every archive's shape.
-    //
-    // Only for terms *this run created*. A term the destination already had is
-    // locally managed — the first pass deliberately leaves its name and
-    // description alone, and moving it under the backup's parent would be the
-    // same contradiction: an import that says it skips existing rows, silently
-    // restructuring somebody's category tree (or closing a cycle with it). This
-    // is the taxonomy-shaped twin of the post ancestry rule.
-    for term in &payload.terms {
-        let Some(parent_slug) = &term.parent else {
-            continue;
-        };
-        let child = term_by_slug(&repos, &term.taxonomy, &term.slug).await?;
-        let parent = term_by_slug(&repos, &term.taxonomy, parent_slug).await?;
-        let (Some(child), Some(parent)) = (child, parent) else {
-            continue;
-        };
-        if !created_terms.contains(&child.id) {
-            continue;
-        }
-        if child.id != parent.id && child.parent_id != Some(parent.id) {
-            repos
-                .terms
-                .update(
-                    child.id,
-                    &crate::models::UpdateTerm {
-                        taxonomy: autumn_web::hooks::Patch::Unchanged,
-                        name: autumn_web::hooks::Patch::Unchanged,
-                        slug: autumn_web::hooks::Patch::Unchanged,
-                        description: autumn_web::hooks::Patch::Unchanged,
-                        parent_id: autumn_web::hooks::Patch::Set(Some(parent.id)),
-                    },
-                )
-                .await?;
-        }
-    }
+    // Creations and ancestry go together, in one transaction owned by
+    // `content::import_terms`. Split across statements, a failure during the
+    // linking half left the creations committed, and a retry then read every
+    // one of those rows as pre-existing local content it must not restructure
+    // — so the unfinished links were skipped permanently and the hierarchy
+    // stayed flat while the retry reported the terms as already present.
+    repos
+        .with_conn(async |conn| {
+            content::import_terms(
+                conn,
+                &payload
+                    .terms
+                    .iter()
+                    .map(|term| content::ImportedTerm {
+                        taxonomy: term.taxonomy.clone(),
+                        name: term.name.clone(),
+                        slug: term.slug.clone(),
+                        description: term.description.clone(),
+                        parent: term.parent.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        })
+        .await?;
 
     // Attachment metadata first, so posts can reference it. Matched by slug —
     // the same "ids mean nothing across installations" rule the author and

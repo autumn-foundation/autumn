@@ -5850,3 +5850,482 @@ async fn the_media_library_is_paginated() {
         "page two must not repeat page one"
     );
 }
+
+/// A guest's identity fields are capped, not just their comment body.
+///
+/// `/comments/{post_id}` is unauthenticated with the shipped defaults and the
+/// form's `maxlength` attributes are a browser convenience; `author_url` has no
+/// input on the form at all. Uncapped, a handful of accepted comments carry
+/// request-sized values that the moderation queue then renders fifty at a time.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_guests_identity_fields_are_capped() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Caps", "Body.", "publish").await;
+
+    sign_out(&client);
+    let long_name = "n".repeat(81);
+    let long_email = format!("{}@example.com", "e".repeat(250));
+    let long_url = format!("https://example.com/{}", "u".repeat(200));
+
+    for (label, fields) in [
+        (
+            "name",
+            vec![
+                ("body", "Hello"),
+                ("author_name", long_name.as_str()),
+                ("author_email", "guest@example.com"),
+            ],
+        ),
+        (
+            "email",
+            vec![
+                ("body", "Hello"),
+                ("author_name", "Guest"),
+                ("author_email", long_email.as_str()),
+            ],
+        ),
+        (
+            "url",
+            vec![
+                ("body", "Hello"),
+                ("author_name", "Guest"),
+                ("author_email", "guest@example.com"),
+                ("author_url", long_url.as_str()),
+            ],
+        ),
+    ] {
+        let refused = client
+            .post(&format!("/comments/{post_id}"))
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_ne!(
+            refused.status,
+            303,
+            "an oversized {label} must be refused: {}",
+            refused.text()
+        );
+    }
+
+    // A signed-in commenter's name and email come from their account rather
+    // than the request, so they are not capped here — enforcing an account
+    // rule at the comment door would refuse a legitimate long display name.
+    sign_out(&client);
+    let reader = register(&client, "reader").await;
+    let long_display = "D".repeat(120);
+    client
+        .post("/admin/users/2")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("role", "subscriber"),
+            ("email", "reader@example.com"),
+            ("display_name", long_display.as_str()),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &reader)
+        .form(&form(&[("body", "From the account.")]))
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// Re-parenting is bounded by the deepest descendant, not by the moved page.
+///
+/// Checking only where the moved row would land let a subtree be dragged under
+/// a parent deep enough to push its own children past `MAX_PAGE_DEPTH`:
+/// `page_ancestry` then truncated those children's canonical paths while
+/// `resolve_page_path` still walked down from a real root, so each of them
+/// 404'd at the URL the site itself published.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn reparenting_is_bounded_by_the_deepest_descendant() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let page = async |title: &str, parent: Option<&str>| -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ];
+        if let Some(parent) = parent {
+            fields.push(("parent_id", parent));
+        }
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating {title}: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+
+    // A chain six deep. `P6` is the deepest legal parent for a *leaf*.
+    let mut chain = Vec::new();
+    for level in 1..=6 {
+        let parent = chain.last().cloned();
+        chain.push(page(&format!("P{level}"), parent.as_deref()).await);
+    }
+
+    // A separate subtree three levels tall: A > B > C.
+    let a = page("A", None).await;
+    let b = page("B", Some(&a)).await;
+    let _c = page("C", Some(&b)).await;
+
+    // Moving A under P6 puts C at nine ancestors. The old check asked only
+    // where A itself would land — six — and allowed it.
+    let refused = client
+        .post(&format!("/admin/content/page/{a}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A"),
+            ("slug", "a"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("parent_id", chain[5].as_str()),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "the subtree's own height has to count: {}",
+        refused.text()
+    );
+
+    // A is still where it was, and still reachable.
+    sign_out(&client);
+    client
+        .get("/a/b/c")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+
+    // A leaf may still take that place — the bound is on the height that would
+    // result, not on re-parenting.
+    let leaf = page("Leaf", None).await;
+    client
+        .post(&format!("/admin/content/page/{leaf}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Leaf"),
+            ("slug", "leaf"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("parent_id", chain[5].as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// An import's term pass is all-or-nothing.
+///
+/// The creations and the ancestry links are two passes — a child term can
+/// appear in the file before its parent — but they are one transaction. Split
+/// across statements, a failure during the linking half left the creations
+/// committed, and a retry then read every one of those rows as pre-existing
+/// local content it must not restructure, so the unfinished links were skipped
+/// permanently while the retry reported success.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failed_import_leaves_no_half_created_taxonomy() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // The failure has to land *after* a row has been written, which is the only
+    // shape the atomicity is about: a malformed payload is rejected before the
+    // pass starts and proves nothing. A trigger that refuses one particular
+    // name is the smallest way to fail the pass mid-flight, standing in for the
+    // constraint violation or dropped connection that would do it in practice.
+    let db = TestDb::shared().await;
+    try_execute(
+        db,
+        "CREATE OR REPLACE FUNCTION refuse_boom() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.name = 'Boom' THEN RAISE EXCEPTION 'boom'; END IF;
+             RETURN NEW;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .await
+    .expect("create the trigger function");
+    try_execute(db, "DROP TRIGGER IF EXISTS refuse_boom ON terms")
+        .await
+        .expect("clear any previous trigger");
+    try_execute(
+        db,
+        "CREATE TRIGGER refuse_boom BEFORE INSERT ON terms
+         FOR EACH ROW EXECUTE FUNCTION refuse_boom()",
+    )
+    .await
+    .expect("install the trigger");
+
+    // The first term is perfectly valid and is written; the second is refused,
+    // failing the pass with the first already inserted.
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "attachments": [],
+        "posts": [],
+        "terms": [
+            {"taxonomy": "category", "name": "Guides", "slug": "guides", "description": ""},
+            {"taxonomy": "category", "name": "Boom", "slug": "boom", "description": ""}
+        ]
+    })
+    .to_string();
+
+    let failed = client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await;
+    assert_ne!(failed.status, 303, "the import must not report success");
+
+    let categories = client
+        .get("/admin/terms/category")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    categories.assert_ok();
+    assert!(
+        !categories.text().contains("Guides"),
+        "a failed term pass must roll its creations back, or a retry reads \
+         them as local content and never finishes the ancestry"
+    );
+
+    try_execute(db, "DROP TRIGGER refuse_boom ON terms")
+        .await
+        .expect("remove the trigger");
+
+    // And a well-formed file still restores the hierarchy it describes.
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "attachments": [],
+        "posts": [],
+        "terms": [
+            {"taxonomy": "category", "name": "Beginner", "slug": "beginner",
+             "description": "", "parent": "guides"},
+            {"taxonomy": "category", "name": "Guides", "slug": "guides", "description": ""}
+        ]
+    })
+    .to_string();
+    client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await
+        .assert_ok();
+    client
+        .get("/admin/terms/category")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Guides — ");
+}
+
+/// The content-administration list is paginated in SQL.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_content_admin_list_is_paginated() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // 60 posts, newest first by `updated_at`: `Item 01` is the most recent.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO posts (post_type, title, slug, excerpt, body, status, author_id,
+                            password, comment_status, menu_order, updated_at)
+         SELECT 'post',
+                'Item ' || lpad(g::text, 2, '0'),
+                'item-' || lpad(g::text, 2, '0'),
+                '', 'Body.', 'publish', 1, '', 'open', 0,
+                NOW() - (g || ' minutes')::interval
+         FROM generate_series(1, 60) AS g",
+    )
+    .await
+    .expect("seed the content list");
+
+    let first = client
+        .get("/admin/content/post")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    first.assert_ok();
+    let first = first.text();
+    assert!(first.contains("Item 01"), "the newest row leads page one");
+    assert!(first.contains("Item 50"), "page one holds a full page");
+    assert!(
+        !first.contains("Item 51"),
+        "page one must stop at the page size rather than render the whole table"
+    );
+    assert!(first.contains("Page 1 of 2"));
+
+    let second = client
+        .get("/admin/content/post?page=2")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    second.assert_ok();
+    let second = second.text();
+    assert!(second.contains("Item 60"), "the tail is reachable");
+    assert!(
+        !second.contains("Item 01"),
+        "page two must not repeat page one"
+    );
+
+    // The status filter and the search still apply, and are applied in SQL
+    // alongside the bound rather than to rows already loaded.
+    let drafts = client
+        .get("/admin/content/post?status=draft")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    drafts.assert_ok();
+    assert!(!drafts.text().contains("Item 01"));
+
+    let searched = client
+        .get("/admin/content/post?s=Item")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    searched.assert_ok();
+    let searched = searched.text();
+    assert!(searched.contains("Item 01"));
+    assert!(
+        !searched.contains("Item 51"),
+        "a search is bounded too, not just the unfiltered list"
+    );
+
+    // A Contributor's restriction is a predicate, not a filter applied after
+    // the page was already chosen — otherwise their page one would be mostly
+    // empty rows they cannot open.
+    sign_out(&client);
+    let contributor = register(&client, "contributor").await;
+    client
+        .post("/admin/users/2")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("role", "contributor"),
+            ("email", "contributor@example.com"),
+            ("display_name", "Contributor"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let theirs = client
+        .get("/admin/content/post")
+        .header("cookie", &contributor)
+        .send()
+        .await;
+    theirs.assert_ok();
+    assert!(
+        !theirs.text().contains("Item 01"),
+        "a Contributor must not see another account's content"
+    );
+}
+
+/// The featured-image picker is bounded, and keeps the current selection.
+///
+/// Paginating `/admin/media` did nothing for this control: opening any
+/// thumbnail-capable editor still rendered every attachment as an `<option>`.
+/// Bounding it introduces its own hazard — a selection older than the bound
+/// would fall out of the select, and saving the form unchanged would clear it —
+/// so the current value is added back explicitly.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_featured_media_picker_is_bounded_and_keeps_its_selection() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Illustrated", "Body.", "draft").await;
+
+    // 150 uploads. `Shot 001` is the newest; `Shot 150` is far past the bound.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO attachments (title, slug, mime_type, byte_size, created_at)
+         SELECT 'Shot ' || lpad(g::text, 3, '0'),
+                'shot-' || lpad(g::text, 3, '0'),
+                'image/png',
+                1024,
+                NOW() - (g || ' minutes')::interval
+         FROM generate_series(1, 150) AS g",
+    )
+    .await
+    .expect("seed the library");
+
+    let editor = client
+        .get(&format!("/admin/content/post/{post_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    editor.assert_ok();
+    let editor = editor.text();
+    assert!(
+        editor.contains("Shot 001"),
+        "the newest uploads are offered"
+    );
+    assert!(
+        !editor.contains("Shot 150"),
+        "the picker must not render the whole library"
+    );
+    assert!(
+        editor.contains("most recent uploads"),
+        "the editor says it is showing a window, rather than implying the \
+         library is this small"
+    );
+
+    // Now select the oldest one, which is well past the bound.
+    let oldest: String = "Shot 150".to_owned();
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "UPDATE posts SET featured_media_id =
+                 (SELECT id FROM attachments WHERE title = '{oldest}')
+             WHERE id = {post_id}"
+        ),
+    )
+    .await
+    .expect("select the oldest attachment");
+
+    let editor = client
+        .get(&format!("/admin/content/post/{post_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    editor.assert_ok();
+    assert!(
+        editor.text().contains(&oldest),
+        "a selection older than the bound must still be in the select, or \
+         saving the form unchanged silently clears it"
+    );
+}

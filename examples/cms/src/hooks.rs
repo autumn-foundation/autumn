@@ -57,6 +57,20 @@ const CREATABLE_STATUSES: &[&str] = &["draft", "pending", "publish"];
 /// on the `Comment` model.
 pub const MAX_COMMENT_BODY_BYTES: usize = 10_000;
 
+/// The largest guest name accepted, matching the form's `maxlength`.
+pub const MAX_COMMENT_NAME_BYTES: usize = 80;
+
+/// The largest guest email accepted — the longest address RFC 5321 allows, and
+/// the form's `maxlength`.
+pub const MAX_COMMENT_EMAIL_BYTES: usize = 254;
+
+/// The largest commenter website accepted.
+///
+/// There is no input for it on the form at all, which is exactly why it needs a
+/// server-side cap: the only way to set it is a request that was not made by a
+/// browser.
+pub const MAX_COMMENT_URL_BYTES: usize = 200;
+
 /// Comment moderation states.
 pub const COMMENT_STATUSES: &[&str] = &["approved", "pending", "spam", "trash"];
 
@@ -65,10 +79,11 @@ pub const COMMENT_STATUSES: &[&str] = &["approved", "pending", "spam", "trash"];
 /// Public because [`crate::content::create_comment`] inserts through direct
 /// Diesel — it has to, so the row and the post's approved-comment counter move
 /// in one transaction — and therefore never runs `CommentHooks::before_create`.
-/// These are the *only* server-side checks on a comment body; the form's
-/// `required` attributes are a browser convenience a crafted request ignores,
-/// and a signed-in commenter's empty body would otherwise be inserted
-/// pre-approved and increment the counter.
+/// These are the *only* server-side checks a comment ever gets — on its body
+/// and on its identity fields alike; the form's `required` and `maxlength`
+/// attributes are a browser convenience a crafted request ignores, and a
+/// signed-in commenter's empty body would otherwise be inserted pre-approved
+/// and increment the counter.
 pub fn validate_comment(new: &mut NewComment) -> AutumnResult<()> {
     new.body = new.body.trim().to_owned();
     if new.body.is_empty() {
@@ -98,6 +113,37 @@ pub fn validate_comment(new: &mut NewComment) -> AutumnResult<()> {
     new.author_name = new.author_name.trim().to_owned();
     if new.author_id.is_none() && new.author_name.is_empty() {
         return Err(AutumnError::unprocessable_msg("Name is required"));
+    }
+
+    // The identity fields need caps for the same reason the body does, and the
+    // reason is sharper here: `/comments/{post_id}` is unauthenticated with the
+    // shipped defaults, and the form's `maxlength` attributes are a browser
+    // convenience a crafted POST ignores. Uncapped, a handful of accepted
+    // comments carry request-sized names and emails, which the moderation
+    // queue then loads and renders fifty at a time.
+    //
+    // Name and email are checked only for a guest, because those are the only
+    // submissions where they come from the request: a signed-in commenter's
+    // are copied from their account by the handler, and rejecting a comment
+    // over the length of its author's own display name would enforce an
+    // account rule at the wrong door. `author_url` is checked for everyone —
+    // the handler passes it through from the form either way, and there is no
+    // input for it on the form at all, so the only way to set it is a request
+    // that never went through one.
+    new.author_email = new.author_email.trim().to_owned();
+    new.author_url = new.author_url.trim().to_owned();
+    let mut capped: Vec<(&str, &str, usize)> =
+        vec![("Website", &new.author_url, MAX_COMMENT_URL_BYTES)];
+    if new.author_id.is_none() {
+        capped.push(("Name", &new.author_name, MAX_COMMENT_NAME_BYTES));
+        capped.push(("Email", &new.author_email, MAX_COMMENT_EMAIL_BYTES));
+    }
+    for (label, value, cap) in capped {
+        if value.len() > cap {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "{label} must be at most {cap} characters"
+            )));
+        }
     }
     Ok(())
 }
@@ -228,6 +274,43 @@ pub fn validate_post_update(before: &Post, after: &mut Post) -> AutumnResult<()>
     Ok(())
 }
 
+/// Normalize and validate a new term.
+///
+/// Public for the same reason [`validate_comment`] and [`normalize_new_user`]
+/// are: [`crate::content::import_terms`] restores a file's whole taxonomy —
+/// the rows and their ancestry — in one transaction, which it can only do
+/// through direct Diesel, and therefore never reaches
+/// `TermHooks::before_create`.
+pub fn normalize_new_term(new: &mut NewTerm) -> AutumnResult<()> {
+    if new.taxonomy.trim().is_empty() {
+        new.taxonomy = "category".to_owned();
+    }
+    let Some(taxonomy) = crate::content_types::find_taxonomy(&new.taxonomy) else {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Unknown taxonomy `{}`",
+            new.taxonomy
+        )));
+    };
+    // A flat taxonomy has no hierarchy to put a term in. Silently dropping
+    // the parent is friendlier than a 400 here: the field simply does not
+    // exist for tags, so a client that sends one is confused, not hostile.
+    if !taxonomy.hierarchical {
+        new.parent_id = None;
+    }
+
+    new.slug = if new.slug.trim().is_empty() {
+        slugify(&new.name)
+    } else {
+        slugify(&new.slug)
+    };
+    if new.slug.is_empty() {
+        return Err(AutumnError::unprocessable_msg(
+            "Term name must contain at least one alphanumeric character",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub struct TermHooks;
 
@@ -241,33 +324,7 @@ impl MutationHooks for TermHooks {
         _ctx: &mut MutationContext,
         new: &mut NewTerm,
     ) -> AutumnResult<()> {
-        if new.taxonomy.trim().is_empty() {
-            new.taxonomy = "category".to_owned();
-        }
-        let Some(taxonomy) = crate::content_types::find_taxonomy(&new.taxonomy) else {
-            return Err(AutumnError::bad_request_msg(format!(
-                "Unknown taxonomy `{}`",
-                new.taxonomy
-            )));
-        };
-        // A flat taxonomy has no hierarchy to put a term in. Silently dropping
-        // the parent is friendlier than a 400 here: the field simply does not
-        // exist for tags, so a client that sends one is confused, not hostile.
-        if !taxonomy.hierarchical {
-            new.parent_id = None;
-        }
-
-        new.slug = if new.slug.trim().is_empty() {
-            slugify(&new.name)
-        } else {
-            slugify(&new.slug)
-        };
-        if new.slug.is_empty() {
-            return Err(AutumnError::unprocessable_msg(
-                "Term name must contain at least one alphanumeric character",
-            ));
-        }
-        Ok(())
+        normalize_new_term(new)
     }
 
     async fn before_update(

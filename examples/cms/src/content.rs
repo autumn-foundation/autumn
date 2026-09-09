@@ -1740,6 +1740,33 @@ pub async fn depth_under(
     Ok(depth)
 }
 
+/// How many levels of descendants a page has below it.
+///
+/// `0` for a leaf. Walked level by level with one query per level rather than
+/// row by row, and bounded by the same limit the resolver has, so a hierarchy
+/// that a direct write left deeper than the bound terminates instead of
+/// spinning.
+pub async fn subtree_height(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<usize> {
+    let mut height = 0usize;
+    let mut level = vec![post_id];
+    while !level.is_empty() {
+        if height > MAX_PAGE_DEPTH + 2 {
+            break;
+        }
+        let children: Vec<i64> = posts::table
+            .filter(posts::parent_id.eq_any(&level))
+            .select(posts::id)
+            .load(&mut *conn)
+            .await?;
+        if children.is_empty() {
+            break;
+        }
+        height += 1;
+        level = children;
+    }
+    Ok(height)
+}
+
 /// Validate a proposed parent for a page: no cycle, and within the depth the
 /// permalink builder can render.
 ///
@@ -1781,7 +1808,19 @@ pub async fn validate_parent(
             "A page cannot be placed under itself or one of its own children",
         ));
     }
-    if depth_under(conn, candidate_parent_id).await? >= MAX_PAGE_DEPTH {
+    // The depth that matters is the *deepest descendant's*, not the moved
+    // page's. Checking only where this row would land let a subtree be dragged
+    // under a parent deep enough to push its own children past the bound: the
+    // move validated, and then `page_ancestry` truncated those children's
+    // canonical paths while `resolve_page_path` still walked down from a real
+    // root — so each of them 404'd at the URL the site itself published for it.
+    // A page being created has no descendants, so this reduces to the old check
+    // on that path.
+    let moved_height = match post_id {
+        Some(post_id) => subtree_height(conn, post_id).await?,
+        None => 0,
+    };
+    if depth_under(conn, candidate_parent_id).await? + moved_height >= MAX_PAGE_DEPTH {
         return Err(AutumnError::unprocessable_msg(format!(
             "Pages can be nested at most {MAX_PAGE_DEPTH} levels deep"
         )));
@@ -2089,6 +2128,246 @@ pub async fn imported_source_slugs(
         .into_iter()
         .map(|(post_type, slug, id)| ((post_type, slug), id))
         .collect())
+}
+
+/// What the content-administration screen is asking for.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminPostQuery<'a> {
+    pub post_type: &'a str,
+    /// `None` means "every status except trash", which is what WordPress's
+    /// unfiltered list shows.
+    pub status: Option<&'a str>,
+    pub search: Option<&'a str>,
+    /// Set for a role without `EditOthersPosts`, so the restriction is a
+    /// predicate rather than a filter applied to rows already loaded.
+    pub author_id: Option<i64>,
+}
+
+/// One page of the content-administration list, with its total.
+///
+/// Every part of the question — the type, the status, the search, the
+/// Contributor's own-content restriction, the order and the bound — is asked of
+/// Postgres. Each branch previously loaded the complete matching rows, bodies
+/// and all, filtered and sorted them in Rust and rendered every one of them;
+/// Authors and Contributors grow this table continuously, so the primary
+/// content-management screen was on course to become the least usable one on
+/// the site.
+pub async fn admin_posts_page(
+    conn: &mut AsyncPgConnection,
+    query: &AdminPostQuery<'_>,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<(Vec<Post>, i64)> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+
+    #[derive(diesel::QueryableByName)]
+    struct Total {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct MatchedId {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+
+    // A status of `NULL` means the unfiltered list, which hides trash; a search
+    // of `NULL` means no search. Expressed as bound parameters rather than by
+    // concatenating SQL, so the predicate below is one constant string and the
+    // untrusted search text never reaches the query text.
+    //
+    // `search_vector` is used unrestricted here, unlike `search_published`: this
+    // screen is behind `EditPosts` and every row it can return is one the caller
+    // may open and read in full, so there is nothing for a restricted vector to
+    // withhold.
+    const PREDICATE: &str = "post_type = $1          AND (CASE WHEN $2::text IS NULL THEN status <> 'trash' ELSE status = $2 END)          AND ($3::text IS NULL OR search_vector @@ websearch_to_tsquery('english', $3))          AND ($4::bigint IS NULL OR author_id = $4)";
+
+    let total: i64 = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM posts WHERE {PREDICATE}"
+    ))
+    .bind::<Text, _>(query.post_type)
+    .bind::<Nullable<Text>, _>(query.status)
+    .bind::<Nullable<Text>, _>(query.search)
+    .bind::<Nullable<BigInt>, _>(query.author_id)
+    .get_result::<Total>(conn)
+    .await?
+    .count;
+
+    let matched: Vec<i64> = diesel::sql_query(format!(
+        "SELECT id FROM posts WHERE {PREDICATE}          ORDER BY updated_at DESC, id DESC LIMIT $5 OFFSET $6"
+    ))
+    .bind::<Text, _>(query.post_type)
+    .bind::<Nullable<Text>, _>(query.status)
+    .bind::<Nullable<Text>, _>(query.search)
+    .bind::<Nullable<BigInt>, _>(query.author_id)
+    .bind::<BigInt, _>(limit.max(0))
+    .bind::<BigInt, _>(offset.max(0))
+    .load::<MatchedId>(conn)
+    .await?
+    .into_iter()
+    .map(|row| row.id)
+    .collect();
+
+    if matched.is_empty() {
+        return Ok((Vec::new(), total));
+    }
+
+    let mut rows: Vec<Post> = posts::table
+        .filter(posts::id.eq_any(&matched))
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+    rows.sort_by_key(|post| {
+        matched
+            .iter()
+            .position(|id| *id == post.id)
+            .unwrap_or(usize::MAX)
+    });
+
+    Ok((rows, total))
+}
+
+/// The accounts that authored a page of posts, in one query.
+///
+/// The list screen looked each one up per row, so a fifty-row page cost fifty
+/// round trips to render a column of names.
+pub async fn authors_for_posts(
+    conn: &mut AsyncPgConnection,
+    rows: &[Post],
+) -> AutumnResult<std::collections::HashMap<i64, User>> {
+    let ids: Vec<i64> = rows.iter().map(|post| post.author_id).collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(users::table
+        .filter(users::id.eq_any(ids))
+        .select(User::as_select())
+        .load(conn)
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user))
+        .collect())
+}
+
+/// A term as an export file describes it.
+///
+/// The parent is a **slug**, not an id: ids mean nothing across installations,
+/// which is the same rule the post ancestry and the term references follow.
+#[derive(Debug, Clone)]
+pub struct ImportedTerm {
+    pub taxonomy: String,
+    pub name: String,
+    pub slug: String,
+    pub description: String,
+    pub parent: Option<String>,
+}
+
+/// Restore a file's taxonomy — the rows and their ancestry — in one transaction.
+///
+/// Returns how many terms this call created.
+///
+/// Two passes are unavoidable: a child term can appear in the file before its
+/// parent, so nothing can be linked until every row exists. What matters is
+/// that both passes are one transaction. Run as separate statements, a failure
+/// during the linking pass left the creations committed — and a retry then
+/// found every one of those rows already present, so none joined the
+/// "this run created it" set, and the branch that protects a locally-managed
+/// hierarchy from being restructured by an import skipped the unfinished links
+/// forever. The tree stayed flat while the retry reported success. All-or-
+/// nothing makes the retry start from the same place the first run did.
+///
+/// The rule the second pass enforces is unchanged: only rows *this restore
+/// created* are re-parented. A term the site already had is locally managed —
+/// the first pass deliberately leaves its name and description alone, and
+/// moving it under the file's parent would be the same contradiction.
+pub async fn import_terms(
+    conn: &mut AsyncPgConnection,
+    incoming: &[ImportedTerm],
+) -> AutumnResult<usize> {
+    use crate::models::NewTerm;
+
+    conn.transaction(async move |conn| {
+        // Normalized once, up front, so the slug a row is stored under and the
+        // slug a parent reference is resolved against come from the same
+        // function. Resolving the raw file slug instead would miss any parent
+        // whose slug `slugify` changed.
+        let mut drafts: Vec<NewTerm> = Vec::with_capacity(incoming.len());
+        for term in incoming {
+            let mut draft = NewTerm {
+                taxonomy: term.taxonomy.clone(),
+                name: term.name.clone(),
+                slug: term.slug.clone(),
+                description: term.description.clone(),
+                parent_id: None,
+            };
+            crate::hooks::normalize_new_term(&mut draft)?;
+            drafts.push(draft);
+        }
+
+        let mut created: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for draft in &drafts {
+            let existing: Option<Term> = terms::table
+                .filter(terms::taxonomy.eq(&draft.taxonomy))
+                .filter(terms::slug.eq(&draft.slug))
+                .select(Term::as_select())
+                .first(conn)
+                .await
+                .optional()?;
+            if existing.is_none() {
+                let row: Term = diesel::insert_into(terms::table)
+                    .values(draft)
+                    .returning(Term::as_returning())
+                    .get_result(conn)
+                    .await?;
+                created.insert(row.id);
+            }
+        }
+
+        for (term, draft) in incoming.iter().zip(&drafts) {
+            let Some(parent_slug) = &term.parent else {
+                continue;
+            };
+            // A flat taxonomy has no hierarchy to put a term in. The hook says
+            // so on the create path; the direct `UPDATE` below has to say it
+            // too, or the importer becomes the one way to give a tag a parent.
+            if !crate::content_types::find_taxonomy(&draft.taxonomy)
+                .is_some_and(|registered| registered.hierarchical)
+            {
+                continue;
+            }
+            let parent_slug = autumn_web::slugify(parent_slug);
+            let child: Option<Term> = terms::table
+                .filter(terms::taxonomy.eq(&draft.taxonomy))
+                .filter(terms::slug.eq(&draft.slug))
+                .select(Term::as_select())
+                .first(conn)
+                .await
+                .optional()?;
+            let parent: Option<Term> = terms::table
+                .filter(terms::taxonomy.eq(&draft.taxonomy))
+                .filter(terms::slug.eq(&parent_slug))
+                .select(Term::as_select())
+                .first(conn)
+                .await
+                .optional()?;
+            let (Some(child), Some(parent)) = (child, parent) else {
+                continue;
+            };
+            if !created.contains(&child.id) {
+                continue;
+            }
+            if child.id != parent.id && child.parent_id != Some(parent.id) {
+                diesel::update(terms::table.find(child.id))
+                    .set(terms::parent_id.eq(parent.id))
+                    .execute(conn)
+                    .await?;
+            }
+        }
+
+        Ok::<_, AutumnError>(created.len())
+    })
+    .await
 }
 
 /// One page of a taxonomy's terms, ordered by name, bounded in SQL.

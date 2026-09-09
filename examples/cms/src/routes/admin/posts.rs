@@ -91,6 +91,30 @@ pub struct ListFilters {
     pub status: Option<String>,
     #[serde(default)]
     pub s: Option<String>,
+    #[serde(default)]
+    pub page: Option<usize>,
+}
+
+/// How many rows one page of the content list shows.
+const POSTS_PER_PAGE: i64 = 50;
+
+/// Percent-encode one query-string value.
+///
+/// The pager carries the reader's status and search on every link, and a search
+/// for `a&b` or `100%` would otherwise split the query string or decode as an
+/// escape. Written out rather than pulled in: the workspace has no
+/// URL-encoding dependency, and this is the only place the starter needs one.
+fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// What the editor submits.
@@ -222,52 +246,73 @@ pub async fn list(
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
     let registered = resolve_type(&post_type)?;
 
-    let mut posts: Vec<Post> = match (&filters.status, &filters.s) {
-        // The status filter applies to a search too. Matching the search arm
-        // first and dropping `status` showed published and trashed matches
-        // under a filter whose label says it contains only drafts — the screen
-        // contradicting its own control.
-        (_, Some(query)) if !query.trim().is_empty() => repos
-            .posts
-            .search(query.trim())
-            .await?
-            .into_iter()
-            .filter(|p| p.post_type == post_type)
-            .filter(|p| match filters.status.as_deref() {
-                Some(status) if !status.is_empty() => p.status == status,
-                // The unfiltered search still hides trash, like the plain list.
-                _ => p.status != "trash",
-            })
-            .collect(),
-        (Some(status), _) if !status.is_empty() => {
-            repos
-                .posts
-                .find_by_post_type_and_status(post_type.clone(), status.clone())
-                .await?
-        }
-        // The default list hides trash, exactly as WordPress's does — trashed
-        // content is reachable through the "Trash" filter.
-        _ => repos
-            .posts
-            .find_by_post_type(post_type.clone())
-            .await?
-            .into_iter()
-            .filter(|p| p.status != "trash")
-            .collect(),
-    };
-    posts.sort_by_key(|post| std::cmp::Reverse(post.updated_at));
-
+    // Type, status, search, the Contributor restriction, the order and the
+    // bound are all asked of Postgres. Every branch here used to load the
+    // complete matching rows — bodies included — sort them in Rust, render all
+    // of them, and look the author up once per row; Authors and Contributors
+    // grow this table continuously, so the screen used to manage content was
+    // the one that stopped working first.
+    let status = filters
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let search = filters
+        .s
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     // A Contributor sees only their own content — the list must not advertise
     // what they cannot open.
-    if !user.role().can(Capability::EditOthersPosts) {
-        posts.retain(|p| p.author_id == user.id);
-    }
+    let author_id = (!user.role().can(Capability::EditOthersPosts)).then_some(user.id);
+    let page = i64::try_from(filters.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
 
-    let mut rows = Vec::with_capacity(posts.len());
-    for post in &posts {
-        let author = repos.users.find_by_id(post.author_id).await.ok().flatten();
-        rows.push((post.clone(), author));
-    }
+    let (rows, total) = {
+        let mut conn = repos.conn().await?;
+        let query = content::AdminPostQuery {
+            post_type: &post_type,
+            status,
+            search,
+            author_id,
+        };
+        let (posts, total) = content::admin_posts_page(
+            &mut conn,
+            &query,
+            (page - 1) * POSTS_PER_PAGE,
+            POSTS_PER_PAGE,
+        )
+        .await?;
+        let authors = content::authors_for_posts(&mut conn, &posts).await?;
+        let rows: Vec<(Post, Option<User>)> = posts
+            .into_iter()
+            .map(|post| {
+                let author = authors.get(&post.author_id).cloned();
+                (post, author)
+            })
+            .collect();
+        (rows, total)
+    };
+    let last_page = ((total + POSTS_PER_PAGE - 1) / POSTS_PER_PAGE).max(1);
+
+    // Carried on every pager link so paging does not silently drop the filter
+    // the reader is looking at.
+    let carried = {
+        let mut parts = Vec::new();
+        if let Some(status) = status {
+            parts.push(format!("status={}", query_escape(status)));
+        }
+        if let Some(search) = search {
+            parts.push(format!("s={}", query_escape(search)));
+        }
+        parts.join("&")
+    };
+    let page_href = |target: i64| {
+        if carried.is_empty() {
+            format!("/admin/content/{post_type}?page={target}")
+        } else {
+            format!("/admin/content/{post_type}?{carried}&page={target}")
+        }
+    };
 
     let body = html! {
         div class="flex items-center justify-between mb-4 gap-4 flex-wrap" {
@@ -339,9 +384,30 @@ pub async fn list(
                     }
                     @if rows.is_empty() {
                         tr { td colspan="4" class="px-4 py-10 text-center text-gray-400" {
-                            "Nothing here yet."
+                            @if page > 1 { "Nothing on this page." } @else { "Nothing here yet." }
                         } }
                     }
+                }
+            }
+        }
+
+        @if last_page > 1 {
+            nav aria-label="Content pages"
+                class="flex items-center justify-between mt-6 text-sm" {
+                @if page > 1 {
+                    a href=(page_href(page - 1)) class="text-indigo-700 hover:underline" {
+                        "← Newer"
+                    }
+                } @else {
+                    span {}
+                }
+                span class="text-gray-500" { "Page " (page) " of " (last_page) }
+                @if page < last_page {
+                    a href=(page_href(page + 1)) class="text-indigo-700 hover:underline" {
+                        "Older →"
+                    }
+                } @else {
+                    span {}
                 }
             }
         }
@@ -452,7 +518,19 @@ struct EditorContext {
     taxonomies: Vec<TaxonomyField>,
     parents: Vec<Post>,
     media: Vec<Attachment>,
+    /// Whether the library holds more than the picker is showing, so the
+    /// editor can say so rather than appear to be the whole library.
+    media_truncated: bool,
 }
+
+/// How many attachments the featured-image picker offers.
+///
+/// Paginating `/admin/media` did nothing for this control: opening any
+/// thumbnail-capable editor still materialized the entire library and rendered
+/// every row as an `<option>`, so the core authoring workflow was the one left
+/// unprotected. The most recent uploads are what an author is choosing between;
+/// the current selection is added to them explicitly below, whatever its age.
+const MEDIA_PICKER_LIMIT: i64 = 100;
 
 impl EditorContext {
     async fn load(repos: &Repos, registered: &PostType, post: Option<&Post>) -> AutumnResult<Self> {
@@ -523,16 +601,38 @@ impl EditorContext {
         // the error that caused it never surfaces. Failing the page is the
         // honest outcome: the editor cannot be saved from a state it was not
         // shown correctly.
-        let media = if registered.supports_thumbnail {
-            repos.attachments.find_all().await?
+        //
+        // Bounded for the same reason, and the bound is what makes the
+        // re-adding below necessary: a post whose featured image has since
+        // scrolled past `MEDIA_PICKER_LIMIT` would otherwise be shown a select
+        // that does not contain its own current value, and saving the form
+        // unchanged would clear it — the exact failure the paragraph above is
+        // about, reintroduced by the fix for the size.
+        let (media, media_truncated) = if registered.supports_thumbnail {
+            let (rows, total) = repos
+                .with_conn(async |conn| {
+                    let rows = content::attachments_page(conn, 0, MEDIA_PICKER_LIMIT).await?;
+                    let total = content::attachment_count(conn).await?;
+                    Ok((rows, total))
+                })
+                .await?;
+            let mut rows = rows;
+            if let Some(selected) = post.and_then(|p| p.featured_media_id)
+                && !rows.iter().any(|item| item.id == selected)
+                && let Some(current) = repos.attachments.find_by_id(selected).await?
+            {
+                rows.insert(0, current);
+            }
+            (rows, total > MEDIA_PICKER_LIMIT)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
         Ok(Self {
             taxonomies,
             parents,
             media,
+            media_truncated,
         })
     }
 }
@@ -731,6 +831,15 @@ fn editor(
                                            == Some(media.id)] {
                                     (media.title)
                                 }
+                            }
+                        }
+                        @if context.media_truncated {
+                            p class="text-xs text-gray-400 mt-2" {
+                                "Showing the " (MEDIA_PICKER_LIMIT) " most recent uploads. "
+                                a href="/admin/media" class="text-indigo-700 hover:underline" {
+                                    "Browse the library"
+                                }
+                                " to find an older one."
                             }
                         }
                     }
