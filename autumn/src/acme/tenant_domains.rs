@@ -275,15 +275,22 @@ impl CustomDomainTask {
     /// Only for a store this task can enumerate; a store it cannot answers
     /// `true`, so a non-filesystem store is never wrongly re-ordered.
     fn certificate_present(&self, hostname: &str) -> bool {
-        if self.cache.get(hostname).is_some() {
-            return true;
-        }
         let Some(fs) = self.cert_store_paths.as_ref() else {
             return true;
         };
         let Some((chain_path, key_path)) = fs.find_cert_for_domains(&[hostname.to_owned()]) else {
             return false;
         };
+        // A cache hit is not evidence the DURABLE pair is still there: a
+        // certificate deleted or corrupted after it was cached keeps serving
+        // from memory, and the repair pass — the only thing that would re-order
+        // it — used to skip it for exactly as long as it stayed resident. The
+        // first eviction or restart then failed every handshake for that
+        // domain. Enumerating the pair is a `stat`; the parse below is the part
+        // worth skipping while the cache holds a usable copy of it.
+        if self.cache.get(hostname).is_some() {
+            return true;
+        }
         let (Ok(chain), Ok(key)) = (std::fs::read(&chain_path), std::fs::read(&key_path)) else {
             return false;
         };
@@ -733,10 +740,16 @@ impl CustomDomainTask {
         // registered in the gap owns whatever sits at this hostname's cache
         // slot and certificate id now, and deleting those would leave THEIR
         // domain recorded as active with nothing to serve.
-        if self.registry.get(host).is_none() {
-            self.purge_local(host).await;
-        }
-        if removed {
+        let purged = if self.registry.get(host).is_none() {
+            self.purge_local(host).await
+        } else {
+            true
+        };
+        // A cleanup that failed has just raised its own alert, naming a private
+        // key still on disk. Retracting it here — because the registry is
+        // empty and therefore "healthy" — would leave that key with nothing
+        // pointing at it, and no retention sweep runs by default.
+        if removed && purged {
             self.clear_alert_if_healthy(crate::custom_domain::now_unix());
         }
         Ok(removed)
@@ -781,7 +794,8 @@ impl CustomDomainTask {
     /// tenant's private key left on disk is an operator's problem, and nothing
     /// else retries it: the orphan prune only runs when a `[retention]
     /// custom_domains` window is configured, and it is unset by default.
-    async fn purge_local(&self, host: &str) {
+    /// Returns whether everything local actually went.
+    async fn purge_local(&self, host: &str) -> bool {
         self.cache.remove(host);
         self.limiter.forget(host);
         if let Err(e) = self.certs.delete_cert(&cert_id_for(host)).await {
@@ -791,7 +805,9 @@ impl CustomDomainTask {
             );
             tracing::warn!("{message}");
             (self.reporter)(message);
+            return false;
         }
+        true
     }
 
     /// Retract the operator alert once NOTHING is failing any more.

@@ -1224,6 +1224,89 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
     assert_eq!(record.status, DomainStatus::Active);
 }
 
+#[tokio::test]
+async fn an_offboard_whose_cleanup_failed_keeps_its_alert() {
+    // Two fixes met and cancelled each other: offboarding raises an alert when
+    // the certificate cannot be deleted, and offboarding clears the alert once
+    // nothing is failing. Removing the last unhealthy domain did both — so the
+    // alert naming a private key still on disk was retracted a moment after it
+    // was raised, and nothing else retries the deletion by default.
+    let issuer = ScriptedIssuer::new(&["doomed.clientco.com"]);
+    let mut h = harness(
+        TableVerifier::new(&[("doomed.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.certs = Arc::new(UndeletableCertStore(Arc::clone(&h.store)))
+        as Arc<dyn autumn_web::acme::store::AcmeStore>;
+    h.registry
+        .register("doomed.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    assert_eq!(
+        h.alerts.lock().unwrap().len(),
+        1,
+        "the failing order alerts first"
+    );
+
+    assert!(h.task.offboard("doomed.clientco.com").await.unwrap());
+
+    let alerts = h.alerts.lock().unwrap().clone();
+    assert_eq!(alerts.len(), 2, "the failed cleanup alerts too: {alerts:?}");
+    assert!(alerts[1].contains("private key"), "{alerts:?}");
+    assert!(
+        h.recovered.lock().unwrap().is_empty(),
+        "and that alert must NOT be retracted while the key is still on disk"
+    );
+}
+
+#[tokio::test]
+async fn a_cached_certificate_does_not_hide_a_missing_one() {
+    // The cache keeps serving a certificate whose files have gone, so the
+    // repair pass — the only thing that re-orders it — must not take cache
+    // residency as evidence that the durable pair is still there. Otherwise
+    // the domain looks healthy until the first eviction or restart, and then
+    // fails every handshake.
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.task.tick(NOW).await;
+    assert_eq!(issuer.count(), 1);
+    assert!(h.cache.get("app.clientco.com").is_some());
+
+    // The stored pair goes, the cache does not.
+    h.store
+        .delete_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+        .await
+        .unwrap();
+    assert!(
+        h.cache.get("app.clientco.com").is_some(),
+        "the cached copy is still resident"
+    );
+
+    h.task.tick(NOW + 1).await;
+    assert_eq!(
+        issuer.count(),
+        2,
+        "the repair pass must re-order a domain whose durable certificate is gone"
+    );
+    assert!(
+        h.task
+            .certs
+            .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "and the certificate is back on disk"
+    );
+}
+
 /// A registry store whose saves fail once armed, leaving reads intact.
 #[derive(Debug, Default)]
 struct FailingSaveStore {
