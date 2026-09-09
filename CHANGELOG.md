@@ -392,7 +392,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `autumn migrate` creates it on the control database, and on a `sqlite://`
   target applies the SQLite variants of the shard-required sets, which it had
   skipped, version-disambiguated together with the app's own set so a shared
-  version masks nothing) and as a standalone set the runtime applies when a
+  version masks nothing, and an app migration a database already ran under
+  such a version keeps its record under its new tracked version instead of
+  running twice) and as a standalone set the runtime applies when a
   derivation is
   registered (on every shard primary too).
   Each batch locks its state row, so replicas take turns on one sweep.
@@ -409,8 +411,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derivation onto its own table sweeps one parent per batch, a batch the
   database aborts to break a deadlock is retried from its checkpoint, every
   mutation on such a table takes a per-table advisory lock before its first
-  row lock (`upsert_many` before the `FOR UPDATE` load it diffs against) so
-  crossing re-parents and upserts wait rather than deadlock, and
+  row lock (`upsert_many` before the `FOR UPDATE` load it diffs against, the
+  delete family and retention before theirs) so crossing mutations wait
+  rather than deadlock, and
   `derivation::resweep` re-enqueues one derivation for the settling pass a
   rolling deployment that changed a definition needs (see the guide). The
   collision check also covers the column a `#[commentable(counter_cache)]`

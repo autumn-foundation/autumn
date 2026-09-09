@@ -580,12 +580,15 @@ fn live_predicate(view: &SqlView, want_live: bool) -> String {
 /// deltas cannot help, since each child lock is already held. So every such
 /// mutation first takes one transaction-scoped advisory lock keyed by the
 /// table, before any row lock, and two of them take turns instead of crossing.
-/// Every hook here takes it on entry; the generated `upsert_many` also calls
-/// this before the `FOR UPDATE` load it diffs against, since that load locks
-/// the existing child rows before any hook runs (the hook's own take is then
-/// a re-entrant no-op). A table without a self-referential leg costs nothing
-/// here. `SQLite` serializes writers with `BEGIN IMMEDIATE` already, so it has
-/// nothing to take.
+/// Every hook here takes it on entry, and every generated mutation that
+/// row-locks before its hook runs (`upsert_many`'s `FOR UPDATE` load, the
+/// hooked delete's load for `before_delete`, `delete_many`'s preload, the
+/// dependent cascade's child lock, a retention sweep's batch lock) calls this
+/// at the top of its transaction too, so the advisory lock always comes before
+/// the first row lock; the hook's later take is then a re-entrant no-op. A
+/// table without a self-referential leg costs nothing here. `SQLite`
+/// serializes writers with `BEGIN IMMEDIATE` already, so it has nothing to
+/// take.
 ///
 /// # Errors
 ///

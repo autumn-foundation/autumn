@@ -125,7 +125,10 @@ The state table is the framework's. `_autumn_derivations` ships in the
 framework migration set, so `autumn migrate` creates it on the control database
 like every other framework table (on a `sqlite://` target it applies the SQLite
 variant with the other shard-required tables, version-disambiguated against the
-app's own set as at boot), and the runtime folds the same
+app's own set as at boot; a database that already ran an app migration under a
+version the framework one now claims keeps that record, moved to the app
+migration's new tracked version, rather than running it twice), and the
+runtime folds the same
 migration in as a standalone set (on every shard target too) whenever the
 binary registers at least one `#[derivation]`. An application with no
 derivation gets no boot work: the table sits empty.
@@ -390,9 +393,10 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   table, and two re-parents can want each other's rows), so on Postgres every
   counter-cached mutation on such a table takes a transaction-scoped advisory
   lock keyed by the table before its first row lock (`upsert_many` before the
-  `FOR UPDATE` load of the rows it is about to diff) and they take turns; the
-  price is that writes to that table serialize. SQLite serializes writers
-  already.
+  `FOR UPDATE` load of the rows it is about to diff, a delete before the load
+  for its hook, `delete_many` before its preload, a retention sweep before
+  its batch lock) and they take turns; the price is that writes to that
+  table serialize. SQLite serializes writers already.
 - **Weights are ordinary numbers, not the edges of `i64`.** The delta paths
   never overflow on their own (a difference that does not fit goes out as two
   deltas, a bulk mutation's total is netted in `i128`, and a tenant-scoped

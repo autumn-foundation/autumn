@@ -2664,12 +2664,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let __autumn_cc_before_many =
             ::autumn_web::repository::counter_cache_capture_fks_many(conn, #cc_specs, ids).await?;
     };
-    // `upsert_many` row-locks the existing rows of each chunk (`FOR UPDATE`)
-    // before it can diff them, so on a table with a leg onto itself the lock
-    // that serializes such mutations has to be taken before that load, not by
-    // the post-upsert hook: two upserts that each hold the other's parent row
-    // would otherwise deadlock on the way to it.
-    let cc_before_upsert = quote! {
+    // Every counter-cache hook takes the per-table advisory lock that
+    // serializes mutations on a table with a leg onto itself, but a hook runs
+    // where the mutation needs it, and several mutations row-lock before that
+    // point: `upsert_many` loads each chunk `FOR UPDATE` before it can diff it,
+    // the hooked delete loads the row `FOR UPDATE` for `before_delete`,
+    // `delete_many` preloads its rows, the dependent cascade locks the child
+    // ids, and a retention sweep locks its batch. Two such transactions that
+    // each hold the other's parent row would deadlock on the way to the
+    // advisory lock, so each of those paths takes it first, at the top of its
+    // transaction; the hook's later take is then a re-entrant no-op. A model
+    // without a self-referential leg issues nothing here.
+    let cc_serialize = quote! {
         ::autumn_web::repository::counter_cache_serialize_self_referential(
             conn, #cc_specs,
         ).await?;
@@ -3448,6 +3454,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // `backend_select!` picks the suffix in autumn-web's own
                         // compilation, so the Postgres SQL is byte-identical to
                         // before and the SQLite form drops the clause.
+                        #cc_serialize
                         let __for_update: &str = ::autumn_web::backend_select! {
                             pg => { " FOR UPDATE" },
                             sqlite => { "" },
@@ -6596,6 +6603,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
                                     ::core::option::Option::None;
@@ -6661,6 +6669,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
 
                                 let load_query = #table_ident::table.find(id);
@@ -6704,6 +6713,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut ctx = MutationContext::new(MutationOp::Delete);
                             let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
                                 ::core::option::Option::None;
@@ -6772,6 +6782,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
@@ -6809,6 +6820,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<(), ::autumn_web::AutumnError, _>(&mut *conn, |conn| {
                         async move {
+                            #cc_serialize
                             let mut ctx = MutationContext::new(MutationOp::Delete);
 
                             let load_query = #table_ident::table.find(id);
@@ -8566,6 +8578,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 let mut current_rows = Vec::new();
                                 for chunk in ids.chunks(1000) {
                                     let load_query = #table_ident::table.filter(#table_ident::id.eq_any(chunk))
@@ -10672,6 +10685,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                             async move {
+                                #cc_serialize
                                 // #1740: cascade dependent actions for every parent BEFORE
                                 // the bulk parent delete (empty for repos with no
                                 // dependents, preserving the prior bulk codegen).
@@ -11003,7 +11017,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let mut upserted = Vec::new();
                         let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
                         let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
-                        #cc_before_upsert
+                        #cc_serialize
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
                             let chunk_ids: Vec<_> = chunk.iter().map(|r| r.id).collect();
@@ -11413,6 +11427,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 async move {
                                     let mut __autumn_dep_broadcasts: ::std::vec::Vec<(::std::string::String, ::std::string::String)> =
                                         ::std::vec::Vec::new();
+                                    #cc_serialize
                                     #parent_ctx_decl
                                     #parent_idempotency_setup
 
@@ -12471,6 +12486,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // Without it here, the two transactions could
                                 // take the same rows in opposite orders and one
                                 // would be aborted.
+                                #cc_serialize
                                 let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
@@ -12526,6 +12542,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // Locked ascending by id, matching the
                                 // soft-delete branch's identical fix above
                                 // (#1342 review round 22).
+                                #cc_serialize
                                 let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                     #table_ident::table
                                         .filter(#table_ident::id.eq_any(ids))
@@ -12809,6 +12826,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                             // Locked ascending by id, matching
                                             // the age branches' identical fix
                                             // above (#1342 review round 22).
+                                            #cc_serialize
                                             let __locked_ids: ::std::vec::Vec<i64> = ::autumn_web::maybe_for_update!(
                                                 #table_ident::table
                                                     .filter(#table_ident::id.eq_any(ids))
@@ -26085,6 +26103,60 @@ mod tests {
             "each of the three FOR UPDATE lock queries (age primary pass, age reclaim pass, \
              purge) must order by id ascending before locking: {retention_run}"
         );
+    }
+
+    #[test]
+    fn repository_macro_delete_family_serializes_self_reference_before_any_row_lock() {
+        // A counter-cache hook takes the per-table advisory lock that serializes
+        // mutations on a self-referential table, but the delete family row-locks
+        // before its hook runs: the hooked delete loads the row `FOR UPDATE` for
+        // `before_delete`, `delete_many` preloads its rows, and a retention sweep
+        // locks its batch. Each of those transactions therefore takes the lock
+        // first, or two of them holding each other's parent row deadlock on the
+        // way to it (Codex review, PR #2632).
+        let serialize = "counter_cache_serialize_self_referential";
+
+        let generated = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
+        let mut rest = retention_run;
+        let mut locks = 0;
+        while let Some(lock) = rest.find("let __locked_ids") {
+            let taken = rest[..lock]
+                .rfind(serialize)
+                .expect("every retention lock query is preceded by the serialization lock");
+            assert!(
+                !rest[taken..lock].contains("maybe_for_update !"),
+                "the serialization lock must come before the batch lock, not after: {retention_run}"
+            );
+            rest = &rest[lock + "let __locked_ids".len()..];
+            locks += 1;
+        }
+        assert_eq!(locks, 3, "three retention lock sites: {retention_run}");
+
+        // The hooked delete loads the row `FOR UPDATE` for `before_delete`, and
+        // the hooked `delete_many` preloads its rows the same way.
+        let generated = durable_hook_repository_tokens();
+        for signature in ["async fn delete_by_id", "async fn delete_many"] {
+            let body = generated_fn(&generated, signature);
+            let taken = body
+                .find(serialize)
+                .unwrap_or_else(|| panic!("{signature} takes the serialization lock: {body}"));
+            let lock = body
+                .find("maybe_for_update !")
+                .unwrap_or_else(|| panic!("{signature} row-locks: {body}"));
+            assert!(
+                taken < lock,
+                "{signature} must take the serialization lock before its first row lock: {body}"
+            );
+        }
     }
 
     #[test]

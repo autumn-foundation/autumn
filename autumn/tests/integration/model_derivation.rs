@@ -226,6 +226,31 @@ pub struct DvNode {
 #[autumn_web::repository(DvNode, table = "dv_nodes")]
 pub trait DvNodeRepository {}
 
+/// Hooks whose `before_delete` pauses: a hooked repository loads the row
+/// `FOR UPDATE` for `before_delete` before its counter-cache hook runs, and
+/// the pause widens that window from microseconds to something a concurrent
+/// re-parent reliably lands in, which is what the crossing-delete test needs.
+#[derive(Clone, Default)]
+pub struct DvNodeHooks;
+
+impl autumn_web::hooks::MutationHooks for DvNodeHooks {
+    type Model = DvNode;
+    type NewModel = NewDvNode;
+    type UpdateModel = UpdateDvNode;
+
+    async fn before_delete(
+        &self,
+        _ctx: &mut autumn_web::hooks::MutationContext,
+        _record: &DvNode,
+    ) -> autumn_web::AutumnResult<()> {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        Ok(())
+    }
+}
+
+#[autumn_web::repository(DvNode, table = "dv_nodes", hooks = DvNodeHooks)]
+pub trait HookedDvNodeRepository {}
+
 // ── Setup & helpers ─────────────────────────────────────────────────────────
 
 const COUNT_DERIVATION: &str = "dv_posts.published_comment_count";
@@ -261,7 +286,8 @@ const DDL: &[&str] = &[
      (id BIGSERIAL PRIMARY KEY, page_id BIGINT NOT NULL REFERENCES dv_pages(id), \
       published BOOLEAN NOT NULL DEFAULT FALSE, deleted_at TIMESTAMP NULL)",
     "CREATE TABLE IF NOT EXISTS dv_nodes \
-     (id BIGSERIAL PRIMARY KEY, parent_id BIGINT NULL REFERENCES dv_nodes(id), \
+     (id BIGSERIAL PRIMARY KEY, \
+      parent_id BIGINT NULL REFERENCES dv_nodes(id) ON DELETE SET NULL, \
       child_count BIGINT NOT NULL DEFAULT 0)",
 ];
 
@@ -1576,6 +1602,96 @@ async fn a_self_referential_derivation_survives_crossing_upserts() {
                 .count;
         assert_eq!(count, 0, "node {node} counts no children");
     }
+}
+
+/// A delete crossing a re-parent. A hooked repository's delete loads the row
+/// `FOR UPDATE` for `before_delete` before the counter-cache hook runs; a
+/// re-parent under that node takes the advisory lock first and then needs the
+/// node's row, for the foreign key and for its `+1`. Unless the delete takes
+/// the advisory lock at the top of its transaction, each holds what the other
+/// wants and Postgres aborts one.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_self_referential_derivation_survives_a_delete_crossing_a_reparent() {
+    #[derive(diesel::QueryableByName)]
+    struct Pair {
+        #[diesel(sql_type = BigInt)]
+        stored: i64,
+        #[diesel(sql_type = BigInt)]
+        actual: i64,
+    }
+    let (_guard, _pg, pool) = setup().await;
+    let repo = PgDvNodeRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    mark_all_complete(&mut conn).await;
+
+    let c = seed_node(&repo, None).await;
+    let d = seed_node(&repo, None).await;
+    // One worker deletes C and recreates it under the same id; the foreign
+    // key's `ON DELETE SET NULL` detaches D whenever it is under C at the time.
+    let deleter = {
+        let hooked = PgHookedDvNodeRepository::with_pool_untracked(pool.clone());
+        let plain = PgDvNodeRepository::with_pool_untracked(pool.clone());
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                hooked.delete_by_id(c).await?;
+                plain
+                    .upsert_many(&[DvNode {
+                        id: c,
+                        parent_id: None,
+                        child_count: 0,
+                    }])
+                    .await?;
+            }
+            Ok::<(), autumn_web::AutumnError>(())
+        })
+    };
+    // The other moves D under C and back. Between C's delete and its
+    // recreation the move fails its foreign key; that is the race the test
+    // sets up, not a deadlock, so it is skipped rather than counted.
+    let mover = {
+        let repo = PgDvNodeRepository::with_pool_untracked(pool.clone());
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                for parent in [Some(c), None] {
+                    match repo
+                        .update(
+                            d,
+                            &UpdateDvNode {
+                                parent_id: Patch::Set(parent),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) if format!("{e:?}").contains("ForeignKeyViolation") => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Ok::<(), autumn_web::AutumnError>(())
+        })
+    };
+    for worker in [deleter, mover] {
+        worker
+            .await
+            .expect("join")
+            .expect("a delete crossing a re-parent must wait, not deadlock");
+    }
+    // C counts exactly the rows under it.
+    let pair = diesel::sql_query(
+        "SELECT child_count AS stored, \
+         (SELECT COUNT(*) FROM dv_nodes WHERE parent_id = $1) AS actual \
+         FROM dv_nodes WHERE id = $1",
+    )
+    .bind::<BigInt, _>(c)
+    .get_result::<Pair>(&mut conn)
+    .await
+    .expect("read the count");
+    assert_eq!(
+        pair.stored, pair.actual,
+        "C's count matches the rows under it"
+    );
 }
 
 // ── AC6: resumable backfill ────────────────────────────────────────────────
