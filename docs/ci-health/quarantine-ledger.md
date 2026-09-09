@@ -87,9 +87,40 @@ without also filling in the intake form above.
 - **Observed**: 3/17 eligible `macos-latest` CI executions (14 confirmed, 3
   unresolved — see the 2026-09-04 census for the derivation), 0/16-17 on
   `ubuntu-latest`, organic PR-traffic sample, 2026-09-03/04.
-- **Verdict not yet rendered**: whether this is macOS runner contention or a
-  genuine narrow race in the hot-upgrade handoff (`autumn/src/upgrade.rs`)
-  that macOS's scheduling merely exposes more reliably.
+- **New organic hit, 2026-09-09, breaks the macOS-only working hypothesis**:
+  a 4th hit, but for the first time on a **Linux** runner and at a
+  **different assertion**. Run 34317587464 (PR #2645, branch
+  `claude/wizardly-wright-i1jsql`), job `Coverage (workspace)` (a plain
+  hosted `ubuntu-latest` runner, confirmed via the job's own `labels` —
+  `heavy_runs_on` only overrides the `test` job's `ubuntu-latest` matrix
+  leg, and this run drew a standard hosted runner, not a contended
+  self-hosted one), step "Generate coverage (workspace catch-all)" — this
+  is `cargo llvm-cov`, which instruments and roughly doubles the cost of
+  every test binary it wraps (per this job's own inline comment). Failure
+  is at `tests/live_upgrade.rs:567`: `"the new build should have served
+  part of the load"` — the v2 binary never appeared in the observed read
+  set — not the connection-error assertion (line ~551) the 3 macOS hits
+  above were classified against. Full run: 5 passed, 1 failed in the
+  `hot-upgrade` package.
+  - **Why this matters**: the working hypothesis driving the (still
+    undispatched, see below) macOS-only rerun campaign was "macOS runner
+    contention" specifically. A hit on a plain Linux hosted runner, on a
+    different assertion, under a job that is inherently 2x+ slower than a
+    normal test run, points instead at a more general mechanism: *any*
+    sufficiently slow/contended execution can shrink the effective window
+    the test's fixed-duration load generator has to observe the new build
+    actually taking over traffic, before the test's own timeout fires and
+    it asserts on what it saw. That is a hypothesis about the *test's*
+    design (a wall-clock load window racing a real cutover, at the mercy of
+    whatever the host's actual perf happens to be for that run), not
+    proof either way — still not confirmed, but the "macOS-specific"
+    framing this entry has carried since 2026-09-04 no longer fits the
+    evidence.
+- **Verdict not yet rendered**: whether this is runner-class/contention
+  timing dependence in the test's load-window design (now: on *any* slow or
+  loaded runner, not only macOS) or a genuine narrow race in the hot-upgrade
+  handoff (`autumn/src/upgrade.rs`) that slow execution merely exposes more
+  reliably.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -97,18 +128,26 @@ without also filling in the intake form above.
   in #2527 the workflow failed to parse (`jobs.test.if` referenced the
   `matrix` context, which isn't available there — GitHub rejected every
   dispatch attempt with zero jobs run, caught by #2548 but not fixed before
-  #2527 merged); fixed in `docs/reports/2026-09-08-semaphore-macos-contention-harness-fix.md`
-  and verified `actionlint`-clean. Still needs a human to actually dispatch
-  it — that gap is unchanged by the fix. #2548 separately banked 13/13 clean
-  organic macOS samples on the tracked corpus since #2510 merged —
-  reassuring, still short of the ≥20 (≥50 for the sub-10% end) this ledger's
-  intake form requires to close an entry.
+  #2527 merged); fixed in
+  `docs/reports/2026-09-08-semaphore-macos-contention-harness-fix.md` (#2627)
+  and verified `actionlint`-clean. **Four days later, it still has zero
+  `workflow_dispatch` runs** (`total_count: 0` against the workflow's own
+  run history, checked 2026-09-09) — nobody has dispatched it yet, and that
+  gap is now more urgent given the new Linux hit above widens what the
+  campaign needs to test (not macOS-only; ideally a Linux `Coverage
+  (workspace)`-shaped rerun too, not just `cargo test --workspace` on a
+  plain runner). #2548 separately banked 13/13 clean organic macOS samples
+  on the tracked corpus since #2510 merged — reassuring, still short of the
+  ≥20 (≥50 for the sub-10% end) this ledger's intake form requires to close
+  an entry.
 - **A fix is already in flight** (PR #2510) that reclassifies
   `ECONNRESET`/`ECONNABORTED` (retryable) separately from `ECONNREFUSED`
   (hard zero-tolerance failure) — but per its own description it could not
   be verified against a real macOS run, so it does not yet carry the
-  before/after rerun evidence this ledger's intake form requires. Track it
-  against the rerun campaign above before treating this entry as resolved.
+  before/after rerun evidence this ledger's intake form requires, and it
+  would not address the new line-567 signature above regardless (different
+  assertion entirely). Track it against the rerun campaign above before
+  treating this entry as resolved.
 
 ### `cache_stampede::swr_serves_stale_and_refreshes_in_background`
 
@@ -117,8 +156,20 @@ without also filling in the intake form above.
   already hardened for a documented `windows-latest` flake in #1809 — same
   test, two different timing-sensitive assertions on two different
   non-Linux platforms.
-- **Status**: one occurrence — suggestive, not yet a repeat signature.
-  Covered by the same rerun campaign as `live_upgrade` above.
+- **Second organic hit, 2026-09-09 — now a repeat signature, not a
+  one-off**: run 34297324354 (branch `dependabot/cargo/validator-0.21.0`),
+  job `Test (macos-latest)`, same test, same assertion, same line:
+  `autumn/tests/integration/cache_stampede.rs:501:6`, `"background refresh
+  must publish the new value after it finishes computing"`. Six days apart,
+  same exact panic site, both on `macos-latest` — this is no longer
+  "suggestive," it is a confirmed-repeat failure signature. Still not a
+  formal rerun-rate (organic sample only, denominator not tracked as
+  tightly as the 2026-09-04 census's), so still below this ledger's ≥20/≥50
+  bar for a fix PR, but it should be weighted at least as high as
+  `live_upgrade` for the next rerun campaign, not treated as the minor
+  entry it was when it had n=1.
+- **Status**: under active investigation, same rerun campaign as
+  `live_upgrade` above (still undispatched).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
