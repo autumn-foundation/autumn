@@ -318,9 +318,11 @@ pub struct ResolvedDeployConfig {
     /// real file in [`Self::shared_data_dir`] and links each release at this
     /// path (see [`crate::deploy::exec::sqlite_data_link_op`]).
     ///
-    /// `None` for a Postgres app, and for a `SQLite` app whose URL is already an
-    /// absolute path outside the releases dir — there is nothing to relocate.
-    /// Set by [`Self::with_sqlite_data_file`]; [`Self::resolve`] leaves it
+    /// [`SqliteDataPlacement::None`] for a Postgres app;
+    /// [`SqliteDataPlacement::Persistent`] for a `SQLite` app whose URL is
+    /// already an absolute path outside the releases dir, which is verified on
+    /// the host but never relocated. Set by
+    /// [`Self::with_sqlite_data_placement`]; [`Self::resolve`] leaves it
     /// `None`, since it grades `[deploy]` and never reads `[database]`.
     pub sqlite_data: SqliteDataPlacement,
     /// Basenames this deploy writes into the release dir (the app binary and the
@@ -2462,10 +2464,7 @@ fn collides_with_release_payload(text: &str, cfg: &ResolvedDeployConfig) -> Opti
     // replacing the database with the binary. Requiring the whole path to equal a
     // payload missed that entirely (a single component is just the one-segment
     // case of this rule).
-    let Some(first) = text.split('/').next().filter(|c| !c.is_empty()) else {
-        return None;
-    };
-    let text = first;
+    let text = text.split('/').next().filter(|c| !c.is_empty())?;
     if text == cfg.app_name {
         return Some(format!("the {} binary", cfg.app_name));
     }

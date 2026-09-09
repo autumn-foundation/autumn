@@ -288,7 +288,7 @@ fn stage(artifact: &Path, staged: &Path, db: &Path) -> Result<(), SnapshotError>
 /// `lstat` (`symlink_metadata`), so a symlink planted at the name is compared as
 /// the symlink it is and cannot match. Narrows, and does not eliminate, the race
 /// on the two steps that must use a name: an account able to write the database's
-/// own directory could still swap the entry between this check and SQLite's open
+/// own directory could still swap the entry between this check and `SQLite`'s open
 /// or the rename. Not granting write on that directory is the actual control;
 /// this makes the remaining window a tight race rather than an open door.
 #[cfg(unix)]
@@ -808,6 +808,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_staging_file_swapped_after_creation_is_never_published() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("source.db");
         drop(seeded(&source));
@@ -835,7 +837,6 @@ mod tests {
         same_file_as_handle(&handle, &staged).expect_err("a swapped staging name must be refused");
 
         // And the victim is untouched — mode, owner and bytes.
-        use std::os::unix::fs::PermissionsExt as _;
         let victim_after = std::fs::metadata(&victim).expect("victim metadata");
         assert_eq!(
             std::fs::read(&victim).expect("victim readable"),
