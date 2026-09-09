@@ -196,10 +196,120 @@ pub async fn dependent_nullify<M: 'static>(
     Ok(())
 }
 
+/// [`dependent_child_ids`], but takes `FOR UPDATE` on the selected rows, in
+/// ascending id order (Postgres only — a no-op clause on `SQLite`, whose
+/// single-writer lock already serializes this).
+///
+/// Codex review, PR #2647: the snapshot this feeds a subsequent bulk DELETE,
+/// so it must be safe to act on. Under READ COMMITTED, `SELECT ... FOR UPDATE`
+/// blocks on a row a concurrent transaction is mid-write to, and once that
+/// transaction commits, re-checks `fk_column = parent_id` against the *new*
+/// row version before including it — so a row reparented away in that window
+/// is correctly excluded, matching the locked `SELECT ... FOR UPDATE` the
+/// per-row Destroy loop has always taken over the same predicate. A plain
+/// unlocked read has no such re-check: it can return a row that is reparented
+/// and committed away before the caller's later DELETE/decrement run,
+/// decrementing the wrong parent's counter cache for a row that was never
+/// actually removed. Used only when a counter-cache decrement needs the ids
+/// back afterwards — see [`lock_dependent_children_for_update`] for the
+/// id-free variant, and [`dependent_delete_all`]'s doc comment for why the
+/// `ORDER BY id` acquisition order matters even with no counter caches.
+#[cfg(feature = "db")]
+async fn dependent_child_ids_for_update(
+    conn: &mut crate::db::RuntimeConnection,
+    table: &str,
+    fk_column: &str,
+    parent_id: i64,
+) -> crate::AutumnResult<Vec<i64>> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct ChildId {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        id: i64,
+    }
+
+    let for_update: &str = crate::backend_select! {
+        pg => { " FOR UPDATE" },
+        sqlite => { "" },
+    };
+
+    Ok(diesel::sql_query(format!(
+        "SELECT id FROM \"{table}\" WHERE \"{fk_column}\" = $1 ORDER BY id{for_update}"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(parent_id)
+    .load::<ChildId>(conn)
+    .await
+    .map_err(crate::AutumnError::from)?
+    .into_iter()
+    .map(|row| row.id)
+    .collect())
+}
+
+/// Take the same `FOR UPDATE`, ascending-id locks [`dependent_child_ids_for_update`]
+/// does, without transmitting the ids back to the client at all.
+///
+/// Codex review, PR #2647: [`dependent_delete_all`]'s deterministic pre-lock
+/// only needs ids at all when there are counter caches to decrement; a
+/// cache-free cascade needs the LOCKS (for deadlock-free ordering against a
+/// concurrent cascade through a different foreign key) but never reads an id
+/// back. An earlier revision selected `id` and called `execute()` instead of
+/// `load()`, which does stop the driver from materializing a `Vec` — but
+/// `execute()` still receives every row Postgres sends: the server has no
+/// notion of a client that discards results, so a naked `SELECT id ... FOR
+/// UPDATE` still puts one `DataRow` per matching child on the wire, an O(rows)
+/// *network* cost even with O(1) heap use. Wrapping the same locking `SELECT`
+/// in an outer `count(*)` keeps the fix: `FOR UPDATE` is legal on the
+/// unaggregated inner query (locking every row it touches, in the same
+/// `ORDER BY id` acquisition order as before), and only the outer query's
+/// single count row ever reaches the client — O(1) statements, O(1) memory,
+/// O(1) network, for a `delete_all`/leaf-`destroy` cascade of any fan-out.
+#[cfg(feature = "db")]
+async fn lock_dependent_children_for_update(
+    conn: &mut crate::db::RuntimeConnection,
+    table: &str,
+    fk_column: &str,
+    parent_id: i64,
+) -> crate::AutumnResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    let for_update: &str = crate::backend_select! {
+        pg => { " FOR UPDATE" },
+        sqlite => { "" },
+    };
+
+    diesel::sql_query(format!(
+        "SELECT count(*) FROM (SELECT id FROM \"{table}\" WHERE \"{fk_column}\" = $1 \
+         ORDER BY id{for_update}) AS __autumn_locked"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(parent_id)
+    .execute(conn)
+    .await
+    .map_err(crate::AutumnError::from)?;
+    Ok(())
+}
+
 /// Bulk-delete every child row pointing at `parent_id`.
 ///
 /// #1325: same shape as [`dependent_nullify`] — the rows are about to go, so
 /// their counter-cached parents are decremented first, across every spec.
+///
+/// Codex review, PR #2647: an ordered pre-lock now runs unconditionally, not
+/// only when `has_counter_caches` — without it, two concurrent cascades
+/// hitting an overlapping child set through *different* foreign keys (a
+/// diamond: the same child table `dependent(..., on_delete = destroy)` of two
+/// different parents) would each fall straight through to a plan-dependent-
+/// order bulk `DELETE`, and two deletes locking the same overlapping rows in
+/// opposite orders can deadlock, aborting one parent's cascade. The pre-lock,
+/// taken in the same `ORDER BY id` every concurrent caller uses, makes the
+/// acquisition order deterministic regardless of which foreign key drove the
+/// scan — matching the per-row Destroy loop's existing guarantee. Which
+/// pre-lock variant runs depends on whether the ids are needed afterwards:
+/// [`dependent_child_ids_for_update`] when a counter-cache decrement will read
+/// them back, [`lock_dependent_children_for_update`] otherwise, so a cache-free
+/// cascade over a huge fan-out never materializes a child id it doesn't need.
+/// Either way this stays O(1) statements: one extra locked `SELECT`, not one
+/// per row.
 ///
 /// This is a runtime support function for code generated by Autumn proc macros.
 /// It is semver-exempt; do not call it directly.
@@ -221,8 +331,15 @@ pub async fn dependent_delete_all<M: 'static>(
     use diesel_async::RunQueryDsl;
 
     if has_counter_caches {
-        let ids = dependent_child_ids(conn, table, fk_column, parent_id).await?;
+        // The id selection below row-locks the children before the
+        // counter-cache hook can take the lock that serializes mutations on
+        // a table with a leg onto itself, so take it here first (see
+        // `counter_cache_serialize_self_referential`).
+        counter_cache_serialize_self_referential(conn, specs).await?;
+        let ids = dependent_child_ids_for_update(conn, table, fk_column, parent_id).await?;
         counter_cache_before_delete_many(conn, specs, &ids).await?;
+    } else {
+        lock_dependent_children_for_update(conn, table, fk_column, parent_id).await?;
     }
 
     diesel::sql_query(format!(

@@ -3087,6 +3087,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // id) already on the destroy path, and an already-seen row is skipped (see
         // the per-row guard in the loop), so cyclic graphs terminate.
         let has_dependents = !config.dependents.is_empty();
+        // Ledger: when this child has none of the per-row machinery the Destroy
+        // cascade exists for — no repository-attribute grandchildren, no
+        // `before_delete`/etc. hooks, no version history/commit-hook/broadcast
+        // bookkeeping, and it is never soft-deleted — the per-row reload-then-
+        // delete loop below does no work a single batched statement couldn't:
+        // `#destroy_mutation`'s plain-hard-delete arm never reads `__record`, and
+        // nothing else in Phase 2 needs it either. Route that case through the
+        // same `dependent_delete_all` runtime helper already used for the
+        // `DeleteAll` action (which already batches its optional counter-cache
+        // decrement via `counter_cache_before_delete_many`), guarded by an
+        // additional RUNTIME check that this model has no *model-attribute*
+        // `#[has_many(dependent = ...)]` grandchildren either — `has_dependents`
+        // only rules out the repository-attribute route, and the two routes are
+        // resolved independently (see `dep_autumn_dependents_use` below). A model
+        // with runtime grandchildren still needs the per-row loop to cascade into
+        // them, so it falls through to the unchanged path at runtime.
+        // Codex review, PR #2647: `position(...)` is excluded too. A bulk
+        // multi-row DELETE removes several same-scope siblings in one
+        // statement, but the row-level compaction triggers `position(...)`
+        // installs only ever see one departing row at a time (see
+        // `delete_chunk_size`'s `config.position.is_some()` guard elsewhere in
+        // this file, which forces single-row chunks for the exact same
+        // reason) — removing several ranked siblings at once leaves the
+        // survivors' ranks gapped or duplicated instead of compacted.
+        let destroy_fast_path_eligible = !has_dependents
+            && config.hooks_type.is_none()
+            && !dep_needs_post
+            && !config.soft_delete
+            && config.position.is_none();
         // The grandchildren follow this child's delete kind: a soft-delete child
         // is only soft-deleted when its parent is (`__parent_soft`), so its own
         // children inherit `__parent_soft`; a non-soft-delete child is always hard
@@ -3312,6 +3341,204 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
+        // Ledger: the unmodified per-row Destroy body — one bulk `FOR UPDATE` id
+        // select, a restrict pre-scan pass, then a reload-then-mutate pass per
+        // child id. Emitted verbatim regardless of `destroy_fast_path_eligible` so
+        // a model with runtime (`#[has_many(dependent = ...)]`) grandchildren —
+        // invisible to `has_dependents`, which only sees the repository-attribute
+        // route — still gets the recursive cascade it needs; see
+        // `destroy_fast_path` below.
+        let destroy_per_row_loop = quote! {
+            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+            struct __AutumnDepId {
+                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                id: i64,
+            }
+            // Codex P2, "lock children before the restrict pre-scan": this id
+            // selection takes `FOR UPDATE` on every selected child row before the
+            // read-only restrict pre-scan below. Under READ COMMITTED an FK insert
+            // of a `restrict` grandchild takes `FOR KEY SHARE` on the referenced
+            // child row, so holding `FOR UPDATE` here blocks that insert until this
+            // transaction ends. A concurrent grandchild therefore cannot slip in
+            // between the pre-scan `EXISTS` probe and either the Phase-2 reload /
+            // `before_delete` hook or the child delete. The Phase-2 reload still
+            // calls `.for_update()`, but that is now a no-op re-lock rather than
+            // the first lock. The lock is hoisted from Phase 2 to here, over the
+            // same rows in the same parent→child order, so it adds no new deadlock
+            // class, and `ORDER BY id` makes acquisition order deterministic
+            // across concurrent cascades. This covers `delete_by_id` and both
+            // `delete_many` bulk paths, and both soft and hard child deletes:
+            // `#destroy_live_filter` is applied before `FOR UPDATE`, so the locked
+            // rows match the rows the later passes operate on.
+            //
+            // The `FOR UPDATE` clause is emitted only on Postgres. SQLite rejects
+            // `SELECT … FOR UPDATE` and needs no such clause: its single-writer
+            // database-level lock already serializes concurrent cascades — the
+            // rationale that also degrades the DSL `maybe_for_update!` seam to a
+            // plain read. `backend_select!` picks the suffix in autumn-web's own
+            // compilation, so the Postgres SQL is byte-identical to before and the
+            // SQLite form drops the clause.
+            #cc_serialize
+            let __for_update: &str = ::autumn_web::backend_select! {
+                pg => { " FOR UPDATE" },
+                sqlite => { "" },
+            };
+            let __q = format!(
+                "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
+                __table, __fk_column, #destroy_live_filter, __for_update
+            );
+            let __ids: ::std::vec::Vec<__AutumnDepId> =
+                ::autumn_web::reexports::diesel::sql_query(__q)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                    .load::<__AutumnDepId>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            // #1800 case 2, pre-scan pass: probe the `restrict` grandchildren of
+            // every selected child id before any child `before_delete` hook fires.
+            // Codex round-5-A already ordered a child's own grandchild restrict
+            // ahead of that child's hook, but the probe sat inside the per-child
+            // mutating loop, so with several siblings an earlier sibling's
+            // `before_delete` fired and only then did a later sibling's restrict
+            // grandchild return the 409. The transaction rolls back; a
+            // non-transactional hook side effect does not. Hoisting the read-only
+            // probe into its own pass closes that window. The probe mutates
+            // neither `__path` nor `__deleted` — a `restrict` action is a pure
+            // `SELECT EXISTS` — so it is safe ahead of, and need not re-run in, the
+            // mutating pass.
+            for __row in &__ids {
+                let __cid = __row.id;
+                // #1800, "re-probe restricts on hard revisits": skip a row already
+                // physically removed elsewhere, whose restrict grandchildren were
+                // probed on that path. This consults `__physical`, not the
+                // all-handled `__deleted`, to match the Phase-2 diamond
+                // revisit-skip below: a row merely soft-deleted on an earlier path
+                // is in `__deleted` but not in `__physical`, so a later
+                // hard-delete revisit still re-runs this pre-scan. Keyed on
+                // `__deleted` it would skip the probe while Phase 2, keyed on
+                // `__physical`, still hard-deletes the row — firing the child hook
+                // and falling through to a raw FK failure instead of the typed 409
+                // when the row has a soft-deleted restrict dependent. The
+                // hard-path probe drops the live filter, since `__parent_soft` is
+                // false there, so it includes the soft-deleted dependent and
+                // returns the 409 before any hook. The probe body may be empty, so
+                // this is a positive guard rather than an early `continue`, which
+                // clippy flags as redundant when it is the loop's last statement.
+                if !__physical.contains(&(#table_name, __cid)) {
+                    #grandchild_restrict_cascade
+                }
+            }
+            // Phase 2: now that every sibling's restrict grandchildren have
+            // passed, fire hooks and mutate.
+            for __row in __ids {
+                let __cid = __row.id;
+                // The diamond traversal revisit-skip (Codex round-5-B, #1800 case
+                // 1). Skip a row already physically removed, which dedups across
+                // independent batch roots and branches. It consults `__physical`,
+                // not the all-handled `__deleted`: a row soft-deleted on an
+                // earlier path is not physically gone, so a later hard path in a
+                // mixed diamond must still remove it. A redundant soft re-visit is
+                // caught by the `__record.deleted_at` guard below once reloaded,
+                // so a soft-handled row is not re-hooked either.
+                if __physical.contains(&(#table_name, __cid)) {
+                    continue;
+                }
+                // #1739 cycle guard (now the ACTIVE-path stack): skip a (table,
+                // id) already on the current destroy path. `insert` returns false
+                // when the row is already present, so a self- or mutual-reference
+                // (e.g. a grandchild pointing back at an ancestor) is not
+                // re-entered and the traversal terminates. Pushed here before
+                // descending; popped after this row's subtree completes (see the
+                // `__path.remove` below), so a completed sibling/root never
+                // suppresses a later cascade.
+                if !__path.insert((#table_name, __cid)) {
+                    continue;
+                }
+                // #1369: reload the exact id the parent-soft-gated selection
+                // returned. Do not re-apply `#sd_filter` (`deleted_at IS NULL`)
+                // here: on a hard parent delete the selection deliberately
+                // includes already soft-deleted children, whose FK still
+                // references the parent, so a live-only reload would return
+                // `None`, skip the hard delete, and leave the row to FK-fail the
+                // parent DELETE. The id set is authoritative for the parent kind,
+                // and the row is locked with `for_update`.
+                let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
+                    .first::<#model_name>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if let ::core::option::Option::Some(__record) = __record {
+                    // #1800 case 1: skip a redundant SOFT re-visit of an already-
+                    // soft-deleted row (it is not in `__deleted`).
+                    #destroy_soft_revisit_skip
+                    #destroy_ctx_decl
+                    // #1800 case 2: this child's own `restrict` grandchildren were
+                    // already probed in the pre-scan pass above (read-only 409),
+                    // so the child `before_delete` hook only ever fires once every
+                    // reachable sibling restrict has passed.
+                    #destroy_before_delete
+                    // #1739: mutate this child's OWN dependents (grandchildren)
+                    // before removing the child row, so a hard delete never
+                    // leaves an FK-dangling grandchild and never FK-fails the
+                    // child delete.
+                    #grandchild_mutating_cascade
+                    // #1325: this child's OWN counter caches move as it is
+                    // destroyed, in the cascade's transaction. Without it a
+                    // `dependent = destroy` parent silently leaves every
+                    // surviving grandparent's count inflated.
+                    #cc_before_delete_cascade
+                    #destroy_mutation
+                    // #1800 case 1: record the row as gone ONLY when it was
+                    // physically deleted (a soft-deleted row stays reachable for a
+                    // later hard-delete path).
+                    #destroy_deleted_mark
+                    #destroy_post_mutation
+                }
+                // Codex round-5-B: pop this row off the ACTIVE path once its
+                // whole subtree is processed, so it only ever blocks re-entry
+                // WHILE on the recursion stack (cycle-break), never afterwards.
+                // Runs whether or not the row was still present.
+                __path.remove(&(#table_name, __cid));
+            }
+            ::core::result::Result::Ok(#destroy_ret_value)
+        };
+
+        // Ledger: when `destroy_fast_path_eligible` (no repository-attribute
+        // grandchildren, no hooks, no version-history/commit-hook/broadcast
+        // bookkeeping, never soft-deleted, no `position(...)` — see where it's
+        // computed above), route through the SAME bulk helper the `DeleteAll`
+        // action already uses
+        // (`dependent_delete_all`, which already batches its optional
+        // counter-cache decrement via `counter_cache_before_delete_many` instead
+        // of one decrement per row) rather than the per-row reload-then-delete
+        // loop, which for this exact configuration reloads a record nothing reads
+        // (`#destroy_mutation`'s plain-hard-delete arm deletes by id alone) and
+        // deletes it one row at a time. `has_dependents` only rules out
+        // repository-attribute grandchildren; a model can still declare runtime
+        // grandchildren via `#[has_many(dependent = ...)]`, invisible to this
+        // macro invocation, so this checks `#model_name::dependents()` — cheap,
+        // no DB round trip — and falls back to the untouched per-row loop when it
+        // is non-empty.
+        let destroy_body = if destroy_fast_path_eligible {
+            quote! {
+                if #model_name::dependents().is_empty() {
+                    ::autumn_web::repository::dependent_delete_all(
+                        conn,
+                        __table,
+                        #cc_specs,
+                        #cc_has,
+                        __fk_column,
+                        __parent_id,
+                    )
+                    .await?;
+                    ::core::result::Result::Ok(#destroy_ret_value)
+                } else {
+                    #destroy_per_row_loop
+                }
+            }
+        } else {
+            destroy_per_row_loop
+        };
+
         quote! {
             /// Apply a [`DependentAction`](::autumn_web::repository::DependentAction)
             /// to this model's rows whose `__fk_column` equals `__parent_id`,
@@ -3447,170 +3674,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // set breaks self-/mutual-referential cycles.
                         #destroy_register
                         #destroy_ret_decl
-                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                        struct __AutumnDepId {
-                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                            id: i64,
-                        }
-                        // Codex P2, "lock children before the restrict pre-scan":
-                        // this id selection takes `FOR UPDATE` on every selected
-                        // child row before the read-only restrict pre-scan below.
-                        // Under READ COMMITTED an FK insert of a `restrict`
-                        // grandchild takes `FOR KEY SHARE` on the referenced child
-                        // row, so holding `FOR UPDATE` here blocks that insert until
-                        // this transaction ends. A concurrent grandchild therefore
-                        // cannot slip in between the pre-scan `EXISTS` probe and
-                        // either the Phase-2 reload / `before_delete` hook or the
-                        // child delete. The Phase-2 reload still calls
-                        // `.for_update()`, but that is now a no-op re-lock rather
-                        // than the first lock. The lock is hoisted from Phase 2 to
-                        // here, over the same rows in the same parent→child order,
-                        // so it adds no new deadlock class, and `ORDER BY id` makes
-                        // acquisition order deterministic across concurrent cascades.
-                        // This covers `delete_by_id` and both `delete_many` bulk
-                        // paths, and both soft and hard child deletes:
-                        // `#destroy_live_filter` is applied before `FOR UPDATE`, so
-                        // the locked rows match the rows the later passes operate on.
-                        //
-                        // The `FOR UPDATE` clause is emitted only on Postgres.
-                        // SQLite rejects `SELECT … FOR UPDATE` and needs no such
-                        // clause: its single-writer database-level lock already
-                        // serializes concurrent cascades — the rationale that also
-                        // degrades the DSL `maybe_for_update!` seam to a plain read.
-                        // `backend_select!` picks the suffix in autumn-web's own
-                        // compilation, so the Postgres SQL is byte-identical to
-                        // before and the SQLite form drops the clause.
-                        #cc_serialize
-                        let __for_update: &str = ::autumn_web::backend_select! {
-                            pg => { " FOR UPDATE" },
-                            sqlite => { "" },
-                        };
-                        let __q = format!(
-                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
-                            __table, __fk_column, #destroy_live_filter, __for_update
-                        );
-                        let __ids: ::std::vec::Vec<__AutumnDepId> =
-                            ::autumn_web::reexports::diesel::sql_query(__q)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
-                                .load::<__AutumnDepId>(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                        // #1800 case 2, pre-scan pass: probe the `restrict`
-                        // grandchildren of every selected child id before any child
-                        // `before_delete` hook fires. Codex round-5-A already ordered
-                        // a child's own grandchild restrict ahead of that child's
-                        // hook, but the probe sat inside the per-child mutating loop,
-                        // so with several siblings an earlier sibling's
-                        // `before_delete` fired and only then did a later sibling's
-                        // restrict grandchild return the 409. The transaction rolls
-                        // back; a non-transactional hook side effect does not.
-                        // Hoisting the read-only probe into its own pass closes that
-                        // window. The probe mutates neither `__path` nor `__deleted`
-                        // — a `restrict` action is a pure `SELECT EXISTS` — so it is
-                        // safe ahead of, and need not re-run in, the mutating pass.
-                        for __row in &__ids {
-                            let __cid = __row.id;
-                            // #1800, "re-probe restricts on hard revisits": skip a
-                            // row already physically removed elsewhere, whose
-                            // restrict grandchildren were probed on that path. This
-                            // consults `__physical`, not the all-handled
-                            // `__deleted`, to match the Phase-2 diamond revisit-skip
-                            // below: a row merely soft-deleted on an earlier path is
-                            // in `__deleted` but not in `__physical`, so a later
-                            // hard-delete revisit still re-runs this pre-scan. Keyed
-                            // on `__deleted` it would skip the probe while Phase 2,
-                            // keyed on `__physical`, still hard-deletes the row —
-                            // firing the child hook and falling through to a raw FK
-                            // failure instead of the typed 409 when the row has a
-                            // soft-deleted restrict dependent. The hard-path probe
-                            // drops the live filter, since `__parent_soft` is false
-                            // there, so it includes the soft-deleted dependent and
-                            // returns the 409 before any hook. The probe body may be
-                            // empty, so this is a positive guard rather than an early
-                            // `continue`, which clippy flags as redundant when it is
-                            // the loop's last statement.
-                            if !__physical.contains(&(#table_name, __cid)) {
-                                #grandchild_restrict_cascade
-                            }
-                        }
-                        // Phase 2: now that every sibling's restrict grandchildren
-                        // have passed, fire hooks and mutate.
-                        for __row in __ids {
-                            let __cid = __row.id;
-                            // The diamond traversal revisit-skip (Codex round-5-B,
-                            // #1800 case 1). Skip a row already physically removed,
-                            // which dedups across independent batch roots and
-                            // branches. It consults `__physical`, not the all-handled
-                            // `__deleted`: a row soft-deleted on an earlier path is
-                            // not physically gone, so a later hard path in a mixed
-                            // diamond must still remove it. A redundant soft re-visit
-                            // is caught by the `__record.deleted_at` guard below once
-                            // reloaded, so a soft-handled row is not re-hooked either.
-                            if __physical.contains(&(#table_name, __cid)) {
-                                continue;
-                            }
-                            // #1739 cycle guard (now the ACTIVE-path stack): skip a
-                            // (table, id) already on the current destroy path. `insert`
-                            // returns false when the row is already present, so a self-
-                            // or mutual-reference (e.g. a grandchild pointing back at an
-                            // ancestor) is not re-entered and the traversal terminates.
-                            // Pushed here before descending; popped after this row's
-                            // subtree completes (see the `__path.remove` below), so a
-                            // completed sibling/root never suppresses a later cascade.
-                            if !__path.insert((#table_name, __cid)) {
-                                continue;
-                            }
-                            // #1369: reload the exact id the parent-soft-gated
-                            // selection returned. Do not re-apply `#sd_filter`
-                            // (`deleted_at IS NULL`) here: on a hard parent delete
-                            // the selection deliberately includes already
-                            // soft-deleted children, whose FK still references the
-                            // parent, so a live-only reload would return `None`, skip
-                            // the hard delete, and leave the row to FK-fail the parent
-                            // DELETE. The id set is authoritative for the parent kind,
-                            // and the row is locked with `for_update`.
-                            let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
-
-                                .first::<#model_name>(conn)
-                                .await
-                                .optional()
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            if let ::core::option::Option::Some(__record) = __record {
-                                // #1800 case 1: skip a redundant SOFT re-visit of an
-                                // already-soft-deleted row (it is not in `__deleted`).
-                                #destroy_soft_revisit_skip
-                                #destroy_ctx_decl
-                                // #1800 case 2: this child's own `restrict`
-                                // grandchildren were already probed in the pre-scan
-                                // pass above (read-only 409), so the child
-                                // `before_delete` hook only ever fires once every
-                                // reachable sibling restrict has passed.
-                                #destroy_before_delete
-                                // #1739: mutate this child's OWN dependents
-                                // (grandchildren) before removing the child row, so
-                                // a hard delete never leaves an FK-dangling
-                                // grandchild and never FK-fails the child delete.
-                                #grandchild_mutating_cascade
-                                // #1325: this child's OWN counter caches move
-                                // as it is destroyed, in the cascade's
-                                // transaction. Without it a `dependent =
-                                // destroy` parent silently leaves every
-                                // surviving grandparent's count inflated.
-                                #cc_before_delete_cascade
-                                #destroy_mutation
-                                // #1800 case 1: record the row as gone ONLY when it
-                                // was physically deleted (a soft-deleted row stays
-                                // reachable for a later hard-delete path).
-                                #destroy_deleted_mark
-                                #destroy_post_mutation
-                            }
-                            // Codex round-5-B: pop this row off the ACTIVE path once
-                            // its whole subtree is processed, so it only ever blocks
-                            // re-entry WHILE on the recursion stack (cycle-break), never
-                            // afterwards. Runs whether or not the row was still present.
-                            __path.remove(&(#table_name, __cid));
-                        }
-                        ::core::result::Result::Ok(#destroy_ret_value)
+                        #destroy_body
                     }
                 }
                 })
@@ -23255,6 +23319,116 @@ mod tests {
         assert!(
             generated.contains("dependent_delete_all"),
             "delete_all must issue a bulk DELETE"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_leaf_takes_batched_fast_path() {
+        // Ledger: a plain leaf child (no hooks, not soft-delete, no
+        // dependent(...) of its own) routes the Destroy arm through the same
+        // dependent_delete_all() helper on_delete = delete_all already uses,
+        // guarded by a runtime check that the model has no *model-attribute*
+        // (#[has_many(dependent = ...)]) grandchildren either. This checks
+        // Comment's OWN generated `__autumn_apply_dependent_on_conn` (used
+        // when something ELSE destroys Comment as its child), so Comment must
+        // declare no `dependent(...)` of its own here -- a repository that
+        // itself has `dependent(...)` is the "has grandchildren" case tested
+        // separately below and must NOT take this fast path.
+        let generated = repository_macro(
+            quote! { Comment },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("dependent_delete_all"),
+            "a hookless, non-soft-delete, dependent-free leaf must take the \
+             batched dependent_delete_all fast path: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("dependents") && destroy_arm.contains("is_empty"),
+            "the fast path must still guard on the model's own runtime \
+             dependents() being empty: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_own_dependents_skips_fast_path() {
+        // A child that itself declares dependent(...) (repo-attribute
+        // grandchildren) must keep the per-row loop -- dependent_delete_all()
+        // has no way to recurse into a grandchild cascade.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with its own repository-attribute dependent(...) \
+             grandchildren must never take the batched fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_hooks_skips_fast_path() {
+        // A child with hooks must keep the exact per-row loop -- the fast
+        // path's dependent_delete_all() call never fires before_delete.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with before_delete hooks must never take the batched \
+             fast path (it would skip the hook): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_soft_delete_skips_fast_path() {
+        // A soft-delete child must keep the per-row loop too --
+        // dependent_delete_all() only ever hard-deletes.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a soft-delete child must never take the hard-delete-only batched \
+             fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_positioned_skips_fast_path() {
+        // Codex review, PR #2647: a `position(...)` child must keep the
+        // per-row loop even though it has none of the other disqualifiers --
+        // dependent_delete_all()'s bulk multi-row DELETE removes several
+        // same-scope siblings in one statement, but the row-level compaction
+        // triggers position(...) installs only ever see one departing row at
+        // a time (see this file's `delete_chunk_size` guard, which forces
+        // single-row chunks for the identical reason), so a batched delete
+        // here would leave the survivors' ranks gapped or duplicated.
+        // `position(...)` does not yet support a repo's OWN `dependent(...)`
+        // (an unrelated, pre-existing restriction), so this checks the
+        // unconditionally-generated Destroy arm on a bare `position` leaf
+        // instead of pairing it with grandchildren like the sibling tests
+        // above do.
+        let generated = repository_macro(
+            quote! { Comment, position },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a position(...) child must never take the batched fast path \
+             (it would corrupt the ordering): {destroy_arm}"
         );
     }
 
