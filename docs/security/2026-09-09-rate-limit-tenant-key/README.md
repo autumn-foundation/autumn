@@ -171,6 +171,20 @@ bug.
   above.
 - `cargo test --workspace --doc` — 0 failed across every workspace crate
   including `autumn_web`.
+- `./scripts/check-panic-gate.sh` and `./scripts/check-determinism-gate.sh`
+  — both self-tests and gates pass unchanged (67 / 18 modules gated, same
+  counts as trunk); this change touches neither a panic-gated nor a
+  determinism-gated module.
+- `./scripts/check-feature-combinations.sh` (needs `cargo-hack`, not
+  installed in this sandbox) and `./scripts/check-semver.sh` (needs a
+  pinned `1.94.1` toolchain, not installed in this sandbox) could not run
+  here — both environment gaps, not failures. Substituted by hand: the fix
+  adds one private `fn tenant_qualify_bucket_key` and changes no public
+  signature (`__check_throttle`'s signature is byte-for-byte unchanged,
+  only its body gained one line), so there is nothing for
+  `check-semver.sh` to flag; the two explicit gated-feature clippy lanes
+  above already cover the feature combinations `check-feature-combinations.sh`
+  would otherwise sweep for this unconditionally-compiled module.
 - Re-attack: confirmed a same-tenant repeat still shares its own bucket
   (the fix partitions by tenant; it does not disable per-principal
   throttling), and that two *different* tenants with *different* principal
