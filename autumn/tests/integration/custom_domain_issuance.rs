@@ -902,6 +902,208 @@ async fn a_renewal_is_skipped_when_the_domain_no_longer_points_here() {
         0,
         "a domain that moved away must not be renewed"
     );
+
+    // ...and it is RECORDED, not merely logged. The certificate is inside its
+    // renewal window and will expire, so an operator has to act: the tenant
+    // repointed the record or gave the hostname up. Skipping silently left
+    // health `Up` and raised no alert until the expiry took the domain down.
+    let record = h.registry.get("app.clientco.com").unwrap();
+    assert_eq!(
+        record.status,
+        DomainStatus::Active,
+        "the certificate is still valid and still served"
+    );
+    let reason = record
+        .failure_reason
+        .clone()
+        .expect("the skip must be recorded");
+    assert!(reason.contains("renewal skipped"), "{reason}");
+    assert!(
+        !record.is_due(NOW),
+        "and must back off rather than re-checking every tick"
+    );
+    let report = h.registry.health_report(NOW);
+    assert!(report.contains("app.clientco.com"), "{report}");
+    assert!(report.contains("tenant-a"), "{report}");
+    let alerts = h.alerts.lock().unwrap().clone();
+    assert_eq!(alerts.len(), 1, "the operator is alerted once: {alerts:?}");
+    assert!(alerts[0].contains("app.clientco.com"), "{alerts:?}");
+}
+
+// ── Codex round 5 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn offboarding_the_last_failing_domain_clears_the_operator_alert() {
+    // The alert is raised per failing domain and retracted only when nothing
+    // is failing. Offboarding removes the failure from the registry without
+    // being a success, so without clearing here the `scheduled_task_failure`
+    // alert stood forever — for a domain that no longer exists.
+    let issuer = ScriptedIssuer::new(&["doomed.clientco.com"]);
+    let h = harness(
+        TableVerifier::new(&[("doomed.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("doomed.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert_eq!(
+        h.alerts.lock().unwrap().len(),
+        1,
+        "the failure must alert the operator"
+    );
+    assert!(
+        h.recovered.lock().unwrap().is_empty(),
+        "nothing has recovered yet"
+    );
+
+    assert!(h.task.offboard("doomed.clientco.com").await.unwrap());
+    assert!(
+        h.registry.health_report(NOW).is_empty(),
+        "no domain is failing any more"
+    );
+    assert_eq!(
+        h.recovered.lock().unwrap().len(),
+        1,
+        "the standing alert must be retracted"
+    );
+}
+
+/// A registry store whose next `delete` blocks until released, so a test can
+/// hold the retention sweep inside one offboard and change the registry
+/// underneath it.
+#[derive(Debug)]
+struct PausingDeleteStore {
+    inner: MemoryCustomDomainStore,
+    gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    release: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+}
+
+impl PausingDeleteStore {
+    fn new() -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        Self {
+            inner: MemoryCustomDomainStore::new(),
+            gate: Mutex::new(Some(rx)),
+            release: Mutex::new(Some(tx)),
+        }
+    }
+
+    fn release(&self) {
+        let sender = self.release.lock().unwrap().take();
+        if let Some(tx) = sender {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for PausingDeleteStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        self.inner.load_all()
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.save(domain)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        let held = self.gate.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(rx) = held {
+                let _ = rx.await;
+            }
+            self.inner.delete(hostname).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_retention_sweep_leaves_a_domain_that_came_up_while_it_ran() {
+    use autumn_web::custom_domain::CustomDomainPruner as _;
+
+    // The sweep picks its candidates from a `list()` snapshot and then awaits
+    // an offboard per candidate. The orchestrator ticks concurrently, so a
+    // domain that was `pending_dns` when the snapshot was taken can be serving
+    // by the time its turn comes — and deleting it then disconnects a tenant
+    // seconds after their domain came up, taking the certificate with it.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let store = Arc::new(PausingDeleteStore::new());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    let task = Arc::new(task_over(
+        Arc::clone(&registry),
+        Arc::new(CustomDomainCertCache::new(8)),
+        Arc::clone(&certs),
+        TableVerifier::new(&[]) as Arc<dyn DomainVerifier>,
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    ));
+
+    // Both are abandoned when the sweep starts; `list()` sorts by hostname, so
+    // `a-` is offboarded first and holds the sweep inside its store delete.
+    for host in ["a-abandoned.clientco.com", "b-latecomer.clientco.com"] {
+        registry.register(host, "tenant-a", NOW).await.unwrap();
+    }
+    let cert_id = CertId::from_domains(&["b-latecomer.clientco.com".to_owned()]);
+    certs
+        .save_cert(
+            &cert_id,
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let sweep = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.prune(NOW + 86_400, false).await.unwrap() }
+    });
+    // Let the sweep reach the held delete for the first candidate.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    // The second domain finishes setup while the sweep is suspended.
+    registry
+        .record_active("b-latecomer.clientco.com", NOW + 10, NOW + 90 * 86_400)
+        .await
+        .unwrap();
+    store.release();
+
+    assert_eq!(
+        sweep.await.unwrap(),
+        1,
+        "only the still-abandoned domain may be counted"
+    );
+    assert!(
+        registry.get("a-abandoned.clientco.com").is_none(),
+        "the abandoned registration is still pruned"
+    );
+    let survivor = registry
+        .get("b-latecomer.clientco.com")
+        .expect("a domain that came up mid-sweep must survive it");
+    assert_eq!(survivor.status, DomainStatus::Active);
+    assert!(
+        certs.load_cert(&cert_id).await.unwrap().is_some(),
+        "and must keep the certificate it just installed"
+    );
 }
 
 #[tokio::test]

@@ -876,7 +876,14 @@ when a certificate has actually expired: one tenant's pending retry is not a
 deployment outage. A failed order also raises the
 [`scheduled_task_failure`](./operator-alerts.md) alert for
 `custom_domain_certificates`, naming the domain and tenant, and that alert
-clears when the **last** failing domain recovers.
+clears when the **last** failing domain recovers — or is offboarded, since a
+domain that no longer exists is not still failing.
+
+A renewal skipped because the domain stopped pointing here is recorded the same
+way. The certificate keeps serving until it expires, so the domain stays
+`active`, but the reason and the alert appear immediately rather than at expiry,
+when it would already be down: either the tenant restores the record or the
+domain should be offboarded.
 
 ---
 

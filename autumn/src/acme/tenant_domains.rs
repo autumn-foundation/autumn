@@ -238,7 +238,7 @@ impl CustomDomainTask {
             .registry
             .due_for_renewal(now_unix, self.renew_before_days)
         {
-            if !self.still_points_here(&domain.hostname).await {
+            if !self.still_points_here(&domain, now_unix).await {
                 continue;
             }
             self.issue_one(&domain.hostname, &domain.tenant, now_unix)
@@ -300,22 +300,48 @@ impl CustomDomainTask {
         }
     }
 
-    /// Does `hostname` still resolve to this deployment?
+    /// Does `domain` still resolve to this deployment?
     ///
     /// A lookup that returns nothing answers `true`: a resolver blip must not
     /// stop a healthy renewal, and the CA's own validation is the real gate.
-    async fn still_points_here(&self, hostname: &str) -> bool {
+    ///
+    /// A domain that has genuinely moved away is RECORDED, not merely logged.
+    /// It is inside its renewal window and will expire — the tenant repointed
+    /// or gave the hostname up — so an operator has to act. Skipping silently
+    /// left `/actuator/health` `Up` and raised no alert until the certificate
+    /// expired, at which point the domain was already down.
+    async fn still_points_here(
+        &self,
+        domain: &crate::custom_domain::CustomDomain,
+        now_unix: i64,
+    ) -> bool {
+        let hostname = domain.hostname.as_str();
         let observed = self.verifier.observe(hostname).await;
         if matches!(observed, crate::custom_domain::ObservedTarget::None) {
             return true;
         }
-        if grade_dns_verification(&observed, &self.effective_ingress().await).is_verified() {
+        let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
+        if outcome.is_verified() {
             return true;
         }
         tracing::warn!(
             hostname,
             "skipping renewal: the domain no longer points at this deployment"
         );
+        let reason = outcome
+            .reason()
+            .unwrap_or_else(|| "the domain no longer points at this deployment".to_owned());
+        self.record_failure(
+            hostname,
+            &domain.tenant,
+            now_unix,
+            format!(
+                "renewal skipped: {reason}. The certificate will expire unless the record is \
+                 restored or the domain is offboarded"
+            ),
+            true,
+        )
+        .await;
         false
     }
 
@@ -559,14 +585,10 @@ impl CustomDomainTask {
                 .await;
             return Ok(());
         }
-        // Clear the operator alert only once NOTHING is failing: with a
-        // thousand domains, recovering one while another is still broken must
-        // not retract an alert that is still true.
-        if let Some(recovery) = &self.recovery
-            && self.registry.health_report(now_unix).is_empty()
-        {
-            recovery();
-        }
+        // Only once NOTHING is failing: with a thousand domains, recovering one
+        // while another is still broken must not retract an alert that is
+        // still true.
+        self.clear_alert_if_healthy(now_unix);
         Ok(())
     }
 
@@ -639,12 +661,67 @@ impl CustomDomainTask {
             return Ok(false);
         };
         let removed = self.registry.remove(&host).await?;
-        self.cache.remove(&host);
-        self.limiter.forget(&host);
-        if let Err(e) = self.certs.delete_cert(&cert_id_for(&host)).await {
+        self.purge_local(&host).await;
+        self.clear_alert_if_healthy(crate::custom_domain::now_unix());
+        Ok(removed)
+    }
+
+    /// Offboard `hostname` only while it is still the record `expected`
+    /// describes — same tenant, same status, same registration time.
+    ///
+    /// The retention sweep's candidates come from a snapshot taken before a
+    /// series of awaits; this re-asserts each one inside the registry's
+    /// per-hostname write gate, so a domain that finished setup in the
+    /// meantime is left alone. Nothing local is purged when the guard rejects:
+    /// the certificate belongs to a domain that is now live.
+    async fn offboard_if_unchanged(
+        &self,
+        expected: &crate::custom_domain::CustomDomain,
+    ) -> std::io::Result<bool> {
+        let Ok(host) = crate::custom_domain::normalize_hostname(&expected.hostname) else {
+            return Ok(false);
+        };
+        let removed = self
+            .registry
+            .remove_if(&host, |current| {
+                current.tenant == expected.tenant
+                    && current.status == expected.status
+                    && current.registered_at_unix == expected.registered_at_unix
+            })
+            .await?;
+        if !removed {
+            tracing::debug!(
+                hostname = %host,
+                "skipping a retention offboard: the domain changed while the sweep was running"
+            );
+            return Ok(false);
+        }
+        self.purge_local(&host).await;
+        self.clear_alert_if_healthy(crate::custom_domain::now_unix());
+        Ok(true)
+    }
+
+    /// Drop everything this process holds for an offboarded hostname.
+    async fn purge_local(&self, host: &str) {
+        self.cache.remove(host);
+        self.limiter.forget(host);
+        if let Err(e) = self.certs.delete_cert(&cert_id_for(host)).await {
             tracing::warn!(hostname = %host, "failed to delete the offboarded certificate: {e}");
         }
-        Ok(removed)
+    }
+
+    /// Retract the operator alert once NOTHING is failing any more.
+    ///
+    /// Offboarding the one domain that was failing removes the failure from the
+    /// registry but is not itself a success, so without this the
+    /// `scheduled_task_failure` alert it raised would stand for a domain that
+    /// no longer exists.
+    fn clear_alert_if_healthy(&self, now_unix: i64) {
+        if let Some(recovery) = &self.recovery
+            && self.registry.health_report(now_unix).is_empty()
+        {
+            recovery();
+        }
     }
 
     /// Offboard every domain a tenant owns. Returns how many were removed.
@@ -752,11 +829,23 @@ impl crate::custom_domain::CustomDomainPruner for CustomDomainTask {
                 if domain.status == crate::custom_domain::DomainStatus::PendingDns
                     && domain.registered_at_unix < cutoff_unix
                 {
-                    removed += 1;
-                    if !dry_run {
-                        self.offboard(&domain.hostname)
-                            .await
-                            .map_err(|e| format!("failed to offboard {}: {e}", domain.hostname))?;
+                    if dry_run {
+                        removed += 1;
+                        continue;
+                    }
+                    // These candidates came from a `list()` snapshot and each
+                    // offboard below awaits, so by the time this one runs the
+                    // domain may have verified, issued and gone `Active` — the
+                    // orchestrator ticks concurrently. Deleting it then would
+                    // disconnect a tenant seconds after their domain came up,
+                    // and take the certificate with it, so the record is
+                    // re-asserted inside the registry's per-hostname gate.
+                    if self
+                        .offboard_if_unchanged(&domain)
+                        .await
+                        .map_err(|e| format!("failed to offboard {}: {e}", domain.hostname))?
+                    {
+                        removed += 1;
                     }
                 }
             }
@@ -795,15 +884,24 @@ impl CustomDomainTask {
             // A non-filesystem store cannot be enumerated through this seam.
             return Ok(0);
         };
+        // Enumerate the store FIRST, then snapshot the registry. The reverse
+        // order deletes a certificate issued in between: its hostname was
+        // registered after the registry snapshot, so it is missing from `live`,
+        // while its freshly written pair is already in `stored`. Activation
+        // would then complete with its durable certificate gone, and the domain
+        // would fail the first handshake after a cache eviction or a restart.
+        // This way, a pair written after the enumeration is simply not a
+        // candidate, and one written before it has a record the later snapshot
+        // sees.
+        let stored = fs
+            .list_certs()
+            .map_err(|e| format!("failed to enumerate stored certificates: {e}"))?;
         let live: std::collections::HashSet<String> = self
             .registry
             .list()
             .into_iter()
             .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
             .collect();
-        let stored = fs
-            .list_certs()
-            .map_err(|e| format!("failed to enumerate stored certificates: {e}"))?;
         let mut removed = 0;
         for (id, chain, key) in stored {
             if live.contains(id.as_str()) || self.retained_cert_ids.contains(id.as_str()) {

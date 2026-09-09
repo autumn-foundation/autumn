@@ -1183,6 +1183,28 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's delete error.
     pub async fn remove(&self, hostname: &str) -> io::Result<bool> {
+        self.remove_if(hostname, |_| true).await
+    }
+
+    /// [`remove`](Self::remove), but only while `guard` still holds for the
+    /// stored record. Returns whether a record was actually removed.
+    ///
+    /// The guard runs inside the per-hostname write gate, so a caller that
+    /// decided to offboard a domain BEFORE an `.await` re-asserts that decision
+    /// against the record as it is now. The retention sweep needs exactly this:
+    /// it picks its candidates from a `list()` snapshot, and a domain that
+    /// finished verifying and issuing while the sweep was awaiting an earlier
+    /// offboard would otherwise be deleted — certificate and all — moments
+    /// after it came up.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's delete error.
+    pub async fn remove_if(
+        &self,
+        hostname: &str,
+        guard: impl FnOnce(&CustomDomain) -> bool,
+    ) -> io::Result<bool> {
         let Ok(host) = normalize_hostname(hostname) else {
             return Ok(false);
         };
@@ -1195,6 +1217,9 @@ impl CustomDomainRegistry {
         // at the next restart.
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
+        if !read_lock(&self.index).get(&host).is_none_or(guard) {
+            return Ok(false);
+        }
         self.store.delete(&host).await?;
         Ok(write_lock(&self.index).remove(&host).is_some())
     }
