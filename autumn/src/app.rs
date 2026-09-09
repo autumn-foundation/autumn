@@ -4720,6 +4720,7 @@ impl AppBuilder {
                             listener,
                             tls_cfg,
                             acme_cfg,
+                            config.tenancy.base_domain.as_deref(),
                             &config.credentials,
                             https_port,
                             acme_status.clone(),
@@ -5003,7 +5004,10 @@ impl AppBuilder {
                 http_challenge_port,
                 https_port,
                 dns01,
+                custom_domains,
             } = bind_state;
+            // Read before `custom_domains` is moved into the spawn below.
+            let custom_domains_enabled = custom_domains.is_some();
 
             // The `:80` challenge/redirect listener, bound dual-stack so the CA
             // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
@@ -5022,7 +5026,13 @@ impl AppBuilder {
             let challenge_listeners =
                 match crate::acme::challenge::bind_challenge_listeners(http_challenge_port).await {
                     Ok(listeners) => listeners,
-                    Err(e) if dns01 => {
+                    // Only DNS-01 WITHOUT custom domains can live without this
+                    // listener. Tenant certificates are always ordered over
+                    // HTTP-01 — the record lives in the tenant's zone, where
+                    // this deployment holds no DNS credential — so continuing
+                    // here would verify every tenant domain and then burn its
+                    // issuance budget into permanent backoff, never activating.
+                    Err(e) if dns01 && !custom_domains_enabled => {
                         tracing::warn!(
                             port = http_challenge_port,
                             error = %e,
@@ -5035,6 +5045,21 @@ impl AppBuilder {
                         Vec::new()
                     }
                     Err(e) => {
+                        if dns01 {
+                            tracing::error!(
+                                port = http_challenge_port,
+                                "Failed to bind the ACME HTTP-01 challenge listener: {e}. This \
+                                 deployment issues its own certificate over DNS-01, which does \
+                                 not need the listener — but [server.tls.acme.custom_domains] is \
+                                 enabled, and a tenant's domain can only be validated over \
+                                 HTTP-01. Grant CAP_NET_BIND_SERVICE, set [server.tls.acme] \
+                                 http_challenge_port to a port a front-end forwards :80 to, or \
+                                 disable custom domains"
+                            );
+                            #[cfg(feature = "managed-pg")]
+                            crate::managed_pg::emergency_stop_async().await;
+                            std::process::exit(1);
+                        }
                         tracing::error!(
                             port = http_challenge_port,
                             "Failed to bind the ACME HTTP-01 challenge listener: {e}. Port \
@@ -5047,7 +5072,8 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                 };
-            let challenge_router = crate::acme::challenge::challenge_router(tokens, https_port);
+            let challenge_router =
+                crate::acme::challenge::challenge_router(tokens.clone(), https_port);
             // Serve every bound listener (one for dual-stack, two for the split
             // fallback), each a child of `server_shutdown` so they tear down with
             // the main server. The router is cheap to clone (shared Arc state).
@@ -5120,11 +5146,26 @@ impl AppBuilder {
             let reporter = compose_acme_alert_reporter(reporter, &state);
             renewal_task.recovery = Some(make_acme_alert_recovery(&state));
             let renewal_shutdown = server_shutdown.child_token();
+            let renewal_coordinator = std::sync::Arc::clone(&coordinator);
             tokio::spawn(async move {
                 renewal_task
-                    .run(coordinator, reporter, renewal_shutdown)
+                    .run(renewal_coordinator, reporter, renewal_shutdown)
                     .await;
             });
+
+            // Tenant custom domains (#1635): publish the registry so tenancy
+            // resolution can route a connected `Host`, register the health
+            // indicator and the retention pruner, and spawn the orchestrator.
+            if let Some(cd) = custom_domains {
+                spawn_custom_domain_task(
+                    cd,
+                    tokens,
+                    std::sync::Arc::clone(&coordinator),
+                    leadership_degraded,
+                    &state,
+                    server_shutdown.child_token(),
+                );
+            }
         }
 
         tracing::info!(bound = %bound_desc, "Listening");
@@ -9215,6 +9256,23 @@ struct AcmeBindState {
     /// challenge/redirect port is fatal (HTTP-01) or a warning (DNS-01, where
     /// the CA never connects to this host).
     dns01: bool,
+    /// The tenant custom-domain wiring (#1635), present exactly when
+    /// `[server.tls.acme.custom_domains] enabled = true`.
+    custom_domains: Option<CustomDomainBindState>,
+}
+
+/// Everything the custom-domain orchestrator needs, built at bind time so the
+/// SNI resolver and the loop share one registry and one certificate cache.
+#[cfg(feature = "acme")]
+struct CustomDomainBindState {
+    registry: std::sync::Arc<crate::custom_domain::CustomDomainRegistry>,
+    cache: std::sync::Arc<crate::custom_domain::CustomDomainCertCache>,
+    store: std::sync::Arc<crate::acme::store::FsAcmeStore>,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    config: crate::config::CustomDomainsConfig,
+    /// The enclosing `[server.tls.acme]`, so the per-domain issuer orders on
+    /// the SAME account and directory as the deployment's own certificate.
+    acme: crate::config::AcmeConfig,
 }
 
 /// Build a TLS listener for ACME mode: serve a stored certificate if one is
@@ -9222,10 +9280,18 @@ struct AcmeBindState {
 /// returned [`AcmeBindState`] carries everything the renewal task and challenge
 /// listener need.
 #[cfg(feature = "acme")]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one bind-time assembly of the ACME listener, its store, its \
+              placeholder and the custom-domain registry; splitting it would \
+              only scatter the ordering these steps depend on"
+)]
 async fn build_acme_tls_listener(
     tcp: tokio::net::TcpListener,
     tls_cfg: &crate::config::TlsConfig,
     acme_cfg: &crate::config::AcmeConfig,
+    tenancy_base_domain: Option<&str>,
     credentials: &crate::credentials::CredentialsStore,
     https_port: u16,
     status: Option<crate::acme::renewal::AcmeStatus>,
@@ -9277,9 +9343,100 @@ async fn build_acme_tls_listener(
     };
 
     let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(initial));
-    let server_config = crate::tls::build_server_config(
+
+    // Tenant custom domains (#1635): the registry is hydrated from disk before
+    // the listener binds, so a restart routes and serves every connected domain
+    // on the first request rather than after the first orchestrator tick. The
+    // SNI resolver wraps — rather than replaces — the operator's own resolver,
+    // so the deployment's certificate keeps serving its own names unchanged.
+    let custom_domains = match acme_cfg.custom_domains.as_ref() {
+        Some(cd_cfg) if cd_cfg.enabled => {
+            // Reserve everything this deployment already serves. Without it a
+            // tenant registers another tenant's subdomain — which the
+            // operator's own wildcard already points here, so it verifies and
+            // issues — and every request for that host then resolves to
+            // whoever registered it.
+            let mut reserved = acme_cfg.domains.clone();
+            reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
+            // The ingress hostname is the sharpest of the three. It ALREADY
+            // resolves to the ingress addresses, so a tenant who registers it
+            // needs no DNS change at all: verification passes on the first
+            // tick, HTTP-01 validates, and from then on every request to the
+            // deployment's own infrastructure hostname routes to that tenant.
+            // It is not necessarily covered by `domains` — an operator may run
+            // ingress under a separate infrastructure zone — so it is reserved
+            // explicitly rather than by assuming overlap.
+            reserved.extend(cd_cfg.ingress_hostname.clone());
+            let registry = std::sync::Arc::new(
+                crate::custom_domain::CustomDomainRegistry::new(
+                    std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
+                        cd_cfg.store_dir.clone(),
+                    )),
+                    cd_cfg.max_domains,
+                )
+                .with_reserved(reserved),
+            );
+            match registry.load().await {
+                Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
+                // A registry that cannot be read is not fatal to the
+                // deployment: its own certificate still serves. It IS fatal to
+                // custom domains, though — an index that hydrated nothing
+                // cannot tell whether a hostname is already owned, so
+                // `register` refuses until a load succeeds rather than
+                // overwriting the durable record of whoever holds it.
+                Err(e) => tracing::error!(
+                    "failed to load the tenant custom-domain registry: {e}; connected domains will \
+                     not route and no new domain can be connected until this is fixed and the \
+                     process restarted"
+                ),
+            }
+            Some(CustomDomainBindState {
+                registry,
+                cache: std::sync::Arc::new(crate::custom_domain::CustomDomainCertCache::new(
+                    cd_cfg.cert_cache_size,
+                )),
+                store: std::sync::Arc::new(FsAcmeStore::new(
+                    acme_cfg.cache_dir.clone(),
+                    crate::acme::directory_label(&acme_cfg.directory),
+                )),
+                provider: std::sync::Arc::clone(&provider),
+                config: cd_cfg.clone(),
+                acme: acme_cfg.clone(),
+            })
+        }
+        _ => None,
+    };
+
+    let cert_resolver: std::sync::Arc<dyn rustls::server::ResolvesServerCert> =
+        custom_domains.as_ref().map_or_else(
+            || {
+                std::sync::Arc::clone(&resolver)
+                    as std::sync::Arc<dyn rustls::server::ResolvesServerCert>
+            },
+            |cd| {
+                std::sync::Arc::new(
+                    crate::custom_domain::SniCertResolver::new(
+                        std::sync::Arc::clone(&resolver),
+                        acme_cfg.domains.clone(),
+                        std::sync::Arc::clone(&cd.registry),
+                        std::sync::Arc::clone(&cd.cache),
+                    )
+                    // A domain evicted from the bounded cache (or never warmed,
+                    // in a deployment with more domains than the cache holds)
+                    // loads its certificate here rather than stopping being
+                    // served.
+                    .with_source(std::sync::Arc::new(
+                        crate::acme::tenant_domains::FsSniCertSource::new(
+                            std::sync::Arc::clone(&cd.store),
+                            std::sync::Arc::clone(&provider),
+                        ),
+                    )),
+                )
+            },
+        );
+    let server_config = crate::tls::build_server_config_with_resolver(
         std::sync::Arc::clone(&provider),
-        std::sync::Arc::clone(&resolver),
+        cert_resolver,
     )
     .map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
@@ -9317,6 +9474,7 @@ async fn build_acme_tls_listener(
             http_challenge_port: acme_cfg.http_challenge_port,
             https_port,
             dns01: acme_cfg.dns.is_some(),
+            custom_domains,
         },
     ))
 }
@@ -9489,6 +9647,110 @@ fn compose_acme_alert_reporter(
         inner(message);
     })
 }
+
+/// Publish the custom-domain registry and spawn its orchestrator (#1635).
+///
+/// The registry goes into `AppState` so tenancy resolution can route a
+/// connected `Host`; the health indicator and the retention pruner are
+/// registered from the same handles the loop mutates, so the three can never
+/// disagree about a domain's state.
+#[cfg(feature = "acme")]
+fn spawn_custom_domain_task(
+    bind_state: CustomDomainBindState,
+    tokens: crate::acme::challenge::Http01Tokens,
+    coordinator: std::sync::Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    leadership_degraded: bool,
+    state: &AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let CustomDomainBindState {
+        registry,
+        cache,
+        store,
+        provider,
+        config,
+        acme,
+    } = bind_state;
+
+    state.insert_extension(std::sync::Arc::clone(&registry));
+    if let Err(e) = state.health_indicator_registry.register(
+        "custom_domains",
+        crate::actuator::IndicatorGroup::HealthOnly,
+        std::sync::Arc::new(crate::custom_domain::CustomDomainHealthIndicator::new(
+            std::sync::Arc::clone(&registry),
+        )),
+    ) {
+        tracing::warn!("{e}");
+    }
+
+    let issuer = std::sync::Arc::new(crate::acme::tenant_domains::AcmeDomainIssuer::new(
+        acme.clone(),
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
+        tokens,
+    ));
+    let task = std::sync::Arc::new(crate::acme::tenant_domains::CustomDomainTask {
+        registry,
+        cache,
+        certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
+        provider,
+        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier),
+        issuer,
+        limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
+            config.issuance_per_domain_per_day,
+            config.issuance_global_per_hour,
+            config.failure_backoff_secs,
+            config.max_failure_backoff_secs,
+        )),
+        ingress: config.ingress(),
+        renew_before_days: acme.renew_before_days,
+        // A per-domain failure is a framework-scheduled operation failing, so
+        // it raises #1610's alert naming the domain and its tenant.
+        reporter: make_custom_domain_reporter(state),
+        recovery: Some(make_custom_domain_recovery(state)),
+        coordinator,
+        leadership_degraded,
+        cert_store_paths: Some(store),
+        // The deployment's own certificate shares this store and has no
+        // registry record; naming it keeps the retention prune from deleting
+        // the certificate the listener is serving.
+        retained_cert_ids: std::iter::once(
+            crate::acme::store::CertId::from_domains(&acme.domains)
+                .as_str()
+                .to_owned(),
+        )
+        .collect(),
+    });
+
+    state.insert_extension(std::sync::Arc::clone(&task)
+        as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
+
+    let interval = std::time::Duration::from_secs(config.poll_interval_secs.max(1));
+    tokio::spawn(async move {
+        task.run(interval, shutdown).await;
+    });
+}
+
+/// The reporter a custom-domain failure is dispatched through.
+#[cfg(feature = "acme")]
+fn make_custom_domain_reporter(state: &AppState) -> crate::acme::tenant_domains::ReporterFn {
+    let state = state.clone();
+    std::sync::Arc::new(move |message: String| {
+        crate::alerts::notify_scheduled_task_failure(&state, CUSTOM_DOMAIN_TASK_NAME, &message);
+    })
+}
+
+/// The callback that clears an outstanding custom-domain alert.
+#[cfg(feature = "acme")]
+fn make_custom_domain_recovery(state: &AppState) -> crate::acme::tenant_domains::RecoveryFn {
+    let state = state.clone();
+    std::sync::Arc::new(move || {
+        crate::alerts::notify_scheduled_task_recovered(&state, CUSTOM_DOMAIN_TASK_NAME);
+    })
+}
+
+/// The scheduled-task name a custom-domain failure alert is keyed on.
+#[cfg(feature = "acme")]
+const CUSTOM_DOMAIN_TASK_NAME: &str = "custom_domain_certificates";
 
 /// The callback that clears an outstanding ACME renewal alert once issuance
 /// succeeds again.

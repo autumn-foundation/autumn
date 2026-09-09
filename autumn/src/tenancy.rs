@@ -39,7 +39,14 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
             .ok_or_else(|| {
                 crate::AutumnError::service_unavailable_msg("Config is not available")
             })?;
-        let tenant_id = extract_tenant_from_parts(parts, &config).await?;
+        let domains =
+            state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
+        let tenant_id = extract_tenant_from_parts_with_domains(
+            parts,
+            &config,
+            domains.as_deref().map(AsRef::as_ref),
+        )
+        .await?;
         Ok(Self(tenant_id))
     }
 }
@@ -70,7 +77,49 @@ pub async fn extract_tenant_from_parts(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
+    extract_tenant_from_parts_with_domains(parts, config, None).await
+}
+
+/// [`extract_tenant_from_parts`], plus the custom-domain registry (#1635).
+///
+/// A hostname a tenant connected is not a subdomain of `tenancy.base_domain`,
+/// so subdomain resolution would reject it. Consulting the registry FIRST — and
+/// only for a domain that has reached `Active` — is what routes
+/// `app.clientco.com` to its owning tenant while an unregistered outside host
+/// keeps its 400.
+///
+/// Applies only to `tenancy.source = "subdomain"`, where the `Host` header is
+/// already what identifies the tenant. Under a credential-backed source
+/// (`header`, `session`, `jwt`) the registry is not consulted at all.
+///
+/// Callers holding an `AppState` pass
+/// [`CustomDomainRegistry::from_state`](crate::custom_domain::CustomDomainRegistry::from_state);
+/// `None` is the pre-#1635 behaviour.
+///
+/// # Errors
+///
+/// Returns the same rejection as [`extract_tenant_from_parts`] when the
+/// configured source cannot resolve a tenant.
+pub async fn extract_tenant_from_parts_with_domains(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    domains: Option<&crate::custom_domain::CustomDomainRegistry>,
+) -> Result<String, crate::AutumnError> {
     if let Some(tenant_id) = replayed_tenant() {
+        return Ok(tenant_id);
+    }
+    // Only under `source = "subdomain"`, where the `Host` header is ALREADY the
+    // tenant signal. Under `header`/`session`/`jwt` the tenant comes from a
+    // credential the client cannot forge, and letting a connected `Host`
+    // outrank it would let any authenticated user reach another tenant's data
+    // by setting one header.
+    if config.tenancy.enabled
+        && config.tenancy.source == "subdomain"
+        && let Some(registry) = domains
+        && let Some(host) = request_host(parts)
+        && let Some(tenant_id) = registry.tenant_for_host(&host)
+    {
+        record_tenant(&tenant_id);
         return Ok(tenant_id);
     }
     // A capsule with no recorded tenant falls through to the real resolver.
@@ -113,6 +162,27 @@ fn record_tenant(tenant_id: &str) {
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
 const fn record_tenant(_tenant_id: &str) {}
+
+/// The request's effective host, preferring the proxy-resolved one.
+///
+/// The `X-Forwarded-Host` a trusted upstream set (resolved into
+/// [`crate::security::ResolvedClientIdentity`]) wins over the raw `Host`
+/// header, so a deployment behind a load balancer sees the name the client
+/// actually asked for. `None` when neither is present or the header is not
+/// UTF-8.
+fn request_host(parts: &axum::http::request::Parts) -> Option<String> {
+    parts
+        .extensions
+        .get::<crate::security::ResolvedClientIdentity>()
+        .and_then(|id| id.host.clone())
+        .or_else(|| {
+            parts
+                .headers
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(ToOwned::to_owned)
+        })
+}
 
 // Tenant extraction logic based on configuration
 #[allow(
@@ -161,32 +231,21 @@ async fn extract_tenant_from_parts_inner(
             Ok(val)
         }
         "subdomain" => {
-            // Prefer the proxy-resolved host (honours X-Forwarded-Host from trusted
-            // upstreams); fall back to the raw Host header when the layer has not run.
-            let host_owned: String = parts
-                .extensions
-                .get::<crate::security::ResolvedClientIdentity>()
-                .and_then(|id| id.host.clone())
-                .map_or_else(
-                    || {
-                        parts
-                            .headers
-                            .get(axum::http::header::HOST)
-                            .ok_or_else(|| {
-                                crate::AutumnError::bad_request_msg(
-                                    "Missing Host header for subdomain tenancy",
-                                )
-                            })
-                            .and_then(|h| {
-                                h.to_str().map(ToOwned::to_owned).map_err(|_| {
-                                    crate::AutumnError::bad_request_msg(
-                                        "Invalid UTF-8 in Host header",
-                                    )
-                                })
-                            })
-                    },
-                    Ok,
-                )?;
+            let host_owned = match request_host(parts) {
+                Some(host) => host,
+                // A present-but-undecodable `Host` is a different operator
+                // problem from an absent one, so it keeps its own message.
+                None if parts.headers.contains_key(axum::http::header::HOST) => {
+                    return Err(crate::AutumnError::bad_request_msg(
+                        "Invalid UTF-8 in Host header",
+                    ));
+                }
+                None => {
+                    return Err(crate::AutumnError::bad_request_msg(
+                        "Missing Host header for subdomain tenancy",
+                    ));
+                }
+            };
 
             let host = host_owned.as_str();
             let host_only = host.split(':').next().unwrap_or(host).trim();
@@ -569,29 +628,32 @@ pub async fn tenancy_middleware(
         return next.run(Request::from_parts(parts, body)).await;
     }
 
-    let tenant_id = match extract_tenant_from_parts(&mut parts, &config).await {
-        Ok(t) => t,
-        Err(e) => {
-            // For browser logins, bounce a missing/unauthenticated tenant to the
-            // configured login page instead of returning a raw 401. Only do this
-            // for clients that accept HTML (navigating browsers): API clients
-            // (e.g. `Accept: application/json`) expect the 401 so their error
-            // handling isn't broken by a 303 to a login page. Other error classes
-            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
-            // are not masked as login redirects.
-            if e.status() == axum::http::StatusCode::UNAUTHORIZED
-                && let Some(target) = &config.tenancy.login_redirect
-                && parts
-                    .headers
-                    .get(axum::http::header::ACCEPT)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|accept| accept.contains("text/html"))
-            {
-                return axum::response::Redirect::to(target).into_response();
+    let domains = crate::custom_domain::CustomDomainRegistry::from_state(&state);
+    let tenant_id =
+        match extract_tenant_from_parts_with_domains(&mut parts, &config, domains.as_deref()).await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // For browser logins, bounce a missing/unauthenticated tenant to the
+                // configured login page instead of returning a raw 401. Only do this
+                // for clients that accept HTML (navigating browsers): API clients
+                // (e.g. `Accept: application/json`) expect the 401 so their error
+                // handling isn't broken by a 303 to a login page. Other error classes
+                // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
+                // are not masked as login redirects.
+                if e.status() == axum::http::StatusCode::UNAUTHORIZED
+                    && let Some(target) = &config.tenancy.login_redirect
+                    && parts
+                        .headers
+                        .get(axum::http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|accept| accept.contains("text/html"))
+                {
+                    return axum::response::Redirect::to(target).into_response();
+                }
+                return e.into_response();
             }
-            return e.into_response();
-        }
-    };
+        };
 
     // Tag the request-scoped log context (#1169) so every subsequent event
     // automatically carries the resolved tenant id.

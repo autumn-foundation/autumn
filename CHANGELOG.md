@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
+  management system.** `autumn new <name> --starter cms` now scaffolds a
+  complete CMS, joining `saas` as the second curated built-in. The rendered
+  form is committed at `examples/cms/` and pinned to the starter byte-for-byte
+  by `embedded_cms_matches_example_cms`, so the two cannot diverge.
+
+  What it covers: posts, pages and custom post types over one `posts` table
+  keyed by `post_type`; hierarchical categories, flat tags and custom
+  taxonomies; the six WordPress post statuses as a `#[state_machine]` (so an
+  undeclared edge like `publish -> future` is refused rather than merely
+  discouraged); scheduled publishing on a real `#[scheduled]` timer rather than
+  wp-cron's visitor-triggered one; revisions with restore; a `BlobStore`-backed
+  media library with a server-side MIME allowlist; threaded comments with the
+  approved/pending/spam/trash moderation queue and guest commenters; the five
+  core roles and their capability matrix, derived from the stored role at check
+  time rather than copied into usermeta; menus, widgets and switchable themes;
+  a typed action/filter plugin API whose hook names are enum variants, so a
+  misspelled hook is a compile error; shortcodes; all five permalink structures;
+  Atom/RSS feeds site-wide and per-term; a permalink-aware sitemap; a REST API;
+  and idempotent JSON import/export.
+
+  Deliberately excluded, with reasons in the example's README: multisite (Autumn's
+  row-level tenancy is the better answer, see `examples/saas`), XML-RPC, the block
+  editor, pingbacks, and runtime plugin/theme installation.
+
+  The `new` skill now documents `--starter` at all, which it did not before:
+  the flag has been stable CLI surface since #993, but no skill or agent file
+  mentioned it, so an agent scaffolding a project would never offer either
+  archetype. It now carries a starter table, when to reach for each, the
+  `cms` starter's Postgres 12 requirement and first-account-owns-the-site
+  flow, and the provenance caveat for community starters.
+
+  Requires PostgreSQL 12+ — the full-text `search_vector` is a stored generated
+  column. The Docker suite covers the flows most likely to rot: draft
+  invisibility, the state machine refusing an undeclared edge, comment-counter
+  arithmetic across moderation transitions, contributor capability limits,
+  password protection across page/feed/API, permalink-structure changes not
+  404ing existing URLs, revision restore, export/import idempotence, and a CSRF
+  round trip.
+
+### Changed
+
+- **Migration version gate: starter templates no longer collide with their
+  examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror
+  of its committed example and the two never coexist in one database, so
+  `scripts/check-migration-versions.sh` now exempts a starter/example pair from
+  the **uniqueness** check only — shape, real-time and precision still apply,
+  since a scaffolded project inherits the version verbatim. Previously the only
+  such pair (`saas`) passed by accident, because both sides happened to be
+  grandfathered in the baseline.
+
+- **Starter drift gate: one implementation for every starter.**
+  `embedded_saas_matches_example_saas` was a single hard-coded test body; it is
+  now `assert_starter_matches_example(starter, project_name)`, called by both
+  the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
 
 - **web:** the `application/problem+json` `errors` array no longer includes a
@@ -21,6 +78,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty-message fields the same way `Display` does.
 
 ### Security
+
+- **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
+  (and `#[throttle(key = "principal")]`) now folds in the ambient resolved
+  tenant (🛡 Warden):** the key was built as `principal:<id>` from whatever
+  identity value an app's login handler stored in the session
+  (`session.insert("user_id", user.id.to_string())`, the pattern
+  `docs/guide/authentication.md` documents), with no tenant consulted —
+  unlike every `tenant_scoped` repository operation, which resolves
+  `CURRENT_TENANT` automatically. That identity value is not guaranteed
+  unique across tenants: Autumn's own sharding guide documents that
+  per-tenant primary keys are shard-local `BIGSERIAL`s
+  (`docs/guide/sharding.md`), so the first user provisioned on two different
+  tenants' shards both land on `id = 1`. An app that turned on Autumn's
+  multi-tenancy (`[tenancy] enabled = true`) together with either documented
+  rate-limiting feature shared one token bucket across any two tenants whose
+  users' principal ids happened to coincide: an ordinary authenticated user
+  of tenant A exhausting their own bucket denied service (`429`) to an
+  unrelated tenant B user who had made zero requests of their own.
+  `Limiter::extract_key` and `#[throttle]`'s per-route guard now fold
+  `CURRENT_TENANT` into the bucket key (not into the value handed to
+  `with_tier_hook`, which still receives the bare principal id its
+  documented signature promises), tagging both the tenant-present and
+  tenant-absent cases so a caller with a self-chosen principal id can never
+  forge one into colliding with the other. **Compatibility note:**
+  upgrading resets any in-flight `authenticated_principal`/`principal`
+  bucket, tenancy-enabled or not — a one-time full-bucket refill, not a
+  correctness change. See `docs/security/2026-09-09-rate-limit-tenant-key/`.
 
 - **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
   layers in SSG/ISR (`dist`) mode, closing an authn-bypass gap (🛡 Warden):**
@@ -677,6 +761,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `counter_cache_capture_fks`/`_many` now return `(parent, contribution)` pairs
   rather than parent ids. See `docs/guide/derivations.md`.
 
+- **a11y:** `autumn a11y verify` now keys its findings to the **routes** that
+  serve them, and rolls them up by WCAG success criterion (part of #1706). The
+  scan reads the route attribute macros — `#[get]`, `#[post]`, `#[put]`,
+  `#[patch]`, `#[delete]`, `#[static_get]` — out of the token stream it already
+  walks, indexes every function and the free functions it calls, then walks out
+  from each handler to the markup it reaches, so a defect in a shared partial
+  names the routes that reach it, not just a file and a line. The JSON manifest gains a `routes` array
+  (per-route `pass`/`fail` with a finding count), a `routes` list on each
+  finding, and a `wcag` rollup that splits the multi-criterion rules so `label`
+  reports separately under 1.3.1, 3.3.2 and 4.1.2; the summary gains `routes`,
+  `routes_failing` and `unrouted`. Attribution is a conservative lower bound in
+  the same spirit as the scanner: a call is followed only when the called name
+  is defined exactly once across the scan as a free item (a nested or
+  associated `fn` is not a bare-call target); method calls, type-qualified
+  associated calls (`Widget::new()`), functions passed by name and names a
+  parameter or local shadows are not resolved; and the path is the one declared on the handler (mount-time prefixes
+  are applied at runtime and are not resolved). So `status: "pass"` means no
+  finding was attributed to that route, which `summary.unrouted` qualifies.
+  Exit codes are unchanged — route data reports, it does not gate.
+
+- **a11y:** new typed `a11y::RadioGroup` / `a11y::RadioOption` primitives (part
+  of #1706) — the last common form control without a compile-time label
+  obligation. A radio group needs two accessible names, and both are now
+  type-level: `RadioOption::new(value, label)` requires the choice label, and
+  `RadioGroup::new(name, first)` returns a `RadioGroup<NoLabel>` that does not
+  implement `Render` until `.label(..)`/`.aria_label(..)`/`.labelled_by(..)`
+  transitions it to `RadioGroup<Labeled>`, so an unnamed group is
+  unrepresentable as markup (proven by trybuild fixtures). The first choice is a
+  constructor argument, so a group of choices always has one. A visible name
+  renders `<fieldset><legend>`, the ARIA variants a `<div>`, both with
+  `role="radiogroup"` — `<fieldset>` alone maps to role `group`, which does not
+  support `aria-required`. `aria-invalid` and `hx-*` land on each `<input>`,
+  where assistive technology reads validity and htmx reads a value;
+  `aria-describedby` and `aria-required` stay on the group. `checked_value(..)`
+  sets the single selection authoritatively, and each choice gets an id pairing
+  it with its own `<label for=…>` — derived from the group name and the choice
+  value with any `-` doubled, so two groups cannot collide, and prefixable with
+  `.id_prefix(..)` when the same group is rendered repeatedly.
 
 - **cli:** `autumn db scrub --sample <table>=<count|percent%>` emits a
   **referentially-intact subset** instead of the whole scrubbed copy (issue
@@ -1166,6 +1288,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after every refresh, and the run refuses and rolls back if either moved. A
   refresh that UPDATEs in place without changing a count or invalidating a
   reference is not detected, and is not claimed to be.
+
 - **An actuator path drift gate for the docs corpus [no-plugin]:** the five
   docs gates that came before it cover the link a reader clicks
   (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
@@ -1291,6 +1414,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now comes from one derivation shared with `code()`, so the two cannot
   disagree. Guide: `docs/guide/forms.md`, "Reading the failure back".
 
+- **tls:** tenants can connect their own domains, each with its own
+  automatically issued and renewed certificate (issue #1635). Enable
+  `[server.tls.acme.custom_domains]` with an ingress hostname (and addresses,
+  for apex domains) and the whole journey ships: the app registers a hostname
+  for a tenant, autumn renders the exact CNAME or A/AAAA records to show that
+  tenant, and the domain moves through queryable `pending_dns` → `verified` →
+  `issuing` → `active` states carrying the reason whenever it is stuck. No
+  ACME order is created until autumn independently confirms the hostname
+  resolves to this deployment; once active, requests on that `Host` resolve to
+  the owning tenant and are served that domain's certificate by SNI. An SNI
+  hostname nobody registered is refused at the handshake without contacting the
+  CA, and issuance is capped per domain and deployment-wide with exponential
+  backoff on repeated failure. Renewal is per domain and isolated: a failure
+  names the domain and tenant in `/actuator/health` and raises the
+  `scheduled_task_failure` alert while every other domain keeps serving and
+  renewing. Certificates load incrementally through a bounded cache, so a
+  1,000-domain deployment does not need them all resident. Offboarding stops
+  routing, serving and renewal and deletes the stored certificate; the new
+  `custom_domains` retention dataset prunes abandoned registrations and
+  orphaned certificates. `autumn doctor` grades the section and, with
+  `--online`, flags registered domains whose DNS no longer points here. See
+  `docs/guide/tls.md`.
 - **A Rust symbol drift gate for the docs corpus [no-plugin]:** the four docs
   gates that came before it cover the link a reader clicks
   (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the

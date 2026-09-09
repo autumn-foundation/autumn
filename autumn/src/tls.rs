@@ -459,6 +459,23 @@ pub fn build_server_config(
     provider: Arc<CryptoProvider>,
     resolver: Arc<ReloadableCertResolver>,
 ) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    build_server_config_with_resolver(provider, resolver)
+}
+
+/// [`build_server_config`], for any [`ResolvesServerCert`].
+///
+/// The custom-domain path (#1635) serves a per-SNI resolver rather than the
+/// single swappable certificate, so the listener takes the resolver as a trait
+/// object; everything else about the config is identical.
+///
+/// # Errors
+///
+/// Returns [`TlsError::BuildConfig`] if rustls rejects the chosen protocol
+/// versions for the provider.
+pub fn build_server_config_with_resolver(
+    provider: Arc<CryptoProvider>,
+    resolver: Arc<dyn ResolvesServerCert>,
+) -> Result<Arc<rustls::ServerConfig>, TlsError> {
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|source| TlsError::BuildConfig { source })?
@@ -768,7 +785,9 @@ pub fn inspect_leaf(
 /// private key, WITHOUT touching the filesystem.
 ///
 /// Used by the ACME path (issue #1608) to hot-swap a freshly issued certificate
-/// into a [`ReloadableCertResolver`] without a round-trip through disk. Like
+/// into a [`ReloadableCertResolver`] without a round-trip through disk, and by
+/// the custom-domain SNI cache (issue #1635) to parse a per-tenant certificate
+/// read back from the store. Like
 /// [`load_certified_key`], `from_der` validates the key and checks it matches
 /// the leaf; unlike it, this does not reject an expired leaf (the caller — the
 /// renewal task — decides how to react to a stale cert, and the self-signed
@@ -778,7 +797,6 @@ pub fn inspect_leaf(
 ///
 /// Returns a human-readable message if the PEM cannot be parsed or the key does
 /// not match the leaf certificate.
-#[cfg(feature = "acme")]
 pub fn certified_key_from_pem(
     chain_pem: &[u8],
     key_pem: &[u8],
@@ -800,14 +818,14 @@ pub fn certified_key_from_pem(
 
 /// The leaf certificate's `notAfter` (UNIX seconds) from an in-memory PEM chain.
 ///
-/// Used by the ACME renewal loop and health indicator to decide when a stored
+/// Used by the ACME renewal loop and health indicator — and by the per-domain
+/// custom-domain renewal scheduler (#1635) — to decide when a stored
 /// certificate is due for renewal. Returns an error message if the PEM has no
 /// certificate or the leaf cannot be parsed.
 ///
 /// # Errors
 ///
 /// Returns a human-readable message on a missing or unparseable leaf.
-#[cfg(feature = "acme")]
 pub fn leaf_not_after_from_pem(chain_pem: &[u8]) -> Result<i64, String> {
     let leaf = CertificateDer::pem_slice_iter(chain_pem)
         .next()

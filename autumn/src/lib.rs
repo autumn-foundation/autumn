@@ -153,6 +153,7 @@ pub mod config;
 pub mod consent;
 pub mod credentials;
 pub mod current;
+pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
 pub(crate) mod db_url;

@@ -297,6 +297,12 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_checkbox_unlabeled.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_filefield_unlabeled.rs");
+    // A radio group carries two obligations: a name for each choice and a name
+    // for the group. Neither can be skipped.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_radiogroup_unlabeled.rs");
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/a11y_radiooption_missing_label.rs");
 }
 
 /// The `state_migration!` fixtures get their own `TestCases` for the same

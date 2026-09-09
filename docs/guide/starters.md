@@ -28,6 +28,7 @@ autumn new --list-starters
 Available built-in starters:
 
   saas  Multi-tenant SaaS: session auth + row-level tenancy + tenant-scoped dashboard
+  cms   WordPress-parity CMS: posts/pages, taxonomies, media, moderated comments, roles, themes, plugins
 
 Scaffold one with:   autumn new <name> --starter <starter>
 Community starters:  autumn new <name> --starter <git-url|owner/repo>[@ref] [--yes]
@@ -49,6 +50,28 @@ composes only already-shipped primitives — session auth, row-level
 multi-tenancy, repositories, and sessions — and is itself the committed
 [`examples/saas`](../../examples/saas) app, covered by the same CI drift gate as
 every other example, so it cannot rot silently.
+
+Or scaffold the content-management starter:
+
+```bash
+autumn new mysite --starter cms
+cd mysite
+docker compose up -d        # Postgres 12+ (the full-text column is a stored generated column)
+autumn migrate
+autumn dev
+```
+
+Open `http://localhost:3000/register`; the **first** account created owns the
+site and is made an Administrator, so there are no default credentials shipped
+anywhere. Everything after that happens in `/admin`: posts, pages and custom
+post types, categories and tags, a media library, a comment moderation queue,
+revisions, users and roles, menus, widgets, themes and settings. Like `saas`,
+it composes only already-shipped primitives — `#[state_machine]`,
+`#[searchable]`, `#[repository]`, `MutationHooks`, `storage::BlobStore`,
+`#[scheduled]`, `#[cached]` — and is itself the committed
+[`examples/cms`](../../examples/cms) app, covered by the same CI drift gate.
+Its README carries a full WordPress-core parity scorecard, including what is
+deliberately left out.
 
 Bare `autumn new <name>` (no `--starter`) keeps today's minimal-base behaviour
 unchanged.
@@ -176,5 +199,7 @@ registry to register with; share the `owner/repo` and a ref and you are done.
 
 - [`examples/saas`](../../examples/saas) — the flagship built-in starter, in its
   rendered form.
+- [`examples/cms`](../../examples/cms) — the `cms` starter in its rendered form,
+  with the WordPress-core parity scorecard in its README.
 - [`STABILITY.md`](../../STABILITY.md) — `--starter`, `--list-starters`,
   `--starter-ref`, and `--yes` are stable CLI surface.
