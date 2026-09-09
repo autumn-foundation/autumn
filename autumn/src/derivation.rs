@@ -1819,6 +1819,21 @@ mod tests {
         check_source_columns(&[&folded], &[]).expect_err("case variants are one column on SQLite");
     }
 
+    /// The control set carries a copy of the state-table migration so
+    /// `autumn migrate` creates it; the copy must not drift from the set the
+    /// runtime and the shard migrator apply.
+    #[test]
+    fn the_control_copy_of_the_state_migration_matches_the_standalone_set() {
+        assert_eq!(
+            include_str!("../migrations/20260907000000_create_derivations/up.sql"),
+            include_str!("../derivation_migrations/20260907000000_create_derivations/up.sql"),
+        );
+        assert_eq!(
+            include_str!("../migrations/20260907000000_create_derivations/down.sql"),
+            include_str!("../derivation_migrations/20260907000000_create_derivations/down.sql"),
+        );
+    }
+
     #[test]
     fn source_columns_are_read_off_the_lowered_sql() {
         // The grouping key first, then the SQL's columns.

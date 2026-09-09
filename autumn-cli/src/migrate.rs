@@ -3168,6 +3168,15 @@ mod tests {
                 .any(|name| name == "20260515000000_create_repository_commit_hook_queue"),
             "framework migrations must include the durable repository commit hook queue: {names:?}"
         );
+        // `autumn migrate` applies only this set to the control target, so the
+        // derivation state table has to be in it or a release migration job
+        // reports the control database current without it (#1769).
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "20260907000000_create_derivations"),
+            "framework migrations must include the derivation state table: {names:?}"
+        );
     }
 
     #[test]

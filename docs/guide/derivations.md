@@ -121,10 +121,12 @@ ALTER TABLE posts ADD COLUMN visible_score BIGINT NOT NULL DEFAULT 0;
 `NOT NULL DEFAULT 0` is load-bearing. The maintenance is `c = c + $1`, and
 `NULL + 1` is `NULL`.
 
-The state table is the framework's. `_autumn_derivations` ships as a framework
-migration, folded in automatically when the binary registers at least one
-`#[derivation]`. An application with no derivation gets neither the table nor
-the boot work.
+The state table is the framework's. `_autumn_derivations` ships in the
+framework migration set, so `autumn migrate` creates it on the control database
+like every other framework table, and the runtime folds the same migration in
+as a standalone set (on every shard target too) whenever the binary registers
+at least one `#[derivation]`. An application with no derivation gets no boot
+work: the table sits empty.
 
 ## What is maintained, and when
 

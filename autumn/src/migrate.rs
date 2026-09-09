@@ -3052,6 +3052,31 @@ mod tests {
     /// repositories that write those rows touch. Missing one leaves
     /// `autumn migrate --shard` reporting a clean shard that a boot then fails
     /// on, so the list is asserted rather than left to review.
+    /// The control target is migrated by `autumn migrate` from
+    /// [`FRAMEWORK_MIGRATIONS`] alone, so every table the runtime appends as a
+    /// standalone set must also live in the control set, or a release
+    /// migration job reports the control database current without it and the
+    /// boot's reconciliation fails on a missing table.
+    #[cfg(feature = "db")]
+    #[test]
+    fn every_shard_required_framework_table_is_in_the_control_set_too() {
+        let names: Vec<String> = migration_versions_and_names::<Pg>(&FRAMEWORK_MIGRATIONS)
+            .expect("enumerate the control set")
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        for required in [
+            "20260526000000_create_version_history",
+            "20260515000000_create_repository_commit_hook_queue",
+            "20260907000000_create_derivations",
+        ] {
+            assert!(
+                names.iter().any(|name| name == required),
+                "`{required}` must reach the control target through `autumn migrate`: {names:?}"
+            );
+        }
+    }
+
     #[cfg(feature = "db")]
     #[test]
     fn every_shard_required_framework_table_is_in_the_shard_set() {
