@@ -10019,53 +10019,12 @@ async fn a_term_is_locked_before_its_relationships_are_written() {
         {{crate_name}}::content::set_post_terms(&mut conn, post_id, vec![term_id]).await
     });
 
-    // Wait for the save to be blocked on a lock rather than merely slow.
-    let mut blocked_pid: Option<i32> = None;
-    for _ in 0..100 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mut probe = TestDb::shared().await.pool().get().await.expect("conn");
-        #[derive(diesel::QueryableByName)]
-        struct Pid {
-            #[diesel(sql_type = diesel::sql_types::Integer)]
-            pid: i32,
-        }
-        // A row-level wait shows up as an ungranted lock on the *transaction*
-        // holding the row, not on the relation — filtering to relation locks
-        // finds nothing however long you poll.
-        let waiting: Vec<Pid> = diesel::sql_query(
-            "SELECT pid FROM pg_locks WHERE NOT granted AND pid <> pg_backend_pid()",
-        )
-        .load(&mut probe)
-        .await
-        .expect("pg_locks");
-        if let Some(found) = waiting.into_iter().next() {
-            blocked_pid = Some(found.pid);
-            break;
-        }
-    }
-    let blocked_pid = blocked_pid.expect("the save must block on the held term lock");
+    let blocked_pid = wait_for_a_blocked_backend().await;
 
     // The discriminating question: has the blocked transaction already written
     // to `post_terms`? A write there takes a `RowExclusiveLock` on the table,
     // which is granted and visible for as long as the transaction lives.
-    #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
-    let held: i64 = {
-        let mut probe = TestDb::shared().await.pool().get().await.expect("conn");
-        let rows: Vec<Count> = diesel::sql_query(format!(
-            "SELECT count(*) AS n
-             FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
-             WHERE l.pid = {blocked_pid} AND l.granted
-               AND c.relname = 'post_terms' AND l.mode = 'RowExclusiveLock'"
-        ))
-        .load(&mut probe)
-        .await
-        .expect("pg_locks");
-        rows.into_iter().next().map_or(0, |row| row.n)
-    };
+    let held = granted_locks(blocked_pid, "post_terms", "RowExclusiveLock").await;
     assert_eq!(
         held, 0,
         "the save must take the term's lock before writing any post_terms row; \
@@ -10090,6 +10049,270 @@ async fn a_term_is_locked_before_its_relationships_are_written() {
             .expect("the count")
     };
     assert_eq!(filed, 1, "the post is filed under the term");
+}
+
+/// The post is locked before its terms, so the lock order is the same
+/// everywhere.
+///
+/// `transition_status` and the scheduled-publish sweep both update the post row
+/// and then recount its terms. A taxonomy save that took a term lock first and
+/// then blocked on the post — the relationship insert key-shares it through the
+/// foreign key — closes the cycle, and PostgreSQL aborts one of them.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_post_is_locked_before_its_terms() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Ordered", "Body.", "publish").await;
+
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Ordered"), ("slug", "ordered")]))
+        .send()
+        .await
+        .assert_status(303);
+    let term_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::terms::table
+            .filter({{crate_name}}::schema::terms::slug.eq("ordered"))
+            .select({{crate_name}}::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the term")
+    };
+
+    // The *post* held this time, not the term.
+    let mut holder = TestDb::shared().await.pool().get().await.expect("conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    diesel::sql_query(format!(
+        "SELECT id FROM posts WHERE id = {post_id} FOR UPDATE"
+    ))
+    .execute(&mut holder)
+    .await
+    .expect("hold the post");
+
+    let save = tokio::spawn(async move {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::set_post_terms(&mut conn, post_id, vec![term_id]).await
+    });
+
+    let blocked_pid = wait_for_a_blocked_backend().await;
+
+    // A `SELECT ... FOR UPDATE` on `terms` takes a `RowShareLock` on the table
+    // and keeps it for the transaction. Holding one while blocked on the post
+    // is the inverted order.
+    let held = granted_locks(blocked_pid, "terms", "RowShareLock").await;
+    assert_eq!(
+        held, 0,
+        "the save must reach the post's lock before it takes any lock on terms"
+    );
+
+    diesel::sql_query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("commit");
+    save.await.expect("the task").expect("the save succeeds");
+}
+
+/// The export reads every table from one snapshot.
+///
+/// The reads were separate repository calls, each on its own pooled connection
+/// and therefore its own snapshot, so a rename landing between two of them
+/// could write a page into the file under its old slug and name it as a child's
+/// ancestor under the new one. A restore then cannot resolve the parent and
+/// files the child at the top level.
+///
+/// Held here deterministically: the export is blocked part-way through by an
+/// exclusive lock on `posts`, a row is committed to a table it has not read
+/// yet, and the finished file must not contain it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_export_reads_one_snapshot() {
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Exported", "Body.", "publish").await;
+
+    // `posts` is read after `terms` and before `attachments`, so locking it
+    // stops the export with its snapshot already fixed.
+    let mut holder = TestDb::shared().await.pool().get().await.expect("conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    diesel::sql_query("LOCK TABLE posts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut holder)
+        .await
+        .expect("lock posts");
+
+    let export = tokio::spawn(async move {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::export_snapshot(&mut conn).await
+    });
+
+    wait_for_a_blocked_backend().await;
+
+    // Committed after the export began, into a table it has not reached.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO attachments (title, slug, mime_type, byte_size, alt_text, caption)
+         VALUES ('Late', 'after-the-export-began', 'image/png', 1, '', '')",
+    )
+    .await
+    .expect("insert the late attachment");
+
+    diesel::sql_query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("commit");
+    let rows = export.await.expect("the task").expect("the export");
+
+    assert!(
+        rows.attachments
+            .iter()
+            .all(|attachment| attachment.slug != "after-the-export-began"),
+        "a row committed after the export began must not be in the file"
+    );
+}
+
+/// Poll until some backend is waiting on a lock, and return its pid.
+///
+/// A row-level wait shows up as an ungranted lock on the *transaction* holding
+/// the row, not on the relation — filtering to relation locks finds nothing
+/// however long you poll.
+async fn wait_for_a_blocked_backend() -> i32 {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut probe = TestDb::shared().await.pool().get().await.expect("conn");
+        let waiting: Vec<Pid> = diesel::sql_query(
+            "SELECT pid FROM pg_locks WHERE NOT granted AND pid <> pg_backend_pid()",
+        )
+        .load(&mut probe)
+        .await
+        .expect("pg_locks");
+        if let Some(found) = waiting.into_iter().next() {
+            return found.pid;
+        }
+    }
+    panic!("nothing blocked on a lock");
+}
+
+/// How many granted locks of `mode` a backend holds on `relation`.
+async fn granted_locks(pid: i32, relation: &str, mode: &str) -> i64 {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut probe = TestDb::shared().await.pool().get().await.expect("conn");
+    let rows: Vec<Count> = diesel::sql_query(format!(
+        "SELECT count(*) AS n
+         FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+         WHERE l.pid = {pid} AND l.granted
+           AND c.relname = '{relation}' AND l.mode = '{mode}'"
+    ))
+    .load(&mut probe)
+    .await
+    .expect("pg_locks");
+    rows.into_iter().next().map_or(0, |row| row.n)
+}
+
+/// A comment the page cannot render is not promised an anchor.
+///
+/// A page is capped at `MAX_THREAD_COMMENTS`, so on a thread past the cap a new
+/// reply can belong to a page with no room left for it. Sending the browser to
+/// `#comment-<id>` for a comment that is not on the page it lands on is the
+/// same broken promise as sending it to the wrong page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_comment_the_page_cannot_render_is_not_anchored() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Overfull", "Body.", "publish").await;
+
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             VALUES ({post_id}, NULL, 1, 'Owner', 'owner@example.com', '', '',
+                     'The root', 'approved', NOW())"
+        ),
+    )
+    .await
+    .expect("seed the root");
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             SELECT {post_id}, (SELECT id FROM comments WHERE body = 'The root'),
+                    1, 'Owner', 'owner@example.com', '', '',
+                    'Reply ' || lpad(g::text, 5, '0'), 'approved',
+                    NOW() - ((2000 - g) || ' seconds')::interval
+             FROM generate_series(1, 1500) AS g"
+        ),
+    )
+    .await
+    .expect("seed the replies");
+
+    // A signed-in reply is approved immediately, and it is the newest comment
+    // on a page that is already full — so it is exactly what truncation drops,
+    // which takes the oldest rows first.
+    let root_id: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::comments::table
+            .filter({{crate_name}}::schema::comments::body.eq("The root"))
+            .select({{crate_name}}::schema::comments::id)
+            .first(&mut conn)
+            .await
+            .expect("the root")
+    };
+    let posted = client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("body", "One reply too many"),
+            ("reply_to", &root_id.to_string()),
+        ]))
+        .send()
+        .await;
+    let location = posted
+        .assert_status(303)
+        .header("location")
+        .expect("a redirect");
+    assert!(
+        !location.contains("#comment-"),
+        "the redirect must not promise an anchor the page does not render: {location}"
+    );
+
+    // The comment really was accepted — the page just cannot show it, and says
+    // so through the truncation notice.
+    client
+        .get(location)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("some replies are not shown");
 }
 
 /// A comment URL survives the one permalink structure that is already a query.

@@ -290,13 +290,21 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
     let _user = require_capability!(repos, session, csrf, Capability::ExportContent);
     let settings = repos.settings().await?;
 
+    // Every read on one repeatable-read snapshot. They were separate
+    // repository calls, each on its own pooled connection and therefore its own
+    // snapshot: renaming a page while the export ran could write that page into
+    // the file under its old slug and, a few rows later, name it as a child's
+    // ancestor under the new one. The restore then cannot resolve the parent
+    // and files the child at the top level — a backup that is wrong in a way
+    // nobody can see, which is the failure mode a backup exists to prevent.
+    let rows = {
+        let mut conn = repos.conn().await?;
+        crate::content::export_snapshot(&mut conn).await?
+    };
+
     let mut terms = Vec::new();
-    for taxonomy in crate::content_types::all_taxonomies() {
-        let in_taxonomy = repos
-            .terms
-            .find_by_taxonomy(taxonomy.slug.to_owned())
-            .await?;
-        for term in &in_taxonomy {
+    for (_, in_taxonomy) in &rows.terms_by_taxonomy {
+        for term in in_taxonomy {
             // Resolve the parent to a slug now, while the ids still mean
             // something in this database.
             let parent = term.parent_id.and_then(|parent_id| {
@@ -316,94 +324,75 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
     }
 
     let mut posts = Vec::new();
-    for post_type in crate::content_types::all_post_types() {
-        for post in repos
-            .posts
-            .find_by_post_type(post_type.slug.to_owned())
-            .await?
-        {
-            // Trash is deliberately excluded: an export is a backup of the
-            // site's content, and restoring somebody's deleted drafts into a
-            // fresh install is a surprise, not a feature.
-            if post.status == "trash" {
-                continue;
-            }
-            // Propagated, not swallowed. `.ok()` turned a database error into an
-            // empty username and still produced a file that *looks* like a
-            // valid backup — importing it silently reassigns the post to
-            // whoever ran the import. A backup that is wrong in a way nobody
-            // can see is worse than an export that fails loudly.
-            let author = repos
-                .users
-                .find_by_id(post.author_id)
-                .await?
-                .map(|u| u.username)
-                .unwrap_or_default();
-            // The parent's slug, resolved now while the ids still mean
-            // something in this database.
-            // Same reasoning as `author`: a swallowed error here flattens the
-            // page tree in the backup, so a restore puts `/about/team` back at
-            // `/team` and every link to it starts 404ing.
-            let parent_slug = match post.parent_id {
-                Some(parent_id) => repos.posts.find_by_id(parent_id).await?.map(|p| p.slug),
-                None => None,
-            };
-            // The full path, which is what identifies a page now that a nested
-            // slug is only unique among its siblings.
-            let path = if post.post_type == "page" {
-                let ancestry = repos.page_ancestry(&post).await?;
-                Some(if ancestry.is_empty() {
-                    post.slug.clone()
-                } else {
-                    format!("{}/{}", ancestry.join("/"), post.slug)
-                })
+    for post in &rows.posts {
+        // Propagated, not swallowed. `.ok()` turned a database error into an
+        // empty username and still produced a file that *looks* like a valid
+        // backup — importing it silently reassigns the post to whoever ran the
+        // import. An account deleted between the read and now cannot happen at
+        // all any more: the snapshot answers both questions at one instant.
+        let author = rows
+            .usernames
+            .get(&post.author_id)
+            .cloned()
+            .unwrap_or_default();
+        // The parent's slug, resolved from the same snapshot. Swallowing a
+        // failure here flattens the page tree in the backup, so a restore puts
+        // `/about/team` back at `/team` and every link to it starts 404ing.
+        let parent_slug = post
+            .parent_id
+            .and_then(|parent_id| rows.posts_by_id.get(&parent_id))
+            .map(|parent| parent.slug.clone());
+        // The full path, which is what identifies a page now that a nested slug
+        // is only unique among its siblings.
+        let path = if post.post_type == "page" {
+            let ancestry = rows.ancestry(post);
+            Some(if ancestry.is_empty() {
+                post.slug.clone()
             } else {
-                None
-            };
-            let assigned = repos.post_terms(post.id).await?;
-            // The featured image by slug, resolved now while the ids still mean
-            // something in this database.
-            // And here: swallowing drops the featured image from the backup.
-            let featured_media = match post.featured_media_id {
-                Some(media_id) => repos
-                    .attachments
-                    .find_by_id(media_id)
-                    .await?
-                    .map(|attachment| attachment.slug),
-                None => None,
-            };
-            posts.push(ExportPost {
-                post_type: post.post_type.clone(),
-                title: post.title.clone(),
-                slug: post.slug.clone(),
-                excerpt: post.excerpt.clone(),
-                body: post.body.clone(),
-                status: post.status.clone(),
-                comment_status: post.comment_status.clone(),
-                password: post.password.clone(),
-                author,
-                path,
-                parent: parent_slug,
-                published_at: post.published_at,
-                sticky: post.sticky,
-                menu_order: post.menu_order,
-                terms: assigned
-                    .iter()
-                    .map(|t| ExportTermRef {
-                        taxonomy: t.taxonomy.clone(),
-                        slug: t.slug.clone(),
-                    })
-                    .collect(),
-                featured_media,
-            });
-        }
+                format!("{}/{}", ancestry.join("/"), post.slug)
+            })
+        } else {
+            None
+        };
+        let assigned = rows.terms_by_post.get(&post.id);
+        // The featured image by slug, resolved from the same snapshot: a
+        // dropped one is a missing image on every restore of this file.
+        let featured_media = post
+            .featured_media_id
+            .and_then(|media_id| rows.attachments_by_id.get(&media_id))
+            .map(|attachment| attachment.slug.clone());
+        posts.push(ExportPost {
+            post_type: post.post_type.clone(),
+            title: post.title.clone(),
+            slug: post.slug.clone(),
+            excerpt: post.excerpt.clone(),
+            body: post.body.clone(),
+            status: post.status.clone(),
+            comment_status: post.comment_status.clone(),
+            password: post.password.clone(),
+            author,
+            path,
+            parent: parent_slug,
+            published_at: post.published_at,
+            sticky: post.sticky,
+            menu_order: post.menu_order,
+            terms: assigned
+                .into_iter()
+                .flatten()
+                .map(|t| ExportTermRef {
+                    taxonomy: t.taxonomy.clone(),
+                    slug: t.slug.clone(),
+                })
+                .collect(),
+            featured_media,
+        });
     }
 
     // Metadata only — the bytes live in the blob store, which is backed up
     // separately. Carrying the rows is what lets a restore resolve
     // `/media/{slug}` and re-attach featured images once those bytes are back.
     let mut attachments = Vec::new();
-    for attachment in repos.attachments.find_all().await? {
+    for attachment in &rows.attachments {
         attachments.push(ExportAttachment {
             slug: attachment.slug.clone(),
             title: attachment.title.clone(),

@@ -491,6 +491,19 @@ pub async fn post_comment(
     // held-for-moderation root, which has no page yet.
     let thread_page = content::approved_thread_page_of(&mut conn, created.id).await?;
 
+    // And whether that page actually renders it. A page is capped at
+    // `MAX_THREAD_COMMENTS`, so on a thread past the cap a new reply can belong
+    // to a page with no room left for it — and an anchor to a comment the page
+    // does not contain is the same broken promise as an anchor to a comment on
+    // a different page. Without a page there is nothing to anchor to either.
+    let anchored = match thread_page {
+        Some(page) => {
+            status == "approved"
+                && content::approved_comment_is_rendered(&mut conn, created.id, page).await?
+        }
+        None => false,
+    };
+
     // Released before the permalink read below, so the handler never holds two.
     drop(conn);
 
@@ -507,9 +520,9 @@ pub async fn post_comment(
     {
         destination = crate::permalinks::with_query(&destination, "comments", &page.to_string());
     }
-    if status == "approved" {
+    if anchored {
         destination = format!("{destination}#comment-{}", created.id);
-    } else {
+    } else if status != "approved" {
         destination = crate::permalinks::with_query(&destination, "moderated", "1");
     }
     Ok(Redirect::to(&destination).into_response())

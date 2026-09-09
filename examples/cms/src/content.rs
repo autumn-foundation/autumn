@@ -463,6 +463,22 @@ pub async fn set_post_terms(
     term_ids: Vec<i64>,
 ) -> AutumnResult<()> {
     conn.transaction(async move |conn| {
+        // The post first, then its terms — one lock order across every path
+        // that touches both. `transition_status` and the scheduled-publish
+        // sweep each update the post row and *then* recount its terms, so a
+        // taxonomy save that took a term lock first and then blocked on the
+        // post (the insert below key-shares it through the foreign key) closes
+        // the cycle and PostgreSQL aborts one of them. Taking it here also
+        // costs nothing on the editor'"'"'s path, which already holds this lock
+        // from the stale-edit check.
+        let _locked_post: Option<i64> = posts::table
+            .find(post_id)
+            .select(posts::id)
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?;
+
         let previous: Vec<i64> = post_terms::table
             .filter(post_terms::post_id.eq(post_id))
             .select(post_terms::term_id)
@@ -525,10 +541,10 @@ pub async fn set_post_terms(
 
 /// Take `FOR UPDATE` on the given term rows, in ascending id order.
 ///
-/// Called before any write that will need to recount them — see
-/// [`set_post_terms`] for why the order and the timing both matter. The ids are
-/// sorted here rather than trusted from the caller, because a caller that
-/// forgets is exactly the bug this prevents.
+/// Called before any write that will need to recount them, and *after* the post
+/// row is locked — see [`set_post_terms`] for why the order and the timing both
+/// matter. The ids are sorted here rather than trusted from the caller, because
+/// a caller that forgets is exactly the bug this prevents.
 async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
     let mut ordered = term_ids.to_vec();
     ordered.sort_unstable();
@@ -2626,6 +2642,169 @@ pub async fn populated_terms(
         .await?)
 }
 
+// ── Export ──────────────────────────────────────────────────────────────────
+
+/// Every row an export writes, read from one connection.
+///
+/// The reads were repository calls, each taking its own pooled connection and
+/// therefore its own snapshot: a page renamed while the export ran could be
+/// written into the file under its old slug as a post and its new slug as some
+/// other page'"'"'s ancestor. The restore then cannot resolve that parent and files
+/// the child at the top level — a backup that is silently wrong, which is worse
+/// than one that fails. See [`export_snapshot`].
+pub struct ExportRows {
+    /// Every term, grouped by taxonomy in the registry'"'"'s order.
+    pub terms_by_taxonomy: Vec<(String, Vec<Term>)>,
+    /// The posts to export: registered types, trash excluded, type by type.
+    pub posts: Vec<Post>,
+    /// Every post by id, *including* trash and unregistered types. A page'"'"'s
+    /// path is built through its ancestors, and an ancestor may be either.
+    pub posts_by_id: std::collections::HashMap<i64, Post>,
+    /// Author usernames by account id.
+    pub usernames: std::collections::HashMap<i64, String>,
+    /// The terms each post is filed under, by post id.
+    pub terms_by_post: std::collections::HashMap<i64, Vec<Term>>,
+    /// Every attachment, oldest first.
+    pub attachments: Vec<crate::models::Attachment>,
+    /// The same rows by id, for resolving featured images.
+    pub attachments_by_id: std::collections::HashMap<i64, crate::models::Attachment>,
+}
+
+impl ExportRows {
+    /// A page'"'"'s ancestor slugs, outermost first, resolved in memory.
+    ///
+    /// The same walk and the same bound as [`crate::routes::site::Repos::page_ancestry`],
+    /// against the snapshot rather than the live table — which is the whole
+    /// point: a path assembled from rows read at different instants can name an
+    /// ancestor by a slug the file also writes differently elsewhere.
+    #[must_use]
+    pub fn ancestry(&self, post: &Post) -> Vec<String> {
+        let mut slugs = Vec::new();
+        let mut cursor = post.parent_id;
+        let mut seen = vec![post.id];
+        while let Some(parent_id) = cursor {
+            if slugs.len() >= MAX_PAGE_DEPTH || seen.contains(&parent_id) {
+                break;
+            }
+            seen.push(parent_id);
+            match self.posts_by_id.get(&parent_id) {
+                Some(parent) => {
+                    slugs.push(parent.slug.clone());
+                    cursor = parent.parent_id;
+                }
+                None => break,
+            }
+        }
+        slugs.reverse();
+        slugs
+    }
+}
+
+/// Read everything an export needs from one repeatable-read snapshot.
+///
+/// `REPEATABLE READ` rather than the default `READ COMMITTED`: every statement
+/// in the transaction sees the database as of the first one, so no concurrent
+/// rename, retitle or re-filing can land between two of these reads and make
+/// the file internally inconsistent. `READ ONLY` says so to the server and lets
+/// it skip the work a writable snapshot costs.
+pub async fn export_snapshot(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
+    conn.build_transaction()
+        .repeatable_read()
+        .read_only()
+        .run(async |conn| export_rows(conn).await)
+        .await
+}
+
+/// The reads themselves. Separate from [`export_snapshot`] so the transaction
+/// is one line and cannot accidentally gain a statement outside itself.
+async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
+    let mut terms_by_taxonomy = Vec::new();
+    for taxonomy in crate::content_types::all_taxonomies() {
+        let rows: Vec<Term> = terms::table
+            .filter(terms::taxonomy.eq(taxonomy.slug))
+            .order(terms::id.asc())
+            .select(Term::as_select())
+            .load(conn)
+            .await?;
+        terms_by_taxonomy.push((taxonomy.slug.to_owned(), rows));
+    }
+
+    // Every post in one query, trash and unregistered types included, because
+    // an ancestor may be either and the path has to be built through it.
+    let all_posts: Vec<Post> = posts::table
+        .order(posts::id.asc())
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+    let posts_by_id: std::collections::HashMap<i64, Post> = all_posts
+        .iter()
+        .map(|post| (post.id, post.clone()))
+        .collect();
+
+    // Type by type, in registry order, so the file'"'"'s shape does not depend on
+    // insertion order. Trash is deliberately excluded: an export is a backup of
+    // the site'"'"'s content, and restoring somebody'"'"'s deleted drafts into a fresh
+    // install is a surprise, not a feature.
+    let mut posts = Vec::new();
+    for post_type in crate::content_types::all_post_types() {
+        posts.extend(
+            all_posts
+                .iter()
+                .filter(|post| post.post_type == post_type.slug && post.status != "trash")
+                .cloned(),
+        );
+    }
+
+    let author_ids: Vec<i64> = posts.iter().map(|post| post.author_id).collect();
+    let usernames = users_by_ids(conn, &author_ids)
+        .await?
+        .into_iter()
+        .map(|(id, user)| (id, user.username))
+        .collect();
+
+    // Two queries for every post'"'"'s terms rather than two per post.
+    let post_ids: Vec<i64> = posts.iter().map(|post| post.id).collect();
+    let links: Vec<(i64, i64)> = if post_ids.is_empty() {
+        Vec::new()
+    } else {
+        post_terms::table
+            .filter(post_terms::post_id.eq_any(&post_ids))
+            .order((post_terms::post_id.asc(), post_terms::term_id.asc()))
+            .select((post_terms::post_id, post_terms::term_id))
+            .load(conn)
+            .await?
+    };
+    let linked_term_ids: Vec<i64> = links.iter().map(|(_, term_id)| *term_id).collect();
+    let linked_terms = terms_by_ids(conn, &linked_term_ids).await?;
+    let mut terms_by_post: std::collections::HashMap<i64, Vec<Term>> =
+        std::collections::HashMap::new();
+    for (post_id, term_id) in links {
+        if let Some(term) = linked_terms.get(&term_id) {
+            terms_by_post.entry(post_id).or_default().push(term.clone());
+        }
+    }
+
+    let attachments: Vec<crate::models::Attachment> = attachments::table
+        .order(attachments::id.asc())
+        .select(crate::models::Attachment::as_select())
+        .load(conn)
+        .await?;
+    let attachments_by_id = attachments
+        .iter()
+        .map(|attachment| (attachment.id, attachment.clone()))
+        .collect();
+
+    Ok(ExportRows {
+        terms_by_taxonomy,
+        posts,
+        posts_by_id,
+        usernames,
+        terms_by_post,
+        attachments,
+        attachments_by_id,
+    })
+}
+
 /// The `post_meta` key under which the importer records the slug a post carried
 /// in the file it came from.
 ///
@@ -3548,6 +3727,57 @@ pub async fn approved_thread_page(
         total_roots,
         truncated,
     })
+}
+
+/// A page holds more comments than it holds roots, so a root always fits.
+///
+/// [`approved_comment_is_rendered`] leans on this: it can answer "yes" for a
+/// root without asking the database, because the root window is loaded before
+/// the budget applies to anything.
+const _: () = assert!(THREAD_ROOTS_PER_PAGE <= MAX_THREAD_COMMENTS);
+
+/// Whether a comment is actually rendered on the page it belongs to.
+///
+/// Belonging to a page and appearing on it are different questions once a page
+/// is capped at [`MAX_THREAD_COMMENTS`]: on a thread past that cap, a newly
+/// approved reply can belong to a page that has no room left for it. Promising
+/// `#comment-<id>` then sends the browser to an anchor that is not there, which
+/// is the same broken promise the root-page redirect was added to fix.
+///
+/// Two cheap answers come first, because the expensive one should be rare:
+/// a root is always rendered (the const above), and no page truncates while the
+/// whole post fits in one page's budget. Only past that does this replay the
+/// renderer's own page load — the *same* function, so the two cannot disagree
+/// about what is on the page.
+pub async fn approved_comment_is_rendered(
+    conn: &mut AsyncPgConnection,
+    comment_id: i64,
+    page: i64,
+) -> AutumnResult<bool> {
+    let Some(comment): Option<Comment> = comments::table
+        .find(comment_id)
+        .select(Comment::as_select())
+        .first(conn)
+        .await
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    if comment.parent_id.is_none() {
+        return Ok(true);
+    }
+    if approved_comment_count(conn, comment.post_id).await? <= MAX_THREAD_COMMENTS {
+        return Ok(true);
+    }
+
+    let page = approved_thread_page(
+        conn,
+        comment.post_id,
+        (page - 1).max(0) * THREAD_ROOTS_PER_PAGE,
+        THREAD_ROOTS_PER_PAGE,
+    )
+    .await?;
+    Ok(page.comments.iter().any(|row| row.id == comment_id))
 }
 
 /// Which page of a post's approved thread a comment appears on, if any.
