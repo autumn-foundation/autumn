@@ -1858,6 +1858,12 @@ fn framework_route_clashes(
 /// path (`"openapi.json"` with no leading slash) or two endpoints on the same
 /// path make the serving router unbuildable, and an export that ignored that
 /// would let `--check` pass for an app that cannot start (issue #802).
+///
+/// Gated on `openapi` like every item it touches: `OpenApiConfig`,
+/// `validate_route_path` and `RouterBuildError::DuplicateOpenApiPath` are all
+/// behind that feature, and extracting this out of `build_openapi_router` (which
+/// sits inside the gated region) moved it out from under the gate.
+#[cfg(feature = "openapi")]
 pub fn validate_openapi_mount_paths(
     config: &crate::openapi::OpenApiConfig,
 ) -> Result<(), RouterBuildError> {
