@@ -211,6 +211,29 @@ Disposition:
    that path for *any* tenant-aware feature, not just rate limiting.
    Replied on the review thread referencing that precedent; not resolving
    it (same ambiguous/architectural-finding rule as above).
+6. **P1, static-mode (`dist` manifest) custom limiters run outside tenancy
+   scope** — correct mechanically: `try_build_router_with_static_inner`
+   (`router.rs:5611-5629`) deliberately drains `AppBuilder::layer` /
+   `static_gate` custom layers and reapplies them *outside* the static-first
+   middleware and outside session, so a `RateLimitLayer` registered that way
+   runs before `tenancy_middleware` ever enters the `CURRENT_TENANT` scope —
+   `tenant_qualify_bucket_key` sees `None` there even on an otherwise
+   tenant-scoped route, and falls to the shared `n:`-tagged case. **Not a
+   gap introduced by this fix, and not fixable at this layer**: that
+   ordering is deliberate and predates this PR — the same comment block
+   documents *why* (compression must see pre-rendered responses, static
+   serving must stay up when the session backend is down, ISR regeneration
+   must save raw HTML) — and it already has one documented tenant-adjacent
+   consequence (`custom_layers_require_fail_closed_idempotency`, cited in
+   `docs/security/2026-09-02-idempotency-tenant-scope/README.md`, forces
+   fail-closed idempotency for exactly this class of layer for the same
+   reason). No tenant signal is available to any tenant-aware feature's
+   outer/custom layer in this mode, not just rate limiting's — fixing it
+   would mean redesigning how static-mode wires custom layers relative to
+   tenancy middleware, an architecturally significant, cross-cutting change
+   to the static-serving path well beyond "fold the ambient tenant into a
+   bucket key." Replied on the review thread referencing that precedent;
+   not resolving it (same ambiguous/architectural-finding rule as above).
 
 ## ✅ Verification
 
