@@ -237,7 +237,7 @@ pub fn validate_signing_secret(
 
 /// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
 ///
-/// Signs (and, via [`ResolvedSigningKeys::verify`]) verifies CSRF tokens and
+/// Signs (and, via `ResolvedSigningKeys::verify`) verifies CSRF tokens and
 /// session cookies when a signing secret is configured (`security.csrf.enabled`
 /// / session signing) — not local-storage payloads, which sign themselves via
 /// their own `sign`/`sign_upload` in `storage/local.rs`. `benches/csrf_verify.rs`
