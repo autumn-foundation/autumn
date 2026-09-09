@@ -44,6 +44,7 @@ pub async fn list(
     Query(filter): Query<QueueFilter>,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ModerateComments);
+    let settings = repos.settings().await?;
     let status = filter
         .status
         .clone()
@@ -118,7 +119,7 @@ pub async fn list(
                                 }
                             }
                             p class="text-xs text-gray-400 mt-0.5" {
-                                (comment.created_at.format("%Y-%m-%d %H:%M").to_string())
+                                (settings.format_datetime(comment.created_at))
                                 @if let Some(post) = post {
                                     " · on " (post.title)
                                 }

@@ -182,31 +182,34 @@ fn optional_id(raw: Option<&String>) -> Option<i64> {
         .and_then(|v| v.parse::<i64>().ok())
 }
 
-/// Every descendant of `root` within `all`, by id.
+/// The publish date the editor's `datetime-local` field carries, as UTC.
 ///
-/// A breadth-first walk over the in-memory set the selector already loaded, so
-/// it costs no extra queries. Bounded by the set size, so a pre-existing cycle
-/// cannot spin.
-fn descendant_ids(all: &[Post], root: i64) -> std::collections::HashSet<i64> {
-    let mut found = std::collections::HashSet::new();
-    let mut frontier = vec![root];
-    while let Some(parent) = frontier.pop() {
-        for post in all {
-            if post.parent_id == Some(parent) && found.insert(post.id) {
-                frontier.push(post.id);
-            }
-        }
-    }
-    found
-}
-
-/// The publish date the editor's `datetime-local` field carries, if any.
-fn scheduled_at(form: &PostForm) -> Option<chrono::NaiveDateTime> {
-    form.publish_at
+/// `datetime-local` submits a wall-clock value with **no offset**. Storing it
+/// as-is made it a UTC timestamp by accident, and the scheduler compares
+/// against `Utc::now()` — so an editor in UTC-7 who scheduled a post for 09:00
+/// had it publish at 02:00 their time. The site timezone is what turns the
+/// wall-clock reading into the instant it names.
+fn scheduled_at(
+    form: &PostForm,
+    settings: &crate::settings::Settings,
+) -> AutumnResult<Option<chrono::NaiveDateTime>> {
+    let Some(local) = form
+        .publish_at
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .and_then(|value| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M").ok())
+    else {
+        return Ok(None);
+    };
+    // `None` only for a local time that does not exist — the hour a
+    // daylight-saving change skips. Saying so is better than silently
+    // scheduling an hour the editor did not choose.
+    settings.from_local(local).map(Some).ok_or_else(|| {
+        AutumnError::unprocessable_msg(
+            "That time does not exist in this site's timezone — daylight saving skips it",
+        )
+    })
 }
 
 fn resolve_type(slug: &str) -> AutumnResult<PostType> {
@@ -226,6 +229,8 @@ pub async fn list(
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
     let registered = resolve_type(&post_type)?;
+
+    let settings = repos.settings().await?;
 
     // Type, status, search, the Contributor restriction, the order and the
     // bound are all asked of Postgres. Every branch here used to load the
@@ -359,7 +364,7 @@ pub async fn list(
                             }
                             td class="px-4 py-3" { (status_badge(&post.status)) }
                             td class="px-4 py-3 text-gray-500" {
-                                (post.updated_at.format("%Y-%m-%d %H:%M").to_string())
+                                (settings.format_datetime(post.updated_at))
                             }
                         }
                     }
@@ -496,8 +501,13 @@ struct TaxonomyField {
 
 /// Everything the editor form needs besides the post itself.
 struct EditorContext {
+    /// Carried so the editor can render and collect times in the site's zone
+    /// rather than in UTC, without changing every `editor` caller.
+    settings: crate::settings::Settings,
     taxonomies: Vec<TaxonomyField>,
     parents: Vec<Post>,
+    /// Whether the type holds more rows than the parent picker is showing.
+    parents_truncated: bool,
     media: Vec<Attachment>,
     /// Whether the library holds more than the picker is showing, so the
     /// editor can say so rather than appear to be the whole library.
@@ -512,6 +522,16 @@ struct EditorContext {
 /// unprotected. The most recent uploads are what an author is choosing between;
 /// the current selection is added to them explicitly below, whatever its age.
 const MEDIA_PICKER_LIMIT: i64 = 100;
+
+/// How many rows the hierarchical parent picker offers.
+///
+/// Same argument as `MEDIA_PICKER_LIMIT`: paginating the content list left the
+/// editor itself loading every page of the type — bodies and all — and
+/// rendering nearly all of them as `<option>`s, so the screen an author uses
+/// most was the one still growing without bound. The most recently edited pages
+/// are what a parent is chosen from; the current parent is added to them
+/// explicitly below, whatever its age.
+const PARENT_PICKER_LIMIT: i64 = 100;
 
 impl EditorContext {
     async fn load(repos: &Repos, registered: &PostType, post: Option<&Post>) -> AutumnResult<Self> {
@@ -555,25 +575,41 @@ impl EditorContext {
         // parent is NULL, every page in that cycle becomes unreachable at its
         // own permalink. The write path refuses it too (see `update`); this
         // just keeps the impossible option off the screen.
-        let parents = if registered.hierarchical {
-            let all: Vec<Post> = repos
-                .posts
-                .find_by_post_type(registered.slug.to_owned())
+        let (parents, parents_truncated) = if registered.hierarchical {
+            let current_id = post.map(|p| p.id);
+            let current_parent = post.and_then(|p| p.parent_id);
+            let slug = registered.slug.to_owned();
+            repos
+                .with_conn(async move |conn| {
+                    let (rows, total) =
+                        content::parent_candidates(conn, &slug, PARENT_PICKER_LIMIT).await?;
+                    // Resolved in SQL rather than from the loaded set: the set
+                    // is a window now, so a descendant outside it would have
+                    // been offered as its own ancestor's parent.
+                    let descendants = match current_id {
+                        Some(id) => content::descendant_ids(conn, id).await?,
+                        None => std::collections::HashSet::new(),
+                    };
+                    let mut rows: Vec<Post> = rows
+                        .into_iter()
+                        .filter(|p| Some(p.id) != current_id && !descendants.contains(&p.id))
+                        .collect();
+                    // The current parent, whatever its age. Without this a page
+                    // whose parent has not been edited recently would be shown
+                    // a select missing its own value, and saving the form
+                    // unchanged would move the page to the top level — silently
+                    // changing its canonical URL.
+                    if let Some(parent_id) = current_parent
+                        && !rows.iter().any(|p| p.id == parent_id)
+                        && let Some(parent) = content::post_by_id(conn, parent_id).await?
+                    {
+                        rows.insert(0, parent);
+                    }
+                    Ok((rows, total > PARENT_PICKER_LIMIT))
+                })
                 .await?
-                .into_iter()
-                .filter(|p| p.status != "trash")
-                .collect();
-            match post {
-                Some(current) => {
-                    let descendants = descendant_ids(&all, current.id);
-                    all.into_iter()
-                        .filter(|p| p.id != current.id && !descendants.contains(&p.id))
-                        .collect()
-                }
-                None => all,
-            }
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
         // Propagated, not swallowed. An empty library renders a form whose
@@ -610,8 +646,10 @@ impl EditorContext {
         };
 
         Ok(Self {
+            settings: repos.settings().await?,
             taxonomies,
             parents,
+            parents_truncated,
             media,
             media_truncated,
         })
@@ -713,11 +751,18 @@ fn editor(
                     div {
                         label for="publish_at" class="block text-sm font-medium mb-1" {
                             "Publish date "
-                            span class="text-gray-400 font-normal" { "(for Scheduled)" }
+                            span class="text-gray-400 font-normal" {
+                                "(for Scheduled, " (context.settings.timezone) ")"
+                            }
                         }
+                        // Rendered *and* read back in the site'"'"'s zone. The control
+                        // submits a wall clock with no offset, so naming the zone
+                        // beside it is part of the fix rather than decoration:
+                        // whichever zone the browser is in, this field means the
+                        // site'"'"'s.
                         input #publish_at type="datetime-local" name="publish_at"
                               value=(post.and_then(|p| p.published_at)
-                                  .map(|d| d.format("%Y-%m-%dT%H:%M").to_string())
+                                  .map(|d| context.settings.format_datetime_local(d))
                                   .unwrap_or_default())
                               class="w-full border rounded px-3 py-2 text-sm";
                     }
@@ -869,6 +914,12 @@ fn editor(
                                     }
                                 }
                             }
+                            @if context.parents_truncated {
+                                p class="text-xs text-gray-400 mt-2" {
+                                    "Showing the " (PARENT_PICKER_LIMIT)
+                                    " most recently edited."
+                                }
+                            }
                         }
                         div {
                             label for="menu_order" class="block text-sm font-medium mb-1" {
@@ -907,7 +958,7 @@ pub async fn create(
     // would carry `published_at = NULL`, and the publish sweep — which selects
     // `status = 'future' AND published_at <= now()` — would never see it
     // again: the post would sit in `future` forever.
-    let scheduled_for = scheduled_at(&form);
+    let scheduled_for = scheduled_at(&form, &repos.settings().await?)?;
     require_future_publish_date(&status, scheduled_for)?;
 
     // Asked before anything is written. `private` and `future` are reached by
@@ -1091,7 +1142,7 @@ pub async fn update(
     }
 
     let status = requested_status(&form, &user);
-    let scheduled_for = scheduled_at(&form);
+    let scheduled_for = scheduled_at(&form, &repos.settings().await?)?;
     // The submitted date, not the stored one. Falling back to
     // `existing.published_at` is what let a past timestamp through.
     require_future_publish_date(&status, scheduled_for)?;
@@ -1501,6 +1552,7 @@ pub async fn revisions(
         ));
     }
 
+    let settings = repos.settings().await?;
     let history = repos
         .with_conn(async |conn| content::revisions_for(conn, id).await)
         .await?;
@@ -1530,7 +1582,7 @@ pub async fn revisions(
                     div class="min-w-0" {
                         p class="font-medium" { (revision.title) }
                         p class="text-xs text-gray-500" {
-                            (revision.created_at.format("%Y-%m-%d %H:%M").to_string())
+                            (settings.format_datetime(revision.created_at))
                             " · " (revision.summary)
                             " · " (revision.status)
                             @if let Some(name) = revision.author_id.and_then(|a| names.get(&a)) {

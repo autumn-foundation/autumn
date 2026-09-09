@@ -31,6 +31,8 @@ pub struct SettingsForm {
     pub active_theme: String,
     pub date_format: String,
     #[serde(default)]
+    pub timezone: String,
+    #[serde(default)]
     pub front_page_id: String,
 }
 
@@ -76,6 +78,24 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                     input #date_format type="text" name="date_format" required
                           value=(settings.date_format)
                           class="w-full border rounded px-3 py-2 font-mono text-sm";
+                }
+                div {
+                    label for="timezone" class="block text-sm font-medium mb-1" {
+                        "Timezone "
+                        span class="text-gray-400 font-normal" { "(IANA name)" }
+                    }
+                    // A text field rather than a `<select>` of every zone the
+                    // database knows: that list is some six hundred entries, and
+                    // rendering all of them into every settings page is the same
+                    // unbounded-control shape the media and parent pickers were
+                    // just fixed for.
+                    input #timezone type="text" name="timezone" required
+                          value=(settings.timezone) placeholder="Europe/London"
+                          class="w-full border rounded px-3 py-2 font-mono text-sm";
+                    p class="text-xs text-gray-400 mt-1" {
+                        "Times are stored in UTC and shown in this zone — including \
+                         the publish date the editor collects for a scheduled post."
+                    }
                 }
             }
 
@@ -217,6 +237,7 @@ pub async fn save(
         ),
         ("active_theme".to_owned(), form.active_theme.clone()),
         ("date_format".to_owned(), form.date_format.clone()),
+        ("timezone".to_owned(), form.timezone.trim().to_owned()),
         ("front_page_id".to_owned(), form.front_page_id.clone()),
     ]);
 

@@ -6,6 +6,7 @@ use autumn_web::reexports::axum::response::Response;
 use serde::Deserialize;
 
 use crate::capabilities::Capability;
+use crate::content;
 use crate::content_types::{self, Taxonomy};
 use crate::models::{NewTerm, Term, UpdateTerm};
 use crate::repositories::TermRepository as _;
@@ -13,6 +14,22 @@ use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
 use super::layout;
+
+/// How many terms one page of the taxonomy screen shows.
+const TERMS_PER_PAGE: i64 = 50;
+
+/// How many terms the hierarchical parent selector offers.
+///
+/// Terms accumulate through ordinary category creation *and* the post editor's
+/// find-or-create box, so this control grows on its own; the same bound the
+/// media and page pickers now carry.
+const TERM_PARENT_LIMIT: i64 = 100;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TermsFilter {
+    #[serde(default)]
+    pub page: Option<usize>,
+}
 
 #[derive(Deserialize)]
 pub struct TermForm {
@@ -36,11 +53,40 @@ pub async fn list(
     session: Session,
     csrf: Csrf,
     Path(taxonomy): Path<String>,
+    Query(filter): Query<TermsFilter>,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ManageCategories);
     let registered = resolve(&taxonomy)?;
-    let mut terms = repos.terms.find_by_taxonomy(taxonomy.clone()).await?;
-    terms.sort_by_key(|term| term.name.to_lowercase());
+
+    // Ordered and bounded in SQL, and the parent selector below is bounded
+    // separately. This screen loaded and sorted the whole taxonomy and then
+    // rendered every term a second time as an `<option>`, so the only screen
+    // for managing terms was the one a large taxonomy broke first.
+    let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
+    let (terms, total, parents, parent_names, parents_truncated) = {
+        let mut conn = repos.conn().await?;
+        let (terms, total) = content::terms_page_with_total(
+            &mut conn,
+            &taxonomy,
+            (page - 1) * TERMS_PER_PAGE,
+            TERMS_PER_PAGE,
+        )
+        .await?;
+        // The parent names this page refers to, fetched by id. Resolving them
+        // from the loaded set was correct only while the set was the whole
+        // taxonomy: a term whose parent sits on another page would have
+        // rendered as if it had none.
+        let parent_ids: Vec<i64> = terms.iter().filter_map(|term| term.parent_id).collect();
+        let parent_names = content::terms_by_ids(&mut conn, &parent_ids).await?;
+        let (parents, parents_truncated) = if registered.hierarchical {
+            let rows = content::terms_page(&mut conn, &taxonomy, 0, TERM_PARENT_LIMIT).await?;
+            (rows, total > TERM_PARENT_LIMIT)
+        } else {
+            (Vec::new(), false)
+        };
+        (terms, total, parents, parent_names, parents_truncated)
+    };
+    let last_page = ((total + TERMS_PER_PAGE - 1) / TERMS_PER_PAGE).max(1);
 
     let body = html! {
         div class="grid grid-cols-1 lg:grid-cols-3 gap-6" {
@@ -61,7 +107,7 @@ pub async fn list(
                             tr class="border-t border-gray-100" {
                                 td class="px-4 py-3 font-medium" {
                                     @if let Some(parent) = term.parent_id {
-                                        @if let Some(p) = terms.iter().find(|t| t.id == parent) {
+                                        @if let Some(p) = parent_names.get(&parent) {
                                             span class="text-gray-400" { (p.name) " — " }
                                         }
                                     }
@@ -87,8 +133,32 @@ pub async fn list(
                         }
                         @if terms.is_empty() {
                             tr { td colspan="4" class="px-4 py-10 text-center text-gray-400" {
-                                "No " (registered.plural.to_lowercase()) " yet."
+                                @if page > 1 {
+                                    "Nothing on this page."
+                                } @else {
+                                    "No " (registered.plural.to_lowercase()) " yet."
+                                }
                             } }
+                        }
+                    }
+                }
+
+                @if last_page > 1 {
+                    nav aria-label="Term pages"
+                        class="flex items-center justify-between p-4 border-t \
+                               border-gray-100 text-sm" {
+                        @if page > 1 {
+                            a href=(format!("/admin/terms/{taxonomy}?page={}", page - 1))
+                              class="text-indigo-700 hover:underline" { "← Previous" }
+                        } @else {
+                            span {}
+                        }
+                        span class="text-gray-500" { "Page " (page) " of " (last_page) }
+                        @if page < last_page {
+                            a href=(format!("/admin/terms/{taxonomy}?page={}", page + 1))
+                              class="text-indigo-700 hover:underline" { "Next →" }
+                        } @else {
+                            span {}
                         }
                     }
                 }
@@ -116,8 +186,13 @@ pub async fn list(
                         select #parent_id name="parent_id"
                                class="w-full border rounded px-3 py-2 text-sm" {
                             option value="" { "(none)" }
-                            @for term in &terms {
+                            @for term in &parents {
                                 option value=(term.id) { (term.name) }
+                            }
+                        }
+                        @if parents_truncated {
+                            p class="text-xs text-gray-400 mt-1" {
+                                "Showing the first " (TERM_PARENT_LIMIT) " by name."
                             }
                         }
                     }

@@ -873,7 +873,10 @@ pub fn assemble_thread(
 /// node. `CommentView`'s fields are public, so owning the storage costs nothing
 /// on the render side.
 #[must_use]
-pub fn to_comment_views(nodes: &[ThreadNode]) -> Vec<autumn_web::widgets::CommentView> {
+pub fn to_comment_views(
+    nodes: &[ThreadNode],
+    settings: &crate::settings::Settings,
+) -> Vec<autumn_web::widgets::CommentView> {
     nodes
         .iter()
         .map(|node| autumn_web::widgets::CommentView {
@@ -886,8 +889,8 @@ pub fn to_comment_views(nodes: &[ThreadNode]) -> Vec<autumn_web::widgets::Commen
                     .and_utc()
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             ),
-            timestamp: node.comment.created_at.format("%Y-%m-%d %H:%M").to_string(),
-            replies: to_comment_views(&node.replies),
+            timestamp: settings.format_datetime(node.comment.created_at),
+            replies: to_comment_views(&node.replies, settings),
         })
         .collect()
 }
@@ -1811,6 +1814,51 @@ pub async fn subtree_height(conn: &mut AsyncPgConnection, post_id: i64) -> Autum
     Ok(height)
 }
 
+/// One post by id, on a caller-supplied connection.
+///
+/// The repository has `find_by_id`, but it takes a connection of its own from
+/// the pool; a caller already inside a `with_conn` needs this one.
+pub async fn post_by_id(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<Option<Post>> {
+    Ok(posts::table
+        .find(post_id)
+        .select(Post::as_select())
+        .first(conn)
+        .await
+        .optional()?)
+}
+
+/// Every descendant of a page, by id.
+///
+/// Level by level, one query per level, bounded by the depth the resolver
+/// walks. The editor used to compute this from the full set of pages it had
+/// already loaded — which stopped being an option once the parent picker became
+/// a bounded window, since a descendant outside the window would then have been
+/// offered as its own ancestor'"'"'s parent.
+pub async fn descendant_ids(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<std::collections::HashSet<i64>> {
+    let mut found = std::collections::HashSet::new();
+    let mut level = vec![post_id];
+    let mut depth = 0usize;
+    while !level.is_empty() && depth <= MAX_PAGE_DEPTH + 2 {
+        let children: Vec<i64> = posts::table
+            .filter(posts::parent_id.eq_any(&level))
+            .select(posts::id)
+            .load(&mut *conn)
+            .await?;
+        // A pre-existing cycle (only reachable by a direct write) would
+        // otherwise revisit the same rows forever.
+        let next: Vec<i64> = children
+            .into_iter()
+            .filter(|id| found.insert(*id))
+            .collect();
+        level = next;
+        depth += 1;
+    }
+    Ok(found)
+}
+
 /// Validate a proposed parent for a page: no cycle, and within the depth the
 /// permalink builder can render.
 ///
@@ -2150,6 +2198,60 @@ pub async fn record_import_source(
     Ok(())
 }
 
+/// The `post_meta` key marking an imported row as *finished*.
+///
+/// The source-slug marker alone says only "an import created this row", and it
+/// is written before the row's terms, status and ancestry are, so it cannot
+/// also mean "and it is done". Without a separate completion record every later
+/// import of the same backup re-applied the file's terms and status — silently
+/// undoing an editor who had since re-filed the post or moved it back to draft,
+/// on a screen that promises existing items are left alone.
+pub const IMPORT_COMPLETED_KEY: &str = "_import_completed";
+
+/// Mark imported rows as fully restored — terms, status and ancestry.
+///
+/// Written once, at the very end of the run: the ancestry pass comes after the
+/// per-post loop, so marking earlier would let a failure there leave a post
+/// recorded as finished with its parent never set, and the retry that exists to
+/// repair exactly that would skip it.
+pub async fn mark_imports_complete(
+    conn: &mut AsyncPgConnection,
+    post_ids: &[i64],
+) -> AutumnResult<()> {
+    if post_ids.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<_> = post_ids
+        .iter()
+        .map(|id| {
+            (
+                post_meta::post_id.eq(id),
+                post_meta::meta_key.eq(IMPORT_COMPLETED_KEY),
+                post_meta::meta_value.eq("1"),
+            )
+        })
+        .collect();
+    diesel::insert_into(post_meta::table)
+        .values(rows)
+        .on_conflict_do_nothing()
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// The imported rows a previous run finished.
+pub async fn completed_import_ids(
+    conn: &mut AsyncPgConnection,
+) -> AutumnResult<std::collections::HashSet<i64>> {
+    Ok(post_meta::table
+        .filter(post_meta::meta_key.eq(IMPORT_COMPLETED_KEY))
+        .select(post_meta::post_id)
+        .load::<i64>(conn)
+        .await?
+        .into_iter()
+        .collect())
+}
+
 /// Every `(post_type, source slug)` a previous import recorded, and the row it
 /// produced.
 ///
@@ -2296,6 +2398,76 @@ pub async fn users_page(
 /// How many accounts the site holds, for the pager.
 pub async fn user_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
     Ok(users::table.count().get_result(conn).await?)
+}
+
+/// The most recently updated live rows of a hierarchical type, for a parent
+/// picker, with the total so the caller can say the list is a window.
+///
+/// The picker loaded every row of the type — full bodies included — and
+/// rendered nearly all of them as `<option>`s, so paginating the content list
+/// left the editor itself as the screen that grows without bound. Only the
+/// columns a picker shows are selected.
+pub async fn parent_candidates(
+    conn: &mut AsyncPgConnection,
+    post_type: &str,
+    limit: i64,
+) -> AutumnResult<(Vec<Post>, i64)> {
+    let total: i64 = posts::table
+        .filter(posts::post_type.eq(post_type))
+        .filter(posts::status.ne("trash"))
+        .count()
+        .get_result(conn)
+        .await?;
+    let rows = posts::table
+        .filter(posts::post_type.eq(post_type))
+        .filter(posts::status.ne("trash"))
+        .order((posts::updated_at.desc(), posts::id.desc()))
+        .limit(limit.max(0))
+        .select(Post::as_select())
+        .load(conn)
+        .await?;
+    Ok((rows, total))
+}
+
+/// One page of a taxonomy's terms with the taxonomy's total, for the admin
+/// screen'"'"'s list and its pager.
+pub async fn terms_page_with_total(
+    conn: &mut AsyncPgConnection,
+    taxonomy: &str,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<(Vec<Term>, i64)> {
+    let total: i64 = terms::table
+        .filter(terms::taxonomy.eq(taxonomy))
+        .count()
+        .get_result(conn)
+        .await?;
+    let rows = terms_page(conn, taxonomy, offset, limit).await?;
+    Ok((rows, total))
+}
+
+/// The terms named by a set of ids, for resolving the parent names a page of
+/// the term list refers to.
+///
+/// The list renders each term'"'"'s parent name, and it used to find that parent in
+/// the same in-memory set — which silently became wrong the moment the set was
+/// a page rather than the whole taxonomy: a term whose parent sits on another
+/// page would have rendered with no parent at all.
+pub async fn terms_by_ids(
+    conn: &mut AsyncPgConnection,
+    ids: &[i64],
+) -> AutumnResult<std::collections::HashMap<i64, Term>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(terms::table
+        .filter(terms::id.eq_any(ids))
+        .select(Term::as_select())
+        .load(conn)
+        .await?
+        .into_iter()
+        .map(|term| (term.id, term))
+        .collect())
 }
 
 /// The accounts that authored a page of posts, in one query.

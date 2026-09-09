@@ -75,7 +75,7 @@ pub async fn render_thread(
     let mut sorted = rows;
     sorted.sort_by_key(|c| (c.created_at, c.id));
     let thread = content::assemble_thread(&sorted, None, 0, &name_of);
-    let views = content::to_comment_views(&thread);
+    let views = content::to_comment_views(&thread, &settings);
 
     // The type's flag as well as the row's column, so a row carrying a stale
     // `comment_status = "open"` on a type that disabled comments neither offers

@@ -582,6 +582,7 @@ fn settings_form(overrides: &[(&str, &str)]) -> String {
         ("allow_guest_comments", "on"),
         ("active_theme", "default"),
         ("date_format", "%B %-d, %Y"),
+        ("timezone", "UTC"),
     ];
     for (key, value) in overrides {
         match fields.iter_mut().find(|(k, _)| k == key) {
@@ -6478,5 +6479,313 @@ async fn the_users_admin_list_is_paginated() {
     assert!(
         !second.contains("user-01"),
         "page two must not repeat page one"
+    );
+}
+
+/// A scheduled post is stored as the instant the editor's wall clock names.
+///
+/// `datetime-local` submits a wall-clock value with **no offset**. Storing it
+/// as-is made it a UTC timestamp by accident, and the scheduler compares
+/// against `Utc::now()` — so scheduling 09:00 on a site set to UTC-7 published
+/// at 02:00 local.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_scheduled_date_is_read_in_the_sites_timezone() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("timezone", "America/Los_Angeles")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Far enough out that it is in the future in every zone, so the test is
+    // about the *offset* rather than about the guard.
+    let local = (chrono::Utc::now() + chrono::Duration::days(30))
+        .naive_utc()
+        .format("%Y-%m-%dT09:00")
+        .to_string();
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Later"),
+            ("slug", "later"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", local.as_str()),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "body: {}", created.text());
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    // 09:00 in America/Los_Angeles is 16:00 or 17:00 UTC depending on daylight
+    // saving — never 09:00. Asserting the stored hour is *not* the submitted
+    // one is what the old behaviour fails.
+    let stored: String = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let when: Option<chrono::NaiveDateTime> = cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::published_at)
+            .first(&mut conn)
+            .await
+            .expect("the scheduled post");
+        when.expect("a scheduled post has a date")
+            .format("%H:%M")
+            .to_string()
+    };
+    assert!(
+        stored == "16:00" || stored == "17:00",
+        "09:00 Pacific must be stored as the UTC instant it names, not as 09:00 UTC: {stored}"
+    );
+
+    // And the editor reads it back in the site's zone, so the round trip is
+    // stable rather than drifting by the offset on every save.
+    let editor = client
+        .get(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    editor.assert_ok();
+    assert!(
+        editor.text().contains(&local),
+        "the editor must redisplay the wall clock the author typed"
+    );
+}
+
+/// A completed import is not reconciled again.
+///
+/// The source marker says "an import created this row" and is written before
+/// the row's terms, status and ancestry are — so on its own it cannot also mean
+/// "and it is done". Without a separate completion record, importing the same
+/// backup twice re-applied the file's terms and status over an editor's later
+/// changes, on a screen that promises existing items are left alone.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_completed_import_is_left_alone_on_a_re_import() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "attachments": [],
+        "posts": [
+            {
+                "post_type": "post", "title": "Restored", "slug": "restored",
+                "excerpt": "", "body": "Imported body.", "status": "publish",
+                "password": "", "comment_status": "open",
+                "author": "owner", "terms": [], "comments": [],
+                "published_at": null, "parent": null, "sticky": false, "menu_order": 0
+            }
+        ]
+    })
+    .to_string();
+
+    client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    // An editor then unpublishes it — a perfectly ordinary thing to do to
+    // restored content.
+    let id: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("restored"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("the imported post")
+    };
+    client
+        .post(&format!("/admin/content/post/{id}/status?to=draft"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    // The same backup again. It must report the post as already present and
+    // change nothing.
+    client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("already present");
+
+    let status: String = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id)
+            .select(cms::schema::posts::status)
+            .first(&mut conn)
+            .await
+            .expect("the imported post")
+    };
+    assert_eq!(
+        status, "draft",
+        "a finished import must not republish content an editor unpublished"
+    );
+}
+
+/// The hierarchical parent picker is bounded, and keeps the current parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_parent_picker_is_bounded_and_keeps_its_selection() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // 150 pages. `Page 001` is the most recently edited; `Page 150` is far
+    // past the bound.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO posts (post_type, title, slug, excerpt, body, status, author_id,
+                            password, comment_status, menu_order, updated_at)
+         SELECT 'page',
+                'Page ' || lpad(g::text, 3, '0'),
+                'page-' || lpad(g::text, 3, '0'),
+                '', 'Body.', 'publish', 1, '', 'closed', 0,
+                NOW() - (g || ' minutes')::interval
+         FROM generate_series(1, 150) AS g",
+    )
+    .await
+    .expect("seed the pages");
+
+    let editor = client
+        .get("/admin/content/page/new")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    editor.assert_ok();
+    let editor = editor.text();
+    assert!(editor.contains("Page 001"), "recent pages are offered");
+    assert!(
+        !editor.contains("Page 150"),
+        "the picker must not render every page of the type"
+    );
+    assert!(editor.contains("most recently edited"));
+
+    // A child whose parent is older than the bound must still see it selected,
+    // or saving the form unchanged moves the page to the top level and changes
+    // its canonical URL.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO posts (post_type, title, slug, excerpt, body, status, author_id,
+                            password, comment_status, menu_order, parent_id, updated_at)
+         SELECT 'page', 'Child', 'child', '', 'Body.', 'publish', 1, '', 'closed', 0,
+                (SELECT id FROM posts WHERE slug = 'page-150'), NOW()",
+    )
+    .await
+    .expect("seed the child");
+
+    let child_id: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("child"))
+            .select(cms::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("the child page")
+    };
+    let editor = client
+        .get(&format!("/admin/content/page/{child_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    editor.assert_ok();
+    assert!(
+        editor.text().contains("Page 150"),
+        "a parent older than the bound must still be in the select"
+    );
+}
+
+/// The taxonomy screen is paginated, and its parent selector is bounded.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_taxonomy_admin_screen_is_paginated() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // 120 categories, `cat-001` … `cat-120`, ordered by name.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         SELECT 'category',
+                'cat-' || lpad(g::text, 3, '0'),
+                'cat-' || lpad(g::text, 3, '0'),
+                '', 0
+         FROM generate_series(1, 120) AS g",
+    )
+    .await
+    .expect("seed the terms");
+
+    let first = client
+        .get("/admin/terms/category")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    first.assert_ok();
+    let first = first.text();
+    assert!(first.contains("cat-001"), "the first term leads page one");
+    assert!(first.contains("cat-050"), "page one holds a full page");
+    // Counted on the per-row delete form rather than on a term name: the
+    // parent selector below the table renders its own (differently bounded)
+    // set of terms, so a name appearing on the page does not mean the *list*
+    // grew.
+    assert_eq!(
+        first.matches("/delete\"").count(),
+        50,
+        "the list must stop at the page size rather than render the taxonomy"
+    );
+    assert!(first.contains("Page 1 of 3"));
+    // The parent selector is bounded independently of the list: it may reach
+    // past the page, but not to the whole taxonomy.
+    assert!(
+        !first.contains("cat-101"),
+        "the parent selector must not render every term either"
+    );
+    assert!(first.contains("Showing the first"));
+
+    let third = client
+        .get("/admin/terms/category?page=3")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    third.assert_ok();
+    let third = third.text();
+    assert!(third.contains("cat-120"), "the tail is reachable");
+    assert_eq!(
+        third.matches("/delete\"").count(),
+        20,
+        "the last page holds the remainder, not a repeat of the first"
     );
 }

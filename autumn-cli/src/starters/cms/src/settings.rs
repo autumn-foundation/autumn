@@ -40,6 +40,15 @@ pub struct Settings {
     pub date_format: String,
     /// A page id to show as the front page instead of the blog index.
     pub front_page_id: Option<i64>,
+    /// The IANA zone the site's wall-clock times are in — WordPress's
+    /// `timezone_string`.
+    ///
+    /// Timestamps are stored in UTC and always will be; this is the zone an
+    /// editor reads and writes them in. Without it the editor's
+    /// `datetime-local` field submits a wall-clock value with no offset that
+    /// was then compared against `Utc::now()`, so scheduling 09:00 in UTC-7
+    /// published at 02:00 local.
+    pub timezone: String,
 }
 
 impl Default for Settings {
@@ -57,6 +66,9 @@ impl Default for Settings {
             active_theme: "default".to_owned(),
             date_format: "%B %-d, %Y".to_owned(),
             front_page_id: None,
+            // UTC, like WordPress's own default. An operator who never opens
+            // the setting gets the previous behaviour exactly.
+            timezone: "UTC".to_owned(),
         }
     }
 }
@@ -74,6 +86,7 @@ pub mod keys {
     pub const ACTIVE_THEME: &str = "active_theme";
     pub const DATE_FORMAT: &str = "date_format";
     pub const FRONT_PAGE_ID: &str = "front_page_id";
+    pub const TIMEZONE: &str = "timezone";
 }
 
 /// Whether a strftime pattern can actually be rendered.
@@ -145,13 +158,53 @@ impl Settings {
                 keys::FRONT_PAGE_ID => {
                     settings.front_page_id = value.parse::<i64>().ok().filter(|id| *id > 0);
                 }
+                // Only a zone the database actually knows, for the same reason
+                // an unrenderable date format is refused: this is the one
+                // funnel every source goes through — the form, an import, a
+                // direct write — and a name nothing can resolve would leave
+                // every conversion below with no answer.
+                keys::TIMEZONE if value.parse::<chrono_tz::Tz>().is_ok() => {
+                    settings.timezone = value.to_owned();
+                }
                 _ => {}
             }
         }
         settings
     }
 
-    /// Render a timestamp with the configured pattern, without the panic.
+    /// The configured zone, resolved.
+    ///
+    /// `from_rows` only stores a name that parses, so the fallback is
+    /// unreachable through it — but a `Settings` can also be built by hand.
+    #[must_use]
+    pub fn zone(&self) -> chrono_tz::Tz {
+        self.timezone.parse().unwrap_or(chrono_tz::UTC)
+    }
+
+    /// A stored UTC timestamp as the site's wall clock reads it.
+    #[must_use]
+    pub fn to_local(&self, utc: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+        use chrono::TimeZone as _;
+        self.zone().from_utc_datetime(&utc).naive_local()
+    }
+
+    /// A wall-clock time an editor typed, as the UTC instant to store.
+    ///
+    /// `None` for a local time that does not exist — the hour a
+    /// daylight-saving change skips. Ambiguous times (the hour that happens
+    /// twice) resolve to the earlier instant, which is the one an editor who
+    /// typed it almost certainly meant.
+    #[must_use]
+    pub fn from_local(&self, local: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
+        use chrono::TimeZone as _;
+        self.zone()
+            .from_local_datetime(&local)
+            .earliest()
+            .map(|resolved| resolved.naive_utc())
+    }
+
+    /// Render a stored UTC timestamp with the configured pattern, in the
+    /// configured zone, without the panic.
     ///
     /// `format(..).to_string()` is the obvious spelling and it panics on a
     /// malformed pattern. `from_rows` refuses to store one, so this should
@@ -160,12 +213,29 @@ impl Settings {
     #[must_use]
     pub fn format_date(&self, when: chrono::NaiveDateTime) -> String {
         use std::fmt::Write as _;
+        let local = self.to_local(when);
         let mut out = String::new();
-        if write!(out, "{}", when.format(&self.date_format)).is_ok() {
+        if write!(out, "{}", local.format(&self.date_format)).is_ok() {
             return out;
         }
         // Unreachable via `from_rows`; ISO-8601 rather than an empty cell.
-        when.format("%Y-%m-%d").to_string()
+        local.format("%Y-%m-%d").to_string()
+    }
+
+    /// A stored UTC timestamp as a date *and* time in the site's zone.
+    ///
+    /// The admin screens want the clock as well as the day, and they were each
+    /// spelling `%Y-%m-%d %H:%M` against the raw UTC value — which read as the
+    /// editor's own wall clock and was not.
+    #[must_use]
+    pub fn format_datetime(&self, when: chrono::NaiveDateTime) -> String {
+        self.to_local(when).format("%Y-%m-%d %H:%M").to_string()
+    }
+
+    /// The value a `datetime-local` input takes, in the site's zone.
+    #[must_use]
+    pub fn format_datetime_local(&self, when: chrono::NaiveDateTime) -> String {
+        self.to_local(when).format("%Y-%m-%dT%H:%M").to_string()
     }
 
     /// The `(name, value)` pairs that persist this struct.
@@ -193,6 +263,7 @@ impl Settings {
             ),
             (keys::ACTIVE_THEME, self.active_theme.clone()),
             (keys::DATE_FORMAT, self.date_format.clone()),
+            (keys::TIMEZONE, self.timezone.clone()),
             (
                 keys::FRONT_PAGE_ID,
                 self.front_page_id

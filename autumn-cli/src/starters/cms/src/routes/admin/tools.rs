@@ -489,6 +489,12 @@ pub async fn import(
     let imported_source_slugs = repos
         .with_conn(async |conn| content::imported_source_slugs(conn).await)
         .await?;
+    // Which of those a previous run *finished*. The source marker is written
+    // before the row's terms, status and ancestry are, so on its own it cannot
+    // distinguish "ours, unfinished, repair it" from "ours, done, leave it".
+    let completed_imports = repos
+        .with_conn(async |conn| content::completed_import_ids(conn).await)
+        .await?;
 
     let mut imported = 0_usize;
     let mut skipped = 0_usize;
@@ -528,12 +534,21 @@ pub async fn import(
             .any(|p| p.post_type == post.post_type);
 
         if let Some(ours) = marker_owned {
-            // Ours, so a previous run may have left it unfinished: reapply the
-            // terms and the status, and offer it to the ancestry pass. The
-            // marker commits before that work, so a failure in between leaves
-            // exactly this state, and a retry that only skipped would never
-            // repair it.
             skipped += 1;
+            // A row an earlier run finished. Left completely alone, exactly
+            // like somebody else's row below: re-applying the file's terms and
+            // status here would silently undo an editor who has since re-filed
+            // the post or moved it back to draft — on a screen whose whole
+            // promise is that existing items are left alone. Reconciliation is
+            // for *unfinished* work, not for every re-import of the same
+            // backup.
+            if completed_imports.contains(&ours.id) {
+                continue;
+            }
+            // Ours and unfinished: reapply the terms and the status, and offer
+            // it to the ancestry pass. The marker commits before that work, so
+            // a failure in between leaves exactly this state, and a retry that
+            // only skipped would never repair it.
             let term_ids = resolve_import_terms(&repos, post).await?;
             let wanted_status = post.status.clone();
             let ours_id = ours.id;
@@ -752,6 +767,15 @@ pub async fn import(
             orphaned += 1;
         }
     }
+
+    // Recorded only now, after the ancestry pass — that is what makes the
+    // marker mean "finished" rather than "created". A failure anywhere above
+    // leaves these rows unmarked, so the next run reconciles them instead of
+    // skipping them.
+    let finished: Vec<i64> = created_ids.iter().map(|(id, _, _, _)| *id).collect();
+    repos
+        .with_conn(async |conn| content::mark_imports_complete(conn, &finished).await)
+        .await?;
 
     // Fired only now, after the ancestry pass. A listener that indexes or
     // caches a post's permalink needs the parent link already in place: firing
