@@ -48,10 +48,24 @@ pub async fn sitemap(repos: Repos, State(state): State<AppState>) -> AutumnResul
         if remaining == 0 {
             break;
         }
-        for post in repos
+        let batch = repos
             .published_posts(post_type.slug, i64::try_from(remaining).unwrap_or(i64::MAX))
-            .await?
-        {
+            .await?;
+        // Ancestors for the whole batch in one query per level, rather than one
+        // per ancestor per page — `Repos::permalink` walks the chain a row at a
+        // time, and this endpoint is unauthenticated with a 50,000-URL budget,
+        // so a page-heavy site turned one crawler request into tens of
+        // thousands of round trips. Only a hierarchical type has ancestry at
+        // all; for the rest the map is never consulted.
+        let ancestors = if post_type.hierarchical {
+            let ids: Vec<i64> = batch.iter().map(|post| post.id).collect();
+            repos
+                .with_conn(async move |conn| crate::content::posts_with_ancestors(conn, &ids).await)
+                .await?
+        } else {
+            std::collections::HashMap::new()
+        };
+        for post in batch {
             // Emitted whatever shape it has, query string included. The
             // `plain` structure makes every post's canonical URL `/?p=<id>` —
             // which `front_page` serves — so skipping query-string paths
@@ -59,7 +73,7 @@ pub async fn sitemap(repos: Repos, State(state): State<AppState>) -> AutumnResul
             // chose that structure. A query string is valid in `<loc>`; the
             // `&` that a multi-parameter one would carry is escaped by
             // `escape_xml` below.
-            let path = repos.permalink(&post, &settings).await?;
+            let path = crate::routes::site::permalink_from(&post, &ancestors, &settings);
             let lastmod = post.published_at.map(|published| {
                 post.updated_at
                     .max(published)

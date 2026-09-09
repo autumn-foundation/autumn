@@ -11,7 +11,7 @@ use serde::Deserialize;
 use crate::content;
 use crate::models::{Comment, NewComment, Post};
 use crate::plugins::{Action, do_action};
-use crate::repositories::{CommentRepository as _, PostRepository as _, UserRepository as _};
+use crate::repositories::{CommentRepository as _, PostRepository as _};
 
 use super::site::{Csrf, Repos};
 
@@ -57,14 +57,17 @@ pub async fn render_thread(
     // Resolve account-backed display names once. A registered commenter renders
     // under their *current* public name; a guest renders under the name they
     // gave at the time.
-    let mut names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-    for id in rows.iter().filter_map(|c| c.author_id) {
-        if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(id)
-            && let Some(user) = repos.users.find_by_id(id).await.ok().flatten()
-        {
-            slot.insert(user.public_name().to_owned());
-        }
-    }
+    // One query for the whole page of comments, not one per distinct account.
+    // The rows are bounded at `MAX_THREAD_COMMENTS`, but a thread of two
+    // hundred comments by two hundred people still made an ordinary public page
+    // view cost two hundred sequential round trips.
+    let account_ids: Vec<i64> = rows.iter().filter_map(|c| c.author_id).collect();
+    let names: std::collections::HashMap<i64, String> = repos
+        .with_conn(async move |conn| crate::content::users_by_ids(conn, &account_ids).await)
+        .await?
+        .into_iter()
+        .map(|(id, user)| (id, user.public_name().to_owned()))
+        .collect();
     let name_of = |comment: &Comment| -> String {
         comment
             .author_id

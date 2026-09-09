@@ -8583,3 +8583,171 @@ async fn deleting_an_author_takes_the_hierarchy_lock() {
         .await
         .expect("the deletion proceeds once the lock is free");
 }
+
+/// A locked post shows no thread, and does no work building one.
+///
+/// The thread used to be rendered and then discarded for a password-protected
+/// post, so a deliberately locked public URL handed every anonymous request the
+/// most expensive path on the page — a count, up to two hundred comment rows,
+/// their authors and the whole tree.
+///
+/// The saved work is not observable here: the markup was discarded, so the
+/// response was already correct and this test passes with the gate removed. It
+/// is a correctness guard on the *output* half — that a locked page leaks
+/// neither the comments nor their scaffolding, and that unlocking restores
+/// both. The cost half is visible only in the diff.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_locked_post_renders_no_comment_thread() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Secret"),
+            ("slug", "secret"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", "hunter2"),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "body: {}", created.text());
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    // A comment already on it, so there is a thread to leak. The comment
+    // endpoint requires the password too, so unlock first — which is also what
+    // makes the sign-out below a real transition back to locked.
+    client
+        .post(&format!("/unlock/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("password", "hunter2")]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/comments/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "Insider knowledge.")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Locked: the page asks for the password and says nothing about comments.
+    sign_out(&client);
+    let locked = client.get("/secret").send().await;
+    locked.assert_ok();
+    let locked = locked.text();
+    assert!(
+        !locked.contains("Insider knowledge."),
+        "a locked post must not render its thread"
+    );
+    assert!(
+        !locked.contains("comments-heading"),
+        "and must not render the thread scaffolding either — the work is what \
+         this is about, not just the text:\n{locked}"
+    );
+
+    // Unlocked, it is all there.
+    client
+        .post(&format!("/unlock/{id}"))
+        .form(&form(&[("password", "hunter2")]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/secret")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Insider knowledge.");
+}
+
+/// A thread by many distinct accounts still renders every name.
+///
+/// The commenter lookup moved from one query per distinct account to a single
+/// `WHERE id IN (…)`. That is a cost change rather than a behaviour change and
+/// the cost is not observable through the endpoint, so this is a correctness
+/// guard: what a batched fetch can quietly lose is a name, or the distinction
+/// between a registered commenter's current public name and the name a guest
+/// gave at the time.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_thread_by_many_accounts_renders_every_name() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+    let post_id = create_post(&client, &owner, "Busy", "Body.", "publish").await;
+
+    // Three registered commenters, each with a display name that differs from
+    // their username — so a lookup that silently missed would show the wrong
+    // thing rather than nothing.
+    for n in 1..=3 {
+        sign_out(&client);
+        let cookie = register(&client, &format!("commenter{n}")).await;
+        client
+            .post(&format!("/admin/users/{}", n + 1))
+            .header("cookie", &owner)
+            .form(&form(&[
+                ("role", "subscriber"),
+                ("email", &format!("commenter{n}@example.com")),
+                ("display_name", &format!("Person {n}")),
+                ("bio", ""),
+                ("website", ""),
+            ]))
+            .send()
+            .await
+            .assert_status(303);
+        client
+            .post(&format!("/comments/{post_id}"))
+            .header("cookie", &cookie)
+            .form(&form(&[("body", &format!("Comment {n}."))]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    // And one guest, who renders under the name they gave rather than an
+    // account's.
+    sign_out(&client);
+    client
+        .post(&format!("/comments/{post_id}"))
+        .form(&form(&[
+            ("body", "Passing through."),
+            ("author_name", "Visitor"),
+            ("author_email", "visitor@example.com"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post("/admin/comments/4/status?to=approved")
+        .header("cookie", &owner)
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let page = client.get("/busy").send().await;
+    page.assert_ok();
+    let page = page.text();
+    for n in 1..=3 {
+        assert!(
+            page.contains(&format!("Person {n}")),
+            "every registered commenter renders under their current public name:\n{page}"
+        );
+    }
+    assert!(
+        page.contains("Visitor"),
+        "and a guest under the name they gave"
+    );
+}

@@ -665,9 +665,15 @@ async fn single_post(
 
     let comments_open = post.comment_status == "open"
         && content_types::find_post_type(&post.post_type).is_some_and(|t| t.supports_comments);
-    let thread = if comments_open || post.comment_count > 0 {
-        // Rendering an existing thread on a closed post is deliberate: closing
-        // comments stops new ones, it does not retract the conversation.
+    // `unlocked` gates the work, not just the output. The markup was built and
+    // then thrown away for a locked post — so a deliberately password-protected
+    // URL handed every anonymous request the most expensive path on the page:
+    // a count, up to two hundred comment rows, their authors and the whole
+    // tree. Nothing about a locked post needs any of it.
+    //
+    // Rendering an existing thread on a *closed* post is still deliberate:
+    // closing comments stops new ones, it does not retract the conversation.
+    let thread = if unlocked && (comments_open || post.comment_count > 0) {
         super::comments::render_thread(repos, session, csrf, &post).await?
     } else {
         html! {}

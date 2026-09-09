@@ -140,6 +140,10 @@ pub async fn update_post_with_revision(
             .await?;
 
         prune_revisions(conn, post_id).await?;
+        // After the write, inside this transaction, so a refusal rolls the edit
+        // back: the page's full path is only settled once the slug and the
+        // parent are both stored, and this statement is what stores them.
+        guard_page_path(conn, post_id).await?;
         Ok::<_, AutumnError>(saved)
     })
     .await
@@ -1669,13 +1673,13 @@ const RESERVED_PATHS: &[&str] = &[
     "startup",
 ];
 
-/// The probe segments *this deployment* mounts, once something has looked.
+/// The probe paths *this deployment* mounts, once something has looked.
 ///
-/// The four names in `RESERVED_PATHS` are the framework's defaults; all four
-/// are configurable. An operator who sets `health.path = "/healthz"` gets a
-/// literal `/healthz` route, which still beats the front controller's wildcard
-/// — so the static list has to be a floor rather than the whole answer.
-static CONFIGURED_PROBE_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+/// Each entry is the path split into segments. The four names in
+/// `RESERVED_PATHS` are the framework's defaults; all four are configurable,
+/// and a configured path need not be a single segment — which is why this
+/// stores whole paths rather than bare slugs.
+static CONFIGURED_PROBE_PATHS: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
 
 /// Record the probe paths this deployment mounts, from its own configuration.
 ///
@@ -1690,17 +1694,17 @@ pub fn observe_probe_paths(config: &autumn_web::config::AutumnConfig) {
     if CONFIGURED_PROBE_PATHS.get().is_some() {
         return;
     }
-    let _ = CONFIGURED_PROBE_PATHS.set(probe_segments(&config.health));
+    let _ = CONFIGURED_PROBE_PATHS.set(probe_paths(&config.health));
 }
 
-/// The bare first segments a health configuration mounts.
+/// The paths a health configuration mounts, split into segments.
 ///
 /// Pure, and separate from the `OnceLock` above so it can be tested: the store
 /// is process-global by design — one process runs one configuration — which
 /// makes the seeding itself awkward to exercise from a suite that shares a
 /// process.
 #[must_use]
-pub fn probe_segments(health: &autumn_web::config::HealthConfig) -> Vec<String> {
+pub fn probe_paths(health: &autumn_web::config::HealthConfig) -> Vec<Vec<String>> {
     if !health.enabled {
         // Explicitly disabled, so nothing is mounted and nothing is claimed.
         // The defaults in `RESERVED_PATHS` still stand — a reserved slug
@@ -1716,12 +1720,29 @@ pub fn probe_segments(health: &autumn_web::config::HealthConfig) -> Vec<String> 
     ]
     .iter()
     .filter_map(|path| {
-        let segment = path.trim_start_matches('/');
-        // One segment only: a probe mounted at `/a/b` cannot shadow a bare
-        // slug, and reserving `a` on its account would be wrong.
-        (!segment.is_empty() && !segment.contains('/')).then(|| segment.to_owned())
+        let segments: Vec<String> = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(std::string::ToString::to_string)
+            .collect();
+        (!segments.is_empty()).then_some(segments)
     })
     .collect()
+}
+
+/// Whether a whole page path is one this deployment's framework routes claim.
+///
+/// A page is addressed by its full ancestry, so a *nested* probe path can be
+/// shadowed too: `health.path = "/internal/probe"` is reachable as a root page
+/// `internal` with a child `probe`, whose canonical `/internal/probe` the
+/// framework's literal route wins. An earlier version of this discarded
+/// multi-segment paths on the grounds that only bare slugs can collide, which
+/// is true for posts and false for pages.
+#[must_use]
+pub fn is_claimed_page_path(segments: &[String]) -> bool {
+    CONFIGURED_PROBE_PATHS
+        .get()
+        .is_some_and(|paths| paths.iter().any(|path| path.as_slice() == segments))
 }
 
 /// Whether a slug would be shadowed by one of the application's own routes, or
@@ -1731,7 +1752,7 @@ pub fn is_reserved_path(slug: &str) -> bool {
     RESERVED_PATHS.contains(&slug)
         || CONFIGURED_PROBE_PATHS
             .get()
-            .is_some_and(|paths| paths.iter().any(|path| path == slug))
+            .is_some_and(|paths| paths.iter().any(|path| path.len() == 1 && path[0] == slug))
 }
 
 /// A scheduled post needs a date that is actually in the future.
@@ -2002,6 +2023,49 @@ pub async fn post_by_id(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnRes
         .optional()?)
 }
 
+/// Refuse a page whose full path a framework route already serves.
+///
+/// Checked *after* the write, inside the caller's transaction, so it rolls the
+/// change back — the same shape the hierarchy re-validation uses. The path is
+/// only known once the slug is allocated and the parent is set, and those
+/// happen in the same statement, so there is no earlier point that has both.
+///
+/// A bare slug is caught long before this by `ensure_unique_slug`; what this
+/// adds is the nested case, which only a page can reach.
+pub async fn guard_page_path(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<()> {
+    let Some(post) = post_by_id(conn, post_id).await? else {
+        return Ok(());
+    };
+    if post.post_type != "page" || post.parent_id.is_none() {
+        return Ok(());
+    }
+
+    let mut segments = vec![post.slug.clone()];
+    let mut cursor = post.parent_id;
+    let mut seen = vec![post.id];
+    while let Some(parent_id) = cursor {
+        if segments.len() > MAX_PAGE_DEPTH || seen.contains(&parent_id) {
+            break;
+        }
+        seen.push(parent_id);
+        let Some(parent) = post_by_id(conn, parent_id).await? else {
+            break;
+        };
+        segments.push(parent.slug.clone());
+        cursor = parent.parent_id;
+    }
+    segments.reverse();
+
+    if is_claimed_page_path(&segments) {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "/{} is served by this site's health probe, so a page there would never be \
+             reachable",
+            segments.join("/")
+        )));
+    }
+    Ok(())
+}
+
 /// Every descendant of a page, by id.
 ///
 /// Level by level, one query per level, bounded by the depth the resolver
@@ -2140,6 +2204,13 @@ pub async fn set_post_parent(
             .set(posts::parent_id.eq(parent_id))
             .execute(conn)
             .await?;
+        // Re-parenting is the other way a page's path changes. Declining
+        // rather than raising, like the checks above it: the importer treats an
+        // unusable link as "leave this page at the top level" and reports the
+        // count.
+        if guard_page_path(conn, post_id).await.is_err() {
+            return Ok(false);
+        }
         Ok::<_, AutumnError>(true)
     })
     .await
@@ -2721,6 +2792,27 @@ pub async fn terms_by_ids(
         .collect())
 }
 
+/// The accounts named by `ids`, in one query.
+///
+/// The public thread renderer looked each commenter up individually, so an
+/// ordinary page view cost one round trip per distinct account in the thread.
+pub async fn users_by_ids(
+    conn: &mut AsyncPgConnection,
+    ids: &[i64],
+) -> AutumnResult<std::collections::HashMap<i64, User>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(users::table
+        .filter(users::id.eq_any(ids))
+        .select(User::as_select())
+        .load(conn)
+        .await?
+        .into_iter()
+        .map(|user| (user.id, user))
+        .collect())
+}
+
 /// The accounts that authored a page of posts, in one query.
 ///
 /// The list screen looked each one up per row, so a fifty-row page cost fifty
@@ -2777,6 +2869,7 @@ pub async fn insert_post_with_unique_slug(
                     .returning(Post::as_returning())
                     .get_result(conn)
                     .await?;
+                guard_page_path(conn, saved.id).await?;
                 Ok::<_, AutumnError>(saved)
             })
             .await;
@@ -3203,7 +3296,7 @@ pub async fn publish_due_post(
 
 #[cfg(test)]
 mod slug_shape_tests {
-    use super::{Registration, probe_segments, reads_as_date_archive, segment_claim};
+    use super::{Registration, probe_paths, reads_as_date_archive, segment_claim};
 
     /// The namespace answer covers every branch `permalinks::resolve` tries
     /// before it reaches bare post/page content — the whole point of having one
@@ -3255,27 +3348,38 @@ mod slug_shape_tests {
     fn a_renamed_probe_path_is_still_claimed() {
         let mut health = autumn_web::config::HealthConfig::default();
         assert_eq!(
-            probe_segments(&health),
-            vec!["health", "live", "ready", "startup"],
+            probe_paths(&health),
+            vec![
+                vec!["health".to_owned()],
+                vec!["live".to_owned()],
+                vec!["ready".to_owned()],
+                vec!["startup".to_owned()],
+            ],
             "the defaults are what `RESERVED_PATHS` already carries"
         );
 
         "/healthz".clone_into(&mut health.path);
-        let segments = probe_segments(&health);
-        assert!(segments.contains(&"healthz".to_owned()));
+        let paths = probe_paths(&health);
+        assert!(paths.contains(&vec!["healthz".to_owned()]));
         assert!(
-            !segments.contains(&"health".to_owned()),
+            !paths.contains(&vec!["health".to_owned()]),
             "the renamed path replaces the default rather than adding to it"
         );
 
-        // A probe nested under a prefix cannot shadow a bare slug, and
-        // reserving its first segment on that account would be wrong.
-        "/internal/health".clone_into(&mut health.path);
-        let segments = probe_segments(&health);
-        assert!(!segments.iter().any(|s| s == "internal" || s == "health"));
+        // A nested probe is kept whole. A page is addressed by its full
+        // ancestry, so `/internal/probe` is reachable as a root page
+        // `internal` with a child `probe` — discarding it (which an earlier
+        // version did) left exactly that collision open.
+        "/internal/probe".clone_into(&mut health.path);
+        let paths = probe_paths(&health);
+        assert!(paths.contains(&vec!["internal".to_owned(), "probe".to_owned()]));
+        assert!(
+            !paths.contains(&vec!["internal".to_owned()]),
+            "the prefix alone is not claimed — `/internal` serves nothing"
+        );
 
         // Disabled probes mount nothing and claim nothing.
         health.enabled = false;
-        assert!(probe_segments(&health).is_empty());
+        assert!(probe_paths(&health).is_empty());
     }
 }

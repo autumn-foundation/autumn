@@ -1103,8 +1103,17 @@ pub async fn create(
                     use diesel_async::AsyncConnection as _;
                     conn.transaction(async move |conn| {
                         content::lock_page_hierarchy(conn).await?;
-                        content::validate_parent(conn, Some(created.id), registered.slug, parent_id)
-                            .await
+                        content::validate_parent(
+                            conn,
+                            Some(created.id),
+                            registered.slug,
+                            parent_id,
+                        )
+                        .await?;
+                        // The path is only settled now: the slug the allocator
+                        // chose plus the parent this insert carried. A refusal
+                        // takes the unwind below, like every other check here.
+                        content::guard_page_path(conn, created.id).await
                     })
                     .await
                 })

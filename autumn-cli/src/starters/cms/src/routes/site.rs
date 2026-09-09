@@ -581,6 +581,28 @@ impl Submit {
     }
 }
 
+/// A post's permalink, built from an already-loaded map of ancestors.
+///
+/// The map-based twin of [`Repos::permalink`], for callers that have loaded a
+/// batch: the sitemap and the navigation both render many posts at once, and
+/// walking the ancestor chain a row at a time made each of them cost a query
+/// per level per post.
+#[must_use]
+pub fn permalink_from(
+    post: &Post,
+    ancestors: &std::collections::HashMap<i64, Post>,
+    settings: &Settings,
+) -> String {
+    let ancestry = if post.post_type == "page" {
+        ancestry_from(post, ancestors)
+    } else {
+        Vec::new()
+    };
+    settings
+        .permalink_structure
+        .permalink(post, &ancestry, settings.zone())
+}
+
 /// A menu item's target: its post, its term, or its raw URL — in that order,
 /// matching the three link kinds the menu editor offers.
 ///
@@ -594,14 +616,7 @@ fn menu_item_url(
     settings: &Settings,
 ) -> String {
     if let Some(post) = item.post_id.and_then(|id| posts.get(&id)) {
-        let ancestry = if post.post_type == "page" {
-            ancestry_from(post, posts)
-        } else {
-            Vec::new()
-        };
-        return settings
-            .permalink_structure
-            .permalink(post, &ancestry, settings.zone());
+        return permalink_from(post, posts, settings);
     }
     if let Some(term) = item.term_id.and_then(|id| terms.get(&id)) {
         return theme::term_url(term);
