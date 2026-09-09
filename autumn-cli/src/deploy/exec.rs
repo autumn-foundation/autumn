@@ -7863,6 +7863,7 @@ mod tests {
     /// `Verdict::Proceed` also asserts the link actually lands on the shared
     /// file: a guard that lets a state through without linking is a different
     /// failure, not a pass.
+    #[cfg(target_os = "linux")]
     /// What occupies `current/<db>` in one row of the state table.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Current {
@@ -7872,6 +7873,7 @@ mod tests {
         RealFile,
     }
 
+    #[cfg(target_os = "linux")]
     /// What the deploy must do about it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Verdict {
@@ -7879,6 +7881,7 @@ mod tests {
         Refuse,
     }
 
+    #[cfg(target_os = "linux")]
     /// One row: `current` × shared-file × marker → verdict, and why.
     type LinkDataRow = (Current, bool, bool, Verdict, &'static str);
 
@@ -7886,6 +7889,7 @@ mod tests {
     ///
     /// `operator.db` sits outside the app dir entirely: a refusal must leave it
     /// byte-intact, which is what makes "refused" mean "touched nothing".
+    #[cfg(target_os = "linux")]
     fn build_link_data_layout(
         root: &Path,
         current: Current,
@@ -7927,6 +7931,7 @@ mod tests {
     }
 
     /// Run the real `link-data` shell against one row's layout and check it.
+    #[cfg(target_os = "linux")]
     fn check_link_data_row(root: &Path, row: LinkDataRow) {
         let (current, shared_exists, marker, want, why) = row;
         let release = build_link_data_layout(root, current, shared_exists, marker);
@@ -7992,6 +7997,13 @@ mod tests {
     /// that read correctly and covered one state fewer than the deploy can
     /// reach, so an assertion on the generated TEXT would have passed for both.
     /// Reintroducing either gate fails this test on its exact row.
+    // Linux-only, for the reason `prune_shell_protects_current_and_previous_dirs_end_to_end`
+    // is: these execute the generated shell against a real tree, so they need
+    // `std::os::unix::fs::symlink` (absent on Windows — a compile error) and GNU
+    // `readlink -f` (BSD `readlink` has no `-f`, so macOS panics). The shell they
+    // run is written for a POSIX deploy target that is Ubuntu, so gating the
+    // RUNNER loses no coverage.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_link_op_decides_every_state_of_current_and_the_shared_file() {
         use Current::{Absent, LinkElsewhere, LinkToShared, RealFile};
@@ -8057,6 +8069,7 @@ mod tests {
     /// The marker is written the first time the shared database is seen, so the
     /// refusal above has something to key on — and it lives in `shared/`, never
     /// in `shared/data`, which is the mount whose absence it exists to detect.
+    #[cfg(target_os = "linux")]
     #[test]
     fn seeing_the_shared_database_records_the_marker_outside_the_data_mount() {
         let cfg = resolved_sqlite();
@@ -8096,6 +8109,7 @@ mod tests {
     /// so the host is asked instead (#2589 item 13): a database whose parent
     /// resolves into the releases directory is refused before anything is
     /// uploaded or pruned.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_persistent_data_guard_resolves_a_symlinked_app_dir_on_the_host() {
         let root = std::env::temp_dir().join(format!("autumn-datadir-{}", std::process::id()));
