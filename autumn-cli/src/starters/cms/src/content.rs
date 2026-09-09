@@ -1278,6 +1278,20 @@ pub async fn lock_page_hierarchy(conn: &mut AsyncPgConnection) -> AutumnResult<(
 /// while `resolve_page_path` refuses trashed ancestors — every published child
 /// starts 404ing at its own canonical URL, and the sitemap advertises those
 /// dead URLs.
+/// Whether a term's archive is reachable at all.
+///
+/// A taxonomy lives in a process-global registry a plugin can stop registering,
+/// but its terms and their `post_terms` rows stay in the database. `term_url`
+/// falls back to the stored taxonomy slug, and `permalinks::resolve` recognises
+/// a term archive only by iterating the *currently registered* taxonomies — so
+/// a link built for an orphaned term either 404s or, worse, resolves as
+/// unrelated page content. Anywhere that renders links for terms it did not
+/// choose has to ask this first.
+#[must_use]
+pub fn is_routable_term(term: &Term) -> bool {
+    crate::content_types::find_taxonomy(&term.taxonomy).is_some()
+}
+
 /// Whether a registered post type nests.
 #[must_use]
 pub fn is_hierarchical_type(post_type: &str) -> bool {
@@ -3172,6 +3186,8 @@ pub struct ExportRows {
     pub terms_by_post: std::collections::HashMap<i64, Vec<Term>>,
     /// Every attachment, oldest first.
     pub attachments: Vec<crate::models::Attachment>,
+    /// Retained revisions of the exported posts, by post id, oldest first.
+    pub revisions_by_post: std::collections::HashMap<i64, Vec<Revision>>,
     /// Custom fields on the exported posts, by post id, excluding the
     /// importer's own private keys.
     pub meta_by_post: std::collections::HashMap<i64, Vec<(String, String)>>,
@@ -3293,6 +3309,27 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
             .push(comment.clone());
     }
 
+    // Retained revisions, oldest first — the order they have to be replayed in
+    // for `restore_revision` to mean the same thing after a restore.
+    let revision_rows: Vec<Revision> = if post_ids.is_empty() {
+        Vec::new()
+    } else {
+        revisions::table
+            .filter(revisions::post_id.eq_any(&post_ids))
+            .order((revisions::created_at.asc(), revisions::id.asc()))
+            .select(Revision::as_select())
+            .load(conn)
+            .await?
+    };
+    let mut revisions_by_post: std::collections::HashMap<i64, Vec<Revision>> =
+        std::collections::HashMap::new();
+    for revision in &revision_rows {
+        revisions_by_post
+            .entry(revision.post_id)
+            .or_default()
+            .push(revision.clone());
+    }
+
     // Custom fields. The importer's own markers are deliberately excluded: they
     // record where a row came from *in this database*, so carrying them into a
     // file would make the next restore treat a fresh row as one it had already
@@ -3323,6 +3360,11 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
     // account from their own comments.
     let mut author_ids: Vec<i64> = posts.iter().map(|post| post.author_id).collect();
     author_ids.extend(comment_rows.iter().filter_map(|comment| comment.author_id));
+    author_ids.extend(
+        revision_rows
+            .iter()
+            .filter_map(|revision| revision.author_id),
+    );
     author_ids.sort_unstable();
     author_ids.dedup();
     let usernames = users_by_ids(conn, &author_ids)
@@ -3370,9 +3412,118 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
         terms_by_post,
         attachments,
         attachments_by_id,
+        revisions_by_post,
         meta_by_post,
         comments_by_post,
     })
+}
+
+/// One retained revision as an export file describes it.
+pub struct ImportedRevision {
+    /// The editor's **username**, if the snapshot recorded one.
+    pub author_username: Option<String>,
+    pub title: String,
+    pub excerpt: String,
+    pub body: String,
+    pub status: String,
+    pub summary: String,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// Restore a post's revision history.
+///
+/// Returns how many snapshots this call wrote.
+///
+/// Replaces whatever the row has rather than appending, and that is the whole
+/// difficulty: the importer creates every post as a draft and transitions it,
+/// and both of those record revisions of their own. So a post always has
+/// history by the time this runs, and appending would interleave the file's
+/// record with the restore's own bookkeeping — leaving an editor a "history"
+/// whose newest entries describe the import rather than anything anybody wrote.
+/// The file's history is the true one; the rows the restore made along the way
+/// are an artefact of restoring.
+///
+/// Bounded by [`REVISION_LIMIT`], newest kept, exactly as an edit is.
+pub async fn import_revisions(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    incoming: &[ImportedRevision],
+) -> AutumnResult<usize> {
+    if incoming.is_empty() {
+        return Ok(0);
+    }
+    let usernames: Vec<String> = incoming
+        .iter()
+        .filter_map(|revision| revision.author_username.clone())
+        .collect();
+    let accounts: std::collections::HashMap<String, i64> = if usernames.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        users::table
+            .filter(users::username.eq_any(&usernames))
+            .select((users::username, users::id))
+            .load::<(String, i64)>(conn)
+            .await?
+            .into_iter()
+            .collect()
+    };
+
+    // Newest `REVISION_LIMIT`, in the order they were written.
+    let keep: Vec<ImportedRevision> = incoming
+        .iter()
+        .skip(
+            incoming
+                .len()
+                .saturating_sub(usize::try_from(REVISION_LIMIT).unwrap_or(usize::MAX)),
+        )
+        .map(|revision| ImportedRevision {
+            author_username: revision.author_username.clone(),
+            title: revision.title.clone(),
+            excerpt: revision.excerpt.clone(),
+            body: revision.body.clone(),
+            status: revision.status.clone(),
+            summary: revision.summary.clone(),
+            created_at: revision.created_at,
+        })
+        .collect();
+
+    conn.transaction(async move |conn| {
+        let locked: Option<i64> = posts::table
+            .find(post_id)
+            .select(posts::id)
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?;
+        if locked.is_none() {
+            return Ok(0);
+        }
+        diesel::delete(revisions::table.filter(revisions::post_id.eq(post_id)))
+            .execute(conn)
+            .await?;
+        for revision in &keep {
+            diesel::insert_into(revisions::table)
+                .values((
+                    revisions::post_id.eq(post_id),
+                    revisions::title.eq(&revision.title),
+                    revisions::excerpt.eq(&revision.excerpt),
+                    revisions::body.eq(&revision.body),
+                    revisions::status.eq(&revision.status),
+                    revisions::author_id.eq(revision
+                        .author_username
+                        .as_ref()
+                        .and_then(|username| accounts.get(username).copied())),
+                    revisions::summary.eq(&revision.summary),
+                    // Explicit, like a comment's: a history whose timestamps all
+                    // say "the moment of the restore" is not a history.
+                    revisions::created_at.eq(revision.created_at),
+                ))
+                .execute(conn)
+                .await?;
+        }
+        Ok::<_, AutumnError>(keep.len())
+    })
+    .await
 }
 
 /// The `post_meta` keys this application owns.

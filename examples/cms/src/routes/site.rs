@@ -715,7 +715,13 @@ fn menu_item_is_visible(
         });
     }
     if let Some(term_id) = item.term_id {
-        return terms.contains_key(&term_id);
+        // Registered, not merely present: a term whose taxonomy a plugin
+        // stopped registering still has a row, and `menu_item_url` would build
+        // it an archive link that resolves nowhere — see
+        // `content::is_routable_term`.
+        return terms
+            .get(&term_id)
+            .is_some_and(crate::content::is_routable_term);
     }
     true
 }

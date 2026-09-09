@@ -768,9 +768,14 @@ async fn single_post(
                 (password_form(&post, csrf))
             }
 
-            @if !terms.is_empty() && unlocked {
+            // Only terms whose taxonomy is still registered. A plugin that
+            // stops registering one leaves its terms and filings in place, and
+            // `permalinks::resolve` recognises an archive only by iterating the
+            // registered taxonomies — so a link for an orphaned term 404s, or
+            // resolves as unrelated page content.
+            @if terms.iter().any(crate::content::is_routable_term) && unlocked {
                 footer class="mt-8 pt-4 border-t border-gray-100 flex flex-wrap gap-2" {
-                    @for term in &terms {
+                    @for term in terms.iter().filter(|term| crate::content::is_routable_term(term)) {
                         a href=(theme::term_url(term))
                           class="px-2 py-0.5 bg-gray-100 rounded text-xs text-gray-700 \
                                  hover:bg-gray-200" {

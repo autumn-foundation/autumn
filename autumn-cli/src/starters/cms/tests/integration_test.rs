@@ -3691,6 +3691,266 @@ async fn a_stale_plain_permalink_is_a_404() {
     client.get("/").send().await.assert_ok();
 }
 
+/// A term whose taxonomy is no longer registered is not linked.
+///
+/// A plugin that stops registering a taxonomy leaves its terms and filings in
+/// place, and `permalinks::resolve` recognises a term archive only by iterating
+/// the *currently registered* taxonomies — so a link built for an orphaned term
+/// 404s, or resolves as unrelated page content.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unregistered_taxonomys_terms_are_not_linked() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Filed", "Body.", "publish").await;
+
+    // A term of a taxonomy nothing registers — the state a removed plugin
+    // leaves behind. Written directly, because the admin screens are
+    // registry-driven and cannot produce it.
+    //
+    // The slug is deliberately one no other test registers: `content_types` is
+    // a process-global registry, so `shelf` — which
+    // `a_registered_custom_taxonomy_is_editable` registers — is *registered* by
+    // the time this runs in a full suite, and the term would be routable after
+    // all. That is the same trap round 57 hit with a post type.
+    // One statement per call: `try_execute` prepares, and a prepared statement
+    // cannot carry several.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         VALUES ('retired-plugin', 'Reference', 'reference', '', 1)",
+    )
+    .await
+    .expect("seed the orphaned term");
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO post_terms (post_id, term_id)
+             VALUES ({id}, (SELECT id FROM terms WHERE slug = 'reference'))"
+        ),
+    )
+    .await
+    .expect("file it under the orphaned term");
+
+    // A category too, so the footer is not simply empty.
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "News"),
+            ("slug", ""),
+            ("description", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO post_terms (post_id, term_id)
+             VALUES ({id}, (SELECT id FROM terms WHERE slug = 'news'))"
+        ),
+    )
+    .await
+    .expect("file it under the category");
+
+    sign_out(&client);
+    let page = client.get("/filed").send().await.assert_ok().text();
+    assert!(
+        page.contains("/category/news"),
+        "a registered taxonomy's term is still linked:\n{page}"
+    );
+    assert!(
+        !page.contains("Reference") && !page.contains("/retired-plugin/reference"),
+        "and one whose taxonomy nothing registers is not advertised at all"
+    );
+    // The link it would have minted really does go nowhere, which is the point.
+    assert_eq!(
+        client.get("/retired-plugin/reference").send().await.status,
+        404
+    );
+}
+
+/// A seeded composite is all there or not there at all.
+///
+/// The menu and the sidebar are each a composite whose existence check reads
+/// only the first row. Committed statement by statement, a run interrupted
+/// after the menu row but before its items left a menu the next run reads as
+/// already seeded — so the missing items were never restored, and the
+/// idempotent retry this seeder advertises could not repair it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_seeded_composite_is_all_or_nothing() {
+    let client = db_client().await;
+    let _cookie = register(&client, "owner").await;
+
+    // A trigger that refuses the *second* menu item, which is what an
+    // interruption part-way through the composite looks like.
+    try_execute(
+        TestDb::shared().await,
+        "CREATE FUNCTION refuse_second_item() RETURNS trigger AS $$
+         BEGIN
+           IF (SELECT count(*) FROM menu_items) >= 1 THEN
+             RAISE EXCEPTION 'interrupted';
+           END IF;
+           RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .await
+    .expect("install the function");
+    try_execute(
+        TestDb::shared().await,
+        "CREATE TRIGGER refuse_second_item BEFORE INSERT ON menu_items
+         FOR EACH ROW EXECUTE PROCEDURE refuse_second_item()",
+    )
+    .await
+    .expect("install the trigger");
+
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::seed::seed_site(&mut conn)
+            .await
+            .expect_err("the seed fails while the trigger refuses");
+    }
+
+    // Nothing half-written: the menu row did not survive its items' failure.
+    let menus: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::get_result({{crate_name}}::schema::menus::table.count(), &mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(
+        menus, 0,
+        "a menu with no items must not be left for the next run to read as done"
+    );
+
+    // With the fault removed, a retry seeds it completely.
+    try_execute(
+        TestDb::shared().await,
+        "DROP TRIGGER refuse_second_item ON menu_items",
+    )
+    .await
+    .expect("remove the trigger");
+    try_execute(TestDb::shared().await, "DROP FUNCTION refuse_second_item()")
+        .await
+        .expect("remove the function");
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::seed::seed_site(&mut conn)
+            .await
+            .expect("the retry repairs it");
+    }
+    let items: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::get_result({{crate_name}}::schema::menu_items::table.count(), &mut conn)
+            .await
+            .expect("the count")
+    };
+    assert!(items >= 2, "the whole menu is there, got {items} items");
+}
+
+/// A backup carries the revision history.
+///
+/// Revisions are a supported feature, and a restore that drops them takes away
+/// the ability to roll content back — silently, since nothing on the restored
+/// post says its history used to exist.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_export_carries_revision_history() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Revised", "First draft.", "publish").await;
+
+    // Two edits, so there is a history worth keeping.
+    for body in ["Second draft.", "Third draft."] {
+        client
+            .post(&format!("/admin/content/post/{id}"))
+            .header("cookie", &cookie)
+            .form(
+                &edit_form(
+                    &id,
+                    &[
+                        ("title", "Revised"),
+                        ("slug", "revised"),
+                        ("excerpt", ""),
+                        ("body", body),
+                        ("status", "publish"),
+                        ("password", ""),
+                        ("taxonomy_names[post_tag]", ""),
+                    ],
+                )
+                .await,
+            )
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    let payload = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        payload.contains("First draft.") && payload.contains("Second draft."),
+        "the snapshots travel, not just the current body:\n{payload}"
+    );
+
+    let fresh = db_client().await;
+    let cookie = register(&fresh, "owner").await;
+    import_export(&fresh, &cookie, &payload).await.assert_ok();
+
+    let bodies: Vec<String> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::load(
+            {{crate_name}}::schema::revisions::table
+                .order({{crate_name}}::schema::revisions::created_at.asc())
+                .select({{crate_name}}::schema::revisions::body),
+            &mut conn,
+        )
+        .await
+        .expect("the revisions")
+    };
+    assert!(
+        bodies.contains(&"First draft.".to_owned()) && bodies.contains(&"Second draft.".to_owned()),
+        "the history comes back: {bodies:?}"
+    );
+    // And it is the file's history, not the restore's own bookkeeping: the
+    // import creates every post as a draft and transitions it, and both record
+    // snapshots of their own.
+    assert!(
+        !bodies.iter().any(|body| body == "Third draft."),
+        "the restore's own snapshots do not survive beside it: {bodies:?}"
+    );
+
+    // The author travels too.
+    let authors: Vec<Option<i64>> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::load(
+            {{crate_name}}::schema::revisions::table.select({{crate_name}}::schema::revisions::author_id),
+            &mut conn,
+        )
+        .await
+        .expect("the authors")
+    };
+    assert!(
+        authors.iter().any(Option::is_some),
+        "a snapshot's editor is resolved back to an account: {authors:?}"
+    );
+}
+
 /// A backup carries custom fields.
 ///
 /// A plugin storing per-post data through the `PostMeta` repository had every

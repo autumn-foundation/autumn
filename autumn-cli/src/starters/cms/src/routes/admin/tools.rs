@@ -123,6 +123,14 @@ pub struct ExportPost {
     /// was unrecoverable even with the blob store backed up.
     #[serde(default)]
     pub featured_media: Option<String>,
+    /// The post's retained revision history, oldest first.
+    ///
+    /// Carried in version 5 with the comments and the custom fields. Revisions
+    /// are a supported feature of this CMS, and a restore that drops them takes
+    /// away the ability to roll content back — silently, since nothing on the
+    /// restored post says its history used to exist.
+    #[serde(default)]
+    pub revisions: Vec<ExportRevision>,
     /// Custom fields, as `key` → `value` pairs.
     ///
     /// Carried in version 5 alongside the comments. A plugin storing per-post
@@ -141,6 +149,24 @@ pub struct ExportPost {
     /// `wp:comment` for exactly this reason.
     #[serde(default)]
     pub comments: Vec<ExportComment>,
+}
+
+/// One retained revision in an export file.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportRevision {
+    /// The editor's **username**, absent when the snapshot recorded no author
+    /// (the scheduler and the seeder write some).
+    #[serde(default)]
+    pub author: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub excerpt: String,
+    #[serde(default)]
+    pub body: String,
+    pub status: String,
+    #[serde(default)]
+    pub summary: String,
+    pub created_at: chrono::NaiveDateTime,
 }
 
 /// One custom field in an export file.
@@ -439,6 +465,23 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 })
                 .collect(),
             featured_media,
+            revisions: rows
+                .revisions_by_post
+                .get(&post.id)
+                .into_iter()
+                .flatten()
+                .map(|revision| ExportRevision {
+                    author: revision
+                        .author_id
+                        .and_then(|id| rows.usernames.get(&id).cloned()),
+                    title: revision.title.clone(),
+                    excerpt: revision.excerpt.clone(),
+                    body: revision.body.clone(),
+                    status: revision.status.clone(),
+                    summary: revision.summary.clone(),
+                    created_at: revision.created_at,
+                })
+                .collect(),
             meta: rows
                 .meta_by_post
                 .get(&post.id)
@@ -492,6 +535,22 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
         .into_response())
 }
 
+/// The file's revisions, in the shape `content::import_revisions` restores.
+fn imported_revisions(revisions: &[ExportRevision]) -> Vec<content::ImportedRevision> {
+    revisions
+        .iter()
+        .map(|revision| content::ImportedRevision {
+            author_username: revision.author.clone(),
+            title: revision.title.clone(),
+            excerpt: revision.excerpt.clone(),
+            body: revision.body.clone(),
+            status: revision.status.clone(),
+            summary: revision.summary.clone(),
+            created_at: revision.created_at,
+        })
+        .collect()
+}
+
 /// The file's custom fields, in the shape `content::import_post_meta` restores.
 fn imported_meta(meta: &[ExportMeta]) -> Vec<(String, String)> {
     meta.iter()
@@ -521,6 +580,14 @@ fn imported_comments(comments: &[ExportComment]) -> Vec<content::ImportedComment
 /// Built from the roots down, so a row whose parent is missing — a comment
 /// whose parent was deleted by a direct write — is dropped rather than promoted
 /// to a root it never was.
+///
+/// Indexed by parent once rather than filtered per node. Filtering the whole
+/// slice at every call is quadratic, and it is quadratic in the thing an
+/// unauthenticated visitor grows: a thread of ten thousand roots is a hundred
+/// million comparisons, so producing a backup could monopolise a core or time
+/// the administrator out. The tree is bounded by `MAX_COMMENT_DEPTH` but the
+/// *breadth* is not, which is exactly the shape that has bitten the render path
+/// twice in this review.
 fn export_comments(
     rows: Option<&Vec<crate::models::Comment>>,
     usernames: &std::collections::HashMap<i64, String>,
@@ -528,8 +595,14 @@ fn export_comments(
     let Some(rows) = rows else {
         return Vec::new();
     };
+    let mut by_parent: std::collections::HashMap<Option<i64>, Vec<&crate::models::Comment>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        by_parent.entry(row.parent_id).or_default().push(row);
+    }
+
     fn children(
-        rows: &[crate::models::Comment],
+        by_parent: &std::collections::HashMap<Option<i64>, Vec<&crate::models::Comment>>,
         parent: Option<i64>,
         depth: usize,
         usernames: &std::collections::HashMap<i64, String>,
@@ -539,8 +612,10 @@ fn export_comments(
         if depth > crate::content::MAX_COMMENT_DEPTH + 1 {
             return Vec::new();
         }
-        rows.iter()
-            .filter(|row| row.parent_id == parent)
+        by_parent
+            .get(&parent)
+            .into_iter()
+            .flatten()
             .map(|row| ExportComment {
                 author: row.author_id.and_then(|id| usernames.get(&id).cloned()),
                 author_name: row.author_name.clone(),
@@ -549,11 +624,11 @@ fn export_comments(
                 body: row.body.clone(),
                 status: row.status.clone(),
                 created_at: row.created_at,
-                replies: children(rows, Some(row.id), depth + 1, usernames),
+                replies: children(by_parent, Some(row.id), depth + 1, usernames),
             })
             .collect()
     }
-    children(rows, None, 0, usernames)
+    children(&by_parent, None, 0, usernames)
 }
 
 /// What identifies a post inside an export file.
@@ -912,6 +987,13 @@ pub async fn import(
             repos
                 .with_conn(async |conn| content::import_post_meta(conn, ours.id, &fields).await)
                 .await?;
+            // After the status transition above, which records revisions of its
+            // own: the file's history is the true one, and the rows the restore
+            // made along the way are an artefact of restoring.
+            let history = imported_revisions(&post.revisions);
+            repos
+                .with_conn(async |conn| content::import_revisions(conn, ours.id, &history).await)
+                .await?;
             created_ids.push((
                 ours.id,
                 post.post_type.clone(),
@@ -1076,6 +1158,13 @@ pub async fn import(
         repos
             .with_conn(async |conn| content::import_post_meta(conn, created_id, &fields).await)
             .await?;
+        // After the status transition above, which records revisions of its
+        // own: the file's history is the true one, and the rows the restore
+        // made along the way are an artefact of restoring.
+        let history = imported_revisions(&post.revisions);
+        repos
+            .with_conn(async |conn| content::import_revisions(conn, created_id, &history).await)
+            .await?;
         created_ids.push((
             created_id,
             post.post_type.clone(),
@@ -1189,4 +1278,78 @@ pub async fn import(
         }
     };
     Ok(layout(&user, &csrf, "/admin/tools", "Import", body).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comment(id: i64, parent: Option<i64>, body: &str) -> crate::models::Comment {
+        crate::models::Comment {
+            id,
+            post_id: 1,
+            parent_id: parent,
+            author_id: None,
+            author_name: "Guest".to_owned(),
+            author_email: String::new(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: body.to_owned(),
+            status: "approved".to_owned(),
+            created_at: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    /// The tree the file carries is the tree the rows describe.
+    ///
+    /// Guarding the rewrite that made this linear: it used to filter the whole
+    /// slice at every node, so indexing by parent was a change to *how* the
+    /// nesting is found, and this is what says the nesting itself did not move.
+    #[test]
+    fn the_export_tree_matches_the_rows() {
+        let names = std::collections::HashMap::new();
+        let rows = vec![
+            comment(1, None, "root one"),
+            comment(2, Some(1), "reply to one"),
+            comment(3, None, "root two"),
+            comment(4, Some(2), "reply to the reply"),
+            // A row whose parent is gone — only reachable by a direct write.
+            comment(5, Some(99), "orphan"),
+        ];
+        let tree = export_comments(Some(&rows), &names);
+
+        let roots: Vec<&str> = tree.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(
+            roots,
+            vec!["root one", "root two"],
+            "an orphan is dropped rather than promoted to a root it never was"
+        );
+        assert_eq!(tree[0].replies.len(), 1);
+        assert_eq!(tree[0].replies[0].body, "reply to one");
+        assert_eq!(tree[0].replies[0].replies[0].body, "reply to the reply");
+        assert!(tree[1].replies.is_empty());
+    }
+
+    /// A cycle from a direct write terminates the walk rather than spinning.
+    #[test]
+    fn the_export_tree_is_bounded() {
+        let names = std::collections::HashMap::new();
+        // 1 → 2 → 3 → … each the child of the last, deeper than the cap.
+        let mut rows = vec![comment(1, None, "root")];
+        for id in 2..20 {
+            rows.push(comment(id, Some(id - 1), "deeper"));
+        }
+        let tree = export_comments(Some(&rows), &names);
+
+        let mut depth = 0;
+        let mut node = &tree[0];
+        while let Some(next) = node.replies.first() {
+            depth += 1;
+            node = next;
+        }
+        assert!(
+            depth <= crate::content::MAX_COMMENT_DEPTH + 1,
+            "the walk stops at the cap the write path enforces, got {depth}"
+        );
+    }
 }

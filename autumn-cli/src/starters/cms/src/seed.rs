@@ -8,7 +8,7 @@
 use autumn_web::AutumnResult;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
+use diesel_async::{AsyncConnection as _, RunQueryDsl};
 
 use crate::models::{NewMenu, NewMenuItem, NewPost, NewSiteOption, NewTerm, NewWidget};
 use crate::schema::{menu_items, menus, options, posts, terms, users, widgets};
@@ -115,83 +115,106 @@ pub async fn seed_site(
     // violated that index. The settings, terms and posts above are already
     // committed by then, so the task reported failure over a half-seeded site
     // and failed the same way on every retry.
-    let menu_exists: i64 = menus::table
-        .filter(menus::location.eq("primary"))
-        .count()
-        .get_result(conn)
-        .await?;
-    if menu_exists == 0 {
-        let menu_id: i64 = diesel::insert_into(menus::table)
-            .values(&NewMenu {
-                name: "Primary".to_owned(),
-                slug: "primary".to_owned(),
-                location: "primary".to_owned(),
-            })
-            .returning(menus::id)
+    // The menu and its items are one transaction, and so is the sidebar.
+    //
+    // Each of these is a composite record whose existence check reads only its
+    // *first* row. Committed statement by statement, a run interrupted after
+    // the menu row but before its items left a menu the next run reads as
+    // already seeded — so the missing items were never restored, and the
+    // idempotent retry this seeder advertises could not repair what a failure
+    // had left behind. The check and the writes have to be in the same
+    // transaction for "already there" to mean "already complete".
+    conn.transaction(async move |conn| {
+        // Asked of the *location*, which is what `idx_menus_location`
+        // constrains. Asking for the slug meant a site whose primary menu was
+        // named anything else — "Main", say — read as having none, and the
+        // insert below then violated that index.
+        let menu_exists: i64 = menus::table
+            .filter(menus::location.eq("primary"))
+            .count()
             .get_result(conn)
             .await?;
+        if menu_exists == 0 {
+            let menu_id: i64 = diesel::insert_into(menus::table)
+                .values(&NewMenu {
+                    name: "Primary".to_owned(),
+                    slug: "primary".to_owned(),
+                    location: "primary".to_owned(),
+                })
+                .returning(menus::id)
+                .get_result(conn)
+                .await?;
 
-        let about_id: Option<i64> = posts::table
-            .filter(posts::post_type.eq("page"))
-            .filter(posts::slug.eq("about"))
-            .select(posts::id)
-            .first(conn)
-            .await
-            .optional()?;
+            let about_id: Option<i64> = posts::table
+                .filter(posts::post_type.eq("page"))
+                .filter(posts::slug.eq("about"))
+                .select(posts::id)
+                .first(conn)
+                .await
+                .optional()?;
 
-        diesel::insert_into(menu_items::table)
-            .values(&NewMenuItem {
-                menu_id,
-                parent_id: None,
-                label: "Home".to_owned(),
-                url: "/".to_owned(),
-                post_id: None,
-                term_id: None,
-                position: 0,
-            })
-            .execute(conn)
-            .await?;
-        if let Some(about_id) = about_id {
             diesel::insert_into(menu_items::table)
                 .values(&NewMenuItem {
                     menu_id,
                     parent_id: None,
-                    label: "About".to_owned(),
-                    url: String::new(),
-                    post_id: Some(about_id),
+                    label: "Home".to_owned(),
+                    url: "/".to_owned(),
+                    post_id: None,
                     term_id: None,
-                    position: 1,
+                    position: 0,
                 })
                 .execute(conn)
                 .await?;
+            if let Some(about_id) = about_id {
+                diesel::insert_into(menu_items::table)
+                    .values(&NewMenuItem {
+                        menu_id,
+                        parent_id: None,
+                        label: "About".to_owned(),
+                        url: String::new(),
+                        post_id: Some(about_id),
+                        term_id: None,
+                        position: 1,
+                    })
+                    .execute(conn)
+                    .await?;
+            }
         }
-    }
+        Ok::<_, AutumnError>(())
+    })
+    .await?;
 
-    // A sidebar.
-    let widget_count: i64 = widgets::table.count().get_result(conn).await?;
-    if widget_count == 0 {
-        for (position, kind, title, settings) in [
-            (0, "search", "Search", serde_json::json!({})),
-            (
-                1,
-                "recent_posts",
-                "Recent posts",
-                serde_json::json!({ "count": 5 }),
-            ),
-            (2, "categories", "Categories", serde_json::json!({})),
-        ] {
-            diesel::insert_into(widgets::table)
-                .values(&NewWidget {
-                    sidebar: "primary".to_owned(),
-                    kind: kind.to_owned(),
-                    title: title.to_owned(),
-                    settings,
-                    position,
-                })
-                .execute(conn)
-                .await?;
+    // A sidebar. Same reasoning: the guard reads "any widget at all", so a run
+    // that died after the first of the three left a sidebar the next run
+    // considers done.
+    conn.transaction(async move |conn| {
+        let widget_count: i64 = widgets::table.count().get_result(conn).await?;
+        if widget_count == 0 {
+            for (position, kind, title, settings) in [
+                (0, "search", "Search", serde_json::json!({})),
+                (
+                    1,
+                    "recent_posts",
+                    "Recent posts",
+                    serde_json::json!({ "count": 5 }),
+                ),
+                (2, "categories", "Categories", serde_json::json!({})),
+            ] {
+                diesel::insert_into(widgets::table)
+                    .values(&NewWidget {
+                        sidebar: "primary".to_owned(),
+                        kind: kind.to_owned(),
+                        title: title.to_owned(),
+                        settings,
+                        position,
+                    })
+                    .execute(conn)
+                    .await?;
+            }
         }
-    }
+        Ok::<_, AutumnError>(())
+    })
+    .await?;
 
     autumn_web::reexports::tracing::info!("demo content seeded");
     Ok(())
