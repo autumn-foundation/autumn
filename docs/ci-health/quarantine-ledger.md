@@ -166,14 +166,16 @@ without also filling in the intake form above.
   this ledger's intake form above — the intake form's own requirement is
   just a same-commit rerun-rate baseline, `<k>/<n>`, with no minimum `n`
   written into it.)
-- **A fix is already in flight** (PR #2510) that reclassifies
-  `ECONNRESET`/`ECONNABORTED` (retryable) separately from `ECONNREFUSED`
-  (hard zero-tolerance failure) — but per its own description it could not
-  be verified against a real macOS run, so it does not yet carry the
-  before/after rerun evidence this ledger's intake form requires, and it
-  would not address the new line-567 signature above regardless (different
-  assertion entirely). Track it against the rerun campaign above before
-  treating this entry as resolved.
+- **A fix has already landed** (PR #2510, merged 2026-09-05T20:25:01Z) that
+  reclassifies `ECONNRESET`/`ECONNABORTED` (retryable) separately from
+  `ECONNREFUSED` (hard zero-tolerance failure) — this is the change behind
+  today's `refused == 0` / `hard == 0` split at lines 520-528 referenced
+  above. But per its own description it could not be verified against a
+  real macOS run at merge time, so it still does not carry the before/after
+  rerun evidence this role's evidentiary bar calls for, and it would not
+  address the new line-567 signature above regardless (different assertion
+  entirely). Track it against the rerun campaign above before treating this
+  entry as resolved — "merged" is not the same as "verified."
 
 ### `cache_stampede::swr_serves_stale_and_refreshes_in_background`
 
