@@ -9,7 +9,6 @@ use serde::Deserialize;
 use crate::capabilities::{Capability, Role};
 use crate::content;
 use crate::models::NewUser;
-use crate::repositories::UserRepository as _;
 use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
@@ -214,7 +213,7 @@ pub async fn create(
     State(state): State<AppState>,
     Form(form): Form<NewUserForm>,
 ) -> AutumnResult<Response> {
-    let _actor = require_capability!(repos, session, csrf, Capability::EditUsers);
+    let actor = require_capability!(repos, session, csrf, Capability::EditUsers);
 
     // The configured `[auth.password]` policy, not a hard-coded one, so an
     // administrator creating an account is held to the same rules as a visitor
@@ -231,24 +230,31 @@ pub async fn create(
         ));
     }
 
+    let draft = NewUser {
+        username: form.username.trim().to_lowercase(),
+        email: form.email.trim().to_lowercase(),
+        password_hash: hash_password(&form.password).await?,
+        display_name: if form.display_name.trim().is_empty() {
+            form.username.trim().to_owned()
+        } else {
+            form.display_name.trim().to_owned()
+        },
+        // Parse rather than trust: a hand-crafted POST could otherwise put
+        // any string in the column, and an unrecognised role degrades to
+        // Subscriber — silently granting *less*, never more.
+        role: Role::parse(&form.role).slug().to_owned(),
+        bio: String::new(),
+        website: String::new(),
+    };
+
+    // Re-authorized against the actor's current row, under the same lock every
+    // other change to the administrator set takes. The check above ran before a
+    // password hash that takes hundreds of milliseconds by design, and the
+    // account being created can carry any role — so an administrator demoted in
+    // that window could otherwise still mint a fresh administrator and keep
+    // privileged access through it.
     repos
-        .users
-        .save(&NewUser {
-            username: form.username.trim().to_lowercase(),
-            email: form.email.trim().to_lowercase(),
-            password_hash: hash_password(&form.password).await?,
-            display_name: if form.display_name.trim().is_empty() {
-                form.username.trim().to_owned()
-            } else {
-                form.display_name.trim().to_owned()
-            },
-            // Parse rather than trust: a hand-crafted POST could otherwise put
-            // any string in the column, and an unrecognised role degrades to
-            // Subscriber — silently granting *less*, never more.
-            role: Role::parse(&form.role).slug().to_owned(),
-            bio: String::new(),
-            website: String::new(),
-        })
+        .with_conn(async |conn| content::create_user_as(conn, actor.id, draft).await)
         .await?;
 
     Ok(Redirect::to("/admin/users").into_response())

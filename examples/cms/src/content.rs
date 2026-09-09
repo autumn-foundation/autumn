@@ -1406,6 +1406,64 @@ pub async fn save_settings(
 /// is arbitrary but must be stable and unique within the database.
 const ADMIN_SET_LOCK_KEY: i64 = 7_717_260_231_001;
 
+/// Create an account on an administrator's behalf, re-authorizing the actor
+/// against their *current* row.
+///
+/// The handler's capability check runs at the start of a request that then
+/// spends hundreds of milliseconds hashing a password — deliberately, since the
+/// cost is the point of bcrypt. That is a wide window, and the account being
+/// created can carry any role: an administrator demoted or deleted while their
+/// request was hashing could still land a fresh `administrator` account and
+/// keep privileged access through it. An authorization decision that old is not
+/// a decision about the account doing the writing.
+///
+/// Serialized on [`ADMIN_SET_LOCK_KEY`], the same lock every other change to
+/// the administrator set takes, so a demotion cannot commit between this
+/// re-read and this insert.
+pub async fn create_user_as(
+    conn: &mut AsyncPgConnection,
+    actor_id: i64,
+    new: crate::models::NewUser,
+) -> AutumnResult<User> {
+    let mut new = new;
+    // The model's declared rules, which this direct insert never runs.
+    crate::hooks::normalize_new_user(&mut new)?;
+    conn.transaction(async move |conn| {
+        diesel::sql_query(format!(
+            "SELECT pg_advisory_xact_lock({ADMIN_SET_LOCK_KEY})"
+        ))
+        .execute(conn)
+        .await?;
+
+        // Re-read rather than trust the session's copy: the row is the truth
+        // about what this account may do *now*. A deleted actor has no
+        // authority at all, which is why a missing row is a refusal rather than
+        // a fall-through.
+        let actor: Option<User> = users::table
+            .find(actor_id)
+            .select(User::as_select())
+            .first(conn)
+            .await
+            .optional()?;
+        let permitted =
+            actor.is_some_and(|actor| actor.role().can(crate::capabilities::Capability::EditUsers));
+        if !permitted {
+            return Err(AutumnError::forbidden_msg(
+                "Your account can no longer manage users",
+            ));
+        }
+
+        Ok::<_, AutumnError>(
+            diesel::insert_into(users::table)
+                .values(&new)
+                .returning(User::as_returning())
+                .get_result(conn)
+                .await?,
+        )
+    })
+    .await
+}
+
 /// Create an account, electing the first one created as the site owner —
 /// atomically.
 ///

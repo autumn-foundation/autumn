@@ -3643,6 +3643,119 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// Creating an account is authorized against the actor's current row.
+///
+/// The handler's capability check runs at the start of a request that then
+/// spends hundreds of milliseconds hashing a password — the cost is the point
+/// of bcrypt, and it is a wide window. The account being created can carry any
+/// role, so an administrator demoted or deleted while their request was hashing
+/// could otherwise still mint a fresh administrator and keep privileged access
+/// through it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn creating_an_account_is_authorized_against_the_actors_current_row() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let _owner = register(&client, "owner").await;
+    let demoted = register(&client, "second").await;
+    try_execute(
+        TestDb::shared().await,
+        "UPDATE users SET role = 'administrator' WHERE username = 'second'",
+    )
+    .await
+    .expect("promote the second account");
+    let actor_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::users::table
+                .filter({{crate_name}}::schema::users::username.eq("second"))
+                .select({{crate_name}}::schema::users::id),
+            &mut conn,
+        )
+        .await
+        .expect("the actor")
+    };
+
+    // Demoted after the session was established — which is exactly the state a
+    // request that started before the demotion is holding.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE users SET role = 'subscriber' WHERE id = {actor_id}"),
+    )
+    .await
+    .expect("demote the actor");
+
+    // The content layer is the subject: the handler would refuse this on its
+    // own check, and what has to hold is that the *write* refuses too, however
+    // stale the caller's authority turns out to be.
+    let outcome = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::create_user_as(
+            &mut conn,
+            actor_id,
+            {{crate_name}}::models::NewUser {
+                username: "planted".to_owned(),
+                email: "planted@example.com".to_owned(),
+                password_hash: "x".repeat(60),
+                display_name: "Planted".to_owned(),
+                role: "administrator".to_owned(),
+                bio: String::new(),
+                website: String::new(),
+            },
+        )
+        .await
+    };
+    let error = outcome.expect_err("a demoted account may not mint an administrator");
+    assert_eq!(
+        error.status(),
+        autumn_web::prelude::StatusCode::FORBIDDEN,
+        "and is told so: {error}"
+    );
+
+    let planted: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::get_result(
+            {{crate_name}}::schema::users::table
+                .filter({{crate_name}}::schema::users::username.eq("planted"))
+                .count(),
+            &mut conn,
+        )
+        .await
+        .expect("the count")
+    };
+    assert_eq!(planted, 0, "and no account was created");
+
+    // A deleted actor has no authority either — a missing row is a refusal, not
+    // a fall-through.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE users SET role = 'administrator' WHERE id = {actor_id}"),
+    )
+    .await
+    .expect("restore the role");
+    let ok = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::create_user_as(
+            &mut conn,
+            actor_id,
+            {{crate_name}}::models::NewUser {
+                username: "legitimate".to_owned(),
+                email: "legitimate@example.com".to_owned(),
+                password_hash: "x".repeat(60),
+                display_name: "Legitimate".to_owned(),
+                role: "editor".to_owned(),
+                bio: String::new(),
+                website: String::new(),
+            },
+        )
+        .await
+    };
+    ok.expect("an administrator may still create accounts");
+    let _ = demoted;
+}
+
 /// The edit path authorizes against the row as locked, not against what a
 /// caller checked earlier.
 ///
