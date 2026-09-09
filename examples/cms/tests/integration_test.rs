@@ -9806,3 +9806,78 @@ async fn the_sidebar_renders_a_bounded_number_of_widgets() {
     assert!(screen.contains("Widget 001"));
     assert!(!screen.contains("Widget 031"));
 }
+
+/// A widget's title and body are capped.
+///
+/// A sidebar widget renders on *every* public page, so its size is paid
+/// site-wide rather than on the one page that carries it — and the model
+/// declares no length rule, so the form's `maxlength` was the whole defence
+/// against a body bounded only by the request limit.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_widget_cannot_carry_an_unbounded_title_or_body() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let refused = client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("kind", "text"),
+            ("title", &"t".repeat(201)),
+            ("text", "Body."),
+            ("position", "0"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "an oversized title must be refused: {}",
+        refused.text()
+    );
+
+    let refused = client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("kind", "text"),
+            ("title", "About"),
+            ("text", &"x".repeat(10_001)),
+            ("position", "0"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "an oversized body must be refused: {}",
+        refused.text()
+    );
+
+    let placed: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::widgets::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(placed, 0, "neither refused submission may have been stored");
+
+    // At the cap, both still save — the bound is the stated one.
+    client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("kind", "text"),
+            ("title", &"t".repeat(200)),
+            ("text", &"x".repeat(10_000)),
+            ("position", "0"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+}

@@ -15,6 +15,18 @@ use crate::theme::WidgetKind;
 use super::super::site::{Csrf, Repos};
 use super::layout;
 
+/// The longest widget title accepted, matching the cap the `Menu` and
+/// `MenuItem` models declare for the same kind of label.
+const MAX_WIDGET_TITLE: usize = 200;
+
+/// The longest body a text widget may carry.
+///
+/// The widget renders in the sidebar of *every* public page, so its size is
+/// paid on every request rather than on the one page it belongs to. Generous
+/// enough for a real "about this site" blurb and nowhere near the request
+/// limit, which is what the field was otherwise bounded by.
+const MAX_WIDGET_TEXT: usize = 10_000;
+
 /// The theme locations a menu can be assigned to.
 const LOCATIONS: &[(&str, &str)] = &[("primary", "Primary navigation"), ("footer", "Footer")];
 
@@ -365,6 +377,7 @@ pub async fn show(
                             "Heading " span class="text-gray-400 font-normal" { "(optional)" }
                         }
                         input #widget-title type="text" name="title"
+                              maxlength=(MAX_WIDGET_TITLE)
                               class="w-full border rounded px-3 py-2";
                     }
                     div {
@@ -383,6 +396,7 @@ pub async fn show(
                             }
                         }
                         textarea #widget-text name="text" rows="3"
+                                 maxlength=(MAX_WIDGET_TEXT)
                                  class="w-full border rounded px-3 py-2 text-sm" {}
                     }
                     div {
@@ -510,12 +524,28 @@ pub async fn create_widget(
         _ => serde_json::json!({}),
     };
 
+    // The model declares no length rule for these, and a sidebar widget is the
+    // one piece of content that renders on every page — so an unbounded title
+    // or body is paid site-wide, not on the page that carries it. The form's
+    // `maxlength` is a browser convenience a crafted POST ignores.
+    let title = form.title.trim();
+    if title.chars().count() > MAX_WIDGET_TITLE {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A widget title must be at most {MAX_WIDGET_TITLE} characters"
+        )));
+    }
+    if form.text.chars().count() > MAX_WIDGET_TEXT {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A text widget must be at most {MAX_WIDGET_TEXT} characters"
+        )));
+    }
+
     repos
         .widgets
         .save(&NewWidget {
             sidebar: "primary".to_owned(),
             kind: kind.slug().to_owned(),
-            title: form.title.trim().to_owned(),
+            title: title.to_owned(),
             settings,
             position: form.position.trim().parse::<i32>().unwrap_or(0),
         })
