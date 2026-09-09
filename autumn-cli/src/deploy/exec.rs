@@ -2000,7 +2000,7 @@ fn adoption_recovery(service: &str, current: &str, shared: &str, source: MoveSou
 /// refusal against a database that was never created.
 #[must_use]
 pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
-    let shared = cfg.shared_sqlite_data_file()?;
+    let shared = cfg.managed_sqlite_data_file()?;
     Some(RemoteCommand::new(
         "record-data-adopted",
         format!(
@@ -2045,6 +2045,22 @@ pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComman
 pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
     let path = cfg.persistent_sqlite_data_file()?;
     let app_dir = &cfg.app_dir;
+    let marker = cfg.sqlite_data_marker_file();
+    // The same refusal `link-data` gives a relative database whose shared file has
+    // gone: the marker says it existed, so a missing file is a fault, not a first
+    // deploy. Without it the `mkdir` below recreated the directory over an absent
+    // mount and the migration created a fresh empty database inside it, which the
+    // app then served and wrote to while the real one sat unavailable.
+    let missing_refusal = format!(
+        "autumn deploy: the SQLite database {path} is missing, but {marker} records that \
+         it existed. The volume holding it is most likely not mounted, and continuing \
+         would create a fresh empty database and orphan the real one, so this deploy \
+         stopped."
+    );
+    let missing_recovery = format!(
+        "Mount the volume holding {path} and deploy again. If the database was \
+         deliberately removed and a new one should be created, remove {marker} first."
+    );
     let refusal = format!(
         "autumn deploy: the SQLite database {path} resolves to a path inside the deploy's \
          own app directory ({app_dir}), where only {} is yours: `releases/` is replaced on \
@@ -2075,12 +2091,19 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
              db=$(readlink -f {db_q} 2>/dev/null || printf '%s' {db_q}); \
              dir=$(dirname \"$db\"); \
              case \"$dir\" in \
-             \"$app/shared/data\"|\"$app/shared/data/\"*) mkdir -p \"$dir\" || exit 1 ;; \
+             \"$app/shared/data\"|\"$app/shared/data/\"*) \
+             if [ -e \"$db\" ]; then : > {marker_q} || exit 1; \
+             elif [ -e {marker_q} ]; then \
+             echo {missing_refusal_q} >&2; echo {missing_recovery_q} >&2; exit 1; fi; \
+             mkdir -p \"$dir\" || exit 1 ;; \
              \"$app\"|\"$app/\"*) echo {refusal_q} >&2; exit 1 ;; \
              esac",
             app_dir_q = shell_quote(app_dir),
             db_q = shell_quote(path),
+            marker_q = shell_quote(&marker),
             refusal_q = shell_quote(&refusal),
+            missing_refusal_q = shell_quote(&missing_refusal),
+            missing_recovery_q = shell_quote(&missing_recovery),
         ),
     ))
 }
@@ -8249,6 +8272,119 @@ mod tests {
             op.shell
         );
         // A Postgres app gets no such op, so its sequence is unchanged.
+        assert!(sqlite_data_adopted_op(&resolved()).is_none());
+    }
+
+    /// An ABSOLUTE database in `shared/data` gets the same missing-volume guard a
+    /// relative one does (#2589 round 20).
+    ///
+    /// This is the hole the round-19 `mkdir` opened. The state table built for
+    /// `Relative` was never applied to `Persistent`, so an absolute database in
+    /// the deploy's own namespace had no marker, no refusal — and then a `mkdir`
+    /// that recreated its mount point, after which the migration created a fresh
+    /// empty database the app served and wrote to while the real one was away.
+    ///
+    /// Same three rows as `link-data`'s second question, run against the real
+    /// generated shell.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_absolute_database_in_shared_data_refuses_a_missing_volume() {
+        // (database present, marker present, may proceed, why)
+        let table = [
+            (
+                false,
+                false,
+                true,
+                "a genuine first deploy: nothing has been created yet",
+            ),
+            (true, true, true, "already adopted and present"),
+            (true, false, true, "adopted before the marker existed"),
+            (
+                false,
+                true,
+                false,
+                "it existed and is gone — an unmounted volume, not a first deploy",
+            ),
+        ];
+
+        for (index, (db_exists, marker, may_proceed, why)) in table.into_iter().enumerate() {
+            let root =
+                std::env::temp_dir().join(format!("autumn-absvol-{}-{index}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            let app = root.join("srv/myapp");
+            std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+            let db = app.join("shared/data/app.db");
+            if db_exists {
+                std::fs::create_dir_all(app.join("shared/data")).expect("data dir");
+                std::fs::write(&db, b"REAL").expect("db");
+            }
+            if marker {
+                std::fs::write(app.join("shared/sqlite-data-adopted"), b"").expect("marker");
+            }
+
+            let mut cfg = resolved();
+            cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+            cfg.sqlite_data =
+                SqliteDataPlacement::Persistent(db.to_str().expect("utf-8").to_owned());
+            let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .output()
+                .expect("run check-data-dir");
+
+            assert_eq!(
+                out.status.success(),
+                may_proceed,
+                "db={db_exists} marker={marker} ({why}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if may_proceed {
+                assert!(
+                    app.join("shared/data").is_dir(),
+                    "{why}: the parent must be created so the migration can open it"
+                );
+            } else {
+                // The refusal happens BEFORE the mkdir: recreating the directory
+                // is what lets the migration create the replacement database.
+                assert!(
+                    !app.join("shared/data").exists(),
+                    "{why}: the absent mount point must not be recreated"
+                );
+                assert!(
+                    !String::from_utf8_lossy(&out.stderr).is_empty(),
+                    "{why}: a refusal must say why"
+                );
+            }
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// The adoption marker is recorded for BOTH placements, so the guard above
+    /// has something to key on. Keying it on the relative case alone is what left
+    /// the absolute one unguarded.
+    #[test]
+    fn the_marker_covers_an_absolute_database_in_shared_data_too() {
+        let mut cfg = resolved();
+        cfg.sqlite_data =
+            SqliteDataPlacement::Persistent("/srv/autumn/myapp/shared/data/app.db".to_owned());
+        let op = sqlite_data_adopted_op(&cfg).expect("an in-namespace database is recorded");
+        assert!(
+            op.shell
+                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db' ]")
+                && op
+                    .shell
+                    .contains(": > '/srv/autumn/myapp/shared/sqlite-data-adopted'"),
+            "{}",
+            op.shell
+        );
+
+        // A database OUTSIDE the deploy's namespace is the operator's: not
+        // recorded, and not guarded, because the deploy never creates its
+        // directory either.
+        cfg.sqlite_data = SqliteDataPlacement::Persistent("/var/lib/myapp/app.db".to_owned());
+        assert!(sqlite_data_adopted_op(&cfg).is_none());
+        // …and a Postgres app still gets nothing at all.
         assert!(sqlite_data_adopted_op(&resolved()).is_none());
     }
 

@@ -1269,8 +1269,11 @@ For an **absolute** database the deploy also re-checks containment on the host,
 as a `check-data-dir` step, before anything is uploaded. That step creates
 `shared/data/` when the database lives there — `prepare-dirs` makes `shared/`
 but not `shared/data/`, and SQLite will not create a database whose parent
-directory is missing. A path *outside* the app dir is yours: it is verified,
-never created. It has to: if `app_dir`
+directory is missing. It applies the same `sqlite-data-adopted` guard described
+below before doing so, so an absolute database in `shared/data` on an
+unavailable mount stops the deploy instead of having its mount point recreated
+underneath it. A path *outside* the app dir is yours: it is verified, never
+created, and never guarded. It has to: if `app_dir`
 is itself a symlink (`/srv/autumn/myapp -> /mnt/apps/myapp`) and your database URL
 uses the resolved spelling, the CLI compares two unrelated strings and sees a file
 outside the app dir — while release retention walks the symlink to the same

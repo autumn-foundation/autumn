@@ -78,7 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also creates `shared/data/` when an absolute database lives there — the
   placement the guide recommends — since `prepare-dirs` creates only `shared/`
   and SQLite cannot create a database whose parent directory is absent; a path
-  outside the app dir is verified but never created.
+  outside the app dir is verified but never created — and it applies the same
+  `sqlite-data-adopted` missing-volume guard first, so an absolute database in
+  `shared/data` whose mount is away stops the deploy rather than having its mount
+  point recreated and a fresh empty database created inside it. The marker now
+  covers both placements: keying it on the relative one alone left an absolute
+  database in the deploy's own namespace with no marker and no refusal.
 
 ### Fixed
 

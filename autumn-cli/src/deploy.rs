@@ -586,6 +586,27 @@ impl ResolvedDeployConfig {
             .map(|rel| format!("{}/{rel}", self.shared_data_dir()))
     }
 
+    /// The `SQLite` database this deploy MANAGES inside `shared/data`, whichever
+    /// way it was configured (issue #1909, #2589 round 20).
+    ///
+    /// BOTH placements can land there: a relative path is kept there by
+    /// construction, and an absolute one may name it outright. The deploy creates
+    /// that directory and guards what lives in it, so both need the same
+    /// treatment — keying the adoption marker on the relative case alone left an
+    /// absolute database with no marker, no missing-volume refusal, and a
+    /// `mkdir -p` that recreated its mount point underneath it.
+    ///
+    /// `None` for a database outside `shared/data`: that one is the operator's,
+    /// and the deploy neither creates its directory nor guards it.
+    #[must_use]
+    pub fn managed_sqlite_data_file(&self) -> Option<String> {
+        if let Some(shared) = self.shared_sqlite_data_file() {
+            return Some(shared);
+        }
+        let path = lexically_normalized(self.persistent_sqlite_data_file()?);
+        within(&path, &lexically_normalized(&self.shared_data_dir())).then_some(path)
+    }
+
     /// Marker recording that the shared `SQLite` database has been seen to exist
     /// (issue #1909, #2589 item 17).
     ///
