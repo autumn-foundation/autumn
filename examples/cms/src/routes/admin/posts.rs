@@ -821,12 +821,15 @@ pub async fn create(
             .await?;
     }
 
+    // Unconditionally, even for an empty set: `set_post_terms` *replaces* the
+    // filings, so skipping it when the selection is empty means "remove every
+    // category" quietly does nothing and the post stays in archives it was
+    // taken out of. (A guard here was a regression I introduced when this split
+    // out of `apply_terms`.)
     let term_ids = resolve_term_ids(&repos, &created, &form).await?;
-    if !term_ids.is_empty() {
-        repos
-            .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
-            .await?;
-    }
+    repos
+        .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
+        .await?;
     if status == "future" || status == "private" {
         repos
             .with_conn(async |conn| {
@@ -991,9 +994,9 @@ pub async fn update(
                 )
                 .await?;
 
-                if !term_ids.is_empty() {
-                    content::set_post_terms(conn, id, term_ids).await?;
-                }
+                // Unconditionally — see `create`. An empty selection is a
+                // deliberate "file this under nothing", not "leave it alone".
+                content::set_post_terms(conn, id, term_ids).await?;
 
                 // A status change goes through the state machine, never through the
                 // plain field write above — so an illegal edge is refused rather

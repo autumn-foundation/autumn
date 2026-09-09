@@ -2012,38 +2012,51 @@ pub async fn publish_due_post(
     let new_status = new_status.to_owned();
     conn.transaction(async |conn| {
         let now = chrono::Utc::now().naive_utc();
-        let updated = diesel::update(
-            posts::table
-                .find(post_id)
-                .filter(posts::status.eq("future"))
-                .filter(posts::published_at.eq(observed_published_at))
-                .filter(posts::published_at.le(now)),
-        )
-        .set((posts::status.eq(&new_status), posts::updated_at.eq(now)))
-        .execute(conn)
-        .await?;
 
-        if updated == 0 {
+        // The claim is a locking *read* rather than a blind `UPDATE`, so the
+        // row can be snapshotted in the state it is being moved out of. The
+        // guard conditions live on this query: a second replica blocks on the
+        // row lock, re-evaluates them after the first commits, and matches
+        // nothing — which is the same mutual exclusion the conditional update
+        // gave, with the pre-transition row in hand.
+        let Some(scheduled) = posts::table
+            .find(post_id)
+            .filter(posts::status.eq("future"))
+            .filter(posts::published_at.eq(observed_published_at))
+            .filter(posts::published_at.le(now))
+            .select(Post::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?
+        else {
             return Ok(false);
-        }
+        };
 
-        // The same bookkeeping `transition_status` does, because this *is* a
-        // status transition — it only takes a different shape because the
-        // sweep needs the claim to be conditional. Without it a scheduled
-        // publication was missing from the history the editor advertises as
-        // recording every change, and left `lock_version` untouched, so an
-        // editor holding a form rendered before the post went live could save
-        // over it without the stale-edit check noticing.
-        let published: Post = diesel::update(posts::table.find(post_id))
-            .set(posts::lock_version.eq(posts::lock_version + 1))
-            .returning(Post::as_returning())
-            .get_result(conn)
-            .await?;
-        if type_supports_revisions(&published.post_type) {
-            published
+        // Snapshotted *before* the status changes, like every other transition:
+        // a revision labelled `future → publish` that stores `status = publish`
+        // is a record of the wrong moment, and the scheduled state — the one an
+        // editor would want to look back at — is then absent from the history
+        // entirely.
+        if type_supports_revisions(&scheduled.post_type) {
+            scheduled
                 .record_revision(conn, &format!("Status: future → {new_status}"))
                 .await?;
         }
+
+        // The same bookkeeping `transition_status` does, because this *is* a
+        // status transition — it only takes a different shape because the sweep
+        // needs the claim to be conditional. `lock_version` moves with it, so an
+        // editor holding a form rendered before the post went live cannot save
+        // over the publication without the stale-edit check noticing.
+        diesel::update(posts::table.find(post_id))
+            .set((
+                posts::status.eq(&new_status),
+                posts::updated_at.eq(now),
+                posts::lock_version.eq(posts::lock_version + 1),
+            ))
+            .execute(conn)
+            .await?;
 
         // The post was `future` when its terms were last counted, so every
         // term it is filed under excluded it. This is the moment it became

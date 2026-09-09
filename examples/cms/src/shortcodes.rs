@@ -15,7 +15,10 @@ use std::sync::{OnceLock, RwLock};
 /// The attributes parsed off a shortcode tag.
 pub type Attributes = BTreeMap<String, String>;
 
-type Handler = Box<dyn Fn(&Attributes) -> String + Send + Sync>;
+/// `Arc` rather than `Box` so `expand` can clone the handlers it needs and drop
+/// the registry lock before running any of them — the same reason the action
+/// and filter dispatchers hold `Arc`s. See `expand`.
+type Handler = std::sync::Arc<dyn Fn(&Attributes) -> String + Send + Sync>;
 
 fn registry() -> &'static RwLock<BTreeMap<String, Handler>> {
     static REGISTRY: OnceLock<RwLock<BTreeMap<String, Handler>>> = OnceLock::new();
@@ -32,7 +35,7 @@ pub fn add_shortcode(name: &str, handler: impl Fn(&Attributes) -> String + Send 
     registry()
         .write()
         .expect("shortcode registry poisoned")
-        .insert(name.to_ascii_lowercase(), Box::new(handler));
+        .insert(name.to_ascii_lowercase(), std::sync::Arc::new(handler));
 }
 
 /// The names of every registered shortcode, for the editor's help panel.
@@ -59,7 +62,21 @@ pub fn registered() -> Vec<String> {
 /// would corrupt exactly the documents it was added for.
 #[must_use]
 pub fn expand(input: &str) -> String {
-    let registry = registry().read().expect("shortcode registry poisoned");
+    // A snapshot, not a held guard. Running a handler while holding the read
+    // lock hangs the page the moment that handler calls `add_shortcode`:
+    // `RwLock` is not reentrant, so the write blocks on a read the same thread
+    // holds. Registering from inside a handler is an ordinary thing for a
+    // plugin to do, and this is the same fix `do_action` and `apply_filters`
+    // already carry.
+    //
+    // Cloning the whole map costs one `Arc` bump per registered shortcode —
+    // there are a handful — and it is what lets the handlers run unlocked.
+    let registry: std::collections::BTreeMap<String, Handler> = registry()
+        .read()
+        .expect("shortcode registry poisoned")
+        .iter()
+        .map(|(name, handler)| (name.clone(), std::sync::Arc::clone(handler)))
+        .collect();
     let mut out = String::with_capacity(input.len());
     let bytes: Vec<char> = input.chars().collect();
     let mut i = 0;

@@ -495,6 +495,9 @@ pub async fn import(
     // may have been given a different one to avoid colliding with content
     // already on this site.
     let mut created_ids: Vec<(i64, String, String, Option<String>)> = Vec::new();
+    // Posts whose status was moved out of `draft`, so their transition action
+    // can fire once the ancestry pass has finished — see the dispatch below.
+    let mut transitioned_ids: Vec<i64> = Vec::new();
     for post in &payload.posts {
         // Idempotent on the slug *the file names*, not only on the slug the
         // row ended up with. Those differ whenever the allocator had to add a
@@ -605,13 +608,8 @@ pub async fn import(
                     content::transition_status(conn, created.id, &post.status, Some(user.id)).await
                 })
                 .await?;
-            do_action(Action::PostTransitioned, created.id);
+            transitioned_ids.push(created.id);
         }
-        // The same actions the admin, API and scheduler paths fire. An import
-        // is how a site's content arrives after a restore or a migration, so a
-        // plugin maintaining a search index or a cache being blind to exactly
-        // that content is the worst time for it to be blind.
-        do_action(Action::PostSaved, created.id);
         created_ids.push((
             created.id,
             post.post_type.clone(),
@@ -664,6 +662,21 @@ pub async fn import(
             // aborting half-restored.
             orphaned += 1;
         }
+    }
+
+    // Fired only now, after the ancestry pass. A listener that indexes or
+    // caches a post's permalink needs the parent link already in place: firing
+    // during the creation loop recorded `/child` for a page whose canonical URL
+    // is `/parent/child`, and nothing ever told it the URL had changed.
+    //
+    // The same actions the admin, API and scheduler paths fire — an import is
+    // how a site's content arrives after a restore or a migration, which is the
+    // worst possible moment for a search index to be blind to it.
+    for id in transitioned_ids {
+        do_action(Action::PostTransitioned, id);
+    }
+    for (id, _, _, _) in &created_ids {
+        do_action(Action::PostSaved, *id);
     }
 
     let body = html! {

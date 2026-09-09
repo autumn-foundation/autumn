@@ -4525,3 +4525,188 @@ async fn the_configured_front_page_stays_selected() {
         &screen[..screen.len().min(4000)]
     );
 }
+
+/// Removing every category actually unfiles the post.
+///
+/// `set_post_terms` replaces the filings, so skipping it when the selection is
+/// empty made "remove every category" quietly do nothing and the post stayed in
+/// archives it had been taken out of.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn clearing_every_category_removes_the_post_from_its_archives() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Filed Then Not", "Body.", "publish").await;
+
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "News"),
+            ("slug", ""),
+            ("description", ""),
+            ("parent_id", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let categories: serde_json::Value = client
+        .get("/api/v1/terms?taxonomy=category")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let news = categories.as_array().expect("array")[0]["id"]
+        .as_i64()
+        .expect("id")
+        .to_string();
+
+    let base = |extra: Option<&str>| {
+        let mut fields = vec![
+            ("title", "Filed Then Not"),
+            ("slug", "filed-then-not"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", "rust"),
+            ("comment_status", "open"),
+        ];
+        if let Some(id) = extra {
+            fields.push(("categories", id));
+        }
+        form(&fields)
+    };
+
+    // File it, and confirm the archive lists it.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&base(Some(news.as_str())))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/category/news")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Filed Then Not");
+
+    // Now clear every category and tag.
+    let mut cleared = base(None);
+    cleared = cleared.replace("tags=rust", "tags=");
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&cleared)
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let archive = client.get("/category/news").send().await;
+    archive.assert_ok();
+    assert!(
+        !archive.text().contains("Filed Then Not"),
+        "an emptied selection must unfile the post:\n{}",
+        archive.text()
+    );
+}
+
+/// A shortcode handler that registers a shortcode does not hang the page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_shortcode_that_registers_a_shortcode_does_not_deadlock() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    cms::shortcodes::add_shortcode("reentrant", |_| {
+        // The re-entrant call. Before the fix this never returned.
+        cms::shortcodes::add_shortcode("added-from-inside", |_| String::new());
+        "<span>expanded</span>".to_owned()
+    });
+
+    create_post(
+        &client,
+        &cookie,
+        "Shortcoded",
+        "Before [reentrant] after.",
+        "publish",
+    )
+    .await;
+
+    sign_out(&client);
+    let page = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.get("/shortcoded").send(),
+    )
+    .await
+    .expect("rendering must not hang while a handler registers another shortcode");
+    page.assert_ok().assert_body_contains("expanded");
+}
+
+/// A scheduled publication records the state it left, not the one it reached.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_scheduled_publication_snapshots_the_scheduled_state() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Due Now", "Body.", "draft").await;
+
+    // Make it a scheduled post that is already due, at a date this test names
+    // so the guard can be given exactly what the sweep would have observed.
+    let db = TestDb::shared().await;
+    let due = chrono::NaiveDateTime::parse_from_str("2026-01-02 03:04:05", "%Y-%m-%d %H:%M:%S")
+        .expect("a fixed due date");
+    try_execute(
+        db,
+        &format!("UPDATE posts SET status = 'future', published_at = '{due}' WHERE id = {id}"),
+    )
+    .await
+    .expect("schedule the post");
+
+    // A mismatched `observed_published_at` must not publish it — that guard is
+    // what stops an editor's reschedule being overridden by an in-flight sweep.
+    assert!(
+        !cms::content::publish_due_post(
+            &mut db.pool().get().await.expect("connection"),
+            id,
+            None,
+            "publish",
+        )
+        .await
+        .expect("query"),
+        "the guard compares the observed publish date"
+    );
+
+    assert!(
+        cms::content::publish_due_post(
+            &mut db.pool().get().await.expect("connection"),
+            id,
+            Some(due),
+            "publish",
+        )
+        .await
+        .expect("publish"),
+        "the due post publishes"
+    );
+
+    // The revision snapshots the state it was in *before* the transition.
+    let history = client
+        .get(&format!("/admin/content/post/{id}/revisions"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let after = history
+        .split("future → publish")
+        .nth(1)
+        .expect("the transition is recorded");
+    assert!(
+        after.starts_with(" · future"),
+        "the snapshot must record the scheduled state, not the published one: {}",
+        &after[..after.len().min(60)]
+    );
+}
