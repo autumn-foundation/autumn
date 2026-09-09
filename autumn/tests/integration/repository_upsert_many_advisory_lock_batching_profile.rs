@@ -33,6 +33,7 @@
 
 #![cfg(feature = "db")]
 #![allow(clippy::cast_possible_wrap)] // fixture indices are bounded well under i64::MAX
+#![allow(clippy::cast_possible_truncation)] // TIERS tops out at 1000, well under i32::MAX
 
 use diesel::PgConnection;
 use diesel::connection::SimpleConnection;
@@ -268,8 +269,7 @@ async fn repository_upsert_many_advisory_lock_batching_profile() {
         let upserted = repo.upsert_many(&records).await.expect("upsert_many");
         assert_eq!(upserted.len(), n, "tier {n}: every new row must upsert");
 
-        let (calls, buffers) =
-            print_profile(&mut diag_conn, &format!("upsert_many, {n} new rows"));
+        let (calls, buffers) = print_profile(&mut diag_conn, &format!("upsert_many, {n} new rows"));
         assert!(
             calls > 0,
             "expected at least one advisory-lock statement for a non-empty batch"
