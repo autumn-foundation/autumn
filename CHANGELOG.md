@@ -48,8 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does is its own link to the shared file, so a legacy symlink pointing at a
   different database is refused instead of silently swapped for the shared one,
   even when both exist. A missing shared file is told apart from an unmounted
-  volume by a `shared/sqlite-data-adopted` marker — recorded once the database is
-  seen, and kept outside any `shared/data` mount — so a volume that is away stops
+  volume by a `shared/sqlite-data-adopted` marker — recorded by a step that runs
+  after the migration that creates the database, refreshed whenever a later
+  deploy sees the file, and kept outside any `shared/data` mount — so a volume that is away stops
   the deploy instead of creating a fresh empty database beside the orphaned real
   one. The printed one-time recoveries move every sidecar *before* the database,
   each step gating the next, so a failed sidecar move leaves the refusal firing
@@ -59,9 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   otherwise truncate by writing through the data link; and a relative
   `[deploy] app_dir`, which made the link target resolve beneath the release
   directory. For an absolute operator-managed database, a new `check-data-dir`
-  step re-asks the containment question **on the host**, where a symlinked
-  `app_dir` resolves — the CLI cannot see that from here, and release retention
-  would have deleted the file.
+  step re-asks the containment question **on the host**, resolving the database
+  path itself — so both a symlinked `app_dir` and a database that is *itself* a
+  symlink into `releases/` are caught. The CLI cannot see either from here, and
+  release retention would have deleted the file.
 
 ### Fixed
 

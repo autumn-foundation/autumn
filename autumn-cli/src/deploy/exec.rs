@@ -881,6 +881,10 @@ pub fn first_deploy_ops(
     if matches!(migrate, MigrateStep::Run) {
         ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
     }
+    // The migration is what creates the SQLite database on a first deploy, so
+    // the marker that tells a later deploy it MUST be there is recorded here,
+    // not left for a later deploy to observe (#2589 item 17).
+    ops.extend(sqlite_data_adopted_op(cfg).map(DeployOp::Run));
     ops.extend([
         // enable = boot-persistence; restart = start-or-relaunch. We deliberately
         // use `restart` (not `enable --now`) because an already-active slot — one
@@ -1078,6 +1082,10 @@ pub fn cutover_ops(
     if matches!(migrate, MigrateStep::Run) {
         ops.push(DeployOp::Run(release_migrate_command(cfg, &release_dir)));
     }
+    // The migration is what creates the SQLite database on a first deploy, so
+    // the marker that tells a later deploy it MUST be there is recorded here,
+    // not left for a later deploy to observe (#2589 item 17).
+    ops.extend(sqlite_data_adopted_op(cfg).map(DeployOp::Run));
     ops.extend([
         DeployOp::Run(RemoteCommand::new(
             "readiness-gate",
@@ -1976,6 +1984,33 @@ fn adoption_recovery(service: &str, current: &str, shared: &str, source: MoveSou
     )
 }
 
+/// Record that the shared `SQLite` database now exists (issue #1909, #2589 item
+/// 17), or `None` when the deploy manages no data file.
+///
+/// This runs AFTER the migrate one-shot, which is what creates the database on a
+/// first deploy. Without it the marker was only ever written by a LATER deploy
+/// observing the file, leaving a one-deploy window: a first deploy creates the
+/// database, the `shared/data` volume then becomes unavailable, and the next
+/// deploy sees both the file and the marker absent, reads that as a genuine
+/// first deploy, and creates a fresh database beneath the missing mount while
+/// the real one is orphaned.
+///
+/// Guarded on the file existing, so a run whose migration was skipped (or which
+/// legitimately has no database yet) records nothing rather than arming a
+/// refusal against a database that was never created.
+#[must_use]
+pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
+    let shared = cfg.shared_sqlite_data_file()?;
+    Some(RemoteCommand::new(
+        "record-data-adopted",
+        format!(
+            "if [ -e {shared_q} ]; then : > {marker_q} || exit 1; fi",
+            shared_q = shell_quote(&shared),
+            marker_q = shell_quote(&cfg.sqlite_data_marker_file()),
+        ),
+    ))
+}
+
 /// Verify on the HOST that an operator-managed absolute `SQLite` database is not
 /// inside the releases directory (issue #1909, #2589 item 13), or `None` when
 /// there is none to check.
@@ -2011,17 +2046,26 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
         "check-data-dir",
         // The same rule `classify_sqlite_data_file` applies lexically — inside
         // the app dir but outside `shared/` — re-asked where both sides can
-        // actually be resolved. `readlink -f` falls back to the literal spelling
-        // so a path that cannot be resolved at all is judged as written.
+        // actually be resolved.
+        //
+        // The DATABASE PATH is resolved, not merely its parent: the configured
+        // path can itself be a symlink (`/var/lib/app.db -> …/releases/r1/app.db`),
+        // and resolving only the parent leaves it outside the app dir and
+        // approves it while the app opens the target inside `releases/`, where
+        // pruning deletes it. `readlink -f` resolves a path whose final component
+        // does not exist yet, so a not-yet-created database grades the same as a
+        // present one; the literal spelling is the fallback for a path it cannot
+        // resolve at all.
         format!(
             "app=$(readlink -f {app_dir_q} 2>/dev/null || printf '%s' {app_dir_q}); \
-             db=$(readlink -f {db_parent_q} 2>/dev/null || printf '%s' {db_parent_q}); \
-             case \"$db\" in \
+             db=$(readlink -f {db_q} 2>/dev/null || printf '%s' {db_q}); \
+             dir=$(dirname \"$db\"); \
+             case \"$dir\" in \
              \"$app/shared\"|\"$app/shared/\"*) : ;; \
              \"$app\"|\"$app/\"*) echo {refusal_q} >&2; exit 1 ;; \
              esac",
             app_dir_q = shell_quote(app_dir),
-            db_parent_q = shell_quote(&parent_dir(path)),
+            db_q = shell_quote(path),
             refusal_q = shell_quote(&refusal),
         ),
     ))
@@ -8105,6 +8149,95 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The marker is recorded AFTER the migrate one-shot, on both deploy paths.
+    ///
+    /// The migration is what creates the database on a first deploy. Leaving the
+    /// marker for a LATER deploy to write when it happens to observe the file
+    /// left a one-deploy window: create the database, lose the `shared/data`
+    /// volume, and the next deploy reads both the file and the marker as absent,
+    /// calls it a first deploy, and creates a fresh database beneath the missing
+    /// mount (#2589 item 17).
+    #[test]
+    fn the_marker_is_recorded_after_the_migration_on_both_deploy_paths() {
+        let cfg = resolved_sqlite();
+        let plan = SlotPlan {
+            live_slot: SLOT_GREEN,
+            live_port: 3002,
+            candidate_slot: SLOT_BLUE,
+            candidate_port: 3001,
+            public_port: 3000,
+        };
+        let unit = super::super::render_app_unit(&cfg, RELEASE_DIR, 3001, SLOT_BLUE);
+        for (path, ops) in [
+            (
+                "first deploy",
+                first_deploy_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    MigrateStep::Run,
+                ),
+            ),
+            (
+                "redeploy",
+                cutover_ops(
+                    &cfg,
+                    &proxy(),
+                    &unit,
+                    Secret::new("X=1\n"),
+                    Path::new("/tmp/app"),
+                    &[],
+                    RELEASE_ID,
+                    &plan,
+                    &ProxyServiceOptions {
+                        tls: false,
+                        host: None,
+                    },
+                    MigrateStep::Run,
+                ),
+            ),
+        ] {
+            let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            let migrate = labels
+                .iter()
+                .position(|l| *l == "migrate")
+                .unwrap_or_else(|| panic!("{path}: no migrate step: {labels:?}"));
+            let record = labels
+                .iter()
+                .position(|l| *l == "record-data-adopted")
+                .unwrap_or_else(|| panic!("{path}: the marker is never recorded: {labels:?}"));
+            assert!(
+                migrate < record,
+                "{path}: the marker must be recorded after the migration creates \
+                 the database: {labels:?}"
+            );
+        }
+
+        // It records only a database that is actually there, so a run whose
+        // migration was skipped cannot arm the refusal against one that was
+        // never created.
+        let op = sqlite_data_adopted_op(&cfg).expect("a SQLite app records the marker");
+        assert!(
+            op.shell
+                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db' ]"),
+            "{}",
+            op.shell
+        );
+        assert!(
+            op.shell
+                .contains(": > '/srv/autumn/myapp/shared/sqlite-data-adopted'"),
+            "{}",
+            op.shell
+        );
+        // A Postgres app gets no such op, so its sequence is unchanged.
+        assert!(sqlite_data_adopted_op(&resolved()).is_none());
+    }
+
     /// A symlinked `app_dir` is invisible to the local lexical containment check,
     /// so the host is asked instead (#2589 item 13): a database whose parent
     /// resolves into the releases directory is refused before anything is
@@ -8130,8 +8263,17 @@ mod tests {
         let outside = root.join("var/lib/app.db");
         std::fs::create_dir_all(root.join("var/lib")).expect("operator dir");
 
+        // A configured path that is ITSELF a symlink into the releases dir. Its
+        // parent (`var/lib`) is outside the app dir entirely, so resolving only
+        // the parent approves it while the app opens the target that pruning
+        // deletes.
+        std::fs::write(&inside, b"LIVE").expect("live db");
+        let linked = root.join("var/lib/linked.db");
+        std::os::unix::fs::symlink(&inside, &linked).expect("symlinked database");
+
         for (path, refuse) in [
             (&inside, true),
+            (&linked, true),
             // Inside the app dir but outside `shared/` — the same rule the local
             // lexical check applies, asked where the symlink resolves.
             (&bare_inside, true),

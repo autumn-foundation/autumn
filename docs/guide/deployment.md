@@ -1345,7 +1345,8 @@ database instead of yours, with no error at all — so the deploy stops and lets
 decide which of the two is the real one.
 
 **If `shared/data` is a mounted volume**, note that the deploy records a
-`shared/sqlite-data-adopted` marker the first time it sees the database. Once that
+`shared/sqlite-data-adopted` marker as soon as the database exists — right after
+the migration that creates it, and again on any later deploy that sees the file. Once that
 marker exists, a *missing* database stops the deploy instead of creating a fresh
 one — an unmounted volume is otherwise indistinguishable from a first deploy, and
 guessing wrong orphans your data. The marker lives in `shared/`, not
