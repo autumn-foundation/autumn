@@ -1,0 +1,10 @@
+error[E0599]: no method named `render` found for struct `RadioGroup<State>` in the current scope
+  --> tests/compile-fail/a11y_radiogroup_unlabeled.rs:11:10
+   |
+ 9 |       let _markup = RadioGroup::new("speed")
+   |  ___________________-
+10 | |         .option(RadioOption::new("standard", "Standard"))
+11 | |         .render();
+   | |         -^^^^^^ method not found in `RadioGroup<NoLabel>`
+   | |_________|
+   |

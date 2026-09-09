@@ -1,6 +1,7 @@
-//! GREEN a11y fixture — the SAME dashboard view as `../red/dashboard.rs`, with
+//! GREEN a11y fixture — the SAME dashboard route as `../red/dashboard.rs`, with
 //! every accessibility defect fixed, so `autumn a11y verify` reports ZERO
-//! findings and exits 0 (issue #1932, part of #1706).
+//! findings, marks `GET /settings` conformant, and exits 0 (issue #1932, part
+//! of #1706).
 //!
 //! This file is NOT compiled by cargo; it only has to tokenize (the verifier
 //! scans token streams). The corrections are made in raw `maud::html!` here so
@@ -20,29 +21,40 @@
 
 use maud::{html, Markup};
 
-pub fn view() -> Markup {
+#[get("/settings")]
+pub async fn view() -> Markup {
     html! {
         main {
             h1 { "Account settings" }
-
-            // `label` fixed — the input now has an associated `<label for>`.
-            form {
-                label for="email" { "Email address" }
-                input type="text" name="email" id="email";
-
-                // `button-name` fixed — the button has visible text content.
-                button type="submit" { "Save" }
-            }
-
-            // `image-alt` fixed — the image now has descriptive alt text.
-            img src="/logo.png" alt="Company logo";
-
-            // `label` fixed — the select now has an associated `<label for>`.
-            label for="role" { "Role" }
-            select name="role" id="role" {
-                option value="admin" { "Admin" }
-                option value="viewer" { "Viewer" }
-            }
+            (account_form())
+            (logo_banner())
         }
+    }
+}
+
+fn account_form() -> Markup {
+    html! {
+        // `label` fixed — the input now has an associated `<label for>`.
+        form {
+            label for="email" { "Email address" }
+            input type="text" name="email" id="email";
+
+            // `button-name` fixed — the button has visible text content.
+            button type="submit" { "Save" }
+        }
+
+        // `label` fixed — the select now has an associated `<label for>`.
+        label for="role" { "Role" }
+        select name="role" id="role" {
+            option value="admin" { "Admin" }
+            option value="viewer" { "Viewer" }
+        }
+    }
+}
+
+fn logo_banner() -> Markup {
+    html! {
+        // `image-alt` fixed — the image now has descriptive alt text.
+        img src="/logo.png" alt="Company logo";
     }
 }

@@ -1809,6 +1809,319 @@ impl Render for FileField<Labeled> {
     }
 }
 
+/// One choice in a [`RadioGroup`], carrying its own visible label.
+///
+/// [`RadioOption::new`] takes the submitted `value` and the human-visible
+/// `label` as required positional arguments, so an unlabeled choice cannot be
+/// built (WCAG 1.3.1 Info and Relationships, 4.1.2 Name, Role, Value).
+#[derive(Debug, Clone)]
+pub struct RadioOption {
+    value: String,
+    label: String,
+    checked: bool,
+    disabled: bool,
+}
+
+impl RadioOption {
+    /// Build a choice with a submitted `value` and a human-visible `label`.
+    pub fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+            checked: false,
+            disabled: false,
+        }
+    }
+
+    /// Pre-select this choice. Exactly one choice per group should be checked.
+    #[must_use]
+    pub const fn checked(mut self) -> Self {
+        self.checked = true;
+        self
+    }
+
+    /// Mark this choice `disabled`.
+    #[must_use]
+    pub const fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self
+    }
+}
+
+/// A set of mutually exclusive radio buttons whose group label is enforced by
+/// the type system (WCAG 1.3.1 Info and Relationships, 3.3.2 Labels or
+/// Instructions, 4.1.2 Name, Role, Value).
+///
+/// A radio group needs **two** accessible names: one per choice, and one for
+/// the group itself — without the group name a screen reader announces
+/// "Standard, radio button" with no clue what is being chosen. Both are
+/// obligations here: [`RadioOption::new`] requires the choice label, and
+/// [`RadioGroup::new`] returns a `RadioGroup<NoLabel>`, which has no way to
+/// render. Attaching the group name with [`label`](RadioGroup::label),
+/// [`aria_label`](RadioGroup::aria_label), or
+/// [`labelled_by`](RadioGroup::labelled_by) consumes it and returns a
+/// `RadioGroup<Labeled>`, the only state that implements [`maud::Render`].
+///
+/// A visible group name renders `<fieldset><legend>…</legend>`, the native
+/// grouping HTML gives for free; the `aria-label` / `aria-labelledby` variants
+/// render a `<div role="radiogroup">` instead, so the group keeps its role
+/// without a competing visible name.
+///
+/// ```rust
+/// use autumn_web::a11y::{RadioGroup, RadioOption};
+/// use maud::Render;
+///
+/// let markup = RadioGroup::new("speed")
+///     .option(RadioOption::new("standard", "Standard"))
+///     .option(RadioOption::new("express", "Express").checked())
+///     .label("Shipping speed")
+///     .render()
+///     .into_string();
+/// assert!(markup.contains("<legend>Shipping speed</legend>"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct RadioGroup<State> {
+    name: String,
+    options: Vec<RadioOption>,
+    required: bool,
+    aria_required: bool,
+    class: Option<String>,
+    label_class: Option<String>,
+    aria_invalid: Option<bool>,
+    described_by: Option<String>,
+    hx: Vec<(String, String)>,
+    label: Option<LabelSource>,
+    _state: std::marker::PhantomData<State>,
+}
+
+impl RadioGroup<NoLabel> {
+    /// Start building a radio group with the given form `name`. The returned
+    /// value has no group label yet and cannot be rendered until one is
+    /// attached.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            options: Vec::new(),
+            required: false,
+            aria_required: false,
+            class: None,
+            label_class: None,
+            aria_invalid: None,
+            described_by: None,
+            hx: Vec::new(),
+            label: None,
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    /// Attach a visible `<legend>` and transition to the renderable
+    /// [`Labeled`] state.
+    #[must_use]
+    pub fn label(self, text: impl Into<String>) -> RadioGroup<Labeled> {
+        self.with_label(LabelSource::Visible(text.into()))
+    }
+
+    /// Attach an `aria-label` (no visible legend) and transition to the
+    /// renderable [`Labeled`] state.
+    #[must_use]
+    pub fn aria_label(self, text: impl Into<String>) -> RadioGroup<Labeled> {
+        self.with_label(LabelSource::Aria(text.into()))
+    }
+
+    /// Reference an existing element's `id` via `aria-labelledby` and
+    /// transition to the renderable [`Labeled`] state.
+    #[must_use]
+    pub fn labelled_by(self, id: impl Into<String>) -> RadioGroup<Labeled> {
+        self.with_label(LabelSource::LabelledBy(id.into()))
+    }
+
+    fn with_label(self, label: LabelSource) -> RadioGroup<Labeled> {
+        RadioGroup {
+            name: self.name,
+            options: self.options,
+            required: self.required,
+            aria_required: self.aria_required,
+            class: self.class,
+            label_class: self.label_class,
+            aria_invalid: self.aria_invalid,
+            described_by: self.described_by,
+            hx: self.hx,
+            label: Some(label),
+            _state: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<State> RadioGroup<State> {
+    /// Append a choice. Choices render in insertion order.
+    #[must_use]
+    pub fn option(mut self, option: RadioOption) -> Self {
+        self.options.push(option);
+        self
+    }
+
+    /// Append several choices at once.
+    #[must_use]
+    pub fn options(mut self, options: impl IntoIterator<Item = RadioOption>) -> Self {
+        self.options.extend(options);
+        self
+    }
+
+    /// Mark the group as `required` — one choice must be selected. The
+    /// attribute lands on every control in the group, which is how a browser
+    /// reads a required radio group.
+    #[must_use]
+    pub const fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Add a mirroring `aria-required="true"` on the group element.
+    #[must_use]
+    pub const fn aria_required(mut self) -> Self {
+        self.aria_required = true;
+        self
+    }
+
+    /// Set the `class` attribute on the group element (`<fieldset>` or
+    /// `<div role="radiogroup">`).
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+
+    /// Set the `class` attribute on the visible `<legend>`. Only affects
+    /// rendering when a visible group name was set via [`label`](Self::label).
+    #[must_use]
+    pub fn label_class(mut self, class: impl Into<String>) -> Self {
+        self.label_class = Some(class.into());
+        self
+    }
+
+    /// Set `aria-invalid` on the group to `"true"` or `"false"`. When left
+    /// unset the attribute is omitted entirely.
+    #[must_use]
+    pub const fn aria_invalid(mut self, invalid: bool) -> Self {
+        self.aria_invalid = Some(invalid);
+        self
+    }
+
+    /// Reference the `id` of the element describing this group via
+    /// `aria-describedby`.
+    #[must_use]
+    pub fn described_by(mut self, id: impl Into<String>) -> Self {
+        self.described_by = Some(id.into());
+        self
+    }
+
+    /// Attach an arbitrary `hx-*` attribute to the group element (the `name` is
+    /// the suffix after `hx-`), preserving the typed label obligation. Emitted
+    /// in insertion order. Available before or after a label is attached.
+    #[must_use]
+    pub fn hx(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.hx.push((name.into(), value.into()));
+        self
+    }
+}
+
+/// One `id` per choice, unique within the group.
+///
+/// The id pairs each `<input>` with its `<label for=…>`, so a duplicate would
+/// break the very association the primitive exists to guarantee. Ids derive
+/// from the choice value (stable across reordering) reduced to the safe
+/// `[A-Za-z0-9_-]` alphabet; two values that reduce to the same text are
+/// separated by an index suffix.
+fn radio_option_ids(name: &str, options: &[RadioOption]) -> Vec<String> {
+    let group = slug(name);
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::with_capacity(options.len());
+    for (index, option) in options.iter().enumerate() {
+        let base = format!("{group}-{}", slug(&option.value));
+        let mut id = base.clone();
+        let mut suffix = index;
+        while !seen.insert(id.clone()) {
+            id = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        ids.push(id);
+    }
+    ids
+}
+
+/// Reduce `text` to the `[A-Za-z0-9_-]` alphabet an HTML `id` can safely carry.
+fn slug(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+impl Render for RadioGroup<Labeled> {
+    fn render(&self) -> Markup {
+        let (visible_label, aria_label, aria_labelledby) = match &self.label {
+            Some(LabelSource::Visible(text)) => (Some(text.as_str()), None, None),
+            Some(LabelSource::Aria(text)) => (None, Some(text.as_str()), None),
+            Some(LabelSource::LabelledBy(id)) => (None, None, Some(id.as_str())),
+            None => (None, None, None),
+        };
+        let aria_invalid = self
+            .aria_invalid
+            .map(|invalid| if invalid { "true" } else { "false" });
+        let aria_required = self.aria_required.then_some("true");
+        let ids = radio_option_ids(&self.name, &self.options);
+        let controls = html! {
+            @for (option, id) in self.options.iter().zip(&ids) {
+                input
+                    type="radio"
+                    id=(id)
+                    name=(self.name)
+                    value=(option.value)
+                    checked[option.checked]
+                    disabled[option.disabled]
+                    required[self.required];
+                label for=(id) { (option.label) }
+            }
+        };
+        // A visible name uses the native grouping element; an ARIA name uses an
+        // explicit role, so the group keeps its semantics without a second name.
+        let group = visible_label.map_or_else(
+            || {
+                html! {
+                    div
+                        role="radiogroup"
+                        aria-label=[aria_label]
+                        aria-labelledby=[aria_labelledby]
+                        class=[self.class.as_deref()]
+                        aria-invalid=[aria_invalid]
+                        aria-describedby=[self.described_by.as_deref()]
+                        aria-required=[aria_required] {
+                            (controls)
+                        }
+                }
+            },
+            |text| {
+                html! {
+                    fieldset
+                        class=[self.class.as_deref()]
+                        aria-invalid=[aria_invalid]
+                        aria-describedby=[self.described_by.as_deref()]
+                        aria-required=[aria_required] {
+                            legend class=[self.label_class.as_deref()] { (text) }
+                            (controls)
+                        }
+                }
+            },
+        );
+        with_hx_attrs(group, &self.hx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2033,5 +2346,143 @@ mod tests {
         assert!(!is_valid_hx_suffix("po st"));
         assert!(!is_valid_hx_suffix("post\"onload"));
         assert!(!is_valid_hx_suffix("hx_post"));
+    }
+
+    // ── RadioGroup ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn radio_group_renders_fieldset_legend_and_options() {
+        let markup = RadioGroup::new("speed")
+            .option(RadioOption::new("standard", "Standard"))
+            .option(RadioOption::new("express", "Express"))
+            .label("Shipping speed")
+            .render()
+            .into_string();
+        assert!(markup.contains("<fieldset"), "{markup}");
+        assert!(
+            markup.contains("<legend>Shipping speed</legend>"),
+            "{markup}"
+        );
+        // Every option carries its own input/label pair, associated by id.
+        assert!(
+            markup.contains(r#"id="speed-standard""#) && markup.contains(r#"for="speed-standard""#),
+            "{markup}"
+        );
+        assert!(
+            markup.contains(r#"id="speed-express""#) && markup.contains(r#"for="speed-express""#),
+            "{markup}"
+        );
+        // One radio group: every input shares the form name.
+        assert_eq!(markup.matches(r#"name="speed""#).count(), 2, "{markup}");
+        assert_eq!(markup.matches(r#"type="radio""#).count(), 2, "{markup}");
+    }
+
+    #[test]
+    fn radio_group_aria_label_uses_radiogroup_role() {
+        let markup = RadioGroup::new("speed")
+            .option(RadioOption::new("standard", "Standard"))
+            .aria_label("Shipping speed")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"role="radiogroup""#), "{markup}");
+        assert!(
+            markup.contains(r#"aria-label="Shipping speed""#),
+            "{markup}"
+        );
+        // An aria-named group renders no competing visible legend.
+        assert!(!markup.contains("<legend"), "{markup}");
+        assert!(!markup.contains("<fieldset"), "{markup}");
+    }
+
+    #[test]
+    fn radio_group_labelled_by_uses_radiogroup_role() {
+        let markup = RadioGroup::new("speed")
+            .option(RadioOption::new("standard", "Standard"))
+            .labelled_by("speed-heading")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"role="radiogroup""#), "{markup}");
+        assert!(
+            markup.contains(r#"aria-labelledby="speed-heading""#),
+            "{markup}"
+        );
+    }
+
+    #[test]
+    fn radio_group_marks_the_checked_option_only() {
+        let markup = RadioGroup::new("speed")
+            .option(RadioOption::new("standard", "Standard"))
+            .option(RadioOption::new("express", "Express").checked())
+            .label("Shipping speed")
+            .render()
+            .into_string();
+        assert_eq!(markup.matches(" checked").count(), 1, "{markup}");
+        let express = markup
+            .split(r#"value="express""#)
+            .nth(1)
+            .expect("express option rendered");
+        assert!(express.starts_with(" checked"), "{markup}");
+    }
+
+    #[test]
+    fn radio_group_disambiguates_colliding_option_ids() {
+        // Two values that sanitize to the same id must not produce duplicate
+        // ids: a duplicate id breaks the `for=`/`id=` label association.
+        let markup = RadioGroup::new("plan")
+            .option(RadioOption::new("a b", "A B"))
+            .option(RadioOption::new("a-b", "A-B"))
+            .label("Plan")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"id="plan-a-b""#), "{markup}");
+        assert!(markup.contains(r#"id="plan-a-b-1""#), "{markup}");
+        assert!(markup.contains(r#"for="plan-a-b-1""#), "{markup}");
+    }
+
+    #[test]
+    fn radio_group_carries_required_and_error_wiring() {
+        let markup = RadioGroup::new("speed")
+            .option(RadioOption::new("standard", "Standard"))
+            .option(RadioOption::new("express", "Express"))
+            .required()
+            .aria_required()
+            .aria_invalid(true)
+            .described_by("speed-error")
+            .class("field")
+            .label_class("field__legend")
+            .label("Shipping speed")
+            .render()
+            .into_string();
+        // `required` marks the group by marking each control in it.
+        assert_eq!(markup.matches(" required").count(), 2, "{markup}");
+        assert!(markup.contains(r#"aria-required="true""#), "{markup}");
+        assert!(markup.contains(r#"aria-invalid="true""#), "{markup}");
+        assert!(
+            markup.contains(r#"aria-describedby="speed-error""#),
+            "{markup}"
+        );
+        assert!(markup.contains(r#"class="field""#), "{markup}");
+        assert!(markup.contains(r#"class="field__legend""#), "{markup}");
+    }
+
+    #[test]
+    fn radio_group_accepts_hx_attributes() {
+        let markup = RadioGroup::new("speed")
+            .option(RadioOption::new("standard", "Standard"))
+            .hx("post", "/quote")
+            .label("Shipping speed")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"hx-post="/quote""#), "{markup}");
+    }
+
+    #[test]
+    fn radio_group_disabled_option_renders_disabled() {
+        let markup = RadioGroup::new("speed")
+            .option(RadioOption::new("overnight", "Overnight").disabled())
+            .label("Shipping speed")
+            .render()
+            .into_string();
+        assert!(markup.contains(" disabled"), "{markup}");
     }
 }

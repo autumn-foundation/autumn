@@ -45,6 +45,23 @@
 //! - **`link-name`** — an `<a>` with an `href` but no text content and no
 //!   `aria-label`/`aria-labelledby` (WCAG 2.4.4 / 4.1.2, Serious).
 //!
+//! # Route attribution
+//!
+//! A file and a line say where a defect is; a route says which page it breaks.
+//! The scan reads the route attribute macros (`#[get("/settings")]`,
+//! `#[post(..)]`, …) out of the same token stream, indexes every function and
+//! the free functions it calls, then walks out from each handler to the markup
+//! it reaches — so a defect in a shared partial names every route that renders
+//! it. The manifest carries the result three ways: a `routes` array of
+//! per-route `pass`/`fail`, a `routes` list on each finding, and a `wcag`
+//! rollup keyed by success criterion.
+//!
+//! The walk is as conservative as the scanner: a call is followed only when the
+//! called name is defined exactly once across the scan, method calls are not
+//! resolved, and the path is the one **declared** on the handler (mount-time
+//! prefixes are applied at runtime). Attribution is a lower bound — an
+//! unattributed finding is still a finding — and never changes the exit code.
+//!
 //! # Known heuristic limits
 //!
 //! Like `autumn i18n check`, the scanner reads tokens rather than a
@@ -176,6 +193,11 @@ pub struct Finding {
     pub message: &'static str,
     /// The typed primitive that fixes it at compile time.
     pub hint: &'static str,
+    /// Routes that statically reach this markup, as `"METHOD /path"`. Empty
+    /// when no route handler reaches it (a partial nothing renders, or a call
+    /// chain the scan could not resolve).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
 }
 
 fn serialize_severity<S>(severity: &Severity, serializer: S) -> Result<S::Ok, S::Error>
@@ -185,13 +207,50 @@ where
     serializer.serialize_str(&severity.to_string())
 }
 
-/// Aggregate counts by severity.
+/// Aggregate counts by severity, plus route coverage.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 pub struct Summary {
     pub critical: usize,
     pub serious: usize,
     pub moderate: usize,
     pub total: usize,
+    /// Route handlers discovered in the scanned source.
+    pub routes: usize,
+    /// Routes carrying at least one finding.
+    pub routes_failing: usize,
+    /// Findings no route statically reaches.
+    pub unrouted: usize,
+}
+
+/// Per-route conformance, one entry per declared route handler.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteConformance {
+    /// HTTP method from the route attribute (`GET`, `POST`, …).
+    pub method: String,
+    /// Path **as declared** on the handler. Mount-time prefixes (a `scope`, a
+    /// nested router) are applied at runtime and are not resolved here.
+    pub path: String,
+    /// Handler function name.
+    pub handler: String,
+    /// Source file, relative to the project root.
+    pub file: String,
+    /// 1-based line of the handler.
+    pub line: usize,
+    /// Findings in markup this route statically reaches.
+    pub findings: usize,
+    /// `"pass"` when the route reaches no finding, else `"fail"`.
+    pub status: &'static str,
+}
+
+/// Findings rolled up by WCAG success criterion — the conformance view.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WcagCriterion {
+    /// WCAG 2.1 success criterion, e.g. `"1.1.1"`.
+    pub criterion: String,
+    /// Rule ids that breached it, sorted.
+    pub rules: Vec<&'static str>,
+    /// Findings breaching it.
+    pub findings: usize,
 }
 
 /// The full result of a verify run — the JSON conformance manifest.
@@ -201,8 +260,12 @@ pub struct Report {
     pub files_scanned: usize,
     /// Number of `html!` blocks discovered and analyzed.
     pub html_blocks: usize,
+    /// Declared routes with their conformance status, sorted by path.
+    pub routes: Vec<RouteConformance>,
     /// Findings, sorted by file then line.
     pub findings: Vec<Finding>,
+    /// Findings rolled up by WCAG success criterion, sorted by criterion.
+    pub wcag: Vec<WcagCriterion>,
     pub summary: Summary,
 }
 
@@ -211,6 +274,12 @@ impl Report {
     fn from_scan(mut scan: Scan) -> Self {
         scan.findings
             .sort_by(|a, b| (a.file.as_str(), a.line).cmp(&(b.file.as_str(), b.line)));
+        let graph = RouteGraph::build(&scan.fns);
+        for finding in &mut scan.findings {
+            finding.routes = graph.routes_reaching(&finding.file, finding.line);
+        }
+        let routes = graph.conformance(&scan.findings);
+
         let mut summary = Summary::default();
         for finding in &scan.findings {
             match finding.severity {
@@ -218,11 +287,19 @@ impl Report {
                 Severity::Serious => summary.serious += 1,
                 Severity::Moderate => summary.moderate += 1,
             }
+            if finding.routes.is_empty() {
+                summary.unrouted += 1;
+            }
         }
         summary.total = scan.findings.len();
+        summary.routes = routes.len();
+        summary.routes_failing = routes.iter().filter(|r| r.findings > 0).count();
+
         Self {
             files_scanned: scan.files_scanned,
             html_blocks: scan.html_blocks,
+            routes,
+            wcag: roll_up_wcag(&scan.findings),
             findings: scan.findings,
             summary,
         }
@@ -249,6 +326,8 @@ struct Scan {
     findings: Vec<Finding>,
     files_scanned: usize,
     html_blocks: usize,
+    /// Every function declaration seen, for route attribution.
+    fns: Vec<FnDecl>,
 }
 
 impl Scan {
@@ -262,6 +341,7 @@ impl Scan {
             severity: Severity::Serious,
             message: rule.message(),
             hint: rule.hint(),
+            routes: Vec::new(),
         });
     }
 }
@@ -337,6 +417,8 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
         return;
     };
     find_html_blocks(&stream, file, scan);
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    collect_fns(&trees, file, &mut scan.fns);
 }
 
 /// Recursively walk a token stream, analyzing each `html! { … }` macro body and
@@ -470,6 +552,318 @@ fn looks_like_jsx(trees: &[TokenTree]) -> bool {
         }
     }
     false
+}
+
+// ── Route attribution ──────────────────────────────────────────────────────
+//
+// A finding is only actionable if the developer knows which page it breaks.
+// Autumn declares routes with attribute macros on the handler
+// (`#[get("/settings")] async fn settings()`), so the routes a piece of markup
+// serves can be read from the same token stream the scanner already walks: index
+// every `fn`, record the free functions each one calls, then walk out from each
+// handler to the markup it reaches.
+//
+// The walk is deliberately conservative, like the scanner itself. It resolves a
+// call only when the called name is defined EXACTLY once across the whole scan;
+// two functions sharing a name cannot be told apart from tokens, and guessing
+// would key a defect to a route that never renders it. Method calls
+// (`page.sidebar()`) are not resolved at all. Attribution is therefore a
+// best-effort lower bound: an unattributed finding is still a finding.
+
+/// Route declared by an attribute macro on a handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteDecl {
+    method: &'static str,
+    /// Path as written in the attribute; mount-time prefixes are not resolved.
+    path: String,
+}
+
+/// A function declaration and the call edges leaving it.
+#[derive(Debug)]
+struct FnDecl {
+    name: String,
+    file: String,
+    start_line: usize,
+    end_line: usize,
+    /// Names of free functions called in the body, unresolved.
+    calls: BTreeSet<String>,
+    /// Route attributes on this function, if any.
+    routes: Vec<RouteDecl>,
+}
+
+/// HTTP route attribute macros. `#[static_get]` is excluded: it serves files,
+/// not markup.
+const ROUTE_ATTRS: [(&str, &str); 5] = [
+    ("get", "GET"),
+    ("post", "POST"),
+    ("put", "PUT"),
+    ("patch", "PATCH"),
+    ("delete", "DELETE"),
+];
+
+/// Rust keywords that can precede a parenthesized group without being a call.
+const CALL_KEYWORDS: [&str; 7] = ["if", "while", "match", "return", "for", "in", "fn"];
+
+/// Index every function in `trees`, recording its span, call edges, and any
+/// route attributes, appending to `out`.
+///
+/// `#[cfg(test)]` items are skipped wholesale, mirroring the scanner: test
+/// scaffolding is neither a route nor a rendering path, and indexing it would
+/// only create name collisions that suppress real attribution.
+fn collect_fns(trees: &[TokenTree], file: &str, out: &mut Vec<FnDecl>) {
+    let mut pending: Vec<RouteDecl> = Vec::new();
+    let mut i = 0;
+    while i < trees.len() {
+        if is_cfg_test_attr(trees, i) {
+            i = skip_cfg_test_item(trees, i + 2);
+            pending.clear();
+            continue;
+        }
+        if let Some((route, next)) = read_attr(trees, i) {
+            pending.extend(route);
+            i = next;
+            continue;
+        }
+        if let TokenTree::Ident(ident) = &trees[i] {
+            if *ident == "fn"
+                && let Some(TokenTree::Ident(name)) = trees.get(i + 1)
+                && let Some(body_at) = find_fn_body(trees, i + 2)
+                && let TokenTree::Group(body) = &trees[body_at]
+            {
+                let inner: Vec<TokenTree> = body.stream().into_iter().collect();
+                let mut calls = BTreeSet::new();
+                collect_calls(&inner, &mut calls);
+                out.push(FnDecl {
+                    name: name.to_string(),
+                    file: file.to_owned(),
+                    start_line: trees[i].span().start().line,
+                    end_line: body.span().end().line,
+                    calls,
+                    routes: std::mem::take(&mut pending),
+                });
+                collect_fns(&inner, file, out);
+                i = body_at + 1;
+                continue;
+            }
+            // An attribute binds to the next item. If that item is not a
+            // function, the route attributes seen so far are not ours.
+            if !matches!(
+                ident.to_string().as_str(),
+                "pub" | "async" | "unsafe" | "extern"
+            ) {
+                pending.clear();
+            }
+        }
+        if let TokenTree::Group(group) = &trees[i] {
+            let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+            collect_fns(&inner, file, out);
+        }
+        i += 1;
+    }
+}
+
+/// Read the attribute starting at `trees[i]` (a `#` followed by a bracket
+/// group), returning any route it declares and the index just past it.
+fn read_attr(trees: &[TokenTree], i: usize) -> Option<(Option<RouteDecl>, usize)> {
+    let TokenTree::Punct(p) = trees.get(i)? else {
+        return None;
+    };
+    if p.as_char() != '#' {
+        return None;
+    }
+    let TokenTree::Group(group) = trees.get(i + 1)? else {
+        return None;
+    };
+    if group.delimiter() != Delimiter::Bracket {
+        return None;
+    }
+    Some((route_from_attr(&group.stream()), i + 2))
+}
+
+/// Parse a route attribute body (`get("/settings", …)`, or a path-qualified
+/// `autumn_web::get("/settings")`) into a [`RouteDecl`].
+fn route_from_attr(stream: &TokenStream) -> Option<RouteDecl> {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    // The macro name is the last ident before the argument group.
+    let group_at = trees.iter().position(
+        |t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis),
+    )?;
+    let TokenTree::Ident(name) = trees.get(group_at.checked_sub(1)?)? else {
+        return None;
+    };
+    let name = name.to_string();
+    let method = ROUTE_ATTRS
+        .iter()
+        .find(|(attr, _)| *attr == name)
+        .map(|(_, method)| *method)?;
+    let TokenTree::Group(args) = &trees[group_at] else {
+        return None;
+    };
+    // The path is the first string literal argument.
+    let path = args.stream().into_iter().find_map(|t| match t {
+        TokenTree::Literal(lit) => string_literal_value(&lit),
+        _ => None,
+    })?;
+    Some(RouteDecl { method, path })
+}
+
+/// Index of the brace group holding a function body, searching from `start`
+/// (just past the function name). Returns `None` for a body-less declaration
+/// (a trait method signature), whose `;` is reached first.
+fn find_fn_body(trees: &[TokenTree], start: usize) -> Option<usize> {
+    for (offset, tree) in trees.iter().enumerate().skip(start) {
+        match tree {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => return Some(offset),
+            TokenTree::Punct(p) if p.as_char() == ';' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Collect the names of free functions called anywhere in `trees`.
+///
+/// A call is an identifier immediately followed by a parenthesized group. A
+/// macro (`html!(…)`) does not match — its `!` sits between the two — and an
+/// identifier preceded by `.` is a method call on a receiver this scan cannot
+/// resolve, so it is skipped rather than guessed at.
+fn collect_calls(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    for (i, tree) in trees.iter().enumerate() {
+        if let TokenTree::Ident(ident) = tree
+            && matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+            && !matches!(trees.get(i.wrapping_sub(1)), Some(TokenTree::Punct(p)) if p.as_char() == '.')
+        {
+            let name = ident.to_string();
+            if !CALL_KEYWORDS.contains(&name.as_str()) {
+                out.insert(name);
+            }
+        }
+        if let TokenTree::Group(group) = tree {
+            let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+            collect_calls(&inner, out);
+        }
+    }
+}
+
+/// The call graph rooted at each declared route.
+struct RouteGraph<'a> {
+    fns: &'a [FnDecl],
+    /// One entry per route: its declaration, its handler, and every function it
+    /// statically reaches.
+    routes: Vec<(RouteDecl, usize, BTreeSet<usize>)>,
+}
+
+impl<'a> RouteGraph<'a> {
+    fn build(fns: &'a [FnDecl]) -> Self {
+        // A name defined more than once is unresolvable, so it is not indexed.
+        let mut by_name: std::collections::HashMap<&str, Option<usize>> =
+            std::collections::HashMap::new();
+        for (index, decl) in fns.iter().enumerate() {
+            by_name
+                .entry(decl.name.as_str())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(index));
+        }
+
+        let mut routes = Vec::new();
+        for (index, decl) in fns.iter().enumerate() {
+            for route in &decl.routes {
+                let mut reached = BTreeSet::new();
+                let mut stack = vec![index];
+                while let Some(current) = stack.pop() {
+                    if !reached.insert(current) {
+                        continue;
+                    }
+                    for call in &fns[current].calls {
+                        if let Some(Some(target)) = by_name.get(call.as_str()) {
+                            stack.push(*target);
+                        }
+                    }
+                }
+                routes.push((route.clone(), index, reached));
+            }
+        }
+        Self { fns, routes }
+    }
+
+    /// The innermost function whose span contains `line` in `file`.
+    fn enclosing_fn(&self, file: &str, line: usize) -> Option<usize> {
+        self.fns
+            .iter()
+            .enumerate()
+            .filter(|(_, decl)| {
+                decl.file == file && decl.start_line <= line && line <= decl.end_line
+            })
+            .min_by_key(|(_, decl)| decl.end_line - decl.start_line)
+            .map(|(index, _)| index)
+    }
+
+    /// Routes reaching the markup at `file:line`, as sorted `"METHOD /path"`.
+    fn routes_reaching(&self, file: &str, line: usize) -> Vec<String> {
+        let Some(target) = self.enclosing_fn(file, line) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<String> = self
+            .routes
+            .iter()
+            .filter(|(_, _, reached)| reached.contains(&target))
+            .map(|(route, _, _)| route_key(route))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Per-route conformance, sorted by path then method.
+    fn conformance(&self, findings: &[Finding]) -> Vec<RouteConformance> {
+        let mut out: Vec<RouteConformance> = self
+            .routes
+            .iter()
+            .map(|(route, handler, _)| {
+                let key = route_key(route);
+                let count = findings.iter().filter(|f| f.routes.contains(&key)).count();
+                RouteConformance {
+                    method: route.method.to_owned(),
+                    path: route.path.clone(),
+                    handler: self.fns[*handler].name.clone(),
+                    file: self.fns[*handler].file.clone(),
+                    line: self.fns[*handler].start_line,
+                    findings: count,
+                    status: if count == 0 { "pass" } else { "fail" },
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.path, &a.method, &a.handler).cmp(&(&b.path, &b.method, &b.handler)));
+        out
+    }
+}
+
+/// `"GET /settings"` — the stable key a finding and a route agree on.
+fn route_key(route: &RouteDecl) -> String {
+    format!("{} {}", route.method, route.path)
+}
+
+/// Roll findings up by WCAG success criterion, splitting the multi-criterion
+/// rules (`label` covers 1.3.1, 3.3.2 and 4.1.2) so each criterion reports on
+/// its own — the view a conformance claim is written against.
+fn roll_up_wcag(findings: &[Finding]) -> Vec<WcagCriterion> {
+    let mut by_criterion: std::collections::BTreeMap<&str, (BTreeSet<&'static str>, usize)> =
+        std::collections::BTreeMap::new();
+    for finding in findings {
+        for criterion in finding.wcag.split('/').map(str::trim) {
+            let entry = by_criterion.entry(criterion).or_default();
+            entry.0.insert(finding.rule_id);
+            entry.1 += 1;
+        }
+    }
+    by_criterion
+        .into_iter()
+        .map(|(criterion, (rules, findings))| WcagCriterion {
+            criterion: criterion.to_owned(),
+            rules: rules.into_iter().collect(),
+            findings,
+        })
+        .collect()
 }
 
 // ── Maud markup model ──────────────────────────────────────────────────────
@@ -1492,41 +1886,91 @@ fn print_json(report: &Report) {
 }
 
 fn print_text(report: &Report, strict: bool) {
-    println!("autumn a11y verify");
-    println!(
+    print!("{}", format_text(report, strict));
+}
+
+/// Render the human-readable report.
+fn format_text(report: &Report, strict: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "autumn a11y verify");
+    let _ = writeln!(
+        out,
         "  scanned {} html! block(s) across {} .rs file(s)",
         report.html_blocks, report.files_scanned
     );
-    println!("  {PRIMITIVE_NOTE}");
+    let _ = writeln!(
+        out,
+        "  {} route(s) discovered, {} carrying findings",
+        report.summary.routes, report.summary.routes_failing
+    );
+    let _ = writeln!(out, "  {PRIMITIVE_NOTE}");
 
     if report.findings.is_empty() {
-        println!("\nResult: PASS — no accessibility violations in raw html! markup.");
-        return;
+        let _ = writeln!(
+            out,
+            "\nResult: PASS — no accessibility violations in raw html! markup."
+        );
+        return out;
     }
 
-    println!("\n  findings:");
+    let _ = writeln!(out, "\n  findings:");
     for f in &report.findings {
-        println!(
+        let _ = writeln!(
+            out,
             "    {}:{}: <{}> [WCAG {}] {} — {}",
             f.file, f.line, f.element, f.wcag, f.severity, f.message
         );
-        println!("        hint: {}", f.hint);
+        if !f.routes.is_empty() {
+            let _ = writeln!(out, "        routes: {}", f.routes.join(", "));
+        }
+        let _ = writeln!(out, "        hint: {}", f.hint);
     }
 
-    println!(
-        "\n  summary: {} Critical, {} Serious, {} Moderate ({} total)",
+    let failing: Vec<&RouteConformance> = report.routes.iter().filter(|r| r.findings > 0).collect();
+    if !failing.is_empty() {
+        let _ = writeln!(out, "\n  failing routes:");
+        for route in failing {
+            let _ = writeln!(
+                out,
+                "    {} {} ({}) — {} finding(s)",
+                route.method, route.path, route.handler, route.findings
+            );
+        }
+    }
+
+    let _ = writeln!(out, "\n  WCAG success criteria breached:");
+    for criterion in &report.wcag {
+        let _ = writeln!(
+            out,
+            "    WCAG {} — {} finding(s) [{}]",
+            criterion.criterion,
+            criterion.findings,
+            criterion.rules.join(", ")
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "\n  summary: {} Critical, {} Serious, {} Moderate ({} total, {} not reached by any route)",
         report.summary.critical,
         report.summary.serious,
         report.summary.moderate,
-        report.summary.total
+        report.summary.total,
+        report.summary.unrouted,
     );
     if report.exit_code(strict) == 0 {
-        println!("Result: PASS with findings — below the failure threshold.");
+        let _ = writeln!(
+            out,
+            "Result: PASS with findings — below the failure threshold."
+        );
     } else {
-        println!(
+        let _ = writeln!(
+            out,
             "Result: FAIL — fix the accessibility violations above (or use the typed primitives)."
         );
     }
+    out
 }
 
 #[cfg(test)]
@@ -3025,5 +3469,255 @@ mod tests {
             1,
             "the same defect at the scan root must be flagged",
         );
+    }
+
+    // ── Route attribution (issue #1706, AC3) ───────────────────────────────
+
+    /// Build a full report from one or more in-memory `(file, source)` pairs.
+    fn report_for(files: &[(&str, &str)]) -> Report {
+        let mut scan = Scan::default();
+        for (name, src) in files {
+            scan_source(src, name, &mut scan);
+            scan.files_scanned += 1;
+        }
+        Report::from_scan(scan)
+    }
+
+    /// The routes attributed to the single finding of a one-file report.
+    fn routes_of_only_finding(files: &[(&str, &str)]) -> Vec<String> {
+        let report = report_for(files);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        report.findings[0].routes.clone()
+    }
+
+    #[test]
+    fn finding_in_a_route_handler_is_keyed_to_that_route() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn finding_in_a_called_helper_inherits_the_route() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup {
+                html! { main { (sidebar()) } }
+            }
+
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn attribution_crosses_files() {
+        let handler = r#"
+            #[post("/settings")]
+            async fn save() -> Markup {
+                html! { main { (sidebar()) } }
+            }
+        "#;
+        let partial = r#"
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("routes.rs", handler), ("partials.rs", partial)]),
+            vec!["POST /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_helper_reached_from_two_routes_lists_both() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+
+            #[get("/b")]
+            async fn b() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned(), "GET /b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_helper_name_is_not_traversed() {
+        // Two functions share a name, so a bare `sidebar()` call cannot be
+        // resolved to one of them. Guessing would key the finding to a route
+        // that never renders it, so the call edge is dropped instead.
+        let handler = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+        "#;
+        let one = r#"
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let two = r#"
+            fn sidebar() -> Markup { html! { span { "hi" } } }
+        "#;
+        assert!(
+            routes_of_only_finding(&[("a.rs", handler), ("one.rs", one), ("two.rs", two)])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_finding_outside_any_route_has_no_route() {
+        let src = r#"
+            fn orphan() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(
+            report.findings[0].routes.is_empty(),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(report.summary.unrouted, 1);
+    }
+
+    #[test]
+    fn mutually_recursive_helpers_terminate() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (left()) } }
+
+            fn left() -> Markup { html! { (right()) } }
+
+            fn right() -> Markup { html! { (left()) img src="/logo.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn method_calls_are_not_resolved_as_helpers() {
+        // `self.sidebar()` is a method call, not a call to the free function
+        // `sidebar`; treating it as one would attribute the finding to a route
+        // that cannot reach it.
+        let src = r#"
+            #[get("/a")]
+            async fn a(page: Page) -> Markup { html! { (page.sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn routes_section_reports_per_route_status() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup { html! { img src="/logo.png"; } }
+
+            #[get("/about")]
+            async fn about() -> Markup { html! { img src="/logo.png" alt="Logo"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let paths: Vec<_> = report
+            .routes
+            .iter()
+            .map(|r| (r.path.as_str(), r.findings, r.status))
+            .collect();
+        assert_eq!(paths, vec![("/about", 0, "pass"), ("/settings", 1, "fail")]);
+        assert_eq!(report.routes[1].method, "GET");
+        assert_eq!(report.routes[1].handler, "settings");
+        assert_eq!(report.routes[1].file, "views.rs");
+        assert_eq!(report.summary.routes, 2);
+        assert_eq!(report.summary.routes_failing, 1);
+    }
+
+    #[test]
+    fn a_route_without_markup_is_still_listed_as_passing() {
+        let src = r#"
+            #[get("/api/todos")]
+            async fn list() -> Json<Vec<Todo>> { Json(vec![]) }
+        "#;
+        let report = report_for(&[("api.rs", src)]);
+        assert_eq!(report.routes.len(), 1);
+        assert_eq!(report.routes[0].status, "pass");
+    }
+
+    #[test]
+    fn wcag_rollup_splits_multi_criterion_rules() {
+        let src = r#"
+            fn view() -> Markup {
+                html! { img src="/logo.png"; input type="text" name="email"; }
+            }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let rollup: Vec<_> = report
+            .wcag
+            .iter()
+            .map(|c| (c.criterion.as_str(), c.findings))
+            .collect();
+        // `label` maps to three criteria; each is reported on its own.
+        assert_eq!(
+            rollup,
+            vec![("1.1.1", 1), ("1.3.1", 1), ("3.3.2", 1), ("4.1.2", 1),]
+        );
+        assert_eq!(report.wcag[0].rules, vec!["image-alt"]);
+    }
+
+    #[test]
+    fn wcag_rollup_is_empty_when_clean() {
+        let src = r#"fn view() -> Markup { html! { img src="/l.png" alt="Logo"; } }"#;
+        assert!(report_for(&[("views.rs", src)]).wcag.is_empty());
+    }
+
+    #[test]
+    fn text_output_names_failing_routes_and_criteria() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let text = format_text(&report_for(&[("views.rs", src)]), false);
+        assert!(text.contains("GET /settings"), "{text}");
+        assert!(text.contains("WCAG 1.1.1"), "{text}");
+        assert!(text.contains("Result: FAIL"), "{text}");
+    }
+
+    #[test]
+    fn text_output_passes_clean() {
+        let src = r#"fn view() -> Markup { html! { img src="/l.png" alt="Logo"; } }"#;
+        let text = format_text(&report_for(&[("views.rs", src)]), false);
+        assert!(text.contains("Result: PASS"), "{text}");
+    }
+
+    #[test]
+    fn route_attribution_ignores_cfg_test_handlers() {
+        // A `#[cfg(test)]` handler is test scaffolding: it must not appear in
+        // the route manifest, mirroring the scanner's cfg(test) skip.
+        let src = r#"
+            #[cfg(test)]
+            mod tests {
+                #[get("/fixture")]
+                async fn fixture() -> Markup { html! { img src="/logo.png"; } }
+            }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(report.routes.is_empty(), "{:?}", report.routes);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 }

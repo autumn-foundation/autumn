@@ -1741,6 +1741,8 @@ enum Commands {
     /// time. `autumn a11y verify` covers the escape hatch they cannot see: raw
     /// markup written directly in `html!` blocks. It scans the project's `.rs`
     /// files, reports WCAG-keyed findings, and exits non-zero when any exist.
+    /// Findings are keyed to the routes that reach them, and rolled up per
+    /// WCAG success criterion.
     ///
     /// # Examples
     ///

@@ -111,3 +111,84 @@ fn green_fixture_passes_clean() {
         "GREEN fixture must produce zero findings; got {findings:?}",
     );
 }
+
+/// Parse a verify run's JSON report from stdout.
+fn json_report(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout)
+        .expect("`a11y verify --format json` must emit parseable JSON on stdout")
+}
+
+/// Every RED defect is keyed to the route that serves it, including the ones in
+/// a helper the handler calls — the manifest answers "which page is broken?",
+/// not just "which line".
+#[test]
+fn red_fixture_findings_are_keyed_to_the_route() {
+    let out = run_verify(&fixture_dir("red"), &["--format", "json"]);
+    let report = json_report(&out);
+
+    let findings = report["findings"].as_array().expect("findings array");
+    assert!(!findings.is_empty(), "RED fixture must produce findings");
+    for finding in findings {
+        let routes: Vec<&str> = finding["routes"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            routes,
+            vec!["GET /settings"],
+            "every RED finding must name the route that renders it; got {finding}",
+        );
+    }
+
+    let routes = report["routes"].as_array().expect("routes array");
+    assert_eq!(routes.len(), 1, "{routes:?}");
+    assert_eq!(routes[0]["method"], "GET");
+    assert_eq!(routes[0]["path"], "/settings");
+    assert_eq!(routes[0]["status"], "fail");
+    assert_eq!(routes[0]["findings"], findings.len());
+    assert_eq!(report["summary"]["routes_failing"], 1);
+    assert_eq!(report["summary"]["unrouted"], 0);
+}
+
+/// The RED manifest rolls its findings up by WCAG success criterion, so a
+/// conformance claim can be read off it directly.
+#[test]
+fn red_fixture_report_rolls_up_wcag_criteria() {
+    let out = run_verify(&fixture_dir("red"), &["--format", "json"]);
+    let report = json_report(&out);
+
+    let criteria: Vec<&str> = report["wcag"]
+        .as_array()
+        .expect("wcag array")
+        .iter()
+        .filter_map(|c| c["criterion"].as_str())
+        .collect();
+    for expected in ["1.1.1", "1.3.1", "3.3.2", "4.1.2"] {
+        assert!(
+            criteria.contains(&expected),
+            "expected WCAG {expected} in the rollup; got {criteria:?}",
+        );
+    }
+}
+
+/// The GREEN fixture serves the same route, now reported as conformant.
+#[test]
+fn green_fixture_route_is_listed_as_passing() {
+    let out = run_verify(&fixture_dir("green"), &["--format", "json"]);
+    let report = json_report(&out);
+
+    let routes = report["routes"].as_array().expect("routes array");
+    assert_eq!(routes.len(), 1, "{routes:?}");
+    assert_eq!(routes[0]["path"], "/settings");
+    assert_eq!(routes[0]["status"], "pass");
+    assert_eq!(routes[0]["findings"], 0);
+    assert!(
+        report["wcag"].as_array().expect("wcag array").is_empty(),
+        "a clean run breaches no success criterion",
+    );
+}

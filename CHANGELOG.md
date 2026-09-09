@@ -548,6 +548,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **a11y:** `autumn a11y verify` now keys its findings to the **routes** that
+  serve them, and rolls them up by WCAG success criterion (part of #1706). The
+  scan reads the route attribute macros (`#[get("/settings")]`, `#[post(..)]`,
+  …) out of the token stream it already walks, indexes every function and the
+  free functions it calls, then walks out from each handler to the markup it
+  reaches — so a defect in a shared partial names every route that renders it,
+  not just a file and a line. The JSON manifest gains a `routes` array
+  (per-route `pass`/`fail` with a finding count), a `routes` list on each
+  finding, and a `wcag` rollup that splits the multi-criterion rules so `label`
+  reports separately under 1.3.1, 3.3.2 and 4.1.2; the summary gains `routes`,
+  `routes_failing` and `unrouted`. Attribution is a conservative lower bound in
+  the same spirit as the scanner: a call is followed only when the called name
+  is defined exactly once across the scan, method calls are not resolved, and
+  the path is the one declared on the handler (mount-time prefixes are applied
+  at runtime and are not resolved). Exit codes are unchanged — route data
+  reports, it does not gate.
+
+- **a11y:** new typed `a11y::RadioGroup` / `a11y::RadioOption` primitives (part
+  of #1706) — the last common form control without a compile-time label
+  obligation. A radio group needs two accessible names, and both are now
+  type-level: `RadioOption::new(value, label)` requires the choice label, and
+  `RadioGroup::new(name)` returns a `RadioGroup<NoLabel>` that does not
+  implement `Render` until `.label(..)`/`.aria_label(..)`/`.labelled_by(..)`
+  transitions it to `RadioGroup<Labeled>`, so an unnamed group is
+  unrepresentable as markup (proven by trybuild fixtures). A visible name
+  renders `<fieldset><legend>`; the ARIA variants render
+  `<div role="radiogroup">`. Each choice gets an id derived from its value —
+  disambiguated when two values reduce to the same text — pairing it with its
+  own `<label for=…>`.
+
 - **sqlite:** durable background jobs and a single-host scheduler on the SQLite
   tier (issue #1907). `jobs.backend = "sqlite"` puts the queue in an
   `autumn_jobs` table in the app's own database file, so `#[job]` work is

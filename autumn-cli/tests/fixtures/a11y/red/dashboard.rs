@@ -1,4 +1,4 @@
-//! RED a11y fixture — a small dashboard view written in raw `maud::html!`
+//! RED a11y fixture — a small dashboard route written in raw `maud::html!`
 //! markup with four **genuine, static** accessibility defects that
 //! `autumn a11y verify` reliably flags (issue #1932, part of #1706).
 //!
@@ -11,33 +11,48 @@
 //! Every defect below is a fully static, literal-attribute element that steps
 //! around every one of the verifier's conservative skips (no splices, no
 //! dynamic `id`/`for`, no dynamic `type`, no sibling `(expr)` fragments), so
-//! all four rules fire deterministically. All four live in ONE `html!` block.
+//! all four rules fire deterministically.
+//!
+//! The markup is split across a route handler and two helpers it calls, so the
+//! fixture also exercises route attribution: every finding — including the ones
+//! in `account_form` and `logo_banner` — is keyed to `GET /settings`.
 
 use maud::{html, Markup};
 
-pub fn view() -> Markup {
+#[get("/settings")]
+pub async fn view() -> Markup {
     html! {
         main {
             h1 { "Account settings" }
-
-            // `label` (WCAG 1.3.1 / 3.3.2 / 4.1.2) — a text input with no
-            // associated `<label for=…>`, `aria-label`, or `aria-labelledby`.
-            form {
-                input type="text" name="email" id="email";
-
-                // `button-name` (WCAG 4.1.2) — a button with an empty static
-                // body and no accessible name.
-                button type="submit" {}
-            }
-
-            // `image-alt` (WCAG 1.1.1) — an `<img>` with no `alt`/aria/title.
-            img src="/logo.png";
-
-            // `label` (again) — a `<select>` with no associated label.
-            select name="role" {
-                option value="admin" { "Admin" }
-                option value="viewer" { "Viewer" }
-            }
+            (account_form())
+            (logo_banner())
         }
+    }
+}
+
+fn account_form() -> Markup {
+    html! {
+        // `label` (WCAG 1.3.1 / 3.3.2 / 4.1.2) — a text input with no
+        // associated `<label for=…>`, `aria-label`, or `aria-labelledby`.
+        form {
+            input type="text" name="email" id="email";
+
+            // `button-name` (WCAG 4.1.2) — a button with an empty static
+            // body and no accessible name.
+            button type="submit" {}
+        }
+
+        // `label` (again) — a `<select>` with no associated label.
+        select name="role" {
+            option value="admin" { "Admin" }
+            option value="viewer" { "Viewer" }
+        }
+    }
+}
+
+fn logo_banner() -> Markup {
+    html! {
+        // `image-alt` (WCAG 1.1.1) — an `<img>` with no `alt`/aria/title.
+        img src="/logo.png";
     }
 }

@@ -440,6 +440,7 @@ Each primitive implements `maud::Render`, so it splices straight into an
 | `Link`       | 2.4.4 Link Purpose (In Context) / 4.1.2 Name, Role, Value  | link text is a required constructor argument     |
 | `MenuItem`   | 4.1.2 Name, Role, Value                                     | accessible name is a required constructor argument (renders `role="menuitem"`) |
 | `TextField`  | 1.3.1 Info and Relationships / 3.3.2 Labels / 4.1.2         | only a *labeled* field can be rendered (typestate) |
+| `RadioGroup` | 1.3.1 Info and Relationships / 3.3.2 Labels / 4.1.2         | only a *labeled* group can be rendered; each choice carries its own label |
 
 ```rust
 use autumn_web::a11y::{Button, Img, Link, MenuItem, TextField};
@@ -457,6 +458,25 @@ let page = html! {
     (MenuItem::new("Home").href("/"))                       // link-style menu item
 };
 ```
+
+`TextArea`, `Select` (with `SelectOption`), `Checkbox`, `FileField` and
+`RadioGroup` (with `RadioOption`) carry the same typestate obligation as
+`TextField`. A radio group needs **two** names — one per choice and one for the
+group — so both are required:
+
+```rust
+use autumn_web::a11y::{RadioGroup, RadioOption};
+
+let speed = RadioGroup::new("speed")
+    .option(RadioOption::new("standard", "Standard").checked())  // choice label required
+    .option(RadioOption::new("express", "Express"))
+    .label("Shipping speed");                                    // group name required
+```
+
+A visible group name renders `<fieldset><legend>`; `.aria_label(..)` /
+`.labelled_by(..)` render `<div role="radiogroup">` instead, so the group keeps
+its role without a competing visible name. Each choice gets a unique `id`
+derived from its value, pairing it with its own `<label for=…>`.
 
 `Link::new` takes the visible link text as a required argument (an icon-only
 link routes its name to `aria-label` via `Link::icon`), and `MenuItem::new`
@@ -483,6 +503,12 @@ let _ = MenuItem::new();
 // error: no method named `render` found for `TextField<NoLabel>`
 //        — an unlabeled field cannot be turned into markup
 let _ = TextField::new("email").render();
+
+// error: no method named `render` found for `RadioGroup<NoLabel>`
+//        — a radio group with no group name cannot be turned into markup
+let _ = RadioGroup::new("speed")
+    .option(RadioOption::new("standard", "Standard"))
+    .render();
 ```
 
 **Fix** — supply the accessible name / attach a label:
@@ -492,6 +518,10 @@ let _ = Img::new("/logo.png", "Company logo");            // ✅ compiles
 let _ = Link::new("/about", "About us");                  // ✅ compiles
 let _ = MenuItem::new("Settings");                        // ✅ compiles
 let _ = TextField::new("email").label("Email").render();  // ✅ compiles
+let _ = RadioGroup::new("speed")                          // ✅ compiles
+    .option(RadioOption::new("standard", "Standard"))
+    .label("Shipping speed")
+    .render();
 ```
 
 **Green** — the build passes only once every primitive carries its accessible
@@ -537,6 +567,29 @@ Each finding carries the fix hint — the typed primitive that discharges the
 obligation at compile time (`Img::new(src, alt)`, `TextField::new(..).label(..)`,
 `Button::new(name)`, `Link::new(href, text)`).
 
+### Which route is broken
+
+A file and a line say where a defect is; a route says which page it breaks.
+`verify` reads the route attribute macros (`#[get("/settings")]`, `#[post(..)]`,
+…) out of the same token stream, indexes every function and the free functions
+it calls, then walks out from each handler to the markup it reaches. A finding
+in a shared partial names every route that renders it:
+
+```
+    src/views/settings.rs:42: <img> [WCAG 1.1.1] Serious — raw <img> has no alt attribute
+        routes: GET /settings, POST /settings
+        hint: use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)
+```
+
+The walk is as conservative as the scanner. A call is followed only when the
+called name is defined **exactly once** across the scan — two functions sharing
+a name cannot be told apart from tokens, and guessing would blame a route that
+never renders the markup. Method calls (`page.sidebar()`) are not resolved at
+all, and the `path` is the path **as declared**: mount-time prefixes (a `scope`,
+a nested router) are applied at runtime and are not resolved here. Attribution
+is therefore a lower bound — a finding with no route is still a finding, counted
+as `unrouted` in the summary.
+
 ### Usage
 
 ```bash
@@ -562,6 +615,17 @@ summary, suitable for archiving as a conformance manifest:
 {
   "files_scanned": 12,
   "html_blocks": 34,
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/profile",
+      "handler": "profile",
+      "file": "src/views/profile.rs",
+      "line": 18,
+      "findings": 1,
+      "status": "fail"
+    }
+  ],
   "findings": [
     {
       "file": "src/views/profile.rs",
@@ -571,12 +635,26 @@ summary, suitable for archiving as a conformance manifest:
       "wcag": "1.1.1",
       "severity": "Serious",
       "message": "raw <img> has no alt attribute",
-      "hint": "use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)"
+      "hint": "use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)",
+      "routes": ["GET /profile"]
     }
   ],
-  "summary": { "critical": 0, "serious": 1, "moderate": 0, "total": 1 }
+  "wcag": [
+    { "criterion": "1.1.1", "rules": ["image-alt"], "findings": 1 }
+  ],
+  "summary": {
+    "critical": 0, "serious": 1, "moderate": 0, "total": 1,
+    "routes": 1, "routes_failing": 1, "unrouted": 0
+  }
 }
 ```
+
+Three views of the same run: `routes` is the per-route conformance status
+(`pass` when the route reaches no finding), `findings` is the defect list with
+the routes each one breaks, and `wcag` rolls the findings up by success
+criterion — the multi-criterion rules are split, so `label` reports separately
+under 1.3.1, 3.3.2 and 4.1.2. A clean run emits an empty `wcag` array and every
+route as `pass`.
 
 ### CI integration
 
