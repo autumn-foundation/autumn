@@ -885,12 +885,21 @@ pub async fn import(
                     // leaves the row at the top level and hands it to the
                     // ancestry pass, which declines too and reports the count.
                     let mut draft = draft;
-                    if let Some(parent_id) = draft.parent_id
-                        && content::validate_parent(conn, None, &draft.post_type, parent_id)
+                    if let Some(parent_id) = draft.parent_id {
+                        // Under the hierarchy lock, held through the insert, as
+                        // the editor's create and `set_post_parent` both do.
+                        // Without it this validation and a concurrent
+                        // re-parenting each see the old tree and both commit,
+                        // leaving the imported child past `MAX_PAGE_DEPTH` —
+                        // whose path `page_ancestry` then truncates, so the
+                        // page is unreachable at the URL it advertises.
+                        content::lock_page_hierarchy(conn).await?;
+                        if content::validate_parent(conn, None, &draft.post_type, parent_id)
                             .await
                             .is_err()
-                    {
-                        draft.parent_id = None;
+                        {
+                            draft.parent_id = None;
+                        }
                     }
                     let created = content::insert_post_with_unique_slug(conn, draft).await?;
                     content::record_import_source(conn, created.id, &source_slug).await?;

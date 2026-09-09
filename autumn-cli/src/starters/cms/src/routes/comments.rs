@@ -411,6 +411,9 @@ pub async fn post_comment(
         "pending"
     };
 
+    // The password as this handler saw it, so the locked re-read can refuse if
+    // the gate moved underneath — see `create_comment`.
+    let observed_password = post.password.clone();
     let created = content::create_comment(
         &mut conn,
         NewComment {
@@ -424,6 +427,7 @@ pub async fn post_comment(
             body: form.body.clone(),
             status: status.to_owned(),
         },
+        &observed_password,
     )
     .await?;
 

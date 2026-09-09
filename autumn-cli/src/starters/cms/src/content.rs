@@ -14,7 +14,7 @@ use scoped_futures::ScopedFutureExt;
 
 use crate::models::{Comment, NewRevision, Post, Revision, Term, User};
 use crate::schema::{
-    attachments, comments, menus, post_meta, post_terms, posts, revisions, terms, users,
+    attachments, comments, menu_items, menus, post_meta, post_terms, posts, revisions, terms, users,
 };
 
 /// The maximum reply nesting a comment thread accepts.
@@ -726,10 +726,20 @@ pub async fn moderate_comment(
 }
 
 /// Insert a comment, bumping the approved counter when it lands approved.
+/// `observed_password` is the post's password as the handler saw it when it
+/// checked the session's unlock. Carried in so the locked re-read can tell that
+/// the gate itself moved: an editor who password-protects a post — or changes
+/// its password — between the handler's check and this transaction would
+/// otherwise have a signed-in submission land *approved* on content the
+/// commenter never unlocked. Status, type and `comment_status` were re-checked
+/// here already; the password was the one part of "may this person see it" that
+/// was not.
 pub async fn create_comment(
     conn: &mut AsyncPgConnection,
     mut new: crate::models::NewComment,
+    observed_password: &str,
 ) -> AutumnResult<Comment> {
+    let observed_password = observed_password.to_owned();
     // The direct insert below is the reason this call exists: the row and the
     // post's approved-comment counter have to move in one transaction, which
     // the repository's generated `save` cannot do. But going around the
@@ -763,6 +773,7 @@ pub async fn create_comment(
             || !is_public_type(&post.post_type)
             || !type_supports_comments(&post.post_type)
             || post.comment_status != "open"
+            || post.password != observed_password
         {
             return Err(AutumnError::forbidden_msg(
                 "Comments are closed on this post",
@@ -1227,12 +1238,29 @@ pub async fn update_user(
     bio: String,
     website: String,
 ) -> AutumnResult<()> {
+    // The same rule the registration path applies, for the same reason: this is
+    // a direct Diesel update, so the model's `#[validate(email)]` never runs.
+    // Fixing only the create path left an administrator able to store `user@`
+    // on an existing account.
+    let email = email.trim().to_lowercase();
+    if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email) {
+        return Err(AutumnError::unprocessable_msg(
+            "That email address is not valid",
+        ));
+    }
+    if email.len() > crate::hooks::MAX_EMAIL_BYTES {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "Email must be at most {} characters",
+            crate::hooks::MAX_EMAIL_BYTES
+        )));
+    }
+
     with_administrator_guard(conn, target_id, role, move |conn| {
         async move {
             diesel::update(users::table.find(target_id))
                 .set((
                     users::role.eq(role.slug()),
-                    users::email.eq(email.trim().to_lowercase()),
+                    users::email.eq(&email),
                     users::display_name.eq(display_name),
                     users::bio.eq(bio),
                     users::website.eq(website),
@@ -2810,6 +2838,63 @@ pub async fn terms_by_ids(
         .into_iter()
         .map(|term| (term.id, term))
         .collect())
+}
+
+/// One page of menus, oldest first, bounded in SQL.
+pub async fn menus_page(
+    conn: &mut AsyncPgConnection,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<crate::models::Menu>> {
+    Ok(menus::table
+        .order((menus::name.asc(), menus::id.asc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(crate::models::Menu::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// How many menus the site holds, for the pager.
+pub async fn menu_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
+    Ok(menus::table.count().get_result(conn).await?)
+}
+
+/// The items of a whole page of menus, in one query, grouped by menu.
+///
+/// The Appearance screen issued one unbounded item query per menu, so the cost
+/// of the screen was the number of menus times the size of each — and menus can
+/// be created through the ordinary form with no deletion route, so that grows
+/// and stays grown.
+pub async fn menu_items_for(
+    conn: &mut AsyncPgConnection,
+    menu_ids: &[i64],
+    per_menu: i64,
+) -> AutumnResult<std::collections::HashMap<i64, Vec<crate::models::MenuItem>>> {
+    if menu_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<crate::models::MenuItem> = menu_items::table
+        .filter(menu_items::menu_id.eq_any(menu_ids))
+        .order((
+            menu_items::menu_id.asc(),
+            menu_items::position.asc(),
+            menu_items::id.asc(),
+        ))
+        .select(crate::models::MenuItem::as_select())
+        .load(conn)
+        .await?;
+    let mut grouped: std::collections::HashMap<i64, Vec<crate::models::MenuItem>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let bucket = grouped.entry(row.menu_id).or_default();
+        // Bounded per menu as well as in total: one enormous menu should not be
+        // able to make the screen unusable on its own.
+        if i64::try_from(bucket.len()).unwrap_or(i64::MAX) < per_menu {
+            bucket.push(row);
+        }
+    }
+    Ok(grouped)
 }
 
 /// The accounts named by `ids`, in one query.

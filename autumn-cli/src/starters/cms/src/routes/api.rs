@@ -265,67 +265,60 @@ pub async fn create_post(
         status.clone()
     };
 
-    // Through the shared allocator, not a direct save: `idx_posts_bare_path_slug`
-    // and `idx_posts_type_slug` make slug uniqueness the database's invariant,
-    // so an API client creating a second item with an existing title hit a
-    // constraint error where the admin editor and the importer get the usual
-    // `-2` suffix.
+    // The insert and any deferred transition are one transaction.
+    //
+    // They were not: the insert went through the pool-backed allocator and the
+    // transition followed behind an unwind. An unwind covers a failed
+    // statement, not a cancelled request or a process that stops existing —
+    // either of which left a draft the caller never received and never asked
+    // for, with each retry consuming another suffixed slug. The connection-
+    // scoped allocator makes one transaction possible; the admin editor and the
+    // importer are on it already, and this was the path left behind.
+    //
+    // Still through the shared allocator rather than a direct save:
+    // `idx_posts_bare_path_slug` and `idx_posts_type_slug` make slug uniqueness
+    // the database's invariant, so an API client creating a second item with an
+    // existing title would otherwise hit a constraint error where the editor
+    // and the importer get the usual `-2` suffix.
+    let draft = NewPost {
+        post_type: registered.slug.to_owned(),
+        title: body.title,
+        slug: body.slug,
+        excerpt: body.excerpt,
+        body: body.body,
+        status: initial_status,
+        author_id: user.id,
+        parent_id: None,
+        featured_media_id: None,
+        menu_order: 0,
+        comment_status,
+        password: String::new(),
+        sticky: false,
+        published_at: None,
+    };
+    let deferred_transition_fired = deferred_transition.is_some();
     let created = repos
-        .save_post_with_unique_slug(NewPost {
-            post_type: registered.slug.to_owned(),
-            title: body.title,
-            slug: body.slug,
-            excerpt: body.excerpt,
-            body: body.body,
-            status: initial_status,
-            author_id: user.id,
-            parent_id: None,
-            featured_media_id: None,
-            menu_order: 0,
-            comment_status,
-            password: String::new(),
-            sticky: false,
-            published_at: None,
+        .with_conn(async |conn| {
+            use autumn_web::reexports::diesel_async::AsyncConnection as _;
+            conn.transaction(async move |conn| {
+                let created = crate::content::insert_post_with_unique_slug(conn, draft).await?;
+                match deferred_transition {
+                    Some(target) => {
+                        crate::content::transition_status(
+                            conn,
+                            created.id,
+                            &target,
+                            Some(user.id),
+                            Some(&user),
+                        )
+                        .await
+                    }
+                    None => Ok::<_, AutumnError>(created),
+                }
+            })
+            .await
         })
         .await?;
-
-    let deferred_transition_fired = deferred_transition.is_some();
-    // Unwound on failure, like the admin editor and the importer. The insert is
-    // its own transaction — `save_post_with_unique_slug` retries on its own
-    // connection — so a deferred transition that fails afterwards would return
-    // an error over an already-committed draft the caller never asked for, and
-    // each retry would consume another suffixed slug. Third path with this
-    // shape; the API was the one left.
-    let created = match deferred_transition {
-        Some(target) => {
-            let transitioned = repos
-                .with_conn(async |conn| {
-                    crate::content::transition_status(
-                        conn,
-                        created.id,
-                        &target,
-                        Some(user.id),
-                        Some(&user),
-                    )
-                    .await
-                })
-                .await;
-            match transitioned {
-                Ok(post) => post,
-                Err(error) => {
-                    if let Err(cleanup) = repos.posts.delete_by_id(created.id).await {
-                        autumn_web::reexports::tracing::warn!(
-                            %cleanup,
-                            post_id = created.id,
-                            "failed to remove a post whose API creation could not be completed"
-                        );
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        None => created,
-    };
 
     // The same actions the admin, import and scheduler paths fire, and only
     // once the post is actually complete — a listener that reads it back must

@@ -5622,6 +5622,7 @@ async fn create_comment_rechecks_the_post_under_its_lock() {
             body: "Late comment".to_owned(),
             status: "approved".to_owned(),
         },
+        "",
     )
     .await;
     assert!(
@@ -9114,4 +9115,262 @@ async fn an_interrupted_creation_leaves_no_post() {
         .await
         .assert_ok()
         .assert_body_contains("Created");
+}
+
+/// An API creation that fails part-way leaves no post behind.
+///
+/// `private` is reached by transitioning a draft, and the insert used to commit
+/// on its own with the transition following behind an unwind — which covers a
+/// failed statement, not a cancelled request or a process that stops existing.
+/// The caller then received no post while a draft stayed behind, and each retry
+/// consumed another suffixed slug.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_interrupted_api_creation_leaves_no_post() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let db = TestDb::shared().await;
+    try_execute(
+        db,
+        "CREATE OR REPLACE FUNCTION refuse_private() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.status = 'private' THEN RAISE EXCEPTION 'boom'; END IF;
+             RETURN NEW;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .await
+    .expect("create the trigger function");
+    try_execute(db, "DROP TRIGGER IF EXISTS refuse_private ON posts")
+        .await
+        .expect("clear any previous trigger");
+    try_execute(
+        db,
+        "CREATE TRIGGER refuse_private BEFORE UPDATE ON posts
+         FOR EACH ROW EXECUTE FUNCTION refuse_private()",
+    )
+    .await
+    .expect("install the trigger");
+
+    let refused = client
+        .post("/api/v1/posts")
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "title": "Behind Closed Doors",
+            "body": "Body.",
+            "status": "private"
+        }))
+        .send()
+        .await;
+    assert_ne!(
+        refused.status,
+        201,
+        "the creation must not report success: {}",
+        refused.text()
+    );
+
+    let rows: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(
+        rows, 0,
+        "the insert has to roll back with the transition that completes it"
+    );
+
+    try_execute(db, "DROP TRIGGER refuse_private ON posts")
+        .await
+        .expect("remove the trigger");
+
+    // The same request succeeds once the failure is gone.
+    let created = client
+        .post("/api/v1/posts")
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "title": "Behind Closed Doors",
+            "body": "Body.",
+            "status": "private"
+        }))
+        .send()
+        .await;
+    assert_eq!(created.status, 201, "body: {}", created.text());
+    assert_eq!(
+        created.json::<serde_json::Value>()["slug"],
+        "behind-closed-doors"
+    );
+}
+
+/// A malformed email cannot be stored on an existing account either.
+///
+/// The registration path applies the model's declared validator; the admin edit
+/// is a direct Diesel update, so fixing only the create path left `user@`
+/// storable on an account that already existed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_malformed_email_cannot_be_saved_on_an_existing_account() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+    sign_out(&client);
+    register(&client, "editor").await;
+
+    let refused = client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "editor"),
+            ("email", "editor@"),
+            ("display_name", "Editor"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "the edit path applies the same rule the create path does: {}",
+        refused.text()
+    );
+
+    let stored: String = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::users::table
+            .find(2_i64)
+            .select(cms::schema::users::email)
+            .first(&mut conn)
+            .await
+            .expect("the account")
+    };
+    assert_eq!(stored, "editor@example.com", "the address is unchanged");
+
+    // A valid one still saves.
+    client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "editor"),
+            ("email", "editor@elsewhere.test"),
+            ("display_name", "Editor"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// A comment is refused when the post's password moved under the lock.
+///
+/// The locked re-read checked status, type and `comment_status` — everything
+/// about "may this person see it" except the password. An editor protecting a
+/// post between the handler's unlock check and this transaction would otherwise
+/// have a signed-in submission land approved on content the commenter never
+/// unlocked.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_comment_is_refused_when_the_password_moved_under_the_lock() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Open Then Shut", "Body.", "publish").await;
+
+    // Protect it behind the handler's back, the way a concurrent edit would.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET password = 'hunter2' WHERE id = {post_id}"),
+    )
+    .await
+    .expect("protect the post");
+
+    // The handler observed no password; the locked read sees one.
+    let refused = cms::content::create_comment(
+        &mut TestDb::shared().await.pool().get().await.expect("conn"),
+        cms::models::NewComment {
+            post_id,
+            parent_id: None,
+            author_id: None,
+            author_name: "Guest".to_owned(),
+            author_email: "guest@example.com".to_owned(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: "Slipped through".to_owned(),
+            status: "approved".to_owned(),
+        },
+        "",
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "the insert must re-check the password, not only the status"
+    );
+
+    // With the password the handler actually observed, it is accepted — the
+    // check is on the gate having *moved*, not on protection as such.
+    cms::content::create_comment(
+        &mut TestDb::shared().await.pool().get().await.expect("conn"),
+        cms::models::NewComment {
+            post_id,
+            parent_id: None,
+            author_id: None,
+            author_name: "Guest".to_owned(),
+            author_email: "guest@example.com".to_owned(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: "Unlocked properly".to_owned(),
+            status: "approved".to_owned(),
+        },
+        "hunter2",
+    )
+    .await
+    .expect("an unlocked commenter may still comment");
+}
+
+/// The Appearance screen bounds the menus it loads.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_appearance_menu_list_is_bounded() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO menus (name, slug, location)
+         SELECT 'Menu ' || lpad(g::text, 3, '0'),
+                'menu-' || lpad(g::text, 3, '0'),
+                ''
+         FROM generate_series(1, 45) AS g",
+    )
+    .await
+    .expect("seed the menus");
+
+    let first = client
+        .get("/admin/appearance")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    first.assert_ok();
+    let first = first.text();
+    assert!(first.contains("Menu 001"), "the first menus are shown");
+    assert!(
+        !first.contains("Menu 021"),
+        "the screen must not render every menu"
+    );
+    assert!(first.contains("Page 1 of 3"));
+
+    let last = client
+        .get("/admin/appearance?page=3")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    last.assert_ok();
+    let last = last.text();
+    assert!(last.contains("Menu 045"), "the tail is reachable");
+    assert!(!last.contains("Menu 001"), "page three is not page one");
 }

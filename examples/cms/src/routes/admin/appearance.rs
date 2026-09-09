@@ -6,8 +6,9 @@ use autumn_web::reexports::axum::response::Response;
 use serde::Deserialize;
 
 use crate::capabilities::Capability;
+use crate::content;
 use crate::models::{NewMenuItem, NewWidget, UpdateWidget};
-use crate::repositories::{MenuItemRepository as _, MenuRepository as _, WidgetRepository as _};
+use crate::repositories::{MenuItemRepository as _, WidgetRepository as _};
 use crate::require_capability;
 use crate::theme::WidgetKind;
 
@@ -59,17 +60,52 @@ pub struct WidgetForm {
 /// page selector beside it.
 const MENU_TERM_LIMIT: i64 = 200;
 
+/// How many menus one page of the Appearance screen shows.
+const MENUS_PER_PAGE: i64 = 20;
+
+/// How many items are rendered per menu.
+///
+/// A menu is navigation: past a couple of dozen entries it has stopped being
+/// one, and the screen should not become unusable because a script filled it.
+const MENU_ITEMS_SHOWN: i64 = 100;
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct AppearanceFilter {
+    #[serde(default)]
+    pub page: Option<usize>,
+}
+
 #[get("/admin/appearance")]
-pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
+pub async fn show(
+    repos: Repos,
+    session: Session,
+    csrf: Csrf,
+    Query(filter): Query<AppearanceFilter>,
+) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
 
-    let menus = repos.menus.find_all().await?;
-    let mut menu_blocks = Vec::with_capacity(menus.len());
-    for menu in &menus {
-        let mut items = repos.menu_items.find_by_menu_id(menu.id).await?;
-        items.sort_by_key(|i| (i.position, i.id));
-        menu_blocks.push((menu.clone(), items));
-    }
+    // Bounded and batched. Every menu was loaded and then queried for its items
+    // one at a time, so the screen's cost was the number of menus times the size
+    // of each — and menus are created through the form on this very page, with
+    // no deletion route, so that grows through ordinary use and stays grown.
+    let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
+    let (menu_blocks, menu_total) = {
+        let mut conn = repos.conn().await?;
+        let menus =
+            content::menus_page(&mut conn, (page - 1) * MENUS_PER_PAGE, MENUS_PER_PAGE).await?;
+        let total = content::menu_count(&mut conn).await?;
+        let ids: Vec<i64> = menus.iter().map(|menu| menu.id).collect();
+        let mut items = content::menu_items_for(&mut conn, &ids, MENU_ITEMS_SHOWN).await?;
+        let blocks: Vec<(crate::models::Menu, Vec<crate::models::MenuItem>)> = menus
+            .into_iter()
+            .map(|menu| {
+                let own = items.remove(&menu.id).unwrap_or_default();
+                (menu, own)
+            })
+            .collect();
+        (blocks, total)
+    };
+    let last_menu_page = ((menu_total + MENUS_PER_PAGE - 1) / MENUS_PER_PAGE).max(1);
 
     let mut widgets = repos.widgets.find_by_sidebar("primary".to_owned()).await?;
     widgets.sort_by_key(|w| (w.position, w.id));
@@ -101,6 +137,13 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                                     } @else {
                                         (menu.location)
                                     }
+                                }
+                            }
+                            @if i64::try_from(items.len()).unwrap_or(i64::MAX)
+                                >= MENU_ITEMS_SHOWN
+                            {
+                                p class="text-xs text-gray-400 mb-2" {
+                                    "Showing the first " (MENU_ITEMS_SHOWN) " items."
                                 }
                             }
                             ol class="space-y-1 text-sm mb-4" {
@@ -204,7 +247,31 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                     }
                     @if menu_blocks.is_empty() {
                         p class="text-gray-400 bg-white rounded-lg shadow p-8 text-center" {
-                            "No menus yet. Create one to populate the site navigation."
+                            @if page > 1 {
+                                "No menus on this page."
+                            } @else {
+                                "No menus yet. Create one to populate the site navigation."
+                            }
+                        }
+                    }
+                    @if last_menu_page > 1 {
+                        nav aria-label="Menu pages"
+                            class="flex items-center justify-between text-sm" {
+                            @if page > 1 {
+                                a href=(format!("/admin/appearance?page={}", page - 1))
+                                  class="text-indigo-700 hover:underline" { "← Previous" }
+                            } @else {
+                                span {}
+                            }
+                            span class="text-gray-500" {
+                                "Page " (page) " of " (last_menu_page)
+                            }
+                            @if page < last_menu_page {
+                                a href=(format!("/admin/appearance?page={}", page + 1))
+                                  class="text-indigo-700 hover:underline" { "Next →" }
+                            } @else {
+                                span {}
+                            }
                         }
                     }
                 }
