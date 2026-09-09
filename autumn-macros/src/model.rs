@@ -1436,6 +1436,35 @@ fn classify_filter_field(field: &syn::Field) -> Option<FilterField> {
     })
 }
 
+/// The body of a `fn(&Model) -> Option<String>` reading `field` as text, the
+/// way the database spells `CAST(<column> AS TEXT)` for an integer or string
+/// column: `Some(field.to_string())`, or the `Option` forwarded.
+///
+/// `None` for a field of any other type (or an unnamed one): a leg whose
+/// tenant the maintenance cannot read as text stays exactly as it was, and a
+/// `#[derivation]` rejects such a tenant field outright.
+fn tenant_text_body(field: &syn::Field) -> Option<TokenStream> {
+    let ident = field.ident.as_ref()?;
+    let classified = classify_filter_field(field)?;
+    if classified.kind == FilterScalar::Bool {
+        return None;
+    }
+    Some(if classified.optional {
+        quote! {
+            __autumn_cc_record
+                .#ident
+                .as_ref()
+                .map(::std::string::ToString::to_string)
+        }
+    } else {
+        quote! {
+            ::core::option::Option::Some(::std::string::ToString::to_string(
+                &__autumn_cc_record.#ident,
+            ))
+        }
+    })
+}
+
 /// Build the filter classification map for a model's fields.
 fn filter_field_map(all_fields: &[&syn::Field]) -> FilterFields {
     all_fields
@@ -2297,6 +2326,32 @@ fn emit_counter_caches_impl(
             || quote! { ::core::option::Option::None },
             |tenant| quote! { ::core::option::Option::Some(#tenant) },
         );
+        // The tenant as text, when the child carries the column as a field the
+        // maintenance can read: then a child moved between tenants takes its
+        // contribution off the old parent under the old tenant.
+        let tenant_of = decl
+            .tenant_column
+            .as_deref()
+            .and_then(|tenant| {
+                all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant))
+            })
+            .and_then(|field| tenant_text_body(field))
+            .map_or_else(
+                || quote! { ::core::option::Option::None },
+                |body| {
+                    let tenant_fn = format_ident!("__autumn_counter_cache_tenant_{index}");
+                    fk_fns.push(quote! {
+                        fn #tenant_fn(
+                            __autumn_cc_record: &#model_ident,
+                        ) -> ::core::option::Option<::std::string::String> {
+                            #body
+                        }
+                    });
+                    quote! { ::core::option::Option::Some(#tenant_fn) }
+                },
+            );
         let parent_table = infer_table_name(&assoc.target);
         let fk = &assoc.fk;
         let fk_ident = format_ident!("{fk}");
@@ -2350,6 +2405,7 @@ fn emit_counter_caches_impl(
                 pk_of: __autumn_counter_cache_pk,
                 live_of: __autumn_counter_cache_live,
                 tenant_column: #tenant_column,
+                tenant_of: #tenant_of,
                 contrib_of: __autumn_counter_cache_contrib_one,
                 contrib_sql: "1",
                 filter_sql: "",
@@ -2530,7 +2586,7 @@ fn emit_counter_caches_impl(
 
         // Unlike `counter_cache_tenant`, a derivation's tenant column is read
         // from the CHILD row (`child.tenant`), so the macro can check it.
-        if let Some(tenant) = decl.tenant_column.as_deref() {
+        let tenant_of = if let Some(tenant) = decl.tenant_column.as_deref() {
             let Some(tenant_field) = all_fields
                 .iter()
                 .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant))
@@ -2564,7 +2620,33 @@ fn emit_counter_caches_impl(
                     ),
                 ));
             }
-        }
+            // The maintenance reads the tenant off the record as text and
+            // compares it with the database's `CAST(... AS TEXT)` of the
+            // pre-update row, so the two spellings have to agree: integers
+            // and strings do, anything else does not.
+            let Some(body) = tenant_text_body(tenant_field) else {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` must be an integer \
+                         or `String` field (or an `Option` of one): the maintenance \
+                         reads it as text to tell a child moved between tenants from \
+                         one that stayed"
+                    ),
+                ));
+            };
+            let tenant_fn = format_ident!("__autumn_derivation_tenant_{index}");
+            fk_fns.push(quote! {
+                fn #tenant_fn(
+                    __autumn_cc_record: &#model_ident,
+                ) -> ::core::option::Option<::std::string::String> {
+                    #body
+                }
+            });
+            quote! { ::core::option::Option::Some(#tenant_fn) }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
 
         let lowered = decl
             .filter
@@ -2734,6 +2816,7 @@ fn emit_counter_caches_impl(
                 pk_of: __autumn_counter_cache_pk,
                 live_of: __autumn_counter_cache_live,
                 tenant_column: #tenant_column,
+                tenant_of: #tenant_of,
                 contrib_of: #contrib_fn,
                 contrib_sql: #contrib_sql,
                 filter_sql: #filter_sql,
@@ -11141,6 +11224,68 @@ mod tests {
         assert!(
             generated.contains("cannot maintain `posts.tenant_id`"),
             "the tenant discriminator is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_tenant_reads_the_child_tenant_as_text() {
+        // The pre-update capture reads the tenant with `CAST(... AS TEXT)`, and
+        // the record side must spell it the same way, so the accessor is
+        // emitted for integer and string fields (`Option` forwarded) and a
+        // field of any other type is rejected.
+        for ty in [quote! { i64 }, quote! { String }, quote! { Option<String> }] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #[derivation(Post, column = "reaction_count", fk = post_id, tenant = "org_id")]
+                    pub struct Reaction {
+                        #[id]
+                        pub id: i64,
+                        pub post_id: i64,
+                        pub org_id: #ty,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("tenant_of : :: core :: option :: Option :: Some"),
+                "a readable tenant field gets an accessor: {generated}"
+            );
+        }
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "reaction_count", fk = post_id, tenant = "flag")]
+                pub struct Reaction {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                    pub flag: bool,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("must be an integer or `String` field"),
+            "a tenant the maintenance cannot read as text is rejected: {generated}"
+        );
+        // A plain counter cache with a tenant it cannot read keeps its SQL:
+        // no accessor, no capture of the tenant.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache, counter_cache_tenant = "tenant_id")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("tenant_of : :: core :: option :: Option :: None"),
+            "a leg without the field reads no tenant: {generated}"
         );
     }
 

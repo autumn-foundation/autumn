@@ -59,7 +59,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use diesel::sql_types::{BigInt, Nullable};
+use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl as _;
 use scoped_futures::ScopedFutureExt as _;
 
@@ -73,10 +73,14 @@ use crate::{AutumnError, AutumnResult};
 const PH1: &str = "$1";
 #[cfg(not(feature = "sqlite"))]
 const PH2: &str = "$2";
+#[cfg(not(feature = "sqlite"))]
+const PH3: &str = "$3";
 #[cfg(feature = "sqlite")]
 const PH1: &str = "?";
 #[cfg(feature = "sqlite")]
 const PH2: &str = "?";
+#[cfg(feature = "sqlite")]
+const PH3: &str = "?";
 
 /// Row lock appended to the sub-selects that read a child row's foreign key.
 ///
@@ -177,6 +181,16 @@ pub struct CounterCacheSpec<M: 'static> {
     /// `None` (the default) emits no predicate anywhere, so a single-tenant
     /// app's SQL is byte-for-byte what it would be without this field.
     pub tenant_column: Option<&'static str>,
+    /// Reads the child's tenant discriminator off a record, as text, the way
+    /// the database spells `CAST(<tenant> AS TEXT)`.
+    ///
+    /// `Some` only for a leg with a [`Self::tenant_column`] whose child model
+    /// carries that field as an integer or string. Then the pre-update capture
+    /// reads the old tenant too, and a child moved to another tenant takes its
+    /// contribution off the old parent under the *old* tenant: the live
+    /// predicate would look for the parent under the new one and miss it.
+    /// `None` keeps the leg's SQL exactly as it was.
+    pub tenant_of: Option<fn(&M) -> Option<String>>,
     /// This row's weight in the maintained aggregate. `0` excludes the row.
     ///
     /// A plain counter cache returns `1` for every row; a `#[derivation]`
@@ -494,6 +508,20 @@ fn tenant_predicate_joined(view: &SqlView) -> String {
     )
 }
 
+/// `AND CAST(<parent>.<tenant> AS TEXT) IS NOT DISTINCT FROM $3`, for a delta
+/// scoped by a tenant the pre-update capture read (see
+/// [`TenantScope::Captured`]). Both sides are text so one bind serves every
+/// tenant column type; `IS NOT DISTINCT FROM` matches a NULL tenant to a NULL
+/// bind the way the joined predicate does.
+fn tenant_predicate_captured(view: &SqlView) -> String {
+    let Some(tenant_column) = view.tenant_column else {
+        return String::new();
+    };
+    let tenant_column = quote_ident(tenant_column);
+    let parent_table = quote_ident(view.parent_table);
+    format!(" AND CAST({parent_table}.{tenant_column} AS TEXT) {IS_NOT_DISTINCT_FROM} {PH3}")
+}
+
 fn tenant_predicate(view: &SqlView, child_id: i64) -> String {
     let Some(tenant_column) = view.tenant_column else {
         return String::new();
@@ -565,8 +593,9 @@ pub async fn counter_cache_apply_delta<M: 'static>(
         counter_column,
         ..
     } = quoted(&view);
-    let tenant = match scope {
-        TenantScope::SameTenantAsChild(child_id) => tenant_predicate(&view, child_id),
+    let tenant = match &scope {
+        TenantScope::SameTenantAsChild(child_id) => tenant_predicate(&view, *child_id),
+        TenantScope::Captured(_) => tenant_predicate_captured(&view),
         TenantScope::Unscoped => String::new(),
     };
     let accumulator = accumulator(&view, &counter_column);
@@ -574,12 +603,20 @@ pub async fn counter_cache_apply_delta<M: 'static>(
         "UPDATE {parent_table} SET {counter_column} = {accumulator} + {PH1} \
          WHERE {parent_table}.{parent_pk} = {PH2}{tenant}"
     );
-    diesel::sql_query(sql)
+    let query = diesel::sql_query(sql)
         .bind::<BigInt, _>(delta)
-        .bind::<BigInt, _>(parent_id)
-        .execute(conn)
-        .await
-        .map_err(AutumnError::from)?;
+        .bind::<BigInt, _>(parent_id);
+    // The captured tenant is a third bind, but only when the leg has a tenant
+    // column: without one the predicate is empty and so is the bind list.
+    if let (TenantScope::Captured(tenant), true) = (scope, view.tenant_column.is_some()) {
+        query
+            .bind::<Nullable<Text>, _>(tenant)
+            .execute(conn)
+            .await
+            .map_err(AutumnError::from)?;
+        return Ok(());
+    }
+    query.execute(conn).await.map_err(AutumnError::from)?;
     Ok(())
 }
 
@@ -709,11 +746,17 @@ fn weighted_delta_by_child_id_sql(
 }
 
 /// How a parent-keyed delta is confined to a tenant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TenantScope {
     /// Require the parent to sit in the same tenant as this child row. Emits no
     /// predicate for a child model without a tenant column.
     SameTenantAsChild(i64),
+    /// Require the parent to sit in this tenant, spelled as the text the
+    /// pre-update capture read (`None` for a NULL tenant). Used for the old
+    /// side of a child that changed tenant: its row now says the new tenant,
+    /// so the live predicate would miss the parent it is leaving. Emits no
+    /// predicate for a child model without a tenant column.
+    Captured(Option<String>),
     /// No tenant predicate. Used only by paths that have no child row to scope
     /// against (`recompute`, which sweeps the parent table wholesale).
     Unscoped,
@@ -761,7 +804,8 @@ pub async fn counter_cache_after_insert<M: Send + Sync + 'static>(
             continue;
         }
         if let Some(parent_id) = (spec.fk_of)(record) {
-            contributions.push((index, parent_id, contrib, (spec.pk_of)(record)));
+            let scope = TenantScope::SameTenantAsChild((spec.pk_of)(record));
+            contributions.push((index, parent_id, contrib, scope));
         }
     }
     apply_ordered(conn, specs, contributions).await
@@ -794,24 +838,37 @@ pub async fn counter_cache_after_insert_many<M: Send + Sync + 'static>(
                 continue;
             }
             if let Some(parent_id) = (spec.fk_of)(record) {
-                contributions.push((index, parent_id, contrib, (spec.pk_of)(record)));
+                let scope = TenantScope::SameTenantAsChild((spec.pk_of)(record));
+                contributions.push((index, parent_id, contrib, scope));
             }
         }
     }
     apply_ordered(conn, specs, contributions).await
 }
 
-/// One parent row a mutation will move: `(spec index, parent id, delta,
-/// witness child id)`.
-type Contribution = (usize, i64, i64, i64);
+/// One parent row a mutation will move: `(spec index, parent id, delta, how
+/// the parent is confined to a tenant)`.
+type Contribution = (usize, i64, i64, TenantScope);
 
-/// One leg's pre-mutation `(parent id, contribution)` for a child row.
+/// One leg's pre-mutation view of a child row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Captured {
+    /// The parent the row contributes to.
+    pub parent: i64,
+    /// Its weight in the aggregate. `0` for a row the filter rejects: it *has* a
+    /// parent, and it weighs nothing, which is what makes a filter flip on an
+    /// unchanged parent visible as a delta.
+    pub contrib: i64,
+    /// The row's tenant as text, for a leg that reads it (see
+    /// [`CounterCacheSpec::tenant_of`]); `None` otherwise, or for a NULL tenant.
+    pub tenant: Option<String>,
+}
+
+/// One leg's pre-mutation [`Captured`] for a child row.
 ///
 /// `None` when the row contributes to no parent at all: it does not exist, its
-/// foreign key is NULL, or it is soft-deleted. A row the derivation's filter
-/// rejects is `Some((parent, 0))`: it *has* a parent, and it weighs nothing,
-/// which is what makes a filter flip on an unchanged parent visible as a delta.
-pub type CapturedContribution = Option<(i64, i64)>;
+/// foreign key is NULL, or it is soft-deleted.
+pub type CapturedContribution = Option<Captured>;
 
 /// Every leg's [`CapturedContribution`] for a batch of children, keyed by child
 /// primary key and sorted by it, as the bulk update paths consume it.
@@ -845,15 +902,8 @@ async fn apply_ordered<M: 'static>(
     if contributions.is_empty() {
         return Ok(());
     }
-    for (spec_index, parent_id, delta, witness) in fold_and_order(specs, contributions) {
-        counter_cache_apply_delta(
-            conn,
-            &specs[spec_index],
-            parent_id,
-            delta,
-            TenantScope::SameTenantAsChild(witness),
-        )
-        .await?;
+    for (spec_index, parent_id, delta, scope) in fold_and_order(specs, contributions) {
+        counter_cache_apply_delta(conn, &specs[spec_index], parent_id, delta, scope).await?;
     }
     Ok(())
 }
@@ -868,19 +918,19 @@ fn fold_and_order<M: 'static>(
     // The running total is an `i128`, so weights that cancel do cancel even
     // when no `i64` could hold an intermediate sum (`[MAX, MAX, -MAX, -MAX]`
     // is zero, not two statements the database would refuse).
-    let mut totals: Vec<(usize, i64, i128, i64)> = Vec::with_capacity(contributions.len());
+    let mut totals: Vec<(usize, i64, i128, TenantScope)> = Vec::with_capacity(contributions.len());
     // `(spec, parent)` -> where that parent's running total lives in `totals`.
     let mut seen: HashMap<(usize, i64), usize> = HashMap::new();
-    for (spec_index, parent_id, delta, witness) in contributions {
+    for (spec_index, parent_id, delta, scope) in contributions {
         if specs[spec_index].tenant_column.is_some() {
-            totals.push((spec_index, parent_id, i128::from(delta), witness));
+            totals.push((spec_index, parent_id, i128::from(delta), scope));
             continue;
         }
         if let Some(&at) = seen.get(&(spec_index, parent_id)) {
             totals[at].2 += i128::from(delta);
         } else {
             seen.insert((spec_index, parent_id), totals.len());
-            totals.push((spec_index, parent_id, i128::from(delta), witness));
+            totals.push((spec_index, parent_id, i128::from(delta), scope));
         }
     }
     // A net total that no single `i64` delta can carry goes out as several
@@ -888,11 +938,11 @@ fn fold_and_order<M: 'static>(
     // is to where it ends: when both are representable, so is every step.
     // Zero totals are dropped rather than issued as `+ 0`.
     let mut folded: Vec<Contribution> = Vec::with_capacity(totals.len());
-    for (spec_index, parent_id, mut total, witness) in totals {
+    for (spec_index, parent_id, mut total, scope) in totals {
         while total != 0 {
             let chunk = total.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
             #[allow(clippy::cast_possible_truncation)]
-            folded.push((spec_index, parent_id, chunk as i64, witness));
+            folded.push((spec_index, parent_id, chunk as i64, scope.clone()));
             total -= chunk;
         }
     }
@@ -915,14 +965,14 @@ fn fold_and_order<M: 'static>(
 fn order_tenant_runs<M: 'static>(specs: &[CounterCacheSpec<M>], folded: &mut [Contribution]) {
     let mut start = 0;
     while start < folded.len() {
-        let (spec_index, parent_id, _, _) = folded[start];
+        let (spec_index, parent_id) = (folded[start].0, folded[start].1);
         let mut end = start + 1;
         while end < folded.len() && folded[end].0 == spec_index && folded[end].1 == parent_id {
             end += 1;
         }
         if specs[spec_index].tenant_column.is_some() && end - start > 1 {
             let run = &mut folded[start..end];
-            let total: i128 = run.iter().map(|&(_, _, delta, _)| i128::from(delta)).sum();
+            let total: i128 = run.iter().map(|(_, _, delta, _)| i128::from(*delta)).sum();
             let mut remaining: Vec<Contribution> = run.to_vec();
             let mut prefix: i128 = 0;
             for slot in run.iter_mut() {
@@ -1248,6 +1298,26 @@ pub async fn counter_cache_capture_fks<M: 'static>(
         // to move away from — reporting one would make a later re-parent
         // decrement a counter that had already dropped this row.
         let live = live_predicate(&view, true);
+        // A leg that reads the tenant captures it as well, as text: the old
+        // side of a tenant change is guarded by this value, not by the row's
+        // (by then new) tenant.
+        if let Some(tenant_column) = captured_tenant_column(spec, &view) {
+            let contrib = contrib_case_expr(&view, CHILD_ALIAS);
+            let sql = format!(
+                "SELECT {CHILD_ALIAS}.{fk_column} AS fk_value, \
+                 {contrib} AS contrib_value, \
+                 CAST({CHILD_ALIAS}.{tenant_column} AS TEXT) AS tenant_text \
+                 FROM {child_table} AS {CHILD_ALIAS} \
+                 WHERE {CHILD_ALIAS}.{child_pk} = {PH1}{live}{FOR_UPDATE}"
+            );
+            let row: Option<FkContribTenantRow> = diesel::sql_query(sql)
+                .bind::<BigInt, _>(child_id)
+                .get_result::<FkContribTenantRow>(conn)
+                .await
+                .optional_row()?;
+            out.push(row.and_then(FkContribTenantRow::captured));
+            continue;
+        }
         if view.is_plain() {
             let sql = format!(
                 "SELECT {CHILD_ALIAS}.{fk_column} AS fk_value \
@@ -1259,7 +1329,7 @@ pub async fn counter_cache_capture_fks<M: 'static>(
                 .get_result::<FkRow>(conn)
                 .await
                 .optional_row()?;
-            out.push(row.and_then(|r| r.fk_value).map(|fk| (fk, 1)));
+            out.push(row.and_then(|r| r.fk_value).map(|fk| captured(fk, 1)));
             continue;
         }
         let contrib = contrib_case_expr(&view, CHILD_ALIAS);
@@ -1274,9 +1344,31 @@ pub async fn counter_cache_capture_fks<M: 'static>(
             .get_result::<FkContribRow>(conn)
             .await
             .optional_row()?;
-        out.push(row.and_then(|r| r.fk_value.map(|fk| (fk, r.contrib_value))));
+        out.push(row.and_then(|r| r.fk_value.map(|fk| captured(fk, r.contrib_value))));
     }
     Ok(out)
+}
+
+/// A [`Captured`] with no tenant, for the legs that do not read one.
+const fn captured(parent: i64, contrib: i64) -> Captured {
+    Captured {
+        parent,
+        contrib,
+        tenant: None,
+    }
+}
+
+/// The quoted tenant column the capture reads, when this leg reads one: it
+/// has a tenant column *and* an accessor for the new side to compare against.
+/// Without the accessor the capture stays as it was, so a leg that cannot see
+/// its tenant costs nothing extra.
+fn captured_tenant_column<M: 'static>(
+    spec: &CounterCacheSpec<M>,
+    view: &SqlView,
+) -> Option<String> {
+    let tenant_column = view.tenant_column?;
+    spec.tenant_of?;
+    Some(quote_ident(tenant_column))
 }
 
 /// Move the counters for a child whose foreign keys may have just changed.
@@ -1297,7 +1389,7 @@ pub async fn counter_cache_after_update<M: Send + Sync + 'static>(
 ) -> AutumnResult<()> {
     let mut moves: Vec<Contribution> = Vec::with_capacity(specs.len() * 2);
     for (index, spec) in specs.iter().enumerate() {
-        let old = before.get(index).copied().flatten();
+        let old = before.get(index).cloned().flatten();
         let new = contribution_of(spec, record);
         // Collected rather than applied here, and not old-then-new: every delta
         // this mutation makes goes out in one global lock order (see
@@ -1318,15 +1410,26 @@ fn contribution_of<M: 'static>(spec: &CounterCacheSpec<M>, record: &M) -> Captur
     if !(spec.live_of)(record) {
         return None;
     }
-    (spec.fk_of)(record).map(|fk| (fk, (spec.contrib_of)(record)))
+    (spec.fk_of)(record).map(|parent| Captured {
+        parent,
+        contrib: (spec.contrib_of)(record),
+        tenant: spec.tenant_of.and_then(|tenant_of| tenant_of(record)),
+    })
 }
 
-/// Turn one leg's before/after `(parent, contribution)` into deltas.
+/// Turn one leg's before/after [`Captured`] into deltas.
 ///
-/// Unchanged ⇒ nothing. Same parent, different weight (a filter flip, or an
-/// edited summed field) ⇒ one delta for the difference. Different parent ⇒ the
-/// old weight off the old parent and the new weight onto the new one, each
-/// skipped when it is 0, so a row the filter rejects never touches a parent row.
+/// Unchanged ⇒ nothing. Same parent and tenant, different weight (a filter
+/// flip, or an edited summed field) ⇒ one delta for the difference. Different
+/// parent, or different tenant ⇒ the old weight off the old parent and the new
+/// weight onto the new one, each skipped when it is 0, so a row the filter
+/// rejects never touches a parent row.
+///
+/// The new side is always scoped by the child row as it now is. The old side
+/// is too, unless the tenant changed: then the row no longer says which tenant
+/// the old parent sits in, so the removal is scoped by the tenant the capture
+/// read, and a parent left behind in the old tenant is found rather than
+/// missed.
 fn push_diff(
     index: usize,
     old: CapturedContribution,
@@ -1337,31 +1440,39 @@ fn push_diff(
     if old == new {
         return;
     }
-    if let (Some((old_id, old_contrib)), Some((new_id, new_contrib))) = (old, new)
-        && old_id == new_id
+    let live = TenantScope::SameTenantAsChild(witness);
+    let new_tenant = new.as_ref().and_then(|new| new.tenant.clone());
+    if let (Some(old), Some(new)) = (&old, &new)
+        && old.parent == new.parent
+        && old.tenant == new.tenant
     {
         // Two representable weights need not have a representable difference
         // (`i64::MIN` edited to `i64::MAX`). Then the move goes out as the old
         // weight off and the new weight on, which reach the same total.
-        if let Some(delta) = new_contrib.checked_sub(old_contrib) {
+        if let Some(delta) = new.contrib.checked_sub(old.contrib) {
             if delta != 0 {
-                out.push((index, old_id, delta, witness));
+                out.push((index, old.parent, delta, live));
             }
             return;
         }
-        push_removal(index, old_id, old_contrib, witness, out);
-        out.push((index, new_id, new_contrib, witness));
+        push_removal(index, old.parent, old.contrib, live.clone(), out);
+        out.push((index, new.parent, new.contrib, live));
         return;
     }
-    if let Some((old_id, old_contrib)) = old
-        && old_contrib != 0
+    if let Some(old) = old
+        && old.contrib != 0
     {
-        push_removal(index, old_id, old_contrib, witness, out);
+        let scope = if old.tenant == new_tenant {
+            live.clone()
+        } else {
+            TenantScope::Captured(old.tenant)
+        };
+        push_removal(index, old.parent, old.contrib, scope, out);
     }
-    if let Some((new_id, new_contrib)) = new
-        && new_contrib != 0
+    if let Some(new) = new
+        && new.contrib != 0
     {
-        out.push((index, new_id, new_contrib, witness));
+        out.push((index, new.parent, new.contrib, live));
     }
 }
 
@@ -1373,15 +1484,15 @@ fn push_removal(
     index: usize,
     parent: i64,
     contrib: i64,
-    witness: i64,
+    scope: TenantScope,
     out: &mut Vec<Contribution>,
 ) {
     if let Some(negated) = contrib.checked_neg() {
-        out.push((index, parent, negated, witness));
+        out.push((index, parent, negated, scope));
     } else {
         let half = contrib / 2;
-        out.push((index, parent, -half, witness));
-        out.push((index, parent, -(contrib - half), witness));
+        out.push((index, parent, -half, scope.clone()));
+        out.push((index, parent, -(contrib - half), scope));
     }
 }
 
@@ -1415,6 +1526,29 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
             ..
         } = quoted(&view);
         let live = live_predicate(&view, true);
+        if let Some(tenant_column) = captured_tenant_column(spec, &view) {
+            let contrib = contrib_case_expr(&view, CHILD_ALIAS);
+            let sql = format!(
+                "SELECT {CHILD_ALIAS}.{child_pk} AS child_id, \
+                 {CHILD_ALIAS}.{fk_column} AS fk_value, \
+                 {contrib} AS contrib_value, \
+                 CAST({CHILD_ALIAS}.{tenant_column} AS TEXT) AS tenant_text \
+                 FROM {child_table} AS {CHILD_ALIAS} \
+                 WHERE {CHILD_ALIAS}.{child_pk} IN ({id_list}){live} \
+                 ORDER BY {CHILD_ALIAS}.{child_pk}{FOR_UPDATE}"
+            );
+            let rows: Vec<ChildFkContribTenantRow> = diesel::sql_query(sql)
+                .load::<ChildFkContribTenantRow>(conn)
+                .await
+                .map_err(AutumnError::from)?;
+            for row in rows {
+                let entry = by_child
+                    .entry(row.child_id)
+                    .or_insert_with(|| vec![None; specs.len()]);
+                entry[index] = row.captured();
+            }
+            continue;
+        }
         if view.is_plain() {
             let sql = format!(
                 "SELECT {CHILD_ALIAS}.{child_pk} AS child_id, \
@@ -1431,7 +1565,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
                 let entry = by_child
                     .entry(row.child_id)
                     .or_insert_with(|| vec![None; specs.len()]);
-                entry[index] = row.fk_value.map(|fk| (fk, 1));
+                entry[index] = row.fk_value.map(|fk| captured(fk, 1));
             }
             continue;
         }
@@ -1452,7 +1586,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
             let entry = by_child
                 .entry(row.child_id)
                 .or_insert_with(|| vec![None; specs.len()]);
-            entry[index] = row.fk_value.map(|fk| (fk, row.contrib_value));
+            entry[index] = row.fk_value.map(|fk| captured(fk, row.contrib_value));
         }
     }
     let mut out: CapturedContributions = by_child.into_iter().collect();
@@ -1497,7 +1631,7 @@ pub async fn counter_cache_after_update_many<M: Send + Sync + 'static>(
                 // it to `recompute`.
                 continue;
             };
-            let old = before[found].1.get(index).copied().flatten();
+            let old = before[found].1.get(index).cloned().flatten();
             let new = contribution_of(spec, record);
             push_diff(index, old, new, child_id, &mut contributions);
         }
@@ -1574,14 +1708,15 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
             let new = contribution_of(spec, record);
             match before.get(&child_id) {
                 None => {
-                    if let Some((parent_id, contrib)) = new
-                        && contrib != 0
+                    if let Some(new) = new
+                        && new.contrib != 0
                     {
-                        contributions.push((index, parent_id, contrib, child_id));
+                        let scope = TenantScope::SameTenantAsChild(child_id);
+                        contributions.push((index, new.parent, new.contrib, scope));
                     }
                 }
                 Some(old_fks) => {
-                    let old = old_fks.get(index).copied().flatten();
+                    let old = old_fks.get(index).cloned().flatten();
                     push_diff(index, old, new, child_id, &mut contributions);
                 }
             }
@@ -1936,6 +2071,50 @@ struct FkContribRow {
     contrib_value: i64,
 }
 
+/// [`FkContribRow`] plus the row's tenant as text, for a leg that reads it.
+#[derive(diesel::QueryableByName)]
+struct FkContribTenantRow {
+    #[diesel(sql_type = Nullable<BigInt>)]
+    fk_value: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    contrib_value: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    tenant_text: Option<String>,
+}
+
+impl FkContribTenantRow {
+    fn captured(self) -> CapturedContribution {
+        self.fk_value.map(|parent| Captured {
+            parent,
+            contrib: self.contrib_value,
+            tenant: self.tenant_text,
+        })
+    }
+}
+
+/// [`FkContribTenantRow`] keyed by child, for the bulk capture.
+#[derive(diesel::QueryableByName)]
+struct ChildFkContribTenantRow {
+    #[diesel(sql_type = BigInt)]
+    child_id: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    fk_value: Option<i64>,
+    #[diesel(sql_type = BigInt)]
+    contrib_value: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    tenant_text: Option<String>,
+}
+
+impl ChildFkContribTenantRow {
+    fn captured(self) -> CapturedContribution {
+        self.fk_value.map(|parent| Captured {
+            parent,
+            contrib: self.contrib_value,
+            tenant: self.tenant_text,
+        })
+    }
+}
+
 /// `Result::optional`, spelled locally so this module does not have to pull
 /// diesel's `OptionalExtension` into every call site's scope.
 trait OptionalRow<T> {
@@ -1971,6 +2150,7 @@ mod tests {
             pk_of: |_| 1,
             live_of: |_| true,
             tenant_column: None,
+            tenant_of: None,
             contrib_of: |_| 1,
             contrib_sql: "1",
             filter_sql: "",
@@ -2064,10 +2244,17 @@ mod tests {
         // opposite orders would otherwise take the two row locks in opposite
         // orders and deadlock, and the generated transactions do not retry.
         let specs = two_legs();
-        let ordered = fold_and_order(&specs, vec![(0, 5, 1, 100), (1, 9, 1, 100), (1, 2, 1, 100)]);
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (0, 5, 1, TenantScope::SameTenantAsChild(100)),
+                (1, 9, 1, TenantScope::SameTenantAsChild(100)),
+                (1, 2, 1, TenantScope::SameTenantAsChild(100)),
+            ],
+        );
         let keys: Vec<(&str, i64)> = ordered
             .iter()
-            .map(|&(i, parent_id, _, _)| (specs[i].parent_table, parent_id))
+            .map(|(i, parent_id, _, _)| (specs[*i].parent_table, *parent_id))
             .collect();
         assert_eq!(keys, vec![("posts", 2), ("posts", 9), ("users", 5)]);
 
@@ -2084,14 +2271,20 @@ mod tests {
         let ordered = fold_and_order(
             &specs,
             vec![
-                (1, 2, -1, 10),
-                (1, 2, 1, 11),
-                (1, 7, 1, 12),
-                (1, 7, 1, 13),
-                (0, 4, -1, 14),
+                (1, 2, -1, TenantScope::SameTenantAsChild(10)),
+                (1, 2, 1, TenantScope::SameTenantAsChild(11)),
+                (1, 7, 1, TenantScope::SameTenantAsChild(12)),
+                (1, 7, 1, TenantScope::SameTenantAsChild(13)),
+                (0, 4, -1, TenantScope::SameTenantAsChild(14)),
             ],
         );
-        assert_eq!(ordered, vec![(1, 7, 2, 12), (0, 4, -1, 14)]);
+        assert_eq!(
+            ordered,
+            vec![
+                (1, 7, 2, TenantScope::SameTenantAsChild(12)),
+                (0, 4, -1, TenantScope::SameTenantAsChild(14))
+            ]
+        );
     }
 
     #[test]
@@ -2100,20 +2293,38 @@ mod tests {
         // not an `i64`, so a wrapping fold would apply `-2`. The net total is
         // carried by two deltas of the same sign instead.
         let specs = two_legs();
-        let ordered = fold_and_order(&specs, vec![(1, 2, i64::MAX, 10), (1, 2, i64::MAX, 11)]);
-        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, i64::MAX, 10)]);
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(11)),
+            ],
+        );
+        assert_eq!(
+            ordered,
+            vec![
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10))
+            ]
+        );
         // …and a total one past `i64::MAX` is `MAX` then `1`, never a wrapped
         // negative: the sum of every delta issued is the sum requested.
         let ordered = fold_and_order(
             &specs,
             vec![
-                (1, 2, i64::MAX, 10),
-                (1, 2, -5, 11),
-                (1, 2, 5, 12),
-                (1, 2, 1, 13),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, -5, TenantScope::SameTenantAsChild(11)),
+                (1, 2, 5, TenantScope::SameTenantAsChild(12)),
+                (1, 2, 1, TenantScope::SameTenantAsChild(13)),
             ],
         );
-        assert_eq!(ordered, vec![(1, 2, i64::MAX, 10), (1, 2, 1, 10)]);
+        assert_eq!(
+            ordered,
+            vec![
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, 1, TenantScope::SameTenantAsChild(10))
+            ]
+        );
     }
 
     #[test]
@@ -2126,10 +2337,10 @@ mod tests {
         let ordered = fold_and_order(
             &specs,
             vec![
-                (1, 2, i64::MAX, 10),
-                (1, 2, i64::MAX, 11),
-                (1, 2, -i64::MAX, 12),
-                (1, 2, -i64::MAX, 13),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(11)),
+                (1, 2, -i64::MAX, TenantScope::SameTenantAsChild(12)),
+                (1, 2, -i64::MAX, TenantScope::SameTenantAsChild(13)),
             ],
         );
         assert!(ordered.is_empty(), "{ordered:?}");
@@ -2137,13 +2348,16 @@ mod tests {
         let ordered = fold_and_order(
             &specs,
             vec![
-                (1, 2, i64::MAX, 10),
-                (1, 2, i64::MAX, 11),
-                (1, 2, -i64::MAX, 12),
-                (1, 2, -7, 13),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(11)),
+                (1, 2, -i64::MAX, TenantScope::SameTenantAsChild(12)),
+                (1, 2, -7, TenantScope::SameTenantAsChild(13)),
             ],
         );
-        assert_eq!(ordered, vec![(1, 2, i64::MAX - 7, 10)]);
+        assert_eq!(
+            ordered,
+            vec![(1, 2, i64::MAX - 7, TenantScope::SameTenantAsChild(10))]
+        );
     }
 
     #[test]
@@ -2153,13 +2367,19 @@ mod tests {
         // off and the new one goes on as separate statements. Folding keeps
         // them apart for the same reason.
         let mut out = Vec::new();
-        push_diff(0, Some((7, i64::MIN)), Some((7, i64::MAX)), 1, &mut out);
+        push_diff(
+            0,
+            Some(captured(7, i64::MIN)),
+            Some(captured(7, i64::MAX)),
+            1,
+            &mut out,
+        );
         assert_eq!(
             out,
             vec![
-                (0, 7, i64::MAX / 2 + 1, 1),
-                (0, 7, i64::MAX / 2 + 1, 1),
-                (0, 7, i64::MAX, 1)
+                (0, 7, i64::MAX / 2 + 1, TenantScope::SameTenantAsChild(1)),
+                (0, 7, i64::MAX / 2 + 1, TenantScope::SameTenantAsChild(1)),
+                (0, 7, i64::MAX, TenantScope::SameTenantAsChild(1))
             ]
         );
         // Folded, the three pieces net to 2^64 - 1 and go out as same-sign
@@ -2167,13 +2387,17 @@ mod tests {
         let specs = two_legs();
         assert_eq!(
             fold_and_order(&specs, out.clone()),
-            vec![(0, 7, i64::MAX, 1), (0, 7, i64::MAX, 1), (0, 7, 1, 1)]
+            vec![
+                (0, 7, i64::MAX, TenantScope::SameTenantAsChild(1)),
+                (0, 7, i64::MAX, TenantScope::SameTenantAsChild(1)),
+                (0, 7, 1, TenantScope::SameTenantAsChild(1))
+            ]
         );
 
         // An ordinary edit is still one delta for the difference.
         let mut out = Vec::new();
-        push_diff(0, Some((7, 3)), Some((7, 10)), 1, &mut out);
-        assert_eq!(out, vec![(0, 7, 7, 1)]);
+        push_diff(0, Some(captured(7, 3)), Some(captured(7, 10)), 1, &mut out);
+        assert_eq!(out, vec![(0, 7, 7, TenantScope::SameTenantAsChild(1))]);
     }
 
     #[test]
@@ -2183,26 +2407,35 @@ mod tests {
         // whose sum is the whole, rather than wrapping to `i64::MIN` again and
         // moving the parent the wrong way by 2^63.
         let mut out = Vec::new();
-        push_diff(0, Some((7, i64::MIN)), None, 1, &mut out);
+        push_diff(0, Some(captured(7, i64::MIN)), None, 1, &mut out);
         assert_eq!(
             out,
-            vec![(0, 7, i64::MAX / 2 + 1, 1), (0, 7, i64::MAX / 2 + 1, 1)]
+            vec![
+                (0, 7, i64::MAX / 2 + 1, TenantScope::SameTenantAsChild(1)),
+                (0, 7, i64::MAX / 2 + 1, TenantScope::SameTenantAsChild(1))
+            ]
         );
         assert_eq!(
             out.iter()
-                .map(|&(_, _, delta, _)| i128::from(delta))
+                .map(|(_, _, delta, _)| i128::from(*delta))
                 .sum::<i128>(),
             -i128::from(i64::MIN)
         );
 
         let mut out = Vec::new();
-        push_diff(0, Some((7, i64::MIN)), Some((8, 4)), 1, &mut out);
+        push_diff(
+            0,
+            Some(captured(7, i64::MIN)),
+            Some(captured(8, 4)),
+            1,
+            &mut out,
+        );
         assert_eq!(
             out,
             vec![
-                (0, 7, i64::MAX / 2 + 1, 1),
-                (0, 7, i64::MAX / 2 + 1, 1),
-                (0, 8, 4, 1)
+                (0, 7, i64::MAX / 2 + 1, TenantScope::SameTenantAsChild(1)),
+                (0, 7, i64::MAX / 2 + 1, TenantScope::SameTenantAsChild(1)),
+                (0, 8, 4, TenantScope::SameTenantAsChild(1))
             ]
         );
     }
@@ -2217,27 +2450,123 @@ mod tests {
         let ordered = fold_and_order(
             &specs,
             vec![
-                (1, 2, i64::MAX, 10),
-                (1, 2, i64::MAX, 11),
-                (1, 2, -i64::MAX, 12),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(11)),
+                (1, 2, -i64::MAX, TenantScope::SameTenantAsChild(12)),
             ],
         );
-        let deltas: Vec<i64> = ordered.iter().map(|&(_, _, d, _)| d).collect();
+        let deltas: Vec<i64> = ordered.iter().map(|(_, _, d, _)| *d).collect();
         assert_eq!(deltas, vec![i64::MAX, -i64::MAX, i64::MAX]);
         // …and symmetrically for a negative total.
         let ordered = fold_and_order(
             &specs,
             vec![
-                (1, 2, -i64::MAX, 10),
-                (1, 2, -i64::MAX, 11),
-                (1, 2, i64::MAX, 12),
+                (1, 2, -i64::MAX, TenantScope::SameTenantAsChild(10)),
+                (1, 2, -i64::MAX, TenantScope::SameTenantAsChild(11)),
+                (1, 2, i64::MAX, TenantScope::SameTenantAsChild(12)),
             ],
         );
-        let deltas: Vec<i64> = ordered.iter().map(|&(_, _, d, _)| d).collect();
+        let deltas: Vec<i64> = ordered.iter().map(|(_, _, d, _)| *d).collect();
         assert_eq!(deltas, vec![-i64::MAX, i64::MAX, -i64::MAX]);
         // Every child keeps its own witness, and other parents are untouched.
-        let witnesses: Vec<i64> = ordered.iter().map(|&(_, _, _, w)| w).collect();
-        assert_eq!(witnesses, vec![10, 12, 11]);
+        let witnesses: Vec<TenantScope> = ordered.iter().map(|(_, _, _, w)| w.clone()).collect();
+        assert_eq!(
+            witnesses,
+            vec![
+                TenantScope::SameTenantAsChild(10),
+                TenantScope::SameTenantAsChild(12),
+                TenantScope::SameTenantAsChild(11)
+            ]
+        );
+    }
+
+    fn tenanted(parent: i64, contrib: i64, tenant: Option<&str>) -> CapturedContribution {
+        Some(Captured {
+            parent,
+            contrib,
+            tenant: tenant.map(str::to_owned),
+        })
+    }
+
+    #[test]
+    fn a_tenant_change_takes_the_old_weight_off_under_the_old_tenant() {
+        // The row now says the new tenant, so a live predicate would look for
+        // the old parent in the wrong tenant and miss it; the removal is
+        // scoped by the tenant the capture read. The addition is live.
+        let live = TenantScope::SameTenantAsChild(1);
+        let was_a = TenantScope::Captured(Some("a".to_owned()));
+        let mut out = Vec::new();
+        push_diff(
+            0,
+            tenanted(7, 3, Some("a")),
+            tenanted(7, 3, Some("b")),
+            1,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![(0, 7, -3, was_a.clone()), (0, 7, 3, live.clone())]
+        );
+
+        // Re-parented and moved at once: the same two statements.
+        let mut out = Vec::new();
+        push_diff(
+            0,
+            tenanted(7, 3, Some("a")),
+            tenanted(8, 3, Some("b")),
+            1,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![(0, 7, -3, was_a.clone()), (0, 8, 3, live.clone())]
+        );
+
+        // A NULL old tenant is a captured NULL, not "unknown".
+        let mut out = Vec::new();
+        push_diff(
+            0,
+            tenanted(7, 1, None),
+            tenanted(7, 1, Some("b")),
+            1,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![
+                (0, 7, -1, TenantScope::Captured(None)),
+                (0, 7, 1, live.clone())
+            ]
+        );
+
+        // Same tenant: the diff is what it always was, one live delta.
+        let mut out = Vec::new();
+        push_diff(
+            0,
+            tenanted(7, 3, Some("a")),
+            tenanted(7, 10, Some("a")),
+            1,
+            &mut out,
+        );
+        assert_eq!(out, vec![(0, 7, 7, live.clone())]);
+
+        // Unparented after a tenant change: the removal is still under the old
+        // tenant, and nothing is added.
+        let mut out = Vec::new();
+        push_diff(0, tenanted(7, 3, Some("a")), None, 1, &mut out);
+        assert_eq!(out, vec![(0, 7, -3, was_a)]);
+    }
+
+    #[test]
+    fn a_captured_tenant_scopes_the_parent_by_its_text() {
+        let mut tenanted = spec(false);
+        tenanted.tenant_column = Some("tenant_id");
+        assert_eq!(
+            tenant_predicate_captured(&view(&tenanted)),
+            format!(" AND CAST(\"posts\".\"tenant_id\" AS TEXT) {IS_NOT_DISTINCT_FROM} {PH3}")
+        );
+        // Without a tenant column there is no predicate and no bind.
+        assert_eq!(tenant_predicate_captured(&view(&spec(false))), "");
     }
 
     #[test]
@@ -2247,8 +2576,20 @@ mod tests {
         // tenant-scoped spec stays unfolded — still in the global order.
         let mut specs = two_legs();
         specs[1].tenant_column = Some("tenant_id");
-        let ordered = fold_and_order(&specs, vec![(1, 3, 1, 20), (1, 3, 1, 21)]);
-        assert_eq!(ordered, vec![(1, 3, 1, 20), (1, 3, 1, 21)]);
+        let ordered = fold_and_order(
+            &specs,
+            vec![
+                (1, 3, 1, TenantScope::SameTenantAsChild(20)),
+                (1, 3, 1, TenantScope::SameTenantAsChild(21)),
+            ],
+        );
+        assert_eq!(
+            ordered,
+            vec![
+                (1, 3, 1, TenantScope::SameTenantAsChild(20)),
+                (1, 3, 1, TenantScope::SameTenantAsChild(21))
+            ]
+        );
     }
 
     #[test]
@@ -2477,24 +2818,30 @@ mod tests {
     fn a_filter_flip_on_the_same_parent_is_one_delta() {
         let mut out = Vec::new();
         // Unpublished (0) -> published (1) with the parent unchanged.
-        push_diff(0, Some((4, 0)), Some((4, 1)), 11, &mut out);
-        assert_eq!(out, vec![(0, 4, 1, 11)]);
+        push_diff(0, Some(captured(4, 0)), Some(captured(4, 1)), 11, &mut out);
+        assert_eq!(out, vec![(0, 4, 1, TenantScope::SameTenantAsChild(11))]);
 
         // A rejected row that stays rejected moves nothing, even across a
         // reparent: neither side has a weight to move.
         out.clear();
-        push_diff(0, Some((4, 0)), Some((5, 0)), 11, &mut out);
+        push_diff(0, Some(captured(4, 0)), Some(captured(5, 0)), 11, &mut out);
         assert!(out.is_empty(), "{out:?}");
 
         // A reparent of a qualifying row moves both ends.
         out.clear();
-        push_diff(0, Some((4, 3)), Some((5, 3)), 11, &mut out);
-        assert_eq!(out, vec![(0, 4, -3, 11), (0, 5, 3, 11)]);
+        push_diff(0, Some(captured(4, 3)), Some(captured(5, 3)), 11, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                (0, 4, -3, TenantScope::SameTenantAsChild(11)),
+                (0, 5, 3, TenantScope::SameTenantAsChild(11))
+            ]
+        );
 
         // A weight edit on an unchanged parent is the difference only.
         out.clear();
-        push_diff(0, Some((4, 3)), Some((4, 10)), 11, &mut out);
-        assert_eq!(out, vec![(0, 4, 7, 11)]);
+        push_diff(0, Some(captured(4, 3)), Some(captured(4, 10)), 11, &mut out);
+        assert_eq!(out, vec![(0, 4, 7, TenantScope::SameTenantAsChild(11))]);
     }
 
     #[test]

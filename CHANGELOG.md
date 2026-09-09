@@ -411,6 +411,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tenant_id` discriminator (each under its `#[diesel(column_name)]` when it
   has one; `column = "tenant_id"` is also a compile error),
   string filters cast to `TEXT` so Postgres `citext` compares bytewise too,
+  a tenant-scoped leg captures the child's tenant before an update so a child
+  moved between tenants leaves its old parent under the old tenant (the
+  `tenant` field must be an integer or string),
   `column = "id"` and a self-referential derivation reading the column it
   maintains (its `fk` and `tenant` columns included) are compile errors, and
   so is a derivation reading a column another derivation or counter cache of

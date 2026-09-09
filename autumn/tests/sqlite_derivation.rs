@@ -53,6 +53,8 @@ mod schema {
             published_comment_count -> Int8,
             visible_score -> Int8,
             wanted_tag_count -> Int8,
+            org_id -> Int8,
+            org_comment_count -> Int8,
         }
     }
 
@@ -70,6 +72,7 @@ mod schema {
             post_id -> Int8,
             published -> Bool,
             score -> Int8,
+            org_id -> Int8,
         }
     }
 }
@@ -87,6 +90,11 @@ pub struct SdPost {
     pub visible_score: i64,
     #[default]
     pub wanted_tag_count: i64,
+    /// The tenant discriminator the `org_comment_count` leg is scoped by.
+    #[default]
+    pub org_id: i64,
+    #[default]
+    pub org_comment_count: i64,
 }
 
 #[autumn_web::repository(SdPost, table = "sd_posts")]
@@ -99,12 +107,16 @@ pub trait SdPostRepository {}
 #[autumn_web::model(table = "sd_comments")]
 #[derivation(SdPost, column = "published_comment_count", fk = post_id, filter = published)]
 #[derivation(SdPost, column = "visible_score", fk = post_id, transform = sum(score), filter = published && score > 0)]
+#[derivation(SdPost, column = "org_comment_count", fk = post_id, tenant = "org_id")]
 pub struct SdComment {
     #[id]
     pub id: i64,
     pub post_id: i64,
     pub published: bool,
     pub score: i64,
+    /// The tenant the `org_comment_count` leg is scoped by; `0` for the
+    /// tests that do not care.
+    pub org_id: i64,
 }
 
 #[autumn_web::repository(SdComment, table = "sd_comments")]
@@ -130,6 +142,7 @@ const SUM_DERIVATION: &str = "sd_posts.visible_score";
 // Named so it sorts after the other two: the backfill tests below rely on
 // the count derivation being the first one a sweep reaches.
 const TAG_DERIVATION: &str = "sd_posts.wanted_tag_count";
+const ORG_DERIVATION: &str = "sd_posts.org_comment_count";
 
 /// The framework's own `SQLite` state-table DDL, so this suite proves the
 /// shipped migration rather than a copy of it.
@@ -144,13 +157,16 @@ const DDL: &[&str] = &[
          title TEXT NOT NULL, \
          published_comment_count BIGINT NOT NULL DEFAULT 0, \
          visible_score BIGINT NOT NULL DEFAULT 0, \
-         wanted_tag_count BIGINT NOT NULL DEFAULT 0\
+         wanted_tag_count BIGINT NOT NULL DEFAULT 0, \
+         org_id BIGINT NOT NULL DEFAULT 0, \
+         org_comment_count BIGINT NOT NULL DEFAULT 0\
      )",
     "CREATE TABLE sd_comments (\
          id INTEGER PRIMARY KEY, \
          post_id BIGINT NOT NULL REFERENCES sd_posts(id), \
          published BOOLEAN NOT NULL DEFAULT 0, \
-         score BIGINT NOT NULL DEFAULT 0\
+         score BIGINT NOT NULL DEFAULT 0, \
+         org_id BIGINT NOT NULL DEFAULT 0\
      )",
     // `NOCASE`: the collation under which SQL alone would call `'WANTED'`
     // equal to `'wanted'`.
@@ -237,6 +253,44 @@ async fn seed_post(pool: &SqlitePool, title: &str) -> i64 {
         .id
 }
 
+/// A post in a tenant, for the tenant-scoped leg.
+async fn seed_org_post(pool: &SqlitePool, title: &str, org: i64) -> i64 {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query("INSERT INTO sd_posts (title, org_id) VALUES (?, ?) RETURNING id")
+        .bind::<Text, _>(title)
+        .bind::<BigInt, _>(org)
+        .get_result::<IdRow>(&mut *conn)
+        .await
+        .expect("seed post")
+        .id
+}
+
+/// A comment already counted by its post under `org`: the row and the
+/// maintained value as the framework would have left them after `save`.
+async fn seed_org_comment(pool: &SqlitePool, post: i64, org: i64) -> i64 {
+    let mut conn = pool.get().await.expect("conn");
+    let id = diesel::sql_query(
+        "INSERT INTO sd_comments (post_id, published, score, org_id) \
+         VALUES (?, 1, 1, ?) RETURNING id",
+    )
+    .bind::<BigInt, _>(post)
+    .bind::<BigInt, _>(org)
+    .get_result::<IdRow>(&mut *conn)
+    .await
+    .expect("seed comment")
+    .id;
+    diesel::sql_query(
+        "UPDATE sd_posts SET org_comment_count = org_comment_count + 1, \
+         published_comment_count = published_comment_count + 1, \
+         visible_score = visible_score + 1 WHERE id = ?",
+    )
+    .bind::<BigInt, _>(post)
+    .execute(&mut *conn)
+    .await
+    .expect("count the seeded comment");
+    id
+}
+
 async fn state_of(pool: &SqlitePool, name: &str) -> StateRow {
     let mut conn = pool.get().await.expect("conn");
     diesel::sql_query(
@@ -266,6 +320,7 @@ async fn a_filtered_count_and_sum_are_maintained_on_insert() {
 
     for (published, score) in [(true, 5), (true, 7), (false, 100), (true, -3)] {
         repo.save(&NewSdComment {
+            org_id: 0,
             post_id: post,
             published,
             score,
@@ -306,6 +361,7 @@ async fn deleting_a_rejected_row_moves_nothing_and_a_qualifying_one_moves_both()
 
     let kept = repo
         .save(&NewSdComment {
+            org_id: 0,
             post_id: post,
             published: true,
             score: 5,
@@ -314,6 +370,7 @@ async fn deleting_a_rejected_row_moves_nothing_and_a_qualifying_one_moves_both()
         .expect("save published");
     let draft = repo
         .save(&NewSdComment {
+            org_id: 0,
             post_id: post,
             published: false,
             score: 90,
@@ -322,6 +379,7 @@ async fn deleting_a_rejected_row_moves_nothing_and_a_qualifying_one_moves_both()
         .expect("save draft");
     let second_draft = repo
         .save(&NewSdComment {
+            org_id: 0,
             post_id: post,
             published: false,
             score: 91,
@@ -355,6 +413,7 @@ async fn reparenting_moves_the_old_and_the_new_parent() {
 
     let comment = repo
         .save(&NewSdComment {
+            org_id: 0,
             post_id: old,
             published: true,
             score: 6,
@@ -386,6 +445,7 @@ async fn a_filter_flip_on_the_same_parent_moves_the_derived_value() {
 
     let comment = repo
         .save(&NewSdComment {
+            org_id: 0,
             post_id: post,
             published: false,
             score: 4,
@@ -434,7 +494,12 @@ async fn reconciliation_enqueues_only_the_derivation_whose_definition_changed() 
     first.sort_unstable();
     assert_eq!(
         first,
-        vec![COUNT_DERIVATION, SUM_DERIVATION, TAG_DERIVATION]
+        vec![
+            ORG_DERIVATION,
+            COUNT_DERIVATION,
+            SUM_DERIVATION,
+            TAG_DERIVATION
+        ]
     );
     assert_eq!(
         state_of(&pool, COUNT_DERIVATION).await.backfill_state,
@@ -476,6 +541,8 @@ async fn reconciliation_enqueues_only_the_derivation_whose_definition_changed() 
 }
 
 #[tokio::test]
+// One linear sweep, asserted at each step; splitting it would hide the sequence.
+#[allow(clippy::too_many_lines)]
 async fn a_killed_backfill_resumes_from_its_checkpoint() {
     let pool = boot_pool("sd_backfill").await;
     let mut conn = pool.get().await.expect("conn");
@@ -519,6 +586,7 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
     assert_eq!(
         first.in_progress,
         vec![
+            ORG_DERIVATION.to_owned(),
             COUNT_DERIVATION.to_owned(),
             SUM_DERIVATION.to_owned(),
             TAG_DERIVATION.to_owned()
@@ -526,7 +594,9 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
         "{first:?}"
     );
 
-    let stopped = state_of(&pool, COUNT_DERIVATION).await;
+    // Name order puts the tenant-scoped count first, so that is the
+    // derivation the one batch ran for.
+    let stopped = state_of(&pool, ORG_DERIVATION).await;
     assert_eq!(stopped.backfill_state, "running");
     assert_eq!(stopped.checkpoint, Some(posts[1]));
     assert_eq!(stopped.backfilled_rows, 2);
@@ -536,7 +606,7 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
     let mid = derivation_status(&mut conn).await.expect("status");
     let reported = mid
         .iter()
-        .find(|entry| entry.name == COUNT_DERIVATION)
+        .find(|entry| entry.name == ORG_DERIVATION)
         .expect("the stopped derivation is reported");
     assert_eq!(reported.backfill_state, Some(BackfillState::Running));
     assert_eq!(reported.checkpoint, Some(posts[1]));
@@ -547,13 +617,15 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
         .await
         .expect("resumed pass");
     assert_eq!(
-        second.rows_repaired, 8,
-        "three parents left for the count plus five for the sum, each repaired \
-         once: {second:?}"
+        second.rows_repaired, 13,
+        "three parents left for the tenant-scoped count plus five each for the \
+         count and the sum (the tag count is already right everywhere), each \
+         repaired once: {second:?}"
     );
     assert_eq!(
         second.completed,
         vec![
+            ORG_DERIVATION.to_owned(),
             COUNT_DERIVATION.to_owned(),
             SUM_DERIVATION.to_owned(),
             TAG_DERIVATION.to_owned()
@@ -561,7 +633,12 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
         "{second:?}"
     );
     assert!(second.in_progress.is_empty(), "{second:?}");
-    for name in [COUNT_DERIVATION, SUM_DERIVATION, TAG_DERIVATION] {
+    for name in [
+        ORG_DERIVATION,
+        COUNT_DERIVATION,
+        SUM_DERIVATION,
+        TAG_DERIVATION,
+    ] {
         let done = state_of(&pool, name).await;
         assert_eq!(done.backfill_state, "complete", "{name}");
         assert_eq!(
@@ -571,6 +648,7 @@ async fn a_killed_backfill_resumes_from_its_checkpoint() {
         );
     }
     for post in &posts {
+        assert_eq!(derived(&pool, "org_comment_count", *post).await, 1);
         assert_eq!(derived(&pool, "published_comment_count", *post).await, 1);
         assert_eq!(derived(&pool, "visible_score", *post).await, 2);
     }
@@ -613,6 +691,7 @@ async fn a_state_row_with_no_derivation_is_reported_as_unregistered() {
         names,
         vec![
             "sd_posts.gone",
+            "sd_posts.org_comment_count",
             COUNT_DERIVATION,
             SUM_DERIVATION,
             TAG_DERIVATION
@@ -664,7 +743,7 @@ async fn status_reports_state_and_recompute_clears_the_drift() {
         .expect("inflate");
 
     let drifted = derivation_status(&mut conn).await.expect("status");
-    assert_eq!(drifted.len(), 3, "every derivation is reported");
+    assert_eq!(drifted.len(), 4, "every derivation is reported");
     let count = drifted
         .iter()
         .find(|entry| entry.name == COUNT_DERIVATION)
@@ -683,7 +762,9 @@ async fn status_reports_state_and_recompute_clears_the_drift() {
         "sha256 renders as 64 hex characters"
     );
 
-    for name in [COUNT_DERIVATION, SUM_DERIVATION] {
+    // The legacy comment drifts every leg that counts it: the count, the
+    // sum, and the tenant-scoped count (both rows sit in tenant 0).
+    for name in [COUNT_DERIVATION, SUM_DERIVATION, ORG_DERIVATION] {
         assert_eq!(
             recompute(&mut conn, name).await.expect("recompute"),
             1,
@@ -757,6 +838,93 @@ async fn a_string_filter_compares_bytes_whatever_the_column_collation() {
 }
 
 #[tokio::test]
+async fn a_comment_moved_to_another_tenant_leaves_its_old_parent() {
+    // The tenant predicate looks the parent up under the child's tenant. After
+    // the update the child says the new tenant, so a decrement scoped by the
+    // live row would look for the old parent in the wrong tenant and miss it;
+    // the capture read the old tenant, and the removal is scoped by that.
+    let pool = boot_pool("sd_tenant_move").await;
+    let repo = PgSdCommentRepository::with_pool_untracked(pool.clone());
+    let acme = seed_org_post(&pool, "acme", 1).await;
+    let comment = seed_org_comment(&pool, acme, 1).await;
+    assert_eq!(derived(&pool, "org_comment_count", acme).await, 1);
+
+    // Only the tenant changes: the parent is unchanged, but it no longer sits
+    // in the child's tenant, so the child stops counting toward it.
+    repo.update(
+        comment,
+        &UpdateSdComment {
+            org_id: Patch::Set(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("move the comment to another tenant");
+    assert_eq!(
+        derived(&pool, "org_comment_count", acme).await,
+        0,
+        "the old parent is found under the old tenant and decremented"
+    );
+    // The other legs, not tenant-scoped, still count the row.
+    assert_eq!(derived(&pool, "published_comment_count", acme).await, 1);
+
+    // Moved back: the parent is in the child's tenant again.
+    repo.update(
+        comment,
+        &UpdateSdComment {
+            org_id: Patch::Set(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("move the comment back");
+    assert_eq!(derived(&pool, "org_comment_count", acme).await, 1);
+
+    // Re-parented and moved at once: the old parent loses the row under the
+    // old tenant, the new parent gains it under the new one.
+    let globex = seed_org_post(&pool, "globex", 2).await;
+    repo.update(
+        comment,
+        &UpdateSdComment {
+            post_id: Patch::Set(globex),
+            org_id: Patch::Set(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("re-parent across tenants");
+    assert_eq!(derived(&pool, "org_comment_count", acme).await, 0);
+    assert_eq!(derived(&pool, "org_comment_count", globex).await, 1);
+}
+
+#[tokio::test]
+async fn update_many_moves_comments_between_tenants() {
+    // The bulk capture reads the tenant too, so `update_many` is the same
+    // story as `update`.
+    let pool = boot_pool("sd_tenant_move_many").await;
+    let repo = PgSdCommentRepository::with_pool_untracked(pool.clone());
+    let acme = seed_org_post(&pool, "acme", 1).await;
+    let first = seed_org_comment(&pool, acme, 1).await;
+    let second = seed_org_comment(&pool, acme, 1).await;
+    assert_eq!(derived(&pool, "org_comment_count", acme).await, 2);
+
+    repo.update_many(
+        &[first, second],
+        &UpdateSdComment {
+            org_id: Patch::Set(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("move both comments to another tenant");
+    assert_eq!(
+        derived(&pool, "org_comment_count", acme).await,
+        0,
+        "both rows leave the parent under the old tenant"
+    );
+}
+
+#[tokio::test]
 async fn two_derivations_that_swapped_names_both_keep_their_state() {
     // With names swapped, each derivation's own name is occupied by the
     // other's row, so a name-first match would enqueue both. Matching by
@@ -806,7 +974,7 @@ async fn two_derivations_that_swapped_names_both_keep_their_state() {
     let status = derivation_status(&mut conn).await.expect("status");
     assert_eq!(
         status.len(),
-        3,
+        4,
         "no parked or leftover row survives the reconciliation: {status:?}"
     );
 
@@ -839,7 +1007,7 @@ async fn two_derivations_that_swapped_names_both_keep_their_state() {
     assert_eq!(adopted.backfilled_rows, 3);
     assert_eq!(
         derivation_status(&mut conn).await.expect("status").len(),
-        3,
+        4,
         "the stale occupant is gone, not left as an unregistered leftover"
     );
 }

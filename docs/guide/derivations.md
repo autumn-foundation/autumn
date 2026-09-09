@@ -44,7 +44,7 @@ argument is the parent model type. Every other key follows in any order.
 | `filter` | none | the predicate deciding which child rows contribute |
 | `fk` | the one `#[belongs_to]` leg to that parent, else `{snake(Parent)}_id` | the child column naming the parent. Required when two legs point at one parent |
 | `parent_table` | inferred from the parent type (`Post` gives `posts`) | the parent's table, for a parent that overrides its own |
-| `tenant` | none | tenant-discriminator column, as `counter_cache_tenant`. Must name a field of the child, not renamed with `#[diesel(column_name)]` |
+| `tenant` | none | tenant-discriminator column, as `counter_cache_tenant`. Must name an integer or `String` field of the child (or an `Option` of one), not renamed with `#[diesel(column_name)]`. A child moved to another tenant takes its contribution off the old parent under the old tenant and onto the new parent under the new one |
 | `name` | `{parent_table}.{column}` | the registry name, used by the state table and the actuator. Non-empty, at most 128 bytes, no control characters, and not under the framework's reserved `parked::` prefix |
 
 Each key may appear once. A repeated key is a compile error rather than a
