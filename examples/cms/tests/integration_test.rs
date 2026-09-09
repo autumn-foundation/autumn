@@ -9881,3 +9881,80 @@ async fn a_widget_cannot_carry_an_unbounded_title_or_body() {
         .await
         .assert_status(303);
 }
+
+/// The seeder skips content whose bare path is already taken by another type.
+///
+/// `post` and top-level `page` share the bare URL namespace, and
+/// `idx_posts_bare_path_slug` enforces it — so a same-type existence check
+/// reported "not present" for a *page* named `about`, and the seeder's direct
+/// insert then failed on the constraint, taking the rest of the seed with it
+/// after the settings and terms had already committed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn seeding_skips_a_slug_the_other_bare_type_already_holds() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Deliberately the *opposite* types to the ones the seed wants: it seeds a
+    // post at `/hello-world` and a page at `/about`, so a page at
+    // `/hello-world` and a post at `/about` are invisible to a same-type check
+    // and fatal to the insert that follows it. (My first version of this test
+    // used the matching types, which the old check already caught — it passed
+    // with the fix reverted and proved nothing.)
+    for (post_type, title, slug) in [("page", "Hello", "hello-world"), ("post", "About", "about")] {
+        let created = client
+            .post(&format!("/admin/content/{post_type}"))
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", title),
+                ("slug", slug),
+                ("excerpt", ""),
+                ("body", "Mine, not the seed's."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "body: {}", created.text());
+    }
+
+    let author: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::users::table
+            .select(cms::schema::users::id)
+            .first(&mut conn)
+            .await
+            .expect("the owner")
+    };
+
+    // The seed must complete rather than abort on the constraint.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::seed::seed_posts(&mut conn, author, chrono::Utc::now().naive_utc())
+            .await
+            .expect("the seed skips what is already there rather than failing");
+    }
+
+    // The existing content is untouched, and nothing was duplicated.
+    sign_out(&client);
+    client
+        .get("/hello-world")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Mine, not the seed's.");
+    let taken: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("hello-world"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(taken, 1, "the seed must not duplicate a taken bare path");
+}

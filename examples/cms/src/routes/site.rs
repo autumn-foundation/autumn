@@ -436,14 +436,7 @@ impl Repos {
                 Err(error)
                     if autumn_web::error::unique_violation_field(
                         &error,
-                        &[
-                            (
-                                "idx_posts_bare_path_slug",
-                                "slug",
-                                "That URL is already taken",
-                            ),
-                            ("idx_posts_type_slug", "slug", "That URL is already taken"),
-                        ],
+                        crate::content::SLUG_COLLISION_INDEXES,
                     )
                     .is_some() =>
                 {

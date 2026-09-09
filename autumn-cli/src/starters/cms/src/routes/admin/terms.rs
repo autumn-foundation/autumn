@@ -264,6 +264,14 @@ pub async fn create(
         }
     }
 
+    // A term archive mints `{rewrite_base}/{slug}`, which a configured probe
+    // path can claim exactly as a nested page path can. The slug is normalized
+    // by `TermHooks`, so this checks the same value the row will carry.
+    content::guard_term_path(&taxonomy, &autumn_web::slugify(form.name.trim()))?;
+    if !form.slug.trim().is_empty() {
+        content::guard_term_path(&taxonomy, &autumn_web::slugify(form.slug.trim()))?;
+    }
+
     // Slugging, taxonomy validation and the flat-taxonomy parent rule all live
     // in `TermHooks`, so the importer and the REST API get them too.
     repos

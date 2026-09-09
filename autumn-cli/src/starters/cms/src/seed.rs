@@ -88,56 +88,7 @@ pub async fn seed_demo_content(mut db: Db) -> AutumnResult<()> {
 
     // Content.
     let now = chrono::Utc::now().naive_utc();
-    let content = [
-        (
-            "post",
-            "Hello, world",
-            "hello-world",
-            "The first post on a brand new site.",
-            "# Hello\n\nThis site runs on **Autumn CMS**. Edit or delete this post, then start \
-             writing.\n\nEverything you would reach for in WordPress is here: categories and \
-             tags, pages, a media library, threaded comments with a moderation queue, \
-             revisions, menus, widgets, and a REST API.",
-        ),
-        (
-            "page",
-            "About",
-            "about",
-            "",
-            "This is a page. Pages are hierarchical and undated — they sit outside the blog and \
-             are addressed by their path.",
-        ),
-    ];
-    for (post_type, title, slug, excerpt, body) in content {
-        let exists: i64 = posts::table
-            .filter(posts::post_type.eq(post_type))
-            .filter(posts::slug.eq(slug))
-            .count()
-            .get_result(conn)
-            .await?;
-        if exists > 0 {
-            continue;
-        }
-        diesel::insert_into(posts::table)
-            .values(&NewPost {
-                post_type: post_type.to_owned(),
-                title: title.to_owned(),
-                slug: slug.to_owned(),
-                excerpt: excerpt.to_owned(),
-                body: body.to_owned(),
-                status: "publish".to_owned(),
-                author_id,
-                parent_id: None,
-                featured_media_id: None,
-                menu_order: 0,
-                comment_status: "open".to_owned(),
-                password: String::new(),
-                sticky: false,
-                published_at: Some(now),
-            })
-            .execute(conn)
-            .await?;
-    }
+    seed_posts(conn, author_id, now).await?;
 
     // A primary menu pointing at the About page.
     let menu_exists: i64 = menus::table
@@ -219,5 +170,87 @@ pub async fn seed_demo_content(mut db: Db) -> AutumnResult<()> {
     }
 
     autumn_web::reexports::tracing::info!("demo content seeded");
+    Ok(())
+}
+
+/// Seed the demo posts and pages.
+///
+/// Extracted so a test can drive it directly: the task takes a `Db`
+/// extractor, which a test has no way to build, and the skip rule below is
+/// exactly the part that needed covering.
+pub async fn seed_posts(
+    conn: &mut autumn_web::reexports::diesel_async::AsyncPgConnection,
+    author_id: i64,
+    now: chrono::NaiveDateTime,
+) -> AutumnResult<()> {
+    let content = [
+        (
+            "post",
+            "Hello, world",
+            "hello-world",
+            "The first post on a brand new site.",
+            "# Hello\n\nThis site runs on **Autumn CMS**. Edit or delete this post, then start \
+         writing.\n\nEverything you would reach for in WordPress is here: categories and \
+         tags, pages, a media library, threaded comments with a moderation queue, \
+         revisions, menus, widgets, and a REST API.",
+        ),
+        (
+            "page",
+            "About",
+            "about",
+            "",
+            "This is a page. Pages are hierarchical and undated — they sit outside the blog and \
+         are addressed by their path.",
+        ),
+    ];
+    for (post_type, title, slug, excerpt, body) in content {
+        // Asked of the whole bare-path namespace, not just this type. `post`
+        // and top-level `page` both mint `/about`, and `idx_posts_bare_path_slug`
+        // enforces that — so a same-type check reported "not present" for a
+        // *page* named `about` and the insert then failed on the constraint,
+        // taking the rest of the seed with it after the settings and terms had
+        // already committed.
+        //
+        // Skipping rather than allocating a suffix is deliberate: this is demo
+        // content, and `/about-2` beside somebody's real `/about` is worse than
+        // not seeding it.
+        // The types this slug actually competes with. A bare-path type competes
+        // with every other bare-path type; a custom type is addressed under its
+        // own prefix and competes only with itself, so widening the check for it
+        // would skip content nothing was blocking.
+        let competing: Vec<&str> = if crate::content::BARE_PATH_TYPES.contains(&post_type) {
+            crate::content::BARE_PATH_TYPES.to_vec()
+        } else {
+            vec![post_type]
+        };
+        let exists: i64 = posts::table
+            .filter(posts::slug.eq(slug))
+            .filter(posts::post_type.eq_any(competing))
+            .count()
+            .get_result(conn)
+            .await?;
+        if exists > 0 {
+            continue;
+        }
+        diesel::insert_into(posts::table)
+            .values(&NewPost {
+                post_type: post_type.to_owned(),
+                title: title.to_owned(),
+                slug: slug.to_owned(),
+                excerpt: excerpt.to_owned(),
+                body: body.to_owned(),
+                status: "publish".to_owned(),
+                author_id,
+                parent_id: None,
+                featured_media_id: None,
+                menu_order: 0,
+                comment_status: "open".to_owned(),
+                password: String::new(),
+                sticky: false,
+                published_at: Some(now),
+            })
+            .execute(conn)
+            .await?;
+    }
     Ok(())
 }

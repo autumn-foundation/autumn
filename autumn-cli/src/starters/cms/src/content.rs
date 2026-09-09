@@ -1865,7 +1865,7 @@ pub fn guard_deferred_transition(target_status: &str, title: &str) -> AutumnResu
 /// The post types addressed at the bare URL path rather than under a prefix of
 /// their own. Only these two compete for a bare slug, and only these two can be
 /// shadowed by a segment something else claims.
-const BARE_PATH_TYPES: &[&str] = &["post", "page"];
+pub const BARE_PATH_TYPES: &[&str] = &["post", "page"];
 
 /// One registration, identified by which registry it lives in as well as by its
 /// slug.
@@ -2131,14 +2131,39 @@ pub async fn guard_page_path(conn: &mut AsyncPgConnection, post_id: i64) -> Autu
     }
     segments.reverse();
 
-    if is_claimed_page_path(&segments) {
+    guard_claimed_path(&segments, "page")
+}
+
+/// Refuse content whose URL a framework route already serves.
+///
+/// Pure, and separate from `guard_page_path`, because a page's ancestry is the
+/// only path shape that needs a database walk to compute. A term archive is
+/// `{rewrite_base}/{slug}` and a custom type's item is `{type}/{slug}` — both
+/// nested, both able to collide with a configured probe, and both settled
+/// without a query.
+///
+/// `guard_page_path` covered pages alone, which is exactly the shape this PR
+/// keeps producing: the fix applied where the finding pointed and nowhere else.
+pub fn guard_claimed_path(segments: &[String], what: &str) -> AutumnResult<()> {
+    if is_claimed_page_path(segments) {
         return Err(AutumnError::unprocessable_msg(format!(
-            "/{} is served by this site's health probe, so a page there would never be \
+            "/{} is served by this site's health probe, so a {what} there would never be \
              reachable",
             segments.join("/")
         )));
     }
     Ok(())
+}
+
+/// Refuse a term whose archive URL a framework route already serves.
+pub fn guard_term_path(taxonomy: &str, slug: &str) -> AutumnResult<()> {
+    let Some(registered) = crate::content_types::find_taxonomy(taxonomy) else {
+        return Ok(());
+    };
+    guard_claimed_path(
+        &[registered.rewrite_base.to_owned(), slug.to_owned()],
+        "term archive",
+    )
 }
 
 /// Every descendant of a page, by id.
@@ -3058,6 +3083,22 @@ pub async fn authors_for_posts(
         .collect())
 }
 
+/// Every index that means "this slug is taken", for the allocators' retry.
+///
+/// One list, because there are two allocators and a third caller reasoning
+/// about the same question — and the sibling-page index added when nested page
+/// slugs became per-parent was named in neither of them, so a lost race there
+/// surfaced the raw constraint error instead of allocating `-2`.
+pub const SLUG_COLLISION_INDEXES: &[(&str, &str, &str)] = &[
+    (
+        "idx_posts_bare_path_slug",
+        "slug",
+        "That URL is already taken",
+    ),
+    ("idx_posts_type_slug", "slug", "That URL is already taken"),
+    ("idx_pages_parent_slug", "slug", "That URL is already taken"),
+];
+
 /// Insert a post with a free slug, on the caller's connection.
 ///
 /// The `Repos` allocator does the same thing on a connection of its own, which
@@ -3095,6 +3136,15 @@ pub async fn insert_post_with_unique_slug(
                     .get_result(conn)
                     .await?;
                 guard_page_path(conn, saved.id).await?;
+                // A custom type is addressed under its own prefix, so its items
+                // mint a nested path too — `/product/widget` is as claimable as
+                // `/about/team`, and needs no walk to work out.
+                if !BARE_PATH_TYPES.contains(&saved.post_type.as_str()) {
+                    guard_claimed_path(
+                        &[saved.post_type.clone(), saved.slug.clone()],
+                        &saved.post_type,
+                    )?;
+                }
                 Ok::<_, AutumnError>(saved)
             })
             .await;
@@ -3104,18 +3154,8 @@ pub async fn insert_post_with_unique_slug(
             // out: either can be the one a lost race reports, and re-running
             // allocation is the right answer to both.
             Err(error)
-                if autumn_web::error::unique_violation_field(
-                    &error,
-                    &[
-                        (
-                            "idx_posts_bare_path_slug",
-                            "slug",
-                            "That URL is already taken",
-                        ),
-                        ("idx_posts_type_slug", "slug", "That URL is already taken"),
-                    ],
-                )
-                .is_some() =>
+                if autumn_web::error::unique_violation_field(&error, SLUG_COLLISION_INDEXES)
+                    .is_some() =>
             {
                 continue;
             }
@@ -3179,6 +3219,7 @@ pub async fn import_terms(
                 parent_id: None,
             };
             crate::hooks::normalize_new_term(&mut draft)?;
+            guard_term_path(&draft.taxonomy, &draft.slug)?;
             drafts.push(draft);
         }
 
@@ -3521,7 +3562,9 @@ pub async fn publish_due_post(
 
 #[cfg(test)]
 mod slug_shape_tests {
-    use super::{Registration, probe_paths, reads_as_date_archive, segment_claim};
+    use super::{
+        Registration, SLUG_COLLISION_INDEXES, probe_paths, reads_as_date_archive, segment_claim,
+    };
 
     /// The namespace answer covers every branch `permalinks::resolve` tries
     /// before it reaches bare post/page content — the whole point of having one
@@ -3606,5 +3649,87 @@ mod slug_shape_tests {
         // Disabled probes mount nothing and claim nothing.
         health.enabled = false;
         assert!(probe_paths(&health).is_empty());
+    }
+    /// Every index that can report a slug collision is in the retry list.
+    ///
+    /// The allocators retry on a *named* index, so an index the list does not
+    /// know surfaces its raw constraint error to the caller instead of
+    /// allocating the next suffix. `idx_pages_parent_slug` was added when
+    /// nested page slugs became per-parent and named in neither allocator —
+    /// which is the shape this PR keeps producing, so the list is one constant
+    /// now rather than two copies.
+    #[test]
+    fn every_slug_index_is_a_recognised_collision() {
+        let migration = include_str!("../migrations/20260908005714_create_content_schema/up.sql");
+        let named: Vec<&str> = SLUG_COLLISION_INDEXES
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        // Statement-wise, because the `ON posts` clause is usually on its own
+        // line — and it is the clause that matters: this list is the *post*
+        // allocators' retry set, so a unique slug index on `terms` or `menus`
+        // belongs to their own handling. (The first version matched on the
+        // index name alone and flagged `idx_terms_taxonomy_slug` immediately,
+        // which is how the scope got settled.)
+        for statement in migration.split(';') {
+            let Some(at) = statement.find("CREATE UNIQUE INDEX ") else {
+                continue;
+            };
+            let rest = &statement[at + "CREATE UNIQUE INDEX ".len()..];
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            let Some(name) = words.first().copied() else {
+                continue;
+            };
+            let on_posts = words
+                .windows(2)
+                .any(|pair| pair[0] == "ON" && pair[1].trim_start_matches('(') == "posts");
+            if !on_posts || !name.contains("slug") {
+                continue;
+            }
+            assert!(
+                named.contains(&name),
+                "`{name}` makes a post slug unique but the allocators would not retry on \
+                 it; add it to `SLUG_COLLISION_INDEXES`"
+            );
+        }
+    }
+    /// A nested path is claimable whatever mints it, not only a page.
+    ///
+    /// `guard_page_path` covered pages alone, which is the shape this PR keeps
+    /// producing: the fix applied where the finding pointed and nowhere else. A
+    /// term archive is `{rewrite_base}/{slug}` and a custom type's item is
+    /// `{type}/{slug}` — both nested, both able to collide with a configured
+    /// probe.
+    #[test]
+    fn a_claimed_path_is_refused_whatever_mints_it() {
+        let claimed = |segments: &[&str]| {
+            super::guard_claimed_path(
+                &segments.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "thing",
+            )
+            .is_err()
+        };
+
+        // Nothing is claimed until a configuration has been observed, which is
+        // the store's whole design — so this asserts the *function*, against a
+        // path the defaults do claim once seeded.
+        super::observe_probe_paths(&{
+            let mut config = autumn_web::config::AutumnConfig::default();
+            "/category/status".clone_into(&mut config.health.path);
+            config
+        });
+
+        assert!(
+            claimed(&["category", "status"]),
+            "a term archive under a claimed path is unreachable, exactly as a page is"
+        );
+        assert!(
+            !claimed(&["category", "news"]),
+            "and an ordinary one is untouched"
+        );
+        assert!(
+            !claimed(&["category"]),
+            "the prefix alone serves nothing and is not claimed"
+        );
     }
 }
