@@ -344,6 +344,22 @@ pub fn normalize_new_user(new: &mut NewUser) -> AutumnResult<()> {
     if new.username.is_empty() {
         return Err(AutumnError::unprocessable_msg("Username is required"));
     }
+    // The username *is* the author archive's URL segment — bylines link to
+    // `/author/{username}` and the resolver matches an author archive only on a
+    // two-segment path. So `alice/news` produced an account that could log in
+    // and publish normally while every byline and API author URL it generated
+    // pointed at a 404.
+    //
+    // Refusing rather than silently rewriting: the username is what the person
+    // types to log in, and quietly storing something else is worse than saying
+    // no. `slugify` supplies the suggestion.
+    if new.username != autumn_web::slugify(&new.username) {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A username can only contain lowercase letters, numbers and hyphens \
+             (try `{}`)",
+            autumn_web::slugify(&new.username)
+        )));
+    }
     // An unrecognised role degrades to the least-privileged one rather than
     // being stored verbatim, so `users.role` can only ever hold a value
     // `Role::parse` round-trips.

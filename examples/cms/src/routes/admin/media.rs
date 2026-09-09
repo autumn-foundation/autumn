@@ -148,6 +148,9 @@ pub async fn upload(
     let mut mime_type = String::new();
     let mut alt_text = String::new();
     let mut stored: Option<(autumn_web::storage::Blob, String)> = None;
+    // Armed for the whole handler: anything that returns after a blob is stored
+    // and before the attachment row exists takes the bytes with it.
+    let mut orphan = OrphanedBlobGuard::new(std::sync::Arc::clone(blobs.store()));
 
     while let Some(field) = form.next_field().await? {
         match field.name() {
@@ -185,6 +188,9 @@ pub async fn upload(
                     .with_max_bytes(MAX_UPLOAD_BYTES)
                     .save_to_blob_store(&*blobs.store().clone(), &key)
                     .await?;
+                // From here the bytes exist, so the guard owns them until the
+                // attachment row does.
+                orphan.watch(blob.key.clone());
                 stored = Some((blob, slug));
             }
             _ => {}
@@ -195,13 +201,7 @@ pub async fn upload(
         stored.ok_or_else(|| AutumnError::bad_request_msg("No file was included in the upload"))?;
     let byte_size = i64::try_from(blob.byte_size).unwrap_or(0);
 
-    // The bytes are already in the store, so a failed insert has to take them
-    // back out. `display_title` no longer produces an over-length title, but
-    // any other refusal — a slug collision, a transient database error — would
-    // otherwise leave an object no attachment row points at: invisible in the
-    // media library and impossible to delete through it.
-    let key = blob.key.clone();
-    let created = match repos
+    let created = repos
         .attachments
         .save(&NewAttachment {
             title: display_title(&filename),
@@ -215,23 +215,11 @@ pub async fn upload(
             caption: String::new(),
             uploader_id: Some(user.id),
         })
-        .await
-    {
-        Ok(created) => created,
-        Err(error) => {
-            // Best effort: the insert failed for its own reason, and that is
-            // what the caller needs to hear. A failed cleanup is logged rather
-            // than replacing it.
-            if let Err(cleanup) = blobs.store().delete(&key).await {
-                autumn_web::reexports::tracing::warn!(
-                    %cleanup,
-                    key = %key,
-                    "failed to remove the blob for an attachment that could not be saved"
-                );
-            }
-            return Err(error);
-        }
-    };
+        .await?;
+
+    // The row exists, so the bytes are its responsibility now rather than the
+    // guard's.
+    orphan.keep();
 
     do_action(Action::AttachmentUploaded, created.id);
     Ok(Redirect::to("/admin/media").into_response())
@@ -353,6 +341,58 @@ fn unique_slug(filename: &str, rng: &autumn_web::entropy::Rng) -> String {
     match ext {
         Some(ext) => format!("{base}-{suffix}.{}", autumn_web::slugify(ext)),
         None => format!("{base}-{suffix}"),
+    }
+}
+
+/// Deletes an uploaded blob unless the upload completes.
+///
+/// Cleanup has to survive *every* way the handler can leave after the bytes are
+/// stored, and enumerating those by hand is how the last two attempts at this
+/// went wrong: the first missed the failed `INSERT`, the second missed the
+/// duplicate-part rejection — which leaks a whole 16 MB object, on an endpoint
+/// an Author can call in a loop. A guard makes the property structural instead:
+/// the blob is orphaned unless something explicitly says it is not, so an error
+/// path added later is covered by construction.
+///
+/// The delete is spawned because `Drop` cannot await. It is best-effort by
+/// nature — a cleanup failure is logged and never replaces the error that
+/// caused it, which is what the caller actually needs to hear.
+struct OrphanedBlobGuard {
+    store: autumn_web::storage::SharedBlobStore,
+    key: Option<String>,
+}
+
+impl OrphanedBlobGuard {
+    fn new(store: autumn_web::storage::SharedBlobStore) -> Self {
+        Self { store, key: None }
+    }
+
+    /// Take responsibility for `key` until [`Self::keep`] says otherwise.
+    fn watch(&mut self, key: String) {
+        self.key = Some(key);
+    }
+
+    /// The attachment row exists; the bytes belong to it now.
+    fn keep(&mut self) {
+        self.key = None;
+    }
+}
+
+impl Drop for OrphanedBlobGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let store = std::sync::Arc::clone(&self.store);
+        autumn_web::reexports::tokio::spawn(async move {
+            if let Err(error) = store.delete(&key).await {
+                autumn_web::reexports::tracing::warn!(
+                    %error,
+                    key = %key,
+                    "failed to remove the blob for an upload that did not complete"
+                );
+            }
+        });
     }
 }
 

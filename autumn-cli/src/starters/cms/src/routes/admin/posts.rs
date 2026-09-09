@@ -821,7 +821,12 @@ pub async fn create(
             .await?;
     }
 
-    apply_terms(&repos, &created, &form).await?;
+    let term_ids = resolve_term_ids(&repos, &created, &form).await?;
+    if !term_ids.is_empty() {
+        repos
+            .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
+            .await?;
+    }
     if status == "future" || status == "private" {
         repos
             .with_conn(async |conn| {
@@ -929,58 +934,84 @@ pub async fn update(
         .filter(|value| !value.is_empty())
         .and_then(|value| value.parse::<i32>().ok());
 
-    // The content edit and its revision commit together.
+    // The edit, its revision, the term replacement and any status transition
+    // all commit together.
+    //
+    // They were three independent transactions, so another request trashing the
+    // post in between made the last one reject an undeclared `trash -> private`
+    // edge *after* the title, body, revision and taxonomy changes had already
+    // committed — an error response for a save that had largely happened. The
+    // three calls nest as savepoints inside this one, so the whole save is
+    // atomic and the row lock `update_post_with_revision` takes is held for all
+    // of it.
+    //
+    // The tag find-or-create stays outside: it is repository work on its own
+    // connection, and a tag that survives a failed save is harmless — an
+    // orphaned tag is visible and removable, unlike a half-applied post.
+    let term_ids = resolve_term_ids(&repos, &existing, &form).await?;
     let updated = repos
         .with_conn(async |conn| {
-            content::update_post_with_revision(
-                conn,
-                id,
-                user.id,
-                "Edited",
-                expected_lock_version,
-                registered.supports_revisions,
-                move |post| {
-                    let (
-                        title,
-                        slug,
-                        excerpt,
-                        body,
-                        password,
-                        sticky,
-                        comments_open,
-                        parent,
-                        media,
-                        order,
-                    ) = form_snapshot;
-                    post.title = title;
-                    post.slug = slug;
-                    post.excerpt = excerpt;
-                    post.body = body;
-                    post.password = password;
-                    post.sticky = sticky;
-                    post.comment_status = if comments_open { "open" } else { "closed" }.to_owned();
-                    post.parent_id = parent;
-                    post.featured_media_id = media;
-                    post.menu_order = order;
-                    if let Some(when) = scheduled_for {
-                        post.published_at = Some(when);
-                    }
-                },
-            )
+            use diesel_async::AsyncConnection as _;
+            conn.transaction(async move |conn| {
+                let updated = content::update_post_with_revision(
+                    conn,
+                    id,
+                    user.id,
+                    "Edited",
+                    expected_lock_version,
+                    registered.supports_revisions,
+                    move |post| {
+                        let (
+                            title,
+                            slug,
+                            excerpt,
+                            body,
+                            password,
+                            sticky,
+                            comments_open,
+                            parent,
+                            media,
+                            order,
+                        ) = form_snapshot;
+                        post.title = title;
+                        post.slug = slug;
+                        post.excerpt = excerpt;
+                        post.body = body;
+                        post.password = password;
+                        post.sticky = sticky;
+                        post.comment_status =
+                            if comments_open { "open" } else { "closed" }.to_owned();
+                        post.parent_id = parent;
+                        post.featured_media_id = media;
+                        post.menu_order = order;
+                        if let Some(when) = scheduled_for {
+                            post.published_at = Some(when);
+                        }
+                    },
+                )
+                .await?;
+
+                if !term_ids.is_empty() {
+                    content::set_post_terms(conn, id, term_ids).await?;
+                }
+
+                // A status change goes through the state machine, never through the
+                // plain field write above — so an illegal edge is refused rather
+                // than persisted, and now it is refused before anything commits.
+                let transitioned = status != updated.status;
+                if transitioned {
+                    content::transition_status(conn, id, &status, Some(user.id)).await?;
+                }
+                Ok::<_, AutumnError>((updated, transitioned))
+            })
             .await
         })
         .await?;
+    let (_updated, transitioned) = updated;
 
-    apply_terms(&repos, &updated, &form).await?;
-
-    // A status change goes through the state machine, never through the plain
-    // field write above — so an illegal edge is refused rather than persisted.
-    if status != updated.status {
-        repos
-            .with_conn(async |conn| {
-                content::transition_status(conn, id, &status, Some(user.id)).await
-            })
-            .await?;
+    // Actions fire only after the transaction has committed: a listener that
+    // reads the post back must not see a state that is about to roll back.
+    if transitioned {
         do_action(Action::PostTransitioned, id);
     }
     do_action(Action::PostSaved, id);
@@ -1008,10 +1039,10 @@ fn requested_status(form: &PostForm, user: &User) -> String {
 }
 
 /// Save the post's categories and tags, creating any tag that does not exist.
-async fn apply_terms(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResult<()> {
+async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResult<Vec<i64>> {
     let taxonomies = content_types::taxonomies_for(&post.post_type);
     if taxonomies.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut term_ids: Vec<i64> = Vec::new();
@@ -1094,11 +1125,10 @@ async fn apply_terms(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResul
     term_ids.sort_unstable();
     term_ids.dedup();
 
-    // Every repository read above is finished, so the connection is taken only
-    // for the write.
-    repos
-        .with_conn(async |conn| content::set_post_terms(conn, post.id, term_ids).await)
-        .await
+    // Only the ids. The *write* belongs to whatever transaction the caller is
+    // running, so it commits or rolls back with the rest of the save — see the
+    // update handler.
+    Ok(term_ids)
 }
 
 // ── Status transitions ──────────────────────────────────────────────────────

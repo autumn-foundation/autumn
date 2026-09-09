@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::capabilities::Capability;
 use crate::permalinks::PermalinkStructure;
-use crate::repositories::PgSiteOptionRepository;
+use crate::repositories::{PgSiteOptionRepository, PostRepository as _};
 use crate::require_capability;
 use crate::settings::Settings;
 use crate::theme;
@@ -38,7 +38,18 @@ pub struct SettingsForm {
 pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ManageOptions);
     let settings = repos.settings().await?;
-    let pages = repos.published_posts("page", 200).await?;
+    // The newest 200 pages, plus whichever one is configured. Without the
+    // second half, a front page older than the newest 200 is simply absent from
+    // the `<select>` — the browser then selects the empty option, and saving
+    // any unrelated setting submits an empty `front_page_id` and silently
+    // switches the site back to the posts index.
+    let mut pages = repos.published_posts("page", 200).await?;
+    if let Some(configured) = settings.front_page_id
+        && !pages.iter().any(|page| page.id == configured)
+        && let Some(page) = repos.posts.find_by_id(configured).await?
+    {
+        pages.insert(0, page);
+    }
 
     let body = html! {
         form action="/admin/settings" method="post" class="max-w-2xl space-y-6" {

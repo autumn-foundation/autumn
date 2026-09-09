@@ -361,6 +361,19 @@ async fn db_client() -> TestClient {
     )
     .await;
 
+    // The settings read is memoized per *process*, so truncating `options`
+    // alone does not reset it: a test that changes a setting keeps changing it
+    // for every test that runs afterwards. That surfaced as an unrelated
+    // failure — a test configuring a front page left `/` rendering that single
+    // post for everything after it — and the same shape once disabled guest
+    // comments suite-wide. Invalidating through the app's own mechanism is what
+    // makes each test start from the shipped defaults.
+    assert!(
+        {{crate_name}}::repositories::PgSiteOptionRepository::invalidate_declared_caches(),
+        "the test cache backend cannot invalidate by namespace, so settings would leak \
+         between tests"
+    );
+
     // Registrations are process-global; the real `main` calls this too, so the
     // test app and the shipped app see the same post types and shortcodes.
     {{crate_name}}::bootstrap();
@@ -411,6 +424,19 @@ async fn csrf_client() -> TestClient {
          revisions, comments, menus, menu_items, widgets RESTART IDENTITY CASCADE",
     )
     .await;
+
+    // The settings read is memoized per *process*, so truncating `options`
+    // alone does not reset it: a test that changes a setting keeps changing it
+    // for every test that runs afterwards. That surfaced as an unrelated
+    // failure — a test configuring a front page left `/` rendering that single
+    // post for everything after it — and the same shape once disabled guest
+    // comments suite-wide. Invalidating through the app's own mechanism is what
+    // makes each test start from the shipped defaults.
+    assert!(
+        {{crate_name}}::repositories::PgSiteOptionRepository::invalidate_declared_caches(),
+        "the test cache backend cannot invalidate by namespace, so settings would leak \
+         between tests"
+    );
     {{crate_name}}::bootstrap();
 
     let mut config = AutumnConfig::default();
@@ -4288,4 +4314,214 @@ async fn a_very_long_filename_still_uploads() {
         .await
         .assert_ok()
         .assert_body_contains("aaaa");
+}
+
+/// A rejected duplicate upload leaves no blob behind.
+///
+/// The first `file` part is already persisted when the second is refused, so
+/// the early return leaked a whole object — repeatable, and an Author could
+/// send a 16 MB first part in a loop to consume storage with files the media
+/// library cannot show or delete.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_rejected_duplicate_upload_leaves_no_orphaned_blob() {
+    let db = TestDb::shared().await;
+    let _ = db_client().await;
+    let uploads = std::env::temp_dir().join(format!(
+        "cms-orphan-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&uploads).expect("create the blob store root");
+    let mut config = AutumnConfig::default();
+    config.security.csrf.enabled = false;
+    config.security.submit_token.enabled = false;
+    let store = autumn_web::storage::LocalBlobStore::new(
+        "default".to_owned(),
+        uploads.clone(),
+        "/_blobs".to_owned(),
+        std::time::Duration::from_secs(900),
+        autumn_web::storage::local::SigningKey::new(b"cms-upload-test-key".to_vec()),
+        Vec::new(),
+    )
+    .expect("local blob store");
+    let client = TestApp::new()
+        .routes(app_routes())
+        .config(config)
+        .with_db(db.pool())
+        .state_initializer(move |state| {
+            state.insert_extension::<autumn_web::storage::BlobStoreState>(
+                autumn_web::storage::BlobStoreState::new(std::sync::Arc::new(store)),
+            );
+        })
+        .build();
+    let cookie = register(&client, "owner").await;
+
+    let boundary = "----cmsboundary";
+    let part = |name: &str, body: &str| {
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"{name}\"\r\nContent-Type: text/plain\r\n\r\n{body}\r\n"
+        )
+    };
+    let payload = format!(
+        "{}{}--{boundary}--\r\n",
+        part("first.txt", "the first payload"),
+        part("second.txt", "the second payload")
+    );
+
+    client
+        .post("/admin/media")
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(payload)
+        .send()
+        .await
+        .assert_status(422);
+
+    // The cleanup is spawned, so give it a moment to land, then assert the
+    // store is empty — no attachment row exists, so any file here is orphaned.
+    for _ in 0..50 {
+        if count_files(&uploads) == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        count_files(&uploads),
+        0,
+        "the first part's blob must not survive the rejection"
+    );
+}
+
+/// Every file under `root`, recursively.
+fn count_files(root: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() { count_files(&path) } else { 1 }
+        })
+        .sum()
+}
+
+/// A username has to be usable as the author archive's URL segment.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_username_that_is_not_a_url_segment_is_refused() {
+    let client = db_client().await;
+
+    // `Alice` is deliberately absent: `normalize_new_user` lowercases before it
+    // validates, so it is accepted and stored as `alice`, which is a perfectly
+    // good segment. Only values that cannot be normalized *into* one are
+    // refused.
+    for bad in [
+        "alice/news",
+        "alice bloggs",
+        "alice?x",
+        "alice.news",
+        "alice%2f",
+    ] {
+        let resp = client
+            .post("/register")
+            .form(&form(&[
+                ("username", bad),
+                ("email", "someone@example.com"),
+                ("password", "correct-horse-battery-staple"),
+            ]))
+            .send()
+            .await;
+        assert_ne!(
+            resp.status, 303,
+            "`{bad}` cannot be an author URL segment and must be refused"
+        );
+    }
+
+    // A well-formed one still registers, and its byline resolves.
+    let cookie = register(&client, "alice-bloggs").await;
+    create_post(&client, &cookie, "By Alice", "Body.", "publish").await;
+    sign_out(&client);
+    client
+        .get("/author/alice-bloggs")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("By Alice");
+}
+
+/// The configured front page stays selected however old it is.
+///
+/// The selector listed the newest 200 pages, so a front page older than those
+/// was simply absent — the browser then submitted the empty option and saving
+/// any unrelated setting silently switched the site back to the posts index.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_configured_front_page_stays_selected() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // The page that will be configured, created first so it is the oldest.
+    let front = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Welcome"),
+            ("slug", "welcome"),
+            ("excerpt", ""),
+            ("body", "The front page."),
+            ("status", "publish"),
+            ("password", ""),
+            ("tags", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(front.status, 303);
+    let front_id = front
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("front_page_id", front_id.as_str())]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Push it out of the newest-200 window.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO posts (post_type, title, slug, body, status, author_id, published_at) \
+         SELECT 'page', 'Filler ' || n, 'filler-' || n, '', 'publish', 1, now() \
+         FROM generate_series(1, 250) AS n",
+    )
+    .await
+    .expect("insert filler pages");
+
+    let screen = client
+        .get("/admin/settings")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        screen.contains(&format!(r#"value="{front_id}" selected"#))
+            || screen.contains(&format!(r#"selected value="{front_id}""#))
+            || (screen.contains("Welcome") && screen.contains(&format!(r#"value="{front_id}""#))),
+        "the configured front page must still be in the selector:\n{}",
+        &screen[..screen.len().min(4000)]
+    );
 }
