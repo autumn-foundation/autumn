@@ -75,11 +75,20 @@
 #     `/actuator/loggers/root` and `/actuator/loggers/my_app` both resolve
 #     against the mounted `/actuator/loggers/{name}`. A reader writing a
 #     concrete value is doing the right thing.
-#   - A documented path that is a PREFIX of a mounted one resolves:
-#     `/actuator/webhooks` names the family whose members are
-#     `/webhooks/dlq` and `/webhooks/replay`, and the bare `/actuator` is the
-#     prefix itself. Naming a family is not a claim that the family root
-#     answers.
+#   - A documented path that is a PREFIX of a mounted one resolves WHEN THE PAGE
+#     IS NAMING IT rather than requesting it: `/actuator/webhooks` names the
+#     family whose members are `/webhooks/dlq` and `/webhooks/replay`, and the
+#     bare `/actuator` is the prefix itself. Naming a family is not a claim that
+#     the family root answers — and naming is what the corpus does with every
+#     one of these: ~20 `/actuator/*` family mentions, `access_log_exclude =
+#     ["/health", "/actuator", …]`, "Actuator prefix: `/actuator`",
+#     `Disallow: /actuator/`.
+#     On a line that hands the reader a REQUEST — a `curl`, or an HTTP method
+#     followed by a path — the prefix rule is withdrawn, because there a prefix
+#     is a URL someone sends and `curl …/actuator/webhooks` is a 404. Nothing in
+#     the corpus does this today; the rule exists so nothing can start. The `*`
+#     and `{param}` rules still stand in a request, since `/actuator/*` in a
+#     command is still naming a family.
 #   - A `*` segment matches anything, so `/actuator/*` and
 #     `/actuator/webhooks/*` — the spellings the docs use for "all of these" —
 #     resolve. The framework writes the same glob itself
@@ -387,6 +396,22 @@ TRAILING = ".,;:!?)\"'`]}>"
 # claiming a path was meant to be one of ours.
 MISSING_SEPARATOR = re.compile(r"/actuator[A-Za-z0-9_][A-Za-z0-9_./{}-]*")
 
+# A line that hands the reader a REQUEST rather than a name: a `curl`
+# invocation, or an HTTP method immediately followed by a path. Only these
+# withdraw the prefix rule (see `resolves`), because only on these does a prefix
+# become a URL someone actually sends.
+#
+# The method form requires the path to FOLLOW the method, which is what
+# separates `GET /actuator/webhooks` (a request) from
+# `macro-transparency.md`'s route-table column `/actuator/*  GET  -> actuator`
+# (a listing). Deliberately narrow: everything else in the corpus that writes a
+# prefix — `access_log_exclude = ["/health", "/actuator", …]`, "Actuator prefix:
+# `/actuator`", `Disallow: /actuator/`, and the ~20 `/actuator/*` family
+# mentions — is a NAME, and reporting those would be the gate calling correct
+# lines defects.
+REQUEST_LINE = re.compile(
+    r"\bcurl\b|\b(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+/")
+
 # `<!-- route-surface-allow: /actuator/x — reason -->`. The reason is required:
 # a waiver without one outlives the sentence it was written for. Matched over
 # the whole page rather than line by line, because a waiver long enough to
@@ -448,22 +473,28 @@ def waived_lines(text):
 
 
 def documented(text):
-    """Yield (line_no, path) for every `/actuator/…` path a page shows.
+    """Yield (line_no, path, requested) for every `/actuator/…` path a page shows.
 
     Missing-separator spellings are yielded too, so they are reported rather
     than skipped; nothing mounts them, so resolution rejects them on its own.
+
+    `requested` marks a path the page hands someone to REQUEST rather than to
+    read, which is the one distinction the prefix rule needs and the only one
+    this extractor can honestly draw: a `curl` line, or an HTTP method followed
+    by a path. `check-docs-cli.sh` separates its two populations the same way.
     """
     for lineno, line in enumerate(blank_comments(text).splitlines(), 1):
+        requested = bool(REQUEST_LINE.search(line))
         for pattern in (DOC_PATH, MISSING_SEPARATOR):
             for match in pattern.finditer(line):
                 path = match.group(0).rstrip(TRAILING)
                 if path:
-                    yield lineno, path
+                    yield lineno, path, requested
 
 
 # ── Resolution ───────────────────────────────────────────────────────────────
 
-def resolves(path, mounted):
+def resolves(path, mounted, requested=False):
     """Does `path` name something the framework mounts?
 
     Segment-wise, and permissive in the three ways the header lists: a mounted
@@ -474,6 +505,13 @@ def resolves(path, mounted):
     actually be mounted below — which is the difference between `/actuator/`
     (a family, and how robots.txt and prose write it) and `/actuator/health/`
     (a leaf with a stray slash, which axum answers with a 404).
+
+    `requested=True` withdraws the prefix rule, and only that rule. A path a
+    page hands someone to REQUEST has to be a whole path: `curl …/actuator` and
+    `GET /actuator/webhooks` both 404, however sound `/actuator/webhooks` is as
+    the NAME of a family two lines up in prose. The `*` and `{param}` rules
+    stand, since a page writing `/actuator/*` in a command is still naming a
+    family rather than promising that literal string answers.
     """
     subtree = path.endswith("/")
     segs = [s for s in path.strip("/").split("/") if s]
@@ -484,6 +522,10 @@ def resolves(path, mounted):
         # Nothing is mounted below a path that IS a mounted path, so a trailing
         # slash on one names a route the router does not have.
         if subtree and len(segs) == len(tsegs):
+            continue
+        # A request must name the whole path, not a prefix of one — unless the
+        # shortfall is spelled `*`, which is family notation in any position.
+        if requested and len(segs) < len(tsegs) and "*" not in segs:
             continue
         if all(t.startswith("{") or s == "*" or s == t
                for s, t in zip(segs, tsegs)):
@@ -512,9 +554,9 @@ def main():
         if PREFIX not in text:
             continue
         waivers = waived_lines(text)
-        for lineno, path in documented(text):
+        for lineno, path, requested in documented(text):
             checked += 1
-            if resolves(path, mounted):
+            if resolves(path, mounted, requested):
                 continue
             if lineno in waivers.get(path, ()):
                 waived += 1
@@ -572,7 +614,7 @@ def self_test():
     ]
 
     text = "prose `/actuator/health`.\nand `/actuator/tasks`, plus (/actuator/info)\n"
-    found = sorted(p for _, p in documented(text))
+    found = sorted(p for _, p, _r in documented(text))
     cases.append((
         "trailing sentence punctuation is stripped",
         found,
@@ -602,7 +644,7 @@ def self_test():
     ))
     cases.append((
         "a waiver's own text is not read as a documented path",
-        list(documented(wrapped)),
+        [(n, q) for n, q, _r in documented(wrapped)],
         [(1, "/actuator/gone")],
     ))
     cases.append((
@@ -651,7 +693,7 @@ def self_test():
     # pinned, since the bug was only visible in their combination.
     cases.append((
         "a missing separator is reported, not truncated to the prefix",
-        list(documented("see /actuatorhealth for status\n")),
+        [(n, q) for n, q, _r in documented("see /actuatorhealth for status\n")],
         [(1, "/actuatorhealth")],
     ))
     cases.append((
@@ -660,12 +702,12 @@ def self_test():
     ))
     cases.append((
         "a hyphenated sibling route is out of scope, not a typo",
-        list(documented("mounted at /actuator-dashboard by the app\n")),
+        [(n, q) for n, q, _r in documented("mounted at /actuator-dashboard by the app\n")],
         [],
     ))
     cases.append((
         "the bare prefix still resolves",
-        list(documented("everything under /actuator is gated\n")),
+        [(n, q) for n, q, _r in documented("everything under /actuator is gated\n")],
         [(1, "/actuator")],
     ))
 
@@ -686,7 +728,8 @@ def self_test():
     ))
     cases.append((
         "a trailing slash is kept, not stripped",
-        list(documented("Disallow: /actuator/\n")), [(1, "/actuator/")],
+        [(n, q) for n, q, _r in documented("Disallow: /actuator/\n")],
+        [(1, "/actuator/")],
     ))
 
     # Three suffixes a corpus survey found genuinely terminating a path. Each
@@ -694,20 +737,56 @@ def self_test():
     # unrecognized suffix" would report all three and every one is correct.
     cases.append((
         "a query string is not part of the path",
-        list(documented("GET /actuator/logfile?level=warn\n")),
+        [(n, q) for n, q, _r in documented("GET /actuator/logfile?level=warn\n")],
         [(1, "/actuator/logfile")],
     ))
     cases.append((
         "a markdown autolink terminates the path",
-        list(documented("<http://localhost:3000/actuator/health>\n")),
+        [(n, q) for n, q, _r in documented("<http://localhost:3000/actuator/health>\n")],
         [(1, "/actuator/health")],
     ))
     cases.append((
         "a `::` logger target resolves as a {name} value",
-        resolves(next(p for _, p in documented(
+        resolves(next(q for _, q, _r in documented(
             "curl -X PUT .../actuator/loggers/my_app::orders\n")), surface),
         True,
     ))
+
+    # A prefix is a NAME in prose and a 404 in a request, and the extractor can
+    # tell those apart. Both directions are pinned: withdrawing the prefix rule
+    # too widely would report the ~20 `/actuator/*` family mentions and the
+    # `access_log_exclude = [… "/actuator" …]` config values, every one correct.
+    cases.append((
+        "a prefix resolves when a page NAMES it",
+        resolves("/actuator/webhooks", surface, requested=False), True,
+    ))
+    cases.append((
+        "a prefix does not resolve when a page REQUESTS it",
+        resolves("/actuator/webhooks", surface, requested=True), False,
+    ))
+    cases.append((
+        "the bare prefix does not resolve in a request either",
+        resolves("/actuator", surface, requested=True), False,
+    ))
+    cases.append((
+        "`*` is family notation in a request too",
+        resolves("/actuator/*", surface, requested=True), True,
+    ))
+    cases.append((
+        "a whole mounted path resolves in a request",
+        resolves("/actuator/health", surface, requested=True), True,
+    ))
+    for line, want in (
+        ("curl http://localhost:3000/actuator/webhooks", True),
+        ("GET /actuator/logfile?level=warn", True),
+        # A route-table column, not a request: the method FOLLOWS the path.
+        ("/actuator/*  GET      -> actuator", False),
+        ('access_log_exclude = ["/health", "/actuator", "/static"]', False),
+        ("Everything under `/actuator/webhooks` is sensitive.", False),
+    ):
+        got = [r for _, _, r in documented(line + "\n")]
+        cases.append((f"request-position detection: {line[:40]!r}",
+                      got and got[0], want if got else None))
 
     # Reader-facing surfaces a `*.md`-under-`docs/` view of the corpus misses.
     # The scaffolded README is a `.md.tmpl`; `.claude/skills/` is a second skill

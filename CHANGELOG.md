@@ -428,9 +428,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not be able to inherit the drift it is checking for. Resolution is deliberately permissive in three ways that each make the
   gate report *fewer* paths — a mounted `{param}` matches a concrete value
   (`/actuator/loggers/root`), a documented path that is a prefix of a mounted
-  one resolves (`/actuator/webhooks`), and a `*` segment matches anything
-  (`/actuator/*`) — and none of them can rescue a name that is simply not
-  there. A page that must name a foreign framework's endpoint waives it in
+  one resolves *when a page names it* (`/actuator/webhooks`), and a `*` segment
+  matches anything (`/actuator/*`) — and none of them can rescue a name that is
+  simply not there. On a line that hands the reader a **request** — a `curl`, or
+  an HTTP method followed by a path — the prefix rule is withdrawn, since there
+  a prefix is a URL someone sends and `curl …/actuator/webhooks` is a 404. A page that must name a foreign framework's endpoint waives it in
   place with `<!-- route-surface-allow: /actuator/… — reason -->`, scoped to its
   own block and the one above it. Run it with
   `./scripts/check-docs-routes.sh` (`--list` for the mounted surface,
