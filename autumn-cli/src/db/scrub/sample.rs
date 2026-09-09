@@ -907,14 +907,35 @@ fn describe(edge: &ForeignKeyConstraint) -> String {
 /// ordering was not.
 fn defer_purge_for_excluded_leaf(
     inputs: &SampleInputs<'_>,
+    roles: &BTreeMap<String, SampleRole>,
     edge: &ForeignKeyConstraint,
     purge_after: &mut BTreeSet<String>,
     purged_after_edges: &mut BTreeMap<String, Vec<String>>,
+    purged_before: &mut BTreeMap<String, Vec<String>>,
 ) {
     if inputs.purged.contains(&edge.parent_table) {
         purge_after.insert(edge.parent_table.clone());
         purged_after_edges
             .entry(edge.parent_table.clone())
+            .or_default()
+            .push(describe(edge));
+    }
+    // The mirror requirement, and the one the excuse itself depends on. When
+    // the LEAF's own top-level parent is purged and the edge points INTO a
+    // subsetted table, the excuse ("the purge removes every leaf row first")
+    // holds only while that purge runs BEFORE the sample — exactly as it does
+    // for a non-partitioned purged child. Recording it lets `check_purge_order`
+    // see a contradiction when some other edge defers the very same purge;
+    // dropping it let the two conclusions stand together and the run failed at
+    // delete time instead of refusing.
+    if let Some(root) = inputs.partitions.get(&edge.child_table)
+        && inputs.purged.contains(root)
+        && roles
+            .get(&edge.parent_table)
+            .is_some_and(|role| role.is_subsetted())
+    {
+        purged_before
+            .entry(root.clone())
             .or_default()
             .push(describe(edge));
     }
@@ -988,9 +1009,11 @@ fn classify_edges(
             PartitionVerdict::Ignore => {
                 defer_purge_for_excluded_leaf(
                     inputs,
+                    roles,
                     edge,
                     &mut purge_after,
                     &mut purged_after_edges,
+                    &mut purged_before,
                 );
                 continue;
             }

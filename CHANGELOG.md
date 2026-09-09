@@ -519,7 +519,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different socket directories, the clone's script pasted at its origin after a
   failed `\connect` — the guard passed, the transaction committed, and the
   ORIGIN went from 200 users to 25. A privileged socket role and any TCP target
-  still print.
+  still print. That refusal now covers EVERY Unix-socket target, not only one
+  whose role cannot read `data_directory`: nothing the server reports over a
+  socket identifies the instance. `system_identifier` is copied by any physical
+  clone, the configured port is shared by two clusters on different socket
+  directories, and `data_directory` is server-local — two containers each
+  answering `/var/lib/postgresql/data` match on it while being different
+  databases. Connect over TCP, where the address and port identify the endpoint,
+  or run without `--dry-run`.
+  A purged partition leaf whose outgoing key points into a subsetted table now
+  records that the purge must run BEFORE the sample, the mirror of the deferral
+  the same path already recorded. Without it, another edge deferring the very
+  same purge left two contradictory conclusions standing and the run failed at
+  delete time instead of refusing.
   Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and

@@ -619,17 +619,21 @@ impl std::fmt::Display for ScrubError {
             Self::UnprintableAmbiguousTarget { targets } => write!(
                 f,
                 "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
-                 Over a Unix socket the server reports no address and no port, and a \
-                 physical copy of a cluster — a replica, or a promoted clone — carries \
-                 its origin's `system_identifier`. That leaves `data_directory` as the \
-                 only value the two do not share, and this role cannot read it (it needs \
-                 `pg_read_all_settings`). The guard would then compare a database name, a \
-                 cluster id and a port that a same-port clone matches exactly. Measured: \
-                 two clusters on port 5433 with different socket directories, the clone's \
-                 script pasted at its origin after a failed `\\connect` — the guard \
-                 passed, the transaction committed, and the ORIGIN went from 200 users to \
-                 25. Connect over TCP so the address and port identify the endpoint, or \
-                 grant `pg_read_all_settings`, or run without --dry-run.",
+                 These are reached over a Unix socket, where the server reports no \
+                 address and no port — and nothing else it reports identifies the \
+                 instance either. A physical copy carries its origin's \
+                 `system_identifier`; the configured port is shared by two clusters on \
+                 different socket directories; and `data_directory` is server-LOCAL, so \
+                 two containers each answering `/var/lib/postgresql/data` match on it \
+                 while being different databases. Every value the guard can ask for is \
+                 either cloned or container-local, so a printed block cannot tell this \
+                 target from a copy of it — and `\\connect` keeps the PREVIOUS connection \
+                 when it fails. Measured on two clusters sharing port 5433: the clone's \
+                 script pasted at its origin passed the guard, committed, and took the \
+                 ORIGIN from 200 users to 25. Connect over TCP, where the address and \
+                 port identify the endpoint and two clones cannot hold the same pair, or \
+                 run without --dry-run — the command opens its own connection and cannot \
+                 be on the wrong database.",
                 targets.len(),
                 bullet_list(targets),
             ),
@@ -2720,19 +2724,22 @@ fn classify_and_apply(
                 profile: profile.to_owned(),
             }
         })?;
-        // And refuse a target whose guard could not tell it from a clone. Over a
-        // socket the address and port are NULL, and a physical copy shares its
-        // origin's `system_identifier`, so `data_directory` is the only
-        // discriminator left — and dropping it when unreadable (which is right,
-        // because comparing against a value never learned refuses CORRECT
-        // pastes) leaves nothing. Measured before this: two clusters on port
-        // 5433 with different socket directories, the clone's script pasted at
-        // its origin, guard passed, COMMIT, origin 200 users -> 25.
+        // And refuse a socket target outright, because no value the server
+        // reports identifies the instance behind a socket. Address and port are
+        // NULL there by construction; `system_identifier` is copied by any
+        // physical clone; the configured port is shared by two clusters on
+        // different socket directories; and `data_directory` is server-LOCAL,
+        // so two containers each answering `/var/lib/postgresql/data` match on
+        // it while being different databases. Three narrower guards were each
+        // defeated by the next topology, which is the shape of a value that
+        // does not exist rather than one not yet found. Measured on two
+        // clusters sharing port 5433: the clone's script pasted at its origin,
+        // guard passed, COMMIT, origin 200 users -> 25.
         let mut ambiguous: Vec<String> = plans
             .iter()
             .filter(|(_, _, _, facts, _)| {
                 let e = &facts.endpoint;
-                e.address.is_none() && e.port.is_none() && e.data_directory.is_none()
+                e.address.is_none() && e.port.is_none()
             })
             .map(|(label, _, _, _, _)| (*label).clone())
             .collect();
