@@ -196,9 +196,29 @@ pub fn plan_migration_with_options(
             }
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
+            // SQLite refuses `DROP COLUMN` while an index names the column.
+            // Recover the table's prior indexes so the up path drops them first
+            // (#1906). Postgres cascades the drop and needs none of this.
+            let prior_indexes = if backend == autumn_web::config::DatabaseBackend::Sqlite {
+                super::prior_index::scan_prior_indexes(&project_root.join("migrations"), table)
+            } else {
+                Vec::new()
+            };
             (
-                remove_columns_up_sql_for(backend, table, &fields, &existing_schema),
-                remove_columns_down_sql_for(backend, table, &fields, &existing_schema)?,
+                remove_columns_up_sql_for(
+                    backend,
+                    table,
+                    &fields,
+                    &existing_schema,
+                    &prior_indexes,
+                ),
+                remove_columns_down_sql_for(
+                    backend,
+                    table,
+                    &fields,
+                    &existing_schema,
+                    &prior_indexes,
+                )?,
             )
         }
         MigrationShape::EncryptColumns {
@@ -914,6 +934,90 @@ pub struct Post {
                 drop_idx < drop_col,
                 "down.sql must DROP INDEX before DROP COLUMN: {down}"
             );
+        });
+    }
+
+    /// Issue #1906: a `Remove…From…` on `SQLite` must drop a PRE-EXISTING index
+    /// that names the removed column, not just the conventional
+    /// `idx_<table>_<col>` the generator itself would have created. `SQLite`
+    /// refuses `DROP COLUMN` while any index still references the column, so a
+    /// composite index from an earlier migration would otherwise break the
+    /// migration at apply time.
+    #[test]
+    fn remove_columns_migration_on_sqlite_drops_a_pre_existing_composite_index() {
+        with_no_db_env(|| {
+            let tmp = sqlite_project();
+            let earlier = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(
+                earlier.join("up.sql"),
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT);\n\
+                 CREATE INDEX idx_posts_author_title ON posts (author_id, title);\n",
+            )
+            .unwrap();
+
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveTitleFromPosts",
+                &["title:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_remove_title_from_posts");
+
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let drop_idx = up
+                .find("DROP INDEX IF EXISTS idx_posts_author_title;")
+                .unwrap_or_else(|| panic!("composite index not dropped: {up}"));
+            let drop_col = up
+                .find("ALTER TABLE posts DROP COLUMN title;")
+                .unwrap_or_else(|| panic!("column not dropped: {up}"));
+            assert!(drop_idx < drop_col, "index drop must come first: {up}");
+
+            // The rollback restores it, after the column is back.
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            let add_col = down
+                .find("ALTER TABLE posts ADD COLUMN title")
+                .unwrap_or_else(|| panic!("column not re-added: {down}"));
+            let recreate = down
+                .find("CREATE INDEX idx_posts_author_title ON posts (author_id, title);")
+                .unwrap_or_else(|| panic!("index not re-created: {down}"));
+            assert!(add_col < recreate, "column must precede its index: {down}");
+        });
+    }
+
+    /// The same project shape on Postgres emits no explicit `DROP INDEX` — it
+    /// cascades the drop with the column, so the output is unchanged by #1906.
+    #[test]
+    fn remove_columns_migration_on_postgres_ignores_pre_existing_indexes() {
+        with_no_db_env(|| {
+            let tmp = project();
+            let earlier = tmp.path().join("migrations/20260101000000_create_posts");
+            fs::create_dir_all(&earlier).unwrap();
+            fs::write(
+                earlier.join("up.sql"),
+                "CREATE INDEX idx_posts_author_title ON posts (author_id, title);\n",
+            )
+            .unwrap();
+
+            let plan = plan_migration(
+                tmp.path(),
+                "RemoveTitleFromPosts",
+                &["title:Option<String>".into()],
+                "20260427000000",
+            )
+            .unwrap();
+            plan.execute(Flags::default()).unwrap();
+            let dir = tmp
+                .path()
+                .join("migrations/20260427000000_remove_title_from_posts");
+            let up = fs::read_to_string(dir.join("up.sql")).unwrap();
+            let down = fs::read_to_string(dir.join("down.sql")).unwrap();
+            assert!(!up.contains("DROP INDEX"), "Postgres up.sql: {up}");
+            assert!(!down.contains("idx_posts_author_title"), "down.sql: {down}");
         });
     }
 

@@ -30,6 +30,7 @@ mod nested;
 pub mod notifications;
 pub mod plugin;
 pub mod policy;
+pub mod prior_index;
 pub mod provenance;
 pub mod pwa;
 pub mod scaffold;
@@ -347,6 +348,59 @@ pub fn detect_backend_for_profile(
 ) -> autumn_web::config::DatabaseBackend {
     let effective = crate::migrate::effective_profile(profile);
     detect_backend_with(project_root, Some(&effective), |k| std::env::var(k))
+}
+
+/// Backend detection for the OFFLINE preflights — `migrate check`, `deploy
+/// check`, `doctor` (issue #1906 review).
+///
+/// Resolves the URL from the same layers [`detect_backend`] does — real env,
+/// the project `.env`/`.env.<profile>`, and the profile-merged `autumn.toml` —
+/// but **never exits**. The hard-error `autumn.toml` reader is right for a
+/// command about to migrate a real database; a malformed local config must not
+/// abort an offline SQL check, nor truncate `autumn doctor --json` to zero bytes
+/// mid-report.
+///
+/// `migrate check`'s documented contract is that a bad `.env` cannot abort it,
+/// not that the file goes unread — and a `SQLite` URL living only in `.env` is a
+/// shape both the runtime and the generator support, so skipping it would grade
+/// valid `SQLite` SQL under Postgres rules.
+///
+/// Anything it cannot determine resolves to `Postgres`, the historical default.
+#[must_use]
+pub fn detect_backend_offline(
+    project_root: &Path,
+    profile: Option<&str>,
+) -> autumn_web::config::DatabaseBackend {
+    use autumn_web::config::DatabaseBackend;
+
+    let effective = crate::migrate::effective_profile(profile);
+    let table = crate::migrate::read_autumn_toml_table_with_profile_in_using(
+        project_root,
+        Some(&effective),
+        crate::migrate::read_optional_toml_table,
+    );
+    // Same precedence as `detect_backend_with`: the real environment wins, and
+    // `.env` only fills keys it does not define. A malformed `.env` is dropped
+    // rather than surfaced — this is a best-effort hint, and the commands that
+    // act on a real URL report it loudly themselves.
+    let base = FnEnv(&|k: &str| std::env::var(k));
+    let dotenv: std::collections::BTreeMap<String, String> =
+        autumn_web::dotenv::resolve_dotenv_vars_in(project_root, &effective, &base)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let env = |key: &str| {
+        std::env::var(key).or_else(|_| {
+            dotenv
+                .get(key)
+                .cloned()
+                .ok_or(std::env::VarError::NotPresent)
+        })
+    };
+    crate::migrate::resolve_primary_database_url_from_sources(env, table.as_ref())
+        .as_deref()
+        .and_then(DatabaseBackend::detect)
+        .unwrap_or(DatabaseBackend::Postgres)
 }
 
 /// Directory-, profile-, and env-parameterized core of [`detect_backend`],
