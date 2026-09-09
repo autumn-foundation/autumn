@@ -1311,6 +1311,43 @@ async fn a_cached_certificate_does_not_hide_a_missing_one() {
     );
 }
 
+#[tokio::test]
+async fn a_domain_left_issuing_by_a_crash_recovers_on_the_next_tick() {
+    // A process that dies between persisting `issuing` and finishing the order
+    // leaves the record in that state, and `due_for_issuance` re-selects it on
+    // purpose. Nothing else moves it out of `issuing`, so an order that
+    // refuses to touch that state strands the domain forever: every tick picks
+    // it, every tick abandons it, and the tenant can only escape by being
+    // offboarded and re-registered.
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .record_verified("app.clientco.com", NOW)
+        .await
+        .unwrap();
+    // What the crashed process left behind.
+    h.registry.record_issuing("app.clientco.com").await.unwrap();
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Issuing
+    );
+
+    h.task.tick(NOW).await;
+
+    assert_eq!(issuer.count(), 1, "the interrupted order must be re-placed");
+    assert!(
+        h.registry.is_servable("app.clientco.com"),
+        "and the domain must come up"
+    );
+}
+
 /// A registry store whose saves fail once armed, leaving reads intact.
 #[derive(Debug, Default)]
 struct FailingSaveStore {

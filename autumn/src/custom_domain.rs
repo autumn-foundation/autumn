@@ -1096,9 +1096,12 @@ impl CustomDomainRegistry {
     /// discard, and for one re-registered by someone else it moved the NEW
     /// tenant's record to `Issuing` for an order that was never theirs.
     ///
-    /// `Active` still applies — that is a renewal, and its record legitimately
-    /// stays `Active` while the order runs — but `PendingDns` does not: a
-    /// re-registration has not proven its own DNS yet.
+    /// The admissible states are the same ones activation accepts: `Verified`
+    /// (a first order), `Active` (a renewal, whose record legitimately stays
+    /// `Active` while the order runs) and `Issuing` — a record left mid-order
+    /// by a crash, which `due_for_issuance` deliberately re-selects so the
+    /// domain recovers. Only `PendingDns` is refused: a re-registration has not
+    /// proven its own DNS yet.
     ///
     /// # Errors
     ///
@@ -1106,10 +1109,7 @@ impl CustomDomainRegistry {
     pub async fn record_issuing_for(&self, hostname: &str, tenant: &str) -> io::Result<bool> {
         self.mutate_if(
             hostname,
-            |d| {
-                d.tenant == tenant
-                    && matches!(d.status, DomainStatus::Verified | DomainStatus::Active)
-            },
+            |d| d.tenant == tenant && Self::is_orderable_state(d.status),
             |d| {
                 if d.status == DomainStatus::Verified {
                     d.status = DomainStatus::Issuing;

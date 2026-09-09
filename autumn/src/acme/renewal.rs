@@ -1158,6 +1158,22 @@ pub(crate) async fn load_or_register_account(
 ) -> Result<instant_acme::Account, String> {
     use instant_acme::{AccountCredentials, NewAccount};
 
+    // Serialised process-wide. Reading the stored account and registering a new
+    // one is a check-then-act, and since #1635 there are TWO issuers behind it:
+    // the deployment's own renewal task and the tenant custom-domain task, both
+    // spawned at boot and both reaching this on their first order. On a fresh
+    // cache they would each see no account, each register one with the CA, and
+    // race to persist different credentials — so the deployment and its tenants
+    // would not share an account after all, and every fresh start would spend
+    // another of the CA's per-account registration limits.
+    //
+    // The lock spans the load too: releasing it after a miss would put both
+    // callers back in the same race. After the first success every later call
+    // is a file read behind an uncontended lock.
+    static ACCOUNT_INIT: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    let _init = ACCOUNT_INIT.lock().await;
+
     let directory_url = crate::acme::directory_url(&config.directory);
 
     if let Some(bytes) = store
