@@ -3851,6 +3851,90 @@ async fn a_restore_keeps_each_file_with_its_uploader() {
     );
 }
 
+/// A term's displayed count comes from the posts, not from a stored number the
+/// registry can invalidate.
+///
+/// `terms.post_count` is computed from `public_type_slugs()` — the registry —
+/// so it is right when written and stale the moment a deployment registers a
+/// type differently, or restores content whose plugin is disabled. No row
+/// changes, so nothing recounts. The archive the number describes is already
+/// visibility-aware, so the screens showing it disagreed with the thing they
+/// were describing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_terms_displayed_count_comes_from_the_posts() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Counted", "Body.", "publish").await;
+
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Tallied"),
+            ("slug", ""),
+            ("description", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO post_terms (post_id, term_id)
+             VALUES ({id}, (SELECT id FROM terms WHERE slug = 'tallied'))"
+        ),
+    )
+    .await
+    .expect("file the post");
+
+    // A stored counter that disagrees with the posts — which is exactly what a
+    // registry change leaves behind, since it writes no rows.
+    try_execute(
+        TestDb::shared().await,
+        "UPDATE terms SET post_count = 0 WHERE slug = 'tallied'",
+    )
+    .await
+    .expect("stale the counter");
+
+    // The management screen shows what the archive would.
+    let screen = client
+        .get("/admin/terms/category")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let row = screen
+        .split("Tallied")
+        .nth(1)
+        .expect("the term's row")
+        .to_owned();
+    assert!(
+        row.contains(">1<") || row.contains("> 1 <"),
+        "the screen an editor decides on must agree with the archive:\n{row}"
+    );
+
+    // And so does the API.
+    let api = client
+        .get("/api/v1/terms?taxonomy=category")
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let parsed: serde_json::Value = serde_json::from_str(&api).expect("the terms parse");
+    let counted = parsed
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|term| term["slug"] == "tallied")
+        .expect("the term");
+    assert_eq!(
+        counted["post_count"], 1,
+        "the API publishes the count the archive would produce:\n{api}"
+    );
+}
+
 /// Restoring a disabled plugin's taxonomy keeps its hierarchy.
 ///
 /// The export now carries the terms of a plugin that was disabled when the

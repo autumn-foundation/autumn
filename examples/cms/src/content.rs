@@ -705,6 +705,41 @@ pub async fn recount_terms_for_post_public(
     recount_terms_for_post(conn, post_id).await
 }
 
+/// The live published-post count of each of `term_ids`, in one query.
+///
+/// `terms.post_count` is a *stored* number computed from a process-dependent
+/// predicate: `public_type_slugs()` answers from the registry, so the counter
+/// is right when it is written and stale the moment a deployment registers a
+/// type differently — or restores content whose plugin is disabled, which
+/// persists a zero that re-enabling the plugin never repairs, because a
+/// registry change touches no row.
+///
+/// So the screens that *show* a count ask this instead. The stored counter
+/// stays: `populated_terms` orders by it, where a stale heuristic costs
+/// nothing, and it is still what `recount_term` maintains.
+///
+/// One grouped query rather than one per term — a term list is a page of rows
+/// and this is the number beside each of them.
+pub async fn term_post_counts(
+    conn: &mut AsyncPgConnection,
+    term_ids: &[i64],
+) -> AutumnResult<std::collections::HashMap<i64, i64>> {
+    if term_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(post_terms::table
+        .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
+        .filter(post_terms::term_id.eq_any(term_ids))
+        .filter(posts::status.eq("publish"))
+        .filter(posts::post_type.eq_any(public_type_slugs()))
+        .group_by(post_terms::term_id)
+        .select((post_terms::term_id, diesel::dsl::count_star()))
+        .load::<(i64, i64)>(conn)
+        .await?
+        .into_iter()
+        .collect())
+}
+
 /// Rebuild one term's published-post count from ground truth.
 pub async fn recount_term(conn: &mut AsyncPgConnection, term_id: i64) -> AutumnResult<i64> {
     // The term row is locked *before* the count is taken, so concurrent

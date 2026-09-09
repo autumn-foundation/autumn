@@ -346,11 +346,27 @@ impl Repos {
             Vec::new()
         };
 
+        // One query for every term the sidebar shows, for the reason
+        // `SidebarData::term_counts` gives: the stored counter answers from the
+        // registry and this has to agree with the archive it links to.
+        let term_ids: Vec<i64> = categories
+            .iter()
+            .chain(tags.iter())
+            .map(|term| term.id)
+            .collect();
+        let term_counts = if term_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let mut conn = self.conn().await?;
+            crate::content::term_post_counts(&mut conn, &term_ids).await?
+        };
+
         Ok(theme::render_sidebar(&SidebarData {
             widgets,
             recent_posts,
             categories,
             tags,
+            term_counts,
         }))
     }
 

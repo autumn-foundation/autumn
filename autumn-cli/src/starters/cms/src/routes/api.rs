@@ -394,6 +394,14 @@ pub async fn list_terms(
         .saturating_mul(per_page);
     let mut conn = repos.conn().await?;
     let terms = crate::content::terms_page(&mut conn, &taxonomy, offset, per_page).await?;
+    // Counted live rather than read off `terms.post_count`. The stored number
+    // is computed from the *registry* — which types are public — so it is stale
+    // the moment a deployment registers a type differently or restores content
+    // whose plugin is disabled, and no row changes to repair it. The archive
+    // this count describes is already visibility-aware, so publishing the
+    // stored number meant the API and the archive disagreed.
+    let term_ids: Vec<i64> = terms.iter().map(|term| term.id).collect();
+    let counts = crate::content::term_post_counts(&mut conn, &term_ids).await?;
     Ok(Json(
         terms
             .iter()
@@ -404,7 +412,7 @@ pub async fn list_terms(
                 slug: term.slug.clone(),
                 description: term.description.clone(),
                 parent_id: term.parent_id,
-                post_count: term.post_count,
+                post_count: counts.get(&term.id).copied().unwrap_or(0),
                 url: crate::theme::term_url(term),
             })
             .collect(),

@@ -63,7 +63,7 @@ pub async fn list(
     // rendered every term a second time as an `<option>`, so the only screen
     // for managing terms was the one a large taxonomy broke first.
     let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
-    let (terms, total, parents, parent_names, parents_truncated) = {
+    let (terms, total, parents, parent_names, parents_truncated, counts) = {
         let mut conn = repos.conn().await?;
         let (terms, total) = content::terms_page_with_total(
             &mut conn,
@@ -84,7 +84,22 @@ pub async fn list(
         } else {
             (Vec::new(), false)
         };
-        (terms, total, parents, parent_names, parents_truncated)
+        // Counted live rather than read off `terms.post_count`. The stored
+        // number is computed from the *registry* — which types are public — so
+        // it is stale the moment a deployment registers a type differently, or
+        // restores content whose plugin is disabled, and no row changes to
+        // repair it. This screen is where an editor decides whether a term is
+        // worth keeping, so it has to agree with the archive.
+        let term_ids: Vec<i64> = terms.iter().map(|term| term.id).collect();
+        let counts = content::term_post_counts(&mut conn, &term_ids).await?;
+        (
+            terms,
+            total,
+            parents,
+            parent_names,
+            parents_truncated,
+            counts,
+        )
     };
     let last_page = ((total + TERMS_PER_PAGE - 1) / TERMS_PER_PAGE).max(1);
 
@@ -116,7 +131,9 @@ pub async fn list(
                                 td class="px-4 py-3 font-mono text-xs text-gray-500" {
                                     (term.slug)
                                 }
-                                td class="px-4 py-3 text-gray-500" { (term.post_count) }
+                                td class="px-4 py-3 text-gray-500" {
+                                    (counts.get(&term.id).copied().unwrap_or(0))
+                                }
                                 td class="px-4 py-3 text-right" {
                                     form method="post"
                                          action=(format!("/admin/terms/{taxonomy}/{}/delete",

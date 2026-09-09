@@ -192,6 +192,14 @@ pub struct SidebarData {
     pub recent_posts: Vec<(String, String)>,
     pub categories: Vec<Term>,
     pub tags: Vec<Term>,
+    /// Live published-post counts, by term id.
+    ///
+    /// Not `Term::post_count`: that is stored, and it is computed from the
+    /// *registry* — which post types are public — so it is stale the moment a
+    /// deployment registers a type differently, with no row changing to repair
+    /// it. `populated_terms` already decides *membership* from the posts for
+    /// the same reason; this makes the number beside each term agree with it.
+    pub term_counts: std::collections::HashMap<i64, i64>,
 }
 
 /// Render a sidebar's widgets in order.
@@ -245,7 +253,9 @@ fn render_widget(kind: WidgetKind, widget: &Widget, data: &SidebarData) -> Marku
                     li {
                         a href=(format!("/category/{}", term.slug))
                           class="text-indigo-700 hover:underline" { (term.name) }
-                        span class="text-gray-400" { " (" (term.post_count) ")" }
+                        span class="text-gray-400" {
+                            " (" (data.term_counts.get(&term.id).copied().unwrap_or(0)) ")"
+                        }
                     }
                 }
                 @if data.categories.is_empty() {
