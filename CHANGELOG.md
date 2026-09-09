@@ -255,6 +255,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directions. `#[model]` is unaffected: its read schema describes a response
   only. See the [migration guide](docs/migrations/next.md).
 
+- **openapi:** `autumn openapi export` no longer applies the application-router
+  checks under a non-HTTP process role (issue #802). With `role = "worker"`,
+  `run()` takes the probe-only branch and never builds the application router,
+  so none of those six rules execute — a route may legitimately own
+  `/openapi.json` under that profile. Enforcing them anyway *rejected* a
+  deployment that starts perfectly well. The config-only preconditions still
+  apply to every role, because `run()` performs those before it branches, and
+  the document is still exported either way: it is built from the routes and the
+  `OpenApiConfig`, neither of which depends on the role, so a worker-profile
+  export writes down the same contract the web role serves.
+
 
 ### Changed
 

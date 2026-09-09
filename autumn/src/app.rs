@@ -11665,15 +11665,32 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         )]
         mcp_mount_path,
     } = ctx;
+
+    // `run()`'s OWN pre-router checks first, in its order: an app with no
+    // routes, or with an unguarded mutating repository API under a
+    // production profile, never reaches router construction at all. These hold
+    // for EVERY role — `run()` performs them before it branches on one.
+    validate_pre_router_preconditions(routes, scoped_groups, config)?;
+
+    // Everything below describes the application router, and a `worker` (or any
+    // other non-HTTP) role never builds one: `run()` takes the probe-only branch
+    // and none of these six rules execute. Enforcing them here would REJECT a
+    // deployment that starts perfectly well — a route legitimately owning
+    // `/openapi.json` under a worker profile, say — which is the same
+    // disagreement with the serving path as being too lax, pointing the other
+    // way, and the more expensive of the two because it blocks correct work.
+    //
+    // The document itself is still exported: it is built from the routes and the
+    // `OpenApiConfig`, neither of which depends on the role, so the contract a
+    // worker-profile export writes down is the same one the web role serves.
+    if !config.role.serves_http() {
+        return Ok(());
+    }
+
     // What the ROUTER would see for OpenAPI, resolved once and used by every
     // mount-sensitive check below, so the three cannot disagree about
     // whether the endpoint is mounted.
     let mounted_openapi = config.openapi_runtime.enabled.then_some(openapi_config);
-
-    // `run()`'s OWN pre-router checks first, in its order: an app with no
-    // routes, or with an unguarded mutating repository API under a
-    // production profile, never reaches router construction at all.
-    validate_pre_router_preconditions(routes, scoped_groups, config)?;
 
     let registered_versions: std::collections::HashSet<&str> =
         api_versions.iter().map(|av| av.version.as_str()).collect();
