@@ -441,8 +441,9 @@ what the connection string states is asserted; a port left to libpq is not
 guessed, since `PGPORT` can differ between the machine that planned the run and
 the one pasting the script.
 
-A failover list (`host=db1,db2`) is matched by membership, since psql reports the
-one server it selected. The compaction pass reconnects too, and carries the same
+A failover list (`host=db1,db2`) is matched the way libpq resolves it — host and
+port paired positionally, a single port covering every host — since psql reports
+the one server it selected. The compaction pass reconnects too, and carries the same
 proof for the same reason.
 
 The printed transaction also asserts `session_replication_role = origin` — the

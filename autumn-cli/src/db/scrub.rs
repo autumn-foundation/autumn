@@ -4534,40 +4534,61 @@ fn stated_host_and_port(conninfo: &str) -> (Option<String>, Option<String>) {
 /// The comparison is `pg_catalog`-qualified so a `public.=` cannot answer it,
 /// and the flag is cleared first so a `\gset` whose query fails leaves it false.
 fn psql_connection_terms(conninfo: &str, database: &str) -> String {
-    // Membership, not equality, because libpq takes comma-separated FAILOVER
-    // lists in both `host` and `port` — and psql's `:HOST`/`:PORT` describe the
-    // single server it actually selected. Measured: with
-    // `?host=127.0.0.9,127.0.0.1`, psql reported `HOST=127.0.0.1`. Comparing a
-    // list verbatim made a CORRECT paste skip its own block and every later
-    // target with it — measured on a
-    // `postgres://postgres@127.0.0.9,127.0.0.1:5433/dry_t1` target, 83 statements
-    // reported `query ignored` and the database stayed at 200 rows.
-    //
-    // Host and port are matched independently rather than paired by position:
-    // the question is whether psql landed on one of the endpoints this block was
-    // planned for, and every pair drawn from those lists is one.
-    let members = |value: &str| {
-        value
-            .split(',')
-            .filter(|part| !part.is_empty())
-            .map(quote_literal)
-            .collect::<Vec<_>>()
-            .join(", ")
+    let equals = |variable: &str, value: &str| {
+        format!(
+            ":'{variable}' OPERATOR(pg_catalog.=) {}",
+            quote_literal(value)
+        )
     };
-    let (host, port) = stated_host_and_port(conninfo);
-    let mut terms = vec![format!(
-        ":'DBNAME' OPERATOR(pg_catalog.=) {}",
-        quote_literal(database)
-    )];
-    for (variable, stated) in [("HOST", host), ("PORT", port)] {
-        if let Some(stated) = stated.filter(|s| !s.is_empty()) {
-            terms.push(format!(
-                ":'{variable}' OPERATOR(pg_catalog.=) ANY (ARRAY[{}]::pg_catalog.text[])",
-                members(&stated)
-            ));
-        }
+    let database_is = equals("DBNAME", database);
+    // A conninfo that states no host cannot be proved at all, so the proof is
+    // `false` and the block is skipped. Unreachable today — a URI with an empty
+    // authority (`postgres:///app`, `postgres://user@/app`) fails
+    // `password_free_conninfo`, and the run refuses to print it as an
+    // unprintable target before this is ever reached, measured both ways — but
+    // stated here rather than left to that distant refusal. Omitting the host
+    // term instead would silently drop the one discriminator this proof exists
+    // for, leaving the database name to stand alone against a physical clone
+    // that shares it.
+    let (Some(host), port) = stated_host_and_port(conninfo) else {
+        return "false".to_owned();
+    };
+    let hosts: Vec<&str> = host.split(',').filter(|part| !part.is_empty()).collect();
+    let ports: Vec<&str> = port
+        .as_deref()
+        .map(|p| p.split(',').filter(|part| !part.is_empty()).collect())
+        .unwrap_or_default();
+    if hosts.is_empty() {
+        return "false".to_owned();
     }
-    terms.join(" AND ")
+    let any_host = || {
+        hosts
+            .iter()
+            .map(|h| equals("HOST", h))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+    // libpq pairs a multi-host list with a multi-port list POSITIONALLY, and
+    // broadcasts a single port to every host. Measured on 16.13:
+    // `host=127.0.0.9,127.0.0.1&port=5433,5434` connected to 5434 — the port
+    // belonging to the host it reached, not the first in the list — and
+    // `host=127.0.0.9,127.0.0.1&port=5433` connected to 5433. So `a:5433` is NOT
+    // an endpoint `host=a,b&port=5432,5433` names, and matching host and port
+    // independently would accept a retained connection to one.
+    let endpoint = match (ports.len(), hosts.len()) {
+        (0, _) => any_host(),
+        (1, _) => format!("({}) AND {}", any_host(), equals("PORT", ports[0])),
+        (p, h) if p == h => hosts
+            .iter()
+            .zip(&ports)
+            .map(|(host, port)| format!("({} AND {})", equals("HOST", host), equals("PORT", port)))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+        // libpq refuses this outright — measured, `could not match 3 port
+        // numbers to 2 hosts` — so the run could not have connected either.
+        _ => return "false".to_owned(),
+    };
+    format!("{database_is} AND ({endpoint})")
 }
 
 /// Those terms as the psql conditional each target's transaction opens with.
@@ -5628,8 +5649,8 @@ mod tests {
         // The operator's endpoint, which is what `\connect` acted on — NOT the
         // 5434 the server behind that forward reports for itself.
         assert!(
-            probe.contains(":'PORT' OPERATOR(pg_catalog.=) ANY (ARRAY['25433']")
-                && probe.contains(":'HOST' OPERATOR(pg_catalog.=) ANY (ARRAY['127.0.0.1']")
+            probe.contains(":'PORT' OPERATOR(pg_catalog.=) '25433'")
+                && probe.contains(":'HOST' OPERATOR(pg_catalog.=) '127.0.0.1'")
                 && probe.contains(":'DBNAME' OPERATOR(pg_catalog.=) 'dry_t2'"),
             "every stated component must be pinned to psql's own value: {probe}"
         );
@@ -5660,7 +5681,7 @@ mod tests {
             .find(|l| l.contains("\\gset"))
             .expect("the probe must be emitted");
         assert!(
-            probe.contains(":'HOST' OPERATOR(pg_catalog.=) ANY (ARRAY['db.internal']")
+            probe.contains(":'HOST' OPERATOR(pg_catalog.=) 'db.internal'")
                 && probe.contains(":'DBNAME' OPERATOR(pg_catalog.=) 'app'"),
             "what the conninfo does state is still pinned: {probe}"
         );
@@ -5676,28 +5697,72 @@ mod tests {
                 .find(|l| l.contains("\\gset"))
                 .expect("the probe must be emitted");
         assert!(
-            overridden.contains(":'PORT' OPERATOR(pg_catalog.=) ANY (ARRAY['6000']"),
+            overridden.contains(":'PORT' OPERATOR(pg_catalog.=) '6000'"),
             "the query pair wins over the authority: {overridden}"
         );
     }
 
-    /// A failover list is membership, not a string to match verbatim.
+    /// A failover list is matched the way libpq resolves it: positionally.
     ///
-    /// libpq takes comma-separated lists in `host` and `port`, and psql's
-    /// `:HOST`/`:PORT` name the ONE server it selected — measured, a connection
-    /// made with `?host=127.0.0.9,127.0.0.1` reports `HOST=127.0.0.1`. Comparing
-    /// the list verbatim made a CORRECT paste skip its own block and every later
-    /// target with it: measured end to end, 83 statements reported `query
-    /// ignored` and the database stayed at 200 rows.
+    /// Measured on `PostgreSQL` 16.13, `host=127.0.0.9,127.0.0.1&port=5433,5434`
+    /// connected to 5434 — the port belonging to the host it reached, not the
+    /// first in the list — and `host=127.0.0.9,127.0.0.1&port=5433` connected to
+    /// 5433. So `a:5433` is not an endpoint `host=a,b&port=5432,5433` names, and
+    /// matching host and port independently would accept a retained connection
+    /// to one that was never configured.
     #[test]
-    fn a_failover_list_is_matched_by_membership() {
-        let probe = super::psql_connection_terms(
-            "postgres://postgres@127.0.0.9,127.0.0.1:5433/dry_t1",
-            "dry_t1",
+    fn a_failover_list_keeps_its_host_port_pairing() {
+        let paired = super::psql_connection_terms(
+            "postgres://postgres@a.example/app?host=a.example,b.example&port=5432,5433",
+            "app",
         );
         assert!(
-            probe.contains(":'HOST' OPERATOR(pg_catalog.=) ANY (ARRAY['127.0.0.9', '127.0.0.1']"),
-            "every host libpq may select must satisfy the proof: {probe}"
+            paired.contains(
+                "(:'HOST' OPERATOR(pg_catalog.=) 'a.example' AND :'PORT' OPERATOR(pg_catalog.=) '5432')"
+            ) && paired.contains(
+                "(:'HOST' OPERATOR(pg_catalog.=) 'b.example' AND :'PORT' OPERATOR(pg_catalog.=) '5433')"
+            ),
+            "each host must carry its OWN port: {paired}"
+        );
+        // A single port applies to every host, which libpq does and this must
+        // not turn into a refusal.
+        let broadcast = super::psql_connection_terms(
+            "postgres://postgres@a.example/app?host=a.example,b.example&port=5432",
+            "app",
+        );
+        assert!(
+            broadcast.contains(":'HOST' OPERATOR(pg_catalog.=) 'a.example'")
+                && broadcast.contains(":'HOST' OPERATOR(pg_catalog.=) 'b.example'")
+                && broadcast.matches(":'PORT'").count() == 1,
+            "one port must cover every host: {broadcast}"
+        );
+        // libpq refuses a length mismatch outright — measured, `could not match
+        // 3 port numbers to 2 hosts` — so the run could not have connected
+        // either. Fail closed rather than invent a pairing.
+        let mismatched = super::psql_connection_terms(
+            "postgres://postgres@a.example/app?host=a.example,b.example&port=1,2,3",
+            "app",
+        );
+        assert_eq!(
+            mismatched, "false",
+            "a pairing libpq itself rejects must not be guessed at: {mismatched}"
+        );
+    }
+
+    /// A conninfo stating no host cannot be proved, so it proves nothing.
+    ///
+    /// Unreachable today: a URI with an empty authority fails
+    /// `password_free_conninfo`, and the run refuses to print such a target
+    /// before this is reached — measured for both `postgres:///app` and
+    /// `postgres://user@/app`. Pinned here anyway, because omitting the host
+    /// term instead would leave the database name standing alone against a
+    /// physical clone that shares it.
+    #[test]
+    fn a_conninfo_without_a_host_proves_nothing() {
+        assert_eq!(
+            super::psql_connection_terms("postgres:///app", "app"),
+            "false",
+            "the one discriminator this proof exists for cannot be optional"
         );
     }
 

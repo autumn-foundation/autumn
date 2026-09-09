@@ -552,9 +552,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   components a conninfo STATES are asserted: `PGPORT` can differ between the
   machine that planned the run and the one pasting the script, so a guessed
   default would refuse a correct paste, and an omitted component cannot be what
-  distinguishes two targets anyway — and a comma-separated FAILOVER list is
-  matched by membership, since psql's `:HOST`/`:PORT` name the single server it
-  selected (measured: `?host=127.0.0.9,127.0.0.1` reports `HOST=127.0.0.1`).
+  distinguishes two targets anyway. A comma-separated FAILOVER list is matched
+  the way libpq resolves it, since psql's `:HOST`/`:PORT` name the single server
+  it selected (measured: `?host=127.0.0.9,127.0.0.1` reports `HOST=127.0.0.1`):
+  host and port are paired POSITIONALLY, with a single port broadcast to every
+  host. Measured on 16.13 — `host=127.0.0.9,127.0.0.1&port=5433,5434` connected
+  to 5434, the port belonging to the host it reached, and the same hosts with
+  `port=5433` connected to 5433 — so `a:5433` is not an endpoint
+  `host=a,b&port=5432,5433` names, and matching the two independently would have
+  accepted a retained connection to one that was never configured. A length
+  mismatch libpq itself rejects (`could not match 3 port numbers to 2 hosts`)
+  proves nothing rather than inventing a pairing. A conninfo stating no host
+  proves nothing either — unreachable, since an empty authority is already
+  refused as an unprintable target, but stated rather than left to that distant
+  refusal, because omitting the host term would leave the database name standing
+  alone against a physical clone that shares it.
   The compaction pass carries the same proof, not the endpoint alone: it is a
   second `\connect` with the same retained-connection failure, and a
   `VACUUM (FULL)` on the wrong target locks and rewrites every table it names.
