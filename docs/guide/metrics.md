@@ -251,22 +251,80 @@ metrics::counter("checkout_completed_total")
 > as structured log fields: see [Logging and PII](logging-pii.md).
 
 The facade enforces hard caps so a mistake degrades the metric instead of the
-process:
+process. The three that bound **cardinality** are configurable; the rest are
+fixed:
 
-| Limit                             | Value          | On overflow                                      |
-| --------------------------------- | -------------- | ------------------------------------------------ |
-| **Labeled** series per instrument | 100            | Samples with a new label set dropped and counted |
-| Instruments in the registry       | 256            | Further new names get an inert handle            |
-| Labels per series                 | 8              | Extra labels dropped, sample still recorded      |
-| Label value length                | 128 characters | Truncated                                        |
-| Metric name length                | 128 bytes      | **Rejected** — inert handle, never truncated     |
-| Label name length                 | 128 bytes      | Label dropped, sample still recorded             |
-| Help text length                  | 512 characters | Truncated                                        |
+| Limit                             | Default        | Configurable                            | On overflow                                      |
+| --------------------------------- | -------------- | --------------------------------------- | ------------------------------------------------ |
+| **Labeled** series per instrument | 100            | `[metrics] max_series_per_metric`       | Samples with a new label set dropped and counted |
+| Instruments in the registry       | 256            | `[metrics] max_instruments`             | Further new names get an inert handle            |
+| Labels per series                 | 8              | `[metrics] max_labels_per_series`       | Extra labels dropped, sample still recorded      |
+| Label value length                | 128 characters | no                                      | Truncated                                        |
+| Metric name length                | 128 bytes      | no                                      | **Rejected** — inert handle, never truncated     |
+| Label name length                 | 128 bytes      | no                                      | Label dropped, sample still recorded             |
+| Help text length                  | 512 characters | no                                      | Truncated                                        |
 
 The unlabeled series — what a handle with no `with_label` call records into — is
 separate and does not count against the 100. Names are rejected rather than
 truncated, because two names sharing a 128-byte prefix would otherwise silently
 become one metric.
+
+### Raising a cap
+
+The line between "a label-cardinality mistake" and "a large but deliberate
+label space" is a property of the app, not of the framework, so the three
+cardinality caps come from `autumn.toml`:
+
+```toml
+[metrics]
+max_series_per_metric = 500
+max_instruments = 512
+max_labels_per_series = 12
+```
+
+Each key also takes the usual environment override —
+`AUTUMN_METRICS__MAX_SERIES_PER_METRIC`, `AUTUMN_METRICS__MAX_INSTRUMENTS`,
+`AUTUMN_METRICS__MAX_LABELS_PER_SERIES`. An out-of-range value (`0`, or above
+the ceiling of 100 000 / 100 000 / 64) fails the boot and `autumn check`,
+naming the key — it is not clamped, because a cap of `0` would silently drop
+every labeled sample the app records.
+
+Two things to know before raising one:
+
+- **A retained series is never evicted**, so `max_series_per_metric` bounds
+  *permanent* memory. Raise it because the app's label space is genuinely
+  larger — a hundred routes, say — not to quiet
+  `autumn_metrics_series_dropped_total`. If the label value is a user id, a
+  URL, or an error string, the cap is not the problem.
+- **`max_labels_per_series` changes series identity.** The same twelve labels
+  canonicalize to a different key under a cap of 8 than under 12, so changing
+  it splits an instrument's history in two. Set it before the app ships, not
+  in response to a graph.
+
+The caps that are *not* configurable are the ones protecting the exposition
+format rather than memory: name, label-value and help-text lengths, and bucket
+count. Raising those would not let an app express anything new — only emit a
+scrape body a stricter parser may reject.
+
+`[metrics]` is applied by `AppBuilder::run`, before it builds anything. The
+effective values are readable at runtime through
+`autumn_web::metrics::max_series_per_metric()` and its two siblings, and appear
+on `/actuator/configprops`.
+
+Code in `main` that runs *ahead* of `.run()` therefore sees the defaults.
+`describe_*` and `set_histogram_buckets` are unaffected — they only stash, and
+their staging areas are bounded generously rather than by the running cap
+precisely so the startup pattern above keeps working when you raise
+`max_instruments`. But a metric actually **recorded** before `.run()` registers
+under the default 256, and an inert handle handed out then stays inert.
+
+If your app records more than 256 distinct metric names before its own `run`,
+you need **both**: call `metrics::set_limits` before recording, *and* set the
+same (or a larger) `max_instruments` in `[metrics]`. `run` installs the
+configured section unconditionally — `autumn.toml` is the authority — so
+setting only the former puts the default back at startup, and every metric
+name registered after that is refused against a registry already over the
+restored cap.
 
 Hitting the series cap logs **one** warning per instrument and is visible in the
 scrape itself, so you can alert on it:
@@ -412,8 +470,9 @@ Assert with `contains()` on those unique names — never on whole-body equality 
 line counts of the scrape output, which also carries built-in families and
 anything a concurrent test recorded.
 
-Those names are never reclaimed and they share the process-wide 256-instrument
-budget with every other test in the same binary. A handful per test is fine; a
+Those names are never reclaimed and they share the process-wide instrument
+budget (256 by default, `[metrics] max_instruments`) with every other test in
+the same binary. A handful per test is fine; a
 loop that registers hundreds will exhaust the registry for whatever runs after
 it. Cap the loop, or reuse one name with different labels — that cap is
 per-instrument.

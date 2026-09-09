@@ -229,6 +229,10 @@ mail.transport
 mail.unsubscribe_base_url
 mail.unsubscribe_mailto
 mail.unsubscribe_token_ttl_days
+metrics
+metrics.max_instruments
+metrics.max_labels_per_series
+metrics.max_series_per_metric
 observability
 observability.server_timing
 openapi
