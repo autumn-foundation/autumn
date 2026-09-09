@@ -3851,6 +3851,111 @@ async fn a_restore_keeps_each_file_with_its_uploader() {
     );
 }
 
+/// Restoring a disabled plugin's taxonomy keeps its hierarchy.
+///
+/// The export now carries the terms of a plugin that was disabled when the
+/// backup was taken. Restoring one while that plugin is *still* disabled read
+/// "not registered" as "has no hierarchy" and dropped every parent — and
+/// re-enabling the plugin afterwards found the taxonomy permanently flattened,
+/// because a second import only re-parents rows it created itself.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restoring_an_unregistered_taxonomy_keeps_its_hierarchy() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A file describing a nested taxonomy nothing registers. Slugs no other
+    // test uses: the registry is process-global.
+    let payload = serde_json::json!({
+        "version": 5,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "attachments": [],
+        "posts": [],
+        "terms": [
+            {
+                "taxonomy": "dozing-plugin", "name": "Parent", "slug": "dozing-parent",
+                "description": "", "parent": null
+            },
+            {
+                "taxonomy": "dozing-plugin", "name": "Child", "slug": "dozing-child",
+                "description": "", "parent": "dozing-parent"
+            }
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, &payload).await.assert_ok();
+
+    let (child_parent, parent_id): (Option<i64>, i64) = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let child_parent = RunQueryDsl::first(
+            {{crate_name}}::schema::terms::table
+                .filter({{crate_name}}::schema::terms::slug.eq("dozing-child"))
+                .select({{crate_name}}::schema::terms::parent_id),
+            &mut conn,
+        )
+        .await
+        .expect("the child");
+        let parent_id = RunQueryDsl::first(
+            {{crate_name}}::schema::terms::table
+                .filter({{crate_name}}::schema::terms::slug.eq("dozing-parent"))
+                .select({{crate_name}}::schema::terms::id),
+            &mut conn,
+        )
+        .await
+        .expect("the parent");
+        (child_parent, parent_id)
+    };
+    assert_eq!(
+        child_parent,
+        Some(parent_id),
+        "only the file knows the shape of a taxonomy nothing registers, so the \
+         file is what to believe"
+    );
+
+    // And a registered *flat* taxonomy is still refused a parent — the rule
+    // that check exists for is intact.
+    let flat = serde_json::json!({
+        "version": 5,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "attachments": [],
+        "posts": [],
+        "terms": [
+            {
+                "taxonomy": "post_tag", "name": "Rust", "slug": "rust",
+                "description": "", "parent": null
+            },
+            {
+                "taxonomy": "post_tag", "name": "Async", "slug": "async",
+                "description": "", "parent": "rust"
+            }
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, &flat).await.assert_ok();
+    let tag_parent: Option<i64> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::terms::table
+                .filter({{crate_name}}::schema::terms::slug.eq("async"))
+                .select({{crate_name}}::schema::terms::parent_id),
+            &mut conn,
+        )
+        .await
+        .expect("the tag")
+    };
+    assert_eq!(
+        tag_parent, None,
+        "a registered flat taxonomy still refuses a parent, whatever a file says"
+    );
+}
+
 /// A backup carries content whose plugin is not registered right now.
 ///
 /// A plugin that is disabled when the backup is taken leaves its posts and
@@ -3901,6 +4006,38 @@ async fn a_backup_carries_content_of_an_unregistered_type() {
     );
     // The registered content is still there too.
     assert!(payload.contains("Ordinary"));
+
+    // And it restores. Carrying content the importer then refuses would be a
+    // backup that can be produced and never used — the export half of this fix
+    // is only half of it.
+    let fresh = db_client().await;
+    let cookie = register(&fresh, "owner").await;
+    import_export(&fresh, &cookie, &payload).await.assert_ok();
+
+    let (body, term): (String, i64) = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let body = RunQueryDsl::first(
+            {{crate_name}}::schema::posts::table
+                .filter({{crate_name}}::schema::posts::post_type.eq("dormant-plugin"))
+                .select({{crate_name}}::schema::posts::body),
+            &mut conn,
+        )
+        .await
+        .expect("the restored post");
+        let term = RunQueryDsl::get_result(
+            {{crate_name}}::schema::terms::table
+                .filter({{crate_name}}::schema::terms::taxonomy.eq("dormant-taxonomy"))
+                .count(),
+            &mut conn,
+        )
+        .await
+        .expect("the count");
+        (body, term)
+    };
+    assert_eq!(body, "Still here.", "the content comes back");
+    assert_eq!(term, 1, "and so does the taxonomy that described it");
 }
 
 /// A term whose taxonomy is no longer registered is not linked.

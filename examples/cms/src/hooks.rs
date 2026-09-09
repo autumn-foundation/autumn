@@ -187,10 +187,25 @@ pub fn validate_comment(new: &mut NewComment) -> AutumnResult<()> {
 /// transaction as the insert — which means this validation has to be reachable
 /// from outside the hook.
 pub fn normalize_new_post(new: &mut NewPost) -> AutumnResult<()> {
+    normalize_post(new, false)
+}
+
+/// Normalize a post a *file* describes.
+///
+/// Identical except that an unregistered post type is accepted, for the reason
+/// [`normalize_imported_term`] accepts an unregistered taxonomy: a backup
+/// carries the content of a plugin that was disabled when it was taken, and
+/// refusing it here would mean such a backup could be produced and never
+/// restored.
+pub fn normalize_imported_post(new: &mut NewPost) -> AutumnResult<()> {
+    normalize_post(new, true)
+}
+
+fn normalize_post(new: &mut NewPost, imported: bool) -> AutumnResult<()> {
     if new.post_type.trim().is_empty() {
         new.post_type = "post".to_owned();
     }
-    if crate::content_types::find_post_type(&new.post_type).is_none() {
+    if !imported && crate::content_types::find_post_type(&new.post_type).is_none() {
         return Err(AutumnError::bad_request_msg(format!(
             "Unknown post type `{}`",
             new.post_type
@@ -348,20 +363,40 @@ pub fn validate_post_update(before: &Post, after: &mut Post) -> AutumnResult<()>
 /// through direct Diesel, and therefore never reaches
 /// `TermHooks::before_create`.
 pub fn normalize_new_term(new: &mut NewTerm) -> AutumnResult<()> {
+    normalize_term(new, false)
+}
+
+/// Normalize a term a *file* describes.
+///
+/// Identical except that an unregistered taxonomy is accepted. A backup carries
+/// the terms of a plugin that was disabled when it was taken, so on this path
+/// "not registered" describes the process, not the file — refusing would make
+/// such a backup unrestorable, which is the opposite of what a backup is for.
+/// A client naming a taxonomy that does not exist is still confused, so the
+/// interactive paths keep the refusal.
+pub fn normalize_imported_term(new: &mut NewTerm) -> AutumnResult<()> {
+    normalize_term(new, true)
+}
+
+fn normalize_term(new: &mut NewTerm, imported: bool) -> AutumnResult<()> {
     if new.taxonomy.trim().is_empty() {
         new.taxonomy = "category".to_owned();
     }
-    let Some(taxonomy) = crate::content_types::find_taxonomy(&new.taxonomy) else {
-        return Err(AutumnError::bad_request_msg(format!(
-            "Unknown taxonomy `{}`",
-            new.taxonomy
-        )));
-    };
-    // A flat taxonomy has no hierarchy to put a term in. Silently dropping
-    // the parent is friendlier than a 400 here: the field simply does not
-    // exist for tags, so a client that sends one is confused, not hostile.
-    if !taxonomy.hierarchical {
-        new.parent_id = None;
+    match crate::content_types::find_taxonomy(&new.taxonomy) {
+        // A flat taxonomy has no hierarchy to put a term in. Silently dropping
+        // the parent is friendlier than a 400 here: the field simply does not
+        // exist for tags, so a client that sends one is confused, not hostile.
+        Some(taxonomy) if !taxonomy.hierarchical => new.parent_id = None,
+        Some(_) => {}
+        // Unregistered: unknown, not flat. Only the file knows the shape of a
+        // taxonomy this process has never heard of, so the parent stands.
+        None if imported => {}
+        None => {
+            return Err(AutumnError::bad_request_msg(format!(
+                "Unknown taxonomy `{}`",
+                new.taxonomy
+            )));
+        }
     }
 
     new.slug = if new.slug.trim().is_empty() {

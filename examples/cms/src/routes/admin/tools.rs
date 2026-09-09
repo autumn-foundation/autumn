@@ -1149,7 +1149,13 @@ pub async fn import(
                             draft.parent_id = None;
                         }
                     }
-                    let created = content::insert_post_with_unique_slug(conn, draft).await?;
+                    // The import variant: a file can name a post type this
+                    // process does not register, because the plugin that
+                    // defined it may be disabled right now. The export already
+                    // carries that content; refusing it here would make such a
+                    // backup unrestorable.
+                    let created =
+                        content::insert_imported_post_with_unique_slug(conn, draft).await?;
                     content::record_import_source(conn, created.id, &source_slug).await?;
                     content::set_post_terms(conn, created.id, term_ids).await?;
                     if wanted_status != "draft" {

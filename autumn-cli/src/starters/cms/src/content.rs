@@ -4181,8 +4181,33 @@ pub async fn insert_post_with_unique_slug(
     conn: &mut AsyncPgConnection,
     new: crate::models::NewPost,
 ) -> AutumnResult<Post> {
+    insert_with_unique_slug(conn, new, false).await
+}
+
+/// The same insert for a post a *file* describes.
+///
+/// Differs only in accepting an unregistered post type — see
+/// [`crate::hooks::normalize_imported_post`]. A backup carries the content of a
+/// plugin that was disabled when it was taken, and refusing it on the way back
+/// in would mean such a backup could be produced and never restored.
+pub async fn insert_imported_post_with_unique_slug(
+    conn: &mut AsyncPgConnection,
+    new: crate::models::NewPost,
+) -> AutumnResult<Post> {
+    insert_with_unique_slug(conn, new, true).await
+}
+
+async fn insert_with_unique_slug(
+    conn: &mut AsyncPgConnection,
+    new: crate::models::NewPost,
+    imported: bool,
+) -> AutumnResult<Post> {
     let mut new = new;
-    crate::hooks::normalize_new_post(&mut new)?;
+    if imported {
+        crate::hooks::normalize_imported_post(&mut new)?;
+    } else {
+        crate::hooks::normalize_new_post(&mut new)?;
+    }
     let desired = new.slug.clone();
 
     for _ in 0..5 {
@@ -4459,7 +4484,7 @@ pub async fn import_terms(
                 description: term.description.clone(),
                 parent_id: None,
             };
-            crate::hooks::normalize_new_term(&mut draft)?;
+            crate::hooks::normalize_imported_term(&mut draft)?;
             guard_term_path(&draft.taxonomy, &draft.slug)?;
             drafts.push(draft);
         }
@@ -4487,12 +4512,22 @@ pub async fn import_terms(
             let Some(parent_slug) = &term.parent else {
                 continue;
             };
-            // A flat taxonomy has no hierarchy to put a term in. The hook says
-            // so on the create path; the direct `UPDATE` below has to say it
-            // too, or the importer becomes the one way to give a tag a parent.
-            if !crate::content_types::find_taxonomy(&draft.taxonomy)
-                .is_some_and(|registered| registered.hierarchical)
-            {
+            // A *registered flat* taxonomy has no hierarchy to put a term in.
+            // The hook says so on the create path; the direct `UPDATE` below
+            // has to say it too, or the importer becomes the one way to give a
+            // tag a parent.
+            //
+            // An *unregistered* taxonomy is a different answer: unknown, not
+            // flat. Now that a backup carries the terms of a plugin that was
+            // disabled when it was taken, restoring one while that plugin is
+            // still disabled would read "not registered" as "has no hierarchy"
+            // and drop every parent — and re-enabling the plugin afterwards
+            // would find the taxonomy permanently flattened, because a second
+            // import only re-parents rows *it* created. Only the file knows
+            // what shape that taxonomy has, so the file is what to believe.
+            let flat = crate::content_types::find_taxonomy(&draft.taxonomy)
+                .is_some_and(|registered| !registered.hierarchical);
+            if flat {
                 continue;
             }
             let parent_slug = autumn_web::slugify(parent_slug);
