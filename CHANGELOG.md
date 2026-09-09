@@ -570,7 +570,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directories, and `data_directory` is server-local — two containers each
   answering `/var/lib/postgresql/data` match on it while being different
   databases. Connect over TCP, where the address and port identify the endpoint,
-  or run without `--dry-run`.
+  or run without `--dry-run`. The guide states that requirement under its own
+  heading instead of walking through a socket guard the refusal now makes
+  unreachable.
   A purged partition leaf whose outgoing key points into a subsetted table now
   records that the purge must run BEFORE the sample, the mirror of the deferral
   the same path already recorded. Without it, another edge deferring the very

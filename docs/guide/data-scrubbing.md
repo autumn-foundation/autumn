@@ -454,39 +454,39 @@ untouched. Both are compared with `IS DISTINCT FROM`, because the server reports
 neither over a Unix socket and `NULL <> NULL` would let the check pass by
 failing to be false.
 
-Identity also carries the cluster's `system_identifier`. Address and port are
-NULL for *every* Unix-socket connection, so two socket clusters holding the same
-database name look identical by them — measured, both reported `<null>/<null>`
-while their identifiers differed. It is generated at initdb, survives the socket
-path, and an ordinary `LOGIN` role can read it.
+### `--dry-run` needs a TCP target
 
-It is not identity on its own, though: a **physical copy** of a cluster carries
-the identifier of the cluster it was cloned from, so a production primary and a
-promoted staging clone of it report the same one. Measured against a
-`pg_basebackup` clone of a live cluster, both reached over `/tmp`, the guard saw
-the same database name, the same identifier and `<null>/<null>` on both sides.
-So identity also carries the server's configured `port` — which answers over a
-socket, where `inet_server_port()` is NULL — and its `data_directory`, the value
-two postmasters on one machine cannot share:
+The address and port are what identify an endpoint, and a Unix socket has
+neither. So `--dry-run` **refuses** to print a script for a socket target at all,
+before printing a single line:
 
-```
-ERROR:  this block is for app at <NULL>:<NULL> (cluster 7682669380557907941, port 5435,
-        data directory /tmp/pgd3), but the session is on app at <NULL>:<NULL>
-        (cluster 7682669380557907941, port 5433, data directory /tmp/pgd)
+```text
+✗ `--dry-run` cannot print a runnable script for 1 target(s):
+    - control
+  These are reached over a Unix socket, where the server reports no address and
+  no port — and nothing else it reports identifies the instance either. ...
 ```
 
-`data_directory` is restricted to `pg_read_all_settings`. The guard reads it out
-of `pg_settings` rather than with `current_setting`, because that view simply
-omits the row for a role without the privilege while `current_setting` raises
-`permission denied to examine ...` — which, inside the guard, would abort a
-*correct* paste. Both sides then compare `NULL`, so an ordinary role loses that
-one discriminator rather than the run, and still refuses the clone above on the
-port alone (verified with a plain `LOGIN` role).
+Nothing else the server reports can stand in. The cluster's `system_identifier`
+is generated at initdb and an ordinary `LOGIN` role can read it, but a
+**physical copy** carries the identifier of the cluster it was cloned from:
+measured against a `pg_basebackup` clone of a live cluster, both reached over
+`/tmp`, the guard saw the same database name, the same identifier and
+`<null>/<null>` on both sides. The server's configured `port` does answer over a
+socket, but two clusters on different socket directories can share one — measured
+on two clusters both on 5433, the clone's script pasted at its origin passed a
+port-based guard, committed, and took the **origin** from 200 users to 25. And
+`data_directory` is server-*local*: two containers each answering
+`/var/lib/postgresql/data` match on it while being different databases. It is
+also restricted to `pg_read_all_settings`, so an ordinary role reads NULL for it
+and loses even that.
 
-What remains is a copy running on a *different machine* at the same port and
-data directory. A pasted script reaches a Unix socket only on the machine it is
-pasted on, so that case needs the operator to paste on a host other than the one
-they configured the target for.
+Three narrower guards were each defeated by the next topology. That is the shape
+of a value that does not exist rather than one not yet found, so the refusal
+covers every socket target rather than trying a fourth. Configure the target over
+TCP to use `--dry-run` on it; scrubbing a socket target *without* `--dry-run` is
+unaffected, because the command holds its own connection and never has to prove
+which one it is.
 
 Every value is asked of the target connection while the run plans, never
 parsed out of its URL: libpq defaults an omitted database name to the user name,
