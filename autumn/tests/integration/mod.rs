@@ -63,6 +63,9 @@ mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
+#[cfg(feature = "acme")]
+mod custom_domain_issuance;
+mod custom_domains;
 mod custom_layer;
 #[cfg(feature = "db")]
 mod data_classification;
@@ -262,6 +265,7 @@ mod rate_limit_pipeline;
 mod rate_limit_principal;
 #[cfg(feature = "redis")]
 mod rate_limit_redis_integration;
+mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;

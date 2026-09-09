@@ -229,6 +229,9 @@ fn build_harness(
         renew_before_days: 1,
         ca_root_path: Some(root_path),
         dns: None,
+        // This suite drives the deployment's OWN certificate against a real
+        // CA; tenant custom domains (#1635) have their own suite.
+        custom_domains: None,
     };
     config
         .validate()

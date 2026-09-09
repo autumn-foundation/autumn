@@ -215,6 +215,446 @@ scrub should do behind a one-word config key. Schema bookkeeping
 
 ---
 
+## Sampling: a laptop-sized subset
+
+A scrubbed copy of a 400 GB production database is still 400 GB. `--sample`
+emits a **referentially-intact subset** in the same pass, so what you carry away
+is small *and* anonymized:
+
+```sh
+# 1% of users, plus everything those users relate to, scrubbed.
+autumn db scrub --sample users=1%
+
+# An absolute count instead, and two roots in one run.
+autumn db scrub --sample users=500 --sample orders=2000
+```
+
+The amount applies **per target**: with shards configured, `--sample orders=500`
+selects up to 500 rows from each database, not 500 across the topology.
+
+Sampling is a phase of the scrub, never a command of its own: the subset and the
+rewrites commit in one transaction, so there is no flag combination that emits
+sampled-but-unscrubbed rows.
+
+### How rows are chosen
+
+You name the **roots**. Everything else follows the foreign key graph the
+database itself reports:
+
+- **Descend** — rows that reference a selected row are selected too, and they
+  carry their own children in turn. That is what "1% of users plus all their
+  data" means.
+- **Ascend** — rows a selected row references are selected, so every foreign key
+  resolves. Those rows are *not* descended from, which is what stops one shared
+  parent (an org, a plan) from dragging its whole subtree back in. The other
+  children of that org are therefore unreachable, and the run says so rather
+  than emptying them.
+
+### Per-table rules
+
+Two rules live alongside the PII declaration, in the same `scrub.toml`:
+
+```toml
+[sample]
+# Reference data: copied whole, and never descended from.
+always_include = ["countries", "currencies", "plans"]
+# Excluded entirely — the subset is not the place for an audit trail.
+never_include = ["audit_logs", "request_logs"]
+```
+
+### Deterministic
+
+Row selection is ordered by a hash of `--seed` and the row's primary key — not
+by physical order, and not by `random()`. The same seed against the same source
+data selects the identical rows, so a teammate can rebuild the exact subset that
+exhibits a bug:
+
+```sh
+autumn db scrub --sample users=1% --seed 20260101
+```
+
+The seed defaults to `0`, so a run is reproducible whether or not you pass one.
+
+That guarantee holds across operators, not just across repeats on one machine.
+The key is hashed from its text rendering, and several session settings change
+what that rendering is — `DateStyle` for a `date` or `timestamp` key,
+`bytea_output`, `extra_float_digits`, `IntervalStyle`, `TimeZone`,
+`lc_monetary` for a `money` key — so the scrub pins all of them for its own
+transaction. Without that, the same seed over the
+same `date` primary key selects a different subset under `DateStyle = ISO, YMD`
+than under `Postgres, DMY`, and neither operator has any way to tell.
+
+### Fail-closed, same as the classification
+
+Sampling refuses before it deletes anything when it cannot prove the result:
+
+- a table **no root can reach** through the graph (it would be emptied without
+  saying so) — name it as a root, or declare it `always_include` /
+  `never_include`. Being connected to a root is not enough: the walk descends
+  only out of a root and out of the tables it descended into, so a table hanging
+  off one it merely *ascended* into (that shared org), or off an
+  `always_include` lookup table, is not reachable;
+- a foreign key pointing **into** a `never_include` table, which would dangle;
+- a table with **no primary key**, which has no row identity to select on;
+- a **reference cycle** between tables the sample removes rows from, where those
+  removals have no order that keeps every constraint satisfied (copying one of
+  them whole with `always_include` takes it out of the removals and breaks the
+  cycle);
+- a **framework-owned table referencing a sampled one** — those rows are outside
+  the sample, so empty them in the same run with `[framework] purge`;
+- a **retained table referencing a purged one** — the mirror image. A purge of a
+  framework table normally runs before the sample, so that the case above holds;
+  when a table the sample *empties* references it, the purge waits until after
+  the sample instead. But when a table whose rows the sample *keeps* references
+  it, no order works and the run refuses: stop purging that table, or drop the
+  referencing one with `never_include`;
+- a **purge needed both before and after the sample**: one framework table that
+  references a subsetted table (so its purge must run first) *and* is referenced
+  by a table the sample empties (so its purge must run last). The only valid
+  order interleaves the sample's own deletes around the purge, which one atomic
+  sample between two purge passes cannot express;
+- **legacy `INHERITS` table inheritance** anywhere in `public`. A declarative
+  partition the sample models through its parent on purpose; an inheritance
+  child is an ordinary table it would plan separately, while `DELETE FROM
+  parent` reaches the child's rows anyway — the statements are not written `ONLY
+  parent` — so the two would delete each other's selections. A scrub *without*
+  `--sample` is unaffected and still runs;
+- a **foreign key declared on a partition** rather than on its partitioned
+  parent. The sample plays a partition's rows through that parent, whose rows
+  span every partition, so it cannot honour a key binding one partition alone.
+  Declare the key on the partitioned parent — Postgres then clones it to each
+  partition, and the clone is followed through the parent as usual.
+
+A root asked for exactly `100%` keeps every row, so it counts as removing none:
+a framework table referencing it is not refused, and it carries no delete-order
+constraint. It still descends, which is the point — `users=100%` keeps every user
+and subsets what hangs off them.
+
+`autumn db scrub --check --sample users=1%` proves the plan is complete and
+writes nothing — run it in CI next to the classification check. The foreign key
+re-count below is an apply-time check, so `--check` does not run it.
+
+### What it reports
+
+Every run prints per-table row counts, the total against the source, and the
+size after the subsetted tables are compacted:
+
+```text
+  ℹ Sampling control from users 1%, seed 0 — the same seed against the same source selects the identical rows.
+  ── control: sampled rows ──
+    users: 1000000 → 10000 row(s) (1.0%, root)
+    comments: 4820113 → 48221 row(s) (1.0%, related)
+    countries: 249 → 249 row(s) (100.0%, always-include)
+    audit_logs: 91002881 → 0 row(s) (0.0%, never-include)
+    Total: 96823243 → 58470 row(s) (0.1% of the source), settled in 3 pass(es).
+  ✓ 14 foreign key(s) re-verified — every reference in the subset resolves.
+    Table size: 402.1 GB → 1.4 GB (0.3% of the source).
+```
+
+`[framework] purge` and `[sample] never_include` both empty their tables **again
+after the column rewrites**, and that final pass is the one the guarantee rests
+on. Earlier passes exist only to
+make the sample's deletes possible; a trigger on a scrubbed table — an audit or
+history trigger copying `OLD` values — can write fresh rows carrying the original
+PII into either kind of table while the rewrites run, long after those. Both
+settings promise the same thing — this table ends up empty — so both are enforced
+last. (The scrub
+still warns when a table it writes to carries user-defined triggers: emptying the
+destination cannot help a trigger that writes somewhere the purge list does not
+name.)
+
+Running that pass last has a cost, and it is a **refusal** rather than a
+warning. Its own `DELETE`s fire after every column rewrite, so an archive
+trigger on a purged or `never_include` table can copy the rows it is removing
+into an ordinary classified table that has already been scrubbed — putting real
+values into a table the run reports as clean, and into any `--output` artifact.
+No ordering avoids it (the trigger graph decides, and can be cyclic) and no
+postcondition catches it (a trigger body can write anywhere), so a `DELETE`
+trigger — or an `ON DELETE` rewrite rule, which reaches the same destinations
+through `pg_rewrite` rather than `pg_trigger` — on a table the run empties is
+refused before anything is written, by `--check` and `--dry-run` too. Drop or disable the trigger on the copy
+(`ALTER TABLE audit_logs DISABLE TRIGGER audit_archive`) and the run proceeds —
+a disabled trigger cannot fire, so it does not hold the refusal. The check
+follows `pg_inherits` down, too: `DELETE FROM parent` fires a trigger declared
+on a leaf partition, so a trigger anywhere below an emptied table refuses it.
+
+After that pass, every promised-empty table is **counted**, and a run that finds
+rows in one aborts. Ordering the removals cannot rule this out: each `DELETE`
+fires triggers, and one of those can insert into a table an earlier `DELETE`
+already emptied — an `ON DELETE` archive trigger between two promised-empty
+tables does exactly that, and the trigger graph can be cyclic. So the promise is
+checked rather than arranged, the same way the foreign keys are re-counted rather
+than trusted to the walk.
+
+The foreign key re-check runs **inside** the scrub's transaction, so a violation
+rolls the whole run back rather than handing you a broken copy. It counts orphans
+per constraint under that constraint's own NULL rule: a partly-NULL composite
+reference satisfies the default `MATCH SIMPLE` and is skipped, but violates
+`MATCH FULL` and is counted — which matters because the one thing this re-check
+adds over Postgres itself is catching a constraint a migration left `NOT VALID`,
+where the server never revisits the rows that predate it. Afterwards each
+subsetted table is rewritten with `VACUUM (FULL, ANALYZE)` — deleting rows on its
+own frees no disk, and the point of a sample is the disk. `[framework] purge`
+tables are rewritten and measured with them: they sit outside the sample's own
+universe, but the run empties them, and an emptied offline-sync buffer is often
+the largest thing it removes — leaving it out would report a laptop-sized result
+for a database still holding that buffer's whole file.
+
+The materialized views the run refreshes are measured too, on both sides of the
+ratio (a view left `WITH NO DATA` that nothing populated reads is neither
+refreshed nor measured — it occupies no heap). A view is rebuilt from whatever survives the sample, so one over a table
+`always_include` keeps whole does not shrink at all; measuring the sampled base
+tables alone reported `488.0 kB → 232.0 kB` on a database whose refreshed view
+still held 44 MB. They are measured but not compacted — `REFRESH` has already
+rewritten each one's heap.
+
+`--dry-run` prints that whole sequence as SQL you can actually run. Each
+target's block is preceded by a `\connect` line, because the printed stream is
+one file and the blocks are destructive: without it, pasting runs every target's
+transaction against whichever database the session happens to be on. That line
+carries the target's whole connection string with its password removed — and
+where the password cannot be removed with certainty, which is any keyword-form
+string (`host=... password=...`, where libpq allows whitespace around the `=`
+and quoted values with escapes), the run **refuses** rather than print a
+destructive block with no boundary above it. Configure such a target as a URI to
+use `--dry-run` on it; scrubbing it without `--dry-run` is unaffected.
+
+Compaction is printed after **every** target's transaction, never between two of
+them, and with `ON_ERROR_STOP` turned off first — because that is what the
+command itself does: it commits each target and then compacts in a second pass
+where a failed `VACUUM` is a warning. Printed inside a target's block it was
+neither, and a `VACUUM` on the first target that timed out against a concurrent
+reader ended the script with that database scrubbed and the second still holding
+its production rows.
+
+The boundary is checked twice, in two different currencies. First by psql, from
+its own `:HOST`, `:PORT` and `:DBNAME` — the conninfo psql resolved, which a
+failed `\connect` leaves describing the previous connection. That check is what
+makes a failed reconnect unable to continue: measured, one target's script pasted
+into a session on another printed `Previous connection kept` and then `query
+ignored` for every statement from `BEGIN;` onward. It matters that this is psql's
+view and not the server's, because `inet_server_addr()` and `inet_server_port()`
+report the endpoint the *server* accepted on, not the one you configured — behind
+a forwarder, a session connected to `127.0.0.1:15433` reports `127.0.0.1:5433`,
+so two servers reached through different forwards can report the same pair.
+
+The connection string therefore has to state both host and port. A port left to
+libpq is **refused** rather than printed: psql resolves one at paste time — from
+`PGPORT`, or 5432 — and the same host-only URI reaches 5433 under `PGPORT=5433`
+and 5432 without it, two different servers. Accepting any port for the host would
+drop the discriminator on exactly the pair this proof exists to tell apart, and
+embedding the port the run resolved is no better, since libpq can take it from a
+service file this command does not read. State it, or scrub without `--dry-run`.
+
+A failover list (`host=db1,db2`) is matched the way libpq resolves it — host and
+port paired positionally, a single port covering every host — since psql reports
+the one server it selected. The compaction pass reconnects too, and carries the same
+proof for the same reason.
+
+The printed transaction also asserts `session_replication_role = origin` — the
+precondition the run refuses to plan without. `origin` fires `O`/`A` triggers and
+`replica` fires `R`/`A`, and the trigger analysis only ever saw the first set; the
+script inherits whatever the pasting session is in, so it checks rather than
+assumes.
+
+That boundary is then checked again inside the transaction. `\connect` does **not** close the
+existing connection when the new one fails: psql prints `Previous connection
+kept` and the session carries on, so the block below it would run against the
+previous target. Removing the password from the printed conninfo is what makes
+that failure likely rather than remote. So each block opens with
+`\set ON_ERROR_STOP on` — which covers running the file with `psql -f`, where a
+failed `\connect` already halts — and, as its first statement inside the
+transaction, one that aborts unless the session is on the target the block names
+— the database name together with the address and port the server itself
+reports:
+
+```text
+ERROR:  this block is for app at 10.0.0.3/32:5432, but the session is on app at
+        10.0.0.2/32:5432 — the \connect above did not take effect (psql keeps
+        the previous connection when one fails)
+```
+
+The name alone is not an identity. A sharded fleet runs the same database name
+on every shard — the topology in [Sharding](sharding.md) names all three `app` —
+so a retained connection to shard 0 answers `current_database()` exactly as the
+intended shard would. Measured on two clusters both holding `app`: with a
+name-only guard, shard 1's block scrubbed shard 0 from 200 users to 100, 400
+comments to 200 and 500 audit rows to 0, while the shard it named went
+untouched. Both are compared with `IS DISTINCT FROM`, because the server reports
+neither over a Unix socket and `NULL <> NULL` would let the check pass by
+failing to be false.
+
+### `--dry-run` needs a TCP target
+
+The address and port are what identify an endpoint, and a Unix socket has
+neither. So `--dry-run` **refuses** to print a script for a socket target at all,
+before printing a single line:
+
+```text
+✗ `--dry-run` cannot print a runnable script for 1 target(s):
+    - control
+  These are reached over a Unix socket, where the server reports no address and
+  no port — and nothing else it reports identifies the instance either. ...
+```
+
+Nothing else the server reports can stand in. The cluster's `system_identifier`
+is generated at initdb and an ordinary `LOGIN` role can read it, but a
+**physical copy** carries the identifier of the cluster it was cloned from:
+measured against a `pg_basebackup` clone of a live cluster, both reached over
+`/tmp`, the guard saw the same database name, the same identifier and
+`<null>/<null>` on both sides. The server's configured `port` does answer over a
+socket, but two clusters on different socket directories can share one — measured
+on two clusters both on 5433, the clone's script pasted at its origin passed a
+port-based guard, committed, and took the **origin** from 200 users to 25. And
+`data_directory` is server-*local*: two containers each answering
+`/var/lib/postgresql/data` match on it while being different databases. It is
+also restricted to `pg_read_all_settings`, so an ordinary role reads NULL for it
+and loses even that.
+
+Three narrower guards were each defeated by the next topology. That is the shape
+of a value that does not exist rather than one not yet found, so the refusal
+covers every socket target rather than trying a fourth. Configure the target over
+TCP to use `--dry-run` on it; scrubbing a socket target *without* `--dry-run` is
+unaffected, because the command holds its own connection and never has to prove
+which one it is.
+
+The same reasoning refuses three TCP shapes that cannot name **one** endpoint
+either. A conninfo with **no port** leaves psql to resolve one when the script is
+pasted — measured, the same host-only URI reaches 5433 under `PGPORT=5433` and
+5432 without it. One stating **`hostaddr`** picks the endpoint independently of
+`host`: `host=not-a-real-host.example hostaddr=127.0.0.1` connects although that
+name does not resolve, psql still reports `HOST=not-a-real-host.example`, and
+there is no `:HOSTADDR` to pin instead — `\echo [:HOSTADDR]` prints the name
+back unexpanded. And one naming **several endpoints** is chosen between per
+connection: 20 connections with `load_balance_hosts=random` split 7/13 across two
+members, so the run sizes the sample on one member and the pasted script runs on
+another. Against a two-member URI whose first member held 200 rows and whose
+second held none, ten dry runs printed `LIMIT 2` six times and `LIMIT 0` four
+times — and `LIMIT 0` selects no root rows, so the delete pass empties the table
+instead of sampling it. Each of the three still scrubs without `--dry-run`.
+
+Every value is asked of the target connection while the run plans, never
+parsed out of its URL: libpq defaults an omitted database name to the user name,
+which defaults to the OS user, and the connection already knows the answer those
+rules produce. The guard is emitted after the session pins and every call in it
+is `pg_catalog`-qualified, so a `public.current_database()` sitting ahead of
+`pg_catalog` in the pasting session's `search_path` cannot answer for the
+catalog — measured, such a function returned the intended name while
+`pg_catalog.current_database()` returned the truth.
+
+An interactive paste ignores `ON_ERROR_STOP`, but it cannot ignore an aborted
+transaction: every following statement is refused with `current transaction is
+aborted`, and the closing `COMMIT` rolls back. That guard is printed and never
+executed by `autumn db scrub` itself, which opens its own connection and cannot
+be on the wrong database.
+
+That protection ends at the `COMMIT`, though, and one part of a target's plan
+runs past it: `VACUUM (FULL)` cannot run inside a transaction block, so the
+compaction is emitted outside the envelope. The `COMMIT` turns the guard's abort
+into a `ROLLBACK` and clears the aborted state, leaving the server nothing to
+refuse with — measured, a clone's script pasted at its origin had all 64
+destructive statements refused and then ran six `VACUUM (FULL, ANALYZE)`
+statements on the origin, each taking an `ACCESS EXCLUSIVE` lock and rewriting
+the table. So psql decides that part instead of the server:
+
+```
+\set autumn_scrubbed false
+BEGIN;
+... the guarded transaction ...
+SELECT true AS autumn_scrubbed \gset      -- its last statement
+COMMIT;
+\set autumn_commit_error :ERROR
+SET search_path = pg_catalog, public;
+SELECT (:'autumn_scrubbed'::bool AND NOT :'autumn_commit_error'::bool
+        AND NOT (...the same predicate the guard uses...)) AS autumn_on_target \gset
+\if :autumn_on_target
+SET lock_timeout = '30s';
+VACUUM (FULL, ANALYZE) "public"."users";
+\endif
+```
+
+Being on the right server is not the same as having scrubbed it, so the fence
+asks both. A statement failing inside the transaction for a reason the guard
+knows nothing about — a lock timeout, a constraint — aborts it, and the printed
+`COMMIT` still clears that state; measured, an endpoint-only probe then ran all
+six compaction statements against a target whose scrub had just rolled back.
+psql's `:ERROR` does not close it either, because psql reports that `ROLLBACK`
+as a *success*. The transaction's last statement therefore sets a variable an
+aborted transaction cannot set, and `:ERROR` is captured immediately after
+`COMMIT` — by a `\set`, which executes no query and so does not reset it.
+
+The same flag spans the whole stream, because `autumn db scrub` itself stops at
+the first target that fails and never touches the rest. Each target block is
+wrapped in `\if :autumn_ok`, so a target that rolls back is not followed by the
+next one connecting and scrubbing anyway — measured with two targets, that used
+to leave a partially scrubbed topology behind a stream that ended without an
+error.
+
+Both failure modes are closed, measured on psql 16.13: a false value prints
+`query ignored` for every statement in the block, and a `\gset` whose query
+*errored* leaves the variable unset, which `\if` reports as `Boolean expected`
+and still skips. The `search_path` is re-pinned first because the run's own pins
+are `SET LOCAL` — they belonged to the transaction that just rolled back.
+
+One statement the dry run cannot print truthfully is the rewrite of an
+`#[encrypted]` column: the scrub encrypts a fabricated value per row under the
+**target's** key, and expressing that as SQL would mean embedding that key in a
+script meant to be pasted and shared. Where a plan contains one, `--dry-run`
+reports the plan as usual and then refuses to print the script at all:
+
+```
+✗ `--dry-run` cannot print a runnable script: 1 column(s) are #[encrypted]:
+    - control: users.api_token
+```
+
+Printing the rest and omitting that one line is not an option, and neither is
+marking it. A script missing its encrypted rewrites samples and empties exactly
+as advertised, then commits a copy whose other columns are scrubbed and whose
+encrypted ones still hold the original production ciphertext. And nothing placed
+in the stream stops a paste partway: a `RAISE EXCEPTION` aborts its own
+transaction — which does refuse the statements below it — but the `COMMIT` the
+script prints turns that into a `ROLLBACK` and clears the state, after which the
+out-of-transaction `VACUUM (FULL)` statements and the *next* target's `\connect`
+and `DELETE`s execute for real. A `\quit` is worse still: `psql` exits and the
+shell that launched it reads the remainder of the paste.
+
+So the boundary is the same one the keyword-form conninfo gets below — the plan
+above is complete and accurate, and the executable stream is withheld. Run
+without `--dry-run` to apply it for real.
+
+The walk prints as the loop it is — a `DO` block that repeats the pass and stops on one
+that selects nothing — rather than as a single pass with a comment saying to
+repeat it. The difference is not cosmetic: within a pass the statements run in
+list order, and that order comes from the catalog, so one pass reaches only as
+deep as the order happens to favour and everything below it is deleted. Nothing
+would catch that — dropping a descendant leaves every foreign key satisfied, so
+the integrity assertions still pass and the script commits a copy quietly
+missing rows. The compaction is the only thing printed outside the transaction,
+because `VACUUM (FULL)` cannot run inside one.
+
+With `--output`, the artifact is captured **before** the compaction, not after.
+Every lock is released when the scrub commits, so the gap between committing and
+dumping is a gap in which a concurrent write could land unscrubbed rows in the
+artifact; compaction is `VACUUM (FULL)` over every subsetted table, which on a
+large source would stretch that gap from moments to minutes. It contributes
+nothing to the artifact either — `pg_dump` is logical, so a compacted table dumps
+to the same bytes — so it runs afterwards, on the live copy, where the reclaimed
+disk is the point.
+
+That leaves the unavoidable gap between the commit and the dump's own snapshot.
+It is another reason the target should be a restored copy rather than a database
+still taking writes: a scrub cannot hold locks it has already released.
+
+Pair it with `--output` to hand a teammate a small, scrubbed artifact:
+
+```sh
+AUTUMN_ENV=staging autumn db scrub \
+    --artifact backups/prod/20260101T020000Z \
+    --sample users=1% --output backups/laptop --force
+```
+
+---
+
 ## Replacement strategies
 
 | Strategy | Produces | Unique-safe |
@@ -318,23 +758,51 @@ apply-time error.
   column too — and refuses on any difference, so a privilege gap can never look
   like a clean bill of health. Foreign tables count as part of that universe: one
   left pointing at production would otherwise be classified by nothing.
-- **Row-level security is refused**, for the tables the scrub rewrites *and* the
-  ones `[framework] purge` empties. A role that does not bypass RLS would touch
-  only the rows its policies expose and report success — a silent partial scrub.
-  Connect as the table owner or a `BYPASSRLS` role.
+- **Row-level security is refused** on every table the run reads or writes: the
+  ones it rewrites, the ones `[framework] purge` and `never_include` empty, the
+  ones the sample reads to decide what to keep, and both endpoints of every
+  foreign key the run re-counts. A role that does not bypass RLS sees only the
+  rows its policies expose, and each phase then reports a success it cannot
+  stand behind — a partial rewrite, a table reported emptied that is not, or a
+  re-count that misses the orphan it exists to find. Connect as the table owner
+  or a `BYPASSRLS` role.
+
+  The re-count's endpoints matter more than they look: a framework-owned table
+  the run never writes still gets checked, because a constraint a migration left
+  `NOT VALID` is never revalidated by Postgres, and a policy hiding the orphan
+  would turn that check into a false clean bill of health.
 - **Triggers are warned about, not disabled.** An audit or history trigger can
   copy the pre-scrub row into another table as the rewrite runs. The scrub names
   the tables carrying user triggers; check or disable them on the copy.
-- **Materialized views are refreshed** (in dependency order, inside the scrub's
-  own transaction) since they hold their own copy of whatever they selected — so
-  a refresh the role is not allowed to run rolls the rewrites back rather than
-  committing base tables a stale view contradicts.
+- **Materialized views are refreshed** (in dependency order — traced through
+  ordinary views, and through the function dependencies PostgreSQL records, since
+  a materialized view that reads another through one must still be rebuilt after
+  it — inside the scrub's own transaction) since they hold their own copy of
+  whatever they selected — so a refresh the role is not allowed to run rolls the
+  rewrites back rather than committing base tables a stale view contradicts.
+  The function hop is followed however the view reaches it: a direct call, a
+  cast, an aggregate, a user-defined operator, or a domain's `CHECK`
+  constraint. A view read through a function whose body PostgreSQL does *not*
+  track, such as a SQL function written as a string literal or one in
+  `plpgsql`, is **refused**: nothing records what it reads, so the order cannot
+  be derived. Rewrite the function with `BEGIN ATOMIC`, which is tracked. On
+  PostgreSQL 13 and older no SQL body is tracked at all, so a view reached
+  through any function is refused there. A view left `WITH NO DATA` is
+  the one exception: it holds no rows to scrub, so it is skipped rather than
+  populated, and the scrub does not spend the query time and disk it was left
+  unpopulated to save. If a populated view reads it, it is refreshed after all —
+  the dependent cannot be rebuilt otherwise — and emptied again once that
+  dependent has been, so both end as the run found them. Every view that had no
+  data gets that closing `REFRESH ... WITH NO DATA`, which also settles a race:
+  the scrub locks base tables, not views, so another session can populate a
+  skipped view from pre-scrub rows while the run is open.
 - **A key column holding PII can only be declared `safe`.** A natural key
   (`patients(ssn PRIMARY KEY)`) cannot be anonymized in place without rewriting
   every row that references it, which this command does not do — so it is kept
   verbatim and listed in the report. Restructure the schema or scrub it by hand.
-- **Full-copy only.** Row subsetting/sampling for very large databases is not
-  supported — scrub the whole copy.
+- **A sample is valid, not representative.** `--sample` guarantees the subset is
+  referentially intact and PII-free; it does not preserve distributions, and it
+  never fabricates rows to pad a small table (that is `autumn seed`'s job).
 - **Values are fake, not statistically faithful.** Replacements only need to be
   constraint-valid; there is no synthetic-data modelling or differential
   privacy.

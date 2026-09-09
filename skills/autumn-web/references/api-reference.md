@@ -1597,6 +1597,73 @@ provider = "cloudflare"
 
 See `docs/guide/tls.md`.
 
+### `[server.tls.acme.custom_domains]` (feature `acme`, unreleased — trunk-dev, #1635)
+
+Lets a **tenant connect its own hostname** (`app.clientco.com`), each getting its
+own verified, auto-renewing certificate served by SNI. Config-only: no per-domain
+entry ever appears in `autumn.toml`, so a 1,000-tenant deployment is the same
+block as a 1-tenant one. Wildcards (#1620) cover subdomain tenants; this covers
+the B2B customer who brings their own domain.
+
+```toml
+[server.tls.acme.custom_domains]
+enabled          = true
+ingress_hostname = "ingress.myapp.com"   # CNAME target for tenant subdomains
+ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
+```
+
+- `enabled` (default `false`), `ingress_hostname` / `ingress_ipv4` /
+  `ingress_ipv6` — at least one target is required; an **apex** domain cannot
+  carry a CNAME, so accepting apex domains needs the addresses.
+- `store_dir` (default `config/acme/domains`), `max_domains` (default `1000`),
+  `cert_cache_size` (default `256`) — certificates load incrementally, so the
+  cache is a memory knob, not a correctness one.
+- `issuance_per_domain_per_day` (default `5`), `issuance_global_per_hour`
+  (default `50`), `failure_backoff_secs` (default `300`, doubling),
+  `max_failure_backoff_secs` (default `86400`), `poll_interval_secs`
+  (default `60`).
+
+The app drives the journey through
+`autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
+`register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
+renders the exact record to show the tenant, and `list_for_tenant` renders
+status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
+active and serving.
+
+**Offboard through `<dyn CustomDomainPruner>::from_state(&state)`** —
+`offboard_domain(hostname)` and `offboard_tenant_domains(tenant)`. The
+registry's own `remove` / `remove_tenant` only drop the record: they stop
+routing, but the certificate and its private key stay in the ACME store until a
+`[retention] custom_domains` window prunes them, which is unset by default.
+`CustomDomainPruner` does both.
+
+Three gates stand between a tenant-supplied hostname and an ACME order: the app
+registered it, DNS independently resolves to this deployment, and the budget has
+headroom. An SNI hostname nobody registered is refused at the handshake without
+contacting the CA. A hostname the deployment already owns (under
+`[server.tls.acme] domains` or `[tenancy] base_domain`) is refused at
+registration, so a tenant cannot claim another tenant's subdomain.
+
+Requests carrying a registered `Host` resolve to the owning tenant — under
+`[tenancy] source = "subdomain"` only, so a client-supplied `Host` never
+outranks an authenticated `jwt`/`session`/`header` tenant. Tenant certificates
+are issued over **HTTP-01** even when the deployment's own uses DNS-01: the
+record lives in the tenant's zone, where autumn holds no credential.
+
+A failure names the domain AND its tenant in the `custom_domains` health
+indicator and raises #1610's `scheduled_task_failure` alert for
+`custom_domain_certificates`, while every other domain keeps serving and
+renewing. `autumn doctor` grades the section and, with `--online`, flags
+registered domains whose DNS no longer points here. Offboarding stops routing,
+serving and renewal and deletes the stored certificate; the `custom_domains`
+retention dataset prunes abandoned registrations and orphaned certificates.
+
+Single-host, like the rest of the ACME path: the HTTP-01 token map and
+certificate store are per-process. Behind a load balancer, terminate TLS there.
+
+See `docs/guide/tls.md`.
+
 ## reexports module
 
 `autumn_web::reexports` exposes upstream crates for generated code and

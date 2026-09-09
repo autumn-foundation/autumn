@@ -85,6 +85,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers both placements: keying it on the relative one alone left an absolute
   database in the deploy's own namespace with no marker and no refusal.
 
+- **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
+  management system.** `autumn new <name> --starter cms` now scaffolds a
+  complete CMS, joining `saas` as the second curated built-in. The rendered
+  form is committed at `examples/cms/` and pinned to the starter byte-for-byte
+  by `embedded_cms_matches_example_cms`, so the two cannot diverge.
+
+  What it covers: posts, pages and custom post types over one `posts` table
+  keyed by `post_type`; hierarchical categories, flat tags and custom
+  taxonomies; the six WordPress post statuses as a `#[state_machine]` (so an
+  undeclared edge like `publish -> future` is refused rather than merely
+  discouraged); scheduled publishing on a real `#[scheduled]` timer rather than
+  wp-cron's visitor-triggered one; revisions with restore; a `BlobStore`-backed
+  media library with a server-side MIME allowlist; threaded comments with the
+  approved/pending/spam/trash moderation queue and guest commenters; the five
+  core roles and their capability matrix, derived from the stored role at check
+  time rather than copied into usermeta; menus, widgets and switchable themes;
+  a typed action/filter plugin API whose hook names are enum variants, so a
+  misspelled hook is a compile error; shortcodes; all five permalink structures;
+  Atom/RSS feeds site-wide and per-term; a permalink-aware sitemap; a REST API;
+  and idempotent JSON import/export.
+
+  Deliberately excluded, with reasons in the example's README: multisite (Autumn's
+  row-level tenancy is the better answer, see `examples/saas`), XML-RPC, the block
+  editor, pingbacks, and runtime plugin/theme installation.
+
+  The `new` skill now documents `--starter` at all, which it did not before:
+  the flag has been stable CLI surface since #993, but no skill or agent file
+  mentioned it, so an agent scaffolding a project would never offer either
+  archetype. It now carries a starter table, when to reach for each, the
+  `cms` starter's Postgres 12 requirement and first-account-owns-the-site
+  flow, and the provenance caveat for community starters.
+
+  Requires PostgreSQL 12+ — the full-text `search_vector` is a stored generated
+  column. The Docker suite covers the flows most likely to rot: draft
+  invisibility, the state machine refusing an undeclared edge, comment-counter
+  arithmetic across moderation transitions, contributor capability limits,
+  password protection across page/feed/API, permalink-structure changes not
+  404ing existing URLs, revision restore, export/import idempotence, and a CSRF
+  round trip.
+
+### Changed
+
+- **Migration version gate: starter templates no longer collide with their
+  examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror
+  of its committed example and the two never coexist in one database, so
+  `scripts/check-migration-versions.sh` now exempts a starter/example pair from
+  the **uniqueness** check only — shape, real-time and precision still apply,
+  since a scaffolded project inherits the version verbatim. Previously the only
+  such pair (`saas`) passed by accident, because both sides happened to be
+  grandfathered in the baseline.
+
+- **Starter drift gate: one implementation for every starter.**
+  `embedded_saas_matches_example_saas` was a single hard-coded test body; it is
+  now `assert_starter_matches_example(starter, project_name)`, called by both
+  the `saas` and `cms` gates. No behavior change for `saas`.
+
 ### Fixed
 
 - **web:** the `application/problem+json` `errors` array no longer includes a
@@ -99,6 +155,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty-message fields the same way `Display` does.
 
 ### Security
+
+- **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
+  (and `#[throttle(key = "principal")]`) now folds in the ambient resolved
+  tenant (🛡 Warden):** the key was built as `principal:<id>` from whatever
+  identity value an app's login handler stored in the session
+  (`session.insert("user_id", user.id.to_string())`, the pattern
+  `docs/guide/authentication.md` documents), with no tenant consulted —
+  unlike every `tenant_scoped` repository operation, which resolves
+  `CURRENT_TENANT` automatically. That identity value is not guaranteed
+  unique across tenants: Autumn's own sharding guide documents that
+  per-tenant primary keys are shard-local `BIGSERIAL`s
+  (`docs/guide/sharding.md`), so the first user provisioned on two different
+  tenants' shards both land on `id = 1`. An app that turned on Autumn's
+  multi-tenancy (`[tenancy] enabled = true`) together with either documented
+  rate-limiting feature shared one token bucket across any two tenants whose
+  users' principal ids happened to coincide: an ordinary authenticated user
+  of tenant A exhausting their own bucket denied service (`429`) to an
+  unrelated tenant B user who had made zero requests of their own.
+  `Limiter::extract_key` and `#[throttle]`'s per-route guard now fold
+  `CURRENT_TENANT` into the bucket key (not into the value handed to
+  `with_tier_hook`, which still receives the bare principal id its
+  documented signature promises), tagging both the tenant-present and
+  tenant-absent cases so a caller with a self-chosen principal id can never
+  forge one into colliding with the other. **Compatibility note:**
+  upgrading resets any in-flight `authenticated_principal`/`principal`
+  bucket, tenancy-enabled or not — a one-time full-bucket refill, not a
+  correctness change. See `docs/security/2026-09-09-rate-limit-tenant-key/`.
 
 - **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
   layers in SSG/ISR (`dist`) mode, closing an authn-bypass gap (🛡 Warden):**
@@ -665,6 +748,494 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn db scrub --sample <table>=<count|percent%>` emits a
+  **referentially-intact subset** instead of the whole scrubbed copy (issue
+  #1636), so a production copy fits on a laptop. The subset is anchored on
+  developer-chosen roots (`--sample users=1%`, `--sample orders=500`,
+  repeatable) and follows the database's own foreign key graph: rows that
+  reference a selected row are carried along with it, and rows a selected row
+  references are carried too, so every foreign key still resolves. The walk
+  deliberately never descends out of an `always_include` table, or one lookup
+  row would drag the whole database back in. Two per-table rules live alongside
+  the PII declaration in `scrub.toml` — `[sample] always_include` copies
+  reference data whole, `never_include` excludes a table entirely.
+  Selection is deterministic: rows are ordered by a hash of `--seed` (default
+  `0`) and the row key, so the same seed against the same source reproduces the
+  identical subset. Sampling is a phase of the scrub's own transaction, never a
+  command of its own, so no flag combination emits sampled-but-unscrubbed rows.
+  It is fail-closed like the classification: a table no root can reach, a
+  foreign key into a `never_include` table, a table with no primary key, a
+  reference cycle between tables, and a framework-owned table referencing a
+  sampled one all abort with a non-zero exit that names the offenders — before a
+  row is removed. Each run reports per-table row counts, the total against the
+  source, and the size after every table it emptied or subsetted is compacted —
+  `[framework] purge` targets included, since `DELETE` frees no file space and an
+  emptied buffer is often the largest thing the run removes — and re-verifies
+  every foreign key inside the transaction so a violation rolls the run back.
+  `--check` and `--dry-run` cover the sample too and still write nothing.
+  One ordering change reaches every scrub, sampled or not: `[framework] purge`
+  now empties its tables at the START of the transaction rather than after the
+  column rewrites, so a framework-owned table that references a sampled one is
+  already empty when the sample removes the rows it points at — except a purge
+  the sample's own emptied rows reference, which waits until after it instead,
+  and the shape no order satisfies (rows the sample KEEPS referencing a purged
+  table) is refused up front, as is a purge one edge needs before the sample and
+  another needs after it; a deferred purge also carries the purges it references
+  into the same phase, so the split never separates two framework tables that
+  reference each other. The purge also runs a final pass AFTER the column
+  rewrites, which is the pass the guarantee rests on: an audit trigger on a
+  scrubbed table can copy `OLD` values — the original PII — into a purged table
+  while the rewrites run, so a purge that ran only beforehand would report the
+  table emptied while it held real data. That final pass covers `[sample]
+  never_include` tables too — both settings promise a table ends up empty, and
+  both are now enforced after every write rather than only before. **Breaking:**
+  running that pass last means its own `DELETE`s fire after every column
+  rewrite, so an archive trigger on a purged or `never_include` table can copy
+  the rows it removes into an ordinary classified table that has already been
+  scrubbed. No ordering avoids it and no postcondition catches it — a trigger
+  body can write anywhere — so a `DELETE` trigger, or an `ON DELETE` rewrite
+  rule, on a table the run empties is now refused before anything is written,
+  `--check` and `--dry-run` included. Drop or disable it on the copy.
+  Each printed target block now opens with `\set ON_ERROR_STOP on` and, inside
+  its transaction, a guard that aborts unless the session is on the target the
+  block is for — database name **and** the address and port the server reports,
+  since a sharded fleet runs the same database name on every shard and a
+  name-only check passes on the wrong one: `\connect` does **not** close the old connection when the new
+  one fails — psql prints `Previous connection kept` and carries on — so a pasted
+  stream would otherwise run one target's deletes against the previous one, which
+  the deliberately password-free conninfo makes likely rather than remote.
+  `ON_ERROR_STOP` alone does not help an interactive paste; the guard aborts the
+  transaction, so every following statement is refused and `COMMIT` rolls back.
+  Identity includes the cluster's `system_identifier`: address and port are NULL
+  for every Unix-socket connection, so two socket clusters holding the same
+  database name were indistinguishable without it. It also includes the server's
+  configured `port` and its `data_directory`, because a *physical copy* of a
+  cluster — a replica, or a promoted staging clone — carries the identifier of
+  the cluster it was cloned from. Measured with a `pg_basebackup` clone of a live
+  cluster, both reached over `/tmp`: same database name, same identifier, both
+  address and port NULL, and the clone's block would have scrubbed the origin.
+  `current_setting('port')` answers over a socket where `inet_server_port()` is
+  NULL, and two postmasters on one machine cannot hold one data directory. The
+  data directory is restricted to `pg_read_all_settings`, so it is read out of
+  `pg_settings` rather than with `current_setting`, which raises `permission
+  denied to examine ...` for a role without it: the view omits the row, both
+  sides compare NULL, and an ordinary role loses the discriminator rather than
+  the run — verified with a plain `LOGIN` role, which still refuses the clone on
+  the port alone. A discriminator the PLANNING role could not read is now
+  dropped from the guard rather than compared against the value it never
+  learned: `None` there means "unknown", not "the target has none", and such a
+  term refuses a CORRECT paste whenever the pasting role can read what the
+  planning role could not — measured, with `EXECUTE` revoked on
+  `pg_control_system()` (a per-database ACL) the emitted guard aborted the whole
+  paste with `permission denied for function pg_control_system`. Address and
+  port are still compared when NULL, because for a Unix-socket target that IS
+  the answer.
+  `--dry-run` now also refuses to print a runnable script for a profile the
+  command will not scrub without `--force`. The guard runs only when the run
+  writes, which was harmless while the dry run merely described a plan and is
+  not now that it prints a paste-ready script whose `\connect` names the
+  protected database — measured, `--dry-run --profile production` printed 14
+  runnable lines for a target the same command refuses to touch, with the
+  password removed on purpose and `.pgpass` to supply it. The plan report is
+  unchanged; only the script is withheld.
+  A positive `--sample` percentage of a nonempty table now always selects at
+  least one row. `ceil` alone did not guarantee the documented round-up: a
+  denormal percentage (`5e-324` parses as finite and greater than zero) makes
+  `total * pct / 100.0` UNDERFLOW to `0.0`, measured for a table of 1 and of 10
+  rows, and `ceil(0.0)` is `0` — a zero-row seed, whose root
+  `DELETE ... WHERE NOT EXISTS (keep)` then matches every row and empties the
+  table it was asked to sample.
+  The compaction that runs AFTER the transaction — `VACUUM (FULL)` cannot run
+  inside one — is fenced by psql rather than by the guard, because the guard
+  cannot reach it: the printed `COMMIT` turns its abort into a `ROLLBACK` and
+  clears the aborted state. Measured, that gap was reachable — a clone's script
+  pasted at its origin had all 64 destructive statements refused and then ran six
+  `VACUUM (FULL, ANALYZE)` statements on the origin, each taking an `ACCESS
+  EXCLUSIVE` lock. The script now emits the same predicate through `\gset` and
+  wraps the compaction in `\if`; both failure modes are closed (a false value
+  prints `query ignored`, and a `\gset` whose query errored leaves the variable
+  unset, which `\if` reports and still skips). That fence also requires the
+  transaction to have SUCCEEDED, not merely to be on the right server: measured,
+  a statement failing inside the transaction for a reason the guard knows
+  nothing about still left an endpoint-only probe true, and all six
+  `VACUUM (FULL, ANALYZE)` ran — `ACCESS EXCLUSIVE` locks and full rewrites on a
+  target whose scrub had just rolled back. psql's own `:ERROR` does not catch it
+  (it reports that `ROLLBACK` as success), so the transaction's last statement
+  sets a `\gset` flag that an aborted transaction cannot set. That flag spans the
+  whole stream rather than one target: `execute` returns on the first target that
+  fails and never touches the rest, and the printed script now matches —
+  measured with two targets and a failure in the first, the second target's
+  `\connect` and its entire destructive block used to run anyway, leaving a
+  partially scrubbed topology and a stream that ends with no error at all.
+  The printed transaction now also emits the `REFRESH MATERIALIZED VIEW`
+  statements the run performs, in the same dependency order and the same place
+  inside the envelope. A materialized view keeps its own physical copy of what
+  it selected, so a script that skipped them left the view's heap holding the
+  pre-scrub rows — measured against a view over `users.email`, the base table
+  finished with 0 original addresses and the view still held all 200.
+  The size report measures over EVERY materialized view in `public`, enumerated
+  flat, rather than over the dependency-ordered list the refresh uses: that list
+  comes from a recursive walk with a depth cap, and a view past it would be left
+  out of both sides of the ratio while still holding its heap. Refresh order and
+  measurement are now separate questions with separate lists.
+  Both lists are now drawn from the views the run actually has to refresh:
+  every POPULATED view, plus every view one of those reads. A materialized view
+  left `WITH NO DATA` holds no rows — selecting from one raises `materialized
+  view "…" has not been populated` — so it has no pre-scrub copy to rebuild, and
+  refreshing it ran the view's query and materialized a heap the database
+  deliberately did not have: on the expensive query such a view usually guards,
+  time and disk spent inside the scrub's transaction, where exhausting either
+  rolls the whole run back. One a populated view reads is the exception, because
+  the dependent's own `REFRESH` fails while its source is unpopulated and an
+  unrefreshed populated view keeps its pre-scrub rows — so it is refreshed, and
+  then emptied again with `REFRESH ... WITH NO DATA` once the dependent has been
+  rebuilt. Measured: the dependent keeps its rows and its populated state when
+  its source is emptied afterwards, so both relations end as the run found them.
+  That closing `REFRESH ... WITH NO DATA` covers EVERY view that had no data,
+  not only the one populated for a dependent, because skipping one outright left
+  a race: probing runs on its own connection before the apply transaction, which
+  locks base tables and no views at all, and `REFRESH` needs only `ACCESS SHARE`
+  on the tables it reads. Measured — a concurrent `REFRESH` of a skipped view
+  fired while the scrub held `SHARE ROW EXCLUSIVE` on `users` did not wait, and
+  the run committed with `users` at 2 rows and the view holding all 200 original
+  addresses. It costs nothing that skipping saved: `REFRESH ... WITH NO DATA`
+  does not run the view's query, measured on a view defined as `SELECT 1/0`,
+  where it succeeds and a plain `REFRESH` raises `division by zero`.
+  `--dry-run` now prints the compaction after EVERY target's transaction rather
+  than inside each one, and turns `ON_ERROR_STOP` off first, matching the
+  executor: it commits every target in one loop and compacts in a second, where
+  a failed `VACUUM` is a warning and the next target is compacted anyway.
+  Measured on two TCP targets — a first-target `VACUUM (FULL, ANALYZE)` that
+  timed out against a concurrent reader ended the script at rc=3 with that
+  database scrubbed and sampled and the SECOND still holding all 200 of its
+  original addresses. Each target's compaction reconnects and re-checks the
+  endpoint before running, so a failed `\connect` in that pass cannot compact
+  the previous target's database.
+  Each target's block also proves the reconnect landed where it was aimed, from
+  psql's OWN `:HOST`, `:PORT` and `:DBNAME` rather than from anything the server
+  reports. The in-transaction guard compares server-side values, and those are
+  not the connection's identity: `inet_server_addr()`/`inet_server_port()` are
+  the endpoint the SERVER accepted on, measured through a forwarder as
+  `127.0.0.1:5433` for a session connected to `127.0.0.1:15433`. Two servers
+  behind different forwards, or in separate container networks sharing a private
+  address, report the same pair — and with a physical clone's inherited
+  `system_identifier` and a container-local `data_directory`, every value that
+  guard compares can match on two different databases. psql's variables are
+  connection-specific instead, and a failed `\connect` leaves them describing the
+  PREVIOUS connection (measured: `HOST=127.0.0.1 PORT=15433 DBNAME=postgres`
+  before and after a `\connect` to port 25433 failed). Measured end to end — one
+  target's script pasted interactively into a session on another, with the
+  reconnect refused: `Previous connection kept`, then every statement from
+  `BEGIN;` onward reported `query ignored`, the server-side guard never ran at
+  all, and the pasting session's database was untouched at 200 rows. Only the
+  components a conninfo STATES are asserted: `PGPORT` can differ between the
+  machine that planned the run and the one pasting the script, so a guessed
+  default would refuse a correct paste, and an omitted component cannot be what
+  distinguishes two targets anyway. A comma-separated FAILOVER list is matched
+  the way libpq resolves it, since psql's `:HOST`/`:PORT` name the single server
+  it selected (measured: `?host=127.0.0.9,127.0.0.1` reports `HOST=127.0.0.1`):
+  host and port are paired POSITIONALLY, with a single port broadcast to every
+  host. Measured on 16.13 — `host=127.0.0.9,127.0.0.1&port=5433,5434` connected
+  to 5434, the port belonging to the host it reached, and the same hosts with
+  `port=5433` connected to 5433 — so `a:5433` is not an endpoint
+  `host=a,b&port=5432,5433` names, and matching the two independently would have
+  accepted a retained connection to one that was never configured. A length
+  mismatch libpq itself rejects (`could not match 3 port numbers to 2 hosts`)
+  proves nothing rather than inventing a pairing. A conninfo stating no host
+  proves nothing either — unreachable, since an empty authority is already
+  refused as an unprintable target, but stated rather than left to that distant
+  refusal, because omitting the host term would leave the database name standing
+  alone against a physical clone that shares it.
+  A conninfo that leaves the PORT to libpq is now REFUSED rather than printed.
+  psql reports the resolved port in `:PORT`, and the same host-only URI resolves
+  to 5433 under `PGPORT=5433` and to 5432 without it — two different servers — so
+  accepting any port for the host would drop the discriminator on exactly the
+  pair the proof exists to tell apart. Embedding the port this run resolved is
+  not honest either: libpq's resolution can come from a service file this
+  command does not read. State the port, or run without `--dry-run`, where the
+  command holds its own connection and never has to prove which one it is.
+  The compaction pass carries the same proof, not the endpoint alone: it is a
+  second `\connect` with the same retained-connection failure, and a
+  `VACUUM (FULL)` on the wrong target locks and rewrites every table it names.
+  The printed transaction also asserts `session_replication_role = origin`, the
+  precondition the run refuses to PLAN without. `origin` fires `O`/`A` triggers
+  and `replica` fires `R`/`A`, and the trigger walk only ever inspected the
+  first set — but the script inherits whatever the pasting session is in.
+  Measured: with the session in `replica` and the printed `\connect` failing, so
+  that session is retained ON the right endpoint and passes both the psql proof
+  and the endpoint guard, the assertion raised and the transaction aborted with
+  the database untouched at 200 rows. Asserted rather than pinned, as the
+  command refuses rather than resets: the setting is `SUSET`, so a `SET LOCAL`
+  would fail for the ordinary role the script is written for.
+  The dependency walk now traverses ordinary views. `pg_depend` records only the
+  hop a rewrite rule actually took, so matching a materialized view's dependency
+  straight against the set of materialized views lost both hops of `a_report ->
+  bridge_view -> z_source` and left two roots that sorted by name. Measured:
+  `a_report` refreshed FIRST from a `z_source` still holding pre-scrub rows, and
+  since refreshing a source does not update a view built from it, the run
+  reported success with `users` at 2 rows, 0 original addresses in the base
+  tables and in `z_source`, and all 200 still in `a_report`. Rule dependencies
+  are now read between relations of any kind and walked through anything that is
+  not a materialized view, so the edge is recovered however many ordinary views
+  sit in between. The walk also follows the one function hop PostgreSQL records,
+  `rewrite -> pg_proc -> pg_class`, which a `BEGIN ATOMIC` body produces — and
+  REFUSES a view read through a function whose body it does not track. Measured
+  on `a_report -> bridge_fn() -> z_source` with a string-literal body:
+  `pg_depend` holds `a_report -> pg_proc(bridge_fn)` and the function holds no
+  relation dependency at all, so no path exists to walk; the views sorted by
+  name, `a_report` refreshed FIRST from a stale `z_source`, and the run reported
+  success with `users` at 2 rows, both base tables clean, and all 200 original
+  addresses still in `a_report`. The same shape with a `BEGIN ATOMIC` body is
+  ordered correctly instead — measured, `z_source` refreshed first despite
+  sorting later, both views ending clean. That refusal covers every relation
+  REACHABLE from a materialized view, not only the views themselves: the walk
+  crosses ordinary views, so a function called by one of those is just as
+  invisible. Measured on `a_report -> bridge_view -> bridge_fn() -> z_source`,
+  where only the ordinary view's rule names the function — a check restricted to
+  materialized views skipped it, `a_report` refreshed first from a stale
+  `z_source`, and the run reported success with all 200 original addresses still
+  in `a_report`. Both the traversal and the refusal close over function-to-
+  function calls as well. A tracked function that calls another tracked function
+  yielded no edge when only its own relation dependencies were read — measured on
+  `a_report -> outer_fn() -> inner_fn() -> z_source`, `a_report` refreshed first
+  and kept all 200 — and a tracked function calling an OPAQUE one passed the
+  refusal on the strength of its own relation dependency while the body that
+  actually read `z_source` was invisible. Both are now followed to the end of the
+  chain: measured, the tracked pair orders `z_source` first and ends clean, and
+  the opaque one is refused as `a_report via opaque_inner` before a row is
+  written. Opacity is read from `pg_proc.prosqlbody`, the parsed body a
+  `BEGIN ATOMIC` function has and a string-literal, `plpgsql` or C function does
+  not — the property itself, where "records no relation dependency" was a proxy
+  for it and a wrong one. A tracked wrapper that only calls another tracked
+  function records no relation of its own and was refused although the closure
+  can follow it to the table: measured on `a_report -> wrap_fn() -> inner_fn() ->
+  z_source`, refused as `via wrap_fn`, and now scrubbing with `z_source`
+  refreshed first and both views clean. `prosqlbody` is PostgreSQL 14 and is
+  probed for with `has_catalog_column`, like every other version-specific
+  catalog column this file reads; on an older server every function reached from
+  a view is treated as opaque, which is what it is, since no SQL body is parsed
+  into the catalog before 14. The function closure is seeded from every catalog
+  path a rewrite rule can record, not only `pg_proc`. Measured over the four
+  indirections: a direct call, a cast and an aggregate all record `pg_proc`, but
+  a user-defined OPERATOR records `pg_operator` and a DOMAIN's `CHECK` records
+  `pg_type`, each with no `pg_proc` row at all. The operator case was a silent
+  leak — `a_report` reading `z_source` only through `1 ==> 200`, whose
+  implementation is a tracked `BEGIN ATOMIC` function, produced no edge, the two
+  views sorted by name, and the run reported success with `users` at 2 rows,
+  `z_source` clean, and all 200 original addresses still in `a_report`. Both are
+  now followed: measured, `z_source` refreshes first against alphabetical order
+  and `a_report` ends with 0 original addresses, and an opaque body behind
+  either an operator or a domain check is refused rather than ordered around.
+  Those paths are resolved at every step of the closure, not only where it is
+  seeded from a rewrite rule. A tracked function that itself uses a custom
+  operator records `pg_proc -> pg_operator`, and one that casts to a domain
+  records `pg_proc -> pg_type`; following only `pg_proc -> pg_proc` from a
+  reached function missed both. Measured on `a_report -> harvest() ->
+  (1 ==> 200) -> z_source`, every body `BEGIN ATOMIC`: no edge at all, `a_report`
+  refreshed FIRST, and the run reported success with `users` at 2 rows,
+  `z_source` clean and all 200 original addresses still in `a_report`. One
+  relation now resolves a dependency to the function it denotes, and both the
+  seed and the recursive step read it, so the two cannot diverge again.
+  A partition leaf whose top-level parent is emptied by `[framework] purge` is
+  treated like one under `never_include` — its outgoing foreign key is ignored
+  rather than refused. Purging the parent removes every leaf row before the
+  sample runs, so nothing can dangle, and refusing it left NO remedy: measured, a
+  partitioned `autumn_jobs` with a leaf-local key to `countries` was refused with
+  "drop the table with `never_include`", and naming a framework table there is
+  itself refused with "framework-owned rows are emptied with `[framework]
+  purge`". The purge-order deferral the excluded-leaf path already computes is
+  applied unchanged.
+  Two refusals close paths that were silently wrong. A materialized-view chain
+  the dependency walk cannot reach the end of is refused rather than partly
+  refreshed: measured on a 36-deep chain, the run refreshed 33 views, reported
+  success, left `users` with 0 original addresses and the deepest view holding
+  all 200. And `--dry-run` refuses to print a script for a Unix-socket target
+  whose role cannot read `data_directory`: over a socket the address and port
+  are NULL and a physical copy shares its origin's `system_identifier`, so
+  nothing distinguishes the two. Measured with two clusters on port 5433 under
+  different socket directories, the clone's script pasted at its origin after a
+  failed `\connect` — the guard passed, the transaction committed, and the
+  ORIGIN went from 200 users to 25. A privileged socket role and any TCP target
+  still print. That refusal now covers EVERY Unix-socket target, not only one
+  whose role cannot read `data_directory`: nothing the server reports over a
+  socket identifies the instance. `system_identifier` is copied by any physical
+  clone, the configured port is shared by two clusters on different socket
+  directories, and `data_directory` is server-local — two containers each
+  answering `/var/lib/postgresql/data` match on it while being different
+  databases. Connect over TCP, where the address and port identify the endpoint,
+  or run without `--dry-run`. The guide states that requirement under its own
+  heading instead of walking through a socket guard the refusal now makes
+  unreachable.
+  A purged partition leaf whose outgoing key points into a subsetted table now
+  records that the purge must run BEFORE the sample, the mirror of the deferral
+  the same path already recorded. Without it, another edge deferring the very
+  same purge left two contradictory conclusions standing and the run failed at
+  delete time instead of refusing.
+  Its values are asked of the
+  target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
+  meant reimplementing those rules — and every call is `pg_catalog`-qualified and
+  emitted after the session pins, so a `public.current_database()` in the pasting
+  session's `search_path` cannot answer for the catalog.
+  Where a schema has an `#[encrypted]` column, `--dry-run` now reports the plan
+  and WITHHOLDS the runnable script entirely. That rewrite has no SQL text — the
+  value is re-encrypted per row under the target's key, which cannot be printed
+  without embedding that key — and a script printed without it commits a sampled
+  copy still holding the original production ciphertext with every other column
+  scrubbed, the one state this command promises is impossible. Nor can a marker
+  in the stream close that: a `RAISE EXCEPTION` aborts only its own transaction,
+  the printed `COMMIT` clears the aborted state, and the following `VACUUM
+  (FULL)`s and the NEXT target's `\connect` and DELETEs then run for real —
+  measured, a stopped first target still took a second cluster from 200 rows to
+  0. The classification report, the sample plan and the purge list are unchanged;
+  only the paste-ready SQL is refused.
+  `--dry-run` also refuses a target configured with a keyword-form connection string
+  (`host=... password=...`): each printed block is destructive and the `\connect`
+  line above it is what points `psql` at the right database, but a keyword-form
+  string cannot be printed with its password removed for certain, so the
+  boundary is withheld — and a block without one runs against whichever database
+  the pasting session is already on. Configure such a target as a URI to use
+  `--dry-run`. The URI it does print is re-encoded the way libpq reads one,
+  through the parser and encoder in `pg.rs` rather than `url::Url`'s
+  `query_pairs()`: the latter applies `x-www-form-urlencoded` rules and writes a
+  space back as `+`, which libpq — which only percent-decodes — then reads
+  literally. Measured against psql 16.13, an operator's
+  `?options=-c%20search_path%3Dpg_catalog` connects and sets the path, while the
+  `+` form printed in its place did not connect at all (`FATAL: unrecognized
+  configuration parameter "+search_path"`) — leaving the session on the previous
+  database, which is the case the target guard exists for. The size report now
+  also counts the materialized views the run
+  refreshes: a view is rebuilt from whatever survives the sample, so one over
+  reference data does not shrink, and measuring the sampled base tables alone
+  reported `488.0 kB → 232.0 kB` on a database still holding a 44 MB view.
+  An excluded partition leaf's outgoing foreign key is still ignored for the
+  walk and the re-count — emptying its top-level parent takes every leaf row, so
+  it cannot dangle — but it now keeps its say over removal ORDER: a leaf pointing
+  into a `[framework] purge` table defers that purge, instead of letting it run
+  first against rows the leaf has not lost yet and failing the run.
+  A `--sample` spec splits at its LAST `=`, so a table whose quoted name
+  contains one (`events=2026`) can be named as a root, and the table portion is
+  taken verbatim rather than trimmed — a quoted name may begin or end with a
+  space, and trimming silently retargeted such a root at whatever table the
+  trimmed name happened to hit. A root that differs from a real table only by
+  surrounding space is now reported as unknown, with the trimmed name suggested.
+  See the
+  [migration guide](docs/migrations/next.md#scrub-a-delete-trigger-or-rule-on-a-table-autumn-db-scrub-empties-is-refused). Legacy
+  `INHERITS` inheritance is refused for a sampled run (a statement naming the
+  parent reaches the child, which the plan models separately); an exact `100%`
+  root counts as removing no rows, so it no longer trips the outside-reference
+  refusal; and `--dry-run` wraps its SQL in `BEGIN`/`COMMIT`, without which the
+  printed `ON COMMIT DROP` keep-sets could not be run as shown. With `--output`,
+  the artifact is now captured BEFORE the sampled tables are compacted: locks are
+  released at commit, and running a whole-schema `VACUUM (FULL)` first would
+  stretch the commit-to-dump window — during which a concurrent write could land
+  unscrubbed rows in the artifact — from moments to minutes, for no benefit,
+  since `pg_dump` is logical and a compacted table dumps to the same bytes.
+  Finally, every promised-empty table is COUNTED after all writes and the run
+  aborts if any holds rows: each emptying statement fires triggers, one of which
+  can refill a table an earlier statement emptied, so the promise is verified
+  rather than ordered for. The integrity re-count also now covers a retained
+  table's foreign keys into framework tables nothing empties, which a `NOT VALID`
+  constraint over a pre-existing orphan would otherwise hide — including from a
+  full-copy or exact-100% table, which keeps every row and so is the likeliest to
+  still hold one. `--dry-run` prints the emptiness assertions too, as `DO` blocks
+  that abort, so the advertised SQL refuses exactly where the real run does — as
+  do the foreign key checks, and the printed sequence now opens with the same
+  `SHARE ROW EXCLUSIVE` locks the run takes, without which a paste into a target
+  still accepting writes would let a row inserted after its `DELETE` survive. A foreign key declared on a partition rather than
+  cloned onto it from its partitioned parent is likewise refused, rather than
+  dropped from the walk and the integrity re-check as if it were a clone. The
+  re-check honours each constraint's own NULL rule, so a partly-NULL composite
+  reference is skipped under `MATCH SIMPLE` but counted under `MATCH FULL`,
+  where it is itself a violation.
+
+- **cli:** `autumn db scrub --dry-run` refuses a target whose connection string
+  cannot name ONE endpoint, alongside the existing socket and port-less
+  refusals. A conninfo stating `hostaddr` selects the endpoint independently of
+  `host`, and psql reports no variable for it — measured,
+  `host=not-a-real-host.example hostaddr=127.0.0.1` connects to 127.0.0.1
+  although the name does not resolve, psql still reports
+  `HOST=not-a-real-host.example`, and `\echo [:HOSTADDR]` prints the name back
+  unexpanded because no such variable exists. One naming several endpoints is
+  chosen between per connection: 20 connections with `load_balance_hosts=random`
+  split 7/13 across two members, so the run sizes the sample on one member and
+  the pasted script runs on another. Against a two-member URI whose first member
+  held 200 rows and whose second held none, ten dry runs printed `LIMIT 2` six
+  times and `LIMIT 0` four times — and `LIMIT 0` selects no root rows, so the
+  delete pass empties the table instead of sampling it. Both still scrub without
+  `--dry-run`, where the command sizes and writes on the one connection it holds.
+- **cli:** `autumn db scrub --dry-run` sizes every target before printing a
+  line. Sizing opens its own connection and reads live counts, so it was the one
+  fallible step left inside the emission loop, and a failure on a LATER target
+  landed after an EARLIER one's complete transaction had been printed, `COMMIT`
+  included. Measured on a control plus one shard where the role could read the
+  catalogs but not `SELECT` the shard's `users`: the run exited 1 with
+  `permission denied for table users`, having already printed the control's
+  whole block — one `COMMIT`, seven `DELETE FROM` — so saving that output and
+  running it would scrub the control and leave the shard untouched, the
+  half-anonymized topology the classify-then-apply split exists to prevent. Now
+  nothing runnable is printed at all when any target cannot be sized (measured:
+  zero `BEGIN`, `COMMIT`, `DELETE FROM` and `ON_ERROR_STOP` lines), and a
+  healthy two-target run still prints both blocks in full.
+- **cli:** `autumn db scrub` proves its promised-empty tables are empty AFTER
+  the materialized-view refreshes, not before them. `REFRESH` runs the view's
+  query, and that query can call a function whose body INSERTs — measured on a
+  tracked `BEGIN ATOMIC` function writing into a `never_include` table, the run
+  reported `audit_logs: 503 -> 0 row(s)` and `✓ Scrub complete` while the table
+  held three rows carrying real addresses. Volatility does not identify such a
+  function: measured, `CREATE FUNCTION ... STABLE BEGIN ATOMIC INSERT ...` is
+  accepted, so a `provolatile` test would miss exactly this one. Checking after
+  every write covers both this and the emptying-trigger case the check was
+  written for, and needs no guess about which functions can write. The run now
+  refuses and rolls back, naming the table.
+- **cli:** `autumn db scrub` no longer refuses a materialized view that uses a
+  fully tracked user-defined **aggregate**. An aggregate's `pg_proc` row is a
+  shell with no body of any kind, so `prosqlbody` is NULL for a traceable one
+  and the opacity check reported the aggregate itself as untraceable — measured,
+  an aggregate whose transition function is a tracked `BEGIN ATOMIC` body was
+  refused as `a_report via gather`, blocking a valid scrub. Only `prokind = 'a'`
+  is exempt, and only the shell: everything an aggregate runs is a separate
+  `pg_proc` the closure already reaches, so an opaque transition or final
+  function is still named (measured on both). A window function is not exempt —
+  it has no body because it is written in C, which is opacity rather than a
+  shell.
+- **cli:** `autumn db scrub` refuses a materialized view that reads relations
+  named in a **string the server executes**. `query_to_xml` takes its query as
+  text, and `schema_to_xml`/`database_to_xml` take no relation argument at all,
+  so `pg_depend` records nothing about what they read — measured, a view defined
+  `SELECT query_to_xml('SELECT email FROM z_source', …)` records only itself.
+  Refresh order comes from those dependencies, so the two views sorted by name,
+  the dependent refreshed FIRST from a stale source, and the run reported
+  `✓ Scrub complete` with the base tables clean and all 200 original addresses
+  still in the dependent. Nothing in the catalog can recover the edge, so it is
+  refused. `table_to_xml` is not refused: measured, its `regclass` argument
+  records `pg_class -> users` like any other reference. Detected from the rule's
+  PARSED tree, so a column or literal that merely spells the name cannot trip it.
+- **cli:** `autumn db scrub` no longer refuses on rules and views its refresh
+  never evaluates. Two false refusals, both measured: an `ON INSERT` rule on a
+  table a view reads refused the run as `a_view via log_it`, though a `REFRESH`
+  is a `SELECT` and can never fire it — the walk now follows only `_RETURN`
+  rules, the ones that define a view. And a standalone view left `WITH NO DATA`
+  refused the run as `lonely via opaque_fn`, though it only ever gets
+  `REFRESH ... WITH NO DATA`, which provably never runs its query — the opacity
+  walk now covers the views the run will actually evaluate.
+- **cli:** `autumn db scrub --dry-run` refuses a target whose endpoint is chosen
+  by the environment rather than by `host`/`port`: `PGHOSTADDR`, or a service
+  file named by `service=` in the connection string or by `PGSERVICE`. All three
+  were measured reaching 127.0.0.1 through `host=not-a-real-host.example`, a
+  name that does not resolve, with psql still reporting that name as `:HOST`. A
+  pasting session brings its own environment, so what this run resolved need not
+  be what it resolves. Each still scrubs without `--dry-run`.
+- **cli:** `autumn db scrub` re-checks the sample's own postconditions after the
+  materialized-view refreshes. `sample::apply` selects the subset, deletes,
+  verifies the foreign keys and counts — all before the refreshes, which are the
+  last writes in the transaction and can perform DML of their own. Measured, a
+  tracked `BEGIN ATOMIC` function writing into `comments` left the run reporting
+  `comments: 403 → 4 row(s)` and `✓ Scrub complete` over a table holding 7 rows,
+  3 of them never rewritten: the subset was not the subset, and the reported
+  number was not the number. The counts and the foreign-key checks now run again
+  after every refresh, and the run refuses and rolls back if either moved. A
+  refresh that UPDATEs in place without changing a count or invalidating a
+  reference is not detected, and is not claimed to be.
 - **An actuator path drift gate for the docs corpus [no-plugin]:** the five
   docs gates that came before it cover the link a reader clicks
   (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
@@ -790,6 +1361,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now comes from one derivation shared with `code()`, so the two cannot
   disagree. Guide: `docs/guide/forms.md`, "Reading the failure back".
 
+- **tls:** tenants can connect their own domains, each with its own
+  automatically issued and renewed certificate (issue #1635). Enable
+  `[server.tls.acme.custom_domains]` with an ingress hostname (and addresses,
+  for apex domains) and the whole journey ships: the app registers a hostname
+  for a tenant, autumn renders the exact CNAME or A/AAAA records to show that
+  tenant, and the domain moves through queryable `pending_dns` → `verified` →
+  `issuing` → `active` states carrying the reason whenever it is stuck. No
+  ACME order is created until autumn independently confirms the hostname
+  resolves to this deployment; once active, requests on that `Host` resolve to
+  the owning tenant and are served that domain's certificate by SNI. An SNI
+  hostname nobody registered is refused at the handshake without contacting the
+  CA, and issuance is capped per domain and deployment-wide with exponential
+  backoff on repeated failure. Renewal is per domain and isolated: a failure
+  names the domain and tenant in `/actuator/health` and raises the
+  `scheduled_task_failure` alert while every other domain keeps serving and
+  renewing. Certificates load incrementally through a bounded cache, so a
+  1,000-domain deployment does not need them all resident. Offboarding stops
+  routing, serving and renewal and deletes the stored certificate; the new
+  `custom_domains` retention dataset prunes abandoned registrations and
+  orphaned certificates. `autumn doctor` grades the section and, with
+  `--online`, flags registered domains whose DNS no longer points here. See
+  `docs/guide/tls.md`.
 - **A Rust symbol drift gate for the docs corpus [no-plugin]:** the four docs
   gates that came before it cover the link a reader clicks
   (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the

@@ -3,7 +3,7 @@ name: new
 description: >
   Use when the user runs /autumn:new, asks to create a new Autumn web
   application, or wants to scaffold a fresh project with the autumn CLI.
-argument-hint: "<app-name> [--with-i18n] [--with-seed] [--with <plugin>]"
+argument-hint: "<app-name> [--starter <name>] [--with-i18n] [--with-seed] [--with <plugin>]"
 allowed-tools:
   - Bash
   - Read
@@ -17,27 +17,35 @@ setup`, and walks the user through the first-run configuration.
 
 ## Execution flow
 
-1. Confirm the app name, flags, and target directory:
+1. Decide whether a **starter** fits. `autumn new <app-name>` alone scaffolds a
+   minimal base project; a starter scaffolds a complete, runnable application
+   archetype instead. If the user described the *kind* of app they are building
+   (a SaaS, a blog or content site) rather than just asking for a new project,
+   offer the matching starter before scaffolding the base — reaching a working
+   domain-shaped app is usually what they wanted. See "Starters" below.
+2. Confirm the app name, flags, and target directory:
    ```
-   Will create: autumn new <app-name> [--with-i18n] [--with-seed] [--with <plugin>]
+   Will create: autumn new <app-name> [--starter <name>] [--with-i18n] [--with-seed] [--with <plugin>]
    Directory:   ./<app-name>/
    ```
    Pass any flags the user provided (e.g. `--with-i18n`, `--with-seed`) through
    to the command — they can only be applied at creation time, not added later.
    `--with <plugin>` is the exception: a plugin can also be added afterwards
    with `autumn plugin add`, and removed again with `autumn plugin remove`.
-2. Ask for confirmation before proceeding.
-3. Run with the user's flags:
+3. Ask for confirmation before proceeding.
+4. Run with the user's flags:
    ```bash
-   autumn new <app-name> [--with-i18n] [--with-seed] [--with <plugin>]
+   autumn new <app-name> [--starter <name>] [--with-i18n] [--with-seed] [--with <plugin>]
    ```
-4. Change into the new directory and run:
+5. Change into the new directory and run:
    ```bash
    cd <app-name> && autumn setup
    ```
    `autumn setup` downloads the Tailwind CSS binary used during development.
-5. Show the generated project structure.
-6. Walk through first-run configuration (see below).
+6. Show the generated project structure.
+7. Walk through first-run configuration (see below). A starter prints its own
+   next steps on completion — follow those rather than the generic checklist
+   when one was used, since a starter's schema and first screen differ.
 
 ## First-run configuration checklist
 
@@ -66,8 +74,43 @@ First-run checklist:
 5. Run autumn doctor --strict before your first deploy.
 ```
 
+## Starters
+
+A starter scaffolds a complete application archetype instead of the minimal
+base project. Both built-ins are the committed, CI-gated example apps of the
+same name, so what the user gets is code that is known to run.
+
+```bash
+autumn new <app-name> --starter <name>
+autumn new --list-starters          # what ships with this CLI
+```
+
+| Starter | Reach for it when | What lands |
+|---|---|---|
+| `saas` | The user is building a multi-tenant product — accounts, organisations, per-customer data | Session auth, row-level tenancy, a tenant-scoped dashboard |
+| `cms` | The user is building a content site, a blog, or replacing WordPress | Posts/pages/custom post types, categories and tags, media library, moderated comments, revisions, roles and capabilities, menus, widgets, themes, plugin hooks, permalinks, feeds, sitemap, REST API |
+
+Notes:
+
+- One starter per project, chosen at creation time. `--starter` is rejected
+  alongside `--with-i18n`, `--with-seed`, `--daemon`, `--bundled-pg` or
+  `--api` — a starter brings its own composition — but it **does** compose with
+  `--with <plugin>`, and each plugin name is resolved and version-checked
+  before a byte is written.
+- `cms` needs **PostgreSQL 12 or newer** (its full-text column is a stored
+  generated column). Its first screen is `/register`, and the **first account
+  created owns the site** — there are no default credentials, so tell the user
+  to register before anything else.
+- A community starter is any git repo or local directory following the same
+  manifest format: `autumn new <app> --starter <owner/repo>[@ref]`. Provenance
+  is printed and confirmed before anything is fetched; non-interactive use
+  needs `--yes`. You are trusting that source's code — say so before running it.
+- Full reference: `docs/guide/starters.md`.
+
 ## Flags
 
+- `--starter <name>`: Scaffold an application archetype rather than the minimal
+  base project. See "Starters" above.
 - `--with-i18n`: Scaffold the optional i18n module (Fluent translations at
   `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the `i18n` feature
   on `autumn-web`).

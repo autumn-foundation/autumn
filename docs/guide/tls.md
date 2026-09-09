@@ -19,8 +19,10 @@ it, and which one you want depends on where TLS is terminated:
 
 > **Quick decision.** Own cert, single host → [Direct TLS](#direct-in-process-tls-servertls).
 > Want auto-issued certs, single host, no proxy →
-> [ACME](#automatic-acme-certificates-servertlsacme). Using `autumn deploy`, a
-> proxy, or multiple replicas → [Reverse-proxy termination](#terminating-tls-at-a-reverse-proxy).
+> [ACME](#automatic-acme-certificates-servertlsacme). Tenants bringing their own
+> hostnames → [Tenant custom domains](#tenant-custom-domains-servertlsacmecustom_domains).
+> Using `autumn deploy`, a proxy, or multiple replicas →
+> [Reverse-proxy termination](#terminating-tls-at-a-reverse-proxy).
 
 Direct TLS and ACME are both **off by default** and each gated behind an
 off-by-default cargo feature (`tls` and `acme`), so a default build never links
@@ -702,6 +704,193 @@ and raises the operator-alert
 `acme-renewal`. Because renewal starts `renew_before_days` (default 30) ahead of
 expiry, that alert fires with weeks of validity left, and clears automatically
 on the first successful renewal.
+
+---
+
+## Tenant custom domains (`[server.tls.acme.custom_domains]`)
+
+Wildcard certificates cover `tenant42.myapp.com`. A B2B customer who wants
+`app.clientco.com` needs a certificate of their own. Turn the feature on and
+autumn does the whole journey: it hands each tenant exact DNS instructions,
+independently confirms the hostname points here, orders one certificate per
+hostname, serves it by SNI, routes requests on that `Host` to the owning
+tenant, and renews it. There is no per-domain configuration — a thousand
+tenants use the same twenty lines.
+
+```toml
+[server.tls.acme]
+domains        = ["myapp.com", "*.myapp.com"]
+contact_email  = "ops@myapp.com"
+directory      = "production"
+
+[server.tls.acme.custom_domains]
+enabled          = true
+ingress_hostname = "ingress.myapp.com"   # CNAME target for tenant subdomains
+ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
+# ingress_ipv6   = ["2001:db8::10"]      # AAAA records
+# store_dir                  = "config/acme/domains"  # the registry (0600 files)
+# max_domains                = 1000
+# cert_cache_size            = 256       # certificates held in memory at once
+# issuance_per_domain_per_day = 5
+# issuance_global_per_hour    = 50
+# failure_backoff_secs        = 300      # doubles per consecutive failure
+# max_failure_backoff_secs    = 86400
+# poll_interval_secs          = 60
+```
+
+`ingress_hostname` is what tenants CNAME at. An **apex** domain
+(`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
+`ingress_ipv6` instead; set both kinds if you accept both.
+
+### The tenant journey
+
+Your app owns the screens; autumn owns the state. Register a hostname when a
+tenant asks for it, show them what the framework says to publish, and render
+the status.
+
+Autumn refuses a hostname the deployment already serves — anything under
+`[server.tls.acme] domains` or `[tenancy] base_domain` — so one tenant cannot
+connect another's subdomain. **Per-tenant quotas are yours**: `max_domains` is
+deployment-wide, so cap registrations per tenant in your own code if one tenant
+must not be able to spend the whole budget.
+
+```rust
+use autumn_web::custom_domain::{CustomDomainPruner, CustomDomainRegistry, DnsInstructions};
+
+let registry = CustomDomainRegistry::from_state(&state).expect("custom domains are enabled");
+let ingress = config.server.tls.as_ref()
+    .and_then(|t| t.acme.as_ref())
+    .and_then(|a| a.custom_domains.as_ref())
+    .map(|cd| cd.ingress())
+    .unwrap_or_default();
+
+// 1. Connect. Your app decides who may — plan, entitlement, per-tenant quota.
+let domain = registry.register("app.clientco.com", &tenant_id, now_unix).await?;
+
+// 2. Show the tenant exactly what to publish. Fields are tab-separated.
+let instructions = DnsInstructions::for_hostname(&domain.hostname, &ingress)?;
+println!("{}", instructions.render());   // app.clientco.com\tCNAME\tingress.myapp.com
+
+// 3. Render status, including why it is stuck.
+for d in registry.list_for_tenant(&tenant_id) {
+    println!("{} — {} {}", d.hostname, d.status, d.failure_reason.unwrap_or_default());
+}
+
+// 4. Offboard. Routing, serving and renewal stop AND the certificate is deleted.
+let domains = <dyn CustomDomainPruner>::from_state(&state).expect("custom domains are enabled");
+domains.offboard_domain("app.clientco.com").await?;
+domains.offboard_tenant_domains(&tenant_id).await?;   // every domain the tenant owns
+```
+
+`registry.remove` forgets the registration only — routing and serving stop, but
+the certificate stays in the ACME store. Offboard through `CustomDomainPruner`
+so the private key goes too.
+
+The states are `pending_dns` → `verified` → `issuing` → `active`. There is no
+separate failed state: a domain that fails carries a `failure_reason` and a
+`next_attempt_unix`, and one that already reached `active` **stays** `active`
+while it retries — a failed renewal never takes a live tenant offline.
+
+Once a domain is `active`, requests carrying that `Host` resolve to its tenant.
+The usual `[tenancy] base_domain` rejection does not apply to a registered
+domain, and subdomain tenancy is unchanged for every other host.
+
+### Abuse posture toward the CA
+
+Custom domains mean tenant-supplied hostnames drive certificate orders, so
+three gates stand between a hostname and Let's Encrypt:
+
+1. **Registration.** Only a hostname your app registered is known at all. An
+   SNI hostname nobody registered is refused at the TLS handshake, and no code
+   path from there reaches the ACME provider.
+2. **Verification.** No order is created until autumn independently resolves
+   the hostname and finds it pointing at this deployment. A domain whose DNS
+   points elsewhere sits at `pending_dns` with the observed address in its
+   `failure_reason` and costs the CA nothing.
+3. **Budget.** At the defaults, at most **5 orders per domain per day** and
+   **50 across the whole deployment per hour** — comfortably inside Let's
+   Encrypt's 300-new-orders-per-account-per-3-hours limit. Failures back off
+   exponentially from 5 minutes to a day, so a permanently broken domain
+   converges to roughly one attempt a day rather than one a tick.
+
+Tenant certificates are ordered over **HTTP-01** even when your own certificate
+uses DNS-01: the record lives in the *tenant's* zone, where autumn holds no
+credential. That is the same condition verification already proved, so
+`:80` must reach this deployment for tenant domains to issue.
+
+Every tenant order uses the **same ACME account** as your own certificate, so
+the CA sees one registration however many domains connect.
+
+### Scale and restarts
+
+The registry is one `0600` JSON file per domain, loaded into an in-memory index
+before the listener binds — a restart routes and serves every connected domain
+on the first request. Certificates load **incrementally**: at most
+`cert_cache_size` are held in memory, and a handshake for a colder domain reads
+its certificate back from the store and caches it. Nothing requires every
+certificate to be resident, so `cert_cache_size` is a memory knob, not a
+correctness one.
+
+Custom domains live **inside** the ACME TLS listener, so they exist only where
+autumn terminates TLS itself. Behind
+[reverse-proxy termination](#terminating-tls-at-a-reverse-proxy) there is no
+registry and no `Host`-based tenant routing — the proxy owns the certificates
+and your app owns the mapping.
+
+Ordering is leader-elected per domain through the same `SchedulerCoordinator`
+the deployment's own renewal uses, so replicas do not race the CA. Everything
+else about the ACME path is still single-host: the HTTP-01 token map and the
+certificate store are per-process, so behind a load balancer the CA's
+validation request usually reaches a replica that never published the token.
+Run custom domains on a single host.
+
+### Offboarding and retention
+
+`offboard_domain` (or `offboard_tenant_domains`) stops routing, stops serving,
+halts renewal, drops the cached certificate and deletes the stored pair. Beyond
+that, the
+`custom_domains`
+[retention dataset](./data-retention.md) prunes two things the app cannot: a
+registration that never reached DNS verification within its window, and a stored
+certificate for a hostname no longer registered at all.
+
+```toml
+[retention]
+custom_domains = "30d"   # drop connections abandoned before DNS was ever published
+```
+
+A registry that cannot be read at boot disables custom-domain **connections**
+as well as routing: an index that hydrated nothing cannot tell whether a
+hostname already belongs to someone, so `register` refuses with "the
+custom-domain registry has not loaded" rather than overwriting the durable
+record of whoever owns it. The deployment's own certificate keeps serving; fix
+the store and restart.
+
+### What doctor checks
+
+| Check | What it catches |
+|---|---|
+| `custom_domains` | The section loads, has somewhere for tenants to point, and its cap is not already exceeded. **Fail** on anything the server would exit at boot on. |
+| `custom_domain_dns` | (`--online`) Each registered domain still points here. **Fail** for an `active` or `verified` domain whose DNS has moved away or vanished — it is serving a certificate nobody can reach and will fail its next renewal. **Warn** for one still `pending_dns`. Probes the first 25 domains and says so. |
+| `custom_domain_http01` | (`--online`) Port 80 is reachable on **every address** each configured ingress target resolves to — one member of a load-balancer record set that drops it fails HTTP-01 for whatever share of tenants lands there. **Fail** when any is unreachable — tenant certificates are always issued over HTTP-01, so a closed port 80 blocks every one of them **even under a DNS-01 deployment**, where `acme_ports` rightly calls it optional for the deployment's own certificate. |
+
+### Failure surfaces through health and alerts
+
+The `custom_domains` health indicator reports how many domains are registered
+and active, and names every unhealthy one **with its tenant** — so an operator
+reading `/actuator/health` can act without a registry lookup. It is `Down` only
+when a certificate has actually expired: one tenant's pending retry is not a
+deployment outage. A failed order also raises the
+[`scheduled_task_failure`](./operator-alerts.md) alert for
+`custom_domain_certificates`, naming the domain and tenant, and that alert
+clears when the **last** failing domain recovers — or is offboarded, since a
+domain that no longer exists is not still failing.
+
+A renewal skipped because the domain stopped pointing here is recorded the same
+way. The certificate keeps serving until it expires, so the domain stays
+`active`, but the reason and the alert appear immediately rather than at expiry,
+when it would already be down: either the tenant restores the record or the
+domain should be offboarded.
 
 ---
 

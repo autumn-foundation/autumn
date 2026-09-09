@@ -140,6 +140,7 @@
 //! | `AUTUMN_RETENTION__WEBHOOK_REPLAY` | `retention.webhook_replay` | duration `String` |
 //! | `AUTUMN_RETENTION__SESSIONS` | `retention.sessions` | duration `String` |
 //! | `AUTUMN_RETENTION__AUDIT_ARCHIVES` | `retention.audit_archives` | duration `String` |
+//! | `AUTUMN_RETENTION__CUSTOM_DOMAINS` | `retention.custom_domains` | duration `String` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
 //! | `AUTUMN_SCHEDULER__KEY_PREFIX` | `scheduler.key_prefix` | `String` |
@@ -3026,6 +3027,7 @@ pub fn split_role_requires_file_backed_sqlite(
 /// webhook_replay         = "3d"    # inbound webhook replay markers
 /// sessions               = "30d"   # server-side session records
 /// audit_archives         = "400d"  # JSONL audit archive entries
+/// custom_domains         = "30d"   # tenant domains never verified since
 /// ```
 ///
 /// Durations use the same syntax as `#[scheduled(every = ...)]`: `s`/`m`/`h`/
@@ -3108,6 +3110,17 @@ pub struct RetentionConfig {
     /// [`crate::audit::JsonlFileAuditSink`].
     #[serde(default)]
     pub audit_archives: Option<String>,
+
+    /// Tenant custom-domain registrations that never reached DNS
+    /// verification, measured from registration. Unset (default): a pending
+    /// registration is kept until the app offboards it.
+    ///
+    /// Never touches a domain that verified: an active domain is live
+    /// configuration, not aged data. Orphaned certificates — a stored pair for
+    /// a hostname no longer registered — are pruned by the same sweep
+    /// regardless of this window, since there is no record left to age.
+    #[serde(default)]
+    pub custom_domains: Option<String>,
 }
 
 impl Default for RetentionConfig {
@@ -3122,6 +3135,7 @@ impl Default for RetentionConfig {
             webhook_replay: None,
             sessions: None,
             audit_archives: None,
+            custom_domains: None,
         }
     }
 }
@@ -3138,7 +3152,7 @@ impl RetentionConfig {
     /// table from drifting apart: adding a field here without adding the
     /// matching dataset fails a test in `crate::data_retention`.
     #[must_use]
-    pub fn windows(&self) -> [(&'static str, Option<&str>); 8] {
+    pub fn windows(&self) -> [(&'static str, Option<&str>); 9] {
         [
             ("job_history", self.job_history.as_deref()),
             ("commit_hooks", self.commit_hooks.as_deref()),
@@ -3151,6 +3165,7 @@ impl RetentionConfig {
             ("webhook_replay", self.webhook_replay.as_deref()),
             ("sessions", self.sessions.as_deref()),
             ("audit_archives", self.audit_archives.as_deref()),
+            ("custom_domains", self.custom_domains.as_deref()),
         ]
     }
 
@@ -5191,6 +5206,7 @@ impl AutumnConfig {
     /// - `AUTUMN_RETENTION__WEBHOOK_REPLAY` → `retention.webhook_replay` (duration `String`)
     /// - `AUTUMN_RETENTION__SESSIONS` → `retention.sessions` (duration `String`)
     /// - `AUTUMN_RETENTION__AUDIT_ARCHIVES` → `retention.audit_archives` (duration `String`)
+    /// - `AUTUMN_RETENTION__CUSTOM_DOMAINS` → `retention.custom_domains` (duration `String`)
     ///
     /// # Signed webhooks
     /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)
@@ -6213,6 +6229,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_RETENTION__AUDIT_ARCHIVES",
             &mut self.retention.audit_archives,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_RETENTION__CUSTOM_DOMAINS",
+            &mut self.retention.custom_domains,
         );
     }
 
@@ -7417,6 +7438,251 @@ pub struct AcmeConfig {
     /// absent, issuance stays on #1608's HTTP-01 path and wildcards are rejected.
     #[serde(default)]
     pub dns: Option<AcmeDnsConfig>,
+
+    /// Tenant custom domains (issue #1635). Present under
+    /// `[server.tls.acme.custom_domains]`.
+    ///
+    /// When enabled, tenants connect their own hostnames, each getting its own
+    /// verified, per-domain certificate served by SNI. Absent means no tenant
+    /// hostname is registrable and SNI selection is unchanged.
+    #[serde(default)]
+    pub custom_domains: Option<CustomDomainsConfig>,
+}
+
+/// `[server.tls.acme.custom_domains]` — tenant-connected hostnames with
+/// per-domain ACME certificates (issue #1635).
+///
+/// The whole feature is config-only: no per-domain entries ever appear here.
+/// Domains are registered at runtime through
+/// [`CustomDomainRegistry`](crate::custom_domain::CustomDomainRegistry), which
+/// is what makes a 1,000-tenant deployment a fixed twenty lines of config.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomDomainsConfig {
+    /// Turn the feature on. Off by default: enabling it opens an ACME order
+    /// path driven by tenant-supplied hostnames.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The ingress hostname tenants CNAME their subdomains at.
+    #[serde(default)]
+    pub ingress_hostname: Option<String>,
+
+    /// The ingress IPv4 addresses tenants point apex domains at with A records.
+    ///
+    /// Held as strings and parsed by [`validate`](Self::validate), matching
+    /// `[server.tls.acme.dns] resolvers`: a typed address here aborts the
+    /// config schema walk that `autumn doctor` and strict-config checking
+    /// build on.
+    #[serde(default)]
+    pub ingress_ipv4: Vec<String>,
+
+    /// The ingress IPv6 addresses, for AAAA records.
+    #[serde(default)]
+    pub ingress_ipv6: Vec<String>,
+
+    /// Directory holding the domain registry. Default: `config/acme/domains`.
+    #[serde(default = "default_custom_domains_dir")]
+    pub store_dir: PathBuf,
+
+    /// Most domains this deployment will accept. Default: `1000`.
+    #[serde(default = "default_custom_domains_max")]
+    pub max_domains: usize,
+
+    /// Certificates held in memory at once. Beyond this, a handshake for a
+    /// cold domain re-reads its certificate from the store. Default: `256`.
+    #[serde(default = "default_custom_domains_cert_cache")]
+    pub cert_cache_size: usize,
+
+    /// ACME orders allowed per domain per day. Default: `5`.
+    #[serde(default = "default_custom_domains_per_domain_per_day")]
+    pub issuance_per_domain_per_day: u32,
+
+    /// ACME orders allowed across all domains per hour. Default: `50`.
+    #[serde(default = "default_custom_domains_global_per_hour")]
+    pub issuance_global_per_hour: u32,
+
+    /// First retry delay after a failure; doubles per consecutive failure.
+    /// Default: `300` (5 minutes).
+    #[serde(default = "default_custom_domains_base_backoff")]
+    pub failure_backoff_secs: u64,
+
+    /// Cap on the doubling backoff. Default: `86400` (a day).
+    #[serde(default = "default_custom_domains_max_backoff")]
+    pub max_failure_backoff_secs: u64,
+
+    /// How often the orchestrator verifies, issues and renews. Default: `60`.
+    #[serde(default = "default_custom_domains_poll_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for CustomDomainsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ingress_hostname: None,
+            ingress_ipv4: Vec::new(),
+            ingress_ipv6: Vec::new(),
+            store_dir: default_custom_domains_dir(),
+            max_domains: default_custom_domains_max(),
+            cert_cache_size: default_custom_domains_cert_cache(),
+            issuance_per_domain_per_day: default_custom_domains_per_domain_per_day(),
+            issuance_global_per_hour: default_custom_domains_global_per_hour(),
+            failure_backoff_secs: default_custom_domains_base_backoff(),
+            max_failure_backoff_secs: default_custom_domains_max_backoff(),
+            poll_interval_secs: default_custom_domains_poll_secs(),
+        }
+    }
+}
+
+impl CustomDomainsConfig {
+    /// A scheme, a port or a path in `ingress_hostname` reaches tenants
+    /// verbatim as their CNAME target. The record would be invalid, the
+    /// ingress would never resolve, and every subdomain domain would sit at
+    /// `pending_dns` with nothing to explain why.
+    fn validate_ingress_hostname(&self) -> Result<(), String> {
+        if let Some(raw) = self
+            .ingress_hostname
+            .as_ref()
+            .filter(|h| !h.trim().is_empty())
+        {
+            let canonical = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+            match crate::custom_domain::normalize_hostname(raw) {
+                Ok(host) if host == canonical => {}
+                Ok(host) => {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] ingress_hostname `{raw}` must be a bare \
+                     DNS name (`{host}`): a scheme, port or path cannot be a CNAME target, so \
+                     tenants would be given a record that never resolves"
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] ingress_hostname `{raw}` is not a usable \
+                     DNS name: {e}. Tenants are given it as their CNAME target, so every \
+                     subdomain would stay at pending_dns"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the custom-domain wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first problem found.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self
+            .ingress_hostname
+            .as_ref()
+            .is_none_or(|h| h.trim().is_empty())
+            && self.ingress_ipv4.is_empty()
+            && self.ingress_ipv6.is_empty()
+        {
+            return Err(
+                "[server.tls.acme.custom_domains] needs somewhere for tenants to point DNS: set \
+                 ingress_hostname (the CNAME target for tenant subdomains) and/or ingress_ipv4 / \
+                 ingress_ipv6 (the A/AAAA records apex domains need). Without one, no tenant can \
+                 be given usable DNS instructions and no domain can ever verify"
+                    .to_owned(),
+            );
+        }
+        self.validate_ingress_hostname()?;
+        for (key, values) in [
+            ("ingress_ipv4", &self.ingress_ipv4),
+            ("ingress_ipv6", &self.ingress_ipv6),
+        ] {
+            for value in values {
+                let parsed = if key == "ingress_ipv4" {
+                    value.trim().parse::<std::net::Ipv4Addr>().is_ok()
+                } else {
+                    value.trim().parse::<std::net::Ipv6Addr>().is_ok()
+                };
+                if !parsed {
+                    return Err(format!(
+                        "[server.tls.acme.custom_domains] {key} entry `{value}` is not a valid \
+                         address; a tenant would be given a DNS record that points nowhere"
+                    ));
+                }
+            }
+        }
+        if self.max_domains == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] max_domains must be at least 1; 0 rejects every \
+                 registration"
+                    .to_owned(),
+            );
+        }
+        if self.cert_cache_size == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] cert_cache_size must be at least 1: a zero-sized \
+                 cache would re-read every certificate on every handshake"
+                    .to_owned(),
+            );
+        }
+        if self.issuance_per_domain_per_day == 0 || self.issuance_global_per_hour == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] issuance_per_domain_per_day and \
+                 issuance_global_per_hour must both be at least 1; 0 refuses every order and no \
+                 domain can ever become active"
+                    .to_owned(),
+            );
+        }
+        if self.failure_backoff_secs == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] failure_backoff_secs must be at least 1: a zero \
+                 backoff retries a permanently broken domain every tick and burns the CA's rate \
+                 limits"
+                    .to_owned(),
+            );
+        }
+        if self.max_failure_backoff_secs < self.failure_backoff_secs {
+            return Err(format!(
+                "[server.tls.acme.custom_domains] max_failure_backoff_secs ({}) must be at least \
+                 failure_backoff_secs ({}): the cap is applied to the doubling delay, so a smaller \
+                 cap silently disables the backoff",
+                self.max_failure_backoff_secs, self.failure_backoff_secs
+            ));
+        }
+        if self.poll_interval_secs == 0 {
+            return Err(
+                "[server.tls.acme.custom_domains] poll_interval_secs must be at least 1; 0 spins \
+                 the orchestrator"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The ingress this deployment tells tenants to point at.
+    ///
+    /// A hostname or address that does not parse is dropped here;
+    /// [`validate`](Self::validate) has already refused the configuration, so
+    /// the app never reaches this with a bad value.
+    #[must_use]
+    pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
+        crate::custom_domain::ExpectedIngress {
+            hostname: self
+                .ingress_hostname
+                .as_ref()
+                .and_then(|h| crate::custom_domain::normalize_hostname(h).ok()),
+            ipv4: self
+                .ingress_ipv4
+                .iter()
+                .filter_map(|a| a.trim().parse().ok())
+                .collect(),
+            ipv6: self
+                .ingress_ipv6
+                .iter()
+                .filter_map(|a| a.trim().parse().ok())
+                .collect(),
+        }
+    }
 }
 
 impl AcmeConfig {
@@ -7536,6 +7802,9 @@ impl AcmeConfig {
         }
         if let Some(dns) = &self.dns {
             dns.validate()?;
+        }
+        if let Some(custom) = &self.custom_domains {
+            custom.validate()?;
         }
         Ok(())
     }
@@ -9685,6 +9954,46 @@ const fn default_acme_http_challenge_port() -> u16 {
 /// leaves ample slack for retries.
 const fn default_acme_renew_before_days() -> u32 {
     30
+}
+
+/// Default custom-domain registry directory.
+fn default_custom_domains_dir() -> PathBuf {
+    PathBuf::from("config/acme/domains")
+}
+
+/// Default cap on registered tenant domains.
+const fn default_custom_domains_max() -> usize {
+    1000
+}
+
+/// Default number of per-domain certificates held in memory.
+const fn default_custom_domains_cert_cache() -> usize {
+    256
+}
+
+/// Default per-domain daily ACME order budget.
+const fn default_custom_domains_per_domain_per_day() -> u32 {
+    5
+}
+
+/// Default deployment-wide hourly ACME order budget.
+const fn default_custom_domains_global_per_hour() -> u32 {
+    50
+}
+
+/// Default first retry delay after a custom-domain failure.
+const fn default_custom_domains_base_backoff() -> u64 {
+    300
+}
+
+/// Default cap on the custom-domain retry backoff.
+const fn default_custom_domains_max_backoff() -> u64 {
+    86_400
+}
+
+/// Default custom-domain orchestrator poll interval.
+const fn default_custom_domains_poll_secs() -> u64 {
+    60
 }
 
 /// Default credentials-store key holding the DNS provider credential
@@ -14086,7 +14395,8 @@ path = "/healthz"
             .with("AUTUMN_RETENTION__EXPERIMENT_ASSIGNMENTS", "180d")
             .with("AUTUMN_RETENTION__WEBHOOK_REPLAY", "1d")
             .with("AUTUMN_RETENTION__SESSIONS", "14d")
-            .with("AUTUMN_RETENTION__AUDIT_ARCHIVES", "365d");
+            .with("AUTUMN_RETENTION__AUDIT_ARCHIVES", "365d")
+            .with("AUTUMN_RETENTION__CUSTOM_DOMAINS", "30d");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
 
@@ -14101,6 +14411,7 @@ path = "/healthz"
         assert_eq!(config.retention.webhook_replay.as_deref(), Some("1d"));
         assert_eq!(config.retention.sessions.as_deref(), Some("14d"));
         assert_eq!(config.retention.audit_archives.as_deref(), Some("365d"));
+        assert_eq!(config.retention.custom_domains.as_deref(), Some("30d"));
     }
 
     #[test]
@@ -15862,6 +16173,7 @@ path = "/healthz"
             renew_before_days: default_acme_renew_before_days(),
             ca_root_path: None,
             dns: None,
+            custom_domains: None,
         }
     }
 

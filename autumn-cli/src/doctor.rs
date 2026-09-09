@@ -1580,6 +1580,461 @@ pub fn probe_port(domain: &str, port: u16) -> PortReachability {
     }
 }
 
+/// What `autumn doctor` found about one registered tenant custom domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomainProbe {
+    /// The registered hostname.
+    pub hostname: String,
+    /// The tenant it routes to.
+    pub tenant: String,
+    /// Its lifecycle state, as the registry recorded it.
+    pub status: String,
+    /// Where DNS says it points, judged against the CONFIGURED ingress.
+    pub dns: CustomDomainDns,
+}
+
+/// Where a registered custom domain points, relative to the configured ingress.
+///
+/// Deliberately not [`DnsPointsHere`]: that grades against the addresses THIS
+/// process can discover for itself, which is the right question for the
+/// deployment's own certificate and the wrong one here. `autumn doctor` usually
+/// runs from an operator's laptop or a deploy runner, and the ingress a tenant
+/// is told to point at is a load balancer or an elastic IP — so a correctly
+/// connected domain would grade as "resolves elsewhere" and fail the run.
+/// Grading against `[server.tls.acme.custom_domains]`'s ingress asks what the
+/// runtime verifier asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomDomainDns {
+    /// Every resolved address is a configured ingress address.
+    PointsHere,
+    /// The name resolves, but not to the ingress.
+    PointsElsewhere {
+        /// The addresses that are not the ingress.
+        seen: Vec<String>,
+    },
+    /// The name does not resolve.
+    Unresolved,
+    /// The ingress itself could not be resolved to any address, so there is
+    /// nothing to compare against — inconclusive, never a hard failure.
+    IngressUnknown,
+}
+
+/// Grade the `[server.tls.acme.custom_domains]` section (offline, pure).
+///
+/// Returns `None` when the section is absent — custom domains are off and
+/// there is nothing to say.
+#[must_use]
+pub fn check_custom_domains_config_impl(
+    custom_domains: Option<&autumn_web::config::CustomDomainsConfig>,
+    error: Option<&str>,
+    registry: &CustomDomainRegistryRead,
+) -> Option<CheckResult> {
+    let registered = registry.domains.len();
+    if let Some(error) = error {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[server.tls.acme.custom_domains] does not load: {error}"
+            )),
+            hint: Some(
+                "Fix the section (an unknown key is rejected outright) — the server will not \
+                 boot with it as written",
+            ),
+        });
+    }
+    let cd = custom_domains?;
+    if !cd.enabled {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Pass,
+            detail: Some(
+                "[server.tls.acme.custom_domains] enabled = false: no tenant hostname is \
+                 registrable"
+                    .to_owned(),
+            ),
+            hint: None,
+        });
+    }
+    if let Err(message) = cd.validate() {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Fail,
+            detail: Some(message),
+            hint: Some("Fix [server.tls.acme.custom_domains]; the server exits at boot on this"),
+        });
+    }
+    if let Some(unreadable) = registry.unreadable.as_ref() {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "the custom-domain registry cannot be read ({unreadable}); at boot this leaves \
+                 every connected domain unrouted, and no new domain can be connected until it is \
+                 fixed"
+            )),
+            hint: Some(
+                "Check the ownership and mode of [server.tls.acme.custom_domains] store_dir — the \
+                 server needs to read and write it",
+            ),
+        });
+    }
+    if !registry.skipped.is_empty() {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{} of {} custom-domain records will not load ({}); the runtime skips them and \
+                 serves the rest, so those tenants' domains stop routing",
+                registry.skipped.len(),
+                registry.skipped.len() + registered,
+                registry.skipped.join(", ")
+            )),
+            hint: Some("Re-register the affected hostnames, or restore the records from a backup"),
+        });
+    }
+    if registered > cd.max_domains {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{registered} domains are registered but max_domains is {}; the ones already \
+                 stored still load and serve, but no new domain can be connected",
+                cd.max_domains
+            )),
+            hint: Some("Raise [server.tls.acme.custom_domains] max_domains"),
+        });
+    }
+    Some(CheckResult {
+        name: "custom_domains",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "custom domains are enabled; {registered} registered, cap {}",
+            cd.max_domains
+        )),
+        hint: None,
+    })
+}
+
+/// Grade one registered custom domain's live DNS (pure; injectable).
+///
+/// A domain that reached `verified` or `active` and whose DNS has since moved
+/// away is a **Fail**: it is serving a certificate for a hostname that no
+/// longer reaches this deployment, and its next HTTP-01 renewal will fail. A
+/// domain still `pending_dns` is expected not to point here yet, so it is
+/// reported without failing the run.
+#[must_use]
+pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
+    let CustomDomainProbe {
+        hostname,
+        tenant,
+        status,
+        dns,
+    } = probe;
+    let settled = status == "active" || status == "verified";
+    match dns {
+        CustomDomainDns::PointsHere => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) resolves to this deployment's ingress"
+            )),
+            hint: None,
+        },
+        CustomDomainDns::IngressUnknown => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "cannot tell where {hostname} (tenant {tenant}) points: the configured ingress \
+                 does not resolve to any address from here"
+            )),
+            hint: Some(
+                "Check [server.tls.acme.custom_domains] ingress_hostname / ingress_ipv4 / \
+                 ingress_ipv6",
+            ),
+        },
+        CustomDomainDns::Unresolved if settled => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is {status} but no longer resolves at all; it is \
+                 serving a certificate nobody can reach, and its renewal will fail"
+            )),
+            hint: Some(
+                "Ask the tenant to restore the record, or offboard the domain so renewals stop",
+            ),
+        },
+        CustomDomainDns::Unresolved => CheckResult {
+            name: "custom_domain_dns",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is {status} and does not resolve yet"
+            )),
+            hint: Some("The tenant has not published the DNS record yet"),
+        },
+        CustomDomainDns::PointsElsewhere { seen } => CheckResult {
+            name: "custom_domain_dns",
+            status: if settled {
+                CheckStatus::Fail
+            } else {
+                CheckStatus::Warn
+            },
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is {status} but resolves to {}, which {} not this \
+                 deployment's ingress",
+                seen.join(", "),
+                if seen.len() == 1 { "is" } else { "are" }
+            )),
+            hint: Some(
+                "Point the record back at this deployment's ingress, or offboard the domain",
+            ),
+        },
+    }
+}
+
+/// Grade port 80 on one ingress target, for tenant custom domains.
+///
+/// Deliberately independent of the deployment certificate's challenge mode.
+/// Tenant certificates are ALWAYS validated over HTTP-01 — a tenant's zone is
+/// the tenant's, so this deployment can hold no credential to write a DNS-01
+/// `_acme-challenge` record in it — while the deployment's own certificate may
+/// well use DNS-01, under which `check_acme_ports_for_challenge` calls a closed
+/// port 80 optional. Without this check, an operator running DNS-01 with a
+/// firewall that drops inbound TCP/80 sees a clean doctor run while every
+/// tenant domain fails its order.
+///
+/// `probed` carries EVERY address the target resolves to, not just the first.
+/// A load balancer published as several A/AAAA records is reached at whichever
+/// one the CA's resolver hands back, so one unreachable member fails HTTP-01
+/// for whatever share of tenants lands on it — a failure a single-address probe
+/// reports as a clean pass.
+#[must_use]
+pub fn check_custom_domain_http01_impl(
+    target: &str,
+    probed: &[(String, PortReachability)],
+) -> CheckResult {
+    let unreachable: Vec<String> = probed
+        .iter()
+        .filter(|(_, state)| *state != PortReachability::Open)
+        .map(|(addr, state)| format!("{addr} ({state:?})"))
+        .collect();
+    if probed.is_empty() {
+        return CheckResult {
+            name: "custom_domain_http01",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "the custom-domain ingress ({target}) does not resolve to any address from here, \
+                 so tenant HTTP-01 validation cannot be checked"
+            )),
+            hint: Some(
+                "Check [server.tls.acme.custom_domains] ingress_hostname / ingress_ipv4 / \
+                 ingress_ipv6",
+            ),
+        };
+    }
+    if unreachable.is_empty() {
+        return CheckResult {
+            name: "custom_domain_http01",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "port 80 is reachable on all {} address(es) of the custom-domain ingress \
+                 ({target})",
+                probed.len()
+            )),
+            hint: None,
+        };
+    }
+    CheckResult {
+        name: "custom_domain_http01",
+        status: CheckStatus::Fail,
+        detail: Some(format!(
+            "port 80 is not reachable on {} of the {} address(es) of the custom-domain ingress \
+             ({target}): {}. Every tenant custom domain is validated over HTTP-01, whatever \
+             challenge this deployment's own certificate uses",
+            unreachable.len(),
+            probed.len(),
+            unreachable.join(", ")
+        )),
+        hint: Some(
+            "Open inbound TCP/80 on every address behind the ingress tenants are told to point \
+             at, so the CA can fetch /.well-known/acme-challenge for their hostnames",
+        ),
+    }
+}
+
+/// Probe `port` on EVERY address `target` resolves to, in resolution order.
+///
+/// An IP literal probes itself. A name that resolves to nothing returns an
+/// empty list, which the caller reports rather than silently passing.
+#[must_use]
+pub fn probe_port_every_address(target: &str, port: u16) -> Vec<(String, PortReachability)> {
+    let addrs = resolve_addresses(target);
+    addrs
+        .into_iter()
+        .map(|addr| (addr.to_string(), probe_addr(addr, port)))
+        .collect()
+}
+
+/// Probe one resolved address, skipping a second resolution of the name.
+fn probe_addr(addr: std::net::IpAddr, port: u16) -> PortReachability {
+    let socket = std::net::SocketAddr::new(addr, port);
+    match std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_secs(2)) {
+        Ok(_) => PortReachability::Open,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => PortReachability::Refused,
+            std::io::ErrorKind::TimedOut => PortReachability::TimedOut,
+            _ => PortReachability::Error,
+        },
+    }
+}
+
+/// Resolve `hostname` and grade it against the configured ingress, through the
+/// SAME grader the runtime verifier uses — so doctor and the running app can
+/// never disagree about whether a domain points here.
+#[must_use]
+pub fn resolve_custom_domain_dns(
+    hostname: &str,
+    ingress: &autumn_web::custom_domain::ExpectedIngress,
+) -> CustomDomainDns {
+    use autumn_web::custom_domain::{ObservedTarget, VerificationOutcome, grade_dns_verification};
+
+    // A resolver reports the addresses a name ends at and follows CNAMEs
+    // silently, so the ingress hostname is resolved and its addresses ADDED to
+    // whatever was configured explicitly — exactly the union
+    // `CustomDomainTask::effective_ingress` builds at runtime. Resolving it
+    // only when no address was configured would fail the setup the guide
+    // documents: subdomains CNAME to a load balancer while apex domains use
+    // static A/AAAA records, two different address sets, so every correctly
+    // connected subdomain would read as pointing elsewhere.
+    let mut expected = ingress.clone();
+    if let Some(host) = expected.hostname.clone() {
+        for addr in resolve_addresses(&host) {
+            match addr {
+                std::net::IpAddr::V4(v4) if !expected.ipv4.contains(&v4) => expected.ipv4.push(v4),
+                std::net::IpAddr::V6(v6) if !expected.ipv6.contains(&v6) => expected.ipv6.push(v6),
+                _ => {}
+            }
+        }
+    }
+    if expected.ipv4.is_empty() && expected.ipv6.is_empty() {
+        return CustomDomainDns::IngressUnknown;
+    }
+
+    let observed = resolve_addresses(hostname);
+    if observed.is_empty() {
+        return CustomDomainDns::Unresolved;
+    }
+    // The VERDICT comes from the runtime grader, so doctor and the app can
+    // never disagree about whether a domain points here. The addresses to SHOW
+    // are recomputed here rather than parsed back out of the grader's message:
+    // reading data out of prose written for a human breaks silently the day
+    // that prose is reworded.
+    let verdict = grade_dns_verification(&ObservedTarget::Addresses(observed.clone()), &expected);
+    match verdict {
+        VerificationOutcome::PointsHere => CustomDomainDns::PointsHere,
+        VerificationOutcome::Unresolved => CustomDomainDns::Unresolved,
+        VerificationOutcome::PointsElsewhere { .. } => CustomDomainDns::PointsElsewhere {
+            seen: observed
+                .into_iter()
+                .filter(|addr| !ingress_contains(&expected, *addr))
+                .map(|addr| addr.to_string())
+                .collect(),
+        },
+    }
+}
+
+/// Is `addr` one of the ingress addresses? Mirrors the runtime's own test, so
+/// the addresses doctor names are exactly the ones the grader rejected.
+fn ingress_contains(
+    expected: &autumn_web::custom_domain::ExpectedIngress,
+    addr: std::net::IpAddr,
+) -> bool {
+    match addr {
+        std::net::IpAddr::V4(v4) => expected.ipv4.contains(&v4),
+        std::net::IpAddr::V6(v6) => expected.ipv6.contains(&v6),
+    }
+}
+
+/// Every address `host` resolves to, or an empty list.
+fn resolve_addresses(host: &str) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs as _;
+    (host, 0_u16)
+        .to_socket_addrs()
+        .map(|addrs| addrs.map(|s| s.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// Read the custom-domain registry off disk, where the runtime store writes it.
+///
+/// Returns `(hostname, tenant, status)` per record, sorted. A file that will
+/// not parse is skipped — the same treatment the runtime store gives it — so
+/// one corrupt record does not blind the check to the rest.
+#[must_use]
+pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainRegistryRead {
+    let entries = match std::fs::read_dir(store_dir) {
+        Ok(entries) => entries,
+        // A directory that is not there yet is not a fault: nothing has been
+        // registered. One that cannot be READ is the fault the runtime hits at
+        // boot, and it must not read as "no domains".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CustomDomainRegistryRead::default();
+        }
+        Err(e) => {
+            return CustomDomainRegistryRead {
+                unreadable: Some(format!("{}: {e}", store_dir.display())),
+                ..CustomDomainRegistryRead::default()
+            };
+        }
+    };
+    let mut read = CustomDomainRegistryRead::default();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        match std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<autumn_web::custom_domain::CustomDomain>(&bytes)
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(domain) => read.domains.push((
+                domain.hostname,
+                domain.tenant,
+                domain.status.as_str().to_owned(),
+            )),
+            // The runtime skips a record it cannot read and serves the rest, so
+            // doctor counts it rather than failing the run over it.
+            Err(e) => read.skipped.push(format!("{}: {e}", path.display())),
+        }
+    }
+    read.domains.sort();
+    read
+}
+
+/// What `autumn doctor` could read of the on-disk custom-domain registry.
+///
+/// Distinguishes the three outcomes the runtime distinguishes: a directory it
+/// could enumerate, a directory it could not (which stops `load()` and, with
+/// it, every registration), and individual records that would not parse (which
+/// the runtime skips, serving the rest).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CustomDomainRegistryRead {
+    /// `(hostname, tenant, status)` per readable record, sorted.
+    pub domains: Vec<(String, String, String)>,
+    /// Why the directory could not be enumerated, if it could not.
+    pub unreadable: Option<String>,
+    /// Records that could not be read or parsed, one message each.
+    pub skipped: Vec<String>,
+}
+
+/// Most custom domains one `doctor --online` run probes.
+///
+/// A deployment can hold a thousand, and a DNS lookup each would turn a
+/// diagnostic into a several-minute stall. The bound is stated in the check's
+/// detail so an operator knows the run was partial.
+pub const MAX_CUSTOM_DOMAIN_PROBES: usize = 25;
+
 /// Thin bounded I/O wrapper: resolve `domain` and compare its addresses to this
 /// host's local IPs via the pure [`grade_dns_points_here`] grader.
 #[must_use]
@@ -6137,6 +6592,16 @@ pub struct AcmeDoctorConfig {
     /// config the server refuses to boot on. `None` when the section is valid or
     /// absent.
     pub dns_error: Option<String>,
+    /// The `[server.tls.acme.custom_domains]` section (issue #1635), when
+    /// configured, as the runtime's typed `CustomDomainsConfig` sees it.
+    /// `None` when the section is absent or does not deserialize — see
+    /// [`custom_domains_error`](Self::custom_domains_error).
+    pub custom_domains: Option<autumn_web::config::CustomDomainsConfig>,
+    /// The rendered deserialization error for a PRESENT but malformed
+    /// `[server.tls.acme.custom_domains]` section. Recorded so the grader FAILs
+    /// rather than reporting "custom domains are off" for a config the server
+    /// refuses to boot on. `None` when the section is valid or absent.
+    pub custom_domains_error: Option<String>,
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -6339,6 +6804,20 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
             Err(e) => (None, Some(e.to_string())),
         });
 
+    // Deserialize `[server.tls.acme.custom_domains]` the same way (#1635). Its
+    // `deny_unknown_fields` catches a mistyped key that would otherwise sit in
+    // the file doing nothing while every tenant domain stayed pending.
+    let (custom_domains, custom_domains_error) =
+        acme.get("custom_domains").map_or((None, None), |value| {
+            match value
+                .clone()
+                .try_into::<autumn_web::config::CustomDomainsConfig>()
+            {
+                Ok(cd) => (Some(cd), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        });
+
     Some(AcmeDoctorConfig {
         domains,
         contact_email,
@@ -6354,6 +6833,8 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         renew_before_days_error,
         dns,
         dns_error,
+        custom_domains,
+        custom_domains_error,
     })
 }
 
@@ -8650,6 +9131,108 @@ pub fn run(opts: DoctorOptions) {
             tasks.push(Box::new(move || {
                 check_acme_tenancy_domain_impl(tenancy_base.as_deref(), &tenancy_domains, covers)
             }));
+
+            // Tenant custom domains (#1635). Offline: the section itself, read
+            // alongside the registry on disk so the cap can be compared
+            // against what is actually registered.
+            let cd_cfg = acme.custom_domains.clone();
+            let cd_error = acme.custom_domains_error.clone();
+            let registered = cd_cfg
+                .as_ref()
+                .filter(|cd| cd.enabled)
+                .map(|cd| read_custom_domain_registry(&cd.store_dir))
+                .unwrap_or_default();
+            let cd_ingress = cd_cfg
+                .as_ref()
+                .filter(|cd| cd.enabled)
+                .map(autumn_web::config::CustomDomainsConfig::ingress);
+            // Every ingress target a tenant can be pointed at: the CNAME
+            // hostname for a subdomain, the A/AAAA addresses for an apex, which
+            // cannot carry a CNAME. Each is a separate path into the
+            // deployment, so each is probed by name.
+            let http01_targets: Vec<String> = cd_ingress.as_ref().map_or_else(Vec::new, |ing| {
+                ing.hostname
+                    .iter()
+                    .cloned()
+                    .chain(ing.ipv4.iter().map(ToString::to_string))
+                    .chain(ing.ipv6.iter().map(ToString::to_string))
+                    .collect()
+            });
+            let registry_read = registered.clone();
+            tasks.push(Box::new(move || {
+                check_custom_domains_config_impl(
+                    cd_cfg.as_ref(),
+                    cd_error.as_deref(),
+                    &registry_read,
+                )
+                .unwrap_or_else(|| {
+                    CheckResult {
+                    name: "custom_domains",
+                    status: CheckStatus::Pass,
+                    detail: Some(
+                        "no [server.tls.acme.custom_domains] section: tenants cannot connect their \
+                         own domains"
+                            .to_owned(),
+                    ),
+                    hint: None,
+                }
+                })
+            }));
+
+            // Online: does each registered domain still point here? A domain
+            // that reached `active` and has since moved away is serving a
+            // certificate nobody can reach and will fail its next renewal —
+            // AC8's "flag registered domains whose DNS no longer points at the
+            // deployment". Bounded, and the bound is reported.
+            if opts.online {
+                let registered = registered.domains;
+                let total = registered.len();
+                // The ingress every registered domain is graded against — the
+                // deployment's, not this CLI host's.
+                let probe_ingress = cd_ingress.unwrap_or_default();
+                for (index, (hostname, tenant, status)) in registered
+                    .into_iter()
+                    .take(MAX_CUSTOM_DOMAIN_PROBES)
+                    .enumerate()
+                {
+                    let probe_ingress = probe_ingress.clone();
+                    tasks.push(Box::new(move || {
+                        let dns = resolve_custom_domain_dns(&hostname, &probe_ingress);
+                        let mut result = check_custom_domain_dns_impl(&CustomDomainProbe {
+                            hostname,
+                            tenant,
+                            status,
+                            dns,
+                        });
+                        // Say once, on the last probe, that the sweep was
+                        // partial — silently checking 25 of 1,000 would read as
+                        // a clean bill of health for 975 unprobed domains.
+                        if index + 1 == MAX_CUSTOM_DOMAIN_PROBES && total > MAX_CUSTOM_DOMAIN_PROBES
+                        {
+                            let detail = result.detail.take().unwrap_or_default();
+                            result.detail = Some(format!(
+                                "{detail} (probed the first {MAX_CUSTOM_DOMAIN_PROBES} of {total} \
+                                 registered domains)"
+                            ));
+                        }
+                        result
+                    }));
+                }
+            }
+
+            // Tenant certificates are always HTTP-01, so port 80 must be open
+            // at the ingress even when this deployment's own certificate uses
+            // DNS-01 — the acme_ports check calls a closed port 80 optional in
+            // that mode, which is right for the deployment and wrong for every
+            // tenant domain.
+            if opts.online {
+                for target in http01_targets {
+                    tasks.push(Box::new(move || {
+                        let probed = probe_port_every_address(&target, 80);
+                        check_custom_domain_http01_impl(&target, &probed)
+                    }));
+                }
+            }
 
             // Probe EVERY configured domain: issuance orders authorizations for
             // all `config.domains`, so a probe of only the first name can pass
@@ -12029,6 +12612,8 @@ pub struct Vault {
             renew_before_days_error: None,
             dns: None,
             dns_error: None,
+            custom_domains: None,
+            custom_domains_error: None,
         }
     }
 
@@ -12039,6 +12624,393 @@ pub struct Vault {
     ) -> autumn_web::config::AcmeDnsConfig {
         toml::from_str(&format!("provider = \"{}\"\n", provider.as_str()))
             .expect("the minimal DNS section parses")
+    }
+
+    // ── Tenant custom domains (#1635) ───────────────────────────────────
+
+    /// A read of `count` healthy records, for the config check's arithmetic.
+    fn read_of(count: usize) -> CustomDomainRegistryRead {
+        CustomDomainRegistryRead {
+            domains: (0..count)
+                .map(|i| {
+                    (
+                        format!("d{i}.clientco.com"),
+                        "tenant-a".to_owned(),
+                        "active".to_owned(),
+                    )
+                })
+                .collect(),
+            ..CustomDomainRegistryRead::default()
+        }
+    }
+
+    fn custom_domains_config(enabled: bool) -> autumn_web::config::CustomDomainsConfig {
+        autumn_web::config::CustomDomainsConfig {
+            enabled,
+            ingress_hostname: Some("ingress.myapp.com".to_owned()),
+            ..autumn_web::config::CustomDomainsConfig::default()
+        }
+    }
+
+    #[test]
+    fn custom_domains_config_check_grades_the_section() {
+        // Absent section: nothing to say.
+        let empty = CustomDomainRegistryRead::default();
+        assert!(check_custom_domains_config_impl(None, None, &empty).is_none());
+
+        // Disabled: a Pass that says so, not silence.
+        let off =
+            check_custom_domains_config_impl(Some(&custom_domains_config(false)), None, &empty)
+                .expect("a present section is always graded");
+        assert_eq!(off.status, CheckStatus::Pass);
+        assert!(off.detail.unwrap().contains("enabled = false"));
+
+        // Enabled with an ingress: Pass, naming the count and the cap.
+        let on =
+            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, &read_of(3))
+                .unwrap();
+        assert_eq!(on.status, CheckStatus::Pass);
+        assert!(on.detail.unwrap().contains('3'));
+
+        // Enabled with nowhere for tenants to point: the same Fail the runtime
+        // exits on at boot.
+        let no_ingress = autumn_web::config::CustomDomainsConfig {
+            enabled: true,
+            ingress_hostname: None,
+            ..autumn_web::config::CustomDomainsConfig::default()
+        };
+        assert_eq!(
+            check_custom_domains_config_impl(Some(&no_ingress), None, &empty)
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
+
+        // A malformed section fails rather than reading as "off".
+        assert_eq!(
+            check_custom_domains_config_impl(None, Some("unknown field `ingres_hostname`"), &empty)
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
+
+        // More registered than the cap allows: a Warn, since the stored domains
+        // still serve.
+        let mut capped = custom_domains_config(true);
+        capped.max_domains = 2;
+        assert_eq!(
+            check_custom_domains_config_impl(Some(&capped), None, &read_of(5))
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+    }
+
+    fn probe(status: &str, dns: CustomDomainDns) -> CustomDomainProbe {
+        CustomDomainProbe {
+            hostname: "app.clientco.com".to_owned(),
+            tenant: "tenant-a".to_owned(),
+            status: status.to_owned(),
+            dns,
+        }
+    }
+
+    #[test]
+    fn the_probe_names_only_the_addresses_that_are_not_the_ingress() {
+        // The addresses shown are computed, not parsed back out of the
+        // grader's human-readable message.
+        let ingress = autumn_web::custom_domain::ExpectedIngress {
+            hostname: None,
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert!(ingress_contains(&ingress, "203.0.113.10".parse().unwrap()));
+        assert!(!ingress_contains(&ingress, "198.51.100.7".parse().unwrap()));
+
+        // An ingress that resolves to nothing is inconclusive, never a failure:
+        // doctor must not fail a correctly connected domain just because it
+        // cannot see the ingress from where it runs.
+        let empty = autumn_web::custom_domain::ExpectedIngress::default();
+        assert_eq!(
+            resolve_custom_domain_dns("no-such-host.invalid", &empty),
+            CustomDomainDns::IngressUnknown
+        );
+    }
+
+    #[test]
+    fn a_live_custom_domain_whose_dns_moved_away_fails() {
+        let moved = probe(
+            "active",
+            CustomDomainDns::PointsElsewhere {
+                seen: vec!["198.51.100.7".to_owned()],
+            },
+        );
+        let result = check_custom_domain_dns_impl(&moved);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("app.clientco.com"), "{detail}");
+        assert!(detail.contains("tenant-a"), "{detail}");
+        assert!(detail.contains("198.51.100.7"), "{detail}");
+
+        // Gone entirely is just as bad.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::Unresolved)).status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn a_pending_custom_domain_that_does_not_point_here_yet_is_only_a_warning() {
+        // Not yet published is the ordinary state right after registration.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("pending_dns", CustomDomainDns::Unresolved)).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe(
+                "pending_dns",
+                CustomDomainDns::PointsElsewhere {
+                    seen: vec!["198.51.100.7".to_owned()],
+                }
+            ))
+            .status,
+            CheckStatus::Warn
+        );
+        // Pointing here is a Pass whatever the state.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::PointsHere)).status,
+            CheckStatus::Pass
+        );
+        // Unknowable from inside a NAT is never a hard failure.
+        assert_eq!(
+            check_custom_domain_dns_impl(&probe("active", CustomDomainDns::IngressUnknown)).status,
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn the_ingress_hostname_is_resolved_alongside_the_configured_addresses() {
+        // The documented mixed setup: tenant subdomains CNAME to a load
+        // balancer while apex domains use static A/AAAA records. Those are two
+        // different address sets, and the runtime grades against their UNION
+        // (`CustomDomainTask::effective_ingress`). Resolving the hostname only
+        // when no address was configured made doctor fail every correctly
+        // connected subdomain — and disagree with the app about it.
+        let ingress = autumn_web::custom_domain::ExpectedIngress {
+            // Resolvable without a network, and not one of the apex addresses.
+            hostname: Some("localhost".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert_eq!(
+            resolve_custom_domain_dns("localhost", &ingress),
+            CustomDomainDns::PointsHere,
+            "a domain pointing at the ingress HOSTNAME must grade as pointing here even when \
+             apex addresses are configured too"
+        );
+
+        // A domain at neither is still elsewhere, and the address it does
+        // resolve to is named.
+        let apex_only = autumn_web::custom_domain::ExpectedIngress {
+            hostname: Some("no-such-ingress.invalid".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert!(matches!(
+            resolve_custom_domain_dns("localhost", &apex_only),
+            CustomDomainDns::PointsElsewhere { .. }
+        ));
+    }
+
+    #[test]
+    fn a_registry_doctor_cannot_read_is_a_failure_not_an_empty_one() {
+        // The runtime's `load()` fails on an unreadable directory, which since
+        // #1635's hydration guard also stops every new registration. Doctor
+        // reporting "0 registered, Pass" would hide exactly the condition an
+        // operator is running it to find.
+        let unreadable = CustomDomainRegistryRead {
+            unreadable: Some("/var/lib/autumn/custom-domains: permission denied".to_owned()),
+            ..CustomDomainRegistryRead::default()
+        };
+        let result =
+            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, &unreadable)
+                .unwrap();
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("permission denied"), "{detail}");
+        assert!(detail.contains("cannot be read"), "{detail}");
+
+        // A single unparseable record is a Warn, not a Fail: the runtime skips
+        // it and serves the rest.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("good.json"),
+            serde_json::json!({
+                "hostname": "app.clientco.com",
+                "tenant": "tenant-a",
+                "status": "active",
+                "failure_reason": null,
+                "registered_at_unix": 1,
+                "verified_at_unix": 1,
+                "activated_at_unix": 1,
+                "cert_not_after_unix": 2,
+                "consecutive_failures": 0,
+                "next_attempt_unix": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("torn.json"), "{not json").unwrap();
+        let read = read_custom_domain_registry(dir.path());
+        assert_eq!(read.domains.len(), 1, "the readable record still counts");
+        assert_eq!(read.skipped.len(), 1, "and the torn one is reported");
+        assert!(read.unreadable.is_none());
+        let partial =
+            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, &read)
+                .unwrap();
+        assert_eq!(partial.status, CheckStatus::Warn);
+        assert!(partial.detail.unwrap().contains("will not load"));
+    }
+
+    #[test]
+    fn port_80_is_required_for_custom_domains_whatever_the_deployment_uses() {
+        // The deployment's own certificate may be issued over DNS-01, under
+        // which a closed port 80 is merely optional. A tenant's zone is the
+        // tenant's, so no tenant certificate can ever use DNS-01: they are all
+        // HTTP-01, and a firewall that drops inbound TCP/80 fails every one of
+        // them while `acme_ports` reports the deployment healthy.
+        let optional_for_the_deployment = check_acme_ports_for_challenge(
+            "myapp.com",
+            PortReachability::Refused,
+            PortReachability::Open,
+            true,
+        );
+        assert_eq!(optional_for_the_deployment.status, CheckStatus::Warn);
+
+        let result = check_custom_domain_http01_impl(
+            "ingress.myapp.com",
+            &[("203.0.113.10".to_owned(), PortReachability::Refused)],
+        );
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "a closed port 80 blocks every tenant custom domain"
+        );
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("ingress.myapp.com"), "{detail}");
+        assert!(detail.contains("HTTP-01"), "{detail}");
+
+        for unreachable in [PortReachability::TimedOut, PortReachability::Error] {
+            assert_eq!(
+                check_custom_domain_http01_impl(
+                    "203.0.113.10",
+                    &[("203.0.113.10".to_owned(), unreachable)]
+                )
+                .status,
+                CheckStatus::Fail
+            );
+        }
+        assert_eq!(
+            check_custom_domain_http01_impl(
+                "ingress.myapp.com",
+                &[("203.0.113.10".to_owned(), PortReachability::Open)]
+            )
+            .status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn one_unreachable_address_behind_the_ingress_fails_the_http01_check() {
+        // A load balancer published as several A/AAAA records is reached at
+        // whichever address the CA's resolver hands back, so one member that
+        // drops port 80 fails HTTP-01 for whatever share of tenants lands on
+        // it. Probing only the first address reported that as a clean pass.
+        let mixed = check_custom_domain_http01_impl(
+            "ingress.myapp.com",
+            &[
+                ("203.0.113.10".to_owned(), PortReachability::Open),
+                ("203.0.113.11".to_owned(), PortReachability::TimedOut),
+                ("2001:db8::1".to_owned(), PortReachability::Open),
+            ],
+        );
+        assert_eq!(mixed.status, CheckStatus::Fail);
+        let detail = mixed.detail.unwrap();
+        assert!(detail.contains("203.0.113.11"), "{detail}");
+        assert!(
+            !detail.contains("203.0.113.10"),
+            "only the unreachable addresses are named: {detail}"
+        );
+
+        // All reachable passes and says how many were probed.
+        let all_open = check_custom_domain_http01_impl(
+            "ingress.myapp.com",
+            &[
+                ("203.0.113.10".to_owned(), PortReachability::Open),
+                ("2001:db8::1".to_owned(), PortReachability::Open),
+            ],
+        );
+        assert_eq!(all_open.status, CheckStatus::Pass);
+        assert!(all_open.detail.unwrap().contains('2'));
+
+        // A target that resolves to nothing is reported, not silently passed.
+        let unresolvable = check_custom_domain_http01_impl("ingress.myapp.com", &[]);
+        assert_eq!(unresolvable.status, CheckStatus::Fail);
+        assert!(unresolvable.detail.unwrap().contains("does not resolve"));
+
+        // And the probe itself walks every resolved address: `localhost`
+        // resolves without a network, and nothing is listening on this port.
+        let probed = probe_port_every_address("localhost", 1);
+        assert!(!probed.is_empty());
+        assert!(
+            probed
+                .iter()
+                .all(|(_, state)| *state != PortReachability::Open)
+        );
+    }
+
+    #[test]
+    fn the_registry_reader_skips_unreadable_records_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        // A missing directory is empty, not an error: nothing has registered yet.
+        let absent = read_custom_domain_registry(&dir.path().join("absent"));
+        assert!(absent.domains.is_empty());
+        assert!(
+            absent.unreadable.is_none(),
+            "a directory that does not exist yet is not a fault"
+        );
+
+        for (file, host) in [("b.json", "b.clientco.com"), ("a.json", "a.clientco.com")] {
+            std::fs::write(
+                dir.path().join(file),
+                serde_json::json!({
+                    "hostname": host,
+                    "tenant": "tenant-a",
+                    "status": "active",
+                    "failure_reason": null,
+                    "registered_at_unix": 1,
+                    "verified_at_unix": 1,
+                    "activated_at_unix": 1,
+                    "cert_not_after_unix": 2,
+                    "consecutive_failures": 0,
+                    "next_attempt_unix": null
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("corrupt.json"), "{not json").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "irrelevant").unwrap();
+
+        let read = read_custom_domain_registry(dir.path());
+        let records = read.domains;
+        assert_eq!(
+            records.len(),
+            2,
+            "the corrupt record must not blind the rest"
+        );
+        assert_eq!(records[0].0, "a.clientco.com");
+        assert_eq!(records[1].0, "b.clientco.com");
     }
 
     #[test]
@@ -12763,6 +13735,10 @@ contact_email = \"ops@example.com\"
                     renew_before_days: *renew_before_days,
                     ca_root_path: None,
                     dns: dns.clone(),
+                    // Tenant custom domains are graded by their own
+                    // `custom_domains` check, not by `acme_config`, so this
+                    // parity case holds them absent on both sides.
+                    custom_domains: None,
                 };
 
                 assert_eq!(
@@ -12809,6 +13785,10 @@ contact_email = \"ops@example.com\"
                     renew_before_days: 30,
                     ca_root_path: None,
                     dns: dns.clone(),
+                    // Tenant custom domains are graded by their own
+                    // `custom_domains` check, not by `acme_config`, so this
+                    // parity case holds them absent on both sides.
+                    custom_domains: None,
                 };
                 assert_eq!(
                     check_acme_config_impl(&doctor_cfg).is_some(),
