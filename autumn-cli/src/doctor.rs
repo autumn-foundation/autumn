@@ -1772,32 +1772,89 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
 /// port 80 optional. Without this check, an operator running DNS-01 with a
 /// firewall that drops inbound TCP/80 sees a clean doctor run while every
 /// tenant domain fails its order.
+///
+/// `probed` carries EVERY address the target resolves to, not just the first.
+/// A load balancer published as several A/AAAA records is reached at whichever
+/// one the CA's resolver hands back, so one unreachable member fails HTTP-01
+/// for whatever share of tenants lands on it — a failure a single-address probe
+/// reports as a clean pass.
 #[must_use]
-pub fn check_custom_domain_http01_impl(target: &str, port_80: PortReachability) -> CheckResult {
-    match port_80 {
-        PortReachability::Open => CheckResult {
+pub fn check_custom_domain_http01_impl(
+    target: &str,
+    probed: &[(String, PortReachability)],
+) -> CheckResult {
+    let unreachable: Vec<String> = probed
+        .iter()
+        .filter(|(_, state)| *state != PortReachability::Open)
+        .map(|(addr, state)| format!("{addr} ({state:?})"))
+        .collect();
+    if probed.is_empty() {
+        return CheckResult {
+            name: "custom_domain_http01",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "the custom-domain ingress ({target}) does not resolve to any address from here, \
+                 so tenant HTTP-01 validation cannot be checked"
+            )),
+            hint: Some(
+                "Check [server.tls.acme.custom_domains] ingress_hostname / ingress_ipv4 / \
+                 ingress_ipv6",
+            ),
+        };
+    }
+    if unreachable.is_empty() {
+        return CheckResult {
             name: "custom_domain_http01",
             status: CheckStatus::Pass,
             detail: Some(format!(
-                "port 80 on the custom-domain ingress ({target}) is reachable"
+                "port 80 is reachable on all {} address(es) of the custom-domain ingress \
+                 ({target})",
+                probed.len()
             )),
             hint: None,
+        };
+    }
+    CheckResult {
+        name: "custom_domain_http01",
+        status: CheckStatus::Fail,
+        detail: Some(format!(
+            "port 80 is not reachable on {} of the {} address(es) of the custom-domain ingress \
+             ({target}): {}. Every tenant custom domain is validated over HTTP-01, whatever \
+             challenge this deployment's own certificate uses",
+            unreachable.len(),
+            probed.len(),
+            unreachable.join(", ")
+        )),
+        hint: Some(
+            "Open inbound TCP/80 on every address behind the ingress tenants are told to point \
+             at, so the CA can fetch /.well-known/acme-challenge for their hostnames",
+        ),
+    }
+}
+
+/// Probe `port` on EVERY address `target` resolves to, in resolution order.
+///
+/// An IP literal probes itself. A name that resolves to nothing returns an
+/// empty list, which the caller reports rather than silently passing.
+#[must_use]
+pub fn probe_port_every_address(target: &str, port: u16) -> Vec<(String, PortReachability)> {
+    let addrs = resolve_addresses(target);
+    addrs
+        .into_iter()
+        .map(|addr| (addr.to_string(), probe_addr(addr, port)))
+        .collect()
+}
+
+/// Probe one resolved address, skipping a second resolution of the name.
+fn probe_addr(addr: std::net::IpAddr, port: u16) -> PortReachability {
+    let socket = std::net::SocketAddr::new(addr, port);
+    match std::net::TcpStream::connect_timeout(&socket, std::time::Duration::from_secs(2)) {
+        Ok(_) => PortReachability::Open,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::ConnectionRefused => PortReachability::Refused,
+            std::io::ErrorKind::TimedOut => PortReachability::TimedOut,
+            _ => PortReachability::Error,
         },
-        PortReachability::Refused | PortReachability::TimedOut | PortReachability::Error => {
-            CheckResult {
-                name: "custom_domain_http01",
-                status: CheckStatus::Fail,
-                detail: Some(format!(
-                    "port 80 on the custom-domain ingress ({target}) is not reachable \
-                     ({port_80:?}); every tenant custom domain is validated over HTTP-01, whatever \
-                     challenge this deployment's own certificate uses"
-                )),
-                hint: Some(
-                    "Open inbound TCP/80 to the ingress tenants are told to point at, so the CA \
-                     can fetch /.well-known/acme-challenge for their hostnames",
-                ),
-            }
-        }
     }
 }
 
@@ -9067,8 +9124,8 @@ pub fn run(opts: DoctorOptions) {
             if opts.online {
                 for target in http01_targets {
                     tasks.push(Box::new(move || {
-                        let p80 = probe_port(&target, 80);
-                        check_custom_domain_http01_impl(&target, p80)
+                        let probed = probe_port_every_address(&target, 80);
+                        check_custom_domain_http01_impl(&target, &probed)
                     }));
                 }
             }
@@ -12657,8 +12714,10 @@ pub struct Vault {
         );
         assert_eq!(optional_for_the_deployment.status, CheckStatus::Warn);
 
-        let result =
-            check_custom_domain_http01_impl("ingress.myapp.com", PortReachability::Refused);
+        let result = check_custom_domain_http01_impl(
+            "ingress.myapp.com",
+            &[("203.0.113.10".to_owned(), PortReachability::Refused)],
+        );
         assert_eq!(
             result.status,
             CheckStatus::Fail,
@@ -12670,13 +12729,70 @@ pub struct Vault {
 
         for unreachable in [PortReachability::TimedOut, PortReachability::Error] {
             assert_eq!(
-                check_custom_domain_http01_impl("203.0.113.10", unreachable).status,
+                check_custom_domain_http01_impl(
+                    "203.0.113.10",
+                    &[("203.0.113.10".to_owned(), unreachable)]
+                )
+                .status,
                 CheckStatus::Fail
             );
         }
         assert_eq!(
-            check_custom_domain_http01_impl("ingress.myapp.com", PortReachability::Open).status,
+            check_custom_domain_http01_impl(
+                "ingress.myapp.com",
+                &[("203.0.113.10".to_owned(), PortReachability::Open)]
+            )
+            .status,
             CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn one_unreachable_address_behind_the_ingress_fails_the_http01_check() {
+        // A load balancer published as several A/AAAA records is reached at
+        // whichever address the CA's resolver hands back, so one member that
+        // drops port 80 fails HTTP-01 for whatever share of tenants lands on
+        // it. Probing only the first address reported that as a clean pass.
+        let mixed = check_custom_domain_http01_impl(
+            "ingress.myapp.com",
+            &[
+                ("203.0.113.10".to_owned(), PortReachability::Open),
+                ("203.0.113.11".to_owned(), PortReachability::TimedOut),
+                ("2001:db8::1".to_owned(), PortReachability::Open),
+            ],
+        );
+        assert_eq!(mixed.status, CheckStatus::Fail);
+        let detail = mixed.detail.unwrap();
+        assert!(detail.contains("203.0.113.11"), "{detail}");
+        assert!(
+            !detail.contains("203.0.113.10"),
+            "only the unreachable addresses are named: {detail}"
+        );
+
+        // All reachable passes and says how many were probed.
+        let all_open = check_custom_domain_http01_impl(
+            "ingress.myapp.com",
+            &[
+                ("203.0.113.10".to_owned(), PortReachability::Open),
+                ("2001:db8::1".to_owned(), PortReachability::Open),
+            ],
+        );
+        assert_eq!(all_open.status, CheckStatus::Pass);
+        assert!(all_open.detail.unwrap().contains('2'));
+
+        // A target that resolves to nothing is reported, not silently passed.
+        let unresolvable = check_custom_domain_http01_impl("ingress.myapp.com", &[]);
+        assert_eq!(unresolvable.status, CheckStatus::Fail);
+        assert!(unresolvable.detail.unwrap().contains("does not resolve"));
+
+        // And the probe itself walks every resolved address: `localhost`
+        // resolves without a network, and nothing is listening on this port.
+        let probed = probe_port_every_address("localhost", 1);
+        assert!(!probed.is_empty());
+        assert!(
+            probed
+                .iter()
+                .all(|(_, state)| *state != PortReachability::Open)
         );
     }
 
