@@ -22843,6 +22843,88 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_dependent_destroy_leaf_takes_batched_fast_path() {
+        // Ledger: a plain leaf child (no hooks, not soft-delete, no
+        // dependent(...) of its own) routes the Destroy arm through the same
+        // dependent_delete_all() helper on_delete = delete_all already uses,
+        // guarded by a runtime check that the model has no *model-attribute*
+        // (#[has_many(dependent = ...)]) grandchildren either. This checks
+        // Comment's OWN generated `__autumn_apply_dependent_on_conn` (used
+        // when something ELSE destroys Comment as its child), so Comment must
+        // declare no `dependent(...)` of its own here -- a repository that
+        // itself has `dependent(...)` is the "has grandchildren" case tested
+        // separately below and must NOT take this fast path.
+        let generated = repository_macro(
+            quote! { Comment },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("dependent_delete_all"),
+            "a hookless, non-soft-delete, dependent-free leaf must take the \
+             batched dependent_delete_all fast path: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("dependents") && destroy_arm.contains("is_empty"),
+            "the fast path must still guard on the model's own runtime \
+             dependents() being empty: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_own_dependents_skips_fast_path() {
+        // A child that itself declares dependent(...) (repo-attribute
+        // grandchildren) must keep the per-row loop -- dependent_delete_all()
+        // has no way to recurse into a grandchild cascade.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with its own repository-attribute dependent(...) \
+             grandchildren must never take the batched fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_hooks_skips_fast_path() {
+        // A child with hooks must keep the exact per-row loop -- the fast
+        // path's dependent_delete_all() call never fires before_delete.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with before_delete hooks must never take the batched \
+             fast path (it would skip the hook): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_soft_delete_skips_fast_path() {
+        // A soft-delete child must keep the per-row loop too --
+        // dependent_delete_all() only ever hard-deletes.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a soft-delete child must never take the hard-delete-only batched \
+             fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
     fn repository_macro_dependent_destroy_helper_is_soft_delete_aware() {
         // AC3: a soft_delete child soft-deletes its rows on cascade. The
         // child-selection live filter is gated on the parent's delete kind
