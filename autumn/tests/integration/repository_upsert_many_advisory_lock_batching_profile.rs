@@ -34,13 +34,12 @@
 #![cfg(feature = "db")]
 #![allow(clippy::cast_possible_wrap)] // fixture indices are bounded well under i64::MAX
 
-use autumn_web::prelude::*;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
+use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -80,6 +79,8 @@ async fn setup_pool() -> (
     String,
     testcontainers::ContainerAsync<Postgres>,
 ) {
+    use diesel_async::RunQueryDsl as _;
+
     let container = Postgres::default()
         .with_tag("16-alpine")
         .with_cmd([
@@ -277,11 +278,7 @@ async fn repository_upsert_many_advisory_lock_batching_profile() {
 
     // Result-equivalence: every row landed with the expected content,
     // regardless of which lock-acquisition shape ran.
-    let all_rows: Vec<LedgerUpsertLockRecord> = ledger_upsert_lock_records::table
-        .order(ledger_upsert_lock_records::id.asc())
-        .load(&mut repo.pool.get().await.expect("conn"))
-        .await
-        .expect("load all rows");
+    let all_rows = repo.find_all().await.expect("load all rows");
     let expected_total: usize = TIERS.iter().sum();
     assert_eq!(all_rows.len(), expected_total);
 }
