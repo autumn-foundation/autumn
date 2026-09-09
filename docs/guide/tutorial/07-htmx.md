@@ -68,7 +68,7 @@ A few things to know:
 - CSRF protection still treats the transport `POST` as unsafe. An
   overridden `DELETE` without a valid `_csrf` token is rejected with
   `403 Forbidden`, exactly like any other mutating POST.
-- `autumn routes` and `/actuator/routes` continue to list the declared
+- `autumn routes` and `/actuator/graph` continue to list the declared
   method (`PUT`, `PATCH`, `DELETE`) — route listings stay semantically
   honest regardless of the transport browsers used.
 
