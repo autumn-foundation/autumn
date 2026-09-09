@@ -2030,6 +2030,17 @@ pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComman
 /// Directories are resolved, not the database file itself: the file may not
 /// exist yet, and `readlink -f` on a missing path still resolves its existing
 /// prefix, so an absent database grades the same as a present one.
+///
+/// It also CREATES the parent when the database sits in `shared/data`. That is
+/// the placement the guide recommends (`sqlite:///srv/autumn/myapp/shared/data/app.db`),
+/// and nothing else makes the directory for it: `prepare-dirs` creates `shared/`
+/// but not `shared/data/`, and the op that does — `sqlite_data_link_op` — is
+/// emitted only for a RELATIVE path. On a fresh host the migration then failed,
+/// because `SQLite` will not create a database whose parent directory is absent.
+///
+/// Only inside `shared/data`, never for a path outside the app dir: `/var/lib/…`
+/// is the operator's own directory, and silently creating it would be the deploy
+/// reaching past its own namespace.
 #[must_use]
 pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
     let path = cfg.persistent_sqlite_data_file()?;
@@ -2044,6 +2055,8 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
         cfg.shared_data_dir()
     );
     Some(RemoteCommand::new(
+        // Named for the check, but it also CREATES the directory when the
+        // database sits in the deploy's own `shared/data` — see below.
         "check-data-dir",
         // The same rule `classify_sqlite_data_file` applies lexically — inside
         // the app dir but outside `shared/` — re-asked where both sides can
@@ -2062,7 +2075,7 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
              db=$(readlink -f {db_q} 2>/dev/null || printf '%s' {db_q}); \
              dir=$(dirname \"$db\"); \
              case \"$dir\" in \
-             \"$app/shared/data\"|\"$app/shared/data/\"*) : ;; \
+             \"$app/shared/data\"|\"$app/shared/data/\"*) mkdir -p \"$dir\" || exit 1 ;; \
              \"$app\"|\"$app/\"*) echo {refusal_q} >&2; exit 1 ;; \
              esac",
             app_dir_q = shell_quote(app_dir),
@@ -8305,6 +8318,66 @@ mod tests {
         // such op at all.
         assert!(sqlite_data_dir_guard_op(&resolved()).is_none());
         assert!(sqlite_data_dir_guard_op(&resolved_sqlite()).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An absolute database under `shared/data` has its parent CREATED, because
+    /// nothing else does (#2589 round 19).
+    ///
+    /// This is the placement the guide recommends. `prepare-dirs` makes
+    /// `shared/` but not `shared/data/`, and the op that makes it —
+    /// `sqlite_data_link_op` — is emitted only for a RELATIVE path. So on a fresh
+    /// host the migration failed: `SQLite` will not create a database whose parent
+    /// directory is absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_persistent_data_guard_creates_a_shared_data_parent_but_not_the_operators() {
+        let root = std::env::temp_dir().join(format!("autumn-mkdata-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let app = root.join("srv/myapp");
+        // Exactly a fresh host after `prepare-dirs`: `shared/` exists, and
+        // `shared/data/` does not.
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::fs::create_dir_all(root.join("var/lib")).expect("operator dir");
+
+        let recommended = app.join("shared/data/app.db");
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data =
+            SqliteDataPlacement::Persistent(recommended.to_str().expect("utf-8").to_owned());
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .status()
+                .expect("run check-data-dir")
+                .success()
+        );
+        assert!(
+            app.join("shared/data").is_dir(),
+            "the recommended placement must have its parent created, or the \
+             migration cannot open the database"
+        );
+
+        // A path outside the app dir is the operator's: verified, never created.
+        let theirs = root.join("var/lib/nested/app.db");
+        cfg.sqlite_data =
+            SqliteDataPlacement::Persistent(theirs.to_str().expect("utf-8").to_owned());
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .status()
+                .expect("run check-data-dir")
+                .success()
+        );
+        assert!(
+            !root.join("var/lib/nested").exists(),
+            "the deploy must not reach past its own namespace to create directories"
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 

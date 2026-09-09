@@ -1266,7 +1266,11 @@ link target resolve beneath the release directory instead of your SSH working
 directory, so the migration would open a dangling link.
 
 For an **absolute** database the deploy also re-checks containment on the host,
-as a `check-data-dir` step, before anything is uploaded. It has to: if `app_dir`
+as a `check-data-dir` step, before anything is uploaded. That step creates
+`shared/data/` when the database lives there — `prepare-dirs` makes `shared/`
+but not `shared/data/`, and SQLite will not create a database whose parent
+directory is missing. A path *outside* the app dir is yours: it is verified,
+never created. It has to: if `app_dir`
 is itself a symlink (`/srv/autumn/myapp -> /mnt/apps/myapp`) and your database URL
 uses the resolved spelling, the CLI compares two unrelated strings and sees a file
 outside the app dir — while release retention walks the symlink to the same

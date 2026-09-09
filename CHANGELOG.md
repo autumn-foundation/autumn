@@ -74,7 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   open and applies the target's mode and owner through that handle, so a symlink
   swapped in at the predictable staging path after creation can no longer
   redirect the `chmod`/`chown`; the name is re-checked against the handle's inode
-  before the copy is verified and again before it is published.
+  before the copy is verified and again before it is published. `check-data-dir`
+  also creates `shared/data/` when an absolute database lives there — the
+  placement the guide recommends — since `prepare-dirs` creates only `shared/`
+  and SQLite cannot create a database whose parent directory is absent; a path
+  outside the app dir is verified but never created.
 
 ### Fixed
 
