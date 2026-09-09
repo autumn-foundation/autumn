@@ -388,16 +388,13 @@ pub async fn dispatch(
             match find_visible(&repos, &post_type, &slug).await? {
                 Some(post) => single_post(&repos, &session, &csrf, post, thread_view).await,
                 // A bare segment is ambiguous: it may be a top-level page
-                // rather than a post. Only a TOP-LEVEL page, though — a nested
-                // page is addressed by its full path, so `/team` must not
-                // resolve to `/about/team`. Without the `parent_id` check, two
-                // pages named `team` under different parents would both answer
-                // at `/team`, and which one you got would depend on row order.
+                // rather than a post. `find_visible` is the one that knows a
+                // hierarchical type answers a single segment only at the top
+                // level — asking it here and filtering afterwards is what
+                // dropped a valid page when a nested namesake came back first.
                 None => match find_visible(&repos, "page", &slug).await? {
-                    Some(page) if page.parent_id.is_none() => {
-                        single_post(&repos, &session, &csrf, page, thread_view).await
-                    }
-                    _ => not_found(&repos, &session, &csrf).await,
+                    Some(page) => single_post(&repos, &session, &csrf, page, thread_view).await,
+                    None => not_found(&repos, &session, &csrf).await,
                 },
             }
         }
@@ -990,13 +987,31 @@ fn page_url(base_path: &str, page: usize) -> String {
 }
 
 /// Find a post by type and slug, excluding trashed content.
+///
+/// A hierarchical type is addressed by its full path, so only a *top-level* row
+/// answers a single segment: `/team` must not resolve to `/about/team`, and two
+/// pages named `team` under different parents must not both answer at `/team`.
+///
+/// The condition belongs in the candidate filter, not after it. `find_by_slug`
+/// has no ordering, and a nested page and a top-level page may legitimately
+/// share a slug — `idx_pages_parent_slug` scopes nested slugs to their parent
+/// and `idx_posts_bare_path_slug` only constrains top-level ones. So a caller
+/// that took the first row and *then* asked whether it was top-level rejected a
+/// perfectly good page whenever the nested row happened to come back first,
+/// 404ing it at its own canonical URL.
 async fn find_visible(repos: &Repos, post_type: &str, slug: &str) -> AutumnResult<Option<Post>> {
+    let top_level_only =
+        content_types::find_post_type(post_type).is_some_and(|registered| registered.hierarchical);
     Ok(repos
         .posts
         .find_by_slug(slug.to_owned())
         .await?
         .into_iter()
-        .find(|post| post.post_type == post_type && post.status != "trash"))
+        .find(|post| {
+            post.post_type == post_type
+                && post.status != "trash"
+                && (!top_level_only || post.parent_id.is_none())
+        }))
 }
 
 /// Walk a page path (`/about/team`) down the `parent_id` chain.

@@ -3643,6 +3643,76 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// A top-level page resolves even when a nested namesake was created first.
+///
+/// `idx_pages_parent_slug` scopes a nested page's slug to its parent and
+/// `idx_posts_bare_path_slug` only constrains top-level ones, so `/about/team`
+/// and `/team` are both legal. `find_by_slug` has no ordering, so taking the
+/// first row and *then* asking whether it was top-level 404'"'"'d the real `/team`
+/// whenever the nested row came back first — which, created first, it does.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_top_level_page_resolves_past_a_nested_namesake() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let page = async |title: &str, slug: &str, parent: &str| -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            (
+                "body",
+                if parent.is_empty() {
+                    "Top level."
+                } else {
+                    "Nested."
+                },
+            ),
+            ("status", "publish"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+        ];
+        if !parent.is_empty() {
+            fields.push(("parent_id", parent));
+        }
+        let response = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(response.status, 303, "create {title}: {}", response.text());
+        response
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+
+    // The nested one first, so it is the row `find_by_slug` returns first.
+    let about_id = page("About", "about", "").await;
+    page("Team", "team", &about_id).await;
+    page("Team", "team", "").await;
+
+    sign_out(&client);
+    // Both are reachable at their own canonical URLs.
+    client
+        .get("/team")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Top level.");
+    client
+        .get("/about/team")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Nested.");
+}
+
 /// A capacity check serializes on something that exists even when the
 /// container is empty.
 ///
