@@ -873,31 +873,62 @@ pub async fn create(
         })
         .await?;
 
-    // The first revision records the content as created, so the history has a
-    // starting point rather than beginning at the first *edit* — for types that
-    // asked for revisions. `supports_revisions: false` is a registration the
-    // storage should honour, not a flag the editor ignores.
-    if registered.supports_revisions {
-        repos
-            .with_conn(async |conn| content::record_initial_revision(conn, &created).await)
-            .await?;
-    }
+    // Everything after the insert, with the row removed if any of it fails.
+    //
+    // The insert has to be its own transaction: it goes through
+    // `save_post_with_unique_slug`, whose retry-on-collision needs a fresh
+    // connection each attempt. So the row is already committed when the
+    // revision, the term resolution and the deferred transition run — and a
+    // failure in any of them returned an error while leaving a draft behind,
+    // which a retry then duplicated under a suffixed slug. Unwinding is the
+    // honest outcome: the caller asked for a post and did not get one.
+    let follow_up = async {
+        if registered.supports_revisions {
+            repos
+                .with_conn(async |conn| content::record_initial_revision(conn, &created).await)
+                .await?;
+        }
 
-    // Unconditionally, even for an empty set: `set_post_terms` *replaces* the
-    // filings, so skipping it when the selection is empty means "remove every
-    // category" quietly does nothing and the post stays in archives it was
-    // taken out of. (A guard here was a regression I introduced when this split
-    // out of `apply_terms`.)
-    let term_ids = resolve_term_ids(&repos, &created, &form).await?;
-    repos
-        .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
-        .await?;
-    if status == "future" || status == "private" {
+        // Unconditionally, even for an empty set: `set_post_terms` *replaces*
+        // the filings, so skipping it when the selection is empty means "remove
+        // every category" quietly does nothing and the post stays in archives
+        // it was taken out of. (A guard here was a regression I introduced when
+        // this split out of `apply_terms`.)
+        let term_ids = resolve_term_ids(&repos, &created, &form).await?;
         repos
-            .with_conn(async |conn| {
-                content::transition_status(conn, created.id, &status, Some(user.id)).await
-            })
+            .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
             .await?;
+        if status == "future" || status == "private" {
+            repos
+                .with_conn(async |conn| {
+                    content::transition_status(conn, created.id, &status, Some(user.id)).await
+                })
+                .await?;
+            return Ok::<_, AutumnError>(true);
+        }
+        Ok::<_, AutumnError>(false)
+    }
+    .await;
+
+    let transitioned = match follow_up {
+        Ok(transitioned) => transitioned,
+        Err(error) => {
+            // Best effort, and never in place of the real error: a failed
+            // cleanup is logged so the row can be found, while the caller hears
+            // why their save failed.
+            if let Err(cleanup) = repos.posts.delete_by_id(created.id).await {
+                autumn_web::reexports::tracing::warn!(
+                    %cleanup,
+                    post_id = created.id,
+                    "failed to remove a post whose creation could not be completed"
+                );
+            }
+            return Err(error);
+        }
+    };
+
+    // Actions fire only once the post is actually complete.
+    if transitioned {
         // The same action the update, explicit-transition, API and scheduler
         // paths fire. Without it a plugin indexing or invalidating on this hook
         // missed exactly the admin-created private and scheduled posts.
@@ -1205,16 +1236,33 @@ async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> Autumn
                 let term = match existing {
                     Some(term) => term,
                     None => {
-                        repos
+                        match repos
                             .terms
                             .save(&crate::models::NewTerm {
                                 taxonomy: taxonomy.slug.to_owned(),
                                 name: name.to_owned(),
-                                slug,
+                                slug: slug.clone(),
                                 description: String::new(),
                                 parent_id: None,
                             })
-                            .await?
+                            .await
+                        {
+                            Ok(term) => term,
+                            // Somebody else created the same new term between
+                            // the lookup and the insert — `idx_terms_taxonomy_slug`
+                            // says so. Find-or-create means the *outcome* is
+                            // what matters, and the outcome is now satisfied,
+                            // so adopting their row is right where failing the
+                            // whole save would be absurd. Two editors tagging
+                            // posts `rust` at the same time is ordinary.
+                            Err(error) => repos
+                                .terms
+                                .find_by_slug(slug)
+                                .await?
+                                .into_iter()
+                                .find(|t| t.taxonomy == taxonomy.slug)
+                                .ok_or(error)?,
+                        }
                     }
                 };
                 term_ids.push(term.id);
@@ -1268,6 +1316,19 @@ pub async fn transition(
             "You do not have permission to change this content's status",
         ));
     }
+
+    // This endpoint carries no date, so it can only move a post to `future`
+    // when the row already holds a future one. Otherwise it produces a
+    // scheduled post that either never publishes (`published_at IS NULL`, which
+    // the sweep's `published_at <= now` never matches) or publishes on the very
+    // next sweep (a retained past date). The editor asks for a date; this is
+    // the one-click control, and the honest answer here is to send the user
+    // there.
+    require_future_publish_date(&query.to, post.published_at).map_err(|_| {
+        AutumnError::unprocessable_msg(
+            "Scheduling needs a publish date — open the editor and pick one",
+        )
+    })?;
 
     repos
         .with_conn(async |conn| {

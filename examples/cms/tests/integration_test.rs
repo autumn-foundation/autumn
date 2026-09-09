@@ -5032,3 +5032,148 @@ async fn an_admin_created_username_must_be_a_url_segment() {
         .await
         .assert_status(303);
 }
+
+/// An import leaves a same-slug local post completely alone.
+///
+/// A retry fix in the previous round offered every already-present row to the
+/// ancestry pass, including ones matched only by slug — so an import advertised
+/// as skipping existing items could re-parent a local page and change its
+/// canonical URL. Only rows this importer created are its to move.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_import_does_not_reparent_a_local_post_that_shares_a_slug() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Two local pages: `guides` at the top level, and `install` under it.
+    for (title, slug, parent) in [
+        ("Guides", "guides", None),
+        ("Install", "install", Some("1")),
+    ] {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            ("body", "Local content."),
+            ("status", "publish"),
+            ("password", ""),
+        ];
+        if let Some(parent) = parent {
+            fields.push(("parent_id", parent));
+        }
+        client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    client
+        .get("/guides/install")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Local content.");
+
+    // A backup that happens to contain a page with the same slug, filed under a
+    // different parent.
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "attachments": [],
+        "posts": [
+            {
+                "post_type": "page", "title": "Manuals", "slug": "manuals",
+                "excerpt": "", "body": "Imported parent.", "status": "publish",
+                "comment_status": "closed", "password": "", "author": "owner",
+                "published_at": null, "parent": null, "terms": [],
+                "sticky": false, "menu_order": 0
+            },
+            {
+                "post_type": "page", "title": "Install", "slug": "install",
+                "excerpt": "", "body": "Imported child.", "status": "publish",
+                "comment_status": "closed", "password": "", "author": "owner",
+                "published_at": null, "parent": "manuals", "terms": [],
+                "sticky": false, "menu_order": 0
+            }
+        ]
+    })
+    .to_string();
+
+    client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    // The local page is where it was, with its own content and URL.
+    sign_out(&client);
+    client
+        .get("/guides/install")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Local content.");
+    assert_eq!(
+        client.get("/manuals/install").send().await.status,
+        404,
+        "the import must not have moved the local page under its own parent"
+    );
+}
+
+/// The one-click status control cannot schedule without a date.
+///
+/// It carries no date, so `to=future` produced a post that either never
+/// publishes (`published_at IS NULL`, which the sweep never matches) or
+/// publishes on the very next sweep (a retained past date).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_status_endpoint_refuses_undated_scheduling() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A fresh draft has no publish date at all.
+    let fresh = create_post(&client, &cookie, "Never Dated", "Body.", "draft").await;
+    let refused = client
+        .post(&format!("/admin/content/post/{fresh}/status?to=future"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    assert_eq!(refused.status, 422, "body: {}", refused.text());
+
+    // A formerly published draft has a *past* one, which is worse: it would
+    // republish on the next sweep.
+    let was_live = create_post(&client, &cookie, "Was Live", "Body.", "publish").await;
+    client
+        .post(&format!("/admin/content/post/{was_live}/status?to=draft"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+    let refused = client
+        .post(&format!("/admin/content/post/{was_live}/status?to=future"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    assert_eq!(refused.status, 422, "body: {}", refused.text());
+
+    // With a genuinely future date already on the row, it is allowed.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET published_at = now() + interval '7 days' WHERE id = {was_live}"),
+    )
+    .await
+    .expect("give it a future date");
+    client
+        .post(&format!("/admin/content/post/{was_live}/status?to=future"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+}

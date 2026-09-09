@@ -152,6 +152,29 @@ pub struct ExportTermRef {
     pub slug: String,
 }
 
+/// The ids of the terms an exported post names, for those that exist here.
+///
+/// Shared by the creation path and the resume path, so a retry files a post
+/// under exactly what a first run would have. Terms are matched by
+/// `(taxonomy, slug)` — an id from another installation means nothing — and one
+/// the destination does not have is skipped rather than created, because an
+/// import restores content and the taxonomy list is the site's own.
+async fn resolve_import_terms(repos: &Repos, post: &ExportPost) -> AutumnResult<Vec<i64>> {
+    let mut term_ids = Vec::new();
+    for reference in &post.terms {
+        if let Some(term) = repos
+            .terms
+            .find_by_slug(reference.slug.clone())
+            .await?
+            .into_iter()
+            .find(|t| t.taxonomy == reference.taxonomy)
+        {
+            term_ids.push(term.id);
+        }
+    }
+    Ok(term_ids)
+}
+
 /// `open`, matching the column default, for a file that predates the field.
 fn default_comment_status() -> String {
     "open".to_owned()
@@ -514,30 +537,72 @@ pub async fn import(
         // so the advertised idempotent re-run duplicated content precisely
         // where the allocator had done its job. The source slug is recorded in
         // `post_meta` at import time and consulted here.
-        let existing = repos
+        // A row a previous run of *this* importer created, identified by the
+        // marker rather than by the slug. That distinction is the whole point:
+        // a marker says "this row is ours, finish it", while a bare slug match
+        // says only "something local is already called that".
+        let marker_owned =
+            match imported_source_slugs.get(&(post.post_type.clone(), post.slug.clone())) {
+                Some(id) => repos.posts.find_by_id(*id).await?,
+                None => None,
+            };
+        let slug_taken = repos
             .posts
             .find_by_slug(post.slug.clone())
             .await?
             .into_iter()
-            .find(|p| p.post_type == post.post_type)
-            .or(
-                match imported_source_slugs.get(&(post.post_type.clone(), post.slug.clone())) {
-                    Some(id) => repos.posts.find_by_id(*id).await?,
-                    None => None,
-                },
-            );
-        if let Some(existing) = existing {
-            // Skipped for content, but still offered to the ancestry pass
-            // below. A retry after a partial import would otherwise never
-            // repair a parent link, because the row it belongs to is "already
-            // present" and the pass only ever saw rows this run created.
+            .any(|p| p.post_type == post.post_type);
+
+        if let Some(ours) = marker_owned {
+            // Ours, so a previous run may have left it unfinished: reapply the
+            // terms and the status, and offer it to the ancestry pass. The
+            // marker commits before that work, so a failure in between leaves
+            // exactly this state, and a retry that only skipped would never
+            // repair it.
             skipped += 1;
+            let term_ids = resolve_import_terms(&repos, post).await?;
+            let wanted_status = post.status.clone();
+            let ours_id = ours.id;
+            let current_status = ours.status.clone();
+            let transitioned = repos
+                .with_conn(async |conn| {
+                    use diesel_async::AsyncConnection as _;
+                    conn.transaction(async move |conn| {
+                        content::set_post_terms(conn, ours_id, term_ids).await?;
+                        if wanted_status != current_status {
+                            content::transition_status(
+                                conn,
+                                ours_id,
+                                &wanted_status,
+                                Some(user.id),
+                            )
+                            .await?;
+                            return Ok::<_, AutumnError>(true);
+                        }
+                        Ok::<_, AutumnError>(false)
+                    })
+                    .await
+                })
+                .await?;
+            if transitioned {
+                transitioned_ids.push(ours.id);
+            }
             created_ids.push((
-                existing.id,
+                ours.id,
                 post.post_type.clone(),
                 post.slug.clone(),
                 post.parent.clone(),
             ));
+            continue;
+        }
+
+        if slug_taken {
+            // Somebody else's row that merely shares the slug. Left completely
+            // alone — an import that says it skips existing items must not then
+            // re-parent them, which would move a local page and change its
+            // canonical URL. Offering these to the ancestry pass was a
+            // regression in the previous round's retry fix.
+            skipped += 1;
             continue;
         }
 
@@ -605,18 +670,7 @@ pub async fn import(
             })
             .await?;
 
-        let mut term_ids = Vec::new();
-        for reference in &post.terms {
-            if let Some(term) = repos
-                .terms
-                .find_by_slug(reference.slug.clone())
-                .await?
-                .into_iter()
-                .find(|t| t.taxonomy == reference.taxonomy)
-            {
-                term_ids.push(term.id);
-            }
-        }
+        let term_ids = resolve_import_terms(&repos, post).await?;
         // The terms and the transition commit together. They were separate
         // transactions after an already-committed insert, so a failure in
         // either left the post present but unfinished — and the dedupe above
