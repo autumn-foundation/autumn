@@ -30,6 +30,7 @@ mod nested;
 pub mod notifications;
 pub mod plugin;
 pub mod policy;
+pub mod prior_index;
 pub mod provenance;
 pub mod pwa;
 pub mod scaffold;
@@ -153,8 +154,8 @@ pub fn sqlite_uuid_pk_unsupported_error() -> GenerateError {
 /// `[[database.shards]]` topology. But `DatabaseConfig::validate_backend_consistency`
 /// rejects *any* `database.shards` against a `SQLite` primary, so no valid
 /// `SQLite` config can ever use a generated sharded resource. Unlike UUID ids
-/// (#2555) or the unsupported field kinds (#1924) — and unlike FTS, now
-/// supported on `SQLite` via FTS5 (#1910) — this is **not** a deferred slice:
+/// (#2555) — and unlike FTS, now supported on `SQLite` via FTS5 (#1910), and
+/// every field kind, now converted (#1924) — this is **not** a deferred slice:
 /// `SQLite` is single-host / single-writer, so
 /// horizontal sharding is Postgres-only and permanently out of scope for
 /// `SQLite` (see `docs/guide/sqlite-in-production.md`). Rather than emit a
@@ -349,6 +350,59 @@ pub fn detect_backend_for_profile(
     detect_backend_with(project_root, Some(&effective), |k| std::env::var(k))
 }
 
+/// Backend detection for the OFFLINE preflights — `migrate check`, `deploy
+/// check`, `doctor` (issue #1906 review).
+///
+/// Resolves the URL from the same layers [`detect_backend`] does — real env,
+/// the project `.env`/`.env.<profile>`, and the profile-merged `autumn.toml` —
+/// but **never exits**. The hard-error `autumn.toml` reader is right for a
+/// command about to migrate a real database; a malformed local config must not
+/// abort an offline SQL check, nor truncate `autumn doctor --json` to zero bytes
+/// mid-report.
+///
+/// `migrate check`'s documented contract is that a bad `.env` cannot abort it,
+/// not that the file goes unread — and a `SQLite` URL living only in `.env` is a
+/// shape both the runtime and the generator support, so skipping it would grade
+/// valid `SQLite` SQL under Postgres rules.
+///
+/// Anything it cannot determine resolves to `Postgres`, the historical default.
+#[must_use]
+pub fn detect_backend_offline(
+    project_root: &Path,
+    profile: Option<&str>,
+) -> autumn_web::config::DatabaseBackend {
+    use autumn_web::config::DatabaseBackend;
+
+    let effective = crate::migrate::effective_profile(profile);
+    let table = crate::migrate::read_autumn_toml_table_with_profile_in_using(
+        project_root,
+        Some(&effective),
+        crate::migrate::read_optional_toml_table,
+    );
+    // Same precedence as `detect_backend_with`: the real environment wins, and
+    // `.env` only fills keys it does not define. A malformed `.env` is dropped
+    // rather than surfaced — this is a best-effort hint, and the commands that
+    // act on a real URL report it loudly themselves.
+    let base = FnEnv(&|k: &str| std::env::var(k));
+    let dotenv: std::collections::BTreeMap<String, String> =
+        autumn_web::dotenv::resolve_dotenv_vars_in(project_root, &effective, &base)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let env = |key: &str| {
+        std::env::var(key).or_else(|_| {
+            dotenv
+                .get(key)
+                .cloned()
+                .ok_or(std::env::VarError::NotPresent)
+        })
+    };
+    crate::migrate::resolve_primary_database_url_from_sources(env, table.as_ref())
+        .as_deref()
+        .and_then(DatabaseBackend::detect)
+        .unwrap_or(DatabaseBackend::Postgres)
+}
+
 /// Directory-, profile-, and env-parameterized core of [`detect_backend`],
 /// separated so the profile-overlay and `.env` resolution is unit-testable
 /// without mutating the process-global environment.
@@ -424,17 +478,11 @@ where
 ///
 /// The `SQLite` column/schema mapping ([`dsl::FieldKind::sqlite_schema_type`])
 /// changes the DDL and diesel sql-type, but the `#[model]` struct field still
-/// renders as its Rust type. As of #1924 `DateTime<Utc>` (via
-/// `TimestamptzSqlite`) and `Attachment` (`autumn_web::storage::Blob`, via
-/// `autumn-web`'s local `Text`/`Sqlite` impls) round-trip on `SQLite`. The
-/// still-rejected kinds are `Uuid` (`uuid::Uuid`), `Decimal`
-/// (`rust_decimal::Decimal`), and `Enum`: their Rust types are foreign to
-/// `autumn-web` (so the orphan rule forbids `autumn-web` adding the required
-/// `Sqlite` conversion) and diesel/`rust_decimal`'s own impls are
-/// Postgres-only, so a generated `SQLite` app using such a field fails to
-/// compile. Rather than emit uncompilable code, generation fails here with an
-/// actionable message (AC #4). Wrapper-based support for these remaining kinds
-/// is tracked in issue #1924.
+/// renders as a Rust type that needs a working conversion. As of #1924 every
+/// DSL kind has one, so this never fires today — it stays as the actionable
+/// message a NEW kind gets if it returns `false` from
+/// [`dsl::FieldKind::sqlite_has_diesel_conversion`] rather than emit code that
+/// cannot compile (AC #4).
 #[must_use]
 pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> GenerateError {
     GenerateError::Config(format!(
@@ -442,9 +490,7 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
          `{rust_type}`: diesel implements no FromSql/ToSql for that type on its SQLite \
          backend in a generated app's feature set, so a generated SQLite app using this \
          field would fail to compile. Supported SQLite field kinds are: {kinds}. \
-         SQLite support for the remaining Uuid / Decimal / enum fields is tracked in \
-         https://github.com/autumn-foundation/autumn/issues/1924 — use a \
-         supported field kind, or target a Postgres database.",
+         Use a supported field kind, or target a Postgres database.",
         kinds = dsl::SQLITE_SUPPORTED_KINDS,
     ))
 }
@@ -455,9 +501,12 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
 /// [`sqlite_field_kind_unsupported_error`]. Postgres callers never invoke this,
 /// so their output is unaffected.
 ///
+/// Every kind converts as of #1924, so this is a standing guard rather than an
+/// active gate — see [`dsl::FieldKind::sqlite_has_diesel_conversion`].
+///
 /// # Errors
 /// Returns [`GenerateError::Config`] for the first field whose kind has no
-/// working diesel `SQLite` conversion (`Uuid`, `Decimal`, `Enum`).
+/// working diesel `SQLite` conversion.
 pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<(), GenerateError> {
     for f in fields {
         if !f.kind.sqlite_has_diesel_conversion() {

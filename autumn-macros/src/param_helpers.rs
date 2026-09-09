@@ -48,21 +48,40 @@ fn pat_binds_name(pat: &syn::Pat, name: &str) -> bool {
 /// `#[throttle]` each mint a handler-unique gate type named
 /// `__Autumn{Kind}Gate_{fn_name}` and insert it as a new leading parameter, so
 /// its check runs — and can reject — before Axum's body extractor ever runs.
+/// `#[feature_flag]` mints the same shape (`__AutumnFlagGate_{fn_name}`) —
+/// Codex review on #2628 found it missing here, which let it wrongly own a
+/// cached idempotency replay (and let a later-expanding `#[secured]`/
+/// `#[step_up]`/`#[throttle]` also wrongly claim ownership, since neither
+/// could see its gate was already there) even when a still-pending
+/// `#[authorize]` needed to run first.
 const GUARD_GATE_TYPE_PREFIXES: &[&str] = &[
     "__AutumnSecuredGate_",
     "__AutumnStepUpGate_",
     "__AutumnThrottleGate_",
+    "__AutumnFlagGate_",
 ];
 
 /// Whether `func` already carries another guard's pre-body gate parameter.
 ///
-/// Used by each of `#[secured]`/`#[step_up]`/`#[throttle]` to decide whether
-/// ITS OWN gate should own idempotency-replay serving: whichever gate is
-/// applied to a still-unguarded function (no earlier gate parameter, and per
-/// [`crate::idempotency_guard::block_has_replay_guard`] no earlier in-body
-/// guard either) is the one whose check every other stacked guard's check is
-/// guaranteed to have already passed by the time it runs, so it — and only
-/// it — may serve a cached replay.
+/// Used two ways:
+/// - By each of `#[secured]`/`#[step_up]`/`#[throttle]` to decide whether ITS
+///   OWN gate should own idempotency-replay serving: whichever gate is
+///   applied to a still-unguarded function (no earlier gate parameter, and
+///   per [`crate::idempotency_guard::block_has_replay_guard`] no earlier
+///   in-body guard either) is the one whose check every other stacked
+///   guard's check is guaranteed to have already passed by the time it
+///   runs, so it — and only it — may serve a cached replay.
+/// - By `static_route.rs` to detect an already-expanded gate (of *any* of
+///   the four kinds, `#[feature_flag]` included) stacked above
+///   `#[static_get]`: none of these pre-body checks run on a cached
+///   SSG/ISR hit (served by the static-first middleware before the inner
+///   router, and the handler along with it, is ever reached), so all four
+///   are incompatible with a static route for the same reason, not just
+///   the three auth/rate ones (Codex review on #2628, tenth finding — an
+///   attempt to narrow this to an auth/rate-only prefix list for that
+///   check, in response to the eighth finding, missed that a disabled
+///   `#[feature_flag]` on a static route would then silently fail to hide
+///   the cached page).
 pub fn has_any_guard_gate_param(func: &ItemFn) -> bool {
     GUARD_GATE_TYPE_PREFIXES
         .iter()
@@ -236,6 +255,36 @@ pub fn extract_fn_item(tokens: proc_macro2::TokenStream, name: &str) -> ItemFn {
         .unwrap_or_else(|| panic!("fn `{name}` not found among the generated items"))
 }
 
+/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
+///
+/// Rust forbids `impl Trait` in local variable type annotations (E0562), so
+/// every `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]` expansion
+/// that binds a handler's awaited output to an explicit local type
+/// (`let __autumn_inner: #ty = …`) must skip that annotation when `ty`
+/// contains `impl Trait` at any depth — not just when `ty` itself is
+/// `impl Trait`, since the common shape is a wrapper like
+/// `AutumnResult<impl IntoResponse>` with `impl Trait` only nested inside.
+pub fn type_contains_impl_trait(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::ImplTrait(_) => true,
+        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
+            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
+                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
+                _ => false,
+            }),
+            syn::PathArguments::Parenthesized(args) => {
+                args.inputs.iter().any(type_contains_impl_trait)
+                    || matches!(&args.output,
+                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
+            }
+            syn::PathArguments::None => false,
+        }),
+        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
+        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +344,19 @@ mod tests {
             async fn h(Json(body): Json<T>) {}
         };
         assert!(!has_any_guard_gate_param(&f));
+    }
+
+    #[test]
+    fn has_any_guard_gate_param_detects_feature_flag_too() {
+        // Codex review on #2628 (tenth finding): a feature-flag gate never
+        // runs on a cached SSG/ISR hit, the same reason the three auth/rate
+        // gates are incompatible with a static route -- so this function
+        // must keep matching it, for both its callers (idempotency-replay
+        // ownership in idempotency_guard.rs, and static-route incompatibility
+        // in static_route.rs).
+        let flagged: ItemFn = parse_quote! {
+            async fn h(_g: __AutumnFlagGate_h) {}
+        };
+        assert!(has_any_guard_gate_param(&flagged));
     }
 }

@@ -27,6 +27,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-application, no ordering change for direct requests). See
   `docs/security/2026-09-07-mcp-custom-layer-static-mode/`.
 
+- **authorize:** **Breaking:** `#[authorize]` reached through a
+  `use ... as ...` alias is now a compile error instead of a silent
+  stale-authorization gap (🛡 Warden).
+  `idempotency_guard::has_pending_authorize_attr` (used by
+  `#[secured]`/`#[step_up]`/`#[throttle]`'s pre-body gates to decide who
+  owns serving a cached idempotency replay) and `route::has_authorize_guard`
+  (used to decide whether the route macro keeps the standalone
+  `IdempotencyReplayLayer`) both detected `#[authorize]` by comparing an
+  attribute's last path segment against the literal string `"authorize"`. A
+  proc-macro attribute never sees the enclosing module's `use` declarations,
+  so `use ::autumn_web::authorize as authz;` defeated both checks even
+  though the identical `authorize_macro` still ran. With no
+  `#[secured]`/`#[step_up]`/`#[throttle]` also stacked, that let the
+  standalone `IdempotencyReplayLayer` serve a cached response as Tower
+  middleware, entirely before the handler (and `#[authorize]`'s in-body
+  policy re-check inside it) ever ran; with one of those gates stacked, the
+  gate wrongly claimed replay ownership for the same reason. Either way, an
+  attacker who legitimately obtained one cached response could replay the
+  same `Idempotency-Key` after their authorization was revoked (role
+  change, resource-ownership transfer, policy update) and keep receiving
+  the stale allow. A shape-based detection heuristic (parsing the
+  attribute's arguments through `#[authorize]`'s own grammar when the name
+  doesn't match) was tried and found unsafe in the *other* direction during
+  review: it misclassified an unrelated attribute sharing the same argument
+  shape as `#[authorize]`, which — with no real `#[authorize]` anywhere —
+  left nothing to serve a cached replay at all, silently breaking
+  `.idempotent()`'s dedup guarantee instead. No syntactic heuristic can
+  resolve the ambiguity safely in both directions (a proc macro cannot see
+  `use` aliases), so `autumn_macros::authorize::reject_if_ambiguous_authorize_shape`
+  now refuses to compile any attribute matching `#[authorize]`'s argument
+  grammar (`"action", resource = Type[, from = ident]`) under a different
+  name, wired into `#[secured]`/`#[step_up]`/`#[throttle]`/the route macros.
+  **Migration:** spell `#[authorize(...)]` by its real name at the call site
+  (no other Autumn macro's aliasing is affected); if the compile error fires
+  on an unrelated attribute that happens to share the same argument shape,
+  rename that attribute. See the
+  [migration guide](docs/migrations/next.md#authorize-aliased-authorize-and-ambiguous-attribute-shapes-are-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
+- **static_get:** **Breaking:** `#[feature_flag]` combined with
+  `#[static_get]` is now a compile error, in either attribute order (🛡
+  Warden). Found during review of the `#[authorize]` fix above: none of
+  `#[secured]`/`#[step_up]`/`#[throttle]`/`#[feature_flag]`'s pre-body
+  `FromRequestParts` gates run on a cached SSG/ISR hit, since the
+  static-first middleware serves it before the inner router — and the
+  handler along with it — is ever reached; the first three were already
+  rejected for exactly this reason, but `#[feature_flag]` never was. A
+  disabled feature flag on a `#[static_get]` route therefore never actually
+  hid the pre-rendered page: the cache would keep serving it regardless of
+  the flag's live value. **Migration:** use `AppBuilder::static_gate`
+  instead, which runs before a cache hit. See the
+  [migration guide](docs/migrations/next.md#static_get-feature_flag-is-now-a-compile-error)
+  and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
+
 ### Performance
 
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
@@ -51,6 +105,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly one `String` allocation).
 
 ### Changed
+
+- **web:** `AutumnError`'s `Display` now appends the failing fields to a
+  validation error, sorted by field name — `Validation failed: email: Must be
+  a valid email address` instead of the bare `Validation failed` (issue
+  #2587). Exact `Display` output is outside the SemVer surface (see
+  `STABILITY.md`), and the `application/problem+json` body is unaffected: it
+  renders the wrapped error, so `detail` still reads `Validation failed` with
+  the fields in `errors`. Persisted failure strings are unaffected too — the
+  job failure capsule, the job and scheduled-task `last_error` columns, the
+  repository commit-hook `last_error`, alerts and the `sys:tasks` broadcast
+  now record `message()`, so a capsule recorded before this change still
+  replays as a match. Keep untrusted text out of
+  `#[validate(message = "...")]`: `Display` output reaches your logs.
+- **The metrics facade's three cardinality caps are now configurable
+  (`[metrics]`, revisits the limits #1378 shipped in 0.7.0):** the call-site
+  facade caps labeled series per instrument (100), instruments in the registry
+  (256) and labels per series (8), and those numbers were compile-time
+  constants. They are the right defaults, but the line between "a
+  label-cardinality mistake" and "a large but deliberate label space" is a
+  property of the app, not of the framework: an app with 150 routes recording a
+  per-route histogram lost 50 series to a cap it had no way to raise, saw one
+  warning and a climbing `autumn_metrics_series_dropped_total`, and had no
+  remedy short of forking. A new `[metrics]` section sets the three:
+
+  ```toml
+  [metrics]
+  max_series_per_metric = 500
+  max_instruments = 512
+  max_labels_per_series = 12
+  ```
+
+  with the usual `AUTUMN_METRICS__MAX_SERIES_PER_METRIC` (and siblings)
+  environment overrides. Every key defaults to the value 0.7.0 shipped, so an
+  app with no `[metrics]` section behaves exactly as before.
+
+  **Only the cardinality caps moved.** The caps that protect the exposition
+  format rather than memory — metric- and label-name length, label-value and
+  help-text length, bucket count — stay fixed, because raising one lets an app
+  emit a scrape body a stricter parser may reject without letting it express
+  anything it could not express already.
+
+  Applied once in `load_config_and_telemetry`, before anything is built from
+  the config and therefore before any call site can record; every `run_*` mode
+  reaches that function, so no path boots with the defaults silently in force.
+  The caps are read at each decision rather than baked in at registration, so
+  the semantics are stated and tested: **lowering a cap never evicts** what is
+  already retained (evicting a counter would reset it, and a reset is
+  indistinguishable from a restart to `rate()`) — it only refuses further
+  series; **raising one takes effect at once**, including on an instrument
+  already at its old cap.
+
+  An out-of-range value (`0`, or above the ceilings of 100 000 / 100 000 / 64)
+  is **rejected** by `AutumnConfig::validate` naming the key, so it fails the
+  boot and `autumn check`, rather than being clamped into something the
+  operator did not ask for — a cap of `0` would otherwise silently drop every
+  labeled sample the app records. `metrics::set_limits`, the programmatic entry
+  point, has no boot to fail and clamps instead, warning when it does.
+
+  The `describe_*` / `set_histogram_buckets` staging areas are bounded by the
+  *ceiling* rather than by the running cap, because the documented startup
+  pattern fills them from `main` before `run` installs `[metrics]` — bounding
+  them by the running cap would silently discard exactly the descriptions an
+  app raising `max_instruments` was entitled to keep, and no later raise can
+  recover a stash that was never taken. What actually registers is still
+  governed by the configured cap.
+
+  `metrics::{MAX_SERIES_PER_METRIC, MAX_INSTRUMENTS, MAX_LABELS_PER_SERIES}`
+  are **deprecated, not removed** — they now read as
+  `DEFAULT_MAX_SERIES_PER_METRIC` and friends, with
+  `metrics::max_series_per_metric()` and siblings returning the effective
+  value. The three keys also appear on `/actuator/configprops`.
+  `docs/guide/metrics.md` documents the split between configurable and fixed
+  caps, and both warnings about raising one. `[metrics]` is declared before
+  `database` in `AutumnConfig` so strict unknown-key validation descends into
+  it — a typo like `max_serie_per_metric` is rejected rather than silently
+  leaving the cap the operator meant to raise at its default; the new
+  `metrics_child_keys_are_strictly_validated` guard fails if that ordering
+  breaks.
+
 
 - **🧭 Wayfinder: `examples/invoice`'s on-screen detail page is now a real
   HTML document (a11y `html-has-lang`/`bypass` Serious 2→0,
@@ -86,6 +219,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pdf_route_renders_the_same_content_as_the_html_view` and
   `pdf_rendering_is_deterministic_given_a_fixed_clock` still pass unchanged,
   confirming the PDF output is untouched.
+- **🧭 Wayfinder: `examples/flock`'s island page gets a `<main>` landmark
+  (a11y `bypass` Serious 1→0, `landmark-one-main` Moderate 1→0) [no-plugin]:**
+  `autumn check --a11y`, run against the live `/` route (its
+  own `tests/system/smoke.rs` says it "mirrors the other supported
+  examples"), found the whole page — the server-rendered heading/paragraph
+  *and* the WASM-island mount point — had no `<main>` landmark, and (since
+  the page carries no other link either) no skip-to-content link. This is
+  not a static-shell artifact of a client-rendered app the way, say,
+  `examples/react-graphql`'s pre-hydration shell would be: neither the maud
+  page nor the Yew `Flock` component that later mounts into `<div
+  data-autumn-island="flock">` (`examples/island-flock/src/lib.rs`'s `view`)
+  emits any landmark, so the gap holds both before and after the island
+  boots — a real end state, not a curl-only false positive.
+  Baseline (`autumn check --a11y --url http://127.0.0.1:3000/`, built
+  binary, live server, pre-fix): 1 Serious (`bypass`) + 1 Moderate
+  (`landmark-one-main`).
+  Fix: wrap the existing content in `main id="main-content"` as the literal
+  first child of `<body>` — matching `todo-app`/`media-room`'s convention —
+  moving nothing else. The deferred module `<script>` moves to after
+  `</main>` (rather than into `<head>`) so `<main>` stays first; a `defer`
+  script's execution order is unaffected by its position in the document.
+  No skip link was added: with `<main>` first in `<body>` there is nothing
+  to bypass, the same reasoning `todo-app`/`media-room` established in
+  #2483 — `autumn check --a11y`'s `bypass` rule already exempts this shape.
+  After (same live-server check, post-fix): 0 violations. `cargo test -p
+  flock`: 1 passed (a new `index_wraps_content_in_a_main_landmark_first_in_body`
+  regression test asserting the `<main id="main-content">` landmark is
+  present, that nothing precedes it in `<body>`, and that the island mount
+  point stays inside it); the existing Chromium smoke test is unaffected.
+  `cargo fmt -p flock -- --check` and `cargo clippy -p flock --all-targets
+  -- -D warnings` both clean.
 - **`autumn-admin-plugin`: shared `execute_action` restore/purge fallthrough.** [no-plugin]
   `TokenAdminModel` and `FeatureFlagAdminModel` each override
   `AdminModel::execute_action` to batch their `"delete"` bulk action into one
@@ -167,6 +331,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A side effect of the digest being taken over LF-normalised text: a CRLF
   checkout of a generated file (`core.autocrlf`) no longer reads as an edit,
   whether or not a manifest entry backs it.
+- **`autumn migrate check` classifies against the app's own backend** (issue
+  #1906). The safety classifier was Postgres-only and gave SQLite apps incorrect
+  advice: it recommended `CREATE INDEX CONCURRENTLY`, which SQLite has no syntax
+  for; it flagged every `DROP INDEX` as blocking, though on SQLite it is a cheap
+  catalog edit *and* a precondition of `DROP COLUMN`, so the generator's own
+  remove-column migrations failed the gate; and it rated `ADD COLUMN NOT NULL`
+  without a default merely "potentially blocking" where SQLite rejects it
+  outright. `check` now detects the backend and applies SQLite's rules. A new
+  `unsupported` risk level marks statements the backend cannot run at all —
+  `ALTER COLUMN` in any spelling, `TRUNCATE`, `CONCURRENTLY`, inline
+  `UNIQUE`/`PRIMARY KEY` on `ADD COLUMN`, a non-constant `ADD COLUMN` default, a
+  multi-action `ALTER TABLE`, sequences, types, extensions, materialized views,
+  `COMMENT ON`, `GRANT`/`REVOKE`, `MERGE`, a writing CTE and the Postgres-only
+  `CREATE INDEX`/`CREATE TABLE` clauses — and fails the `up.sql` gate, since they
+  cannot apply. Postgres classification is unchanged.
 
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
@@ -189,6 +368,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature, which `STABILITY.md` places outside SemVer.
 
 ### Added
+
+- **web:** `AutumnError` now reads back its own validation details (issue
+  #2587). `details()` returns the per-field message map for a validation
+  failure and `None` for anything else, `code()` returns the stable problem
+  code the `application/problem+json` body carries
+  (`autumn.validation_failed`, `autumn.not_found`, …), and `message()`
+  returns the wrapped error's message alone — the string the body's `detail`
+  shows. A consumer with no HTTP response to parse (a GraphQL resolver, a
+  `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl) no longer has to
+  re-run `validator` to say which field failed. The body is unchanged: `code`
+  now comes from one derivation shared with `code()`, so the two cannot
+  disagree. Guide: `docs/guide/forms.md`, "Reading the failure back".
 
 - **tls:** tenants can connect their own domains, each with its own
   automatically issued and renewed certificate (issue #1635). Enable
@@ -488,6 +679,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "autocomplete", "typeahead", "as you type", "outbound webhooks"), none of
   which appeared anywhere in the README before. Wired into the docs-only CI
   job; no toolchain needed.
+- **`Remove…From…` drops a pre-existing index on SQLite** (issue #1906). SQLite
+  refuses `DROP COLUMN` while any index names the column. The generator only
+  knew the conventional `idx_<table>_<col>` name, so a composite, partial,
+  expression or hand-named index from an earlier migration broke the migration
+  at apply time. `generate migration Remove…From…` now replays the project's
+  `migrations/*/up.sql` in timestamp order to recover the indexes live on the
+  table, emits `DROP INDEX IF EXISTS` for each one that names a removed column
+  before the `DROP COLUMN`, and re-creates them in `down.sql` after the column
+  is restored. Indexes created outside `migrations/` stay invisible. Postgres
+  output is unchanged — it cascades index drops with the column.
+
+- **sqlite:** `Uuid`, `decimal{p,s}` and `enum{…}` model fields now work on a
+  SQLite app — the last three field kinds `autumn generate` refused (#1924).
+  `uuid::Uuid` and `rust_decimal::Decimal` belong to other crates, and so does
+  every diesel item their conversion would name, so `autumn-web` can implement
+  nothing for them; they render the new `TEXT`-backed newtypes
+  `autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}` instead, which are
+  `Copy`, deref to the wrapped type, convert with `From`/`Into`, and are
+  `#[serde(transparent)]`. A generated `enum` is local to your app, so the model
+  generator emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. All three
+  store `TEXT`. `SqliteDecimal` writes the normalized value, so it keeps sign and
+  every significant digit but **not** trailing-zero scale: a column holding
+  `0.10` reads back as `0.1`, and one holding `19.9` reads back as `19.9` where
+  Postgres `NUMERIC(10,2)` would give `19.90`. The values are numerically equal —
+  format for display rather than relying on the stored scale. Normalizing is what
+  makes SQLite's byte-wise `=` and `UNIQUE` agree with Rust equality. Note also
+  that a `TEXT` column sorts lexicographically, so `ORDER BY` on a decimal column
+  compares strings — see `docs/guide/sqlite-in-production.md`. Postgres output is
+  unchanged.
+- **sqlite:** a SQLite app's `Cargo.toml` now describes the SQLite backend
+  (#1924): diesel on its `sqlite` feature with the bundled `libsqlite3-sys`,
+  `diesel-async` on the sync-connection wrapper, `autumn-web`'s `sqlite`
+  feature, and no `pq-sys`. Before this a generated SQLite app pulled the
+  Postgres dependency set and could not compile at all.
+- **sqlite:** a `decimal{p,s}` column now carries a generated `CHECK` enforcing
+  the declared precision and scale (#1924). The SQLite column is `TEXT`, so
+  without it the declaration bound nothing and a repository write could persist
+  `123456.789` into a `decimal{5,2}`. Postgres keeps its native `NUMERIC(p,s)`
+  and gains no `CHECK`. Note that Postgres *rounds* a value to `scale` where
+  SQLite rejects it — round before saving if your input can be wider.
+- **sqlite:** a `decimal` `--default` is now written as a quoted, normalized
+  text literal (#1924). Unquoted, SQLite evaluated `DEFAULT 0.10` numerically
+  and TEXT affinity stored `0.1`; a wide default became scientific notation that
+  could not be read back at all. It is normalized through the real `Decimal` so
+  it is byte-identical to what `SqliteDecimal` writes — otherwise a row holding
+  its own default would not match a `find_by_…` for that value, and a unique
+  index would admit both spellings.
+
+### Fixed
+
+- **macros:** the `#[model]` association preloader named `diesel::pg::Pg`
+  directly, so a `--belongs-to … --counter-cache` scaffold did not compile on a
+  SQLite app. It now names `autumn_web::RuntimeBackend`, the alias that already
+  exists for this — the same type on Postgres (#1924).
+- **macros:** `#[model]` recognises the SQLite `Uuid`/`Decimal` newtypes where
+  it previously matched only `Uuid`/`Decimal` by name (#1924), so `.fake()`
+  factories mint distinct values instead of one shared nil UUID (which collided
+  on a `:unique` column), `form_for` renders a decimal as a number input, and a
+  `Uuid` column keeps its sortable index header. A `SqliteDecimal` column is
+  deliberately *not* sortable: its `TEXT` column orders lexicographically, so
+  the header would lie.
+- **schema:** `autumn schema parse` silently dropped every `Uuid` and `decimal`
+  column of a SQLite app, so snapshots and diffs were computed against an
+  incomplete schema (#1924).
+- **cli:** `autumn destroy` no longer strips `autumn-web`'s `sqlite` feature
+  when the last model goes. It is a whole-app backend flip, not a per-resource
+  capability, and without it the app's `sqlite://` URL is refused at boot
+  (#1924).
+
+### Changed
+
+- **cli:** a generated `Scope::list` now takes `autumn_web::RuntimeConnection`
+  instead of a hard-coded `diesel_async::AsyncPgConnection`, matching what
+  `generate auth` already emits. The same type on Postgres, so behaviour is
+  unchanged — but the emitted bytes of `src/policies/<model>.rs` differ, and a
+  SQLite app needs it to compile at all (#1924).
+
+### Added
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,

@@ -85,6 +85,9 @@
 //! | `AUTUMN_TELEMETRY__OTLP_ENDPOINT` | `telemetry.otlp_endpoint` | `String` |
 //! | `AUTUMN_TELEMETRY__PROTOCOL` | `telemetry.protocol` | `Grpc` / `HttpProtobuf` |
 //! | `AUTUMN_TELEMETRY__STRICT` | `telemetry.strict` | `bool` |
+//! | `AUTUMN_METRICS__MAX_SERIES_PER_METRIC` | `metrics.max_series_per_metric` | `usize` |
+//! | `AUTUMN_METRICS__MAX_INSTRUMENTS` | `metrics.max_instruments` | `usize` |
+//! | `AUTUMN_METRICS__MAX_LABELS_PER_SERIES` | `metrics.max_labels_per_series` | `usize` |
 //! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
 //! | `AUTUMN_HEALTH__LIVE_PATH` | `health.live_path` | `String` |
 //! | `AUTUMN_HEALTH__READY_PATH` | `health.ready_path` | `String` |
@@ -1374,6 +1377,28 @@ pub struct AutumnConfig {
     /// `shadow_child_keys_are_strictly_validated` fails if this ordering breaks.
     #[serde(default)]
     pub shadow: crate::shadow::ShadowConfig,
+
+    /// App-metric registry limits (`[metrics]` section).
+    ///
+    /// The cardinality caps the call-site metrics facade
+    /// ([`crate::metrics`], #1378) enforces on an app's own instruments.
+    /// Every key defaults to the value the facade shipped with, so an app
+    /// with no `[metrics]` section behaves exactly as before.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy), `cluster` and [`shadow`](Self::shadow) are:
+    /// `DatabaseConfig`'s `deserialize_with` duration field aborts the
+    /// `SchemaDeserializer` traversal, so a section declared after it is
+    /// recorded only as an opaque root leaf and strict unknown-key validation
+    /// never descends into its children — a typo like
+    /// `[metrics] max_serie_per_metric = 500` would then be silently accepted
+    /// and the cap the operator meant to raise would stay at its default. The
+    /// regression guard `metrics_child_keys_are_strictly_validated` fails if
+    /// this ordering breaks.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
@@ -4875,6 +4900,10 @@ impl AutumnConfig {
         // Fail fast on an insecure or flapping [cluster] section: a node that
         // would boot without a shared secret must not boot at all.
         self.cluster.validate()?;
+        // A zero or absurd `[metrics]` cap is refused here rather than clamped
+        // at apply time, so `autumn check` names the key. A cap of 0 would
+        // silently drop every labeled sample the app records.
+        self.metrics.validate()?;
         // A `[replication]` block that is switched on but cannot ship (no
         // destination, both destinations, no credential indirection) must fail
         // here — so `autumn check` and `autumn doctor` see it too — rather than
@@ -5117,6 +5146,7 @@ impl AutumnConfig {
         self.apply_observability_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
+        self.apply_metrics_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
@@ -5492,6 +5522,24 @@ impl AutumnConfig {
             env,
             "AUTUMN_ACTUATOR__PROMETHEUS",
             &mut self.actuator.prometheus,
+        );
+    }
+
+    fn apply_metrics_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_SERIES_PER_METRIC",
+            &mut self.metrics.max_series_per_metric,
+        );
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_INSTRUMENTS",
+            &mut self.metrics.max_instruments,
+        );
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_LABELS_PER_SERIES",
+            &mut self.metrics.max_labels_per_series,
         );
     }
 
@@ -9149,6 +9197,125 @@ const fn default_actuator_prometheus() -> bool {
     true
 }
 
+/// App-metric registry limits (`[metrics]` section).
+///
+/// These are the three cardinality caps the call-site metrics facade
+/// ([`crate::metrics`]) enforces on an app's own counters, gauges, histograms
+/// and timers. They exist so a label-cardinality mistake degrades the metric
+/// instead of growing memory without bound; they are configurable because the
+/// line between "a mistake" and "a large but deliberate label space" is a
+/// property of the app, not of the framework.
+///
+/// Every key defaults to the value the facade shipped with in 0.7.0, so an
+/// app with no `[metrics]` section is unaffected.
+///
+/// # Raising a cap is not free
+///
+/// A retained series is never evicted — evicting a counter would reset it, and
+/// a reset is indistinguishable from a restart to `rate()`. Raising
+/// `max_series_per_metric` therefore raises the *permanent* memory an
+/// unbounded label value (a user id, a URL, an error string) can claim.
+/// Raise it because the app's label space is genuinely larger, not to silence
+/// `autumn_metrics_series_dropped_total`.
+///
+/// # Examples
+///
+/// ```toml
+/// [metrics]
+/// max_series_per_metric = 500
+/// max_instruments = 512
+/// ```
+///
+/// Each key also takes an environment override:
+/// `AUTUMN_METRICS__MAX_SERIES_PER_METRIC`,
+/// `AUTUMN_METRICS__MAX_INSTRUMENTS`,
+/// `AUTUMN_METRICS__MAX_LABELS_PER_SERIES`.
+///
+/// # Where it is applied
+///
+/// `AppBuilder::run` installs this section process-wide before it builds
+/// anything from the config, so it is in force before the first call site can
+/// record. The registry is process-global, so
+/// [`TestApp`](crate::test::TestApp) deliberately does **not** apply it — one
+/// test's caps would leak into every test sharing the binary. A test that needs
+/// a different cap calls [`crate::metrics::set_limits`] itself and restores the
+/// default afterwards.
+///
+/// See `docs/guide/metrics.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Distinct **labeled** series retained per instrument. Default: `100`.
+    ///
+    /// Beyond this, a sample carrying a label set the instrument has not seen
+    /// is dropped and counted in `autumn_metrics_series_dropped_total`. The
+    /// unlabeled series does not count against it. Range: 1 to
+    /// [`MAX_SERIES_PER_METRIC_CEILING`](crate::metrics::MAX_SERIES_PER_METRIC_CEILING).
+    #[serde(default = "default_max_series_per_metric")]
+    pub max_series_per_metric: usize,
+
+    /// Distinct instruments the process-global registry holds. Default: `256`.
+    ///
+    /// Beyond this, a new metric name gets an inert handle. Range: 1 to
+    /// [`MAX_INSTRUMENTS_CEILING`](crate::metrics::MAX_INSTRUMENTS_CEILING).
+    #[serde(default = "default_max_instruments")]
+    pub max_instruments: usize,
+
+    /// Labels retained on a single series. Default: `8`.
+    ///
+    /// Extras are dropped — lexicographically smallest names survive — and
+    /// the sample is still recorded. Range: 1 to
+    /// [`MAX_LABELS_PER_SERIES_CEILING`](crate::metrics::MAX_LABELS_PER_SERIES_CEILING).
+    ///
+    /// Changing this changes **series identity**: the same twelve labels
+    /// canonicalize to a different key under a cap of 8 than under 12. Set it
+    /// once, before the app records anything.
+    #[serde(default = "default_max_labels_per_series")]
+    pub max_labels_per_series: usize,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            max_series_per_metric: default_max_series_per_metric(),
+            max_instruments: default_max_instruments(),
+            max_labels_per_series: default_max_labels_per_series(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// This section as the value the metrics registry consumes.
+    #[must_use]
+    pub const fn limits(&self) -> crate::metrics::Limits {
+        crate::metrics::Limits {
+            max_series_per_metric: self.max_series_per_metric,
+            max_instruments: self.max_instruments,
+            max_labels_per_series: self.max_labels_per_series,
+        }
+    }
+
+    /// Reject an out-of-range cap by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending `autumn.toml` key and its accepted range.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.limits().validate().map_err(ConfigError::Validation)
+    }
+}
+
+const fn default_max_series_per_metric() -> usize {
+    crate::metrics::DEFAULT_MAX_SERIES_PER_METRIC
+}
+
+const fn default_max_instruments() -> usize {
+    crate::metrics::DEFAULT_MAX_INSTRUMENTS
+}
+
+const fn default_max_labels_per_series() -> usize {
+    crate::metrics::DEFAULT_MAX_LABELS_PER_SERIES
+}
+
 /// CORS (Cross-Origin Resource Sharing) configuration.
 ///
 /// Controls which origins, methods, and headers are allowed for
@@ -12738,6 +12905,81 @@ path = "/healthz"
             config.database.url.as_deref(),
             Some("postgres://override:5432/test")
         );
+    }
+
+    #[test]
+    fn metrics_section_defaults_to_the_shipped_caps() {
+        // The whole point of making the caps configurable is that an app which
+        // configures nothing keeps the behaviour 0.7.0 shipped.
+        let config = AutumnConfig::default();
+        assert_eq!(config.metrics.limits(), crate::metrics::Limits::default());
+
+        let parsed: AutumnConfig =
+            toml::from_str("[server]\nport = 3000\n").expect("config without [metrics] parses");
+        assert_eq!(parsed.metrics.limits(), crate::metrics::Limits::default());
+    }
+
+    #[test]
+    fn metrics_section_parses_a_raised_cap() {
+        let parsed: AutumnConfig =
+            toml::from_str("[metrics]\nmax_series_per_metric = 500\nmax_labels_per_series = 12\n")
+                .expect("[metrics] parses");
+
+        assert_eq!(parsed.metrics.max_series_per_metric, 500);
+        assert_eq!(parsed.metrics.max_labels_per_series, 12);
+        assert_eq!(
+            parsed.metrics.max_instruments,
+            crate::metrics::DEFAULT_MAX_INSTRUMENTS,
+            "an unset key keeps its default rather than zeroing"
+        );
+        parsed.metrics.validate().expect("in-range caps validate");
+    }
+
+    #[test]
+    fn env_override_metrics_caps() {
+        let env = MockEnv::new()
+            .with("AUTUMN_METRICS__MAX_SERIES_PER_METRIC", "500")
+            .with("AUTUMN_METRICS__MAX_INSTRUMENTS", "512")
+            .with("AUTUMN_METRICS__MAX_LABELS_PER_SERIES", "12");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(
+            config.metrics.limits(),
+            crate::metrics::Limits {
+                max_series_per_metric: 500,
+                max_instruments: 512,
+                max_labels_per_series: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_out_of_range_metrics_cap() {
+        // A cap of 0 would drop every labeled sample the app records, silently.
+        // It must fail the boot — and `autumn check` — by name.
+        let mut config = AutumnConfig::default();
+        config.metrics.max_series_per_metric = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero cap must not validate")
+            .to_string();
+        assert!(
+            error.contains("max_series_per_metric"),
+            "the error must name the key at fault; got {error}"
+        );
+
+        let mut config = AutumnConfig::default();
+        config.metrics.max_labels_per_series = crate::metrics::MAX_LABELS_PER_SERIES_CEILING + 1;
+        assert!(
+            config.validate().is_err(),
+            "a cap above its ceiling must not validate"
+        );
+
+        AutumnConfig::default()
+            .validate()
+            .expect("the default [metrics] section validates");
     }
 
     #[test]

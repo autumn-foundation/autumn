@@ -1180,8 +1180,30 @@ pub fn grade_database_url(
 /// Grade `migrate check`: reuse the migration safety classifier and fail when a
 /// pending migration is unsafe for a live rolling deploy. A project with no
 /// migrations directory passes (there is nothing to check).
+///
+/// Detects the backend from the ambient profile. `autumn deploy` calls
+/// [`grade_migrate_check_for`] with the DEPLOY TARGET profile's backend instead
+/// (issue #1906 review); this form is for `autumn doctor`, which reports on the
+/// project as it stands locally.
 #[must_use]
 pub fn grade_migrate_check(migrations_dir: &Path) -> PreflightCheck {
+    // Grade against the app's own backend (issue #1906): a SQLite app's
+    // migrations must be judged by SQLite's dialect, not Postgres's. The
+    // offline detector never reads `.env` and never exits — `autumn doctor
+    // --json` calls this while assembling its report.
+    grade_migrate_check_for(
+        crate::generate::detect_backend_offline(Path::new("."), None),
+        migrations_dir,
+    )
+}
+
+/// [`grade_migrate_check`] against an explicit `backend`, so the grader is
+/// testable without a project on disk.
+#[must_use]
+pub fn grade_migrate_check_for(
+    backend: autumn_web::config::DatabaseBackend,
+    migrations_dir: &Path,
+) -> PreflightCheck {
     if !migrations_dir.exists() {
         return PreflightCheck::pass(
             "migrate_check",
@@ -1189,7 +1211,7 @@ pub fn grade_migrate_check(migrations_dir: &Path) -> PreflightCheck {
         );
     }
 
-    match crate::migrate::check_migrations_in_dir(migrations_dir) {
+    match crate::migrate::check_migrations_in_dir_for(backend, migrations_dir) {
         Ok(reports) => {
             let unsafe_names: Vec<&str> = reports
                 .iter()
@@ -2200,7 +2222,21 @@ fn collect_project_preflight(
             database_configured,
             requires_database_pool(config),
         ),
-        grade_migrate_check(Path::new(MIGRATIONS_DIR)),
+        // Grade migrations against the backend of the SAME profile that will run
+        // them on the host, for the reason spelled out for the signing secret
+        // above: a project whose prod profile is SQLite and whose dev profile is
+        // Postgres would otherwise have its production migrations graded by
+        // Postgres rules. `config` is already the reloaded TARGET-profile config
+        // (see `reload_config_for_deploy_profile`), so it is the one source that
+        // sees `.env.<profile>` — where a production URL often lives — and no
+        // separate detection can match it. Same URL the `database_url` grader
+        // below reads.
+        grade_migrate_check_for(
+            resolve_writable_db_url(&config.database)
+                .and_then(autumn_web::config::DatabaseBackend::detect)
+                .unwrap_or(autumn_web::config::DatabaseBackend::Postgres),
+            Path::new(MIGRATIONS_DIR),
+        ),
     ]
 }
 

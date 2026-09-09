@@ -1,0 +1,39 @@
+   Compiling autumn-macros v0.7.0 (/home/user/autumn/autumn-macros)
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 23s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-c7ea7897a2974d3d)
+
+running 28 tests
+test integration::authorization_integration::attribute_macro_allows_admin ... ok
+test integration::authorization_integration::attribute_macro_allows_owner ... ok
+test integration::authorization_integration::admin_can_update_anyones_record ... ok
+test integration::authorization_integration::authorize_above_secured_records_binding ... ok
+test integration::authorization_integration::authorize_attr_below_route_macro_records_binding ... ok
+test integration::authorization_integration::authorize_above_route_preserves_response_schema ... ok
+test integration::authorization_integration::attribute_macro_denies_non_owner_with_404 ... ok
+test integration::authorization_integration::handler_without_authorize_has_no_bindings ... ok
+test integration::authorization_integration::attribute_macro_honors_forbidden_response_override ... ok
+test integration::authorization_integration::forbidden_response_default_is_404 ... ok
+test integration::authorization_integration::forbidden_response_can_be_set_to_403 ... ok
+test integration::authorization_integration::idempotent_anonymous_session_mutation_denial_does_not_replay_cached_success ... ok
+test integration::authorization_integration::idempotent_authorize_same_session_mutation_denial_does_not_replay_cached_success ... ok
+test integration::authorization_integration::idempotent_authorized_secured_mutation_replays_without_rerunning_handler ... ok
+test integration::authorization_integration::idempotent_authorize_session_rotation_replays_final_cookie_for_old_cookie ... ok
+test integration::authorization_integration::idempotent_replay_bypasses_aliased_authorize_policy_changes ... ok
+test integration::authorization_integration::idempotent_replay_does_not_bypass_authorize_policy_changes ... ok
+test integration::authorization_integration::idempotent_replay_does_not_bypass_authorize_policy_check_when_secured_gate_runs_first ... ok
+test integration::authorization_integration::idempotent_replay_does_not_bypass_secured_role_changes ... ok
+test integration::authorization_integration::non_owner_without_role_cannot_update ... ok
+test integration::authorization_integration::owner_can_update_their_own_record ... ok
+test integration::authorization_integration::reversed_attribute_order_compiles_and_runs_both_checks ... ok
+test integration::authorization_integration::stacked_secured_and_authorize_records_binding ... ok
+test integration::authorization_integration::stacked_secured_and_authorize_owner_passes_both ... ok
+test integration::authorization_integration::stacked_secured_and_authorize_authorized_user_passes_secured_then_authorize_denies ... ok
+test integration::authorization_integration::reversed_attribute_order_owner_passes_both ... ok
+test integration::authorization_integration::stacked_secured_and_authorize_run_both_checks ... ok
+test integration::authorization_integration::unauthenticated_request_is_denied ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 1862 filtered out; finished in 0.34s
+
+
+[exited with code 0]

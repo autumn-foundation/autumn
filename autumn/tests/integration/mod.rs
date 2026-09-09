@@ -89,6 +89,7 @@ mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
 mod error_reporting;
+mod error_validation_details;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
@@ -343,6 +344,7 @@ mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+mod sqlite_ci_coverage;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]
