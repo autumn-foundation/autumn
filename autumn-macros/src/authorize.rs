@@ -146,9 +146,10 @@ fn snake_case(name: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-// `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
-// but keeps the owned `TokenStream` signature every macro entry point in
-// this crate shares (and the proc-macro boundary in `lib.rs` requires).
+// `item` is only ever borrowed via
+// `param_helpers::split_leading_items_and_reject_incompatible` now, but
+// keeps the owned `TokenStream` signature every macro entry point in this
+// crate shares (and the proc-macro boundary in `lib.rs` requires).
 #[allow(clippy::needless_pass_by_value)]
 pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the args first; the parser may surface a leading `"action"`
@@ -180,27 +181,12 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         format_ident!("{}", name)
     });
 
-    let (leading_items, mut input_fn) = match crate::parse::split_leading_items_and_fn(&item) {
-        Ok(v) => v,
-        Err(err) => return err,
-    };
-
-    if input_fn.sig.asyncness.is_none() {
-        return syn::Error::new_spanned(
-            input_fn.sig.fn_token,
-            "#[authorize] can only be applied to async functions",
-        )
-        .to_compile_error();
-    }
-
-    // `#[authorize]` written below `#[static_get]`/`#[ws]` — including under
-    // an alias those macros' own by-name attribute scan cannot see — is
-    // caught here instead, once this guard's own macro is the one running
-    // (Codex review on #2513, tenth finding). See
-    // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
-    if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
-        return err;
-    }
+    let (leading_items, mut input_fn) =
+        match crate::param_helpers::split_leading_items_and_reject_incompatible(&item, "authorize")
+        {
+            Ok(v) => v,
+            Err(err) => return err,
+        };
 
     // Inject hidden `Session` and `State<AppState>` arguments so the
     // check can read the user id from the session and resolve the
@@ -264,26 +250,8 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let resource_lit =
         syn::LitStr::new(&resource_ident.to_string(), proc_macro2::Span::call_site());
     let original_body = &input_fn.block;
-    let original_response = match &input_fn.sig.output {
-        syn::ReturnType::Default => quote! {
-            let __autumn_inner: () = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-        // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
-        // Rust rejects `impl Trait` in local variable type annotations; drop
-        // the annotation and let type inference handle it instead.
-        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
-            quote! {
-                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                    (async move #original_body).await
-                )
-            }
-        }
-        syn::ReturnType::Type(_, ty) => quote! {
-            let __autumn_inner: #ty = (async move #original_body).await;
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)
-        },
-    };
+    let original_response =
+        crate::param_helpers::build_original_response(original_body, &input_fn.sig.output);
     let body_already_has_replay_guard = block_has_replay_guard(original_body);
     let replay_stop = if body_already_has_replay_guard {
         quote! {}
