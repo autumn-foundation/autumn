@@ -436,10 +436,15 @@ ignored` for every statement from `BEGIN;` onward. It matters that this is psql'
 view and not the server's, because `inet_server_addr()` and `inet_server_port()`
 report the endpoint the *server* accepted on, not the one you configured — behind
 a forwarder, a session connected to `127.0.0.1:15433` reports `127.0.0.1:5433`,
-so two servers reached through different forwards can report the same pair. Only
-what the connection string states is asserted; a port left to libpq is not
-guessed, since `PGPORT` can differ between the machine that planned the run and
-the one pasting the script.
+so two servers reached through different forwards can report the same pair.
+
+The connection string therefore has to state both host and port. A port left to
+libpq is **refused** rather than printed: psql resolves one at paste time — from
+`PGPORT`, or 5432 — and the same host-only URI reaches 5433 under `PGPORT=5433`
+and 5432 without it, two different servers. Accepting any port for the host would
+drop the discriminator on exactly the pair this proof exists to tell apart, and
+embedding the port the run resolved is no better, since libpq can take it from a
+service file this command does not read. State it, or scrub without `--dry-run`.
 
 A failover list (`host=db1,db2`) is matched the way libpq resolves it — host and
 port paired positionally, a single port covering every host — since psql reports

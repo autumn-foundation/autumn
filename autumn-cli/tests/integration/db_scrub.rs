@@ -2108,6 +2108,62 @@ async fn a_dry_run_refuses_a_target_it_cannot_print_a_boundary_for() {
     );
 }
 
+/// A target whose connection string omits its port cannot be printed.
+///
+/// psql reports the RESOLVED port in `:PORT`, and the block's proof that
+/// `\connect` reached the intended endpoint pins it. Measured on `PostgreSQL`
+/// 16.13, the same host-only URI resolves to 5433 under `PGPORT=5433` and to
+/// 5432 without it — two different servers. Accepting any port for the host
+/// would drop the discriminator on exactly the pair this proof exists to tell
+/// apart, and embedding a port the run computed itself would mean replicating a
+/// libpq resolution that can read a service file this command does not.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scrub_refuses_to_print_a_target_with_no_stated_port() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "portless").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // Host stated, port left to libpq — supplied through PGPORT so the run can
+    // still connect, which is exactly the shape that makes this ambiguous.
+    let url = format!("postgres://postgres:postgres@{host}/portless");
+    let port = port.to_string();
+    let envs = [
+        ("AUTUMN_DATABASE__URL", url.as_str()),
+        ("PGPORT", port.as_str()),
+    ];
+
+    let (stdout, stderr) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=50%"],
+        &envs,
+    );
+    assert!(
+        stderr.contains("--dry-run") && stderr.contains("control"),
+        "the refusal must say which target it cannot print: {stderr}"
+    );
+    // Nothing runnable may be advertised alongside a refusal.
+    for output in [&stdout, &stderr] {
+        assert!(
+            !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+            "no destructive block may be printed without its boundary: {output}"
+        );
+    }
+
+    // And the same target still scrubs: this is a printing refusal, not a
+    // rejection of the configuration. Without `--dry-run` the command holds its
+    // own connection and never has to prove which one it is.
+    let (_o, ok) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        ok.contains("Scrub complete"),
+        "a port-less target must still scrub: {ok}"
+    );
+}
+
 /// The size report covers the materialized views the run refreshes.
 ///
 /// A view is rebuilt from whatever survives the sample, so one over reference

@@ -304,6 +304,14 @@ pub enum ScrubError {
         /// The target labels, sorted.
         targets: Vec<String>,
     },
+    /// `--dry-run` cannot prove the reconnect for a target whose connection
+    /// string leaves the port to libpq: psql resolves it from `PGPORT` (or the
+    /// 5432 default) at PASTE time, which need not be what it resolved when the
+    /// run planned.
+    UnprintablePortlessTarget {
+        /// The target labels, sorted.
+        targets: Vec<String>,
+    },
     /// A table this run promises to empty carries a user-defined trigger or
     /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
     /// write, so anything it writes lands after every rewrite and is never
@@ -569,6 +577,24 @@ impl std::fmt::Display for ScrubError {
                  target's plan against whichever database the pasting session is already \
                  on, which in a multi-target stream is the previous target. Configure the \
                  target as a URI (`postgres://user@host/db`), or run without `--dry-run`.",
+                targets.len(),
+                bullet_list(targets),
+            ),
+            Self::UnprintablePortlessTarget { targets } => write!(
+                f,
+                "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
+                 Their connection strings name a host but no port, so psql resolves one \
+                 when the script is pasted — from `PGPORT`, or 5432 — and that need not \
+                 be what libpq resolved while this run planned. The block's proof that \
+                 `\\connect` reached the intended endpoint would then have to accept ANY \
+                 port for that host, which is the discriminator it exists for: measured, \
+                 the same URI resolves to 5433 under `PGPORT=5433` and to 5432 without \
+                 it, two different servers. Embedding the port this run resolved is not \
+                 an option either — libpq's own resolution can come from a service file \
+                 this command does not read. State the port in the connection string \
+                 (`postgres://user@host:5432/db`), or run without `--dry-run`, where the \
+                 command holds its own connection and never has to prove which one it \
+                 is.",
                 targets.len(),
                 bullet_list(targets),
             ),
@@ -2747,6 +2773,26 @@ fn classify_and_apply(
         if !ambiguous.is_empty() {
             return Err(ScrubError::UnprintableAmbiguousTarget { targets: ambiguous });
         }
+        // And refuse a TCP target whose conninfo leaves the port to libpq. The
+        // reconnect proof pins psql's own `:PORT`, and psql reports the RESOLVED
+        // port — measured, the same host-only URI reports 5433 under
+        // `PGPORT=5433` and 5432 without it. Accepting any port for the host
+        // would drop the discriminator on exactly the pair of servers this proof
+        // exists to tell apart; asserting a port this run computed itself would
+        // mean replicating libpq's resolution, which can read a service file
+        // this command does not. Neither is honest, so it refuses instead.
+        let mut portless: Vec<String> = plans
+            .iter()
+            .filter(|(_, url, _, _, _)| {
+                password_free_conninfo(url)
+                    .is_some_and(|conninfo| stated_host_and_port(&conninfo).1.is_none())
+            })
+            .map(|(label, _, _, _, _)| (*label).clone())
+            .collect();
+        portless.sort();
+        if !portless.is_empty() {
+            return Err(ScrubError::UnprintablePortlessTarget { targets: portless });
+        }
         let mut encrypted_rewrites: Vec<String> = plans
             .iter()
             .flat_map(|(label, _, plan, _, _)| {
@@ -4576,7 +4622,10 @@ fn psql_connection_terms(conninfo: &str, database: &str) -> String {
     // an endpoint `host=a,b&port=5432,5433` names, and matching host and port
     // independently would accept a retained connection to one.
     let endpoint = match (ports.len(), hosts.len()) {
-        (0, _) => any_host(),
+        // Unreachable: a conninfo stating no port is refused before any line is
+        // printed, for the reason above. Fail closed rather than accept any port
+        // for the host if that refusal is ever relaxed.
+        (0, _) => return "false".to_owned(),
         (1, _) => format!("({}) AND {}", any_host(), equals("PORT", ports[0])),
         (p, h) if p == h => hosts
             .iter()
@@ -5667,37 +5716,23 @@ mod tests {
         );
     }
 
-    /// A component the conninfo does not state is not asserted.
+    /// A query pair overrides the authority it duplicates.
     ///
-    /// `PGPORT` can differ between the machine that planned the run and the one
-    /// pasting the script, so asserting a guessed `5432` would refuse a CORRECT
-    /// paste. An omitted component also cannot be what tells two targets apart:
-    /// libpq resolves it identically for both, so two conninfos differing only
-    /// there are one endpoint written twice.
+    /// That is the precedence libpq applies and `pg::sanitize_db_url`
+    /// normalises, so the proof has to read the conninfo the same way — pinning
+    /// the authority's port here would assert a port psql never connects to.
     #[test]
-    fn an_unstated_component_is_not_asserted() {
-        let probe = super::psql_connection_assertion("postgres://postgres@db.internal/app", "app")
-            .into_iter()
-            .find(|l| l.contains("\\gset"))
-            .expect("the probe must be emitted");
+    fn a_query_pair_overrides_the_authority_it_duplicates() {
+        let overridden = super::psql_connection_assertion(
+            "postgres://postgres@a.example:5432/app?port=6000",
+            "app",
+        )
+        .into_iter()
+        .find(|l| l.contains("\\gset"))
+        .expect("the probe must be emitted");
         assert!(
-            probe.contains(":'HOST' OPERATOR(pg_catalog.=) 'db.internal'")
-                && probe.contains(":'DBNAME' OPERATOR(pg_catalog.=) 'app'"),
-            "what the conninfo does state is still pinned: {probe}"
-        );
-        assert!(
-            !probe.contains(":'PORT'"),
-            "the port it leaves to libpq is not guessed: {probe}"
-        );
-        // A query pair overrides the authority it duplicates, the same
-        // precedence libpq applies and `pg::sanitize_db_url` normalises.
-        let overridden =
-            super::psql_connection_assertion("postgres://postgres@a.example/app?port=6000", "app")
-                .into_iter()
-                .find(|l| l.contains("\\gset"))
-                .expect("the probe must be emitted");
-        assert!(
-            overridden.contains(":'PORT' OPERATOR(pg_catalog.=) '6000'"),
+            overridden.contains(":'PORT' OPERATOR(pg_catalog.=) '6000'")
+                && !overridden.contains("'5432'"),
             "the query pair wins over the authority: {overridden}"
         );
     }
@@ -5763,6 +5798,16 @@ mod tests {
             super::psql_connection_terms("postgres:///app", "app"),
             "false",
             "the one discriminator this proof exists for cannot be optional"
+        );
+        // Nor the port. psql reports the RESOLVED port, and the same host-only
+        // URI resolves to 5433 under `PGPORT=5433` and to 5432 without it —
+        // measured, two different servers. Such a target is refused before
+        // anything is printed; this is the fail-closed answer if that is ever
+        // relaxed.
+        assert_eq!(
+            super::psql_connection_terms("postgres://db.internal/app", "app"),
+            "false",
+            "accepting any port for the host drops the discriminator"
         );
     }
 

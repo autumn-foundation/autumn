@@ -567,6 +567,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused as an unprintable target, but stated rather than left to that distant
   refusal, because omitting the host term would leave the database name standing
   alone against a physical clone that shares it.
+  A conninfo that leaves the PORT to libpq is now REFUSED rather than printed.
+  psql reports the resolved port in `:PORT`, and the same host-only URI resolves
+  to 5433 under `PGPORT=5433` and to 5432 without it — two different servers — so
+  accepting any port for the host would drop the discriminator on exactly the
+  pair the proof exists to tell apart. Embedding the port this run resolved is
+  not honest either: libpq's resolution can come from a service file this
+  command does not read. State the port, or run without `--dry-run`, where the
+  command holds its own connection and never has to prove which one it is.
   The compaction pass carries the same proof, not the endpoint alone: it is a
   second `\connect` with the same retained-connection failure, and a
   `VACUUM (FULL)` on the wrong target locks and rewrites every table it names.
