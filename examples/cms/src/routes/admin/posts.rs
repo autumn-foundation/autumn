@@ -883,6 +883,32 @@ pub async fn create(
     // which a retry then duplicated under a suffixed slug. Unwinding is the
     // honest outcome: the caller asked for a post and did not get one.
     let follow_up = async {
+        // Re-checked *after* the insert, under the hierarchy lock. The
+        // pre-flight check above runs on a released connection, so another
+        // editor can deepen the chosen parent in between and leave this child
+        // past `MAX_PAGE_DEPTH` — `page_ancestry` then truncates its path and
+        // the page is unreachable at the URL it advertises.
+        //
+        // Checked afterwards rather than held across the insert because the
+        // insert cannot join that transaction: it goes through the pool-backed
+        // repository so `PostHooks` runs, and the allocator retries on its own
+        // connection. So the window is closed by unwinding instead — the
+        // failure path below removes the row, which is why this belongs here
+        // rather than before the insert.
+        if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
+            repos
+                .with_conn(async |conn| {
+                    use diesel_async::AsyncConnection as _;
+                    conn.transaction(async move |conn| {
+                        content::lock_page_hierarchy(conn).await?;
+                        content::validate_parent(conn, Some(created.id), registered.slug, parent_id)
+                            .await
+                    })
+                    .await
+                })
+                .await?;
+        }
+
         if registered.supports_revisions {
             repos
                 .with_conn(async |conn| content::record_initial_revision(conn, &created).await)

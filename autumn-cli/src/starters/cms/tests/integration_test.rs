@@ -5177,3 +5177,161 @@ async fn the_status_endpoint_refuses_undated_scheduling() {
         .await
         .assert_status(303);
 }
+
+/// Trashing a page that still has live children is refused.
+///
+/// `page_ancestry` keeps putting a trashed parent's slug in its children's
+/// permalinks while `resolve_page_path` refuses a trashed ancestor, so every
+/// published child 404s at its own canonical URL and the sitemap keeps
+/// advertising it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn trashing_a_page_with_live_children_is_refused() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let parent = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Docs"),
+            ("slug", "docs"),
+            ("excerpt", ""),
+            ("body", "Parent."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(parent.status, 303);
+    let parent_id = parent
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    let child = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Install"),
+            ("slug", "install"),
+            ("excerpt", ""),
+            ("body", "Child."),
+            ("status", "publish"),
+            ("password", ""),
+            ("parent_id", parent_id.as_str()),
+        ]))
+        .send()
+        .await;
+    assert_eq!(child.status, 303);
+    let child_id = child
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    client
+        .get("/docs/install")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Child.");
+
+    // Trashing the parent is refused while the child is live.
+    let refused = client
+        .post(&format!("/admin/content/page/{parent_id}/status?to=trash"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    assert_eq!(refused.status, 422, "body: {}", refused.text());
+
+    // The child is still reachable, so nothing was half-applied.
+    client
+        .get("/docs/install")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Child.");
+
+    // Trash the child first, and the parent goes.
+    client
+        .post(&format!("/admin/content/page/{child_id}/status?to=trash"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/admin/content/page/{parent_id}/status?to=trash"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// An import does not restructure a locally-managed taxonomy.
+///
+/// The first pass deliberately leaves an existing term alone, but the ancestry
+/// pass still assigned the backup's parent — so importing into a populated site
+/// could silently reparent a local category, or close a cycle with it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_import_does_not_reparent_a_local_term() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Two local categories, both at the top level.
+    for name in ["Guides", "Reference"] {
+        client
+            .post("/admin/terms/category")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("name", name),
+                ("slug", ""),
+                ("description", ""),
+                ("parent_id", ""),
+            ]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    // A backup that files `reference` under `guides`.
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "attachments": [],
+        "posts": [],
+        "terms": [
+            {"taxonomy": "category", "name": "Guides", "slug": "guides",
+             "description": "", "parent": null},
+            {"taxonomy": "category", "name": "Reference", "slug": "reference",
+             "description": "", "parent": "guides"}
+        ]
+    })
+    .to_string();
+
+    client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await
+        .assert_ok();
+
+    // The local hierarchy is untouched: `reference` is still top-level.
+    let orphaned = try_execute(
+        TestDb::shared().await,
+        "SELECT 1/COUNT(*) FROM terms WHERE slug = 'reference' AND parent_id IS NOT NULL",
+    )
+    .await;
+    assert!(
+        orphaned.is_err(),
+        "the import must not have reparented the local term"
+    );
+}

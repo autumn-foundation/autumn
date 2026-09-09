@@ -100,11 +100,7 @@ pub async fn update_post_with_revision(
         if post.parent_id != before.parent_id
             && let Some(parent_id) = post.parent_id
         {
-            diesel::sql_query(format!(
-                "SELECT pg_advisory_xact_lock({PAGE_HIERARCHY_LOCK_KEY})"
-            ))
-            .execute(conn)
-            .await?;
+            lock_page_hierarchy(conn).await?;
             validate_parent(conn, Some(post_id), &post.post_type, parent_id).await?;
         }
 
@@ -172,6 +168,26 @@ pub async fn transition_status(
         // The macro-generated enforcing transition: an undeclared edge or a
         // failed guard is a 400 and nothing is written.
         let new_status = post.transition_status_to(&target)?;
+
+        // A trashed parent takes its children's URLs with it: `page_ancestry`
+        // keeps putting its slug in their permalinks while `resolve_page_path`
+        // refuses a trashed ancestor, so every published child 404s at its own
+        // canonical URL and the sitemap keeps advertising it.
+        //
+        // Refused rather than silently re-parented: every automatic answer
+        // changes the children's URLs too, and a CMS that moves published pages
+        // without being asked is worse than one that says what is in the way.
+        // The editor can trash or move the children first.
+        if new_status == "trash" {
+            let children = live_child_count(conn, post_id).await?;
+            if children > 0 {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "This page still has {children} live child {}. Trash or move them \
+                     first — their URLs are built from this one.",
+                    if children == 1 { "page" } else { "pages" }
+                )));
+            }
+        }
 
         // Same rule the editor's save path follows: a type registered
         // `supports_revisions: false` gets no snapshot, from any path.
@@ -828,6 +844,42 @@ pub async fn would_create_cycle(
 /// by writes that actually move a post: an edit that leaves `parent_id` alone
 /// never contends for it.
 pub const PAGE_HIERARCHY_LOCK_KEY: i64 = 7_717_260_231_002;
+
+/// Take the hierarchy lock for the rest of the caller's transaction.
+///
+/// The lock is what makes a parent check mean something: it is a read over the
+/// *tree*, so no row lock serializes it, and a validation that runs on a
+/// released connection can be invalidated before the write it was guarding.
+/// Exposed so the creation path can hold it across validation *and* insertion,
+/// the way `update_post_with_revision` already does for re-parenting.
+pub async fn lock_page_hierarchy(conn: &mut AsyncPgConnection) -> AutumnResult<()> {
+    diesel::sql_query(format!(
+        "SELECT pg_advisory_xact_lock({PAGE_HIERARCHY_LOCK_KEY})"
+    ))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// How many children a post has that are not in the trash.
+///
+/// Only the immediate children need counting: a grandchild's ancestry runs
+/// through one of them, so if every child is trashed no live descendant is
+/// reachable through this post at all.
+///
+/// Trashing a parent leaves its children's `parent_id` pointing at it, so
+/// `page_ancestry` keeps generating permalinks that contain the trashed slug
+/// while `resolve_page_path` refuses trashed ancestors — every published child
+/// starts 404ing at its own canonical URL, and the sitemap advertises those
+/// dead URLs.
+pub async fn live_child_count(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<i64> {
+    Ok(posts::table
+        .filter(posts::parent_id.eq(post_id))
+        .filter(posts::status.ne("trash"))
+        .count()
+        .get_result(conn)
+        .await?)
+}
 
 /// Persist a whole settings form in one transaction.
 ///

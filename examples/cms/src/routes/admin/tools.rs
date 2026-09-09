@@ -416,6 +416,10 @@ pub async fn import(
 
     // Terms first: posts reference them, and creating them up front means one
     // pass over the posts rather than two.
+    //
+    // Which terms this run created, so the ancestry pass below can restrict
+    // itself to them and leave a locally-managed hierarchy alone.
+    let mut created_terms: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for term in &payload.terms {
         let existing = repos
             .terms
@@ -424,7 +428,7 @@ pub async fn import(
             .into_iter()
             .any(|t| t.taxonomy == term.taxonomy);
         if !existing {
-            repos
+            let created = repos
                 .terms
                 .save(&NewTerm {
                     taxonomy: term.taxonomy.clone(),
@@ -436,11 +440,19 @@ pub async fn import(
                     parent_id: None,
                 })
                 .await?;
+            created_terms.insert(created.id);
         }
     }
 
     // Re-link taxonomy ancestry. Hierarchical categories are supported, so a
     // restore that flattened them would quietly change every archive's shape.
+    //
+    // Only for terms *this run created*. A term the destination already had is
+    // locally managed — the first pass deliberately leaves its name and
+    // description alone, and moving it under the backup's parent would be the
+    // same contradiction: an import that says it skips existing rows, silently
+    // restructuring somebody's category tree (or closing a cycle with it). This
+    // is the taxonomy-shaped twin of the post ancestry rule.
     for term in &payload.terms {
         let Some(parent_slug) = &term.parent else {
             continue;
@@ -450,6 +462,9 @@ pub async fn import(
         let (Some(child), Some(parent)) = (child, parent) else {
             continue;
         };
+        if !created_terms.contains(&child.id) {
+            continue;
+        }
         if child.id != parent.id && child.parent_id != Some(parent.id) {
             repos
                 .terms
