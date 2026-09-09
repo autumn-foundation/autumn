@@ -34,7 +34,6 @@
 #![cfg(feature = "db")]
 #![allow(clippy::cast_possible_wrap)] // fixture indices are bounded well under i64::MAX
 
-use autumn_web::hooks::MutationHooks;
 use diesel::PgConnection;
 use diesel::connection::SimpleConnection;
 use diesel::sql_types::{BigInt, Text};
@@ -71,23 +70,14 @@ pub struct LedgerUpsertLockRecord {
     pub value: i32,
 }
 
-// A no-op hooks impl, matching `HookedVersionedRecord` in
-// `repository_bulk_operations.rs` — the proven-working
-// `hooks + versioned = true` combination this harness's model mirrors,
-// rather than the untested hooks-free + versioned=true corner.
-#[derive(Clone, Default)]
-pub struct LedgerUpsertLockRecordHooks;
-
-impl MutationHooks for LedgerUpsertLockRecordHooks {
-    type Model = LedgerUpsertLockRecord;
-    type NewModel = NewLedgerUpsertLockRecord;
-    type UpdateModel = UpdateLedgerUpsertLockRecord;
-}
-
+// No `hooks = ...`: the generated `upsert_many` trait method is gated
+// `config.hooks_type.is_none()` (autumn-macros/src/repository.rs,
+// `upsert_many_trait_method`/`upsert_many_impl_method`) — a hooks-enabled
+// repository doesn't expose `upsert_many` at all, so this harness (which
+// exists specifically to drive `upsert_many`) must stay hooks-free.
 #[autumn_web::repository(
     LedgerUpsertLockRecord,
     table = "ledger_upsert_lock_records",
-    hooks = LedgerUpsertLockRecordHooks,
     versioned = true
 )]
 pub trait LedgerUpsertLockRecordRepository {}
@@ -163,7 +153,6 @@ async fn setup_pool() -> (
 const fn build_repo(pool: Pool<AsyncPgConnection>) -> PgLedgerUpsertLockRecordRepository {
     PgLedgerUpsertLockRecordRepository {
         pool,
-        hooks: LedgerUpsertLockRecordHooks,
         __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
