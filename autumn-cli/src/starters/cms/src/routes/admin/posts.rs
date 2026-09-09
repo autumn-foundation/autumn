@@ -1256,12 +1256,27 @@ pub async fn update(
     // The `lock_version` the editor's form was rendered from. The server
     // compares it against the row it locks, so a save built on content
     // somebody else has since changed is refused rather than overwriting it.
-    let expected_lock_version = form
+    //
+    // Required here, not optional. `update_post_with_revision` takes an
+    // `Option` because it also serves callers that legitimately have no form
+    // behind them — the importer and the API — but for *this* handler a
+    // missing, empty or unparseable value is not "no form", it is a form whose
+    // guard has been removed. Falling through to `None` silently disabled the
+    // stale-edit check, so a crafted save could overwrite an edit committed
+    // after the form was loaded: the one thing optimistic locking exists to
+    // prevent, defeated by omitting a field.
+    let Some(expected_lock_version) = form
         .lock_version
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse::<i32>().ok());
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return Err(AutumnError::unprocessable_msg(
+            "This form is missing its version stamp — reload the editor and try again",
+        ));
+    };
+    let expected_lock_version = Some(expected_lock_version);
 
     // The edit, its revision, the term replacement and any status transition
     // all commit together.

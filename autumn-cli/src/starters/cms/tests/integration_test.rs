@@ -618,6 +618,31 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
         .await
 }
 
+/// Encode an editor form, stamping the post's current `lock_version`.
+///
+/// The editor renders that hidden field on every edit and the update handler
+/// requires it, so a test that omits it is exercising a request the UI cannot
+/// make — and, before the check existed, one that silently skipped the
+/// stale-edit guard.
+async fn edit_form(id: &impl std::fmt::Display, fields: &[(&str, &str)]) -> String {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let id: i64 = id.to_string().parse().expect("a post id");
+    let version = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .find(id)
+            .select({{crate_name}}::schema::posts::lock_version)
+            .first::<i32>(&mut conn)
+            .await
+            .expect("the post")
+            .to_string()
+    };
+    let mut all: Vec<(&str, &str)> = fields.to_vec();
+    all.push(("lock_version", version.as_str()));
+    form(&all)
+}
+
 /// Create a post through the admin editor and return its id.
 async fn create_post(
     client: &TestClient,
@@ -1542,15 +1567,21 @@ async fn editing_a_post_records_a_restorable_revision() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Versioned"),
-            ("slug", "versioned"),
-            ("excerpt", ""),
-            ("body", "Second draft."),
-            ("status", "publish"),
-            ("password", ""),
-            ("taxonomy_names[post_tag]", ""),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Versioned"),
+                    ("slug", "versioned"),
+                    ("excerpt", ""),
+                    ("body", "Second draft."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -2761,16 +2792,22 @@ async fn a_published_post_cannot_be_saved_without_a_title() {
     let refused = client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", ""),
-            ("slug", "has-a-title"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("taxonomy_names[post_tag]", ""),
-            ("comment_status", "open"),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", ""),
+                    ("slug", "has-a-title"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
         .send()
         .await;
     assert_eq!(
@@ -2822,16 +2859,22 @@ async fn a_revision_is_attributed_to_the_editor_who_made_it() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &editor)
-        .form(&form(&[
-            ("title", "Collaborative"),
-            ("slug", "collaborative"),
-            ("excerpt", ""),
-            ("body", "Edited by somebody else."),
-            ("status", "draft"),
-            ("password", ""),
-            ("taxonomy_names[post_tag]", ""),
-            ("comment_status", "open"),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Collaborative"),
+                    ("slug", "collaborative"),
+                    ("excerpt", ""),
+                    ("body", "Edited by somebody else."),
+                    ("status", "draft"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -3126,16 +3169,22 @@ async fn restoring_an_untitled_revision_onto_a_live_post_is_refused() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Final Title"),
-            ("slug", "work-in-progress"),
-            ("excerpt", ""),
-            ("body", "Second body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("taxonomy_names[post_tag]", ""),
-            ("comment_status", "open"),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Final Title"),
+                    ("slug", "work-in-progress"),
+                    ("excerpt", ""),
+                    ("body", "Second body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -3408,16 +3457,22 @@ async fn saving_a_post_keeps_assignments_the_editor_does_not_render() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Filed"),
-            ("slug", "filed"),
-            ("excerpt", ""),
-            ("body", "Edited body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("taxonomy_names[post_tag]", "rust"),
-            ("comment_status", "open"),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Filed"),
+                    ("slug", "filed"),
+                    ("excerpt", ""),
+                    ("body", "Edited body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", "rust"),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -3836,18 +3891,24 @@ async fn a_crafted_category_id_from_another_taxonomy_is_ignored() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Ordinary"),
-            ("slug", "ordinary"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("taxonomy_names[post_tag]", ""),
-            ("comment_status", "open"),
-            ("taxonomies[category]", news_id.as_str()),
-            ("taxonomies[category]", foreign_id.as_str()),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Ordinary"),
+                    ("slug", "ordinary"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                    ("taxonomies[category]", news_id.as_str()),
+                    ("taxonomies[category]", foreign_id.as_str()),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -3988,7 +4049,7 @@ async fn checking_a_category_box_saves_the_post() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&fields))
+        .form(&edit_form(&id, &fields).await)
         .send()
         .await
         .assert_status(303);
@@ -3998,7 +4059,7 @@ async fn checking_a_category_box_saves_the_post() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&fields))
+        .form(&edit_form(&id, &fields).await)
         .send()
         .await
         .assert_status(303);
@@ -4572,7 +4633,8 @@ async fn clearing_every_category_removes_the_post_from_its_archives() {
         .expect("id")
         .to_string();
 
-    let base = |extra: Option<&str>| {
+    let post_id = &id;
+    let base = async |extra: Option<&str>| {
         let mut fields = vec![
             ("title", "Filed Then Not"),
             ("slug", "filed-then-not"),
@@ -4583,17 +4645,17 @@ async fn clearing_every_category_removes_the_post_from_its_archives() {
             ("taxonomy_names[post_tag]", "rust"),
             ("comment_status", "open"),
         ];
-        if let Some(id) = extra {
-            fields.push(("taxonomies[category]", id));
+        if let Some(term) = extra {
+            fields.push(("taxonomies[category]", term));
         }
-        form(&fields)
+        edit_form(post_id, &fields).await
     };
 
     // File it, and confirm the archive lists it.
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&base(Some(news.as_str())))
+        .form(&base(Some(news.as_str())).await)
         .send()
         .await
         .assert_status(303);
@@ -4605,7 +4667,7 @@ async fn clearing_every_category_removes_the_post_from_its_archives() {
         .assert_body_contains("Filed Then Not");
 
     // Now clear every category and tag.
-    let mut cleared = base(None);
+    let mut cleared = base(None).await;
     cleared = cleared.replace(
         "taxonomy_names%5Bpost_tag%5D=rust",
         "taxonomy_names%5Bpost_tag%5D=",
@@ -4814,15 +4876,21 @@ async fn a_registered_custom_taxonomy_is_editable() {
     client
         .post(&format!("/admin/content/page/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Handbook"),
-            ("slug", "handbook"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("taxonomies[shelf]", shelf_id.as_str()),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Handbook"),
+                    ("slug", "handbook"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomies[shelf]", shelf_id.as_str()),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -4844,14 +4912,20 @@ async fn a_registered_custom_taxonomy_is_editable() {
     client
         .post(&format!("/admin/content/page/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Handbook"),
-            ("slug", "handbook"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "publish"),
-            ("password", ""),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Handbook"),
+                    ("slug", "handbook"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -4879,17 +4953,21 @@ async fn a_save_cannot_create_unbounded_terms() {
     let cookie = register(&client, "owner").await;
     let id = create_post(&client, &cookie, "Tagged", "Body.", "publish").await;
 
-    let save = |tags: &str| {
-        form(&[
-            ("title", "Tagged"),
-            ("slug", "tagged"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("comment_status", "open"),
-            ("taxonomy_names[post_tag]", tags),
-        ])
+    let save = async |tags: &str| {
+        edit_form(
+            &id,
+            &[
+                ("title", "Tagged"),
+                ("slug", "tagged"),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+                ("comment_status", "open"),
+                ("taxonomy_names[post_tag]", tags),
+            ],
+        )
+        .await
     };
 
     // Far more than any editor types.
@@ -4897,7 +4975,7 @@ async fn a_save_cannot_create_unbounded_terms() {
     let refused = client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&save(&many.join(",")))
+        .form(&save(&many.join(",")).await)
         .send()
         .await;
     assert_eq!(refused.status, 422, "body: {}", refused.text());
@@ -4906,7 +4984,7 @@ async fn a_save_cannot_create_unbounded_terms() {
     let refused = client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&save(&"a".repeat(500)))
+        .form(&save(&"a".repeat(500)).await)
         .send()
         .await;
     assert_eq!(refused.status, 422, "body: {}", refused.text());
@@ -4924,7 +5002,7 @@ async fn a_save_cannot_create_unbounded_terms() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&save("rust, web, async"))
+        .form(&save("rust, web, async").await)
         .send()
         .await
         .assert_status(303);
@@ -4958,7 +5036,7 @@ async fn scheduling_requires_a_future_date() {
         .await
         .assert_status(303);
 
-    let save = |publish_at: &str| {
+    let save = async |publish_at: &str| {
         let mut fields = vec![
             ("title", "Was Live"),
             ("slug", "was-live"),
@@ -4971,7 +5049,7 @@ async fn scheduling_requires_a_future_date() {
         if !publish_at.is_empty() {
             fields.push(("publish_at", publish_at));
         }
-        form(&fields)
+        edit_form(&id, &fields).await
     };
 
     // No date at all, and a date in the past, are both refused.
@@ -4979,7 +5057,7 @@ async fn scheduling_requires_a_future_date() {
         let refused = client
             .post(&format!("/admin/content/post/{id}"))
             .header("cookie", &cookie)
-            .form(&save(attempt))
+            .form(&save(attempt).await)
             .send()
             .await;
         assert_eq!(
@@ -4997,7 +5075,7 @@ async fn scheduling_requires_a_future_date() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&save(&future))
+        .form(&save(&future).await)
         .send()
         .await
         .assert_status(303);
@@ -5993,15 +6071,21 @@ async fn reparenting_is_bounded_by_the_deepest_descendant() {
     let refused = client
         .post(&format!("/admin/content/page/{a}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "A"),
-            ("slug", "a"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("parent_id", chain[5].as_str()),
-        ]))
+        .form(
+            &edit_form(
+                &a,
+                &[
+                    ("title", "A"),
+                    ("slug", "a"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", chain[5].as_str()),
+                ],
+            )
+            .await,
+        )
         .send()
         .await;
     assert_eq!(
@@ -6026,15 +6110,21 @@ async fn reparenting_is_bounded_by_the_deepest_descendant() {
     client
         .post(&format!("/admin/content/page/{leaf}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Leaf"),
-            ("slug", "leaf"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "publish"),
-            ("password", ""),
-            ("parent_id", chain[5].as_str()),
-        ]))
+        .form(
+            &edit_form(
+                &leaf,
+                &[
+                    ("title", "Leaf"),
+                    ("slug", "leaf"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("parent_id", chain[5].as_str()),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -7091,7 +7181,7 @@ async fn a_save_cannot_apply_an_unbounded_number_of_terms() {
         client
             .post(&format!("/admin/content/post/{id}"))
             .header("cookie", &cookie)
-            .form(&form(&fields))
+            .form(&edit_form(&id, &fields).await)
             .send()
             .await
     };
@@ -7268,14 +7358,20 @@ async fn an_oversized_title_is_refused_on_the_edit_path() {
     let refused = client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", huge.as_str()),
-            ("slug", "modest"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "draft"),
-            ("password", ""),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", huge.as_str()),
+                    ("slug", "modest"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "draft"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
         .send()
         .await;
     assert_eq!(
@@ -7290,14 +7386,20 @@ async fn an_oversized_title_is_refused_on_the_edit_path() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", ok.as_str()),
-            ("slug", "modest"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "draft"),
-            ("password", ""),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", ok.as_str()),
+                    ("slug", "modest"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "draft"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -7392,15 +7494,21 @@ async fn unscheduling_a_post_clears_its_publish_date() {
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Later"),
-            ("slug", "later"),
-            ("excerpt", ""),
-            ("body", "Body."),
-            ("status", "draft"),
-            ("password", ""),
-            ("publish_at", ""),
-        ]))
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Later"),
+                    ("slug", "later"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "draft"),
+                    ("password", ""),
+                    ("publish_at", ""),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -7456,15 +7564,21 @@ async fn unscheduling_a_post_clears_its_publish_date() {
     client
         .post(&format!("/admin/content/post/{live}"))
         .header("cookie", &cookie)
-        .form(&form(&[
-            ("title", "Live"),
-            ("slug", "live"),
-            ("excerpt", ""),
-            ("body", "Edited."),
-            ("status", "publish"),
-            ("password", ""),
-            ("publish_at", ""),
-        ]))
+        .form(
+            &edit_form(
+                &live,
+                &[
+                    ("title", "Live"),
+                    ("slug", "live"),
+                    ("excerpt", ""),
+                    ("body", "Edited."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("publish_at", ""),
+                ],
+            )
+            .await,
+        )
         .send()
         .await
         .assert_status(303);
@@ -7660,4 +7774,227 @@ async fn the_importer_accepts_an_export_too_large_to_url_encode() {
             .expect("the imported post")
     };
     assert_eq!(stored, 1);
+}
+
+/// An edit without a version stamp is refused, not silently unguarded.
+///
+/// `update_post_with_revision` takes an `Option` because the importer and the
+/// API legitimately have no form behind them. For the editor a missing, empty
+/// or unparseable value is not "no form" — it is a form whose guard has been
+/// removed, and falling through to `None` disabled the stale-edit check
+/// entirely, so a crafted save could overwrite an edit committed after the form
+/// was loaded.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_edit_without_a_version_stamp_is_refused() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Contested", "First.", "publish").await;
+
+    let fields = |version: Option<&str>| {
+        let mut fields = vec![
+            ("title", "Contested"),
+            ("slug", "contested"),
+            ("excerpt", ""),
+            ("body", "Overwritten."),
+            ("status", "publish"),
+            ("password", ""),
+            ("comment_status", "open"),
+        ];
+        if let Some(version) = version {
+            fields.push(("lock_version", version));
+        }
+        form(&fields)
+    };
+
+    for (label, version) in [
+        ("missing", None),
+        ("empty", Some("")),
+        ("malformed", Some("not-a-number")),
+    ] {
+        let refused = client
+            .post(&format!("/admin/content/post/{id}"))
+            .header("cookie", &cookie)
+            .form(&fields(version))
+            .send()
+            .await;
+        assert_eq!(
+            refused.status,
+            422,
+            "a {label} version stamp must be refused rather than skipping the check: {}",
+            refused.text()
+        );
+    }
+
+    // The body is untouched by any of them.
+    sign_out(&client);
+    client
+        .get("/contested")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("First.");
+
+    // A stale-but-well-formed version is still refused by the existing check,
+    // and the current one still saves — the requirement is on the stamp being
+    // present, not on the guard changing.
+    let current: i32 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .find(id)
+            .select({{crate_name}}::schema::posts::lock_version)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+    let stale = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&fields(Some(&(current - 1).to_string())))
+        .send()
+        .await;
+    assert_ne!(stale.status, 303, "a stale save must still be refused");
+
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&fields(Some(&current.to_string())))
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client
+        .get("/contested")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Overwritten.");
+}
+
+/// A widget or sitemap archive is derived from posts, not from a cached count.
+///
+/// `terms.post_count` is maintained by `recount_term`, which applies the
+/// *current* `public_type_slugs()` — right whenever it runs, and stale the
+/// moment the answer to "is this type public?" changes without a write to
+/// touch it. `register_post_type` supports replacing a registration, so a
+/// deployment can flip a type's visibility between restarts and nothing
+/// recomputes the counters. A stale positive count then advertises an archive
+/// whose own listing is empty.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_stale_term_count_does_not_advertise_an_empty_archive() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Ghosts"),
+            ("slug", ""),
+            ("description", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The state a visibility flip leaves behind: a positive count with nothing
+    // published behind it. Written directly, because the supported way to
+    // produce it — re-registering a post type as non-public — is
+    // process-global and would change every other test's registry.
+    try_execute(
+        TestDb::shared().await,
+        "UPDATE terms SET post_count = 7 WHERE slug = 'ghosts'",
+    )
+    .await
+    .expect("stale the counter");
+
+    sign_out(&client);
+    let home = client.get("/").send().await;
+    home.assert_ok();
+    assert!(
+        !home.text().contains("Ghosts"),
+        "the widget must not advertise an archive with nothing in it"
+    );
+    let sitemap = client.get("/sitemap.xml").send().await;
+    sitemap.assert_ok();
+    assert!(
+        !sitemap.text().contains("/category/ghosts"),
+        "the sitemap must not list an archive with nothing in it"
+    );
+
+    // And a term that really does have a published post is still listed, so
+    // the derivation replaced the counter rather than emptying the widget.
+    let id = create_post(&client, &cookie, "Real", "Body.", "publish").await;
+    let term: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::terms::table
+            .filter({{crate_name}}::schema::terms::slug.eq("ghosts"))
+            .select({{crate_name}}::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the term")
+    };
+    try_execute(
+        TestDb::shared().await,
+        &format!("INSERT INTO post_terms (post_id, term_id) VALUES ({id}, {term})"),
+    )
+    .await
+    .expect("file the post");
+
+    sign_out(&client);
+    client
+        .get("/sitemap.xml")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("/category/ghosts");
+}
+
+/// The importer's ceiling is the deployment's configuration, not a constant.
+///
+/// A hard-coded cap made `security.upload.max_request_size_bytes` ineffective:
+/// the exporter is unbounded, so a fixed number is a size of backup the CMS can
+/// create and cannot restore, with no way out. The screen states the number the
+/// handler enforces, and both come from the same place.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_import_ceiling_follows_the_configured_request_limit() {
+    // For the schema, the truncation and the cache reset — this test then
+    // builds its own client, because the limit under test is configuration the
+    // shared harness does not vary.
+    drop(db_client().await);
+    let db = TestDb::shared().await;
+
+    // A deployment that has raised the limit well past the old constant.
+    let mut config = AutumnConfig::default();
+    config.security.csrf.enabled = false;
+    config.security.submit_token.enabled = false;
+    config.security.upload.max_request_size_bytes = 96 * 1024 * 1024;
+    let client = TestApp::new()
+        .routes(app_routes())
+        .config(config)
+        .with_db(db.pool())
+        .build();
+    let cookie = register(&client, "owner").await;
+
+    let screen = client
+        .get("/admin/tools")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    screen.assert_ok();
+    let screen = screen.text();
+    assert!(
+        screen.contains("Up to 95 MB"),
+        "the screen must state the configured ceiling, not a constant:\n{screen}"
+    );
+    assert!(
+        screen.contains("max_request_size_bytes"),
+        "and name the knob that changes it"
+    );
 }

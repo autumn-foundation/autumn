@@ -2179,11 +2179,22 @@ pub async fn replace_menu_at_location(
     .await
 }
 
-/// Terms of a taxonomy that have at least one published post, bounded.
+/// Terms of a taxonomy that have at least one published, publicly-routable
+/// post, bounded.
 ///
-/// The `post_count > 0` filter and the limit are both applied in SQL. The
-/// sitemap is an unauthenticated endpoint whose advertised cap has to bound the
-/// work, not only the response.
+/// Membership is derived from the posts themselves rather than read from
+/// `terms.post_count`. The counter is maintained by `recount_term`, which
+/// applies the *current* `public_type_slugs()` — so it is right whenever it
+/// runs, and stale the moment the answer to "is this type public?" changes
+/// without a write to touch it. `register_post_type` supports replacing a
+/// registration, so a deployment can flip a type's visibility between restarts
+/// and nothing recomputes the counters: the sitemap and the widgets would then
+/// advertise an archive whose own listing is empty, or omit one that is full.
+///
+/// Correct by construction is worth a subquery here. The count is still what
+/// orders the result — popularity is a heuristic and a stale one costs nothing
+/// — and the limit still bounds the work, which is what the unauthenticated
+/// sitemap needs.
 pub async fn populated_terms(
     conn: &mut AsyncPgConnection,
     taxonomy: &str,
@@ -2191,7 +2202,13 @@ pub async fn populated_terms(
 ) -> AutumnResult<Vec<Term>> {
     Ok(terms::table
         .filter(terms::taxonomy.eq(taxonomy))
-        .filter(terms::post_count.gt(0))
+        .filter(diesel::dsl::exists(
+            post_terms::table
+                .inner_join(posts::table.on(posts::id.eq(post_terms::post_id)))
+                .filter(post_terms::term_id.eq(terms::id))
+                .filter(posts::status.eq("publish"))
+                .filter(posts::post_type.eq_any(public_type_slugs())),
+        ))
         .order((terms::post_count.desc(), terms::id.asc()))
         .limit(limit.max(0))
         .select(Term::as_select())

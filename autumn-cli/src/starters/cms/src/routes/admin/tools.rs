@@ -197,9 +197,37 @@ pub const EXPORT_VERSION: u32 = 3;
 /// The versions this site can read.
 const READABLE_EXPORT_VERSIONS: &[u32] = &[2, 3];
 
+/// How much of the request budget multipart framing and the CSRF field may use.
+///
+/// The part cap is the configured request limit minus this, so an operator has
+/// exactly one knob — `security.upload.max_request_size_bytes` — and raising it
+/// raises what the importer accepts. A second compile-time constant here would
+/// have made that knob ineffective, which is the whole complaint about a
+/// hard-coded cap: the exporter is unbounded, so a fixed number is a size of
+/// backup the CMS can create and cannot restore, with no way out.
+const IMPORT_FRAMING_HEADROOM: usize = 64 * 1024;
+
+/// The largest export this deployment can accept, from its own configuration.
+fn max_import_bytes(state: &AppState) -> usize {
+    state
+        .config()
+        .security
+        .upload
+        .max_request_size_bytes
+        .saturating_sub(IMPORT_FRAMING_HEADROOM)
+}
+
 #[get("/admin/tools")]
-pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
+pub async fn show(
+    repos: Repos,
+    session: Session,
+    csrf: Csrf,
+    State(state): State<AppState>,
+) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ExportContent);
+    // Read from configuration rather than a constant, so the number the screen
+    // states is the number the handler enforces.
+    let max_import_bytes = max_import_bytes(&state);
     let body = html! {
         div class="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-4xl" {
             section class="bg-white rounded-lg shadow p-5" {
@@ -227,9 +255,9 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                     input #payload type="file" name="payload" required accept="application/json"
                           class="w-full border rounded px-3 py-2 text-sm";
                     p class="text-xs text-gray-400" {
-                        "Up to " (MAX_IMPORT_BYTES / (1024 * 1024)) " MB. A larger backup needs \
-                         `security.upload.max_request_size_bytes` raised in autumn.toml, and \
-                         this constant with it."
+                        "Up to " (max_import_bytes / (1024 * 1024)) " MB, from \
+                         `security.upload.max_request_size_bytes` in autumn.toml — raise that \
+                         and the importer follows."
                     }
                     button type="submit"
                            class="px-4 py-2 border rounded bg-white hover:bg-gray-50" {
@@ -398,22 +426,16 @@ fn import_status(status: &str, published_at: Option<chrono::NaiveDateTime>) -> &
     status
 }
 
-/// The largest export the importer accepts.
-///
-/// Has to stay below `security.upload.max_request_size_bytes` (32 MiB by
-/// default), because that limit is applied by the extractor before this handler
-/// runs — a body over it is a bare 413 the starter cannot turn into a sentence.
-/// Some headroom for multipart framing, hence 24 rather than 32.
-const MAX_IMPORT_BYTES: usize = 24 * 1024 * 1024;
-
 #[post("/admin/tools/import")]
 pub async fn import(
     repos: Repos,
     session: Session,
     csrf: Csrf,
+    State(state): State<AppState>,
     mut form: autumn_web::extract::Multipart,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ImportContent);
+    let max_import_bytes = max_import_bytes(&state);
 
     // A file upload rather than a textarea, which is what the export already
     // hands the operator. The old form posted the JSON as a URL-encoded field:
@@ -432,7 +454,7 @@ pub async fn import(
             // parse.
             raw = Some(
                 field
-                    .with_max_bytes(MAX_IMPORT_BYTES)
+                    .with_max_bytes(max_import_bytes)
                     .bytes_limited()
                     .await?,
             );
