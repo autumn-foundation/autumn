@@ -33,15 +33,18 @@ Sampled the 200 most-recently-completed `pull_request`-triggered `ci.yml` runs
 27 success, **9 failure**. Triaged each failure by job/log inspection rather
 than trusting the run-level conclusion:
 
-- **6 are ordinary PR-under-development failures**, not CI health issues:
-  `Clippy` failures on two commits of an in-progress `#[derivation]` feature
-  branch, a `Migration version gate` failure on the same branch, a
-  `cargo-deny` finding and a genuine compile/test break on a
-  `dependabot/cargo/validator-0.21.0` bump (the new `validator` release needs
-  code changes this PR doesn't have yet), and repeated failures on
-  `feat-cms-starter`'s own new code across its many "round-N review fixes"
-  commits. None of these are flakes — they're WIP branches failing on their
-  own not-yet-fixed changes, working as intended.
+- **6 are ordinary PR-under-development failures**, not CI health issues —
+  each run assigned to exactly one bucket below, by its most notable
+  failure: `Clippy` failures on three separate commits/runs (34313965779,
+  34312510781, 34267218724) of an in-progress `#[derivation]` feature
+  branch (one of the three, 34313965779, also failed a `Migration version
+  gate` check in the same run — not a fourth run), a `cargo-deny` finding
+  on an earlier `dependabot/cargo/validator-0.21.0` commit (run
+  34242145427; the new `validator` release needs code changes this PR
+  doesn't have yet), and `feat-cms-starter`'s own new code failing across
+  its many "round-N review fixes" commits. None of these are flakes —
+  they're WIP branches failing on their own not-yet-fixed changes, working
+  as intended.
 - **1 is a new, unrelated test on an unmerged feature branch**:
   `integration::custom_domain_issuance::a_stale_order_does_not_delete_the_successors_certificate`
   failed on `macos-latest` on PR #2637's branch (`claude/issue-1635-tdd-dv8zqj`,
@@ -49,7 +52,9 @@ than trusting the run-level conclusion:
   occurrence, on that PR's own new code — not part of the tracked cluster,
   logged here only so a repeat is recognized rather than rediscovered.
 - **2 hit the tracked macOS/hot-upgrade timing cluster** in
-  `docs/ci-health/quarantine-ledger.md`:
+  `docs/ci-health/quarantine-ledger.md` (6 + 1 + 2 = 9, all distinct runs;
+  see the note on run 34297324354 below — it carries two independent
+  findings but is counted once, here, not also in the "6"):
 
   1. **`live_upgrade::upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`
      — a new hit on a Linux runner, at a different assertion than the
@@ -89,6 +94,12 @@ than trusting the run-level conclusion:
      panic site as the single occurrence logged 2026-09-03. Six days apart,
      same platform, same line: this is now a confirmed-repeat signature, not
      the "suggestive, not yet a repeat" status the ledger carried until today.
+     This same run also failed `Supply chain (cargo-deny)` — a second,
+     independent finding, distinct from the earlier `dependabot/cargo/validator-0.21.0`
+     commit's own cargo-deny failure (run 34242145427, counted in the "6"
+     above). That cargo-deny failure is ordinary-bucket in substance, but
+     the run itself is counted here, once, under its more notable finding —
+     not double-counted in both buckets.
 
 ## 🔍 Diagnosis
 
