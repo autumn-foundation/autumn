@@ -201,6 +201,31 @@ pub struct DvRevision {
 #[autumn_web::repository(DvRevision, table = "dv_revisions", soft_delete)]
 pub trait DvRevisionRepository {}
 
+// ── Self-referential: a node counts its own children ────────────────────────
+
+diesel::table! {
+    dv_nodes (id) {
+        id -> Int8,
+        parent_id -> Nullable<Int8>,
+        child_count -> Int8,
+    }
+}
+
+/// A tree in one table: the derivation's child and parent rows are the same
+/// rows, so a re-parent locks a child and then a parent of the same table.
+#[autumn_web::model(table = "dv_nodes")]
+#[derivation(DvNode, column = "child_count", fk = parent_id)]
+pub struct DvNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+    #[default]
+    pub child_count: i64,
+}
+
+#[autumn_web::repository(DvNode, table = "dv_nodes")]
+pub trait DvNodeRepository {}
+
 // ── Setup & helpers ─────────────────────────────────────────────────────────
 
 const COUNT_DERIVATION: &str = "dv_posts.published_comment_count";
@@ -235,6 +260,9 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS dv_revisions \
      (id BIGSERIAL PRIMARY KEY, page_id BIGINT NOT NULL REFERENCES dv_pages(id), \
       published BOOLEAN NOT NULL DEFAULT FALSE, deleted_at TIMESTAMP NULL)",
+    "CREATE TABLE IF NOT EXISTS dv_nodes \
+     (id BIGSERIAL PRIMARY KEY, parent_id BIGINT NULL REFERENCES dv_nodes(id), \
+      child_count BIGINT NOT NULL DEFAULT 0)",
 ];
 
 /// Serializes the suite against a Postgres it may not own.
@@ -294,7 +322,7 @@ async fn setup() -> (
         .expect("derivation state table DDL");
     conn.batch_execute(
         "TRUNCATE dv_comments, dv_posts, dv_capped_comments, dv_capped_posts, \
-         dv_revisions, dv_pages RESTART IDENTITY CASCADE; \
+         dv_revisions, dv_pages, dv_nodes RESTART IDENTITY CASCADE; \
          DELETE FROM _autumn_derivations;",
     )
     .await
@@ -396,6 +424,7 @@ const FIXTURE_TABLES: &[&str] = &[
     "dv_capped_posts",
     "dv_revisions",
     "dv_pages",
+    "dv_nodes",
 ];
 
 /// Create the fixture schema.
@@ -1423,6 +1452,77 @@ async fn ac5_reconciliation_waits_for_a_running_batch() {
         adopted.backfilled_rows, 8,
         "the adopted row carries the batch's committed progress"
     );
+}
+
+// ── Self-referential: concurrent re-parents take turns ─────────────────────
+
+/// A node under `parent`, inserted through the repository so the parent's
+/// count moves.
+async fn seed_node(repo: &PgDvNodeRepository, parent: Option<i64>) -> i64 {
+    repo.save(&NewDvNode { parent_id: parent })
+        .await
+        .expect("save node")
+        .id
+}
+
+/// Onto its own table, a re-parent locks the child row and then a parent row
+/// of the same table. Two re-parents that want each other's rows (A under B
+/// while B goes under A) would deadlock, and the repository transaction does
+/// not retry. The self-referential lock makes them take turns, so a burst of
+/// crossing re-parents finishes without an error and leaves the counts right.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_self_referential_derivation_survives_crossing_reparents() {
+    let (_guard, _pg, pool) = setup().await;
+    let repo = PgDvNodeRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    mark_all_complete(&mut conn).await;
+
+    let a = seed_node(&repo, None).await;
+    let b = seed_node(&repo, None).await;
+    // Each side moves its node under the other and back, many times, at once.
+    let workers: Vec<_> = [(a, b), (b, a)]
+        .into_iter()
+        .map(|(mine, other)| {
+            let repo = PgDvNodeRepository::with_pool_untracked(pool.clone());
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    repo.update(
+                        mine,
+                        &UpdateDvNode {
+                            parent_id: Patch::Set(Some(other)),
+                        },
+                    )
+                    .await?;
+                    repo.update(
+                        mine,
+                        &UpdateDvNode {
+                            parent_id: Patch::Set(None),
+                        },
+                    )
+                    .await?;
+                }
+                Ok::<(), autumn_web::AutumnError>(())
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker
+            .await
+            .expect("join")
+            .expect("a crossing re-parent must wait, not deadlock");
+    }
+    // Both ended unparented, so neither counts the other.
+    for node in [a, b] {
+        let count: i64 =
+            diesel::sql_query("SELECT child_count AS count FROM dv_nodes WHERE id = $1")
+                .bind::<BigInt, _>(node)
+                .get_result::<CountRow>(&mut conn)
+                .await
+                .expect("read the count")
+                .count;
+        assert_eq!(count, 0, "node {node} counts no children");
+    }
 }
 
 // ── AC6: resumable backfill ────────────────────────────────────────────────

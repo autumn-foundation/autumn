@@ -404,7 +404,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compares bytewise on both sides (`COLLATE "C"` / `COLLATE BINARY`), so a
   `NOCASE` column cannot make the SQL and Rust lowerings disagree. A
   derivation onto its own table sweeps one parent per batch, a batch the
-  database aborts to break a deadlock is retried from its checkpoint, and
+  database aborts to break a deadlock is retried from its checkpoint, every
+  mutation on such a table takes a per-table advisory lock first so crossing
+  re-parents wait rather than deadlock, and
   `derivation::resweep` re-enqueues one derivation for the settling pass a
   rolling deployment that changed a definition needs (see the guide). The
   collision check also covers the column a `#[commentable(counter_cache)]`

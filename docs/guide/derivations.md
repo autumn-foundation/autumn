@@ -382,8 +382,12 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   could form a lock cycle with a mutation that holds a child row and wants its
   parent. The backfill takes one parent per transaction for such a derivation
   regardless of `batch_size`, `recompute` does the same, and any batch the
-  database aborts to break a deadlock is retried. No test in this release
-  covers the self-referential shape end to end.
+  database aborts to break a deadlock is retried. The delta paths have the
+  same shape (a mutation locks a child row and then a parent row of the same
+  table, and two re-parents can want each other's rows), so on Postgres every
+  counter-cached mutation on such a table first takes a transaction-scoped
+  advisory lock keyed by the table and they take turns; the price is that
+  writes to that table serialize. SQLite serializes writers already.
 - **Weights are ordinary numbers, not the edges of `i64`.** The delta paths
   never overflow on their own (a difference that does not fit goes out as two
   deltas, a bulk mutation's total is netted in `i128`, and a tenant-scoped

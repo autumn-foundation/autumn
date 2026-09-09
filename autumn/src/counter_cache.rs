@@ -569,6 +569,70 @@ fn live_predicate(view: &SqlView, want_live: bool) -> String {
     format!(" AND {CHILD_ALIAS}.{deleted_at} {op}")
 }
 
+/// Take, for the rest of the transaction, the lock that serializes every
+/// counter-cached mutation on a table with a leg onto itself.
+///
+/// Onto its own table, a mutation locks a child row and then a parent row of
+/// the same table. Two such mutations can want each other's rows: one moves
+/// node A under B (holds A, waits for B) while another moves B under A (holds
+/// B, waits for A), and the database breaks the cycle by aborting one, which
+/// the generated repository transaction does not retry. Ordering the parent
+/// deltas cannot help, since each child lock is already held. So every such
+/// mutation first takes one transaction-scoped advisory lock keyed by the
+/// table, before any row lock, and two of them take turns instead of crossing.
+/// A table without a self-referential leg costs nothing here. `SQLite`
+/// serializes writers with `BEGIN IMMEDIATE` already, so it has nothing to
+/// take.
+///
+/// # Errors
+///
+/// Propagates any database error from the lock statement.
+#[doc(hidden)]
+pub async fn counter_cache_serialize_self_referential<M: 'static>(
+    conn: &mut RuntimeConnection,
+    specs: &[CounterCacheSpec<M>],
+) -> AutumnResult<()> {
+    for table in self_referential_tables(specs) {
+        serialize_table(conn, table).await?;
+    }
+    Ok(())
+}
+
+/// The tables of `specs` with a leg onto themselves, each once, in a stable
+/// order (so two mutations over several such tables take the locks in the
+/// same order).
+fn self_referential_tables<M: 'static>(specs: &[CounterCacheSpec<M>]) -> Vec<&'static str> {
+    let mut tables: Vec<&'static str> = specs
+        .iter()
+        .filter(|spec| spec.parent_table == spec.child_table)
+        .map(|spec| spec.child_table)
+        .collect();
+    tables.sort_unstable();
+    tables.dedup();
+    tables
+}
+
+#[cfg(not(feature = "sqlite"))]
+async fn serialize_table(conn: &mut RuntimeConnection, table: &str) -> AutumnResult<()> {
+    // The two-key form keeps this out of the single-key namespace the
+    // framework's migration and job locks use; the first key names this
+    // purpose, the second the table.
+    diesel::sql_query(
+        "SELECT pg_advisory_xact_lock(hashtext('autumn_counter_cache'), hashtext($1))",
+    )
+    .bind::<Text, _>(table)
+    .execute(conn)
+    .await
+    .map_err(AutumnError::from)?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[allow(clippy::unused_async, reason = "one call shape for both backends")]
+async fn serialize_table(_conn: &mut RuntimeConnection, _table: &str) -> AutumnResult<()> {
+    Ok(())
+}
+
 /// Apply `delta` to one parent's counter with a single atomic statement.
 ///
 /// This is the primitive AC5 rests on: `SET c = c + $1` is resolved by the
@@ -792,6 +856,7 @@ pub async fn counter_cache_after_insert<M: Send + Sync + 'static>(
     specs: &[CounterCacheSpec<M>],
     record: &M,
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     let mut contributions: Vec<Contribution> = Vec::with_capacity(specs.len());
     for (index, spec) in specs.iter().enumerate() {
         if !(spec.live_of)(record) {
@@ -827,6 +892,7 @@ pub async fn counter_cache_after_insert_many<M: Send + Sync + 'static>(
     specs: &[CounterCacheSpec<M>],
     records: &[M],
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     let mut contributions: Vec<Contribution> = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
         for record in records {
@@ -1035,6 +1101,7 @@ pub async fn counter_cache_after_insert_by_id<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     for index in specs_in_lock_order(specs) {
         let spec = &specs[index];
         let state = if spec.child_soft_delete {
@@ -1062,6 +1129,7 @@ pub async fn counter_cache_before_delete_by_id<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     for index in specs_in_lock_order(specs) {
         let spec = &specs[index];
         let state = if spec.child_soft_delete {
@@ -1120,6 +1188,7 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_ids: &[i64],
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     if specs.is_empty() || child_ids.is_empty() {
         return Ok(());
     }
@@ -1165,6 +1234,7 @@ pub async fn counter_cache_before_detach_many<M: 'static>(
     fk_column: &str,
     child_ids: &[i64],
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     let detached: Vec<CounterCacheSpec<M>> = specs
         .iter()
         .filter(|spec| spec.fk_column == fk_column)
@@ -1247,6 +1317,7 @@ pub async fn counter_cache_before_restore_by_id<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     for index in specs_in_lock_order(specs) {
         let spec = &specs[index];
         // A model with no `deleted_at` has no restore path; guard anyway so a
@@ -1281,6 +1352,7 @@ pub async fn counter_cache_capture_fks<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_id: i64,
 ) -> AutumnResult<Vec<CapturedContribution>> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     if specs.is_empty() {
         return Ok(Vec::new());
     }
@@ -1511,6 +1583,7 @@ pub async fn counter_cache_capture_fks_many<M: 'static>(
     specs: &[CounterCacheSpec<M>],
     child_ids: &[i64],
 ) -> AutumnResult<CapturedContributions> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     if specs.is_empty() || child_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1677,6 +1750,7 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
     existing: &[M],
     upserted: &[M],
 ) -> AutumnResult<()> {
+    counter_cache_serialize_self_referential(conn, specs).await?;
     if specs.is_empty() {
         return Ok(());
     }
@@ -2555,6 +2629,27 @@ mod tests {
         let mut out = Vec::new();
         push_diff(0, Some(captured_in(7, 3, Some("a"))), None, 1, &mut out);
         assert_eq!(out, vec![(0, 7, -3, was_a)]);
+    }
+
+    #[test]
+    fn only_a_table_with_a_leg_onto_itself_is_serialized_and_only_once() {
+        // Two ordinary legs: nothing to take.
+        assert!(self_referential_tables(&two_legs()).is_empty());
+        // Two legs onto their own table, plus one ordinary: that table once,
+        // and tables in a stable order across mutations.
+        let mut replies = spec(false);
+        replies.parent_table = "comments";
+        replies.counter_column = "reply_count";
+        let mut likes = spec(false);
+        likes.parent_table = "comments";
+        likes.counter_column = "like_count";
+        let mut users = spec(false);
+        users.child_table = "avatars";
+        users.parent_table = "avatars";
+        assert_eq!(
+            self_referential_tables(&[users, replies, spec(false), likes]),
+            vec!["avatars", "comments"]
+        );
     }
 
     #[test]
