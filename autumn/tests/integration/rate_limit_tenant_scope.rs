@@ -155,6 +155,7 @@ async fn global_limiter_principal_bucket_isolated_by_tenant() {
 // ── Per-route `#[throttle(key = "principal")]` ───────────────────────────────
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn per_route_throttle_principal_bucket_isolated_by_tenant() {
     // Isolate the process-global `#[throttle]` registry (see the identical
     // convention in throttle_route.rs, #1725): take TEST_LOCK first, then
