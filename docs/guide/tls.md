@@ -859,6 +859,13 @@ certificate for a hostname no longer registered at all.
 custom_domains = "30d"   # drop connections abandoned before DNS was ever published
 ```
 
+A registry that cannot be read at boot disables custom-domain **connections**
+as well as routing: an index that hydrated nothing cannot tell whether a
+hostname already belongs to someone, so `register` refuses with "the
+custom-domain registry has not loaded" rather than overwriting the durable
+record of whoever owns it. The deployment's own certificate keeps serving; fix
+the store and restart.
+
 ### What doctor checks
 
 | Check | What it catches |

@@ -1199,6 +1199,10 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
     )
     .await
     .unwrap();
+    registry
+        .record_verified("app.clientco.com", NOW + 1)
+        .await
+        .unwrap();
     assert!(
         registry
             .record_active_for("app.clientco.com", "tenant-b", NOW + 2, NOW + 90 * 86_400)
@@ -2124,7 +2128,22 @@ async fn a_certificate_cannot_activate_a_tenant_that_took_over_mid_order() {
     assert!(record.cert_not_after_unix.is_none());
     assert!(!h.registry.is_servable("app.clientco.com"));
 
-    // And the same call for the CURRENT owner does apply.
+    // Nor does it apply for the CURRENT owner while that record is still
+    // `pending_dns`: a re-registration has not proved its own DNS yet, and
+    // promoting it here would walk straight past the verification gate.
+    assert!(
+        !h.registry
+            .record_active_for("app.clientco.com", "tenant-b", NOW, NOW + 86_400)
+            .await
+            .unwrap(),
+        "a fresh registration must not be activated by an order it did not place"
+    );
+
+    // Once the new tenant has verified, activation applies.
+    h.registry
+        .record_verified("app.clientco.com", NOW)
+        .await
+        .unwrap();
     assert!(
         h.registry
             .record_active_for("app.clientco.com", "tenant-b", NOW, NOW + 86_400)

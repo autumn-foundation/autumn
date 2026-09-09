@@ -1627,8 +1627,9 @@ pub enum CustomDomainDns {
 pub fn check_custom_domains_config_impl(
     custom_domains: Option<&autumn_web::config::CustomDomainsConfig>,
     error: Option<&str>,
-    registered: usize,
+    registry: &CustomDomainRegistryRead,
 ) -> Option<CheckResult> {
+    let registered = registry.domains.len();
     if let Some(error) = error {
         return Some(CheckResult {
             name: "custom_domains",
@@ -1661,6 +1662,35 @@ pub fn check_custom_domains_config_impl(
             status: CheckStatus::Fail,
             detail: Some(message),
             hint: Some("Fix [server.tls.acme.custom_domains]; the server exits at boot on this"),
+        });
+    }
+    if let Some(unreadable) = registry.unreadable.as_ref() {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "the custom-domain registry cannot be read ({unreadable}); at boot this leaves \
+                 every connected domain unrouted, and no new domain can be connected until it is \
+                 fixed"
+            )),
+            hint: Some(
+                "Check the ownership and mode of [server.tls.acme.custom_domains] store_dir — the \
+                 server needs to read and write it",
+            ),
+        });
+    }
+    if !registry.skipped.is_empty() {
+        return Some(CheckResult {
+            name: "custom_domains",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{} of {} custom-domain records will not load ({}); the runtime skips them and \
+                 serves the rest, so those tenants' domains stop routing",
+                registry.skipped.len(),
+                registry.skipped.len() + registered,
+                registry.skipped.join(", ")
+            )),
+            hint: Some("Re-register the affected hostnames, or restore the records from a backup"),
         });
     }
     if registered > cd.max_domains {
@@ -1940,31 +1970,62 @@ fn resolve_addresses(host: &str) -> Vec<std::net::IpAddr> {
 /// not parse is skipped — the same treatment the runtime store gives it — so
 /// one corrupt record does not blind the check to the rest.
 #[must_use]
-pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> Vec<(String, String, String)> {
-    let Ok(entries) = std::fs::read_dir(store_dir) else {
-        return Vec::new();
+pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainRegistryRead {
+    let entries = match std::fs::read_dir(store_dir) {
+        Ok(entries) => entries,
+        // A directory that is not there yet is not a fault: nothing has been
+        // registered. One that cannot be READ is the fault the runtime hits at
+        // boot, and it must not read as "no domains".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CustomDomainRegistryRead::default();
+        }
+        Err(e) => {
+            return CustomDomainRegistryRead {
+                unreadable: Some(format!("{}: {e}", store_dir.display())),
+                ..CustomDomainRegistryRead::default()
+            };
+        }
     };
-    let mut out = Vec::new();
+    let mut read = CustomDomainRegistryRead::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        if let Ok(domain) =
-            serde_json::from_slice::<autumn_web::custom_domain::CustomDomain>(&bytes)
-        {
-            out.push((
+        match std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<autumn_web::custom_domain::CustomDomain>(&bytes)
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(domain) => read.domains.push((
                 domain.hostname,
                 domain.tenant,
                 domain.status.as_str().to_owned(),
-            ));
+            )),
+            // The runtime skips a record it cannot read and serves the rest, so
+            // doctor counts it rather than failing the run over it.
+            Err(e) => read.skipped.push(format!("{}: {e}", path.display())),
         }
     }
-    out.sort();
-    out
+    read.domains.sort();
+    read
+}
+
+/// What `autumn doctor` could read of the on-disk custom-domain registry.
+///
+/// Distinguishes the three outcomes the runtime distinguishes: a directory it
+/// could enumerate, a directory it could not (which stops `load()` and, with
+/// it, every registration), and individual records that would not parse (which
+/// the runtime skips, serving the rest).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CustomDomainRegistryRead {
+    /// `(hostname, tenant, status)` per readable record, sorted.
+    pub domains: Vec<(String, String, String)>,
+    /// Why the directory could not be enumerated, if it could not.
+    pub unreadable: Option<String>,
+    /// Records that could not be read or parsed, one message each.
+    pub skipped: Vec<String>,
 }
 
 /// Most custom domains one `doctor --online` run probes.
@@ -9055,12 +9116,12 @@ pub fn run(opts: DoctorOptions) {
                     .chain(ing.ipv6.iter().map(ToString::to_string))
                     .collect()
             });
-            let registered_count = registered.len();
+            let registry_read = registered.clone();
             tasks.push(Box::new(move || {
                 check_custom_domains_config_impl(
                     cd_cfg.as_ref(),
                     cd_error.as_deref(),
-                    registered_count,
+                    &registry_read,
                 )
                 .unwrap_or_else(|| {
                     CheckResult {
@@ -9082,6 +9143,7 @@ pub fn run(opts: DoctorOptions) {
             // AC8's "flag registered domains whose DNS no longer points at the
             // deployment". Bounded, and the bound is reported.
             if opts.online {
+                let registered = registered.domains;
                 let total = registered.len();
                 // The ingress every registered domain is graded against — the
                 // deployment's, not this CLI host's.
@@ -12524,6 +12586,22 @@ pub struct Vault {
 
     // ── Tenant custom domains (#1635) ───────────────────────────────────
 
+    /// A read of `count` healthy records, for the config check's arithmetic.
+    fn read_of(count: usize) -> CustomDomainRegistryRead {
+        CustomDomainRegistryRead {
+            domains: (0..count)
+                .map(|i| {
+                    (
+                        format!("d{i}.clientco.com"),
+                        "tenant-a".to_owned(),
+                        "active".to_owned(),
+                    )
+                })
+                .collect(),
+            ..CustomDomainRegistryRead::default()
+        }
+    }
+
     fn custom_domains_config(enabled: bool) -> autumn_web::config::CustomDomainsConfig {
         autumn_web::config::CustomDomainsConfig {
             enabled,
@@ -12535,17 +12613,20 @@ pub struct Vault {
     #[test]
     fn custom_domains_config_check_grades_the_section() {
         // Absent section: nothing to say.
-        assert!(check_custom_domains_config_impl(None, None, 0).is_none());
+        let empty = CustomDomainRegistryRead::default();
+        assert!(check_custom_domains_config_impl(None, None, &empty).is_none());
 
         // Disabled: a Pass that says so, not silence.
-        let off = check_custom_domains_config_impl(Some(&custom_domains_config(false)), None, 0)
-            .expect("a present section is always graded");
+        let off =
+            check_custom_domains_config_impl(Some(&custom_domains_config(false)), None, &empty)
+                .expect("a present section is always graded");
         assert_eq!(off.status, CheckStatus::Pass);
         assert!(off.detail.unwrap().contains("enabled = false"));
 
         // Enabled with an ingress: Pass, naming the count and the cap.
         let on =
-            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, 3).unwrap();
+            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, &read_of(3))
+                .unwrap();
         assert_eq!(on.status, CheckStatus::Pass);
         assert!(on.detail.unwrap().contains('3'));
 
@@ -12557,7 +12638,7 @@ pub struct Vault {
             ..autumn_web::config::CustomDomainsConfig::default()
         };
         assert_eq!(
-            check_custom_domains_config_impl(Some(&no_ingress), None, 0)
+            check_custom_domains_config_impl(Some(&no_ingress), None, &empty)
                 .unwrap()
                 .status,
             CheckStatus::Fail
@@ -12565,7 +12646,7 @@ pub struct Vault {
 
         // A malformed section fails rather than reading as "off".
         assert_eq!(
-            check_custom_domains_config_impl(None, Some("unknown field `ingres_hostname`"), 0)
+            check_custom_domains_config_impl(None, Some("unknown field `ingres_hostname`"), &empty)
                 .unwrap()
                 .status,
             CheckStatus::Fail
@@ -12576,7 +12657,7 @@ pub struct Vault {
         let mut capped = custom_domains_config(true);
         capped.max_domains = 2;
         assert_eq!(
-            check_custom_domains_config_impl(Some(&capped), None, 5)
+            check_custom_domains_config_impl(Some(&capped), None, &read_of(5))
                 .unwrap()
                 .status,
             CheckStatus::Warn
@@ -12700,6 +12781,56 @@ pub struct Vault {
     }
 
     #[test]
+    fn a_registry_doctor_cannot_read_is_a_failure_not_an_empty_one() {
+        // The runtime's `load()` fails on an unreadable directory, which since
+        // #1635's hydration guard also stops every new registration. Doctor
+        // reporting "0 registered, Pass" would hide exactly the condition an
+        // operator is running it to find.
+        let unreadable = CustomDomainRegistryRead {
+            unreadable: Some("/var/lib/autumn/custom-domains: permission denied".to_owned()),
+            ..CustomDomainRegistryRead::default()
+        };
+        let result =
+            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, &unreadable)
+                .unwrap();
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("permission denied"), "{detail}");
+        assert!(detail.contains("cannot be read"), "{detail}");
+
+        // A single unparseable record is a Warn, not a Fail: the runtime skips
+        // it and serves the rest.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("good.json"),
+            serde_json::json!({
+                "hostname": "app.clientco.com",
+                "tenant": "tenant-a",
+                "status": "active",
+                "failure_reason": null,
+                "registered_at_unix": 1,
+                "verified_at_unix": 1,
+                "activated_at_unix": 1,
+                "cert_not_after_unix": 2,
+                "consecutive_failures": 0,
+                "next_attempt_unix": null
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("torn.json"), "{not json").unwrap();
+        let read = read_custom_domain_registry(dir.path());
+        assert_eq!(read.domains.len(), 1, "the readable record still counts");
+        assert_eq!(read.skipped.len(), 1, "and the torn one is reported");
+        assert!(read.unreadable.is_none());
+        let partial =
+            check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, &read)
+                .unwrap();
+        assert_eq!(partial.status, CheckStatus::Warn);
+        assert!(partial.detail.unwrap().contains("will not load"));
+    }
+
+    #[test]
     fn port_80_is_required_for_custom_domains_whatever_the_deployment_uses() {
         // The deployment's own certificate may be issued over DNS-01, under
         // which a closed port 80 is merely optional. A tenant's zone is the
@@ -12800,7 +12931,12 @@ pub struct Vault {
     fn the_registry_reader_skips_unreadable_records_and_sorts() {
         let dir = tempfile::tempdir().unwrap();
         // A missing directory is empty, not an error: nothing has registered yet.
-        assert!(read_custom_domain_registry(&dir.path().join("absent")).is_empty());
+        let absent = read_custom_domain_registry(&dir.path().join("absent"));
+        assert!(absent.domains.is_empty());
+        assert!(
+            absent.unreadable.is_none(),
+            "a directory that does not exist yet is not a fault"
+        );
 
         for (file, host) in [("b.json", "b.clientco.com"), ("a.json", "a.clientco.com")] {
             std::fs::write(
@@ -12824,7 +12960,8 @@ pub struct Vault {
         std::fs::write(dir.path().join("corrupt.json"), "{not json").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), "irrelevant").unwrap();
 
-        let records = read_custom_domain_registry(dir.path());
+        let read = read_custom_domain_registry(dir.path());
+        let records = read.domains;
         assert_eq!(
             records.len(),
             2,

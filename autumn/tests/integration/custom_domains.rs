@@ -33,11 +33,21 @@ fn ingress() -> ExpectedIngress {
     }
 }
 
+/// A registry hydrated from an empty store, as the app builds one at boot:
+/// `register` refuses until a load has succeeded, so a test registry that
+/// never loaded would refuse everything.
 fn registry() -> Arc<CustomDomainRegistry> {
-    Arc::new(CustomDomainRegistry::new(
+    hydrate(CustomDomainRegistry::new(
         Arc::new(MemoryCustomDomainStore::new()),
         1000,
     ))
+}
+
+/// Load `registry` and hand it back, for the tests that build their own.
+fn hydrate(registry: CustomDomainRegistry) -> Arc<CustomDomainRegistry> {
+    let registry = Arc::new(registry);
+    futures::executor::block_on(registry.load()).expect("the test store must hydrate");
+    registry
 }
 
 /// A [`DomainIssuer`] that records every hostname it was asked to issue for,
@@ -410,7 +420,7 @@ async fn an_unregistered_sni_hostname_is_refused_without_contacting_the_ca() {
 
 #[tokio::test]
 async fn a_thousand_domains_register_and_resolve_without_per_domain_config() {
-    let registry = Arc::new(CustomDomainRegistry::new(
+    let registry = hydrate(CustomDomainRegistry::new(
         Arc::new(MemoryCustomDomainStore::new()),
         1000,
     ));
@@ -446,7 +456,7 @@ async fn a_thousand_domains_register_and_resolve_without_per_domain_config() {
 #[tokio::test]
 async fn removing_a_domain_stops_routing_serving_and_renewal() {
     let store = Arc::new(MemoryCustomDomainStore::new());
-    let registry = Arc::new(CustomDomainRegistry::new(store.clone(), 1000));
+    let registry = hydrate(CustomDomainRegistry::new(store.clone(), 1000));
     registry
         .register("app.clientco.com", "tenant-a", NOW)
         .await
@@ -559,7 +569,7 @@ mod sni {
 
     #[tokio::test]
     async fn sni_serves_the_registered_domains_certificate_and_refuses_the_rest() {
-        let registry = Arc::new(CustomDomainRegistry::new(
+        let registry = super::hydrate(CustomDomainRegistry::new(
             Arc::new(MemoryCustomDomainStore::new()),
             10,
         ));
@@ -637,7 +647,7 @@ async fn a_tenant_cannot_connect_a_hostname_the_deployment_already_owns() {
     // points it here, it verifies, issues, and from then on every request for
     // that host resolves to the ATTACKER's tenant.
     let store = Arc::new(MemoryCustomDomainStore::new());
-    let registry = Arc::new(
+    let registry = hydrate(
         CustomDomainRegistry::new(store, 1000)
             .with_reserved(["myapp.com".to_owned(), "*.myapp.com".to_owned()]),
     );
@@ -721,7 +731,7 @@ async fn a_tenant_cannot_claim_the_deployments_ingress_hostname() {
     // first tick, HTTP-01 validates, and every request to the deployment's own
     // infrastructure hostname would then route to that tenant. It is reserved
     // even when it sits outside the ACME domains and the tenancy base domain.
-    let registry = Arc::new(
+    let registry = hydrate(
         CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10).with_reserved([
             "myapp.com".to_owned(),
             "*.myapp.com".to_owned(),
@@ -759,7 +769,7 @@ async fn an_offboard_is_not_overtaken_by_an_in_flight_save() {
     // disk — which the next restart hydrates as a live domain the app already
     // offboarded.
     let store = Arc::new(MemoryCustomDomainStore::new());
-    let registry = Arc::new(CustomDomainRegistry::new(store.clone(), 10));
+    let registry = hydrate(CustomDomainRegistry::new(store.clone(), 10));
     registry.load().await.unwrap();
     registry
         .register("app.clientco.com", "tenant-a", NOW)
@@ -873,7 +883,7 @@ async fn a_registration_racing_an_offboard_of_the_same_hostname_stays_durable() 
     // offboard erase the claim while the save still landed — or, as here,
     // report success for a record the offboard was about to delete.
     let store = Arc::new(PausingDeleteStore::new());
-    let registry = Arc::new(CustomDomainRegistry::new(
+    let registry = hydrate(CustomDomainRegistry::new(
         Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
         10,
     ));
@@ -970,10 +980,10 @@ async fn a_stored_domain_the_configuration_now_reserves_never_hydrates() {
     // subdomain tenancy, so the stale record wins every request after the
     // restart.
     let store = Arc::new(MemoryCustomDomainStore::new());
-    let before = CustomDomainRegistry::new(
+    let before = hydrate(CustomDomainRegistry::new(
         Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
         10,
-    );
+    ));
     for (host, tenant) in [
         ("acme.myapp.com", "tenant-evil"),
         ("app.clientco.com", "tenant-a"),
@@ -1084,10 +1094,10 @@ async fn a_state_change_that_fails_to_persist_is_not_left_in_the_index() {
     // went on routing as `active`, and the state then vanished at the next
     // boot with nothing to explain it.
     let store = Arc::new(FailingSaveStore::default());
-    let registry = CustomDomainRegistry::new(
+    let registry = hydrate(CustomDomainRegistry::new(
         Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
         10,
-    );
+    ));
     registry
         .register("app.clientco.com", "tenant-a", NOW)
         .await
@@ -1147,7 +1157,7 @@ async fn a_registry_tenant_teardown_leaves_a_hostname_another_tenant_took_over()
     // runs. Removing it unconditionally stops routing a domain that was never
     // part of this teardown.
     let store = Arc::new(PausingDeleteStore::new());
-    let registry = Arc::new(CustomDomainRegistry::new(
+    let registry = hydrate(CustomDomainRegistry::new(
         Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
         10,
     ));
@@ -1182,4 +1192,79 @@ async fn a_registry_tenant_teardown_leaves_a_hostname_another_tenant_took_over()
         .get("b-second.clientco.com")
         .expect("the new tenant's domain must survive the old tenant's teardown");
     assert_eq!(survivor.tenant, "tenant-b");
+}
+
+// ── Codex round 13 ───────────────────────────────────────────────────────
+
+/// A store whose `load_all` fails, as a transient read error at boot does.
+#[derive(Debug, Default)]
+struct UnreadableStore {
+    inner: MemoryCustomDomainStore,
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for UnreadableStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        Box::pin(async move {
+            Err(std::io::Error::other(
+                "the registry directory is unreadable",
+            ))
+        })
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.save(domain)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.delete(hostname)
+    }
+}
+
+#[tokio::test]
+async fn a_registry_that_did_not_hydrate_refuses_to_connect_anything() {
+    // The store keys its files by a hash of the hostname, and a failed load
+    // leaves an index that knows nothing. Registering into it would report
+    // success, overwrite the record of whoever durably owns the hostname, and
+    // hand that hostname to this tenant at the next restart — a cross-tenant
+    // takeover bought with one transient read error, while the directory
+    // itself stayed writable.
+    let store = Arc::new(UnreadableStore::default());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    ));
+    assert!(registry.load().await.is_err());
+    assert!(!registry.is_hydrated());
+
+    let err = registry
+        .register("app.clientco.com", "tenant-evil", NOW)
+        .await
+        .expect_err("a registry that never loaded must refuse to connect a hostname");
+    assert!(matches!(err, RegisterError::NotReady), "{err:?}");
+    // Nothing reached the store, so the durable owner's record is untouched.
+    assert!(store.inner.load_all().await.unwrap().is_empty());
+    assert!(registry.get("app.clientco.com").is_none());
+
+    // A registry that DID load takes registrations as before.
+    let healthy = hydrate(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    assert!(
+        healthy
+            .register("app.clientco.com", "tenant-a", NOW)
+            .await
+            .is_ok()
+    );
 }

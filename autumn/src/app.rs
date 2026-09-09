@@ -9145,12 +9145,16 @@ async fn build_acme_tls_listener(
             );
             match registry.load().await {
                 Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
-                // A registry that cannot be read is not fatal: the deployment's
-                // own certificate still serves, and an app that re-registers
-                // its domains repopulates it. Serving nothing would be worse.
+                // A registry that cannot be read is not fatal to the
+                // deployment: its own certificate still serves. It IS fatal to
+                // custom domains, though — an index that hydrated nothing
+                // cannot tell whether a hostname is already owned, so
+                // `register` refuses until a load succeeds rather than
+                // overwriting the durable record of whoever holds it.
                 Err(e) => tracing::error!(
                     "failed to load the tenant custom-domain registry: {e}; connected domains will \
-                     not route until they are re-registered"
+                     not route and no new domain can be connected until this is fixed and the \
+                     process restarted"
                 ),
             }
             Some(CustomDomainBindState {

@@ -647,6 +647,9 @@ pub enum RegisterError {
     },
     /// The record could not be persisted.
     Store(String),
+    /// The registry has not hydrated from its store, so it cannot tell whether
+    /// another tenant already owns the hostname.
+    NotReady,
 }
 
 impl std::fmt::Display for RegisterError {
@@ -667,6 +670,11 @@ impl std::fmt::Display for RegisterError {
                  name the operator already serves"
             ),
             Self::Store(msg) => write!(f, "failed to persist the custom domain: {msg}"),
+            Self::NotReady => write!(
+                f,
+                "the custom-domain registry has not loaded, so a hostname cannot be connected \
+                 without risking another tenant's record; check the server log for the load error"
+            ),
         }
     }
 }
@@ -853,6 +861,15 @@ impl CustomDomainRegistry {
         }
         if let Some(pattern) = self.reserved_match(&host) {
             return Err(RegisterError::Reserved { pattern });
+        }
+        // An index that never hydrated knows nothing, and the store keys its
+        // files by a hash of the hostname: registering here would report
+        // success, overwrite the record of whoever durably owns the hostname,
+        // and hand it to this tenant at the next restart. A transient read
+        // error at boot must not cost a tenant their domain, so mutations wait
+        // for a load that succeeded.
+        if !self.is_hydrated() {
+            return Err(RegisterError::NotReady);
         }
 
         // Refuse a full registry BEFORE creating this hostname's write gate.
@@ -1143,6 +1160,19 @@ impl CustomDomainRegistry {
             .await
     }
 
+    /// Whether `record_active_for` may promote a record this order found.
+    ///
+    /// The owner alone is not enough: a tenant that offboards and re-registers
+    /// the SAME hostname while its previous order is in flight gets a fresh
+    /// `PendingDns` record, and activating that would carry it straight to
+    /// serving on DNS it has not re-proved — past the verification gate this
+    /// module exists to enforce. Every state an order can legitimately land on
+    /// (`Issuing` for a first order, `Active` for a renewal, `Verified` after a
+    /// failure reset it) is a state that has already been verified.
+    const fn is_orderable_state(status: DomainStatus) -> bool {
+        !matches!(status, DomainStatus::PendingDns)
+    }
+
     async fn activate(
         &self,
         hostname: &str,
@@ -1152,7 +1182,7 @@ impl CustomDomainRegistry {
     ) -> io::Result<bool> {
         self.mutate_if(
             hostname,
-            |d| tenant.is_none_or(|t| d.tenant == t),
+            |d| tenant.is_none_or(|t| d.tenant == t && Self::is_orderable_state(d.status)),
             |d| {
                 d.status = DomainStatus::Active;
                 if d.verified_at_unix.is_none() {
@@ -2052,6 +2082,8 @@ mod tests {
     #[tokio::test]
     async fn write_gates_are_bounded_by_the_registry_not_by_hostnames_ever_seen() {
         let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 2);
+        // `register` refuses until a load has succeeded, as it does at boot.
+        registry.load().await.unwrap();
         for host in ["a.clientco.com", "b.clientco.com"] {
             registry.register(host, "tenant-a", 0).await.unwrap();
         }
@@ -2159,6 +2191,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(FsCustomDomainStore::new(dir.path()));
         let first = CustomDomainRegistry::new(store.clone(), 10);
+        first.load().await.unwrap();
         first.register("app.clientco.com", "t1", 100).await.unwrap();
         first
             .record_active("app.clientco.com", 100, 200)
@@ -2176,6 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn re_registering_the_same_pair_is_idempotent() {
         let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
+        registry.load().await.unwrap();
         registry
             .register("app.clientco.com", "t1", 100)
             .await
@@ -2198,6 +2232,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_order_returns_to_verified_not_pending() {
         let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
+        registry.load().await.unwrap();
         registry
             .register("app.clientco.com", "t1", 100)
             .await
