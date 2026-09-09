@@ -1324,7 +1324,7 @@ async fn ac5_concurrent_reconciliations_take_turns() {
     // Stand in for a replica mid-reconciliation: the lock `ensure_derivations`
     // takes, held open in a transaction it has not committed yet.
     holder
-        .batch_execute("BEGIN; LOCK TABLE _autumn_derivations IN SHARE ROW EXCLUSIVE MODE")
+        .batch_execute("BEGIN; LOCK TABLE _autumn_derivations IN EXCLUSIVE MODE")
         .await
         .expect("hold the reconciliation lock");
 
@@ -1351,6 +1351,77 @@ async fn ac5_concurrent_reconciliations_take_turns() {
     assert!(
         enqueued.is_empty(),
         "with every row current, the second boot enqueues nothing: {enqueued:?}"
+    );
+}
+
+/// AC5: reconciliation waits for a batch that is mid-flight rather than
+/// deadlocking with it. A batch opens with `SELECT ... FOR UPDATE` on its state
+/// row (a `ROW SHARE` table lock plus the row) and later `UPDATE`s it (`ROW
+/// EXCLUSIVE`). A reconciliation lock that let the first through and blocked
+/// the second, while itself waiting on the locked row, would be a deadlock the
+/// database resolves by aborting one side; the boot would then log the failure
+/// and skip the backfill a changed definition needs.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ac5_reconciliation_waits_for_a_running_batch() {
+    use std::time::Duration;
+
+    let (_guard, _pg, pool) = setup().await;
+    let mut batch = pool.get().await.expect("conn");
+    mark_all_complete(&mut batch).await;
+    // A rename to adopt, so the reconciliation has a row to write.
+    diesel::sql_query(
+        "UPDATE _autumn_derivations SET name = 'dv_posts.legacy_name', backfilled_rows = 7 \
+         WHERE name = $1",
+    )
+    .bind::<Text, _>(COUNT_DERIVATION)
+    .execute(&mut batch)
+    .await
+    .expect("rename the row as an older binary would have spelled it");
+
+    // The batch's lock order, literally: the row first.
+    batch
+        .batch_execute(
+            "BEGIN; SELECT definition_hash FROM _autumn_derivations \
+             WHERE name = 'dv_posts.legacy_name' FOR UPDATE",
+        )
+        .await
+        .expect("hold the state row as a batch does");
+
+    let waiter_pool = pool.clone();
+    let mut waiter = tokio::spawn(async move {
+        let mut conn = waiter_pool.get().await.expect("conn");
+        ensure_derivations(&mut conn).await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut waiter)
+            .await
+            .is_err(),
+        "reconciliation must wait for the batch"
+    );
+
+    // The batch's write, then its commit: both must go through.
+    batch
+        .batch_execute(
+            "UPDATE _autumn_derivations SET backfilled_rows = 8 \
+             WHERE name = 'dv_posts.legacy_name'; COMMIT",
+        )
+        .await
+        .expect("the batch's UPDATE and COMMIT go through");
+    let enqueued = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("reconciliation proceeds once the batch commits")
+        .expect("join")
+        .expect("reconciliation is not aborted as a deadlock victim");
+    assert!(
+        enqueued.is_empty(),
+        "a rename enqueues nothing: {enqueued:?}"
+    );
+    let adopted = state_of(&mut batch, COUNT_DERIVATION).await;
+    assert_eq!(adopted.backfill_state, "complete");
+    assert_eq!(
+        adopted.backfilled_rows, 8,
+        "the adopted row carries the batch's committed progress"
     );
 }
 

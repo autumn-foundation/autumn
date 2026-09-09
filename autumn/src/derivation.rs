@@ -684,18 +684,21 @@ pub async fn ensure_derivations(conn: &mut RuntimeConnection) -> AutumnResult<Ve
 /// Exclude every other reconciliation (and writer) for the rest of the
 /// transaction.
 ///
-/// `SHARE ROW EXCLUSIVE` conflicts with itself and with every row-writing
-/// mode, so a second replica's `ensure_derivations` waits at its own lock and
-/// a backfill batch's `FOR UPDATE` waits too, while plain reads (the actuator's
-/// status) go through.
+/// `EXCLUSIVE` conflicts with every mode but `ACCESS SHARE`, so a second
+/// replica's `ensure_derivations` waits at its own lock, a backfill batch
+/// waits at its opening `FOR UPDATE`, and plain reads (the actuator's status)
+/// go through. It has to conflict with `ROW SHARE` in particular: a batch
+/// already past its `FOR UPDATE` holds that mode plus the state row, and a
+/// weaker lock here (`SHARE ROW EXCLUSIVE`) would let reconciliation in, then
+/// block it on that row while the batch's `UPDATE` blocked on this lock, a
+/// deadlock the database would resolve by aborting one of the two. With
+/// `EXCLUSIVE`, reconciliation instead waits for the batch to commit.
 #[cfg(not(feature = "sqlite"))]
 async fn lock_state_table(conn: &mut RuntimeConnection) -> AutumnResult<()> {
-    diesel::sql_query(format!(
-        "LOCK TABLE {STATE_TABLE} IN SHARE ROW EXCLUSIVE MODE"
-    ))
-    .execute(conn)
-    .await
-    .map_err(AutumnError::from)?;
+    diesel::sql_query(format!("LOCK TABLE {STATE_TABLE} IN EXCLUSIVE MODE"))
+        .execute(conn)
+        .await
+        .map_err(AutumnError::from)?;
     Ok(())
 }
 

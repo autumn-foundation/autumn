@@ -175,8 +175,10 @@ other row does and that row's own name does not claim it, has been renamed: that
 row is carried over under the new name, state and checkpoint included, so a
 rename really does cost nothing. Rows are matched by hash before names, in two
 passes, so two derivations that only swapped names both keep their state, and
-the whole reconciliation runs in one transaction holding the state table, so
-replicas booting together take turns rather than racing each other's renames. The framework then sweeps what was enqueued in a
+the whole reconciliation runs in one transaction holding the state table (an
+`EXCLUSIVE` lock on Postgres, so a batch already sweeping finishes first and
+reconciliation never deadlocks with it), so replicas booting together take
+turns rather than racing each other's renames. The framework then sweeps what was enqueued in a
 background task, a few batches per pooled connection. A sharded app reconciles and sweeps on every shard primary as
 well as on the control primary.
 
