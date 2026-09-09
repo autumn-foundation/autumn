@@ -592,8 +592,8 @@ impl std::fmt::Display for ScrubError {
                 "{} materialized view(s) read through a function this run cannot \
                  follow:\n{}\n  \
                  Refresh order is taken from the dependency graph `PostgreSQL` records, \
-                 and it records nothing about what a function whose body is a string \
-                 literal reads. Measured on `a_report -> bridge_fn() -> z_source`: \
+                 and it records nothing about what a function whose body it cannot \
+                 parse reads — a string literal, `plpgsql`, or C. Measured on `a_report -> bridge_fn() -> z_source`: \
                  `pg_depend` holds `a_report -> pg_proc(bridge_fn)` and the function \
                  holds NO relation dependency at all, so the two views sorted by name, \
                  `a_report` refreshed FIRST from a `z_source` still holding pre-scrub \
@@ -3758,10 +3758,17 @@ pub struct DatabaseFacts {
     /// `view via function` for every materialized view whose definition calls a
     /// non-system function that records no relation dependency of its own.
     ///
-    /// Such a function's body is opaque to `pg_depend` — a string literal, or
-    /// `plpgsql` — so the run cannot know whether it reads another materialized
-    /// view, and cannot order the refresh around it. A `BEGIN ATOMIC` body does
-    /// record its reads and is followed by `MV_REFRESH_CLOSURE` instead.
+    /// Opacity is read from `prosqlbody`, which holds the parsed body of a
+    /// `BEGIN ATOMIC` function and is NULL for everything else — a string
+    /// literal, `plpgsql`, or C. That is the property itself, where "records no
+    /// relation dependency" was only a proxy for it, and a wrong one: a tracked
+    /// wrapper that merely calls another tracked function records no relation of
+    /// its own, and was refused although `fn_reach` can follow it all the way to
+    /// the table. Measured — `view -> wrap_fn() -> inner_fn() -> z_source`, every
+    /// body `BEGIN ATOMIC`, refused as `via wrap_fn`.
+    ///
+    /// `prosqlbody` is `PostgreSQL` 14; this file already reads
+    /// `indnullsnotdistinct`, which is 15.
     ///
     /// Read over every relation REACHABLE from a materialized view, not only the
     /// views themselves: the walk crosses ordinary views, so a function called by
@@ -4358,9 +4365,7 @@ fn probe_database_facts(
              JOIN pg_proc p ON p.oid = fr.fn \
              JOIN pg_namespace pn ON pn.oid = p.pronamespace \
              WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND NOT EXISTS (SELECT 1 FROM pg_depend fd \
-                               WHERE fd.classid = 'pg_proc'::regclass AND fd.objid = p.oid \
-                                 AND fd.refclassid = 'pg_class'::regclass) \
+               AND p.prosqlbody IS NULL \
              ORDER BY name"
         ),
         &mut conn,

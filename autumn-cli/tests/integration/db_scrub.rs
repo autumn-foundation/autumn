@@ -2553,17 +2553,20 @@ async fn a_view_read_through_a_tracked_function_is_refreshed_in_order() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     sample_project(dir);
-    // Two tracked functions deep, so the traversal has to close over
-    // function-to-function calls: reading only `atomic_outer`'s own relation
-    // dependencies yields no edge to `z_source` at all.
+    // Two tracked functions deep, and `atomic_outer` is a PURE WRAPPER — it reads
+    // no relation of its own. That is deliberate: it makes the fixture exercise
+    // both halves at once. The traversal has to close over function-to-function
+    // calls to find `z_source` at all, and the opacity check has to read
+    // `prosqlbody` rather than "records a relation dependency", which would
+    // refuse this wrapper outright. An earlier version of this fixture gave the
+    // wrapper a `countries` read and masked the second half.
     atomic
         .batch_execute(
             "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
              CREATE FUNCTION atomic_fn() RETURNS TABLE(id int, email text) LANGUAGE sql \
                  BEGIN ATOMIC SELECT id, email FROM z_source; END; \
              CREATE FUNCTION atomic_outer() RETURNS TABLE(id int, email text) LANGUAGE sql \
-                 BEGIN ATOMIC SELECT f.id, f.email FROM atomic_fn() f \
-                     WHERE EXISTS (SELECT 1 FROM countries); END; \
+                 BEGIN ATOMIC SELECT id, email FROM atomic_fn(); END; \
              CREATE MATERIALIZED VIEW a_report AS SELECT * FROM atomic_outer();",
         )
         .await

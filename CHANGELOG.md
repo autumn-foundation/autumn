@@ -624,7 +624,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actually read `z_source` was invisible. Both are now followed to the end of the
   chain: measured, the tracked pair orders `z_source` first and ends clean, and
   the opaque one is refused as `a_report via opaque_inner` before a row is
-  written.
+  written. Opacity is read from `pg_proc.prosqlbody`, the parsed body a
+  `BEGIN ATOMIC` function has and a string-literal, `plpgsql` or C function does
+  not — the property itself, where "records no relation dependency" was a proxy
+  for it and a wrong one. A tracked wrapper that only calls another tracked
+  function records no relation of its own and was refused although the closure
+  can follow it to the table: measured on `a_report -> wrap_fn() -> inner_fn() ->
+  z_source`, refused as `via wrap_fn`, and now scrubbing with `z_source`
+  refreshed first and both views clean. (`prosqlbody` is PostgreSQL 14; the
+  probe already reads `indnullsnotdistinct`, which is 15.)
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the
