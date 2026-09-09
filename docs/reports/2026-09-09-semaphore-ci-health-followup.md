@@ -1,11 +1,10 @@
-# 🚦 Semaphore: CI health follow-up — the macOS-only hypothesis breaks, `cache_stampede` repeats, the harness is still undispatched
+# 🚦 Semaphore: CI health follow-up — a new Linux hit on live_upgrade, `cache_stampede` repeats, the harness is still undispatched
 
 Follow-up to `docs/reports/2026-09-08-semaphore-macos-contention-harness-fix.md`
 (#2627, merged) and the running investigation in
 `docs/ci-health/quarantine-ledger.md`. No fix PR — the hard gate for one still
-isn't cleared — but this pass finds two new organic hits that materially change
-the working diagnosis, and confirms the rerun harness fixed roughly a day ago
-has still never been run.
+isn't cleared — but this pass finds two new organic hits worth tracking, and
+confirms the rerun harness fixed roughly a day ago has still never been run.
 
 ## 🎯 Verdict path
 
@@ -44,21 +43,34 @@ than trusting the run-level conclusion:
   occurrence, on that PR's own new code — not part of the tracked cluster,
   logged here only so a repeat is recognized rather than rediscovered.
 - **2 hit the tracked macOS/hot-upgrade timing cluster** in
-  `docs/ci-health/quarantine-ledger.md`, and both change the picture:
+  `docs/ci-health/quarantine-ledger.md`:
 
   1. **`live_upgrade::upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`
-     — first-ever hit on a Linux runner, at a different assertion.** Run
-     34317587464 (PR #2645), job `Coverage (workspace)`, on a plain hosted
-     `ubuntu-latest` runner (confirmed via the job's own `labels`, not the
-     `heavy_runs_on`-routed `test` job). This job runs `cargo llvm-cov`,
-     which instruments the wrapped test binary — `ci.yml`'s own comment
-     notes this roughly doubles `target/`'s on-disk *size*; no wall-clock
-     runtime measurement was taken here, so the execution-time overhead is
-     unquantified, not assumed to be the same 2x. Failure: `tests/live_upgrade.rs:567` — `"the new build should
-     have served part of the load"` — a *different* assertion than the
-     3 macOS hits in the 2026-09-04 census (those failed the connection-error
-     check, ~line 551). The new build's version string never showed up in the
-     read set during the test's fixed observation window.
+     — a new hit on a Linux runner, at a different assertion than the
+     tracked macOS cluster; logged as a separate signature, not folded into
+     it.** Run 34317587464 (PR #2645), job `Coverage (workspace)`, on a
+     plain hosted `ubuntu-latest` runner (confirmed via the job's own
+     `labels`). `coverage` is not exempt from the self-hosted-routing
+     mechanism — it uses `heavy_runs_on` directly, same as `test-docker`,
+     `trybuild`, and `loom` — but `runner-routing.yml` hard-codes
+     `heavy_runs_on` to plain `ubuntu-latest` for every `pull_request` event
+     by construction (self-hosted routing is structurally restricted to
+     base-repo-controlled events, since a PR's workflow file comes from a
+     fork-controlled head). So this run got a standard runner, but
+     "standard GitHub-hosted" is not itself a measured contention level —
+     neither this runner's nor any of the 3 macOS runners' actual load is
+     known. This job runs `cargo llvm-cov`, which instruments the wrapped
+     test binary — `ci.yml`'s own comment notes this roughly doubles
+     `target/`'s on-disk *size*; no wall-clock runtime measurement was
+     taken here, so any execution-time overhead is unquantified. Failure:
+     `tests/live_upgrade.rs:567` — `"the new build should have served part
+     of the load"` — a *different* assertion than the 3 macOS hits in the
+     2026-09-04 census (those failed the connection-error check, ~line
+     551). The new build's version string never showed up in the read set
+     during the test's fixed observation window. Same test file, but a
+     different assertion can mean a different bug — this is not treated as
+     evidence against the macOS-specific framing of the existing 3-hit
+     cluster, only as a fourth, separate data point.
   2. **`cache_stampede::swr_serves_stale_and_refreshes_in_background` —
      second hit, exact same assertion as the first.** Run 34297324354
      (branch `dependabot/cargo/validator-0.21.0`), job `Test (macos-latest)`:
@@ -70,27 +82,24 @@ than trusting the run-level conclusion:
 
 ## 🔍 Diagnosis
 
-**Verdict not rendered — but the working hypothesis needs revision.** Since
-2026-09-04 this cluster has been framed as "macOS runner contention,"
-justifying a macOS-only rerun harness. Finding 1 above is a hit on a
-completely different, non-contended, plain hosted Linux runner running under
-`cargo llvm-cov` instrumentation — instrumentation known to add overhead
-(confirmed for disk size; execution-time overhead not measured here) —
-against a `macos-latest` baseline whose own contention level is likewise
-unmeasured. The two hits no longer share "macOS" as their common factor,
-which is enough to say the macOS-only framing doesn't fit the evidence, but
-not enough to name what the actual shared factor is (slower/instrumented
-execution generically is a plausible candidate, not a confirmed one). That
-in turn points at a candidate mechanism in the *test's* design — a
-fixed-duration load-generation window racing a real process cutover — that
-sufficiently slow or loaded execution of *some* kind can lose, rather than a
-macOS-specific scheduling quirk. This remains a hypothesis, not a confirmed
-root cause: distinguishing "test's window is too tight under load" from "a
-genuine narrow race in the hot-upgrade handoff that slow execution exposes
-more reliably" — and actually quantifying what "slow" means here — is
-exactly what the still-undispatched rerun campaign exists to do, and per
-Semaphore's law 3 (product/test verdict rendered first) neither the test's
-tolerance nor the product code should change until that campaign renders it.
+**Verdict not rendered for either signature.** `cache_stampede`'s diagnosis
+is unchanged (still open, still undiagnosed) — its second hit raises its
+priority, not its certainty: two hits of the identical assertion six days
+apart is stronger evidence than the ledger's previous "one occurrence,
+suggestive" framing credited it, but still short of a rerun campaign.
+
+The new `live_upgrade` Linux hit does **not** disprove or replace the
+macOS-specific framing of the existing 3-hit cluster — that would overreach
+from a single data point on a *different assertion*, where "different
+assertion" plausibly means "different bug," not "same bug, different OS."
+What it does establish: a hot-upgrade timing sensitivity has now been
+observed on more than one platform, in more than one form, which is reason
+enough to widen the still-undispatched rerun campaign beyond macOS-only
+rather than to unify the two signatures' diagnoses. Only a rerun campaign
+that reproduces the *same* signature on both platforms would justify
+treating them as one mechanism. Per Semaphore's law 3 (product/test verdict
+rendered first), neither signature's test tolerance nor the product code
+should change until that campaign renders a verdict.
 
 `cache_stampede`'s second hit doesn't change its diagnosis (still open, still
 undiagnosed), but it does change its priority: two hits of the identical
@@ -103,9 +112,10 @@ None. Per the hard gate, a fix requires a named mechanism plus baseline/after
 rerun measurement from a real campaign — this pass has two more organic data
 points, not a campaign. What ships instead:
 
-- **`docs/ci-health/quarantine-ledger.md` updated** with both new hits, their
-  exact signatures, and the revised (no-longer-macOS-only) framing for
-  `live_upgrade`.
+- **`docs/ci-health/quarantine-ledger.md` updated** with both new hits and
+  their exact signatures, keeping `live_upgrade`'s new Linux/line-567
+  signature tracked separately from its existing macOS/connection-error
+  cluster rather than merged into one diagnosis.
 - **Recommendation for a human**: dispatch
   `manual-macos-contention-check.yml` now. It has been fixed and idle for
   about a day (the *workflow file* has existed, mostly broken, for four days
@@ -113,8 +123,9 @@ points, not a campaign. What ships instead:
   #2627 merged) while the organic sample keeps accumulating one data point
   at a time (now 4 hits across the tracked corpus: 3 macOS + 1 Linux, plus a
   second `cache_stampede` repeat) — the exact scenario the harness exists to
-  short-circuit. Given finding 1 above, the campaign should not stay
-  macOS-only forever: a companion rerun of the `Coverage (workspace)` job
+  short-circuit. Given the new Linux hit, the campaign should not stay
+  macOS-only forever even though the two signatures aren't yet shown to
+  share a mechanism: a companion rerun of the `Coverage (workspace)` job
   shape (or several samples of the plain `cargo test --workspace` under
   `cargo llvm-cov` wrapping, with wall-clock timing actually measured this
   time) would test the "slow execution, not the OS" hypothesis directly.

@@ -87,43 +87,52 @@ without also filling in the intake form above.
 - **Observed**: 3/17 eligible `macos-latest` CI executions (14 confirmed, 3
   unresolved — see the 2026-09-04 census for the derivation), 0/16-17 on
   `ubuntu-latest`, organic PR-traffic sample, 2026-09-03/04.
-- **New organic hit, 2026-09-09, breaks the macOS-only working hypothesis**:
-  a 4th hit, but for the first time on a **Linux** runner and at a
-  **different assertion**. Run 34317587464 (PR #2645, branch
-  `claude/wizardly-wright-i1jsql`), job `Coverage (workspace)` (a plain
-  hosted `ubuntu-latest` runner, confirmed via the job's own `labels` —
-  `heavy_runs_on` only overrides the `test` job's `ubuntu-latest` matrix
-  leg, and this run drew a standard hosted runner, not a contended
-  self-hosted one), step "Generate coverage (workspace catch-all)" — this
-  is `cargo llvm-cov`, which instruments every test binary it wraps. This
-  job's own inline comment notes that roughly doubles `target/`'s on-disk
-  *size*; no wall-clock runtime measurement was taken here, so treat the
-  execution-time overhead as real but unquantified, not as a confirmed 2x.
-  Failure is at `tests/live_upgrade.rs:567`: `"the new build should have
-  served part of the load"` — the v2 binary never appeared in the observed
-  read set — not the connection-error assertion (line ~551) the 3 macOS
-  hits above were classified against. Full run: 5 passed, 1 failed in the
-  `hot-upgrade` package.
-  - **Why this matters**: the working hypothesis driving the (still
-    undispatched, see below) macOS-only rerun campaign was "macOS runner
-    contention" specifically. A hit on a plain Linux hosted runner, on a
-    different assertion, under a job running instrumented (and therefore
-    at least somewhat slower, though not measured here) binaries, points
-    instead at a candidate more general mechanism: *some* sufficiently
-    slow/contended execution can shrink the effective window the test's
-    fixed-duration load generator has to observe the new build actually
-    taking over traffic, before the test's own timeout fires and it
-    asserts on what it saw. That is a hypothesis about the *test's* design
-    (a wall-clock load window racing a real cutover, at the mercy of
-    whatever the host's actual perf happens to be for that run), not
-    proof either way, and "slow execution" itself is not yet quantified —
-    still not confirmed, but the "macOS-specific" framing this entry has
-    carried since 2026-09-04 no longer fits the evidence.
-- **Verdict not yet rendered**: whether this is runner-class/contention
-  timing dependence in the test's load-window design (now: on *any* slow or
-  loaded runner, not only macOS) or a genuine narrow race in the hot-upgrade
-  handoff (`autumn/src/upgrade.rs`) that slow execution merely exposes more
-  reliably.
+- **New organic hit, 2026-09-09, on a Linux runner at a different assertion
+  — tracked as a separate signature, not yet unified with the macOS
+  cluster**: run 34317587464 (PR #2645, branch `claude/wizardly-wright-i1jsql`),
+  job `Coverage (workspace)`, a plain hosted `ubuntu-latest` runner
+  (confirmed via the job's own `labels`). This run got a plain hosted
+  runner not because `coverage` is exempt from `heavy_runs_on` — it isn't;
+  `coverage`, like `test-docker`, `trybuild`, and `loom`, uses
+  `runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}` directly and
+  unconditionally (only the `test` job's matrix wraps it in a
+  `matrix.os == 'ubuntu-latest' && ... || matrix.os` ternary) — but because
+  `runner-routing.yml` hard-codes `heavy_runs_on` to `["ubuntu-latest"]` for
+  every `pull_request` event, by construction (self-hosted routing is
+  structurally restricted to base-repo-controlled events — push,
+  workflow_dispatch, schedule — since a PR's workflow file comes from a
+  fork-controlled head). So this run drew a standard runner, not a
+  contended self-hosted one, but "standard GitHub-hosted" is not itself a
+  measured contention level — the actual load on either this runner or any
+  of the 3 macOS runners in the earlier hits is unmeasured in both
+  directions. Step "Generate coverage (workspace catch-all)" runs `cargo
+  llvm-cov`, which instruments every test binary it wraps; this job's own
+  inline comment notes that roughly doubles `target/`'s on-disk *size* —
+  no wall-clock runtime measurement was taken here, so treat any execution
+  overhead as unquantified, not a confirmed slowdown. Failure is at
+  `tests/live_upgrade.rs:567`: `"the new build should have served part of
+  the load"` — the v2 binary never appeared in the observed read set —
+  which is a **different assertion** than the connection-error check
+  (line ~551) the 3 macOS hits above were classified against. Full run: 5
+  passed, 1 failed in the `hot-upgrade` package.
+  - **Why this is logged here but not folded into the macOS cluster's
+    diagnosis**: same test file, but a different assertion can mean a
+    different bug entirely — "the new build never took over" and "requests
+    saw connection errors during cutover" are not obviously the same
+    failure mode just because they share a test. Do not treat this as
+    disproving, or as evidence against, the macOS-specific framing of the
+    *existing* 3-hit cluster; treat it as a fourth, separate data point
+    that argues the still-undispatched rerun campaign (below) should not
+    stay macOS-only, since a hot-upgrade timing sensitivity may exist on
+    more than one platform — without yet claiming those sensitivities
+    share a mechanism. Only a rerun campaign that reproduces the *same*
+    signature on both platforms would justify unifying them.
+- **Verdict not yet rendered**: whether the line-567 signature is a
+  runner-class/contention timing dependence in the test's load-window
+  design, a genuine narrow race in the hot-upgrade handoff
+  (`autumn/src/upgrade.rs`) that slow execution merely exposes more
+  reliably, or an unrelated failure mode from the 3 macOS connection-error
+  hits entirely. All three remain open.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
