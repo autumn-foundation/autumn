@@ -576,10 +576,14 @@ pub enum LifecycleSubcommands {
     /// can reach some terminal state. Exits non-zero when any lifecycle is
     /// unsound (CI-friendly).
     ///
+    /// The `#[lifecycle]` macro proves the same properties at compile time. This
+    /// pass adds a whole-workspace report without a build, and the
+    /// machine-readable artifact behind `--format json`.
+    ///
     /// Note: this is a best-effort source scanner — it resolves bare, qualified,
     /// and same-module-aliased `#[lifecycle]` attributes, but not cross-file or
-    /// glob-reexport aliases (tracked in #1925). The compile-time typestate is
-    /// the by-construction guarantee.
+    /// glob-reexport aliases (tracked in #1925). A lifecycle it skips is still
+    /// proven by the compiler.
     Check {
         /// Project root to scan (defaults to the current directory).
         #[arg(value_name = "PATH", default_value = ".")]
@@ -1754,14 +1758,15 @@ enum Commands {
     },
 
     /// Verify the soundness of `#[lifecycle]` state machines and render their
-    /// lifecycle diagrams at build time.
+    /// lifecycle diagrams.
     ///
-    /// The `#[lifecycle]` macro proves that transition endpoints are real
-    /// variants and that only declared edges are callable. `autumn lifecycle
-    /// check` closes the remaining gap by verifying the *shape* of the
-    /// reachability graph: every referenced state exists, every state is
-    /// reachable from the initial state, and every reachable non-terminal state
-    /// can reach some terminal. Exits non-zero when any lifecycle is unsound.
+    /// The `#[lifecycle]` macro proves the same properties at compile time:
+    /// every referenced state exists, a terminal has no exit, no edge is
+    /// declared twice, every state is reachable from the initial state, and
+    /// every reachable non-terminal state can reach some terminal. `autumn lifecycle check` re-proves them by
+    /// scanning source, which reports a whole workspace without a build and
+    /// emits a machine-readable artifact. Exits non-zero when any lifecycle is
+    /// unsound.
     ///
     /// # Examples
     ///

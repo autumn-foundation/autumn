@@ -269,6 +269,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **macros:** **Breaking:** `#[lifecycle]` now proves the *whole* declared graph
+  sound at compile time, not just its endpoints (issue #1675). Two faults are
+  new compile errors: a state not reachable from the initial state, and a
+  reachable non-terminal state with no declared path to a terminal. Each
+  diagnostic names the variant and is spanned at it, so `cargo` underlines the
+  state to fix, and every offending state is reported in declaration order. A
+  state that is both unreachable and exit-less is reported once, as unreachable
+  — reachability is the root cause. Previously these two whole-graph properties
+  were proven only by `autumn lifecycle check`, which scans source and skips a
+  `#[lifecycle]` reached through a cross-file alias or a glob re-export (#1925),
+  so an unsound lifecycle spelled that way compiled and shipped. A lifecycle the
+  scanner reports sound is unaffected; one it skipped may now fail the build.
+  See the [migration
+  guide](docs/migrations/next.md#lifecycle-an-unsound-lifecycle-graph-is-now-a-compile-error).
+
 - **web:** `AutumnError`'s `Display` now appends the failing fields to a
   validation error, sorted by field name — `Validation failed: email: Must be
   a valid email address` instead of the bare `Validation failed` (issue

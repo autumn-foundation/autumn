@@ -1887,6 +1887,10 @@ pub fn t(input: TokenStream) -> TokenStream {
 ///    `Machine<S>` exposes a consuming `to_<target>` method *only* for declared
 ///    edges — firing an undeclared transition does not compile.
 ///
+/// The declared graph is proven structurally sound at compile time: a state
+/// unreachable from `initial`, or a reachable non-terminal state with no path
+/// to a terminal, is a compile error naming the variant.
+///
 /// # Example
 ///
 /// ```ignore

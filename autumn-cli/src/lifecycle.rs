@@ -1,25 +1,29 @@
-//! `autumn lifecycle check` / `autumn lifecycle diagram` — a build-time
-//! soundness gate and lifecycle-diagram generator for `#[lifecycle]` state
+//! `autumn lifecycle check` / `autumn lifecycle diagram` — a project-wide
+//! soundness report and lifecycle-diagram generator for `#[lifecycle]` state
 //! machines (issue #1675).
 //!
-//! The `#[lifecycle]` proc-macro in `autumn-macros` already proves, *at compile
-//! time*, that every declared `initial`/`terminal`/transition endpoint is a real
-//! enum variant and that only declared edges are callable. What the type system
-//! cannot see is the *shape* of the reachability graph the declared edges form.
-//! This pass closes that gap with four structural checks over the declared
-//! states and transitions of every `#[lifecycle]` enum in a project's source:
+//! The `#[lifecycle]` proc-macro in `autumn-macros` proves all of this *at
+//! compile time* already: endpoint existence, terminals with no exit, only
+//! declared edges callable, and — since #1675 — reachability and dead-ends over
+//! the whole declared graph. This pass re-proves the structural properties by
+//! scanning source, which adds two things a build cannot: one report over a
+//! whole workspace without compiling it, and a machine-readable artifact to
+//! archive or diff in CI. It runs five checks over the declared states and
+//! transitions of every `#[lifecycle]` enum in a project's source:
 //!
 //! - **existence** — `initial`, each terminal, and every transition endpoint
-//!   must be a declared variant. (Redundant with the macro's by-construction
-//!   guarantee for code that compiles, but this scanner parses source directly
-//!   and must stand on its own.)
+//!   must be a declared variant. (The macro proves this too, but this scanner
+//!   parses source directly and must stand on its own.)
 //! - **reachability** — every declared state must be reachable from `initial`
 //!   by following transitions (BFS from `initial`).
 //! - **dead-end** — every reachable, non-terminal state must be able to reach
 //!   *some* terminal state (reverse BFS from the terminals).
 //! - **terminal-source** — a declared terminal state must have no outgoing
-//!   transition (a "movable terminal" is not actually terminal). This mirrors
-//!   the by-construction compile error the macro emits.
+//!   transition (a "movable terminal" is not actually terminal).
+//! - **duplicate-transition** — the same edge must not be declared twice.
+//!
+//! All five mirror compile errors the macro emits. Keep the two in step: this
+//! pass must never report sound a graph the macro rejects.
 //!
 //! Like `autumn a11y verify` and `autumn i18n check`, this is a source scanner:
 //! it parses each `.rs` file with `syn` and inspects enums carrying a
@@ -39,11 +43,9 @@
 //! escape-hatch scanner, this is a best-effort textual pass, not a resolver: it
 //! cannot follow an alias introduced in *another* file, nor one laundered
 //! through a glob re-export (`pub use ...::lifecycle;` then `use crate::x::*;`).
-//! Such an invocation is skipped by the scanner. This is a soundness gap only
-//! for the scanner's reachability report, never for the state machine itself:
-//! the `#[lifecycle]` typestate makes every undeclared transition a *compile
-//! error*, so the by-construction guarantee holds however the macro is spelled —
-//! this pass only adds the reachability-shape checks the type system cannot see.
+//! Such an invocation is skipped by the scanner. That costs only its line in the
+//! report and the artifact, never soundness: the macro proves the same four
+//! properties at compile time however the attribute is spelled.
 //!
 //! `lifecycle check` prints a human-readable report (or `--format json`) and
 //! exits non-zero when any lifecycle is unsound — the CI gate. `lifecycle diagram`
@@ -289,6 +291,8 @@ pub enum ViolationKind {
     /// A declared terminal state has an outgoing transition (a "movable
     /// terminal"): a terminal state must have no outgoing edges.
     TerminalSource,
+    /// The same `From -> To` edge is declared twice.
+    DuplicateTransition,
 }
 
 impl ViolationKind {
@@ -298,6 +302,7 @@ impl ViolationKind {
             Self::Reachability => "reachability",
             Self::DeadEnd => "dead-end",
             Self::TerminalSource => "terminal-source",
+            Self::DuplicateTransition => "duplicate-transition",
         }
     }
 }
@@ -357,7 +362,7 @@ impl Report {
     }
 }
 
-/// Run the three structural checks over one lifecycle, producing its report.
+/// Run the structural checks over one lifecycle, producing its report.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
@@ -414,6 +419,20 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
                 kind: ViolationKind::TerminalSource,
                 states: vec![from.clone()],
                 message: format!("terminal state '{from}' has an outgoing transition to '{to}'"),
+            });
+        }
+    }
+
+    // DUPLICATE-TRANSITION — the same edge declared twice. Not a graph property:
+    // it mirrors the macro's compile error, so this pass never reports sound a
+    // lifecycle the build rejects.
+    let mut seen_edges: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for (from, to) in &wf.transitions {
+        if !seen_edges.insert((from.as_str(), to.as_str())) {
+            violations.push(Violation {
+                kind: ViolationKind::DuplicateTransition,
+                states: vec![from.clone(), to.clone()],
+                message: format!("transition '{from} -> {to}' is declared more than once"),
             });
         }
     }

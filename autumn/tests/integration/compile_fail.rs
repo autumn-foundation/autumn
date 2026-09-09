@@ -72,6 +72,12 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/lifecycle_start_only_on_initial.rs");
     t.compile_fail("tests/compile-fail/lifecycle_unknown_initial.rs");
     t.compile_fail("tests/compile-fail/lifecycle_terminal_source.rs");
+    // #1675 AC3: the whole-graph proofs the typestate cannot see. Registered
+    // from the shared list so the guide-drift test below cannot pin a fixture
+    // that no longer runs.
+    for (fixture, _) in LIFECYCLE_GRAPH_FIXTURES {
+        t.compile_fail(format!("tests/compile-fail/{fixture}.rs"));
+    }
 
     // Ledgered entities (issue #1699). A ledgered entity's history is the
     // record: every way of erasing or redacting it is refused at the repository
@@ -332,6 +338,21 @@ fn query_budget_compile_fail_tests() {
 /// whether it needs the `db` feature. Shared with the guide-drift test below,
 /// so the guide's violation matrix is pinned against the fixtures that
 /// actually run rather than a hand-maintained copy of the list (#1691).
+/// The `#[lifecycle]` whole-graph fixtures (#1675), paired with the diagnostic
+/// substring the guide must reproduce. Shared between the trybuild registration
+/// above and the guide-drift test below, so the guide is pinned against
+/// fixtures that actually run rather than a hand-maintained copy of the list.
+const LIFECYCLE_GRAPH_FIXTURES: &[(&str, &str)] = &[
+    (
+        "lifecycle_unreachable_state",
+        "state `Refunded` is unreachable",
+    ),
+    (
+        "lifecycle_dead_end_state",
+        "state `OnHold` is a non-terminal dead-end",
+    ),
+];
+
 const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     // A write to a model the grant never names.
     ("agent_authority_unlisted_write", false),
@@ -728,6 +749,87 @@ fn query_budget_guide_matches_the_real_diagnostics() {
         assert!(
             root.join(fixture).exists(),
             "guide references a fixture that does not exist: {fixture}"
+        );
+    }
+}
+
+/// The lifecycle guide is where a developer lands when a lifecycle stops the
+/// build, so the diagnostics it prints have to be the ones the macro actually
+/// emits (#1675). Pins the guide against both whole-graph goldens, and against
+/// the fixtures the suite registers.
+#[test]
+fn lifecycle_guide_matches_the_real_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let guide = std::fs::read_to_string(root.join("docs/guide/lifecycle.md"))
+        .expect("docs/guide/lifecycle.md exists");
+
+    // Collapse whitespace so the markdown block and the rustc gutter compare
+    // equal however each is wrapped.
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guide_flat = collapse(&guide);
+
+    for (fixture, needle) in LIFECYCLE_GRAPH_FIXTURES {
+        let golden = format!("{fixture}.stderr");
+        let golden_text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/compile-fail")
+                .join(&golden),
+        )
+        .unwrap_or_else(|_| panic!("{golden} exists"));
+        let golden_flat = collapse(&golden_text);
+
+        let start = golden_flat
+            .find(*needle)
+            .unwrap_or_else(|| panic!("{golden} carries the diagnostic"));
+        let end = golden_flat
+            .find("--> tests/compile-fail")
+            .unwrap_or_else(|| panic!("{golden} carries a span line"));
+        let message = golden_flat[start..end].trim_end();
+
+        assert!(
+            guide_flat.contains(message),
+            "docs/guide/lifecycle.md has drifted from the real diagnostic.\n\n\
+             expected the guide to contain:\n{message}\n\n\
+             Regenerate with TRYBUILD=overwrite and copy the message into the guide."
+        );
+    }
+
+    // Every fixture the guide points at must exist, and the guide must quote the
+    // span line as well as the message — a fixture edit that shifts a line
+    // number has to reach the page.
+    let fixtures = LIFECYCLE_GRAPH_FIXTURES
+        .iter()
+        .map(|(fixture, _)| format!("autumn/tests/compile-fail/{fixture}.rs"))
+        .chain(std::iter::once(
+            "autumn/tests/compile-pass/lifecycle_valid.rs".to_owned(),
+        ));
+    for fixture in fixtures {
+        assert!(
+            guide.contains(&fixture),
+            "guide no longer references {fixture}"
+        );
+        assert!(
+            root.join(&fixture).exists(),
+            "guide references a fixture that does not exist: {fixture}"
+        );
+    }
+    for (fixture, _) in LIFECYCLE_GRAPH_FIXTURES {
+        let golden = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/compile-fail")
+                .join(format!("{fixture}.stderr")),
+        )
+        .expect("golden exists");
+        let span = golden
+            .lines()
+            .find(|l| l.trim_start().starts_with("--> "))
+            .expect("golden carries a span line")
+            .trim();
+        assert!(
+            guide_flat.contains(&collapse(span)),
+            "docs/guide/lifecycle.md is missing {fixture}'s span line:\n  {span}"
         );
     }
 }

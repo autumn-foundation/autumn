@@ -200,7 +200,9 @@ let next_states: Vec<&str> = Order::__AUTUMN_SM_STATUS_TRANSITIONS
   hyphens). Use underscores: `in_progress`, not `in-progress`.
 - The transition graph is not validated for reachability or completeness. Dead
   states and disconnected subgraphs compile fine — they just can never be
-  reached at runtime.
+  reached at runtime. For a graph proven sound at compile time, declare the
+  states with [`#[lifecycle]`](lifecycle.md) and bind the field to it with
+  `#[state_machine(lifecycle = <Enum>)]`.
 
 ---
 

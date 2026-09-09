@@ -1647,6 +1647,10 @@ pub use autumn_macros::edge_routes;
 /// `snake_case`) whose `Machine<S>` only exposes `to_<target>` methods for
 /// declared edges — firing an undeclared transition is a compile error.
 ///
+/// The declared graph is proven structurally sound at compile time: a state
+/// unreachable from `initial`, or a reachable non-terminal state with no path
+/// to a terminal, is a compile error naming the variant.
+///
 /// # Examples
 ///
 /// ```rust,ignore

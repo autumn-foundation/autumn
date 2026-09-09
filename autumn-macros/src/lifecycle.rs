@@ -12,6 +12,11 @@
 //!    consuming `to_<target>` methods exist *only* for declared edges — firing
 //!    an undeclared transition simply does not compile.
 //!
+//! It also proves the declared graph structurally sound (issue #1675): an
+//! unreachable state, or a reachable non-terminal state with no path to a
+//! terminal, is a compile error naming the variant. See
+//! [`check_graph_soundness`].
+//!
 //! ```ignore
 //! use autumn_web::lifecycle;
 //!
@@ -27,6 +32,8 @@
 //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 //! pub enum ArticleState { Draft, Published, Archived }
 //! ```
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -291,6 +298,10 @@ fn expand(item_enum: &ItemEnum, args: &LifecycleArgs) -> syn::Result<TokenStream
         seen_edges.push(key);
     }
 
+    // Endpoints are all real variants by here, so the graph checks can trust
+    // every name they walk.
+    check_graph_soundness(item_enum, args, &variants)?;
+
     let metadata = build_metadata(item_enum, args, &variants);
     let module = build_module(item_enum, args);
 
@@ -298,6 +309,104 @@ fn expand(item_enum: &ItemEnum, args: &LifecycleArgs) -> syn::Result<TokenStream
         #metadata
         #module
     })
+}
+
+/// Prove the declared graph structurally sound, at compile time (issue #1675).
+///
+/// Two properties the typestate itself cannot see, because each generated
+/// transition method only knows its own edge:
+///
+/// - **reachability** — every variant is reachable from `initial`. An
+///   unreachable variant is a state no machine can ever enter.
+/// - **liveness** — every reachable non-terminal variant reaches some terminal.
+///   A state that reaches none is a dead-end: a machine that enters it is stuck.
+///
+/// Every violation is reported, one diagnostic per offending variant, spanned at
+/// the variant so `cargo` underlines it. An unreachable variant is reported only
+/// as unreachable, never also as a dead-end: reachability is the root cause.
+///
+/// `autumn lifecycle check` runs the same two proofs over source. Keep the two
+/// in step.
+fn check_graph_soundness(
+    item_enum: &ItemEnum,
+    args: &LifecycleArgs,
+    variants: &[&Ident],
+) -> syn::Result<()> {
+    let initial = args.initial.to_string();
+    let terminals: BTreeSet<String> = args.terminals.iter().map(ToString::to_string).collect();
+    let edges: Vec<(String, String)> = args
+        .transitions
+        .iter()
+        .map(|tr| (tr.from.to_string(), tr.to.to_string()))
+        .collect();
+
+    let mut forward: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut reverse: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (from, to) in &edges {
+        forward.entry(from).or_default().push(to);
+        reverse.entry(to).or_default().push(from);
+    }
+
+    let reachable = walk(std::iter::once(initial.as_str()), &forward);
+    // Reverse-walk from the terminals: the states that reach one.
+    let live = walk(terminals.iter().map(String::as_str), &reverse);
+
+    let mut error: Option<syn::Error> = None;
+    let mut push = |err: syn::Error| match &mut error {
+        Some(acc) => acc.combine(err),
+        none => *none = Some(err),
+    };
+
+    // Declaration order, so the diagnostics read top-to-bottom with the enum.
+    for variant in variants {
+        let name = variant.to_string();
+        if !reachable.contains(name.as_str()) {
+            push(syn::Error::new_spanned(
+                variant,
+                format!(
+                    "state `{name}` is unreachable from initial state `{initial}` of lifecycle \
+                     `{}` — add a transition into it, or remove the variant",
+                    item_enum.ident
+                ),
+            ));
+        // The terminal test is redundant — terminals seed `live` — but it states
+        // the rule a reader needs: a terminal is never a dead-end.
+        } else if !terminals.contains(&name) && !live.contains(name.as_str()) {
+            push(syn::Error::new_spanned(
+                variant,
+                format!(
+                    "state `{name}` is a non-terminal dead-end of lifecycle `{}`: no declared \
+                     transition path reaches a terminal state — add an outgoing transition, or \
+                     declare it terminal",
+                    item_enum.ident
+                ),
+            ));
+        }
+    }
+
+    error.map_or(Ok(()), Err)
+}
+
+/// Breadth-first set of nodes reachable from any of `starts` over `adj`.
+fn walk<'a>(
+    starts: impl Iterator<Item = &'a str>,
+    adj: &BTreeMap<&'a str, Vec<&'a str>>,
+) -> BTreeSet<&'a str> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    for start in starts {
+        if seen.insert(start) {
+            queue.push_back(start);
+        }
+    }
+    while let Some(node) = queue.pop_front() {
+        for &next in adj.get(node).into_iter().flatten() {
+            if seen.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    seen
 }
 
 /// Build the metadata `impl` block on the enum: the four consts plus
@@ -711,6 +820,199 @@ mod tests {
         .unwrap();
         let err = expand(&item_enum, &args).unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    // ── Graph soundness (issue #1675, AC3) ───────────────────────────────
+    //
+    // The macro proves the *shape* of the declared graph, not just its
+    // endpoints: every variant is reachable from `initial`, and every reachable
+    // non-terminal reaches some terminal. `autumn lifecycle check` runs the
+    // same two proofs over source; these keep the two in step.
+
+    fn expand_err(attr: TokenStream, item: TokenStream) -> Vec<String> {
+        let item_enum: ItemEnum = syn::parse2(item).expect("enum should parse");
+        let args: LifecycleArgs = syn::parse2(attr).expect("args should parse");
+        let err = expand(&item_enum, &args).expect_err("expansion should fail");
+        err.into_iter().map(|e| e.to_string()).collect()
+    }
+
+    #[test]
+    fn unreachable_state_is_a_compile_error_naming_the_state() {
+        let errs = expand_err(
+            quote! {
+                initial = Draft,
+                terminal(Archived),
+                transitions(Draft -> Archived)
+            },
+            quote! {
+                pub enum ArticleState { Draft, Published, Archived }
+            },
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("`Published`"), "{errs:?}");
+        assert!(errs[0].contains("unreachable"), "{errs:?}");
+        assert!(errs[0].contains("`Draft`"), "{errs:?}");
+    }
+
+    #[test]
+    fn every_unreachable_state_is_reported_in_declaration_order() {
+        let errs = expand_err(
+            quote! {
+                initial = Draft,
+                terminal(Archived),
+                transitions(Draft -> Archived)
+            },
+            quote! {
+                pub enum ArticleState { Draft, Review, Published, Archived }
+            },
+        );
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs[0].contains("`Review`"), "{errs:?}");
+        assert!(errs[1].contains("`Published`"), "{errs:?}");
+    }
+
+    #[test]
+    fn non_terminal_dead_end_is_a_compile_error_naming_the_state() {
+        let errs = expand_err(
+            quote! {
+                initial = Draft,
+                terminal(Archived),
+                transitions(
+                    Draft -> Published,
+                    Draft -> Archived,
+                )
+            },
+            quote! {
+                pub enum ArticleState { Draft, Published, Archived }
+            },
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("`Published`"), "{errs:?}");
+        assert!(errs[0].contains("dead-end"), "{errs:?}");
+    }
+
+    #[test]
+    fn a_cycle_that_never_reaches_a_terminal_is_a_dead_end() {
+        // Review <-> Revise spins forever: neither can reach `Archived`.
+        let errs = expand_err(
+            quote! {
+                initial = Draft,
+                terminal(Archived),
+                transitions(
+                    Draft -> Review,
+                    Review -> Revise,
+                    Revise -> Review,
+                    Draft -> Archived,
+                )
+            },
+            quote! {
+                pub enum ArticleState { Draft, Review, Revise, Archived }
+            },
+        );
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs[0].contains("`Review`"), "{errs:?}");
+        assert!(errs[1].contains("`Revise`"), "{errs:?}");
+    }
+
+    #[test]
+    fn an_unreachable_state_is_not_also_reported_as_a_dead_end() {
+        // `Stuck` is unreachable *and* exit-less. Only the root cause is
+        // reported, so the fix list stays one line per broken state.
+        let errs = expand_err(
+            quote! {
+                initial = Draft,
+                terminal(Archived),
+                transitions(
+                    Draft -> Archived,
+                    Orphan -> Stuck,
+                )
+            },
+            quote! {
+                pub enum ArticleState { Draft, Orphan, Stuck, Archived }
+            },
+        );
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs.iter().all(|e| e.contains("unreachable")), "{errs:?}");
+    }
+
+    #[test]
+    fn unreachable_and_dead_end_are_reported_together_in_declaration_order() {
+        // `Draft` is reachable but leads nowhere; `Review` and `Archived` are
+        // orphans. Both kinds accumulate into one error list.
+        let errs = expand_err(
+            quote! {
+                initial = Draft,
+                terminal(Archived),
+                transitions(Review -> Archived)
+            },
+            quote! {
+                pub enum ArticleState { Draft, Review, Archived }
+            },
+        );
+        assert_eq!(errs.len(), 3, "{errs:?}");
+        assert!(
+            errs[0].contains("`Draft`") && errs[0].contains("dead-end"),
+            "{errs:?}"
+        );
+        assert!(
+            errs[1].contains("`Review`") && errs[1].contains("unreachable"),
+            "{errs:?}"
+        );
+        assert!(
+            errs[2].contains("`Archived`") && errs[2].contains("unreachable"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_self_loop_is_not_a_way_out() {
+        // `Review -> Review` gives `Review` an outgoing edge, but no path to a
+        // terminal.
+        let errs = expand_err(
+            quote! {
+                initial = Draft,
+                terminal(Archived),
+                transitions(
+                    Draft -> Review,
+                    Review -> Review,
+                    Draft -> Archived,
+                )
+            },
+            quote! {
+                pub enum ArticleState { Draft, Review, Archived }
+            },
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("`Review`") && errs[0].contains("dead-end"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_cycle_back_to_an_earlier_state_stays_sound() {
+        // `Published -> Draft` is a legal loop: both still reach `Archived`.
+        let out = expand_ok(sample_attr(), sample_enum());
+        assert!(out.contains("pub mod article_state"), "{out}");
+    }
+
+    #[test]
+    fn a_branch_to_a_second_terminal_stays_sound() {
+        let out = expand_ok(
+            quote! {
+                initial = Draft,
+                terminal(Archived, Rejected),
+                transitions(
+                    Draft -> Published,
+                    Draft -> Rejected,
+                    Published -> Archived,
+                )
+            },
+            quote! {
+                pub enum ArticleState { Draft, Published, Archived, Rejected }
+            },
+        );
+        assert!(out.contains("pub mod article_state"), "{out}");
     }
 
     fn parse_args_err(attr: TokenStream) -> String {
