@@ -2861,6 +2861,7 @@ fn classify_and_apply(
             plan,
             &purges,
             &facts.materialized_views,
+            &facts.all_materialized_views,
             sampling.as_ref(),
             label,
         )
@@ -2877,7 +2878,7 @@ fn classify_and_apply(
                 label.as_str(),
                 sampling,
                 purged_tables(&purges),
-                facts.materialized_views.clone(),
+                facts.all_materialized_views.clone(),
                 sampled.size_before,
             ));
         }
@@ -3376,6 +3377,16 @@ pub struct DatabaseFacts {
     /// Materialized views, in dependency order (sources before dependents), so
     /// refreshing them in sequence never re-derives from stale data.
     pub materialized_views: Vec<String>,
+    /// EVERY materialized view in `public`, enumerated flat.
+    ///
+    /// The ordered list above is built by a recursive walk that stops at a depth
+    /// cap, so a view past it is absent from that list — and the size report
+    /// measures over this set. Measuring the ordered list instead let the report
+    /// announce a laptop-sized result while an unmeasured view still held the
+    /// disk. A view that is not refreshed still occupies its heap, so honest
+    /// measurement enumerates them all; refresh ORDER is a separate question and
+    /// keeps its own list.
+    pub all_materialized_views: Vec<String>,
     /// Non-system schemas other than `public` that hold base tables. The whole
     /// classification universe is `public`-only, so these are refused.
     pub other_schemas: BTreeSet<String>,
@@ -3929,6 +3940,16 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
+    // Flat, uncapped, and deliberately not the recursive walk above: the size
+    // report measures over this, and a view the walk's depth cap dropped still
+    // occupies its heap.
+    let all_materialized_views = names(
+        "SELECT rel.relname AS name FROM pg_class rel \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE rel.relkind = 'm' ORDER BY rel.relname",
+        &mut conn,
+    )?;
+
     // ── Framework-owned tables (read from pg_class, not information_schema,
     //    which hides tables the connecting role has no privilege on) ─────────
     let wanted = probe_table_names(config)
@@ -3984,6 +4005,7 @@ fn probe_database_facts(
         replication_role,
         delete_triggered_tables,
         materialized_views,
+        all_materialized_views,
         other_schemas,
         framework_tables,
         public_columns,
@@ -4707,6 +4729,7 @@ fn execute(
     plan: &ScrubPlan,
     purges: &[(String, String)],
     materialized_views: &[String],
+    all_materialized_views: &[String],
     sampling: Option<&sample::SamplePlan>,
     label: &str,
 ) -> Result<Applied, ScrubError> {
@@ -4765,7 +4788,11 @@ fn execute(
             outcome = Some(sample::apply(
                 conn,
                 sampling,
-                &also_measured(&purged_tables(purges), materialized_views),
+                // The uncapped list: refresh ORDER comes from the walk, but a
+                // view the walk's depth cap dropped still holds its heap, and
+                // measuring only the ordered subset is what let the report
+                // announce a size a large unmeasured view contradicted.
+                &also_measured(&purged_tables(purges), all_materialized_views),
             )?);
         }
         // The deferred purges, now that the sample has emptied what referenced

@@ -940,12 +940,18 @@ fn partition_verdict(
     roles: &BTreeMap<String, SampleRole>,
     edge: &ForeignKeyConstraint,
 ) -> PartitionVerdict {
+    // `[framework] purge` empties the child's whole tree exactly as
+    // `never_include` does, so the same reasoning applies — and here it is not
+    // merely symmetry. A framework table cannot be named in `[sample]` at all
+    // (that is its own refusal), so refusing this edge left the operator with
+    // NO configuration remedy while recommending one: measured, a partitioned
+    // `autumn_jobs` with a leaf-local key to `countries` was refused with
+    // "drop the table with `never_include`", and adding it there was refused in
+    // turn with "framework-owned rows are emptied with `[framework] purge`".
     let excluded_leaf = |table: &String| {
-        inputs
-            .partitions
-            .get(table)
-            .and_then(|root| roles.get(root))
-            .is_some_and(|role| *role == SampleRole::NeverInclude)
+        inputs.partitions.get(table).is_some_and(|root| {
+            roles.get(root) == Some(&SampleRole::NeverInclude) || inputs.purged.contains(root)
+        })
     };
     if excluded_leaf(&edge.child_table) {
         return PartitionVerdict::Ignore;

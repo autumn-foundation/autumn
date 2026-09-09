@@ -494,6 +494,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it selected, so a script that skipped them left the view's heap holding the
   pre-scrub rows — measured against a view over `users.email`, the base table
   finished with 0 original addresses and the view still held all 200.
+  The size report measures over EVERY materialized view in `public`, enumerated
+  flat, rather than over the dependency-ordered list the refresh uses: that list
+  comes from a recursive walk with a depth cap, and a view past it would be left
+  out of both sides of the ratio while still holding its heap. Refresh order and
+  measurement are now separate questions with separate lists.
+  A partition leaf whose top-level parent is emptied by `[framework] purge` is
+  treated like one under `never_include` — its outgoing foreign key is ignored
+  rather than refused. Purging the parent removes every leaf row before the
+  sample runs, so nothing can dangle, and refusing it left NO remedy: measured, a
+  partitioned `autumn_jobs` with a leaf-local key to `countries` was refused with
+  "drop the table with `never_include`", and naming a framework table there is
+  itself refused with "framework-owned rows are emptied with `[framework]
+  purge`". The purge-order deferral the excluded-leaf path already computes is
+  applied unchanged.
   Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and
