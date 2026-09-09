@@ -2727,6 +2727,33 @@ pub fn run_pending_shard_framework_migrations(
     }
 }
 
+/// Apply the framework migration sets a `SQLite` database requires.
+///
+/// These are the `SQLite` variants of the version-history, commit-hook queue
+/// and derivation-state tables, the same three
+/// [`run_pending_shard_framework_migrations`] applies to a Postgres shard.
+/// The Postgres control-plane schema (`FRAMEWORK_MIGRATIONS`) has no `SQLite`
+/// variant and is never applied here. This is what gives `autumn migrate` an
+/// apply path for these tables on a `sqlite://` target when startup
+/// auto-migration is off; without it the boot only reports them pending and
+/// a `#[derivation]` reconciliation fails on the missing state table.
+///
+/// # Errors
+///
+/// Returns an error if the connection cannot be established or a migration
+/// fails; the same errors as [`run_pending_sqlite`].
+#[cfg(feature = "sqlite")]
+pub fn run_pending_sqlite_framework_migrations(
+    database_url: &str,
+) -> Result<MigrationResult, MigrationError> {
+    let mut applied: Vec<String> = Vec::new();
+    for set in shard_framework_migration_sets() {
+        let result = run_pending_sqlite(database_url, EmbeddedMigrationsRef(set))?;
+        applied.extend(result.applied);
+    }
+    Ok(MigrationResult { applied })
+}
+
 /// Names of pending shard-required framework migrations (version-history,
 /// commit-hook queue and derivation state) on `database_url`.
 ///
@@ -3075,6 +3102,46 @@ mod tests {
                 "`{required}` must reach the control target through `autumn migrate`: {names:?}"
             );
         }
+    }
+
+    /// `autumn migrate` on a `sqlite://` target applies the `SQLite` variants
+    /// of the shard-required sets, the derivation state table included, and
+    /// a second run applies nothing.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_sqlite_framework_sets_apply_through_the_cli_path() {
+        let path = std::env::temp_dir().join(format!(
+            "autumn-sqlite-framework-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let url = format!("sqlite://{}", path.display());
+        let first = run_pending_sqlite_framework_migrations(&url).expect("first apply");
+        assert!(
+            first
+                .applied
+                .iter()
+                .any(|version| version == "20260907101530"),
+            "the derivation state table is applied: {:?}",
+            first.applied
+        );
+        assert!(
+            first
+                .applied
+                .iter()
+                .any(|version| version == "20260526000000"),
+            "the other shard-required tables come along: {:?}",
+            first.applied
+        );
+        let second = run_pending_sqlite_framework_migrations(&url).expect("second apply");
+        assert!(
+            second.applied.is_empty(),
+            "idempotent: {:?}",
+            second.applied
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(feature = "db")]

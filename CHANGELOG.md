@@ -389,9 +389,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adopts its old state row, finished backfill included, matched by hash before
   name so two derivations that swapped names both keep theirs); the framework-owned
   `_autumn_derivations` state table ships in the framework migration set (so
-  `autumn migrate` creates it on the control database) and as a standalone
-  set the runtime applies when a derivation is registered (on every shard
-  primary too).
+  `autumn migrate` creates it on the control database, and on a `sqlite://`
+  target applies the SQLite variants of the shard-required sets, which it had
+  skipped) and as a standalone set the runtime applies when a derivation is
+  registered (on every shard primary too).
   Each batch locks its state row, so replicas take turns on one sweep.
   `GET /actuator/derivations` (sensitive-gated) reports each derivation's
   hashes, backfill state, checkpoint and current drift (capped at

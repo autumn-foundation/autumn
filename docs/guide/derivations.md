@@ -123,10 +123,11 @@ ALTER TABLE posts ADD COLUMN visible_score BIGINT NOT NULL DEFAULT 0;
 
 The state table is the framework's. `_autumn_derivations` ships in the
 framework migration set, so `autumn migrate` creates it on the control database
-like every other framework table, and the runtime folds the same migration in
-as a standalone set (on every shard target too) whenever the binary registers
-at least one `#[derivation]`. An application with no derivation gets no boot
-work: the table sits empty.
+like every other framework table (on a `sqlite://` target it applies the SQLite
+variant with the other shard-required tables), and the runtime folds the same
+migration in as a standalone set (on every shard target too) whenever the
+binary registers at least one `#[derivation]`. An application with no
+derivation gets no boot work: the table sits empty.
 
 ## What is maintained, and when
 
