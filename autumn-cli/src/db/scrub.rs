@@ -3767,8 +3767,13 @@ pub struct DatabaseFacts {
     /// the table. Measured — `view -> wrap_fn() -> inner_fn() -> z_source`, every
     /// body `BEGIN ATOMIC`, refused as `via wrap_fn`.
     ///
-    /// `prosqlbody` is `PostgreSQL` 14; this file already reads
-    /// `indnullsnotdistinct`, which is 15.
+    /// `prosqlbody` is `PostgreSQL` 14, so it is probed for with
+    /// `has_catalog_column` like every other version-specific catalog fact
+    /// here. Reading it unguarded broke every scrub on an older server with
+    /// `column p.prosqlbody does not exist` — the testcontainer default is
+    /// `postgres:11-alpine`. On a server without it the answer is "every
+    /// function reached from a view", not "none": before 14 no SQL body is
+    /// parsed into the catalog, so none of them can be followed.
     ///
     /// Read over every relation REACHABLE from a materialized view, not only the
     /// views themselves: the walk crosses ordinary views, so a function called by
@@ -4348,6 +4353,20 @@ fn probe_database_facts(
     // predicate skipped it, `a_report` refreshed first from a stale `z_source`,
     // and the run reported success with all 200 original addresses still in
     // `a_report`.
+    //
+    // `pg_proc.prosqlbody` holds the PARSED body of a `BEGIN ATOMIC` function
+    // and is NULL for a string literal, `plpgsql` or C — the property itself
+    // rather than a shadow of it. It arrived in PostgreSQL 14 along with
+    // `BEGIN ATOMIC`, so it is probed for like every other version-specific
+    // catalog fact in this file. On an older server the answer is not
+    // "unknown", it is "every one of them": before 14 no SQL body is parsed
+    // into the catalog at all, so no function reached from a view can be
+    // followed, and each one is untraceable by construction.
+    let opaque_body = if has_catalog_column(&mut conn, "pg_proc", "prosqlbody")? {
+        "p.prosqlbody IS NULL"
+    } else {
+        "true"
+    };
     let untraceable_view_functions = names(
         &format!(
             "{MV_REFRESH_CLOSURE}, node AS ( \
@@ -4365,7 +4384,7 @@ fn probe_database_facts(
              JOIN pg_proc p ON p.oid = fr.fn \
              JOIN pg_namespace pn ON pn.oid = p.pronamespace \
              WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema') \
-               AND p.prosqlbody IS NULL \
+               AND {opaque_body} \
              ORDER BY name"
         ),
         &mut conn,

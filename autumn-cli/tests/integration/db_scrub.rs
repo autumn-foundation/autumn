@@ -322,6 +322,32 @@ async fn start_postgres() -> (
     (container, host, port)
 }
 
+/// Same, on a server new enough to have `BEGIN ATOMIC` function bodies.
+///
+/// The module default above is `postgres:11-alpine`, and it stays that way on
+/// purpose: it is the oldest server the scrub claims to run on, so every test
+/// that does not need a newer feature keeps proving that claim. `BEGIN ATOMIC`
+/// and the `pg_proc.prosqlbody` column that records it are both PostgreSQL 14,
+/// so the two tests about following a tracked function through the catalog
+/// cannot be written against 11 — the fixture itself is a syntax error there.
+async fn start_postgres_with_atomic_bodies() -> (
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    String,
+    u16,
+) {
+    use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("failed to start Postgres testcontainer — is Docker running?");
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    (container, host, port)
+}
+
 // ─── AC #6: the round trip ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2443,7 +2469,7 @@ async fn a_view_reached_through_an_ordinary_view_is_refreshed_in_dependency_orde
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_view_read_through_an_untracked_function_is_refused() {
-    let (_pg, host, port) = start_postgres().await;
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let admin = connect(&format!("{base}/postgres")).await;
     let opaque = seed_sample_fixture(&admin, &base, "fn_opaque").await;
@@ -2546,7 +2572,7 @@ async fn a_view_read_through_an_untracked_function_is_refused() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_view_read_through_a_tracked_function_is_refreshed_in_order() {
-    let (_pg, host, port) = start_postgres().await;
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let admin = connect(&format!("{base}/postgres")).await;
     let atomic = seed_sample_fixture(&admin, &base, "fn_atomic").await;
