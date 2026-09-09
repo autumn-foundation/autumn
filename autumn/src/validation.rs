@@ -425,6 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_ext_failure_exposes_field_details() {
+        // #2587: a non-HTTP caller reads the field map off the error.
+        #[derive(validator::Validate)]
+        struct Form {
+            #[validate(email(message = "Must be a valid email address"))]
+            email: String,
+        }
+
+        let Err(err) = Form {
+            email: "not-an-email".into(),
+        }
+        .validate() else {
+            panic!("invalid email is rejected");
+        };
+
+        let details = err.details().expect("validation error carries details");
+        assert_eq!(
+            details["email"],
+            ["Must be a valid email address".to_owned()]
+        );
+        assert_eq!(err.code(), "autumn.validation_failed");
+        assert_eq!(
+            err.to_string(),
+            "Validation failed: email: Must be a valid email address"
+        );
+    }
+
+    #[test]
     fn validation_errors_to_map_fallback_message() {
         let mut errors = validator::ValidationErrors::new();
         // Create an error with no custom message
@@ -489,6 +517,37 @@ mod tests {
         assert!(
             (&MaybeValidate(&good)).autumn_maybe_validate().is_ok(),
             "valid input must pass"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::needless_borrow, unused_imports)]
+    fn maybe_validate_survives_an_extra_borrow() {
+        // #2586: the repository insert path holds its payload as `&New*`. An
+        // extra borrow makes `T` a reference type, which reaches the validating
+        // arm only through `validator`'s blanket `impl<T: Validate> Validate
+        // for &T`. Both forms must validate — if that blanket impl ever goes,
+        // the wrapped-reference form silently starts accepting everything, and
+        // this is what catches it.
+        use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
+
+        #[derive(validator::Validate)]
+        struct HasRules {
+            #[validate(length(min = 5))]
+            name: String,
+        }
+
+        let owned = HasRules {
+            name: "ab".to_string(),
+        };
+        let payload: &HasRules = &owned;
+        assert!(
+            (&MaybeValidate(payload)).autumn_maybe_validate().is_err(),
+            "the emitted form must reach the validating branch"
+        );
+        assert!(
+            (&MaybeValidate(&payload)).autumn_maybe_validate().is_err(),
+            "a wrapped `&&New*` must not fall through to the no-op arm"
         );
     }
 

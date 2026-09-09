@@ -19,9 +19,10 @@ use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
 use crate::schema::{
-    apply_serde_rename_all_rule, emit_schema_fn_body, emit_schema_fn_body_ext,
-    field_is_translatable, field_serde_serialize_rename, has_attr, is_option_type,
-    serde_rename_all_serialize_rule, type_name_str,
+    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
+    field_has_skip_serializing_if, field_is_translatable, field_serde_serialize_rename, has_attr,
+    is_option_type, serde_bare_word, serde_rename_all_serialize_rule, serde_valued_key,
+    type_name_str,
 };
 
 /// Parsed `#[model(...)]` attribute arguments.
@@ -1499,7 +1500,7 @@ fn emit_association_items(
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
                             .filter(#filter_col.eq_any(__keys))
-                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select())
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -1566,7 +1567,7 @@ fn emit_association_items(
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
                             .filter(#target_table::#fk_ident.eq_any(__keys))
-                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select())
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -1712,7 +1713,7 @@ fn emit_association_items(
                                     )
                                     .select((
                                         #join_mod_ident::#join_table_ident::#fk_ident,
-                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select(),
+                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select(),
                                     ))
                                     .load::<(i64, #target)>(&mut *conn)
                                     .await
@@ -4207,6 +4208,11 @@ fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
         "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
         "Decimal" => Some(quote! { ::autumn_web::fake::decimal() }),
         "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
+        // The SQLite newtypes (issue #1924) wrap exactly those values. Without
+        // these arms every faked row falls back to `Default` — one shared nil
+        // UUID, which collides on a `:unique` column the first time twice.
+        "SqliteDecimal" => Some(quote! { ::autumn_web::fake::decimal().into() }),
+        "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
         // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
         // `FixedOffset`) fall through to Default to avoid a type mismatch.
@@ -4374,7 +4380,7 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
                 step: ::core::option::Option::Some(::std::string::String::from("1")),
             }
         },
-        "f32" | "f64" | "Decimal" | "BigDecimal" => quote! {
+        "f32" | "f64" | "Decimal" | "BigDecimal" | "SqliteDecimal" => quote! {
             ::autumn_web::form::FieldControl::Number {
                 step: ::core::option::Option::Some(::std::string::String::from("any")),
             }
@@ -7455,7 +7461,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     // Compute schema bodies for OpenApiSchema impls.
-    // all_fields is Vec<&Field>; emit_schema_fn_body expects &[&&Field].
+    // all_fields is Vec<&Field>; the schema emitters expect &[&&Field].
     // Thread the container `#[serde(rename_all)]` rule so the advertised schema
     // property names match the wire names the (de)serialized struct uses.
     let schema_rename_all_rule = serde_rename_all_serialize_rule(outer_attrs);
@@ -7464,18 +7470,218 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // #1654: a classified column has no `Serialize` impl, so it can never appear
     // in a JSON body. Advertising it in the read schema would document a property
     // no response can carry. The write schemas keep it: a client still *sets* it.
+    //
+    // #802: the same is true of a field hidden from JSON — `#[private]`, or
+    // `#[encrypted]` without `admin_visible`. Those get `skip_serializing`
+    // injected below, so a response never carries them either. This filter did
+    // not matter while the read schema went unregistered and every model
+    // resolved to an opaque placeholder; now that `#[model]` advertises itself,
+    // omitting it would mark always-absent fields `required` (a strict client
+    // fails to deserialize every response) and publish the names of private and
+    // encrypted columns in the contract. Write schemas keep them: they are only
+    // skipped on the way OUT, and a client still sets them.
+    // An explicit `#[serde(skip)]` / `#[serde(skip_serializing)]` the author
+    // wrote is exactly as absent from a response as the two cases above, and
+    // `field_already_skips_serialization` is the predicate that already knows
+    // it — consult it rather than re-deriving the answer.
     let serializable_field_refs: Vec<&&Field> = all_field_refs
         .iter()
-        .filter(|f| !field_is_classified(f))
+        .filter(|f| {
+            !field_is_classified(f)
+                && !field_hidden_from_json(f)
+                && !field_already_skips_serialization(f)
+        })
         .copied()
         .collect();
-    let query_struct_schema_body =
-        emit_schema_fn_body(&serializable_field_refs, false, schema_rename_all_rule);
-    let new_struct_schema_body =
-        emit_schema_fn_body(&fields_for_new, false, schema_rename_all_rule);
+    // `skip_serializing_if` is the third member of the omission family, after
+    // the unconditional `skip` / `skip_serializing` filtered above. It differs
+    // in kind: the field DOES appear in some responses, so the property stays —
+    // it just cannot be `required`, because a response that trips the predicate
+    // omits it and a strict client would reject that response.
+    //
+    // Sound HERE and only here, because this schema describes a RESPONSE: the
+    // generated repository API takes `New*` / `Update*` as its request bodies,
+    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
+    // — the same type may be a `Json<T>` request — so it refuses the shape
+    // instead, since `skip_serializing_if` governs serialization alone and
+    // serde still rejects a request that omits the field.
+    let query_struct_schema_body = emit_schema_fn_body_full(
+        &serializable_field_refs,
+        false,
+        &[],
+        schema_rename_all_rule,
+        &|f: &Field| field_has_skip_serializing_if(f),
+    );
+    // Whether a container `#[serde(...)]` re-shapes what the QUERY struct
+    // serializes to, in which case the field-by-field schema above describes a
+    // response the server never sends and must not be registered.
+    //
+    // Direction matters, and only the serialize side does: this schema describes
+    // a RESPONSE (the generated API takes `New*` / `Update*` as request bodies).
+    // So:
+    //   * `transparent`     — writes the inner value, not an object     → skip
+    //   * `into = "X"`      — Serialize converts to X and writes X's shape → skip
+    //   * `tag = "t"`       — adds a tag field to the output            → skip
+    //   * `from` / `try_from` — DESERIALIZE-side only; serialization is
+    //                         unaffected, so the response shape is still these
+    //                         fields                                    → keep
+    //   * split `rename_all` — the read schema already takes the serialize
+    //                         side, which is the side a response uses   → keep
+    //
+    // Declining registration rather than raising a compile error: `#[model]` is
+    // a core macro, and refusing to compile an app that legitimately uses
+    // `#[serde(into = ...)]` would be a breaking change out of proportion to the
+    // problem. Falling back to the opaque placeholder restores the pre-#802
+    // behaviour for exactly these models, which is honest rather than wrong —
+    // and `autumn openapi export` names every placeholder it emits, so the
+    // author is told rather than left guessing.
+    //
+    // The same question has to be asked of the FIELDS, not just the container:
+    // a field-level attribute re-shapes one property where a container one
+    // re-shapes the whole object, but either way the emitted schema stops
+    // describing the response. Only fields that actually reach the schema are
+    // consulted — `serializable_field_refs`, not every field — because an
+    // adapter on a field the response never carries cannot misdescribe it.
+    //
+    //   * `flatten`          — serde merges this field's keys into the parent
+    //                          object while the emitter publishes it as a
+    //                          nested property                        → skip
+    //   * `with = "m"`       — sets both directions; the serialize half can
+    //                          write any shape (an `i64` as a string, say),
+    //                          so the Rust type no longer describes it → skip
+    //   * `serialize_with`   — the serialize half alone, same reason    → skip
+    //   * `deserialize_with` — DESERIALIZE-side only; the response is still
+    //                          the Rust type                            → keep
+    let query_field_reshaped = serializable_field_refs.iter().any(|f| {
+        serde_bare_word(&f.attrs, &["flatten"]).is_some()
+            || serde_valued_key(&f.attrs, &["with", "serialize_with"]).is_some()
+    });
+    let query_struct_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
+        || serde_valued_key(outer_attrs, &["into", "tag"]).is_some()
+        || query_field_reshaped;
+    let query_schema_descriptor = if query_struct_reshaped {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DerivedSchemaDescriptor {
+                    name: stringify!(#name),
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+                }
+            }
+        }
+    };
+
+    // `NewModel` carries `#[serde(default)]` on every non-`Option` `bool` (see
+    // the `bool_default` wiring in the struct emitter), so a POST body may omit
+    // one and get `false`. Requiredness has to follow that, not the Rust type,
+    // or a generated client is forced to send a value the server does not need.
+    // RAW identifiers, not the model's serde names. The `New*` / `Update*`
+    // structs deliberately do not inherit `#[serde(rename_all)]` or a field
+    // `#[serde(rename)]` — pinned by `form_for_derive.rs` — so a body is decoded
+    // under the bare Rust identifiers. Advertising the model's renamed keys
+    // would make every generated POST/PUT fail with a missing-field error.
+    let new_struct_schema_body = emit_schema_fn_body_named(
+        &fields_for_new,
+        false,
+        &[],
+        None,
+        &|f: &Field| !is_option_type(&f.ty) && type_name_str(&f.ty) == "bool",
+        true,
+        // `NewModel` fields are plain `T`, not `Patch<T>` — nothing to widen.
+        false,
+    );
+    // A `NewModel` datetime field carries the datetime-local-tolerant
+    // deserializer this macro injects itself (`datetime_local_serde_attr`, wired
+    // in at the `new_fields` construction above). That adapter accepts BOTH RFC
+    // 3339 and the offsetless shape `<input type="datetime-local">` posts, while
+    // this schema is built from the original field type and `scalar_json_schema`
+    // labels every `DateTime` `format: date-time` — whose RFC 3339 production
+    // requires an offset. A strict validator therefore rejects a create body the
+    // generated POST handler accepts.
+    //
+    // Widened to the union rather than split by direction: every value a
+    // response emits is RFC 3339, which is inside the union, so one schema stays
+    // honest for both sides. That is the same reasoning as the `Patch<T>`
+    // nullability widening, and is what distinguishes this from the two
+    // direction-blind cases in #2607, where the correct request and response
+    // schemas genuinely disagree and no single document can serve both.
+    //
+    // The predicate is `datetime_local_serde_attr` itself, not a re-derivation of
+    // "is this a datetime": the schema must describe exactly the fields that
+    // actually receive the adapter, or the two drift.
+    //
+    // Nullability is carried alongside the name and re-applied below.
+    // `datetime_local_serde_attr` accepts `Option<DateTime<..>>` too (it unwraps
+    // the `Option` before matching), so this widening reaches optional datetime
+    // columns as well — and replacing the property wholesale would DISCARD the
+    // `oneOf [.., null]` branch the emitter put there, while the generated
+    // deserializer still accepts an explicit `null`. A string-only schema would
+    // then reject a valid create payload.
+    let datetime_local_properties: Vec<(String, bool)> = fields_for_new
+        .iter()
+        .filter(|f| datetime_local_serde_attr(&f.ty).is_some())
+        .filter_map(|f| {
+            // `raw_field_names: true` above, so the property is the bare ident.
+            let raw = f.ident.as_ref()?.to_string();
+            let name = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
+            Some((name, is_option_type(&f.ty)))
+        })
+        .collect();
+    let datetime_local_property_names: Vec<&String> =
+        datetime_local_properties.iter().map(|(n, _)| n).collect();
+    let datetime_local_property_nullable: Vec<bool> =
+        datetime_local_properties.iter().map(|(_, n)| *n).collect();
+    let new_struct_schema_body = if datetime_local_property_names.is_empty() {
+        new_struct_schema_body
+    } else {
+        quote! {{
+            let mut __autumn_new_schema = { #new_struct_schema_body };
+            if let Some(__autumn_props) = __autumn_new_schema
+                .get_mut("properties")
+                .and_then(|__p| __p.as_object_mut())
+            {
+                for (__autumn_name, __autumn_nullable) in [
+                    #((#datetime_local_property_names, #datetime_local_property_nullable)),*
+                ] {
+                    if let Some(__autumn_prop) = __autumn_props.get_mut(__autumn_name) {
+                        let __autumn_widened = ::autumn_web::reexports::serde_json::json!({
+                            "type": "string",
+                            "description": "RFC 3339, or an offsetless local datetime \
+                                            (YYYY-MM-DDTHH:MM[:SS[.f]]) as posted by an \
+                                            HTML `datetime-local` control.",
+                        });
+                        // An optional column keeps its null branch: the adapter
+                        // unwraps the `Option` but the deserializer still takes
+                        // an explicit `null`.
+                        *__autumn_prop = if __autumn_nullable {
+                            ::autumn_web::reexports::serde_json::json!({
+                                "oneOf": [__autumn_widened, { "type": "null" }]
+                            })
+                        } else {
+                            __autumn_widened
+                        };
+                    }
+                }
+            }
+            __autumn_new_schema
+        }}
+    };
+    // Every mutable field of `UpdateModel` is declared `Patch<T>`, and `null`
+    // is a MEANINGFUL value on both sides of the wire for one: `Deserialize`
+    // maps `null` to `Patch::Clear` ("unset this column"), and `Serialize`
+    // writes `null` for both `Unchanged` and `Clear`. Describing the property
+    // as a plain, non-nullable `T` is therefore wrong in both directions — a
+    // validator rejects a legitimate clear request, and rejects a response that
+    // serializes an `UpdateModel` with any field left unchanged. Widen each to
+    // `oneOf [T, null]`, the same shape `Option<T>` already emits.
+    //
+    // The lock-version column passed as `extra` is NOT a `Patch<T>` (see the
+    // `update_fields` construction above) and stays required and non-nullable.
     let update_struct_schema_body = {
         let extra: &[&&Field] = lock_version_field.as_slice();
-        emit_schema_fn_body_ext(&fields_for_new, true, extra, schema_rename_all_rule)
+        emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true, true)
     };
     let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
         .iter()
@@ -7859,6 +8065,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 | "f64"
                 | "Decimal"
                 | "Uuid"
+                // `SqliteUuid` (issue #1924) is hyphenated lowercase text, which
+                // sorts in UUID byte order. `SqliteDecimal` is deliberately
+                // absent: its column is TEXT, so SQL would order it
+                // lexicographically ("9" after "10") and the header would lie.
+                | "SqliteUuid"
                 | "NaiveDateTime"
                 | "NaiveDate"
                 | "NaiveTime"
@@ -8494,6 +8705,32 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn schema_name() -> &'static str { stringify!(#update_name) }
             fn schema() -> ::serde_json::Value {
                 #update_struct_schema_body
+            }
+        }
+
+        // Advertise all three schemas by identity in the compile-time inventory
+        // the OpenAPI/MCP back-fill consults (issue #802). Without this the
+        // `impl`s above exist but nothing can FIND them: the back-fill resolves
+        // a referenced type through `DerivedSchemaDescriptor`, so a
+        // `#[repository(api = "..")]` endpoint's own model exported as the
+        // generic `{"type":"object","title":"X"}` placeholder — an untyped blob
+        // in every generated client — even though the real schema was compiled
+        // in all along.
+        #query_schema_descriptor
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#new_name),
+                identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                schema: <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema,
+            }
+        }
+
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::openapi::DerivedSchemaDescriptor {
+                name: stringify!(#update_name),
+                identity: ::autumn_web::openapi::type_name_of::<#update_name>,
+                schema: <#update_name as ::autumn_web::openapi::OpenApiSchema>::schema,
             }
         }
 

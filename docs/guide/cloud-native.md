@@ -275,9 +275,11 @@ deploy, and drain each tier on its own.
 
 Requirements:
 
-- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"`. The
-  `local` backend is in-process, so a web replica would enqueue where no worker
-  can drain. Autumn rejects a split role on `local` at startup and
+- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"` here,
+  because this page's topology spans hosts. (`"sqlite"` is durable too, but its
+  queue is a table in one file, so it only backs a split whose processes share a
+  host.) The `local` backend is in-process, so a web replica would enqueue where
+  no worker can drain. Autumn rejects a split role on `local` at startup and
   `autumn doctor --strict` flags it. See
   [Web and worker process roles](jobs.md#web-and-worker-process-roles).
 - **The same migration gate** — both tiers share one backend, so run the
@@ -430,10 +432,16 @@ autumn migrate check
 
 `autumn migrate check` reads every `migrations/*/up.sql` file from disk (no
 database connection required) and classifies each SQL statement by its risk for
-a rolling deploy. It exits **0** when all statements are fully safe and **1**
-when any finding is `potentially-blocking`, `destructive`, `irreversible`,
-`data-backfill`, or `manual-review`. Each finding includes a one-line reason and
-a concrete next action.
+a rolling deploy. It exits **0** when all `up.sql` statements are fully safe and
+**1** when any is `potentially-blocking`, `destructive`, `irreversible`,
+`data-backfill`, `manual-review`, or `unsupported`. `down.sql` is classified and
+reported too, but does not decide the exit code: it runs on `autumn migrate
+down`, not on deploy. Each finding includes a one-line reason and a concrete
+next action.
+
+Classification follows the app's own backend (#1906). The example below is a
+Postgres app; on SQLite the same command applies SQLite's rules — see
+[SQLite in production](./sqlite-in-production.md#migration-mechanics-on-sqlite).
 
 Example output:
 
@@ -457,6 +465,7 @@ Example output:
 | `irreversible` | Cannot be undone without a multi-step expand/contract cycle. |
 | `data-backfill` | Schema change is safe but requires a separate backfill job. |
 | `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
+| `unsupported` | The backend has no syntax for this statement; it fails at apply time. SQLite only (#1906). |
 
 ### Adding `autumn migrate check` to CI
 
@@ -974,7 +983,7 @@ Before calling an Autumn app "cloud ready", verify:
 - migrations run before web rollout via a dedicated migration job
 - destructive/irreversible migrations follow the expand/contract pattern
 - background jobs use the right runtime model
-- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis`, never `local`), with worker replicas exposing `/live` + `/ready`
+- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis` across hosts, `sqlite` within one, never `local`), with worker replicas exposing `/live` + `/ready`
 - `autumn_jobs` has `traceparent` / `tracestate` columns if using the Postgres backend with `telemetry-otlp`
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery

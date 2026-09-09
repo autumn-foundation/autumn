@@ -196,6 +196,9 @@ jobs.redis
 jobs.redis.key_prefix
 jobs.redis.url
 jobs.redis.visibility_timeout_ms
+jobs.sqlite
+jobs.sqlite.poll_interval_ms
+jobs.sqlite.visibility_timeout_ms
 jobs.tracking
 jobs.tracking.route_enabled
 jobs.tracking.ttl_secs
@@ -229,6 +232,10 @@ mail.transport
 mail.unsubscribe_base_url
 mail.unsubscribe_mailto
 mail.unsubscribe_token_ttl_days
+metrics
+metrics.max_instruments
+metrics.max_labels_per_series
+metrics.max_series_per_metric
 observability
 observability.server_timing
 openapi

@@ -102,7 +102,7 @@ not a rewrite.
 | One host, write volume comfortably below a single serialized writer | **SQLite** |
 | Multiple replicas / multiple hosts sharing data | **Postgres** |
 | Read replicas, sharding, or heavy write concurrency | **Postgres** |
-| You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or advisory-lock leader election | **Postgres** |
+| You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or **cross-host** leader election | **Postgres** |
 
 ---
 
@@ -132,9 +132,9 @@ buckets on SQLite:
 | `autumn migrate check` (production-safety classifier) | ✅ | ✅ | Offline SQL-file safety linter (reads no DB URL, so it does not fail on a `sqlite://` target); its safety rules target Postgres migration semantics — there is no SQLite-specific classification yet. | ⚠️ **Partial** — the linter runs (no DB connection), but its rules are Postgres-oriented; no SQLite-specific classification |
 | Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation on the migration path. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. (Note: application **write-RMW** sites *do* issue `BEGIN IMMEDIATE` since #1996 — this row is only about the migration path.) | ⚠️ **Not serialized** — no advisory lock / no migration-path `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. The `generate auth` tracked-sessions store binds `RuntimeBackend` rather than `diesel::pg::Pg`, so it compiles and runs on either backend, and its migration DDL and scaffolded guide are emitted in the app's own dialect (#1908 / #1927). Its `schema.rs` block is backend-independent (every column kind the table uses maps to the same diesel sql-type on both backends), not dialect-forked. The cookie-session backends (`[session] backend = "memory" | "redis"`) are backend-independent and unchanged. **Still Postgres-only, and out of this row's scope:** the framework `DbApiTokenStore` (`api_tokens` — machine tokens, not login sessions) is typed `Pool<AsyncPgConnection>` with Postgres-only DDL, and the `--starter saas` scaffold pins `AsyncPgConnection` throughout. | ✅ **Available now** (#1908, behind the `sqlite` feature) |
-| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | Single-writer claim on the jobs table — durable and restart-safe, **no Redis required**. | ⛔ **Planned — #1907** |
-| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | Single host is always the leader; every tick fires locally (no election needed). | ⛔ **Planned — #1907** |
-| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⛔ | **Refused at construction**, not at boot: `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite` feature, so the app boots and the first attempt to take a lock fails with a named reason. SQLite has no cross-connection advisory lock, and pretending to hold one is worse than refusing; single-host mutual exclusion is what a `Mutex` is for. | ✅ **Available now — refuses at construction** |
+| Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | `jobs.backend = "sqlite"`: a single-writer claim on the `autumn_jobs` table in the app's own file — durable and restart-safe, **no Redis required**. Retries, backoff, dead-lettering, uniqueness windows, concurrency limits, and the job dashboard match Postgres. | ✅ **Available now** (#1907) |
+| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
+| Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ | `autumn_web::lock::Lock` takes a lease row in `autumn_locks` instead of a session lock, so the processes on the host contend. A live holder renews; a dead one's lock frees at the lease expiry. | ⚠️ **Available now** (#1907) — single-host scope, lease not session, not re-entrant |
 | Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (a single host has nothing to notify). `PgFlagStore` / `PgExperimentStore` are Postgres-only (they open a `PgConnection` and use `pg_notify`), so `from_database_config` returns `None` on a SQLite target rather than building a store that cannot connect. Autumn never picks a store for you — the app passes one to `with_flag_store`, so on SQLite pass `InMemoryFlagStore` (an `.expect()` on the `None` now fails at boot instead of at the first flag read). | ⚠️ **Available now — in-process only** |
 | Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target; pass `InMemoryConfigStore` or a custom `ConfigStore` instead. | ⚠️ **Available now — no DB-backed store** |
 | ISR regeneration coordinator (`static_gen`) | ✅ `pg_try_advisory_lock` | ⚠️ | `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite build's app state cannot produce — it is unreachable under the flip rather than refused. Single-host ISR uses the in-process coordinator, which is what one host needs. | ⚠️ **Available now — in-process coordinator** |
@@ -178,9 +178,10 @@ published support contract**. Available **today**:
 - **Backend-aware DDL generator** — `autumn generate` emits SQLite column types
   for the supported field kinds (see
   [field-type support](#sqlite-field-type-support)).
+- **Backend-aware app dependencies (#1924)** — a SQLite app's `Cargo.toml` gets
+  diesel on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
+  and `autumn-web`'s `sqlite` feature, so the generated code actually compiles.
 - **Generate-time rejections**, each naming its tracking issue:
-  - `Uuid` / `Decimal` / `Attachment` / `DateTime<Utc>` / `Enum` field kinds —
-    #1924.
   - `--id uuid` primary keys — #2555.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
@@ -208,9 +209,9 @@ runtime landed without a SQLite-native scaffold smoke harness; that is tracked
 in #2555.
 
 The support-matrix rows still marked **Planned** name follow-on subsystem slices
-whose SQLite support has not landed yet (durable jobs and
-`#[scheduled]` tasks #1907, backup/restore/scrub/retention/deploy persistence
-#1909). A **Planned** row does **not** mean the app refuses to boot — the runtime
+whose SQLite support has not landed yet
+(backup/restore/scrub/retention/deploy persistence #1909). A **Planned** row
+does **not** mean the app refuses to boot — the runtime
 boots and serves; those subsystems are simply not wired for SQLite until their
 tracking issue lands.
 
@@ -243,27 +244,60 @@ implemented**.
 ### `#[scheduled]` tasks
 
 The [multi-replica scheduler](./scheduled-multi-replica.md) uses advisory-lock
-leader election so that a fleet fires each tick exactly once. On SQLite the
-single host **is always the leader** — there is no fleet to elect within — so
-every scheduled tick fires locally with no coordination round-trip. Design
-scheduled tasks to be idempotent regardless of tier; the at-most-once-per-tick
-contract holds because there is only one ticker.
+leader election so that a fleet fires each tick exactly once. SQLite has no
+advisory locks, so it gets two single-host coordinators instead:
+
+- `scheduler.backend = "in_process"` (the **default**). The single process is
+  always the leader, so every tick fires locally with no coordination
+  round-trip. This is right for the ordinary one-process deployment.
+- `scheduler.backend = "sqlite"`. Each `(task, tick)` is leased in the
+  `autumn_scheduler_leases` table in the app's own database file, so **several
+  processes on the one host** elect exactly one leader per tick. Use it when a
+  web tier and a worker tier run side by side, or across a rolling restart where
+  the old and new process overlap.
+
+The lease carries an expiry, not a session. The row is what makes the tick
+claimed, and it stays for the whole of `scheduler.lease_ttl_secs` (default 300)
+whether the leader finished or died — so a second process whose timer reaches the
+same tick a moment later cannot run it again. The next acquire reaps the row once
+it expires.
+
+Set the TTL longer than both the spread between the processes' timers and the
+longest a tick body can take, so a live leader is never preempted mid-tick.
+
+This is stricter than the Postgres coordinator, whose `pg_advisory_unlock` frees
+the tick key the moment the leader finishes.
+
+`scheduler.backend = "postgres"` is refused at boot under SQLite, with a message
+naming both substitutes.
+
+Design scheduled tasks to be idempotent regardless of tier.
 
 ### Distributed lock
 
 [`autumn_web::lock::Lock`](./distributed-locks.md) is a cluster-wide named lock
-built on Postgres advisory locks, and SQLite has no cross-connection analog. So
-under the `sqlite` feature it does not degrade to a single-host lock — it
-**refuses**: `Lock::from_state` returns `LockError::PoolUnavailable` naming the
-backend. That is at **construction**, not at boot, so a SQLite app that never
-takes a lock starts and serves normally, and one that does gets a named error
-at the call rather than a lock that silently guards nothing.
+built on Postgres advisory locks. On SQLite the same API takes a lease row in an
+`autumn_locks` table in the app's own file, so it provides **single-host** mutual
+exclusion across the processes sharing that file. Three differences a caller can
+observe:
 
-Refusing beats downgrading here. A no-op "lock" would let two callers both
-believe they hold it; and single-host mutual exclusion inside one process is
-what a `Mutex` is for, with no database round-trip. Reach for the lock when you
-need *across-host* coordination — which is exactly what the single-host tier
-does not have.
+- **The scope is one host.** Processes sharing the database file contend; two
+  hosts do not.
+- **It is a lease, not a session.** A holder that dies frees the lock at the
+  lease expiry rather than wedging it, and a live holder renews in the
+  background, so a long critical section is not preempted. Postgres releases on
+  connection loss instead.
+- **It is not re-entrant.** A Postgres session lock can be taken twice on one
+  connection; a second `try_lock` on the same name in the same process observes
+  `None`.
+
+`lock()` polls rather than waiting server-side, because SQLite has no
+`pg_advisory_lock` to block in. Tune the interval with `with_poll_interval`.
+Because a SQLite deployment is single-host by definition, a lock used for
+across-host coordination has no counterpart. Every Postgres-only primitive that
+would imply one — a `replica_url`, a shard directory, a Postgres job or
+scheduler backend — is **refused at boot**, not silently downgraded to a no-op
+that would let two replicas both believe they hold it.
 
 ### Feature-flag / experiment cache invalidation
 
@@ -276,12 +310,53 @@ cache there is. See [Feature flags](./feature-flags.md) and
 ### Durable jobs without Redis
 
 This is the headline of the tier. `#[job]` work is durable and restart-safe on
-SQLite with **no Redis and no Postgres** — the job queue is a table in the same
-SQLite file, and a worker claims work with a single-writer claim (the SQLite
-analogue of `FOR UPDATE SKIP LOCKED`). A crash mid-job leaves the row reclaimable
-after restart, exactly as on Postgres. A job or scheduler *backend* that
-genuinely requires Redis or Postgres is refused at boot rather than pretending to
-be durable. See [Jobs](./jobs.md).
+SQLite with **no Redis and no Postgres**. Set:
+
+```toml
+[jobs]
+backend = "sqlite"
+```
+
+The queue is the `autumn_jobs` table in the same SQLite file. A worker claims
+work with a single-writer claim — one `UPDATE … WHERE id = (SELECT … LIMIT 1)
+RETURNING …`, which is the SQLite analogue of `FOR UPDATE SKIP LOCKED`, because
+SQLite serializes writers. A crash mid-job leaves the row reclaimable: a claim
+older than `jobs.sqlite.visibility_timeout_ms` (default 30s) is re-enqueued, or
+dead-lettered when its attempts are spent. The runtime creates the table and its
+indexes at start, so no migration is needed.
+
+Everything the Postgres queue gives you carries over: attempt counting,
+exponential backoff, dead-lettering, `#[job(unique)]` windows,
+`#[job(concurrency = N)]` limits, named queues and `[jobs] pin`, the actuator
+backlog gauges, and the `/admin/jobs` dashboard — which reads the table, so
+every process on the host sees the same queue. `enqueue_tracked` records go in
+the same file too, so `GET /_autumn/jobs/{token}` survives a restart and works
+across a web/worker split.
+
+Three differences from Postgres, all by design:
+
+- **Workers poll.** SQLite has no `LISTEN`/`NOTIFY`. An enqueue in the same
+  process wakes a worker directly; work another process enqueued is seen within
+  `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
+  to cut idle wakeups.
+- **The queue is host-local, and must be a file.** Two processes on one host
+  share it; two hosts do not. A split web/worker role on an **in-memory** target
+  is refused at boot, because each process would get its own database. Nothing
+  enforces the two-hosts case at boot — the tier's Postgres-only primitives
+  (`replica_url`, shards, `jobs.backend = "postgres"`,
+  `scheduler.backend = "postgres"`) are each refused, but a second host pointed
+  at the same file over a network filesystem is not detected. Do not do it; see
+  [The single-host constraint](#the-single-host-constraint).
+- **History is pruned by the runtime, not by `autumn db retention`.** The sweep
+  behind `autumn db retention` is Postgres-only (#1909). Instead the SQLite job
+  runtime prunes its own tables: expired tracked-job records always, and
+  terminal `autumn_jobs` rows when `retention.job_history` is set. Leave that
+  window unset and job history is kept forever, exactly as on Postgres.
+
+`jobs.backend = "local"` (the default) stays the right choice when the work does
+not need to survive a restart: it is in-process and needs no table.
+`jobs.backend = "postgres"` is refused at boot under SQLite, with a message
+naming the durable substitute. See [Jobs](./jobs.md).
 
 ### Backup, restore, scrub, retention
 
@@ -474,11 +549,12 @@ rather than holding up a write.
 ## SQLite field-type support
 
 The backend-aware generator maps model field kinds to SQLite storage types at
-`autumn generate` time. Like the capability matrix above, this tier lands in
-slices: a field kind is either **mapped** to a working SQLite column type, or
-**rejected at generate time** with an actionable message that names its tracking
-issue — never emitted as output that compiles on Postgres but breaks at migrate
-time on SQLite.
+`autumn generate` time. As of #1924 **every** field kind maps to a working SQLite
+column type and a Rust type that compiles; two of them render an `autumn-web`
+newtype rather than the crate type Postgres uses (see [foreign field
+types](#foreign-field-types-on-sqlite)). A future kind with no working conversion
+is **rejected at generate time** with an actionable message rather than emitted
+as output that compiles on Postgres but breaks on SQLite.
 
 | Field kind | On SQLite | SQLite type | Note |
 | --- | :---: | --- | --- |
@@ -490,11 +566,91 @@ time on SQLite.
 | `f64` | ✅ | `REAL` | |
 | `Bytea` | ✅ | `BLOB` | |
 | `NaiveDateTime` | ✅ | `Timestamp` (TEXT) | Core, ungated `diesel::sql_types::Timestamp`. |
-| `DateTime<Utc>` | ⛔ | — | **Rejected at generate time — #1924.** Its only working SQLite conversion needs diesel's `TimestamptzSqlite`, exported only behind diesel's `sqlite` feature, which the generated app's Postgres-oriented deps do not enable. |
-| `Enum` | ⛔ | — | **Rejected at generate time — #1924.** The generated enum emits only Postgres (`Pg`) `ToSql`/`FromSql<Text>` impls, so SQLite repository loads/inserts do not compile. |
-| `Uuid` | ⛔ | — | **Rejected at generate time — #1924.** No working diesel SQLite `FromSql`/`ToSql` in the app's diesel feature set. |
-| `Decimal` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
-| `Attachment` / `Blob` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
+| `DateTime<Utc>` | ✅ | `TimestamptzSqlite` (TEXT) | RFC 3339 UTC text, so the column sorts chronologically. |
+| `json` / `jsonb` | ✅ | `Json` (TEXT) | diesel's own `serde_json::Value` conversion. |
+| `Attachment` / `Blob` | ✅ | `TEXT` | The blob metadata JSON. `Blob` is an `autumn-web` type, so it carries its own `Text`/`Sqlite` conversion. |
+| `Enum` | ✅ | `TEXT` | The generated enum is local to your app, so `autumn generate` emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. |
+| `Uuid` | ✅ | `TEXT` | Renders as `autumn_web::db::sqlite_types::SqliteUuid` — see [foreign field types](#foreign-field-types-on-sqlite). |
+| `Decimal` | ✅ | `TEXT` + `CHECK` | Renders as `autumn_web::db::sqlite_types::SqliteDecimal`; the `CHECK` enforces the declared precision and scale — see [foreign field types](#foreign-field-types-on-sqlite). |
+
+<a id="foreign-field-types-on-sqlite"></a>
+
+### Foreign field types on SQLite
+
+Two field kinds render a different Rust type on SQLite:
+
+| Field kind | Postgres | SQLite |
+| --- | --- | --- |
+| `Uuid` | `uuid::Uuid` | `autumn_web::db::sqlite_types::SqliteUuid` |
+| `decimal{p,s}` | `rust_decimal::Decimal` | `autumn_web::db::sqlite_types::SqliteDecimal` |
+
+`uuid::Uuid` and `rust_decimal::Decimal` belong to other crates, and so does
+every diesel item their SQLite conversion would name, so `autumn-web` can
+implement nothing for them — diesel already blanket-implements `AsExpression`
+for every `Expression`, which rules out even a custom SQL type. A newtype is the
+wrapper diesel prescribes for exactly this case.
+
+Both wrappers are `Copy`, deref to the wrapped type, convert with `From`/`Into`,
+and are `#[serde(transparent)]`, so `Display`, `FromStr` and JSON match the
+wrapped type exactly:
+
+```rust
+use autumn_web::db::sqlite_types::SqliteUuid;
+
+let id: SqliteUuid = some_uuid.into();
+assert_eq!(id.to_string(), some_uuid.to_string());
+let back: uuid::Uuid = *id;
+```
+
+Both store `TEXT`, and both write a **canonical** form, because SQLite compares
+`TEXT` byte for byte — two spellings of one value would break `=` and `UNIQUE`.
+`SqliteUuid` writes hyphenated lowercase; `SqliteDecimal` writes the normalized
+decimal, so `19.990` and `19.99` are one row. The value stays numerically exact,
+which `REAL` would not.
+
+**Precision and scale are enforced by a `CHECK`.** The column is `TEXT`, so the
+migration carries a generated `CHECK` that holds the declared budget — at most
+`scale` fractional digits and `precision - scale` integer digits — that the
+value is a plain decimal literal at all, and that it is genuinely stored as
+`TEXT`, so a hand-written row cannot satisfy the constraint and then fail to
+load. (That last one matters because `TEXT` affinity converts an unquoted number
+but *not* a blob: `x'31392e3939'` would otherwise sit in the column spelling
+`19.99` while refusing to load.) Postgres *rounds* a value to `scale`; SQLite
+has no way to, so it rejects instead. Round before saving
+(`Decimal::round_dp`) if your input can carry more digits than the column
+declares.
+
+A `--default` on a decimal column is written as a quoted, normalized text
+literal for the same reason the runtime normalizes: the default and every later
+write must be the same text, or a row holding its own default would not match a
+lookup for that value.
+
+**Scale is not padded.** Postgres `NUMERIC(10,2)` reads `19.9` back as `19.90`;
+SQLite reads it back as `19.9`. The two are numerically equal — format for
+display rather than relying on the stored scale.
+
+**Ordering.** A `TEXT` column sorts lexicographically, so `ORDER BY` / `<` / `>`
+on a `SqliteDecimal` column compares strings, not numbers (`"9"` after `"10"`,
+`"-1.4"` before `"-1.5"`). Sort or range-filter in Rust, or store minor units in
+an `i64`, when SQL ordering matters. For this reason a scaffolded index does not
+offer a sortable header on a decimal column on SQLite — a dead link that stamped
+a misleading `aria-sort` would be worse than no control. `SqliteUuid` is
+unaffected: hyphenated lowercase text sorts in UUID byte order. Postgres
+`NUMERIC` columns are unaffected.
+
+**Equality on rows Autumn did not write.** `=` and `UNIQUE` match the stored
+bytes. Everything written through these types is canonical, so lookups agree with
+Rust equality. A row inserted by hand or migrated from elsewhere may not be:
+`SqliteUuid` *reads* any form `Uuid::parse_str` accepts (braced, URN,
+unhyphenated, uppercase), and such a row loads correctly but will not match a
+`find_by_…` for the same UUID. Write canonical text.
+
+**Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` still uses
+`autumn_web::test::TestDb`, a Postgres-only testcontainer, so `cargo test` on a
+generated SQLite app does not compile yet — `autumn generate scaffold` warns
+about this on a SQLite app. The app itself is unaffected: `cargo run`, `cargo
+build` and `autumn migrate` all work. A SQLite `TestDb` lands with the runtime
+slice, #1905.
 
 Additional generator shapes are refused on SQLite:
 
@@ -539,12 +695,48 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
 - **Rollback drops indexes before columns.** On the SQLite rollback path the
   generator emits `DROP INDEX` before `DROP COLUMN`, since SQLite will not drop a
   column that an index still references.
-- **Known limitation — dropping a pre-existing indexed column.** A
-  `Remove…From…` migration that drops a column which was indexed by an *earlier*
-  migration can still fail on SQLite, because the generator has no knowledge of
-  the original table's indexes and so cannot emit the matching `DROP INDEX`
-  first. Drop the index in the same migration, or drop the column via a manual
-  table rebuild. Tracked under the SQLite migrations issue #1906.
+- **Pre-existing indexes are dropped too (#1906).** A `Remove…From…` migration
+  reads the project's earlier `migrations/*/up.sql` and emits a `DROP INDEX IF
+  EXISTS` for every index still live on the table that names the removed column.
+  Composite, partial, expression and hand-named indexes are all covered, as are
+  indexes carried through an `ALTER TABLE … RENAME TO`. `down.sql` re-creates
+  them after re-adding the column.
+
+  Three kinds stay invisible, and each still fails at apply time:
+  - an index created by hand against the database, outside `migrations/`;
+  - an index created in a migration's `down.sql` rather than its `up.sql`;
+  - the implicit index behind an inline `UNIQUE` or `PRIMARY KEY` column
+    constraint in a `CREATE TABLE`. SQLite refuses to drop such a column in any
+    case, and refuses to drop its `sqlite_autoindex_*` index too.
+
+  For all three, rebuild the table — `autumn schema diff --write-migration`
+  emits the rebuild.
+- **`autumn migrate check` applies SQLite rules (#1906).** The safety classifier
+  reads the app's backend. It never recommends `CREATE INDEX CONCURRENTLY` (no
+  such syntax), does not flag a plain `DROP INDEX` (a cheap catalog edit, and a
+  precondition of `DROP COLUMN`), and reports statements SQLite cannot run at a
+  new **`unsupported`** risk level, which fails the `up.sql` gate:
+
+  | Statement | Write instead |
+  | --- | --- |
+  | Any `ALTER TABLE` subcommand outside `RENAME`, `ADD COLUMN`, `DROP COLUMN` — `ALTER COLUMN`, `ADD`/`DROP CONSTRAINT`, `SET SCHEMA`, `OWNER TO` | Rebuild the table |
+  | `ADD COLUMN … NOT NULL` with no `DEFAULT`, or `DEFAULT NULL` | A constant `DEFAULT`, or a nullable column |
+  | `ADD COLUMN` with a non-constant `DEFAULT` — `CURRENT_TIMESTAMP`, `now()`, `(1+2)` | A literal, or backfill with `UPDATE` |
+  | `ADD COLUMN` with inline `UNIQUE` / `PRIMARY KEY`, or `GENERATED … STORED` | Add the column, then `CREATE UNIQUE INDEX`; or use `VIRTUAL` |
+  | `CREATE INDEX … USING` / `INCLUDE` / `WITH` / `TABLESPACE` | Drop the clause — SQLite indexes are always B-trees |
+  | `CREATE TABLE … PARTITION BY` / `AS IDENTITY` / `INHERITS` | `INTEGER PRIMARY KEY AUTOINCREMENT`; partition in the app |
+  | `TRUNCATE` | `DELETE FROM <table>;` |
+  | `MERGE`, `SELECT … FOR UPDATE`, `ON CONFLICT ON CONSTRAINT`, a writing CTE | `INSERT … ON CONFLICT (<columns>)`; separate statements |
+  | Sequences, types, extensions, materialized views, `COMMENT ON`, `GRANT`/`REVOKE` | Remove, or gate the migration to Postgres |
+  | `DROP INDEX sqlite_autoindex_*` | Rebuild the table without the constraint |
+
+  A table the same migration creates is exempt from the `ADD COLUMN` rules: it
+  has no rows, so SQLite accepts them. `down.sql` findings are reported but do
+  not decide the exit code — that migration runs on `autumn migrate down`.
+
+  One rule Autumn deliberately does **not** apply: SQLite rejects an added
+  `REFERENCES` column with a non-NULL default only when `PRAGMA foreign_keys` is
+  ON, and the migration connection leaves it OFF, so the statement applies.
 
 ---
 
@@ -595,9 +787,8 @@ never as a runtime surprise on some unlucky code path days later.
   Postgres-only job/scheduler backend, a multi-replica lock) fails at boot with
   an actionable diagnostic.
 - A **generator** that would emit output which compiles on Postgres but breaks
-  on SQLite (for example a `Uuid` / `Decimal` field kind or an `--id uuid`
-  primary key) is rejected at **generate time**, with the reason stated — never
-  silent output that fails later.
+  on SQLite (for example an `--id uuid` primary key) is rejected at **generate
+  time**, with the reason stated — never silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is
 **configured** to use is supported on SQLite. There is no third state where an

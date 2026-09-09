@@ -85,6 +85,9 @@
 //! | `AUTUMN_TELEMETRY__OTLP_ENDPOINT` | `telemetry.otlp_endpoint` | `String` |
 //! | `AUTUMN_TELEMETRY__PROTOCOL` | `telemetry.protocol` | `Grpc` / `HttpProtobuf` |
 //! | `AUTUMN_TELEMETRY__STRICT` | `telemetry.strict` | `bool` |
+//! | `AUTUMN_METRICS__MAX_SERIES_PER_METRIC` | `metrics.max_series_per_metric` | `usize` |
+//! | `AUTUMN_METRICS__MAX_INSTRUMENTS` | `metrics.max_instruments` | `usize` |
+//! | `AUTUMN_METRICS__MAX_LABELS_PER_SERIES` | `metrics.max_labels_per_series` | `usize` |
 //! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
 //! | `AUTUMN_HEALTH__LIVE_PATH` | `health.live_path` | `String` |
 //! | `AUTUMN_HEALTH__READY_PATH` | `health.ready_path` | `String` |
@@ -114,7 +117,9 @@
 //! | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` | `usize` |
 //! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
 //! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
-//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` |
+//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `postgres` / `redis` / `sqlite` |
+//! | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` | `u64` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
 //! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
@@ -125,7 +130,7 @@
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
-//! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
+//! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` / `sqlite` |
 //! | `AUTUMN_RETENTION__SWEEP_INTERVAL` | `retention.sweep_interval` | duration `String` |
 //! | `AUTUMN_RETENTION__JOB_HISTORY` | `retention.job_history` | duration `String` |
 //! | `AUTUMN_RETENTION__COMMIT_HOOKS` | `retention.commit_hooks` | duration `String` |
@@ -1373,6 +1378,28 @@ pub struct AutumnConfig {
     /// `shadow_child_keys_are_strictly_validated` fails if this ordering breaks.
     #[serde(default)]
     pub shadow: crate::shadow::ShadowConfig,
+
+    /// App-metric registry limits (`[metrics]` section).
+    ///
+    /// The cardinality caps the call-site metrics facade
+    /// ([`crate::metrics`], #1378) enforces on an app's own instruments.
+    /// Every key defaults to the value the facade shipped with, so an app
+    /// with no `[metrics]` section behaves exactly as before.
+    ///
+    /// # Field ordering (load-bearing — do not move below `database`)
+    ///
+    /// Declared here, before [`database`](Self::database), for the same reason
+    /// [`deploy`](Self::deploy), `cluster` and [`shadow`](Self::shadow) are:
+    /// `DatabaseConfig`'s `deserialize_with` duration field aborts the
+    /// `SchemaDeserializer` traversal, so a section declared after it is
+    /// recorded only as an opaque root leaf and strict unknown-key validation
+    /// never descends into its children — a typo like
+    /// `[metrics] max_serie_per_metric = 500` would then be silently accepted
+    /// and the cap the operator meant to raise would stay at its default. The
+    /// regression guard `metrics_child_keys_are_strictly_validated` fails if
+    /// this ordering breaks.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
@@ -2772,6 +2799,13 @@ pub enum SchedulerBackend {
     InProcess,
     /// Fleet coordination with Postgres advisory locks.
     Postgres,
+    /// Single-host coordination with a `SQLite` lease table (issue #1907).
+    ///
+    /// Each `(task, tick)` is leased in the app's own database file, so several
+    /// processes on one host elect exactly one leader per tick. `SQLite` has no
+    /// advisory locks, and a `SQLite` deployment is single-host by definition.
+    #[serde(alias = "single_host")]
+    Sqlite,
 }
 
 impl SchedulerBackend {
@@ -2781,6 +2815,7 @@ impl SchedulerBackend {
         match value.trim().to_ascii_lowercase().as_str() {
             "in_process" | "in-process" | "local" | "memory" => Some(Self::InProcess),
             "postgres" | "postgresql" => Some(Self::Postgres),
+            "sqlite" | "single_host" | "single-host" => Some(Self::Sqlite),
             _ => None,
         }
     }
@@ -2796,7 +2831,7 @@ impl SchedulerBackend {
     /// the equivalent query on an actually-built coordinator instance.
     #[must_use]
     pub const fn is_fleet_distributed(self) -> bool {
-        matches!(self, Self::Postgres)
+        matches!(self, Self::Postgres | Self::Sqlite)
     }
 }
 
@@ -2884,7 +2919,11 @@ impl ProcessRole {
 /// A split role runs the HTTP tier and the job/scheduler tier in **separate
 /// processes**, so it needs a jobs backend the two processes can share. Only the
 /// recognized durable backends [`start_runtime`](crate::job::start_runtime)
-/// dispatches to durably — exactly `"postgres"` or `"redis"` — qualify. Every
+/// dispatches to durably — exactly `"postgres"`, `"redis"`, or `"sqlite"` —
+/// qualify. The `"sqlite"` queue is a table in the app's own database file, so
+/// two processes on the **same host** share it; a `SQLite` deployment is
+/// single-host by definition, and a multi-replica `SQLite` topology is already
+/// refused at boot (issue #1907). Every
 /// other value (the in-process `"local"` queue, a typo like `"postgresql"`, or a
 /// blank backend) falls through to the per-process local runtime, where a
 /// [`Web`](ProcessRole::Web) replica would enqueue into a queue no separate
@@ -2894,9 +2933,69 @@ impl ProcessRole {
 ///
 /// The combined role is always valid because it enqueues and drains in one
 /// process. Returns `true` when the combination is **invalid**.
+///
+/// This answers only the *backend shape*. `sqlite` also needs a file-backed
+/// database to be shareable at all — see
+/// [`split_role_requires_file_backed_sqlite`], which the boot guard checks
+/// alongside this one.
 #[must_use]
 pub fn split_role_requires_durable_backend(role: ProcessRole, jobs_backend: &str) -> bool {
-    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis")
+    role != ProcessRole::Combined && !matches!(jobs_backend, "postgres" | "redis" | "sqlite")
+}
+
+/// Whether a `SQLite` target is in memory rather than a file.
+///
+/// An in-memory database is private to the process that opened it — even the
+/// `cache=shared` spellings, which share only within one process. Nothing
+/// written by one process is visible to another.
+///
+/// Deliberately self-contained rather than calling `crate::db`'s equivalent:
+/// that one is gated on the `sqlite` feature, and this has to answer for
+/// `autumn doctor`, which reads a `sqlite://` config from a Postgres build.
+/// The two must agree on the spellings; see
+/// `crate::db::sqlite_target_is_any_in_memory`.
+#[must_use]
+pub fn is_in_memory_sqlite_target(url: &str) -> bool {
+    if url.starts_with("file:") {
+        return url == "file::memory:"
+            || url.starts_with("file::memory:?")
+            || url.contains("mode=memory");
+    }
+    let target = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    // An empty target is in memory too: a bare `sqlite://` or `sqlite:` names
+    // no file, and `crate::db::normalize_sqlite_target` turns it into
+    // `:memory:` before handing it to `sqlite3_open`.
+    target.is_empty()
+        || target == ":memory:"
+        || target == "file::memory:"
+        || target.starts_with("file::memory:?")
+        || target.contains("mode=memory")
+}
+
+/// Whether a split role on the `SQLite` jobs backend is invalid because the
+/// database is in memory (issue #1907).
+///
+/// The `sqlite` queue is durable enough for a split web/worker topology only
+/// because both processes open the same **file**. Against an in-memory target
+/// each process gets its own database, so the web replica enqueues into a queue
+/// the worker can never see and every job is silently stranded — the exact
+/// failure [`split_role_requires_durable_backend`] exists to prevent, which it
+/// cannot see because it is given only the backend name.
+///
+/// `None` for `database_url` answers `false`: a `sqlite` backend with no
+/// database configured fails earlier, with its own error.
+#[must_use]
+pub fn split_role_requires_file_backed_sqlite(
+    role: ProcessRole,
+    jobs_backend: &str,
+    database_url: Option<&str>,
+) -> bool {
+    role != ProcessRole::Combined
+        && jobs_backend == "sqlite"
+        && database_url.is_some_and(is_in_memory_sqlite_target)
 }
 
 /// `[retention]` — one retention window per framework-owned dataset
@@ -3366,6 +3465,8 @@ pub struct JobConfig {
     /// - `local` (default): in-process Tokio queue
     /// - `postgres`: Postgres-backed durable queue (requires `db` feature)
     /// - `redis`: Redis-backed durable queue (requires `redis` feature)
+    /// - `sqlite`: durable queue in the app's own `SQLite` file (requires the
+    ///   `sqlite` feature)
     #[serde(default = "default_job_backend")]
     pub backend: String,
     /// Number of concurrent worker loops to spawn.
@@ -3405,6 +3506,9 @@ pub struct JobConfig {
     /// Postgres backend options.
     #[serde(default)]
     pub postgres: JobPostgresConfig,
+    /// `SQLite` backend options.
+    #[serde(default)]
+    pub sqlite: JobSqliteConfig,
     /// Tracked-job progress/result store options (`enqueue_tracked`, the
     /// built-in `GET /_autumn/jobs/{token}` status route).
     #[serde(default)]
@@ -3423,6 +3527,7 @@ impl Default for JobConfig {
             fleet: JobFleetConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
+            sqlite: JobSqliteConfig::default(),
             tracking: JobTrackingConfig::default(),
         }
     }
@@ -3783,6 +3888,41 @@ impl Default for JobPostgresConfig {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
         }
     }
+}
+
+/// `SQLite` backend configuration options for the job runner (issue #1907).
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobSqliteConfig {
+    /// Duration before an in-flight job claim is considered stale and recovered.
+    ///
+    /// A worker that dies mid-job has its claim reclaimed within this bound.
+    /// Default: 30 seconds.
+    #[serde(default = "default_jobs_sqlite_visibility_timeout_ms")]
+    pub visibility_timeout_ms: u64,
+    /// How long an idle worker waits before it polls the queue table again.
+    ///
+    /// `SQLite` has no `LISTEN`/`NOTIFY`, so a worker polls. An enqueue in the
+    /// same process wakes a worker directly, so this bound sets how fast a
+    /// worker sees work another process enqueued. Default: 250ms.
+    #[serde(default = "default_jobs_sqlite_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
+impl Default for JobSqliteConfig {
+    fn default() -> Self {
+        Self {
+            visibility_timeout_ms: default_jobs_sqlite_visibility_timeout_ms(),
+            poll_interval_ms: default_jobs_sqlite_poll_interval_ms(),
+        }
+    }
+}
+
+const fn default_jobs_sqlite_visibility_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_jobs_sqlite_poll_interval_ms() -> u64 {
+    250
 }
 
 /// Tracked-job progress/result store configuration.
@@ -4860,6 +5000,10 @@ impl AutumnConfig {
         // Fail fast on an insecure or flapping [cluster] section: a node that
         // would boot without a shared secret must not boot at all.
         self.cluster.validate()?;
+        // A zero or absurd `[metrics]` cap is refused here rather than clamped
+        // at apply time, so `autumn check` names the key. A cap of 0 would
+        // silently drop every labeled sample the app records.
+        self.metrics.validate()?;
         // A `[replication]` block that is switched on but cannot ship (no
         // destination, both destinations, no credential indirection) must fail
         // here — so `autumn check` and `autumn doctor` see it too — rather than
@@ -5026,7 +5170,7 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
     ///
     /// # Jobs
-    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
+    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis` / `sqlite`)
     /// - `AUTUMN_JOBS__WORKERS` → `jobs.workers` (`usize`)
     /// - `AUTUMN_JOBS__PIN` → `jobs.pin` (comma-separated queue names)
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
@@ -5101,6 +5245,7 @@ impl AutumnConfig {
         self.apply_observability_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
+        self.apply_metrics_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
         self.apply_reporting_env_overrides_with_env(env);
         #[cfg(feature = "reporting")]
@@ -5476,6 +5621,24 @@ impl AutumnConfig {
             env,
             "AUTUMN_ACTUATOR__PROMETHEUS",
             &mut self.actuator.prometheus,
+        );
+    }
+
+    fn apply_metrics_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_SERIES_PER_METRIC",
+            &mut self.metrics.max_series_per_metric,
+        );
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_INSTRUMENTS",
+            &mut self.metrics.max_instruments,
+        );
+        parse_env(
+            env,
+            "AUTUMN_METRICS__MAX_LABELS_PER_SERIES",
+            &mut self.metrics.max_labels_per_series,
         );
     }
 
@@ -5967,6 +6130,16 @@ impl AutumnConfig {
         );
         parse_env(
             env,
+            "AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS",
+            &mut self.jobs.sqlite.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS",
+            &mut self.jobs.sqlite.poll_interval_ms,
+        );
+        parse_env(
+            env,
             "AUTUMN_JOBS__TRACKING__TTL_SECS",
             &mut self.jobs.tracking.ttl_secs,
         );
@@ -6049,7 +6222,7 @@ impl AutumnConfig {
                 Some(backend) => self.scheduler.backend = backend,
                 None => eprintln!(
                     "Warning: AUTUMN_SCHEDULER__BACKEND={val:?} is not valid \
-                     (expected in_process or postgres), ignoring"
+                     (expected in_process, postgres or sqlite), ignoring"
                 ),
             }
         }
@@ -8878,6 +9051,125 @@ fn default_actuator_prefix() -> String {
 
 const fn default_actuator_prometheus() -> bool {
     true
+}
+
+/// App-metric registry limits (`[metrics]` section).
+///
+/// These are the three cardinality caps the call-site metrics facade
+/// ([`crate::metrics`]) enforces on an app's own counters, gauges, histograms
+/// and timers. They exist so a label-cardinality mistake degrades the metric
+/// instead of growing memory without bound; they are configurable because the
+/// line between "a mistake" and "a large but deliberate label space" is a
+/// property of the app, not of the framework.
+///
+/// Every key defaults to the value the facade shipped with in 0.7.0, so an
+/// app with no `[metrics]` section is unaffected.
+///
+/// # Raising a cap is not free
+///
+/// A retained series is never evicted — evicting a counter would reset it, and
+/// a reset is indistinguishable from a restart to `rate()`. Raising
+/// `max_series_per_metric` therefore raises the *permanent* memory an
+/// unbounded label value (a user id, a URL, an error string) can claim.
+/// Raise it because the app's label space is genuinely larger, not to silence
+/// `autumn_metrics_series_dropped_total`.
+///
+/// # Examples
+///
+/// ```toml
+/// [metrics]
+/// max_series_per_metric = 500
+/// max_instruments = 512
+/// ```
+///
+/// Each key also takes an environment override:
+/// `AUTUMN_METRICS__MAX_SERIES_PER_METRIC`,
+/// `AUTUMN_METRICS__MAX_INSTRUMENTS`,
+/// `AUTUMN_METRICS__MAX_LABELS_PER_SERIES`.
+///
+/// # Where it is applied
+///
+/// `AppBuilder::run` installs this section process-wide before it builds
+/// anything from the config, so it is in force before the first call site can
+/// record. The registry is process-global, so
+/// [`TestApp`](crate::test::TestApp) deliberately does **not** apply it — one
+/// test's caps would leak into every test sharing the binary. A test that needs
+/// a different cap calls [`crate::metrics::set_limits`] itself and restores the
+/// default afterwards.
+///
+/// See `docs/guide/metrics.md`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Distinct **labeled** series retained per instrument. Default: `100`.
+    ///
+    /// Beyond this, a sample carrying a label set the instrument has not seen
+    /// is dropped and counted in `autumn_metrics_series_dropped_total`. The
+    /// unlabeled series does not count against it. Range: 1 to
+    /// [`MAX_SERIES_PER_METRIC_CEILING`](crate::metrics::MAX_SERIES_PER_METRIC_CEILING).
+    #[serde(default = "default_max_series_per_metric")]
+    pub max_series_per_metric: usize,
+
+    /// Distinct instruments the process-global registry holds. Default: `256`.
+    ///
+    /// Beyond this, a new metric name gets an inert handle. Range: 1 to
+    /// [`MAX_INSTRUMENTS_CEILING`](crate::metrics::MAX_INSTRUMENTS_CEILING).
+    #[serde(default = "default_max_instruments")]
+    pub max_instruments: usize,
+
+    /// Labels retained on a single series. Default: `8`.
+    ///
+    /// Extras are dropped — lexicographically smallest names survive — and
+    /// the sample is still recorded. Range: 1 to
+    /// [`MAX_LABELS_PER_SERIES_CEILING`](crate::metrics::MAX_LABELS_PER_SERIES_CEILING).
+    ///
+    /// Changing this changes **series identity**: the same twelve labels
+    /// canonicalize to a different key under a cap of 8 than under 12. Set it
+    /// once, before the app records anything.
+    #[serde(default = "default_max_labels_per_series")]
+    pub max_labels_per_series: usize,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            max_series_per_metric: default_max_series_per_metric(),
+            max_instruments: default_max_instruments(),
+            max_labels_per_series: default_max_labels_per_series(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// This section as the value the metrics registry consumes.
+    #[must_use]
+    pub const fn limits(&self) -> crate::metrics::Limits {
+        crate::metrics::Limits {
+            max_series_per_metric: self.max_series_per_metric,
+            max_instruments: self.max_instruments,
+            max_labels_per_series: self.max_labels_per_series,
+        }
+    }
+
+    /// Reject an out-of-range cap by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending `autumn.toml` key and its accepted range.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.limits().validate().map_err(ConfigError::Validation)
+    }
+}
+
+const fn default_max_series_per_metric() -> usize {
+    crate::metrics::DEFAULT_MAX_SERIES_PER_METRIC
+}
+
+const fn default_max_instruments() -> usize {
+    crate::metrics::DEFAULT_MAX_INSTRUMENTS
+}
+
+const fn default_max_labels_per_series() -> usize {
+    crate::metrics::DEFAULT_MAX_LABELS_PER_SERIES
 }
 
 /// CORS (Cross-Origin Resource Sharing) configuration.
@@ -12429,6 +12721,81 @@ path = "/healthz"
             config.database.url.as_deref(),
             Some("postgres://override:5432/test")
         );
+    }
+
+    #[test]
+    fn metrics_section_defaults_to_the_shipped_caps() {
+        // The whole point of making the caps configurable is that an app which
+        // configures nothing keeps the behaviour 0.7.0 shipped.
+        let config = AutumnConfig::default();
+        assert_eq!(config.metrics.limits(), crate::metrics::Limits::default());
+
+        let parsed: AutumnConfig =
+            toml::from_str("[server]\nport = 3000\n").expect("config without [metrics] parses");
+        assert_eq!(parsed.metrics.limits(), crate::metrics::Limits::default());
+    }
+
+    #[test]
+    fn metrics_section_parses_a_raised_cap() {
+        let parsed: AutumnConfig =
+            toml::from_str("[metrics]\nmax_series_per_metric = 500\nmax_labels_per_series = 12\n")
+                .expect("[metrics] parses");
+
+        assert_eq!(parsed.metrics.max_series_per_metric, 500);
+        assert_eq!(parsed.metrics.max_labels_per_series, 12);
+        assert_eq!(
+            parsed.metrics.max_instruments,
+            crate::metrics::DEFAULT_MAX_INSTRUMENTS,
+            "an unset key keeps its default rather than zeroing"
+        );
+        parsed.metrics.validate().expect("in-range caps validate");
+    }
+
+    #[test]
+    fn env_override_metrics_caps() {
+        let env = MockEnv::new()
+            .with("AUTUMN_METRICS__MAX_SERIES_PER_METRIC", "500")
+            .with("AUTUMN_METRICS__MAX_INSTRUMENTS", "512")
+            .with("AUTUMN_METRICS__MAX_LABELS_PER_SERIES", "12");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(
+            config.metrics.limits(),
+            crate::metrics::Limits {
+                max_series_per_metric: 500,
+                max_instruments: 512,
+                max_labels_per_series: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_out_of_range_metrics_cap() {
+        // A cap of 0 would drop every labeled sample the app records, silently.
+        // It must fail the boot — and `autumn check` — by name.
+        let mut config = AutumnConfig::default();
+        config.metrics.max_series_per_metric = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero cap must not validate")
+            .to_string();
+        assert!(
+            error.contains("max_series_per_metric"),
+            "the error must name the key at fault; got {error}"
+        );
+
+        let mut config = AutumnConfig::default();
+        config.metrics.max_labels_per_series = crate::metrics::MAX_LABELS_PER_SERIES_CEILING + 1;
+        assert!(
+            config.validate().is_err(),
+            "a cap above its ceiling must not validate"
+        );
+
+        AutumnConfig::default()
+            .validate()
+            .expect("the default [metrics] section validates");
     }
 
     #[test]
@@ -18436,6 +18803,129 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             ProcessRole::Worker,
             "redis"
         ));
+        // The SQLite queue is a table two processes on one host share, so it
+        // backs a split role too (issue #1907).
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Web,
+            "sqlite"
+        ));
+        assert!(!split_role_requires_durable_backend(
+            ProcessRole::Worker,
+            "sqlite"
+        ));
+    }
+
+    /// Issue #1907: a split role on the sqlite queue needs a FILE-backed
+    /// database. An in-memory target is private to each process, so the web
+    /// replica would enqueue where no worker can look.
+    #[test]
+    fn split_role_on_sqlite_requires_a_file_backed_database() {
+        // Every in-memory spelling is refused for a split role.
+        for url in [
+            "sqlite::memory:",
+            "sqlite://:memory:",
+            ":memory:",
+            "file::memory:",
+            "file::memory:?cache=shared",
+            "sqlite:file::memory:?cache=shared",
+            "sqlite://app.db?mode=memory",
+            // A bare scheme names no file: `normalize_sqlite_target` turns
+            // both of these into `:memory:`.
+            "sqlite://",
+            "sqlite:",
+        ] {
+            assert!(
+                is_in_memory_sqlite_target(url),
+                "{url} must read as in-memory"
+            );
+            assert!(
+                split_role_requires_file_backed_sqlite(ProcessRole::Web, "sqlite", Some(url)),
+                "a split role on {url} must be refused"
+            );
+        }
+
+        // A file target is exactly what makes the split valid.
+        for url in ["sqlite:///var/lib/app.db", "sqlite://./app.db", "app.db"] {
+            assert!(
+                !is_in_memory_sqlite_target(url),
+                "{url} must read as file-backed"
+            );
+            assert!(
+                !split_role_requires_file_backed_sqlite(ProcessRole::Web, "sqlite", Some(url)),
+                "a split role on {url} is valid"
+            );
+        }
+
+        // The combined role shares nothing, so it is fine either way.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Combined,
+            "sqlite",
+            Some("sqlite::memory:")
+        ));
+        // Other backends do not answer to this rule.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Worker,
+            "postgres",
+            Some("sqlite::memory:")
+        ));
+        // No database configured fails earlier, with its own error.
+        assert!(!split_role_requires_file_backed_sqlite(
+            ProcessRole::Worker,
+            "sqlite",
+            None
+        ));
+    }
+
+    /// Issue #1907: the single-host lease backend is selectable, aliased, and
+    /// reports itself as fleet-distributed.
+    #[test]
+    fn scheduler_backend_sqlite_is_selectable_and_fleet_distributed() {
+        assert_eq!(
+            SchedulerBackend::from_env_value("sqlite"),
+            Some(SchedulerBackend::Sqlite)
+        );
+        assert_eq!(
+            SchedulerBackend::from_env_value(" SINGLE_HOST "),
+            Some(SchedulerBackend::Sqlite)
+        );
+        assert_eq!(SchedulerBackend::from_env_value("nonsense"), None);
+        assert!(SchedulerBackend::Sqlite.is_fleet_distributed());
+        assert!(!SchedulerBackend::InProcess.is_fleet_distributed());
+
+        let config: AutumnConfig =
+            toml::from_str("[scheduler]\nbackend = \"sqlite\"\n").expect("sqlite backend");
+        assert_eq!(config.scheduler.backend, SchedulerBackend::Sqlite);
+        let aliased: AutumnConfig =
+            toml::from_str("[scheduler]\nbackend = \"single_host\"\n").expect("single_host alias");
+        assert_eq!(aliased.scheduler.backend, SchedulerBackend::Sqlite);
+
+        let env = MockEnv::new().with("AUTUMN_SCHEDULER__BACKEND", "sqlite");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.scheduler.backend, SchedulerBackend::Sqlite);
+    }
+
+    /// Issue #1907: `[jobs.sqlite]` carries the durable queue's knobs and
+    /// defaults to values an app never has to set.
+    #[test]
+    fn jobs_sqlite_section_parses_with_defaults() {
+        let defaults = JobSqliteConfig::default();
+        assert_eq!(defaults.visibility_timeout_ms, 30_000);
+        assert_eq!(defaults.poll_interval_ms, 250);
+
+        let config: AutumnConfig = toml::from_str(
+            "[jobs]\nbackend = \"sqlite\"\n\n[jobs.sqlite]\nvisibility_timeout_ms = 5000\n\
+             poll_interval_ms = 50\n",
+        )
+        .expect("sqlite job section");
+        assert_eq!(config.jobs.backend, "sqlite");
+        assert_eq!(config.jobs.sqlite.visibility_timeout_ms, 5_000);
+        assert_eq!(config.jobs.sqlite.poll_interval_ms, 50);
+
+        // Omitting the section keeps the defaults.
+        let bare: AutumnConfig =
+            toml::from_str("[jobs]\nbackend = \"sqlite\"\n").expect("bare jobs section");
+        assert_eq!(bare.jobs.sqlite.visibility_timeout_ms, 30_000);
     }
 
     #[test]
