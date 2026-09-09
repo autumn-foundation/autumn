@@ -14,7 +14,8 @@ use scoped_futures::ScopedFutureExt;
 
 use crate::models::{Comment, NewRevision, Post, Revision, Term, User};
 use crate::schema::{
-    attachments, comments, menu_items, menus, post_meta, post_terms, posts, revisions, terms, users,
+    attachments, comments, menu_items, menus, post_meta, post_terms, posts, revisions, terms,
+    users, widgets,
 };
 
 /// The maximum reply nesting a comment thread accepts.
@@ -2906,6 +2907,26 @@ pub async fn terms_by_ids(
         .into_iter()
         .map(|term| (term.id, term))
         .collect())
+}
+
+/// The widgets placed in a sidebar, ordered and bounded in SQL.
+///
+/// A sidebar is chrome: it renders on *every* public page, and the widgets are
+/// created through an ordinary admin form with no cap, so an unbounded read
+/// here made the cost of every request a function of how many widgets somebody
+/// had added. Past a couple of dozen it has stopped being a sidebar.
+pub async fn sidebar_widgets(
+    conn: &mut AsyncPgConnection,
+    sidebar: &str,
+    limit: i64,
+) -> AutumnResult<Vec<crate::models::Widget>> {
+    Ok(widgets::table
+        .filter(widgets::sidebar.eq(sidebar))
+        .order((widgets::position.asc(), widgets::id.asc()))
+        .limit(limit.max(0))
+        .select(crate::models::Widget::as_select())
+        .load(conn)
+        .await?)
 }
 
 /// One page of menus, oldest first, bounded in SQL.

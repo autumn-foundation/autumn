@@ -229,18 +229,20 @@ pub async fn dashboard(repos: Repos, session: Session, csrf: Csrf) -> AutumnResu
     // uses, so the two can never disagree about who lands where.
     let user = require_capability!(repos, session, csrf, Capability::EditPosts);
 
+    // Propagated, not defaulted. `unwrap_or(0)` rendered a transient database
+    // failure as a genuine "you have no published posts" — a dashboard that
+    // lies plausibly is worse than one that admits it cannot answer, because
+    // nothing about the screen suggests looking at the logs.
     let mut counts = Vec::new();
     for post_type in content_types::all_post_types() {
         let published = repos
             .posts
             .count_by_post_type_and_status(post_type.slug.to_owned(), "publish".to_owned())
-            .await
-            .unwrap_or(0);
+            .await?;
         let drafts = repos
             .posts
             .count_by_post_type_and_status(post_type.slug.to_owned(), "draft".to_owned())
-            .await
-            .unwrap_or(0);
+            .await?;
         counts.push((
             post_type.plural.to_owned(),
             post_type.slug.to_owned(),
@@ -249,11 +251,7 @@ pub async fn dashboard(repos: Repos, session: Session, csrf: Csrf) -> AutumnResu
         ));
     }
 
-    let pending_comments = repos
-        .comments
-        .count_by_status("pending".to_owned())
-        .await
-        .unwrap_or(0);
+    let pending_comments = repos.comments.count_by_status("pending".to_owned()).await?;
 
     let body = html! {
         div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8" {

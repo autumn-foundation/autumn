@@ -12,7 +12,7 @@ use crate::repositories::{
     MenuItemRepository as _, MenuRepository as _, PgAttachmentRepository, PgCommentRepository,
     PgMenuItemRepository, PgMenuRepository, PgPostMetaRepository, PgPostRepository,
     PgSiteOptionRepository, PgTermRepository, PgUserRepository, PgWidgetRepository,
-    PostRepository as _, TermRepository as _, UserRepository as _, WidgetRepository as _,
+    PostRepository as _, TermRepository as _, UserRepository as _,
 };
 use crate::settings::{SITE_SCOPE, Settings, cached_settings};
 use crate::taxonomy::{PgPostTermLinkRepository, PostTermLinkRepository as _};
@@ -86,6 +86,14 @@ impl FromRequestParts<AppState> for Repos {
 /// every public page — so the bound belongs in the query rather than in the
 /// template.
 const WIDGET_TERM_LIMIT: i64 = 50;
+
+/// The most widgets one sidebar renders.
+///
+/// A sidebar is chrome on every public page; past a couple of dozen entries it
+/// has stopped being a sidebar and started being the page. The Appearance
+/// screen reads the same bound, so what an administrator manages is what
+/// visitors see.
+pub const MAX_SIDEBAR_WIDGETS: i64 = 30;
 
 impl Repos {
     /// Borrow a pooled connection for one query.
@@ -233,6 +241,31 @@ impl Repos {
             })
             .await?;
 
+        // An item whose target is no longer public is dropped, not rendered
+        // with a dead link. A menu names a post by id, and that post can be
+        // drafted, scheduled, made private or trashed afterwards — the menu has
+        // no idea, so every page of the site carried a link to a 404 until
+        // somebody noticed and edited the menu.
+        //
+        // Dropping a parent drops its children with it: `build_nav` assembles
+        // by `parent_id`, so leaving them behind floats a sub-item to the top
+        // level, which is a stranger outcome than the link disappearing. The
+        // renderer draws two levels, so one orphan pass covers it.
+        let renderable: std::collections::HashSet<i64> = items
+            .iter()
+            .filter(|item| menu_item_is_visible(item, &posts, &terms))
+            .map(|item| item.id)
+            .collect();
+        let items: Vec<MenuItem> = items
+            .into_iter()
+            .filter(|item| {
+                renderable.contains(&item.id)
+                    && item
+                        .parent_id
+                        .is_none_or(|parent| renderable.contains(&parent))
+            })
+            .collect();
+
         // Building the tree is a pure function over those maps and needs no
         // database access per node.
         let resolved: std::collections::HashMap<i64, String> = items
@@ -249,7 +282,14 @@ impl Repos {
 
     /// Render the primary sidebar.
     pub async fn sidebar(&self, settings: &Settings) -> AutumnResult<Markup> {
-        let widgets = self.widgets.find_by_sidebar("primary".to_owned()).await?;
+        // Ordered and bounded in SQL. This renders on every public page, and
+        // widgets are added through an ordinary form with no cap — so the cost
+        // of the whole site was a function of how many somebody had placed.
+        let widgets = self
+            .with_conn(async |conn| {
+                crate::content::sidebar_widgets(conn, "primary", MAX_SIDEBAR_WIDGETS).await
+            })
+            .await?;
         if widgets.is_empty() {
             return Ok(html! {});
         }
@@ -648,6 +688,27 @@ fn menu_item_url(
     } else {
         item.url.clone()
     }
+}
+
+/// Whether a menu item still points at something a visitor can reach.
+///
+/// A raw URL is the author's own and is always kept — the menu editor accepts
+/// anything there, including an off-site link. A post or term target is only
+/// kept while the row exists and is publicly routable.
+fn menu_item_is_visible(
+    item: &MenuItem,
+    posts: &std::collections::HashMap<i64, Post>,
+    terms: &std::collections::HashMap<i64, crate::models::Term>,
+) -> bool {
+    if let Some(post_id) = item.post_id {
+        return posts.get(&post_id).is_some_and(|post| {
+            post.is_public() && crate::content::is_public_type(&post.post_type)
+        });
+    }
+    if let Some(term_id) = item.term_id {
+        return terms.contains_key(&term_id);
+    }
+    true
 }
 
 /// A page's ancestor slugs, outermost first, read from an already-loaded map.

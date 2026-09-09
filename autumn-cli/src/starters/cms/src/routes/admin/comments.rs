@@ -69,16 +69,15 @@ pub async fn list(
         entries
     };
 
+    // Propagated for the same reason the dashboard's are: a queue badge reading
+    // zero because the database was unreachable tells a moderator the queue is
+    // clear.
     let mut counts = Vec::new();
     for (value, label) in QUEUES {
         counts.push((
             *value,
             *label,
-            repos
-                .comments
-                .count_by_status((*value).to_owned())
-                .await
-                .unwrap_or(0),
+            repos.comments.count_by_status((*value).to_owned()).await?,
         ));
     }
 

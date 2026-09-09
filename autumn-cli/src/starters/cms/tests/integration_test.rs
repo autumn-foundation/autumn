@@ -9648,3 +9648,161 @@ async fn a_failed_ancestor_lookup_does_not_truncate_a_permalink() {
         "a page with genuinely no parent is `Ok(None)` and keeps its bare path: {urls:?}"
     );
 }
+
+/// A menu item whose target stops being public disappears from the nav.
+///
+/// A menu names a post by id, and that post can be drafted, scheduled, made
+/// private or trashed afterwards — the menu has no idea. Every page of the site
+/// carried a link to a 404 until somebody noticed and edited the menu by hand.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_menu_item_pointing_at_hidden_content_is_not_rendered() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Announcement", "Body.", "publish").await;
+
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Primary"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+    let menu: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::menus::table
+            .select({{crate_name}}::schema::menus::id)
+            .first(&mut conn)
+            .await
+            .expect("the menu")
+    };
+    for fields in [
+        vec![("label", "News"), ("post_id", &post_id.to_string()[..])],
+        vec![("label", "Elsewhere"), ("url", "https://example.com/x")],
+    ] {
+        let mut all = fields.clone();
+        all.push(("parent_id", ""));
+        client
+            .post(&format!("/admin/appearance/menus/{menu}/items"))
+            .header("cookie", &cookie)
+            .form(&form(&all))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    // While it is published, it is in the nav.
+    sign_out(&client);
+    let home = client.get("/").send().await;
+    home.assert_ok();
+    assert!(home.text().contains("News"), "a live target is linked");
+
+    // Unpublish it. The link must go, and the rest of the menu must stay.
+    client
+        .post(&format!("/admin/content/post/{post_id}/status?to=draft"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let home = client.get("/").send().await;
+    home.assert_ok();
+    let home = home.text();
+    assert!(
+        !home.contains(">News<"),
+        "a menu item pointing at hidden content must not render a dead link:\n{home}"
+    );
+    assert!(
+        home.contains("Elsewhere"),
+        "and the rest of the menu is untouched"
+    );
+}
+
+/// A dashboard count that cannot be read is an error, not a zero.
+///
+/// `unwrap_or(0)` rendered a transient database failure as "you have no
+/// published posts" — a screen that lies plausibly, with nothing to suggest
+/// looking at the logs.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_dashboard_count_failure_is_not_reported_as_zero() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Live", "Body.", "publish").await;
+
+    // The healthy reading first, so the failure below is the only variable.
+    client
+        .get("/admin")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Posts");
+
+    // A count that cannot be answered. The dashboard must fail rather than
+    // report an inaccurate figure.
+    let db = TestDb::shared().await;
+    try_execute(db, "ALTER TABLE posts RENAME TO posts_hidden")
+        .await
+        .expect("hide the table");
+    let broken = client.get("/admin").header("cookie", &cookie).send().await;
+    let status = broken.status;
+    try_execute(db, "ALTER TABLE posts_hidden RENAME TO posts")
+        .await
+        .expect("restore the table");
+    assert_ne!(
+        status, 200,
+        "a dashboard that cannot count must say so rather than render zeros"
+    );
+
+    // And it recovers once the fault is gone.
+    client
+        .get("/admin")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok();
+}
+
+/// The public sidebar renders a bounded number of widgets.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_sidebar_renders_a_bounded_number_of_widgets() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO widgets (sidebar, kind, title, settings, position)
+         SELECT 'primary', 'text', 'Widget ' || lpad(g::text, 3, '0'),
+                '{\"text\": \"Body.\"}'::jsonb, g
+         FROM generate_series(1, 50) AS g",
+    )
+    .await
+    .expect("seed the widgets");
+
+    sign_out(&client);
+    let home = client.get("/").send().await;
+    home.assert_ok();
+    let home = home.text();
+    assert!(home.contains("Widget 001"), "the first widgets render");
+    assert!(
+        !home.contains("Widget 031"),
+        "the sidebar must not render every widget somebody has placed"
+    );
+
+    // The Appearance screen shows the same set, so what an administrator
+    // manages is what visitors see.
+    let screen = client
+        .get("/admin/appearance")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    screen.assert_ok();
+    let screen = screen.text();
+    assert!(screen.contains("Widget 001"));
+    assert!(!screen.contains("Widget 031"));
+}

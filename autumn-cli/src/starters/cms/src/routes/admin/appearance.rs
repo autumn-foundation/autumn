@@ -107,8 +107,14 @@ pub async fn show(
     };
     let last_menu_page = ((menu_total + MENUS_PER_PAGE - 1) / MENUS_PER_PAGE).max(1);
 
-    let mut widgets = repos.widgets.find_by_sidebar("primary".to_owned()).await?;
-    widgets.sort_by_key(|w| (w.position, w.id));
+    // The same bound the public sidebar renders under, so what an administrator
+    // manages here is what visitors actually see.
+    let widgets = repos
+        .with_conn(async |conn| {
+            content::sidebar_widgets(conn, "primary", crate::routes::site::MAX_SIDEBAR_WIDGETS)
+                .await
+        })
+        .await?;
 
     let pages = repos.published_posts("page", 200).await?;
     // Bounded like `pages` above, and for the same reason: this is a
