@@ -6432,70 +6432,27 @@ impl AppBuilder {
         //
         // Ordered as the serving path orders them, so an app with more than one
         // problem reports the same first error either way.
-        // `run()`'s OWN pre-router checks first, in its order: an app with no
-        // routes, or with an unguarded mutating repository API under a
-        // production profile, never reaches router construction at all.
-        if let Err(message) = validate_pre_router_preconditions(&routes, &scoped_groups, &config) {
-            eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {message}");
-            std::process::exit(1);
-        }
-
-        let registered_versions: std::collections::HashSet<&str> =
-            api_versions.iter().map(|av| av.version.as_str()).collect();
-        let preflight = crate::router::reject_unregistered_api_versions(
-            &routes,
-            &scoped_groups,
-            &registered_versions,
-        )
-        .and_then(|()| {
-            crate::router::reject_duplicate_user_routes(
-                &routes,
-                &scoped_groups,
-                &merge_routers,
-                &nest_routers,
-                &declared_routes,
-                &config,
-            )
-        })
-        .and_then(|()| crate::router::validate_openapi_mount_paths(&openapi_config))
-        .and_then(|()| {
-            crate::router::reject_openapi_path_collisions(
-                Some(&openapi_config),
-                &routes,
-                &scoped_groups,
-                &merge_routers,
-                &nest_routers,
-                &config,
-            )
-        });
-
-        // MCP is part of the same preflight, not a separate concern: an app that
-        // mounts MCP at a malformed path, or at one a user/OpenAPI route already
-        // owns, is rejected by `build_router_pre_state` at startup. An export
-        // that skipped these would certify a router that cannot be built — the
-        // exact failure the four rules above exist to prevent, one subsystem
-        // over. Both call the router's own function, so there is still one
-        // definition per rule.
-        #[cfg(feature = "mcp")]
-        let preflight = preflight.and_then(|()| {
-            let Some(runtime) = mcp.as_ref() else {
-                return Ok(());
-            };
-            let path = runtime.mount_path.as_str();
-            crate::router::validate_mcp_mount_path(path).and_then(|()| {
-                crate::router::reject_mcp_path_collisions(
-                    path,
-                    &routes,
-                    &scoped_groups,
-                    &config,
-                    Some(&openapi_config),
-                    &merge_routers,
-                    &nest_routers,
-                )
-            })
-        });
-
-        if let Err(error) = preflight {
+        let mcp_mount_path: Option<&str> = {
+            #[cfg(feature = "mcp")]
+            {
+                mcp.as_ref().map(|rt| rt.mount_path.as_str())
+            }
+            #[cfg(not(feature = "mcp"))]
+            {
+                None
+            }
+        };
+        if let Err(error) = export_preflight(&ExportPreflight {
+            routes: &routes,
+            scoped_groups: &scoped_groups,
+            api_versions: &api_versions,
+            openapi_config: &openapi_config,
+            merge_routers: &merge_routers,
+            nest_routers: &nest_routers,
+            declared_routes: &declared_routes,
+            config: &config,
+            mcp_mount_path,
+        }) {
             eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {error}");
             std::process::exit(1);
         }
@@ -11628,6 +11585,134 @@ const fn apply_mail_builder_overrides(config: &mut AutumnConfig, mount_unsubscri
     if mount_unsubscribe_endpoint {
         config.mail.mount_unsubscribe_endpoint = true;
     }
+}
+
+/// Run the serving path's whole preflight for a no-boot export.
+///
+/// Split out of `run_dump_openapi_mode` for length once it reached nine checks.
+/// Every one of them calls the router's (or `run()`'s) own function rather than
+/// re-deriving its rule: a second copy would drift, and a preflight that
+/// disagreed with the router about what it rejects — in EITHER direction — would
+/// be worse than none.
+///
+/// `mcp_mount_path` is `None` when MCP is not configured, and unused when the
+/// `mcp` feature is off.
+/// Everything [`export_preflight`] needs, borrowed from the builder.
+///
+/// A context struct rather than nine parameters, following `RouterContext` —
+/// which exists for the same reason on the serving side.
+#[cfg(feature = "openapi")]
+struct ExportPreflight<'a> {
+    routes: &'a [Route],
+    scoped_groups: &'a [ScopedGroup],
+    api_versions: &'a [ApiVersion],
+    openapi_config: &'a crate::openapi::OpenApiConfig,
+    merge_routers: &'a [axum::Router<AppState>],
+    nest_routers: &'a [(String, axum::Router<AppState>)],
+    declared_routes: &'a [crate::route_listing::RouteInfo],
+    config: &'a AutumnConfig,
+    /// `None` when MCP is not configured; unused when the `mcp` feature is off.
+    mcp_mount_path: Option<&'a str>,
+}
+
+#[cfg(feature = "openapi")]
+fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
+    let &ExportPreflight {
+        routes,
+        scoped_groups,
+        api_versions,
+        openapi_config,
+        merge_routers,
+        nest_routers,
+        declared_routes,
+        config,
+        // Read only by the `mcp` block below; binding it unconditionally keeps
+        // one destructuring rather than two cfg'd copies of the same pattern.
+        #[cfg_attr(
+            not(feature = "mcp"),
+            expect(unused_variables, reason = "only the `mcp` block reads it")
+        )]
+        mcp_mount_path,
+    } = ctx;
+    // What the ROUTER would see for OpenAPI, resolved once and used by every
+    // mount-sensitive check below, so the three cannot disagree about
+    // whether the endpoint is mounted.
+    let mounted_openapi = config.openapi_runtime.enabled.then_some(openapi_config);
+
+    // `run()`'s OWN pre-router checks first, in its order: an app with no
+    // routes, or with an unguarded mutating repository API under a
+    // production profile, never reaches router construction at all.
+    validate_pre_router_preconditions(routes, scoped_groups, config)?;
+
+    let registered_versions: std::collections::HashSet<&str> =
+        api_versions.iter().map(|av| av.version.as_str()).collect();
+    let preflight = crate::router::reject_unregistered_api_versions(
+        routes,
+        scoped_groups,
+        &registered_versions,
+    )
+    .and_then(|()| {
+        crate::router::reject_duplicate_user_routes(
+            routes,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            declared_routes,
+            config,
+        )
+    })
+    .and_then(|()| {
+        // The `[openapi]` profile gate decides whether the endpoint is
+        // MOUNTED. `run()` hands `None` to the router when it is off, so
+        // neither the path validation nor the collision check runs and an
+        // application route may legitimately occupy `/openapi.json`.
+        // Validating unconditionally made the exporter STRICTER than
+        // startup — rejecting an app that boots fine — which is the same
+        // class of disagreement as being laxer, just pointing the other
+        // way. The document itself is still exported: the gate governs
+        // serving, not whether the contract can be written down.
+        mounted_openapi.map_or(Ok(()), crate::router::validate_openapi_mount_paths)
+    })
+    .and_then(|()| {
+        crate::router::reject_openapi_path_collisions(
+            mounted_openapi,
+            routes,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            config,
+        )
+    });
+
+    // MCP is part of the same preflight, not a separate concern: an app that
+    // mounts MCP at a malformed path, or at one a user/OpenAPI route already
+    // owns, is rejected by `build_router_pre_state` at startup. An export
+    // that skipped these would certify a router that cannot be built — the
+    // exact failure the four rules above exist to prevent, one subsystem
+    // over. Both call the router's own function, so there is still one
+    // definition per rule.
+    #[cfg(feature = "mcp")]
+    let preflight = preflight.and_then(|()| {
+        let Some(path) = mcp_mount_path else {
+            return Ok(());
+        };
+        crate::router::validate_mcp_mount_path(path).and_then(|()| {
+            // The SAME gated value: `reject_mcp_path_collisions` reserves
+            // the OpenAPI paths as claimed GETs, which they are not when the
+            // endpoint is not mounted.
+            crate::router::reject_mcp_path_collisions(
+                path,
+                routes,
+                scoped_groups,
+                config,
+                mounted_openapi,
+                merge_routers,
+                nest_routers,
+            )
+        })
+    });
+
+    preflight.map_err(|error| error.to_string())
 }
 
 /// Every route/config precondition the serving path enforces BEFORE it hands
