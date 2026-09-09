@@ -179,6 +179,11 @@ pub async fn transition_status(
         // without being asked is worse than one that says what is in the way.
         // The editor can trash or move the children first.
         if new_status == "trash" {
+            // Counted under the hierarchy lock and held through the status
+            // update, so a create or re-parent cannot attach a child after the
+            // count and before the commit — which would leave exactly the
+            // orphaned permalink this guard exists to prevent.
+            lock_page_hierarchy(conn).await?;
             let children = live_child_count(conn, post_id).await?;
             if children > 0 {
                 return Err(AutumnError::unprocessable_msg(format!(
@@ -1705,17 +1710,28 @@ pub async fn set_post_parent(
     let Some(post) = post else {
         return Ok(false);
     };
-    if validate_parent(conn, Some(post_id), &post.post_type, parent_id)
-        .await
-        .is_err()
-    {
-        return Ok(false);
-    }
-    diesel::update(posts::table.find(post_id))
-        .set(posts::parent_id.eq(parent_id))
-        .execute(&mut *conn)
-        .await?;
-    Ok(true)
+
+    // The lock and the transaction belong to *this function*, not to its
+    // callers. The editor's re-parenting takes them and the importer's did not,
+    // so an import making A a child of B while an editor made B a child of A
+    // could commit a cycle — and both pages then resolve nowhere, because page
+    // resolution walks down from a root. Owning them here is what stops the
+    // next caller forgetting, which is how this gap appeared.
+    conn.transaction(async move |conn| {
+        lock_page_hierarchy(conn).await?;
+        if validate_parent(conn, Some(post_id), &post.post_type, parent_id)
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+        diesel::update(posts::table.find(post_id))
+            .set(posts::parent_id.eq(parent_id))
+            .execute(conn)
+            .await?;
+        Ok::<_, AutumnError>(true)
+    })
+    .await
 }
 
 /// Delete a comment and rebuild the post's approved-comment counter — in one
@@ -1923,6 +1939,29 @@ pub async fn populated_terms(
 /// in WordPress's convention for meta the UI does not show.
 pub const IMPORT_SOURCE_SLUG_KEY: &str = "_import_source_slug";
 
+/// Record which file slug an imported row came from.
+///
+/// Takes a connection so it can join the transaction that finishes the rest of
+/// the import for that post: written separately, a failure left an *unmarked*
+/// draft, which the next run reads as unrelated local content and skips
+/// forever. Marked-and-unfinished is recoverable; unmarked-and-unfinished is
+/// not.
+pub async fn record_import_source(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    source_slug: &str,
+) -> AutumnResult<()> {
+    diesel::insert_into(post_meta::table)
+        .values((
+            post_meta::post_id.eq(post_id),
+            post_meta::meta_key.eq(IMPORT_SOURCE_SLUG_KEY),
+            post_meta::meta_value.eq(source_slug),
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Every `(post_type, source slug)` a previous import recorded, and the row it
 /// produced.
 ///
@@ -1979,6 +2018,47 @@ pub async fn terms_page(
 /// discarded in Rust. The bound is generous enough that no real discussion
 /// reaches it, and the renderer says so when one does.
 pub const MAX_THREAD_COMMENTS: i64 = 200;
+
+/// One page of a moderation queue, newest first, ordered and bounded in SQL.
+///
+/// The generated finder loads every row of the status and sorts in memory. A
+/// pending queue is exactly the thing an attacker can grow — guest comments are
+/// on by default and the throttle bounds the rate, not the total — so the
+/// screen needed to *clear* spam was the one that became unusable first.
+pub async fn moderation_queue_page(
+    conn: &mut AsyncPgConnection,
+    status: &str,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<Comment>> {
+    Ok(comments::table
+        .filter(comments::status.eq(status))
+        .order((comments::created_at.desc(), comments::id.desc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(Comment::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// The posts these comments are on, in one query rather than one per comment.
+pub async fn posts_for_comments(
+    conn: &mut AsyncPgConnection,
+    comments: &[Comment],
+) -> AutumnResult<std::collections::HashMap<i64, Post>> {
+    let ids: Vec<i64> = comments.iter().map(|comment| comment.post_id).collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(posts::table
+        .filter(posts::id.eq_any(ids))
+        .select(Post::as_select())
+        .load(conn)
+        .await?
+        .into_iter()
+        .map(|post| (post.id, post))
+        .collect())
+}
 
 /// A post's approved comments, oldest first, bounded.
 ///

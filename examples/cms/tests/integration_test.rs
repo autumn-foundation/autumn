@@ -5335,3 +5335,65 @@ async fn an_import_does_not_reparent_a_local_term() {
         "the import must not have reparented the local term"
     );
 }
+
+/// The moderation queue is bounded and paginated.
+///
+/// It loaded every row of the selected status, sorted in memory, and looked the
+/// post up once per comment — so the screen needed to clear a spam flood was
+/// the first one to stop working under it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_moderation_queue_paginates() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Busy", "Body.", "publish").await;
+
+    // Sixty pending guest comments, written directly — the point is the queue's
+    // shape, not the submission path, and the throttle would bound the rate.
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, author_name, body, status, created_at) \
+             SELECT {post_id}, 'Guest', 'pending ' || n, 'pending', now() - (n || ' minutes')::interval \
+             FROM generate_series(1, 60) AS n"
+        ),
+    )
+    .await
+    .expect("seed the queue");
+
+    let first = client
+        .get("/admin/comments?status=pending")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    // Newest first, bounded at 50: `pending 1` is the newest, `pending 60` the
+    // oldest and off this page.
+    assert!(
+        first.contains("pending 1<"),
+        "the newest comment is on page one"
+    );
+    assert!(
+        !first.contains("pending 60<"),
+        "the oldest must not be on page one — the queue is unbounded:\n{}",
+        &first[..first.len().min(2000)]
+    );
+
+    let second = client
+        .get("/admin/comments?status=pending&page=2")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(second.contains("pending 60<"), "the rest is on page two");
+    assert!(!second.contains("pending 1<"), "pages must not overlap");
+
+    // The post title still shows, so the batched lookup replaced the per-row
+    // one rather than dropping it.
+    assert!(
+        first.contains("Busy"),
+        "the queue names the post being discussed"
+    );
+}

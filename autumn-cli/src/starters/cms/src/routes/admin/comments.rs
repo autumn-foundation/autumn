@@ -14,7 +14,7 @@ use crate::capabilities::Capability;
 use crate::content;
 use crate::models::Comment;
 use crate::plugins::{Action, do_action};
-use crate::repositories::{CommentRepository as _, PostRepository as _};
+use crate::repositories::CommentRepository as _;
 use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
@@ -32,6 +32,8 @@ const QUEUES: &[(&str, &str)] = &[
 pub struct QueueFilter {
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub page: Option<usize>,
 }
 
 #[get("/admin/comments")]
@@ -47,16 +49,24 @@ pub async fn list(
         .clone()
         .unwrap_or_else(|| "pending".to_owned());
 
-    let mut rows: Vec<Comment> = repos.comments.find_by_status(status.clone()).await?;
-    rows.sort_by_key(|comment| std::cmp::Reverse(comment.created_at));
-
-    // The post each comment is on, so the queue shows what is being discussed
-    // rather than a bare id.
-    let mut entries = Vec::with_capacity(rows.len());
-    for comment in &rows {
-        let post = repos.posts.find_by_id(comment.post_id).await.ok().flatten();
-        entries.push((comment.clone(), post));
-    }
+    // Ordered, bounded and joined in SQL. The generated finder loaded every row
+    // of the status and sorted in memory, and the post lookup below ran once
+    // per comment — so the screen needed to clear a spam flood was the one that
+    // stopped working first.
+    let per_page = 50_i64;
+    let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
+    let entries = {
+        let mut conn = repos.conn().await?;
+        let rows =
+            content::moderation_queue_page(&mut conn, &status, (page - 1) * per_page, per_page)
+                .await?;
+        let posts = content::posts_for_comments(&mut conn, &rows).await?;
+        let entries: Vec<(Comment, Option<crate::models::Post>)> = rows
+            .iter()
+            .map(|comment| (comment.clone(), posts.get(&comment.post_id).cloned()))
+            .collect();
+        entries
+    };
 
     let mut counts = Vec::new();
     for (value, label) in QUEUES {

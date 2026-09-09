@@ -16,8 +16,7 @@ use crate::content;
 use crate::models::{NewPost, NewTerm};
 use crate::plugins::{Action, do_action};
 use crate::repositories::{
-    AttachmentRepository as _, PostMetaRepository as _, PostRepository as _, TermRepository as _,
-    UserRepository as _,
+    AttachmentRepository as _, PostRepository as _, TermRepository as _, UserRepository as _,
 };
 use crate::require_capability;
 
@@ -674,17 +673,6 @@ pub async fn import(
             })
             .await?;
 
-        // The slug the file named, so a re-run recognises this row even when
-        // the allocator stored it under a suffix.
-        repos
-            .post_meta
-            .save(&crate::models::NewPostMeta {
-                post_id: created.id,
-                meta_key: content::IMPORT_SOURCE_SLUG_KEY.to_owned(),
-                meta_value: post.slug.clone(),
-            })
-            .await?;
-
         let term_ids = resolve_import_terms(&repos, post).await?;
         // The terms and the transition commit together. They were separate
         // transactions after an already-committed insert, so a failure in
@@ -699,10 +687,18 @@ pub async fn import(
         // which the next run treats as an ordinary slug collision and re-imports
         // beside — visible, rather than silently skipped.
         let wanted_status = post.status.clone();
+        let source_slug = post.slug.clone();
         let transitioned = repos
             .with_conn(async |conn| {
                 use diesel_async::AsyncConnection as _;
                 conn.transaction(async move |conn| {
+                    // The marker joins this transaction. Writing it first, on
+                    // its own, meant a failure left an *unmarked* draft — which
+                    // the next run reads as unrelated local content and skips
+                    // forever, so its terms, status and ancestry are never
+                    // restored. Marked-and-unfinished is recoverable;
+                    // unmarked-and-unfinished is not.
+                    content::record_import_source(conn, created.id, &source_slug).await?;
                     content::set_post_terms(conn, created.id, term_ids).await?;
                     if wanted_status != "draft" {
                         content::transition_status(conn, created.id, &wanted_status, Some(user.id))
@@ -713,7 +709,26 @@ pub async fn import(
                 })
                 .await
             })
-            .await?;
+            .await;
+
+        // The row is removed if any of that failed, so the file is never left
+        // with an unmarked half-import that the next run cannot recognise. The
+        // insert cannot join the transaction — `save_post_with_unique_slug`
+        // retries on its own connection — so unwinding is what makes each
+        // post's import all-or-nothing.
+        let transitioned = match transitioned {
+            Ok(transitioned) => transitioned,
+            Err(error) => {
+                if let Err(cleanup) = repos.posts.delete_by_id(created.id).await {
+                    autumn_web::reexports::tracing::warn!(
+                        %cleanup,
+                        post_id = created.id,
+                        "failed to remove a post whose import could not be completed"
+                    );
+                }
+                return Err(error);
+            }
+        };
         if transitioned {
             transitioned_ids.push(created.id);
         }
