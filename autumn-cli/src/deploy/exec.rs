@@ -65,6 +65,7 @@
 //! before cutover (AC-3).
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -824,6 +825,7 @@ pub fn first_deploy_ops(
     // Keep the SQLite data file out of the release dir (#1909). Immediately after
     // `prepare-dirs` and before the migrate one-shot, so the migration and the app
     // open the same file.
+    ops.extend(sqlite_data_dir_guard_op(cfg).map(DeployOp::Run));
     ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
@@ -1021,6 +1023,7 @@ pub fn cutover_ops(
     )));
     // Keep the SQLite data file out of the release dir (#1909) — same position as
     // on the first-deploy path, and still before the migrate one-shot.
+    ops.extend(sqlite_data_dir_guard_op(cfg).map(DeployOp::Run));
     ops.extend(sqlite_data_link_op(cfg, &release_dir).map(DeployOp::Run));
     ops.push(DeployOp::UploadFile {
         label: "upload-binary",
@@ -1380,6 +1383,7 @@ pub fn rollback_ops(
     // unit is written or started. A release deployed BEFORE the file was adopted
     // into `shared/` no longer holds one at that path, so without this the
     // rolled-back release would boot against a fresh, empty database.
+    ops.extend(sqlite_data_dir_guard_op(cfg).map(DeployOp::Run));
     ops.extend(sqlite_data_link_op(cfg, &target.release_dir).map(DeployOp::Run));
     ops.extend([
         // Re-render the target slot's unit BEFORE bringing it up, so rollback can
@@ -1664,7 +1668,8 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     "proxy-install",
     "proxy-restart-if-changed",
     "prepare-dirs",
-    // #1909: the SQLite data-file link, emitted only for a SQLite app.
+    // #1909: the SQLite data-file ops, emitted only for a SQLite app.
+    "check-data-dir",
     "link-data",
     "upload-binary",
     "upload-config",
@@ -1741,57 +1746,76 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
 
 /// The op that makes a `SQLite` data file survive a deploy (issue #1909), or
 /// `None` when there is nothing to keep (a Postgres app, or an absolute path
-/// the deploy does not manage).
+/// the deploy does not relocate).
 ///
 /// A slot unit's `WorkingDirectory` is the release dir, so a relative
 /// `sqlite://app.db` resolves inside a directory that is replaced on every
 /// deploy and deleted by retention. So the real file lives under `shared/data`,
-/// and the release is linked at the path the app resolves. This op creates that
-/// directory; `shared/` is never pruned and both slots see it. `SQLite` follows
-/// the symlink when it names the `-wal`/`-shm`/`-journal` sidecars, so they land
+/// and the release is linked at the path the app resolves. `SQLite` follows the
+/// symlink when it names the `-wal`/`-shm`/`-journal` sidecars, so they land
 /// beside the shared file too.
 ///
 /// It runs immediately after `prepare-dirs`, and so BEFORE the migrate one-shot.
 /// A migration that ran first would apply to a file in the release dir that the
 /// app never opens.
 ///
-/// Three steps, in order:
+/// # The states, decided together
 ///
-/// A **dangling** symlink at `current` counts as occupied too — unless it points
-/// at the shared file, which is the deploy's own link before the migration
-/// creates that file. A link to an operator database on a temporarily
-/// unavailable mount fails `-e`, and treating that as "nothing here" linked past
-/// it, migrated an empty database into place, and orphaned their data when the
-/// mount came back.
+/// Guards added one at a time did not converge here (#2589 items 8, 10, 17):
+/// each new guard needed an exemption, and each exemption was a state nobody had
+/// enumerated. So the two questions are asked ONCE, in this order, over the whole
+/// state space rather than per-case:
 ///
-/// 1. **Refuse to relocate a live database.** An app deployed before this
-///    contract holds a real file in the release that is still serving. Moving it
-///    is not safe while that app runs: `SQLite` derives the `-wal` name from the
-///    path it resolved, so a connection opened before the move and one opened
-///    after would use two different write-ahead logs for one database. There is
-///    also no atomic move — between the `mv` and the link, a new pooled
-///    connection creates an empty database at the old path. So the deploy stops
-///    and tells the operator to stop the app and move the file once, by hand.
+/// **1. Who owns the file at `current/<db>`?** Only two answers let a deploy
+/// proceed — nothing is there, or what is there is a symlink this deploy wrote,
+/// pointing at the shared file. Anything else is a database the deploy did not
+/// put there, and linking past it would serve an empty one and orphan theirs:
 ///
-///    A `current` that is a **symlink** is refused on the same terms. It is not
-///    tested for, because it cannot be anything else: the shared file is absent
-///    in this branch, so a link pointing AT it dangles and fails `-e`. Any link
-///    that gets here points at a database the operator keeps elsewhere, and
-///    linking past it would serve an empty one and orphan theirs.
-/// 2. **Set aside a stale real file.** A rollback target from before that
-///    migration still holds its own database. It is moved beside the shared file
-///    as `<file>.superseded`, under `shared/`, where retention never reaches it.
-///    The op refuses rather than overwrite an existing one, so it can never
-///    destroy a database.
-/// 3. **Link this release.**
+/// | `current/<db>` | |
+/// | --- | --- |
+/// | absent | proceed |
+/// | symlink → the shared file | proceed — already adopted |
+/// | symlink → anywhere else | refuse: operator-managed database |
+/// | a real file | refuse: live pre-#1909 database |
 ///
-/// Every interpolated path is shell-quoted. Each `mv` carries `|| exit 1`: a
-/// silently failed one leaves a dangling link, and the app then creates an empty
-/// database.
+/// This is deliberately NOT gated on the shared file being absent. That gate
+/// made the two refusals unreachable whenever the shared file happened to exist,
+/// so a legacy `current/<db>` pointing at a different database was linked past in
+/// silence and the app served the shared one after cutover (#2589 item 8).
+///
+/// **2. Should the shared file be there?** A missing shared file is either a
+/// first deploy or a mounted volume that is gone, and `current` cannot tell them
+/// apart — on both, the link exists and dangles. The distinguishing signal is
+/// [`ResolvedDeployConfig::sqlite_data_marker_file`], written once the database
+/// is known to exist and kept in `shared/`, outside any `shared/data` mount:
+///
+/// | shared file | marker | |
+/// | --- | --- | --- |
+/// | present | either | proceed, and record the marker |
+/// | absent | absent | proceed — never created, a genuine first deploy |
+/// | absent | present | refuse: it existed once and is gone |
+///
+/// Without that distinction the deploy recreated the directory under the absent
+/// mount, the migration opened the dangling link under `SQLite`'s
+/// create-on-missing mode, and a fresh empty database was served while the real
+/// one was orphaned (#2589 item 17).
+///
+/// # Then
+///
+/// **Set aside a stale real file.** A rollback target from before the migration
+/// still holds its own database at the release path. It is moved beside the
+/// shared file as `<file>.superseded`, under `shared/`, where retention never
+/// reaches it. An existing one is refused rather than overwritten, so the op can
+/// never destroy a database.
+///
+/// **Link this release.**
+///
+/// Every interpolated path is shell-quoted, and every step gates the next.
 #[must_use]
 pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Option<RemoteCommand> {
-    let relative = cfg.sqlite_data_file.as_ref()?;
+    let relative = cfg.relative_sqlite_data_file()?;
     let shared = cfg.shared_sqlite_data_file()?;
+    let marker = cfg.sqlite_data_marker_file();
     let superseded = format!("{shared}.superseded");
     let shared_parent = parent_dir(&shared);
     let in_release = format!("{release_dir}/{relative}");
@@ -1808,78 +1832,61 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
          {shared} to survive a deploy, and moving it while the app runs is not safe, so \
          this deploy stopped."
     );
-    // The recovery line is a command the operator PASTES AND RUNS, so its own
-    // operands must be shell-quoted too. Quoting only the outer `echo` makes the
-    // text safe to print, not safe to run: a path holding `$(…)` would execute on
-    // paste, and one holding a space would split into two `mv` arguments.
-    //
-    // `&&`, never `;`: a `systemctl stop` can fail (stop timeout, no permission,
-    // a process that will not die). Sequenced with `;` the `mv` runs anyway and
-    // relocates a LIVE database — the split-WAL loss this refusal exists to
-    // prevent. Each step gates the next.
-    //
-    // Sidecars are named, not globbed: `{file}*` also matches an unrelated
-    // `{file}.backup` and would move it, possibly over a file of that name
-    // already in the shared dir. The loop runs last, so a missing sidecar
-    // leaving it non-zero gates nothing.
-    let recovery = format!(
-        "Run this on the host once, then deploy again: systemctl stop \
-         {blue_q} {green_q} && mv {current_q} {shared_q} && \
-         for s in -wal -shm -journal; do [ -e {current_q}$s ] && \
-         mv {current_q}$s {shared_q}$s; done",
-        blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
-        green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
-        current_q = shell_quote(&current),
-        shared_q = shell_quote(&shared),
-    );
+    let recovery = adoption_recovery(service, &current, &shared, MoveSource::TheLinkPathItself);
     // A `current` that is a SYMLINK is refused too, and needs its own message:
     // it points at a database the operator manages elsewhere, and `mv` on the
     // link would move the link, not that database.
     let linked_refusal = format!(
-        "autumn deploy: {current} is a symlink to a SQLite database outside \
-         {shared}. The data file must live there to survive a deploy, so this \
-         deploy stopped rather than link past it and serve an empty database."
+        "autumn deploy: {current} is a symlink to a SQLite database that is not \
+         {shared}. The data file must live there to survive a deploy, so this deploy \
+         stopped rather than link past it and serve a different database."
     );
-    // Each file moves to its EXACT shared name, not merely into the shared
-    // directory: the link target may carry a different basename, and landing the
-    // database next to the name the deploy expects rather than at it leaves the
-    // next deploy creating an empty one — the very loss this refusal prevents.
-    let linked_recovery = format!(
-        "Run this on the host once, then deploy again: systemctl stop \
-         {blue_q} {green_q} && src=$(readlink -f {current_q}) && \
-         mv \"$src\" {shared_q} && rm -f {current_q} && \
-         for s in -wal -shm -journal; do [ -e \"$src$s\" ] && \
-         mv \"$src$s\" {shared_q}$s; done",
-        blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE))),
-        green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN))),
-        current_q = shell_quote(&current),
-        shared_q = shell_quote(&shared),
+    let linked_recovery = adoption_recovery(service, &current, &shared, MoveSource::WhatItPointsAt);
+    // The marker says the database existed; the file says it does not. Never
+    // "probably a first deploy" — creating a fresh one here is the loss.
+    let missing_refusal = format!(
+        "autumn deploy: the SQLite database {shared} is missing, but {marker} records that \
+         it existed. The volume holding {shared_parent} is most likely not mounted, and \
+         continuing would create a fresh empty database and orphan the real one, so this \
+         deploy stopped."
+    );
+    let missing_recovery = format!(
+        "Mount the volume holding {shared} and deploy again. If the database was \
+         deliberately removed and a new one should be created, remove {marker} first."
     );
     let occupied =
         format!("autumn deploy: refusing to move {in_release} aside: {superseded} already exists");
 
     Some(RemoteCommand::new(
         "link-data",
+        // Question 1 is the `current/<db>` ownership block; question 2 is the
+        // shared-file/marker block. Question 2 is asked BEFORE the `mkdir`, which
+        // would otherwise create a directory over an absent mount and hide the
+        // very state it refuses on.
         format!(
-            "mkdir -p {shared_parent_q} {release_parent_q} && \
-             if [ ! -e {shared_q} ] && {{ [ -e {current_q} ] || [ -L {current_q} ]; }} && \
+            "if {{ [ -e {current_q} ] || [ -L {current_q} ]; }} && \
              ! {{ [ -L {current_q} ] && [ \"$(readlink {current_q})\" = {shared_q} ]; }}; then \
              if [ -L {current_q} ]; then \
              echo {linked_refusal_q} >&2; echo {linked_recovery_q} >&2; \
              else echo {refusal_q} >&2; echo {recovery_q} >&2; fi; exit 1; \
              fi && \
+             if [ -e {shared_q} ]; then : > {marker_q} || exit 1; \
+             elif [ -e {marker_q} ]; then \
+             echo {missing_refusal_q} >&2; echo {missing_recovery_q} >&2; exit 1; fi && \
+             mkdir -p {shared_parent_q} {release_parent_q} && \
              if [ -e {in_release_q} ] && [ ! -L {in_release_q} ]; then \
              if [ -e {superseded_q} ]; then echo {occupied_q} >&2; exit 1; fi; \
-             mv -f {in_release_q} {superseded_q} || exit 1; \
              for s in -wal -shm -journal; do \
              if [ -e {in_release_q}$s ]; then \
              mv -f {in_release_q}$s {superseded_q}$s || exit 1; fi; \
              done; \
+             mv -f {in_release_q} {superseded_q} || exit 1; \
              fi && \
              rm -f {in_release_q} && ln -s {shared_q} {in_release_q}",
             shared_parent_q = shell_quote(&shared_parent),
             release_parent_q = shell_quote(&release_parent),
             shared_q = shell_quote(&shared),
+            marker_q = shell_quote(&marker),
             superseded_q = shell_quote(&superseded),
             current_q = shell_quote(&current),
             in_release_q = shell_quote(&in_release),
@@ -1887,7 +1894,135 @@ pub fn sqlite_data_link_op(cfg: &ResolvedDeployConfig, release_dir: &str) -> Opt
             recovery_q = shell_quote(&recovery),
             linked_refusal_q = shell_quote(&linked_refusal),
             linked_recovery_q = shell_quote(&linked_recovery),
+            missing_refusal_q = shell_quote(&missing_refusal),
+            missing_recovery_q = shell_quote(&missing_recovery),
             occupied_q = shell_quote(&occupied),
+        ),
+    ))
+}
+
+/// Which file the printed adoption recovery moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveSource {
+    /// `current/<db>` is a real database: move it.
+    TheLinkPathItself,
+    /// `current/<db>` is a symlink: move what it resolves to, then drop the link.
+    /// `mv` on the link would move the link, not the database.
+    WhatItPointsAt,
+}
+
+/// The one-time manual adoption an operator pastes and runs, for both refusals.
+///
+/// # Why sidecars move first, one gated step each
+///
+/// `shared/data/<file>` existing is what makes the NEXT deploy skip the adoption
+/// refusal. So the database must be the LAST thing to move: if a sidecar move
+/// fails, the database is still at its old path, the refusal fires again, and a
+/// retry resumes. Moving the database first and then looping over the sidecars
+/// strands the `-wal` — the next deploy proceeds and the app starts without every
+/// frame it held (#2589 item 10).
+///
+/// Each sidecar is therefore its own `&&`-gated step rather than a `for` loop: a
+/// loop's status is its LAST iteration's, so a failure in the first is invisible
+/// to whatever follows — which is exactly how that invariant was lost.
+///
+/// `&&` throughout, and never `exit`: this is pasted into an interactive shell,
+/// where `exit` would close the operator's session. A failed `systemctl stop`
+/// (stop timeout, no permission, a process that will not die) must stop the
+/// chain, because relocating a LIVE database is the split-WAL loss the refusal
+/// exists to prevent.
+///
+/// Sidecars are named, never globbed: `{file}*` also matches an unrelated
+/// `{file}.backup` and would move it, possibly over a file of that name already
+/// in the shared dir.
+///
+/// Each file moves to its EXACT shared name, not merely into the shared
+/// directory: the link target may carry a different basename, and landing the
+/// database next to the name the deploy expects rather than at it leaves the next
+/// deploy creating an empty one.
+fn adoption_recovery(service: &str, current: &str, shared: &str, source: MoveSource) -> String {
+    let blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE)));
+    let green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN)));
+    let current_q = shell_quote(current);
+    let shared_q = shell_quote(shared);
+    // The database to move, as one shell word. For a symlink it is resolved
+    // first, into `$src`, because `mv` on a link moves the link.
+    let (resolve, src) = match source {
+        MoveSource::TheLinkPathItself => (String::new(), current_q.clone()),
+        MoveSource::WhatItPointsAt => (
+            format!("src=$(readlink -f {current_q}) && "),
+            "\"$src\"".to_owned(),
+        ),
+    };
+    let mut sidecars = String::new();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        // `[ ! -e X ] || mv X Y` — absent is success, present must move
+        // successfully, and either way the result gates the next step.
+        write!(
+            sidecars,
+            "{{ [ ! -e {src}{suffix} ] || mv {src}{suffix} {shared_q}{suffix}; }} && "
+        )
+        .expect("writing to a String cannot fail");
+    }
+    // The link itself is removed last of all, after the database has landed: a
+    // failure before that leaves the refusal firing on an unchanged layout.
+    let cleanup = match source {
+        MoveSource::TheLinkPathItself => String::new(),
+        MoveSource::WhatItPointsAt => format!(" && rm -f {current_q}"),
+    };
+    format!(
+        "Run this on the host once, then deploy again: systemctl stop {blue_q} {green_q} && \
+         {resolve}{sidecars}mv {src} {shared_q}{cleanup}"
+    )
+}
+
+/// Verify on the HOST that an operator-managed absolute `SQLite` database is not
+/// inside the releases directory (issue #1909, #2589 item 13), or `None` when
+/// there is none to check.
+///
+/// `classify_sqlite_data_file` answers this locally and lexically, which is the
+/// only thing it CAN do — the path names a file on the deploy target and this
+/// process cannot stat it. That leaves one hole: a symlinked `app_dir`
+/// (`/srv/autumn/app -> /mnt/apps/app`) whose database URL uses the RESOLVED
+/// spelling. The text compare calls the file external and grades it durable,
+/// while the prune walks `/srv/autumn/app/releases` to the same inodes and
+/// deletes it.
+///
+/// No local computation can close that — so this asks the host, which can
+/// `readlink -f` both sides. It runs beside `link-data`, before anything is
+/// uploaded or pruned, so a refusal costs nothing.
+///
+/// Directories are resolved, not the database file itself: the file may not
+/// exist yet, and `readlink -f` on a missing path still resolves its existing
+/// prefix, so an absent database grades the same as a present one.
+#[must_use]
+pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
+    let path = cfg.persistent_sqlite_data_file()?;
+    let app_dir = &cfg.app_dir;
+    let refusal = format!(
+        "autumn deploy: the SQLite database {path} resolves to a path inside the deploy's \
+         own app directory ({app_dir}), where only `shared/` survives: `releases/` is \
+         replaced on every deploy and deleted by release retention. Only the host can see \
+         this, because `{app_dir}` resolves elsewhere there. Move the database to {}, or \
+         outside {app_dir} altogether.",
+        cfg.shared_data_dir()
+    );
+    Some(RemoteCommand::new(
+        "check-data-dir",
+        // The same rule `classify_sqlite_data_file` applies lexically — inside
+        // the app dir but outside `shared/` — re-asked where both sides can
+        // actually be resolved. `readlink -f` falls back to the literal spelling
+        // so a path that cannot be resolved at all is judged as written.
+        format!(
+            "app=$(readlink -f {app_dir_q} 2>/dev/null || printf '%s' {app_dir_q}); \
+             db=$(readlink -f {db_parent_q} 2>/dev/null || printf '%s' {db_parent_q}); \
+             case \"$db\" in \
+             \"$app/shared\"|\"$app/shared/\"*) : ;; \
+             \"$app\"|\"$app/\"*) echo {refusal_q} >&2; exit 1 ;; \
+             esac",
+            app_dir_q = shell_quote(app_dir),
+            db_parent_q = shell_quote(&parent_dir(path)),
+            refusal_q = shell_quote(&refusal),
         ),
     ))
 }
@@ -3666,6 +3801,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::super::SqliteDataPlacement;
     use super::test_support::{RecordedCall, RecordingExecutor};
     use super::*;
 
@@ -3683,7 +3819,7 @@ mod tests {
     /// [`resolved`] plus the #1909 `SQLite` data-file contract: a relative
     /// `sqlite://app.db`, which is the shape that needs relocating.
     fn resolved_sqlite() -> ResolvedDeployConfig {
-        resolved().with_sqlite_data_file(Some("app.db".to_owned()))
+        resolved().with_sqlite_data_placement(SqliteDataPlacement::Relative("app.db".to_owned()))
     }
 
     const RELEASE_ID: &str = "20260714T120000Z";
@@ -7413,17 +7549,23 @@ mod tests {
     #[test]
     fn the_data_link_op_refuses_to_relocate_a_live_database() {
         let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
-        // The refusal fires when the shared file is absent and `current`
-        // resolves to something. `-L` then only picks WHICH message — it must
-        // not gate the refusal, or a legacy symlinked database is linked past.
+        // The refusal fires whenever `current` holds a database this deploy did
+        // not put there. `-L` only picks WHICH message.
+        //
+        // The shared file must NOT gate it. Gating on `[ ! -e shared ]` made both
+        // refusals unreachable once that file existed, so a legacy `current`
+        // pointing at a different database was linked past in silence and the app
+        // served the shared one after cutover (#2589 item 8).
         assert!(
             op.shell
-                .contains("[ ! -e '/srv/autumn/myapp/shared/data/app.db' ]")
-                && op
-                    .shell
-                    .contains("[ -e '/srv/autumn/myapp/current/app.db' ]"),
-            "the refusal must fire when the shared file is absent and the current \
-             release still holds a database: {}",
+                .contains("[ -e '/srv/autumn/myapp/current/app.db' ]"),
+            "the refusal must fire when the current release still holds a database: {}",
+            op.shell
+        );
+        assert!(
+            !op.shell
+                .contains("if [ ! -e '/srv/autumn/myapp/shared/data/app.db' ] &&"),
+            "the shared file existing must not disable the refusal: {}",
             op.shell
         );
         assert!(
@@ -7463,7 +7605,9 @@ mod tests {
     /// the deploy host.
     #[test]
     fn the_data_link_op_never_expands_a_configured_path() {
-        let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
+        let hostile = resolved().with_sqlite_data_placement(SqliteDataPlacement::Relative(
+            "$(touch pwned).db".to_owned(),
+        ));
         let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
         // The hazard is a shell-quoted path sitting in an expandable position,
         // not the double-quote character itself. Two constructs legitimately
@@ -7496,8 +7640,10 @@ mod tests {
                 op.shell
             );
         }
-        // `$s`, our own loop variable, is the only thing left expandable.
-        assert!(op.shell.contains("for s in -wal -shm -journal"));
+        // `$s`, our own loop variable, is the only thing left expandable, and it
+        // now appears ONLY in the op body: the printed recoveries gate each
+        // sidecar separately so an early failure cannot be skipped past.
+        assert_eq!(op.shell.matches("for s in -wal -shm -journal").count(), 1);
     }
 
     /// Is byte `index` inside a single-quoted word?
@@ -7536,7 +7682,9 @@ mod tests {
     /// its escaped form, which is what the outer quote turns it into.
     #[test]
     fn the_data_link_op_prints_a_recovery_command_that_is_safe_to_paste() {
-        let hostile = resolved().with_sqlite_data_file(Some("$(touch pwned).db".to_owned()));
+        let hostile = resolved().with_sqlite_data_placement(SqliteDataPlacement::Relative(
+            "$(touch pwned).db".to_owned(),
+        ));
         let op = sqlite_data_link_op(&hostile, RELEASE_DIR).expect("linked");
         assert!(
             op.shell
@@ -7547,7 +7695,8 @@ mod tests {
 
         // A path holding a space must reach `mv` as ONE argument. The `*` stays
         // outside the quotes so it still globs the sidecars.
-        let spaced = resolved().with_sqlite_data_file(Some("app data.db".to_owned()));
+        let spaced = resolved()
+            .with_sqlite_data_placement(SqliteDataPlacement::Relative("app data.db".to_owned()));
         let op = sqlite_data_link_op(&spaced, RELEASE_DIR).expect("linked");
         assert!(
             op.shell
@@ -7571,8 +7720,7 @@ mod tests {
         // until the migration creates that file.
         assert!(
             op.shell.contains(
-                "if [ ! -e '/srv/autumn/myapp/shared/data/app.db' ] && \
-                 { [ -e '/srv/autumn/myapp/current/app.db' ] || \
+                "if { [ -e '/srv/autumn/myapp/current/app.db' ] || \
                  [ -L '/srv/autumn/myapp/current/app.db' ]; }"
             ),
             "a dangling `current` symlink must count as occupied: {}",
@@ -7596,7 +7744,7 @@ mod tests {
         // database, so the real-file recovery would be wrong here.
         assert!(
             op.shell
-                .contains("is a symlink to a SQLite database outside"),
+                .contains("is a symlink to a SQLite database that is not"),
             "the symlink case needs its own refusal: {}",
             op.shell
         );
@@ -7604,61 +7752,403 @@ mod tests {
         // shared directory keeps a differently-named target's basename, and the
         // next deploy then creates an empty database at the name it does expect.
         assert!(
-            op.shell.contains(
-                r#"src=$(readlink -f '\''/srv/autumn/myapp/current/app.db'\'') && mv "$src" '\''/srv/autumn/myapp/shared/data/app.db'\''"#
-            ),
+            op.shell
+                .contains(r"src=$(readlink -f '\''/srv/autumn/myapp/current/app.db'\'') && ")
+                && op
+                    .shell
+                    .contains(r#"mv "$src" '\''/srv/autumn/myapp/shared/data/app.db'\''"#),
             "the symlink recovery must move the target to the exact shared path: {}",
             op.shell
         );
-        // Sidecars follow it, each to the matching shared name.
-        assert!(
-            op.shell.contains(
-                r#"do [ -e "$src$s" ] && mv "$src$s" '\''/srv/autumn/myapp/shared/data/app.db'\''$s"#
-            ),
-            "each sidecar must move to the matching shared name: {}",
-            op.shell
-        );
-    }
-
-    /// Both printed recoveries must GATE the move on the stop succeeding, and
-    /// must name the sidecars instead of globbing.
-    ///
-    /// `systemctl stop` can fail — a stop timeout, no permission, a process that
-    /// will not die. Sequenced with `;` the `mv` runs regardless and relocates a
-    /// LIVE database, which is the split-WAL loss the refusal exists to prevent.
-    /// And `<file>*` also matches an unrelated `<file>.backup`, moving it and
-    /// possibly overwriting a file of that name already in the shared dir.
-    #[test]
-    fn both_recoveries_gate_the_move_on_the_stop_and_never_glob() {
-        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
-        // One `echo` word per line, so the operand quoting appears escaped.
-        for line in ["systemctl stop", "readlink -f"] {
-            assert!(op.shell.contains(line), "expected {line} in: {}", op.shell);
-        }
-        // Every printed `systemctl stop` gates what follows with `&&`, never `;`.
-        for (index, _) in op.shell.match_indices("systemctl stop") {
-            let rest = op.shell.get(index..).unwrap_or_default();
-            let gate = rest.find("&&").unwrap_or(usize::MAX);
-            let seq = rest.find(';').unwrap_or(usize::MAX);
+        // Sidecars PRECEDE it, each to the matching shared name and each gating
+        // the next — see `both_recoveries_move_the_sidecars_before_the_database`
+        // for why the ordering is the load-bearing part.
+        for suffix in ["-wal", "-shm", "-journal"] {
             assert!(
-                gate < seq,
-                "the stop must gate the move with `&&` before any `;`: {}",
+                op.shell.contains(&format!(
+                    r#"{{ [ ! -e "$src"{suffix} ] || mv "$src"{suffix} '\''/srv/autumn/myapp/shared/data/app.db'\''{suffix}; }} && "#
+                )),
+                "{suffix} must move to the matching shared name, gating what follows: {}",
                 op.shell
             );
         }
-        // Neither recovery globs the database name.
-        assert!(
-            !op.shell.contains("app.db'\''*") && !op.shell.contains("app.db*"),
-            "sidecars must be named, not globbed: {}",
-            op.shell
-        );
-        // Both name the three real sidecar suffixes instead.
+    }
+
+    /// Both printed recoveries must move every sidecar BEFORE the database, with
+    /// each step gating the next, and must never glob or `exit`.
+    ///
+    /// `shared/data/<file>` existing is what makes the next deploy skip the
+    /// adoption refusal, so the database has to land LAST: a sidecar that fails
+    /// after the database has moved strands the `-wal`, and the next deploy then
+    /// starts the app without every frame it held (#2589 item 10).
+    ///
+    /// A `for` loop cannot express that — its status is the last iteration's, so
+    /// a failure in the first is invisible to what follows, which is exactly how
+    /// the invariant was lost. Each sidecar is its own `&&`-gated step instead.
+    #[test]
+    fn both_recoveries_move_the_sidecars_before_the_database() {
+        let op = sqlite_data_link_op(&resolved_sqlite(), RELEASE_DIR).expect("linked");
+        // The recovery is printed inside a single-quoted `echo` word, so its own
+        // operands appear in the escaped form that quoting turns them into.
+        let shared = r"'\''/srv/autumn/myapp/shared/data/app.db'\''";
+
+        // Two recoveries are printed: one moves the link path itself, one moves
+        // what the link resolves to.
+        let recoveries: Vec<&str> = op
+            .shell
+            .match_indices("Run this on the host once")
+            .map(|(index, _)| {
+                // The recovery is one single-quoted `echo` word, so it ends at
+                // the quote that closes it — the only `\' >&2` in the line.
+                let rest = op.shell.get(index..).unwrap_or_default();
+                rest.split_once("' >&2").map_or(rest, |(line, _)| line)
+            })
+            .collect();
+        assert_eq!(recoveries.len(), 2, "both refusals print one: {}", op.shell);
+
+        for recovery in recoveries {
+            // Every sidecar moves, and every one of them before the database.
+            // The database is the one destination with no sidecar suffix on it.
+            let database = recovery
+                .match_indices(shared)
+                .map(|(index, _)| index)
+                .find(|index| {
+                    !recovery
+                        .get(index + shared.len()..)
+                        .is_some_and(|rest| rest.starts_with('-'))
+                })
+                .unwrap_or_else(|| panic!("no database move in: {recovery}"));
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = recovery
+                    .find(&format!("{shared}{suffix}"))
+                    .unwrap_or_else(|| panic!("{suffix} is not moved by: {recovery}"));
+                assert!(
+                    sidecar < database,
+                    "{suffix} must move before the database: {recovery}"
+                );
+            }
+            // No `for` loop: a loop's status is its last iteration's, so an early
+            // failure would not stop the database from moving.
+            assert!(
+                !recovery.contains("for s in"),
+                "each sidecar must gate the next on its own: {recovery}"
+            );
+            // Pasted into an interactive shell, `exit` would close the session.
+            assert!(
+                !recovery.contains("exit "),
+                "a pasted recovery must never exit the operator's shell: {recovery}"
+            );
+            // The stop gates everything, with `&&` and never `;`.
+            let stop = recovery.find("systemctl stop").expect("a stop");
+            let rest = recovery.get(stop..).unwrap_or_default();
+            assert!(
+                rest.find("&&").unwrap_or(usize::MAX) < rest.find(';').unwrap_or(usize::MAX),
+                "the stop must gate the move with `&&` before any `;`: {recovery}"
+            );
+            // Sidecars are named, never globbed.
+            assert!(
+                !recovery.contains("app.db*") && !recovery.contains(&format!("{shared}*")),
+                "sidecars must be named, not globbed: {recovery}"
+            );
+        }
+    }
+
+    /// Every row of the `link-data` state table, RUN, not pattern-matched.
+    ///
+    /// The defects this replaces (#2589 items 8 and 17) were both a guard that
+    /// read correctly and covered one state fewer than the deploy can reach, so
+    /// asserting on the generated text would have passed for both. This builds
+    /// each layout on disk and executes the real shell against it.
+    ///
+    /// `Verdict::Proceed` also asserts the link actually lands on the shared
+    /// file: a guard that lets a state through without linking is a different
+    /// failure, not a pass.
+    /// What occupies `current/<db>` in one row of the state table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Current {
+        Absent,
+        LinkToShared,
+        LinkElsewhere,
+        RealFile,
+    }
+
+    /// What the deploy must do about it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        Proceed,
+        Refuse,
+    }
+
+    /// One row: `current` × shared-file × marker → verdict, and why.
+    type LinkDataRow = (Current, bool, bool, Verdict, &'static str);
+
+    /// Build a row's layout under `root` and return the release dir to link.
+    ///
+    /// `operator.db` sits outside the app dir entirely: a refusal must leave it
+    /// byte-intact, which is what makes "refused" mean "touched nothing".
+    fn build_link_data_layout(
+        root: &Path,
+        current: Current,
+        shared_exists: bool,
+        marker: bool,
+    ) -> PathBuf {
+        let releases = root.join("releases");
+        let previous = releases.join("prev");
+        let release = releases.join("new");
+        std::fs::create_dir_all(&release).expect("release dir");
+        std::fs::create_dir_all(&previous).expect("previous release dir");
+        let shared_dir = root.join("shared");
+        let shared_file = shared_dir.join("data/app.db");
+        std::fs::create_dir_all(shared_dir.join("data")).expect("shared dir");
+        if shared_exists {
+            std::fs::write(&shared_file, b"SHARED").expect("shared db");
+        }
+        if marker {
+            std::fs::write(shared_dir.join("sqlite-data-adopted"), b"").expect("marker");
+        }
+        std::fs::write(root.join("operator.db"), b"OPERATOR").expect("operator db");
+
+        if current != Current::Absent {
+            let at = previous.join("app.db");
+            match current {
+                Current::LinkToShared => {
+                    std::os::unix::fs::symlink(&shared_file, &at).expect("link to shared");
+                }
+                Current::LinkElsewhere => {
+                    std::os::unix::fs::symlink(root.join("operator.db"), &at)
+                        .expect("link elsewhere");
+                }
+                Current::RealFile => std::fs::write(&at, b"LIVE").expect("live db"),
+                Current::Absent => unreachable!(),
+            }
+            std::os::unix::fs::symlink(&previous, root.join("current")).expect("current symlink");
+        }
+        release
+    }
+
+    /// Run the real `link-data` shell against one row's layout and check it.
+    fn check_link_data_row(root: &Path, row: LinkDataRow) {
+        let (current, shared_exists, marker, want, why) = row;
+        let release = build_link_data_layout(root, current, shared_exists, marker);
+        let shared_file = root.join("shared/data/app.db");
+        let elsewhere = root.join("operator.db");
+
+        let mut cfg = resolved_sqlite();
+        cfg.app_dir = root.to_str().expect("utf-8 temp dir").to_owned();
+        let op = sqlite_data_link_op(&cfg, release.to_str().expect("utf-8")).expect("linked");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run link-data");
+
+        let got = if out.status.success() {
+            Verdict::Proceed
+        } else {
+            Verdict::Refuse
+        };
         assert_eq!(
-            op.shell.matches("for s in -wal -shm -journal").count(),
-            3,
-            "the op plus both recoveries each enumerate the sidecars: {}",
-            op.shell
+            got,
+            want,
+            "{current:?} + shared={shared_exists} + marker={marker} ({why}): {}",
+            String::from_utf8_lossy(&out.stderr)
         );
+
+        if want == Verdict::Proceed {
+            assert_eq!(
+                std::fs::read_link(release.join("app.db")).ok().as_deref(),
+                Some(shared_file.as_path()),
+                "{why}: the release must be linked at the shared file"
+            );
+            // The shared database is never rewritten by the link step.
+            if shared_exists {
+                assert_eq!(
+                    std::fs::read(&shared_file).expect("shared db"),
+                    b"SHARED",
+                    "{why}: the shared database must be left exactly as it was"
+                );
+            }
+        } else {
+            // A refusal touches nothing — including the operator's database.
+            assert!(
+                !release.join("app.db").exists(),
+                "{why}: a refusal must not link anything"
+            );
+            assert_eq!(
+                std::fs::read(&elsewhere).expect("operator db"),
+                b"OPERATOR",
+                "{why}: a refusal must not touch the operator's database"
+            );
+            assert!(
+                !String::from_utf8_lossy(&out.stderr).is_empty(),
+                "{why}: a refusal must say why"
+            );
+        }
+    }
+
+    /// Every row of the `link-data` state table, RUN, not pattern-matched.
+    ///
+    /// The two defects this replaces (#2589 items 8 and 17) were each a guard
+    /// that read correctly and covered one state fewer than the deploy can
+    /// reach, so an assertion on the generated TEXT would have passed for both.
+    /// Reintroducing either gate fails this test on its exact row.
+    #[test]
+    fn the_link_op_decides_every_state_of_current_and_the_shared_file() {
+        use Current::{Absent, LinkElsewhere, LinkToShared, RealFile};
+        use Verdict::{Proceed, Refuse};
+
+        let table: [LinkDataRow; 9] = [
+            (Absent, false, false, Proceed, "a genuine first deploy"),
+            (
+                LinkToShared,
+                false,
+                false,
+                Proceed,
+                "a retry after a first deploy that failed before the migration",
+            ),
+            (
+                LinkToShared,
+                false,
+                true,
+                Refuse,
+                "the database existed and is gone: an unmounted volume (#2589 item 17)",
+            ),
+            (LinkToShared, true, true, Proceed, "already adopted"),
+            (
+                LinkToShared,
+                true,
+                false,
+                Proceed,
+                "adopted before the marker existed",
+            ),
+            (
+                LinkElsewhere,
+                true,
+                true,
+                Refuse,
+                "an operator database, silently swapped for the shared one (#2589 item 8)",
+            ),
+            (
+                LinkElsewhere,
+                false,
+                false,
+                Refuse,
+                "an operator database on a mount that is away",
+            ),
+            (
+                RealFile,
+                true,
+                true,
+                Refuse,
+                "a live pre-#1909 database, swapped on rollback (#2589 item 8)",
+            ),
+            (RealFile, false, false, Refuse, "a live pre-#1909 database"),
+        ];
+
+        for (index, row) in table.into_iter().enumerate() {
+            let root = std::env::temp_dir()
+                .join(format!("autumn-link-data-{}-{index}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            check_link_data_row(&root, row);
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// The marker is written the first time the shared database is seen, so the
+    /// refusal above has something to key on — and it lives in `shared/`, never
+    /// in `shared/data`, which is the mount whose absence it exists to detect.
+    #[test]
+    fn seeing_the_shared_database_records_the_marker_outside_the_data_mount() {
+        let cfg = resolved_sqlite();
+        assert_eq!(
+            cfg.sqlite_data_marker_file(),
+            "/srv/autumn/myapp/shared/sqlite-data-adopted",
+            "a marker under shared/data would vanish with the mount it reports on"
+        );
+
+        let root = std::env::temp_dir().join(format!("autumn-marker-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let release = root.join("releases/new");
+        std::fs::create_dir_all(&release).expect("release dir");
+        let shared_data = root.join("shared/data");
+        std::fs::create_dir_all(&shared_data).expect("shared dir");
+        std::fs::write(shared_data.join("app.db"), b"SHARED").expect("shared db");
+
+        let mut cfg = resolved_sqlite();
+        cfg.app_dir = root.to_str().expect("utf-8 temp dir").to_owned();
+        let op = sqlite_data_link_op(&cfg, release.to_str().unwrap()).expect("linked");
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .status()
+                .expect("run link-data")
+                .success()
+        );
+        assert!(
+            root.join("shared/sqlite-data-adopted").exists(),
+            "the marker must be recorded once the database is seen"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A symlinked `app_dir` is invisible to the local lexical containment check,
+    /// so the host is asked instead (#2589 item 13): a database whose parent
+    /// resolves into the releases directory is refused before anything is
+    /// uploaded or pruned.
+    #[test]
+    fn the_persistent_data_guard_resolves_a_symlinked_app_dir_on_the_host() {
+        let root = std::env::temp_dir().join(format!("autumn-datadir-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let real = root.join("mnt/apps/myapp");
+        std::fs::create_dir_all(real.join("releases/r1")).expect("release dir");
+        std::fs::create_dir_all(real.join("shared/data")).expect("shared dir");
+        let link = root.join("srv-myapp");
+        std::fs::create_dir_all(root.join("srv")).ok();
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked app dir");
+
+        // The database is spelled with the RESOLVED app dir, so the lexical check
+        // in `classify_sqlite_data_file` compares two unrelated strings and grades
+        // it durable — while retention walks the symlink to the same inode.
+        let inside = real.join("releases/r1/app.db");
+        let bare_inside = real.join("app.db");
+        let shared = real.join("shared/data/app.db");
+        let outside = root.join("var/lib/app.db");
+        std::fs::create_dir_all(root.join("var/lib")).expect("operator dir");
+
+        for (path, refuse) in [
+            (&inside, true),
+            // Inside the app dir but outside `shared/` — the same rule the local
+            // lexical check applies, asked where the symlink resolves.
+            (&bare_inside, true),
+            (&shared, false),
+            (&outside, false),
+        ] {
+            let mut cfg = resolved();
+            cfg.app_dir = link.to_str().expect("utf-8 temp dir").to_owned();
+            cfg.sqlite_data =
+                SqliteDataPlacement::Persistent(path.to_str().expect("utf-8").to_owned());
+            let op = sqlite_data_dir_guard_op(&cfg).expect("a persistent file is verified");
+            assert_eq!(op.label, "check-data-dir");
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .output()
+                .expect("run check-data-dir");
+            assert_eq!(
+                out.status.success(),
+                !refuse,
+                "{}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // A Postgres app, and one whose file the deploy relocates itself, get no
+        // such op at all.
+        assert!(sqlite_data_dir_guard_op(&resolved()).is_none());
+        assert!(sqlite_data_dir_guard_op(&resolved_sqlite()).is_none());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The op must never delete a database file. A rollback target deployed
@@ -7702,6 +8192,26 @@ mod tests {
             "and it must say so: {}",
             op.shell
         );
+        // Sidecars move first here too, for the reason they do in the printed
+        // recoveries: the destination database existing is what a later step
+        // reads as "the move finished". Each `mv` carries `|| exit 1`, so unlike a
+        // pasted recovery the loop cannot continue past a failure.
+        let superseded = "'/srv/autumn/myapp/shared/data/app.db.superseded'";
+        let sidecars = op
+            .shell
+            .find(&format!("{superseded}$s"))
+            .expect("the sidecar move");
+        let database = op
+            .shell
+            .find(&format!(
+                "mv -f '/srv/autumn/myapp/releases/20260714T120000Z/app.db' {superseded}"
+            ))
+            .expect("the database move");
+        assert!(
+            sidecars < database,
+            "the sidecars must be set aside before the database: {}",
+            op.shell
+        );
     }
 
     /// Both journal modes leave sidecars. WAL leaves `-wal`/`-shm`; the default
@@ -7715,6 +8225,98 @@ mod tests {
             "the move-aside step must cover every sidecar: {}",
             op.shell
         );
+    }
+
+    /// Every file the deploy writes into the release ROOT must be refused as a
+    /// relative database path (#2589 item 11).
+    ///
+    /// This is the part that keeps `collides_with_release_payload` honest. Its
+    /// rule for the app binary and the `autumn*.toml` family is written out by
+    /// hand, so a payload added to the op builders later — a new sidecar file, a
+    /// second binary — would silently fall outside it and reopen exactly the hole
+    /// item 11 describes. Rather than trust the enumeration, this reads the real
+    /// op stream and asserts the grader refuses every name in it.
+    #[test]
+    fn every_release_root_payload_is_refused_as_a_database_path() {
+        let manifests = [
+            ManifestUpload {
+                local: PathBuf::from("/tmp/autumn.toml"),
+                remote_basename: "autumn.toml".to_owned(),
+            },
+            ManifestUpload {
+                local: PathBuf::from("/tmp/autumn-prod.toml"),
+                remote_basename: "autumn-prod.toml".to_owned(),
+            },
+            // An arbitrarily-named capacity contract (#1733): the case no static
+            // rule can predict, which is why the deploy passes the real list.
+            ManifestUpload {
+                local: PathBuf::from("/tmp/prod.lock"),
+                remote_basename: "prod.lock".to_owned(),
+            },
+        ];
+        // Mirror production: the payload list the grader sees is the one the op
+        // builders are handed.
+        let cfg = resolved_sqlite().with_release_payloads(
+            manifests
+                .iter()
+                .map(|m| m.remote_basename.clone())
+                .collect(),
+        );
+        let plan = SlotPlan {
+            live_slot: SLOT_GREEN,
+            live_port: 3002,
+            candidate_slot: SLOT_BLUE,
+            candidate_port: 3001,
+            public_port: 3000,
+        };
+        let unit = super::super::render_app_unit(&cfg, RELEASE_DIR, 3001, SLOT_BLUE);
+
+        let ops = first_deploy_ops(
+            &cfg,
+            &proxy(),
+            &unit,
+            Secret::new("X=1\n"),
+            Path::new("/tmp/app"),
+            &manifests,
+            RELEASE_ID,
+            &plan,
+            MigrateStep::Run,
+        );
+
+        let root = format!("{RELEASE_DIR}/");
+        let payloads: Vec<String> = ops
+            .iter()
+            .filter_map(|op| match op {
+                DeployOp::UploadFile { remote_path, .. }
+                | DeployOp::WriteFile { remote_path, .. } => Some(remote_path.clone()),
+                DeployOp::Run(_) => None,
+            })
+            // Only the release ROOT: the data link is created there, and every
+            // payload is written flat, so nothing nested can collide.
+            .filter_map(|path| path.strip_prefix(&root).map(str::to_owned))
+            .filter(|rest| !rest.contains('/'))
+            .collect();
+
+        assert!(
+            payloads.contains(&"myapp".to_owned()),
+            "the binary must be among the release-root payloads: {payloads:?}"
+        );
+        assert!(
+            payloads.len() > manifests.len(),
+            "expected the binary and every manifest: {payloads:?}"
+        );
+
+        for payload in &payloads {
+            let url = format!("sqlite://{payload}");
+            assert!(
+                matches!(
+                    super::super::classify_sqlite_data_file(Some(&url), &cfg),
+                    super::super::SqliteDataFile::Refused(_)
+                ),
+                "{payload} is written into the release root, so a database at that \
+                 path would be truncated by the upload — it must be refused"
+            );
+        }
     }
 
     /// The link must exist before the migrate one-shot runs, on BOTH deploy paths:

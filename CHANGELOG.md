@@ -43,6 +43,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   app, so a Postgres deploy's preflight report is unchanged. `autumn doctor`'s
   `pg_client_tools` check on a SQLite app now passes on the merits instead of
   deferring to a tracking issue.
+  The `link-data` step decides the whole state space at once rather than guard by
+  guard: it proceeds only when nothing occupies the release's data path or what
+  does is its own link to the shared file, so a legacy symlink pointing at a
+  different database is refused instead of silently swapped for the shared one,
+  even when both exist. A missing shared file is told apart from an unmounted
+  volume by a `shared/sqlite-data-adopted` marker — recorded once the database is
+  seen, and kept outside any `shared/data` mount — so a volume that is away stops
+  the deploy instead of creating a fresh empty database beside the orphaned real
+  one. The printed one-time recoveries move every sidecar *before* the database,
+  each step gating the next, so a failed sidecar move leaves the refusal firing
+  and a retry resumes rather than stranding the WAL. Preflight also refuses a
+  relative database whose path is a file the deploy uploads into the release
+  directory (`sqlite://myapp`, `sqlite://autumn.toml`), which the upload would
+  otherwise truncate by writing through the data link; and a relative
+  `[deploy] app_dir`, which made the link target resolve beneath the release
+  directory. For an absolute operator-managed database, a new `check-data-dir`
+  step re-asks the containment question **on the host**, where a symlinked
+  `app_dir` resolves — the CLI cannot see that from here, and release retention
+  would have deleted the file.
 
 ### Security
 

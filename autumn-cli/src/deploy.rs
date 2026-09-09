@@ -322,7 +322,38 @@ pub struct ResolvedDeployConfig {
     /// absolute path outside the releases dir — there is nothing to relocate.
     /// Set by [`Self::with_sqlite_data_file`]; [`Self::resolve`] leaves it
     /// `None`, since it grades `[deploy]` and never reads `[database]`.
-    pub sqlite_data_file: Option<String>,
+    pub sqlite_data: SqliteDataPlacement,
+    /// Basenames this deploy writes into the release dir (the app binary and the
+    /// uploaded config manifests). A relative `SQLite` data file may not collide
+    /// with one: the data link is created first, so `scp` would follow it and
+    /// truncate the database (#2589 item 11).
+    ///
+    /// Empty on [`Self::resolve`], which grades `[deploy]` alone. The real deploy
+    /// path fills it via [`Self::with_release_payloads`]; the refusal in
+    /// [`classify_sqlite_data_file`] also applies a filesystem-independent rule,
+    /// so an empty list never leaves the common names unguarded.
+    pub release_payloads: Vec<String>,
+}
+
+/// What a deploy must do to keep the app's `SQLite` data file (issue #1909).
+///
+/// ONE value rather than two `Option` fields, so the two managed states cannot
+/// both be set: they are decided by a single [`classify_sqlite_data_file`] call.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SqliteDataPlacement {
+    /// Nothing for the deploy to manage: a Postgres app, or a refused config
+    /// that preflight already failed.
+    #[default]
+    None,
+    /// A release-relative file. The real file is kept in `shared/data` and each
+    /// release is linked at the path the app resolves.
+    Relative(String),
+    /// An absolute, operator-managed file. There is nothing to relocate, but the
+    /// deploy still VERIFIES on the host that it is not inside the releases
+    /// directory: a symlinked `app_dir` is invisible to the local lexical check,
+    /// which would grade a file under `releases/` durable while retention
+    /// deletes it (#2589 item 13).
+    Persistent(String),
 }
 
 /// Canonicalize a deploy profile string to the value the app's runtime resolver
@@ -442,16 +473,43 @@ impl ResolvedDeployConfig {
             tls_enabled: cfg.tls.enabled,
             tls_host,
             install_proxy: cfg.install_proxy,
-            sqlite_data_file: None,
+            sqlite_data: SqliteDataPlacement::None,
+            release_payloads: Vec::new(),
         })
     }
 
-    /// Attach the release-relative `SQLite` data-file path this deploy must keep
-    /// persistent (issue #1909). See [`Self::sqlite_data_file`].
+    /// Attach the `SQLite` data-file placement this deploy must honor (issue
+    /// #1909). See [`SqliteDataPlacement`].
     #[must_use]
-    pub fn with_sqlite_data_file(mut self, relative: Option<String>) -> Self {
-        self.sqlite_data_file = relative;
+    pub fn with_sqlite_data_placement(mut self, placement: SqliteDataPlacement) -> Self {
+        self.sqlite_data = placement;
         self
+    }
+
+    /// Attach the basenames this deploy uploads into the release dir. See
+    /// [`Self::release_payloads`].
+    #[must_use]
+    pub fn with_release_payloads(mut self, payloads: Vec<String>) -> Self {
+        self.release_payloads = payloads;
+        self
+    }
+
+    /// The release-relative data file, when the deploy manages one.
+    #[must_use]
+    pub fn relative_sqlite_data_file(&self) -> Option<&str> {
+        match &self.sqlite_data {
+            SqliteDataPlacement::Relative(rel) => Some(rel),
+            SqliteDataPlacement::None | SqliteDataPlacement::Persistent(_) => None,
+        }
+    }
+
+    /// The absolute operator-managed data file, when there is one to verify.
+    #[must_use]
+    pub fn persistent_sqlite_data_file(&self) -> Option<&str> {
+        match &self.sqlite_data {
+            SqliteDataPlacement::Persistent(path) => Some(path),
+            SqliteDataPlacement::None | SqliteDataPlacement::Relative(_) => None,
+        }
     }
 
     /// Persistent per-app dir shared across releases (holds the secret env
@@ -522,9 +580,25 @@ impl ResolvedDeployConfig {
     /// app has none to keep (Postgres, or an already-absolute `SQLite` path).
     #[must_use]
     pub fn shared_sqlite_data_file(&self) -> Option<String> {
-        self.sqlite_data_file
-            .as_ref()
+        self.relative_sqlite_data_file()
             .map(|rel| format!("{}/{rel}", self.shared_data_dir()))
+    }
+
+    /// Marker recording that the shared `SQLite` database has been seen to exist
+    /// (issue #1909, #2589 item 17).
+    ///
+    /// It lives in `shared/`, **never** in `shared/data`: the state it exists to
+    /// detect is `shared/data` being an unavailable mount, and a marker inside
+    /// that mount would disappear with it and report the very "never created"
+    /// answer it is there to refute.
+    ///
+    /// Absent means the database has never been established, so a missing file is
+    /// a genuine first deploy. Present means it must be there, so a missing file
+    /// is a fault — an unmounted volume — and the deploy stops rather than
+    /// creating a fresh database and orphaning the original.
+    #[must_use]
+    pub fn sqlite_data_marker_file(&self) -> String {
+        format!("{}/sqlite-data-adopted", self.shared_dir())
     }
 }
 
@@ -2209,18 +2283,21 @@ fn resolve_writable_db_url(db: &autumn_web::config::DatabaseConfig) -> Option<&s
 /// The release-relative `SQLite` data-file path this deploy must keep persistent,
 /// or `None` when there is none (issue #1909).
 ///
-/// Only the [`SqliteDataFile::Relative`] case needs relocating; an absolute path
-/// already survives, and a refused configuration is caught by
+/// Only the [`SqliteDataFile::Relative`] case needs relocating. An absolute path
+/// already survives a release swap, but is still carried through as
+/// [`SqliteDataPlacement::Persistent`] so the deploy can verify on the HOST that
+/// it is outside the releases dir — a symlinked `app_dir` defeats the local
+/// lexical check (#2589 item 13). A refused configuration is caught by
 /// [`grade_sqlite_data_persistence`] before any remote command runs.
-fn sqlite_relative_data_file(
+fn sqlite_data_placement(
     config: &AutumnConfig,
     resolved: &ResolvedDeployConfig,
-) -> Option<String> {
+) -> SqliteDataPlacement {
     match classify_sqlite_data_file(resolve_writable_db_url(&config.database), resolved) {
-        SqliteDataFile::Relative(rel) => Some(rel),
-        SqliteDataFile::NotSqlite | SqliteDataFile::Persistent(_) | SqliteDataFile::Refused(_) => {
-            None
-        }
+        SqliteDataFile::Relative(rel) => SqliteDataPlacement::Relative(rel),
+        SqliteDataFile::Persistent(path) => SqliteDataPlacement::Persistent(path),
+        // A refused config never reaches the op builders: preflight fails first.
+        SqliteDataFile::NotSqlite | SqliteDataFile::Refused(_) => SqliteDataPlacement::None,
     }
 }
 
@@ -2281,6 +2358,26 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
     // `/srv/app/shared/../releases/r1/app.db` would call it durable, while the
     // kernel resolves it into `releases/`, where retention deletes it.
     let text = lexically_normalized(&raw);
+    let app_dir = lexically_normalized(&cfg.app_dir);
+    // FAIL CLOSED on the one input that makes every rule below undecidable: a
+    // non-absolute app dir. It gates BOTH branches, not just the absolute one.
+    //
+    // For an absolute database it decided containment, and falling through
+    // graded a file under `releases/` durable while retention deletes it. For a
+    // RELATIVE database it decides the link TARGET: `sqlite_data_link_op` points
+    // the release at `{app_dir}/shared/data/<file>`, so a relative `app_dir`
+    // makes that target resolve beneath the release dir instead of the SSH
+    // working directory, and the migration opens a dangling link (#2589 item
+    // 16). One guard, above the split, because the answer is the same on both
+    // sides — placing it on one branch only is what left the other open.
+    if !app_dir.starts_with('/') {
+        return SqliteDataFile::Refused(format!(
+            "the deploy's app directory ({}) is not an absolute path, so where the \
+             SQLite database {text} would live cannot be decided. Set `[deploy] \
+             app_dir` to an absolute path.",
+            cfg.app_dir
+        ));
+    }
     if text.starts_with('/') {
         // Anything the deploy itself manages is transient — `releases/` is
         // replaced every deploy and pruned by retention, and `current` is just a
@@ -2292,20 +2389,7 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
         // app_dir = "/srv/autumn/tmp/../myapp"` names the same directory as
         // `/srv/autumn/myapp`, and comparing the raw spelling would miss a
         // database sitting in the releases dir it resolves to.
-        let app_dir = lexically_normalized(&cfg.app_dir);
         let shared = lexically_normalized(&cfg.shared_dir());
-        // FAIL CLOSED on the one case that cannot be decided: a non-absolute app
-        // dir. Falling through to `Persistent` here graded a database under
-        // `releases/` durable while release retention deletes it, and `within`
-        // against an empty root would swallow every absolute path.
-        if !app_dir.starts_with('/') {
-            return SqliteDataFile::Refused(format!(
-                "the deploy's app directory ({}) is not an absolute path, so whether \
-                 the SQLite database {text} sits inside it cannot be decided. Set \
-                 `[deploy] app_dir` to an absolute path.",
-                cfg.app_dir
-            ));
-        }
         if within(&text, &app_dir) && !within(&text, &shared) {
             return SqliteDataFile::Refused(format!(
                 "the configured SQLite database {text} lives inside the deploy's own app \
@@ -2330,7 +2414,55 @@ pub fn classify_sqlite_data_file(url: Option<&str>, cfg: &ResolvedDeployConfig) 
              Use a plain relative name (sqlite://app.db) or an absolute path."
         ));
     }
+    // The data link is created BEFORE the release payloads are uploaded, and
+    // `scp` writes THROUGH a symlink. So a relative database whose path is also a
+    // payload path has its link made first and is then truncated by the upload —
+    // the migration finds an ELF or a TOML file where the database was, after the
+    // data is already gone (#2589 item 11). Refused here, before any remote
+    // command runs, rather than detected on the host after the loss.
+    if let Some(payload) = collides_with_release_payload(&text, cfg) {
+        return SqliteDataFile::Refused(format!(
+            "the configured SQLite database {text} is also a file this deploy uploads \
+             into the release directory ({payload}), which would overwrite the database \
+             on the first deploy. Rename the database, or move it under a \
+             subdirectory (sqlite://data/app.db)."
+        ));
+    }
     SqliteDataFile::Relative(text)
+}
+
+/// The release payload a relative `SQLite` data file collides with, if any.
+///
+/// Two sources, deliberately: the names this particular deploy would upload
+/// ([`ResolvedDeployConfig::release_payloads`]), plus a filesystem-independent
+/// rule for the app binary and the `autumn*.toml` manifest family. The second is
+/// not redundant — the payload list is empty for a bare
+/// [`ResolvedDeployConfig::resolve`], and a database named `autumn.toml` must be
+/// refused even on a project that has no `autumn.toml` YET, since adding one
+/// later would start truncating it.
+fn collides_with_release_payload(text: &str, cfg: &ResolvedDeployConfig) -> Option<String> {
+    // Every payload is written FLAT in the release root, so only a bare name can
+    // collide: `data/app.db` never can.
+    if text.contains('/') {
+        return None;
+    }
+    if text == cfg.app_name {
+        return Some(format!("the {} binary", cfg.app_name));
+    }
+    // `rsplit_once`, not `ends_with(".toml")`: the latter trips clippy's
+    // case-insensitive-extension lint, and folding case would be wrong anyway —
+    // the uploader always writes the lowercase spelling, and the target is POSIX.
+    let is_manifest = text == "autumn.toml"
+        || (text.starts_with("autumn-")
+            && text.len() > "autumn-.toml".len()
+            && text.rsplit_once('.').is_some_and(|(_, ext)| ext == "toml"));
+    if is_manifest {
+        return Some(format!("the config manifest {text}"));
+    }
+    cfg.release_payloads
+        .iter()
+        .find(|payload| payload.as_str() == text)
+        .map(|payload| format!("the uploaded file {payload}"))
 }
 
 /// Collapse `.` and `..` lexically, and normalize separators.
@@ -3046,6 +3178,29 @@ fn locate_manifest_uploads(resolved: &ResolvedDeployConfig) -> Vec<exec::Manifes
     manifest_uploads_in(&manifest_project_dirs(), &resolved.profile)
 }
 
+/// Every basename this deploy writes into the release directory (#2589 item 11).
+///
+/// The app binary plus the uploaded manifests — including a capacity contract
+/// under whatever name the config gives it, which no static rule could predict.
+/// `collides_with_release_payload` refuses a relative `SQLite` data file that
+/// matches one, because the data link is made first and `scp` writes through it.
+///
+/// `config` is unused today and taken anyway: it is the value that decides the
+/// manifest set, and threading it now keeps the signature honest if the payload
+/// list ever stops being derivable from `resolved` alone.
+fn release_payload_basenames(
+    _config: &AutumnConfig,
+    resolved: &ResolvedDeployConfig,
+) -> Vec<String> {
+    let mut names = vec![resolved.app_name.clone()];
+    names.extend(
+        locate_manifest_uploads(resolved)
+            .into_iter()
+            .map(|upload| upload.remote_basename),
+    );
+    names
+}
+
 /// Format the operator-facing preflight line for the config-manifest upload
 /// (#1952). Pure/testable: either a LOUD no-manifest warning (kills the previous
 /// silent-defaults footgun) or a confirming line naming the uploaded file(s).
@@ -3433,7 +3588,8 @@ fn run_up(
     // Postgres app resolves `None` and nothing below changes.
     let resolved = &resolved
         .clone()
-        .with_sqlite_data_file(sqlite_relative_data_file(config, resolved));
+        .with_release_payloads(release_payload_basenames(config, resolved))
+        .with_sqlite_data_placement(sqlite_data_placement(config, resolved));
 
     // The rollout targets, in declaration order. A single-host config resolves to
     // a one-host fleet whose only element IS today's `resolved`, so everything
@@ -4412,7 +4568,8 @@ fn run_rollback(
     // starting against a fresh, empty database.
     let resolved = &resolved
         .clone()
-        .with_sqlite_data_file(sqlite_relative_data_file(config, resolved));
+        .with_release_payloads(release_payload_basenames(config, resolved))
+        .with_sqlite_data_placement(sqlite_data_placement(config, resolved));
 
     // The rollback targets, in declaration order. A single-host config (either
     // spelling) resolves to a one-host fleet whose only element IS today's
@@ -6085,6 +6242,114 @@ mod tests {
         assert!(matches!(
             classify_sqlite_data_file(Some("sqlite:///var/lib/myapp/app.db"), &aliased),
             SqliteDataFile::Persistent(_)
+        ));
+    }
+
+    /// A relative database whose path is also a file the deploy uploads into the
+    /// release dir is refused (#2589 item 11).
+    ///
+    /// `link-data` runs before the uploads and `scp` writes THROUGH a symlink, so
+    /// the link is made first and the upload truncates the operator's database.
+    /// The migration then finds an ELF or a TOML file where the database was,
+    /// after the data is already gone. Preflight refuses it before any remote
+    /// command runs.
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_collision_with_a_release_payload() {
+        let cfg = deploy_cfg().with_release_payloads(vec!["prod.lock".to_owned()]);
+
+        for (url, expected) in [
+            // The app binary, uploaded at `<release>/<app_name>`.
+            ("sqlite://myapp", "myapp binary"),
+            // The manifest family, matched by shape rather than by enumeration:
+            // a database named `autumn.toml` must be refused on a project that
+            // has no `autumn.toml` YET, since adding one starts truncating it.
+            ("sqlite://autumn.toml", "autumn.toml"),
+            ("sqlite://autumn-prod.toml", "autumn-prod.toml"),
+            ("sqlite://autumn-Production.toml", "autumn-Production.toml"),
+            // And whatever else this particular deploy uploads — a capacity
+            // contract carries an arbitrary configured name that no static rule
+            // could predict.
+            ("sqlite://prod.lock", "prod.lock"),
+        ] {
+            let got = classify_sqlite_data_file(Some(url), &cfg);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("{url} collides with a release payload but was graded {got:?}");
+            };
+            assert!(
+                detail.contains(expected),
+                "{url}: the refusal must name what it collides with: {detail}"
+            );
+        }
+
+        // A normalized spelling collides just the same.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("sqlite://./autumn.toml"), &cfg),
+            SqliteDataFile::Refused(_)
+        ));
+
+        // Every payload is written FLAT in the release root, so a subdirectory
+        // cannot collide — and that is the fix the refusal points the operator at.
+        for safe in [
+            "sqlite://app.db",
+            "sqlite://data/myapp",
+            "sqlite://data/autumn.toml",
+            "sqlite://autumn.db",
+            "sqlite://autumn-prod.db",
+            // Not the manifest shape: no name between the prefix and the suffix.
+            "sqlite://autumn-.toml",
+        ] {
+            assert!(
+                matches!(
+                    classify_sqlite_data_file(Some(safe), &cfg),
+                    SqliteDataFile::Relative(_)
+                ),
+                "{safe} cannot collide with a release payload and must be kept"
+            );
+        }
+    }
+
+    /// A relative `app_dir` is refused for a RELATIVE database too, not just an
+    /// absolute one (#2589 item 16).
+    ///
+    /// The guard that decides containment for an absolute database also decides
+    /// the LINK TARGET for a relative one: `sqlite_data_link_op` points the
+    /// release at `{app_dir}/shared/data/<file>`, so a relative `app_dir` makes
+    /// that target resolve beneath the release directory instead of the SSH
+    /// working directory. The migration then opens a dangling link and the deploy
+    /// fails after it has already touched the host.
+    #[test]
+    fn classify_sqlite_data_file_refuses_a_relative_app_dir_on_both_branches() {
+        let relative_dir = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                app_dir: Some("myapp".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+
+        for url in [
+            // The branch the guard was originally written for…
+            "sqlite:///var/lib/myapp/app.db",
+            // …and the one it was missing.
+            "sqlite://app.db",
+            "sqlite://data/app.db",
+        ] {
+            let got = classify_sqlite_data_file(Some(url), &relative_dir);
+            let SqliteDataFile::Refused(detail) = got else {
+                panic!("a relative app_dir makes {url} undecidable, but it graded {got:?}");
+            };
+            assert!(
+                detail.contains("myapp") && detail.contains("absolute"),
+                "{url}: the refusal must name the app dir and the fix: {detail}"
+            );
+        }
+
+        // A Postgres app is unaffected: the app dir is never consulted.
+        assert!(matches!(
+            classify_sqlite_data_file(Some("postgres://localhost/app"), &relative_dir),
+            SqliteDataFile::NotSqlite
         ));
     }
 

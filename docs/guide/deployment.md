@@ -1258,7 +1258,19 @@ persistent state:
 | Absolute outside the releases dir — `sqlite:///var/lib/myapp/app.db` | Leaves it exactly there; it is already release-independent. |
 | Absolute inside the app dir but outside `shared/` (`releases/…`, `current/…`) | Refused at preflight — retention would delete it. |
 | Relative but not a plain name — `sqlite://../x.db`, `sqlite://.` | Refused at preflight — it does not name a file inside the release dir. |
+| Relative, but the same name as a file the deploy uploads — `sqlite://myapp`, `sqlite://autumn.toml` | Refused at preflight — the upload writes through the data link and would truncate the database. Put it in a subdirectory (`sqlite://data/app.db`). |
 | In-memory — `sqlite::memory:` | Refused at preflight — it does not survive a restart, let alone a deploy. |
+
+`[deploy] app_dir` must be absolute for a SQLite app. A relative one makes the
+link target resolve beneath the release directory instead of your SSH working
+directory, so the migration would open a dangling link.
+
+For an **absolute** database the deploy also re-checks containment on the host,
+as a `check-data-dir` step, before anything is uploaded. It has to: if `app_dir`
+is itself a symlink (`/srv/autumn/myapp -> /mnt/apps/myapp`) and your database URL
+uses the resolved spelling, the CLI compares two unrelated strings and sees a file
+outside the app dir — while release retention walks the symlink to the same
+directory and deletes it. Only the host can resolve that.
 
 `shared/` is created by the deploy's `prepare-dirs` step, is never pruned, and is
 seen by both blue/green slots, so the file a release writes is the file the next
@@ -1281,13 +1293,22 @@ The one-time migration, on the host (the deploy prints these paths for you):
 
 ```sh
 autumn db backup                      # first, from the project dir
-systemctl stop myapp-blue.service myapp-green.service
-mv /srv/autumn/myapp/current/app.db /srv/autumn/myapp/shared/data/app.db
-for s in -wal -shm -journal; do
-  [ -e /srv/autumn/myapp/current/app.db$s ] &&
-    mv /srv/autumn/myapp/current/app.db$s /srv/autumn/myapp/shared/data/app.db$s
-done
+systemctl stop myapp-blue.service myapp-green.service &&
+  { [ ! -e /srv/autumn/myapp/current/app.db-wal ] ||
+    mv /srv/autumn/myapp/current/app.db-wal /srv/autumn/myapp/shared/data/app.db-wal; } &&
+  { [ ! -e /srv/autumn/myapp/current/app.db-shm ] ||
+    mv /srv/autumn/myapp/current/app.db-shm /srv/autumn/myapp/shared/data/app.db-shm; } &&
+  { [ ! -e /srv/autumn/myapp/current/app.db-journal ] ||
+    mv /srv/autumn/myapp/current/app.db-journal /srv/autumn/myapp/shared/data/app.db-journal; } &&
+  mv /srv/autumn/myapp/current/app.db /srv/autumn/myapp/shared/data/app.db
 ```
+
+The **sidecars move first and the database last**, and each step gates the next.
+`shared/data/app.db` existing is what tells the next deploy the move is done, so
+moving it first and then failing on the `-wal` would strand a write-ahead log the
+next deploy no longer stops for — the app would start without every transaction
+it held. Stop on the first failure and the refusal simply fires again, so a retry
+resumes.
 
 Each file moves by name rather than through `app.db*`: that glob also matches an
 unrelated `app.db.backup` and would move it, possibly over a file of that name
@@ -1302,13 +1323,13 @@ a symlink moves the link, not the database behind it:
 
 ```sh
 autumn db backup                      # first, from the project dir
-systemctl stop myapp-blue.service myapp-green.service
-src=$(readlink -f /srv/autumn/myapp/current/app.db)
-mv "$src" /srv/autumn/myapp/shared/data/app.db
-for s in -wal -shm -journal; do
-  [ -e "$src$s" ] && mv "$src$s" /srv/autumn/myapp/shared/data/app.db$s
-done
-rm -f /srv/autumn/myapp/current/app.db
+systemctl stop myapp-blue.service myapp-green.service &&
+  src=$(readlink -f /srv/autumn/myapp/current/app.db) &&
+  { [ ! -e "$src"-wal ] || mv "$src"-wal /srv/autumn/myapp/shared/data/app.db-wal; } &&
+  { [ ! -e "$src"-shm ] || mv "$src"-shm /srv/autumn/myapp/shared/data/app.db-shm; } &&
+  { [ ! -e "$src"-journal ] || mv "$src"-journal /srv/autumn/myapp/shared/data/app.db-journal; } &&
+  mv "$src" /srv/autumn/myapp/shared/data/app.db &&
+  rm -f /srv/autumn/myapp/current/app.db
 ```
 
 Each file moves to its **exact** shared name rather than just into `shared/data`:
@@ -1316,9 +1337,20 @@ your symlink may point at a different basename (`legacy.sqlite`), and leaving it
 under that name puts the database beside the one the deploy opens instead of at
 it — so the next deploy would create an empty one anyway.
 
-The deploy refuses rather than link past your symlink: the shared file does not
-exist yet, so the migration would create an empty database there and the cutover
-would serve it while yours sat untouched at the old path.
+The deploy refuses rather than link past your symlink, **whether or not** a file
+already exists in `shared/data`. If there is none, the migration would create an
+empty database there and the cutover would serve it while yours sat untouched at
+the old path. If there is one, the cutover would quietly start serving *that*
+database instead of yours, with no error at all — so the deploy stops and lets you
+decide which of the two is the real one.
+
+**If `shared/data` is a mounted volume**, note that the deploy records a
+`shared/sqlite-data-adopted` marker the first time it sees the database. Once that
+marker exists, a *missing* database stops the deploy instead of creating a fresh
+one — an unmounted volume is otherwise indistinguishable from a first deploy, and
+guessing wrong orphans your data. The marker lives in `shared/`, not
+`shared/data`, so it is still there when the mount is not. If you removed the
+database deliberately and want a new one, delete the marker too.
 
 The deploy never deletes a database file. A real file it finds at the link path
 in some other release — a rollback target from before the migration — is set
