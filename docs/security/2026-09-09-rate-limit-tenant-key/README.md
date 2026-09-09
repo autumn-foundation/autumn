@@ -106,9 +106,10 @@ Added `tenant_qualify_bucket_key(key_strategy, raw_key)` in
 `rate_limit.rs`: for an `AuthenticatedPrincipal` key that actually resolved
 a principal (`raw_key` starts with `"principal:"`), it reads
 `CURRENT_TENANT` and — when present — rewrites the key to
-`principal:tenant=<tenant>:<id>`, preserving the `"principal:"` prefix so
-`key_class_label` still reports "authenticated principal". Applied at both
-call sites:
+`principal:tenant=<tenant>\0<id>` (a NUL byte, not `:`, joins the tenant and
+the id — see "Codex review findings" below), preserving the `"principal:"`
+prefix so `key_class_label` still reports "authenticated principal".
+Applied at both call sites:
 
 ```rust
 // resolve_key_and_params (global tower layer)
@@ -131,10 +132,54 @@ unique random string and the IP fallback's cross-tenant sharing (e.g. one
 NAT'd network) is an existing, accepted, documented limitation, not this
 bug.
 
+## 🤖 Codex review findings (PR #2653)
+
+Codex's automated review left three findings on the fix commit. Disposition:
+
+1. **P2, key-join ambiguity** (`tenant:id` via `:` is not injective) —
+   **valid, fixed.** Switched the separator to `\0`, matching `key_ns`'s own
+   join in `resolve_key_and_params`. Added
+   `tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries` and
+   three sibling unit tests in `rate_limit.rs`.
+2. **P1, header-sourced tenant not bound to the authenticated session** — a
+   caller with a valid tenant-A session can send an arbitrary `x-tenant-id`
+   header and have `CURRENT_TENANT` (and now the bucket key) resolve to
+   whatever tenant that header names, regardless of which tenant issued
+   their session. **Correct, but not a regression this PR introduces and not
+   fixable at this layer.** `docs/guide/tenant-cells.md` documents header
+   (and JWT/subdomain) tenant sourcing as "request-controlled" — the
+   framework does not itself bind a header/JWT-sourced tenant to session
+   identity; that is the same trust model the already-merged
+   `docs/security/2026-09-02-idempotency-tenant-scope/` and
+   `docs/security/2026-09-05-cached-tenant-key/` fixes build on (both fold
+   in the identical `CURRENT_TENANT`, with the identical trust assumption).
+   Fixing this would mean redesigning how every tenant source binds to
+   authenticated identity across the whole tenancy subsystem — an
+   architecturally significant, cross-cutting change well beyond this PR's
+   scope, and out of scope for a "fold the tenant into a cache/bucket key"
+   fix specifically. Replied on the review thread; not resolving it (a
+   human call, not mine, per the ambiguous/architectural-finding rule).
+3. **P1, `tenancy.public_paths` routes stay unqualified** — correct
+   mechanically (`tenancy_middleware` returns before entering the
+   `CURRENT_TENANT` scope for an exempt path, so `tenant_qualify_bucket_key`
+   sees `None` and no-ops there, same as before the fix). **Not a gap
+   introduced by this fix** — it is the same "public path stays tenantless"
+   property `idempotency_tenant_scope.rs`'s
+   `session_tenancy_public_path_alias_stays_tenantless` test already asserts
+   and accepts for the sibling idempotency fix, and for the same reason:
+   `public_paths` means "this route does not participate in tenancy",
+   framework-wide, so there is no tenant signal available to fold in on
+   that path for *any* tenant-aware feature, not just rate limiting.
+   Replied on the review thread referencing that precedent; not resolving
+   it (same ambiguous/architectural-finding rule as above).
+
 ## ✅ Verification
 
 - Reproduction: both tests FAILED before the fix (`trunk-failure.txt`),
   both PASSED after (`after.txt`).
+- `cargo test -p autumn-web --lib security::rate_limit::tests::tenant_qualify`
+  — 4 passed (no-op cases, tenant fold-in, and the Codex-flagged
+  tenant/id-boundary collision).
 - `cargo test -p autumn-web --test integration_tests --features
   test-support -- rate_limit throttle` — 48 passed, 0 failed, including the
   pre-existing `tier_assignment_hook_selects_correct_limits` (confirms the
