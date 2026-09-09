@@ -3174,7 +3174,7 @@ mod tests {
         assert!(
             names
                 .iter()
-                .any(|name| name == "20260907000000_create_derivations"),
+                .any(|name| name == "20260907101530_create_derivations"),
             "framework migrations must include the derivation state table: {names:?}"
         );
     }

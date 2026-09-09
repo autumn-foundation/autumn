@@ -11183,7 +11183,7 @@ const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
 const VERSION_HISTORY_MIGRATION: &str = "20260526000000_create_version_history";
 
 #[cfg(feature = "db")]
-const DERIVATION_MIGRATION: &str = "20260907000000_create_derivations";
+const DERIVATION_MIGRATION: &str = "20260907101530_create_derivations";
 
 /// Whether startup should create the control-plane `_autumn_shard_directory`
 /// table. It is required only when directory routing is enabled AND shards are

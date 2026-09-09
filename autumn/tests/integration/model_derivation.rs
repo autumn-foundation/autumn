@@ -210,7 +210,7 @@ const CAPPED_DERIVATION: &str = "dv_capped_posts.capped_count";
 /// The state table's own DDL, taken from the migration the framework ships, so
 /// these tests exercise the shipped statement rather than a copy of it.
 const DERIVATIONS_DDL: &str =
-    include_str!("../../derivation_migrations/20260907000000_create_derivations/up.sql");
+    include_str!("../../derivation_migrations/20260907101530_create_derivations/up.sql");
 
 const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS dv_posts \

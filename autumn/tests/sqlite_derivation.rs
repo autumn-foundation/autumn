@@ -147,7 +147,7 @@ const ORG_DERIVATION: &str = "sd_posts.org_comment_count";
 /// The framework's own `SQLite` state-table DDL, so this suite proves the
 /// shipped migration rather than a copy of it.
 const DERIVATIONS_DDL: &str =
-    include_str!("../derivation_migrations_sqlite/20260907000000_create_derivations/up.sql");
+    include_str!("../derivation_migrations_sqlite/20260907101530_create_derivations/up.sql");
 
 const DDL: &[&str] = &[
     // `INTEGER PRIMARY KEY` is the rowid alias that autoincrements; `BIGSERIAL`

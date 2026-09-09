@@ -2480,12 +2480,12 @@ mod tests {
         );
     }
 
-    fn tenanted(parent: i64, contrib: i64, tenant: Option<&str>) -> CapturedContribution {
-        Some(Captured {
+    fn captured_in(parent: i64, contrib: i64, tenant: Option<&str>) -> Captured {
+        Captured {
             parent,
             contrib,
             tenant: tenant.map(str::to_owned),
-        })
+        }
     }
 
     #[test]
@@ -2498,8 +2498,8 @@ mod tests {
         let mut out = Vec::new();
         push_diff(
             0,
-            tenanted(7, 3, Some("a")),
-            tenanted(7, 3, Some("b")),
+            Some(captured_in(7, 3, Some("a"))),
+            Some(captured_in(7, 3, Some("b"))),
             1,
             &mut out,
         );
@@ -2512,8 +2512,8 @@ mod tests {
         let mut out = Vec::new();
         push_diff(
             0,
-            tenanted(7, 3, Some("a")),
-            tenanted(8, 3, Some("b")),
+            Some(captured_in(7, 3, Some("a"))),
+            Some(captured_in(8, 3, Some("b"))),
             1,
             &mut out,
         );
@@ -2526,8 +2526,8 @@ mod tests {
         let mut out = Vec::new();
         push_diff(
             0,
-            tenanted(7, 1, None),
-            tenanted(7, 1, Some("b")),
+            Some(captured_in(7, 1, None)),
+            Some(captured_in(7, 1, Some("b"))),
             1,
             &mut out,
         );
@@ -2543,17 +2543,17 @@ mod tests {
         let mut out = Vec::new();
         push_diff(
             0,
-            tenanted(7, 3, Some("a")),
-            tenanted(7, 10, Some("a")),
+            Some(captured_in(7, 3, Some("a"))),
+            Some(captured_in(7, 10, Some("a"))),
             1,
             &mut out,
         );
-        assert_eq!(out, vec![(0, 7, 7, live.clone())]);
+        assert_eq!(out, vec![(0, 7, 7, live)]);
 
         // Unparented after a tenant change: the removal is still under the old
         // tenant, and nothing is added.
         let mut out = Vec::new();
-        push_diff(0, tenanted(7, 3, Some("a")), None, 1, &mut out);
+        push_diff(0, Some(captured_in(7, 3, Some("a"))), None, 1, &mut out);
         assert_eq!(out, vec![(0, 7, -3, was_a)]);
     }
 

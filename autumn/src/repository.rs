@@ -41,7 +41,7 @@ pub use crate::counter_cache::{
     counter_cache_recompute,
 };
 #[doc(inline)]
-pub use crate::counter_cache::{CapturedContribution, CapturedContributions};
+pub use crate::counter_cache::{Captured, CapturedContribution, CapturedContributions};
 
 // Derivations (#1769) are maintained through the counter-cache specs above, so
 // the hooks a generated repository calls are already in scope from that

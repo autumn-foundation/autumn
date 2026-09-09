@@ -764,7 +764,7 @@ async fn enqueue(conn: &mut RuntimeConnection, def: &DerivationDef) -> AutumnRes
 /// new binary's backfill assigns the new one, so a parent an old replica
 /// touches after the sweep has passed it is wrong until it is swept again. The
 /// framework cannot see the fleet, so it does not wait; the contract is one
-/// [`resweep`](crate::derivation::resweep) (or [`recompute`](crate::derivation::recompute))
+/// [`resweep`] (or [`recompute`])
 /// once no old replica writes, which the guide's deployment section spells out.
 /// A derivation removed for a deployment and reinstated later is the same
 /// contract: its row survives with a matching hash, nothing maintained the
@@ -1300,7 +1300,7 @@ fn is_missing_state_table(error: &AutumnError) -> bool {
 /// Put one derivation back on the backfill queue under its current definition.
 ///
 /// The row keeps its hash and drops its checkpoint, so the next
-/// [`run_backfill`](crate::derivation::run_backfill) (or the next boot) sweeps
+/// [`run_backfill`] (or the next boot) sweeps
 /// the whole parent table again. This is the operator's step after a **rolling
 /// deployment that changed a definition**: replicas still on the old binary
 /// keep applying deltas under the old filter or transform while the new
@@ -1825,12 +1825,12 @@ mod tests {
     #[test]
     fn the_control_copy_of_the_state_migration_matches_the_standalone_set() {
         assert_eq!(
-            include_str!("../migrations/20260907000000_create_derivations/up.sql"),
-            include_str!("../derivation_migrations/20260907000000_create_derivations/up.sql"),
+            include_str!("../migrations/20260907101530_create_derivations/up.sql"),
+            include_str!("../derivation_migrations/20260907101530_create_derivations/up.sql"),
         );
         assert_eq!(
-            include_str!("../migrations/20260907000000_create_derivations/down.sql"),
-            include_str!("../derivation_migrations/20260907000000_create_derivations/down.sql"),
+            include_str!("../migrations/20260907101530_create_derivations/down.sql"),
+            include_str!("../derivation_migrations/20260907101530_create_derivations/down.sql"),
         );
     }
 

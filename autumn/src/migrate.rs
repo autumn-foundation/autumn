@@ -3068,7 +3068,7 @@ mod tests {
         for required in [
             "20260526000000_create_version_history",
             "20260515000000_create_repository_commit_hook_queue",
-            "20260907000000_create_derivations",
+            "20260907101530_create_derivations",
         ] {
             assert!(
                 names.iter().any(|name| name == required),
@@ -3090,7 +3090,7 @@ mod tests {
         for required in [
             "20260526000000_create_version_history",
             "20260515000000_create_repository_commit_hook_queue",
-            "20260907000000_create_derivations",
+            "20260907101530_create_derivations",
         ] {
             assert!(
                 names.iter().any(|name| name == required),
