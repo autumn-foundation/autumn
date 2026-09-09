@@ -2410,55 +2410,6 @@ fn emit_counter_caches_impl(
             ));
         }
         let self_referential = parent_table == table_name;
-        // A derivation onto its own table must not read the column it writes:
-        // the parent-side UPDATE runs no repository hook, so a node's new
-        // aggregate would change its own contribution (or its eligibility)
-        // toward its parent without that parent ever hearing about it.
-        let reads = |source: &str| {
-            let summed = match &decl.transform {
-                DerivationTransform::Sum { field, .. } => field == source,
-                DerivationTransform::Count => false,
-            };
-            summed
-                || decl
-                    .filter
-                    .as_ref()
-                    .is_some_and(|expr| expr_mentions_field(expr, source))
-        };
-        if self_referential && reads(column) {
-            return Err(syn::Error::new(
-                decl.span,
-                format!(
-                    "`#[derivation]` onto its own table cannot read the column it \
-                     maintains: `{column}` is both the maintained column and a \
-                     source of the contribution (in `transform` or `filter`), and \
-                     the parent-side update runs no repository hook, so a row's new \
-                     aggregate would change what it contributes to its own parent \
-                     without that parent being maintained. Read another column, or \
-                     maintain another one"
-                ),
-            ));
-        }
-        // The same hole one level over: a source that something else in this
-        // model maintains on this table moves under direct SQL, and the
-        // contribution built from it changes with no delta carrying the change
-        // up. A comment's `child_score` moves; the post's `sum(child_score)`
-        // never hears of it.
-        if let Some((_, source, by)) = maintained_here
-            .iter()
-            .find(|(owner, source, _)| *owner != Some(index) && reads(source))
-        {
-            return Err(syn::Error::new(
-                decl.span,
-                format!(
-                    "`#[derivation]` cannot read `{source}` as a source: {by} maintains \
-                     `{table_name}.{source}` by direct SQL, which runs no repository \
-                     hook, so this contribution would change without the delta that \
-                     carries it up. Read a column nothing maintains, or maintain the \
-                     aggregate one level at a time"
-                ),
-            ));
-        }
         let fk = derivation_fk(model_ident, decl, assocs)?;
         let Some(fk_field) = all_fields
             .iter()
@@ -2501,6 +2452,60 @@ fn emit_counter_caches_impl(
                     ),
                 ));
             }
+        }
+        // A derivation onto its own table must not read the column it writes:
+        // the parent-side UPDATE runs no repository hook, so a node's new
+        // aggregate would change its own contribution (or its eligibility)
+        // toward its parent without that parent ever hearing about it.
+        // What this derivation reads off the child row: the summed field, the
+        // filter's fields, and the two every aggregate reads implicitly, the
+        // grouping key and the tenant column.
+        let reads = |source: &str| {
+            let summed = match &decl.transform {
+                DerivationTransform::Sum { field, .. } => field == source,
+                DerivationTransform::Count => false,
+            };
+            summed
+                || decl
+                    .filter
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_field(expr, source))
+                || fk_column == source
+                || decl.tenant_column.as_deref() == Some(source)
+        };
+        if self_referential && reads(column) {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` onto its own table cannot read the column it \
+                     maintains: `{column}` is both the maintained column and a \
+                     source of the contribution (in `transform` or `filter`), and \
+                     the parent-side update runs no repository hook, so a row's new \
+                     aggregate would change what it contributes to its own parent \
+                     without that parent being maintained. Read another column, or \
+                     maintain another one"
+                ),
+            ));
+        }
+        // The same hole one level over: a source that something else in this
+        // model maintains on this table moves under direct SQL, and the
+        // contribution built from it changes with no delta carrying the change
+        // up. A comment's `child_score` moves; the post's `sum(child_score)`
+        // never hears of it.
+        if let Some((_, source, by)) = maintained_here
+            .iter()
+            .find(|(owner, source, _)| *owner != Some(index) && reads(source))
+        {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot read `{source}` as a source (summed, filtered \
+                     on, grouped by, or scoped by): {by} maintains `{table_name}.{source}` \
+                     by direct SQL, which runs no repository hook, so this contribution \
+                     would change without the delta that carries it up. Read a column \
+                     nothing maintains, or maintain the aggregate one level at a time"
+                ),
+            ));
         }
         // Read through the field's own ident, which keeps a raw-identifier
         // spelling (`r#type`) that the column name (`type`) has dropped.
@@ -11300,6 +11305,47 @@ mod tests {
                 && generated.contains("a `counter_cache` of this model"),
             "{generated}"
         );
+    }
+
+    #[test]
+    fn model_derivation_cannot_group_or_scope_by_a_column_a_sibling_maintains() {
+        // The grouping key and the tenant column are read implicitly by every
+        // aggregate, so a sibling maintaining one is the same hole.
+        for (attrs, source) in [
+            (
+                quote! {
+                    #[derivation(Node, column = "parent_id", fk = tree_id)]
+                    #[derivation(Node, column = "child_count", fk = parent_id)]
+                },
+                "parent_id",
+            ),
+            (
+                quote! {
+                    #[derivation(Node, column = "org_id", fk = parent_id)]
+                    #[derivation(Tree, column = "node_count", fk = tree_id, tenant = "org_id")]
+                },
+                "org_id",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attrs
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub tree_id: i64,
+                        pub org_id: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains(&format!("cannot read `{source}` as a source")),
+                "{source} is an implicit source: {generated}"
+            );
+        }
         // Reading a column nothing maintains, next to a maintained one, is fine.
         let generated = model_macro(
             TokenStream::new(),

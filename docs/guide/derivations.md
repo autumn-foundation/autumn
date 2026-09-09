@@ -346,7 +346,8 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   `#[id]` and `fk` fields may be renamed that way: the spec reaches SQL under
   the physical column.
 - **A derivation cannot read a column something else maintains on its table.**
-  A source (the summed field, or a field in the filter) that another
+  A source (the summed field, a field in the filter, the `fk` it groups by or
+  the `tenant` column it is scoped by) that another
   derivation, a `counter_cache`, a vote tally or an ordering position maintains
   on the child's table moves under direct SQL, with no delta carrying the change
   up: a comment's `child_score` moves and the post's `sum(child_score)` never

@@ -379,10 +379,12 @@ fn check_registry(defs: &[&DerivationDef]) -> AutumnResult<()> {
     check_source_columns(defs, &claims)
 }
 
-/// The child columns a definition reads: every `{c}."<column>"` in its
-/// contribution and its lowered filter.
+/// The child columns a definition reads: the grouping key and the tenant
+/// column every aggregate reads implicitly, then every `{c}."<column>"` in
+/// its contribution and its lowered filter.
 fn source_columns(def: &DerivationDef) -> Vec<&'static str> {
-    let mut columns = Vec::new();
+    let mut columns = vec![def.fk_column];
+    columns.extend(def.tenant_column);
     for sql in [def.contrib_sql, def.filter_sql] {
         let mut rest = sql;
         while let Some(start) = rest.find("{c}.\"") {
@@ -1664,13 +1666,54 @@ mod tests {
 
     #[test]
     fn source_columns_are_read_off_the_lowered_sql() {
-        assert_eq!(source_columns(&count_def()), ["published"]);
-        assert_eq!(source_columns(&sum_def()), ["score", "published", "score"]);
+        // The grouping key first, then the SQL's columns.
+        assert_eq!(source_columns(&count_def()), ["post_id", "published"]);
+        assert_eq!(
+            source_columns(&sum_def()),
+            ["post_id", "score", "published", "score"]
+        );
         let cast = DerivationDef {
             filter_sql: " AND (CAST({c}.\"status\" AS TEXT) = 'featured' {bin})",
+            tenant_column: Some("org_id"),
             ..count_def()
         };
-        assert_eq!(source_columns(&cast), ["status"]);
+        assert_eq!(source_columns(&cast), ["post_id", "org_id", "status"]);
+    }
+
+    #[test]
+    fn a_derivation_cannot_group_or_scope_by_a_column_another_derivation_maintains() {
+        // A leaf maintaining `dv_comments.post_id` re-parents comments under
+        // direct SQL, so a derivation grouping by it would never see the move.
+        let reparenting = DerivationDef {
+            name: "dv_comments.post_id",
+            parent_table: "dv_comments",
+            column: "post_id",
+            fk_column: "thread_id",
+            filter: "",
+            filter_sql: "",
+            ..count_def()
+        };
+        let message = check_source_columns(&[&reparenting, &count_def()], &[])
+            .expect_err("the grouping key is a source")
+            .to_string();
+        assert!(message.contains("dv_comments.post_id"), "{message}");
+
+        let retenanting = DerivationDef {
+            name: "dv_comments.org_id",
+            parent_table: "dv_comments",
+            column: "org_id",
+            filter: "",
+            filter_sql: "",
+            ..count_def()
+        };
+        let scoped = DerivationDef {
+            tenant_column: Some("org_id"),
+            ..count_def()
+        };
+        check_source_columns(&[&retenanting, &scoped], &[])
+            .expect_err("the tenant column is a source");
+        check_source_columns(&[&retenanting, &count_def()], &[])
+            .expect("an unscoped derivation does not read the tenant column");
     }
 
     #[test]
