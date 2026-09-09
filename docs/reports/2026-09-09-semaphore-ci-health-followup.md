@@ -160,7 +160,9 @@ cosmetic-only defect.
 
 Both hits are organic-sample data points, not rerun-campaign results — no
 before/after to report, consistent with "no fix this pass." Running tallies
-against the ledger's ≥20 (≥50 for sub-10% rates) bar:
+against this role's own ≥20 (≥50 for sub-10% rates) evidentiary bar for
+closing an entry — a Semaphore operating standard, not a numeric threshold
+written into the ledger's intake form itself:
 
 | Test | Hits (this pass) | Cumulative organic hits | Platforms seen |
 |---|---|---|---|

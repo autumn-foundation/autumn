@@ -160,8 +160,12 @@ without also filling in the intake form above.
   (workspace)`-shaped rerun too, not just `cargo test --workspace` on a
   plain runner). #2548 separately banked 13/13 clean organic macOS samples
   on the tracked corpus since #2510 merged — reassuring, still short of the
-  ≥20 (≥50 for the sub-10% end) this ledger's intake form requires to close
-  an entry.
+  ≥20 (≥50 for the sub-10% end) sample size this role's own evidentiary bar
+  calls for before treating an entry as closed. (That specific numeric
+  threshold is Semaphore's own operating standard, not a field defined in
+  this ledger's intake form above — the intake form's own requirement is
+  just a same-commit rerun-rate baseline, `<k>/<n>`, with no minimum `n`
+  written into it.)
 - **A fix is already in flight** (PR #2510) that reclassifies
   `ECONNRESET`/`ECONNABORTED` (retryable) separately from `ECONNREFUSED`
   (hard zero-tolerance failure) — but per its own description it could not
@@ -186,8 +190,9 @@ without also filling in the intake form above.
   same exact panic site, both on `macos-latest` — this is no longer
   "suggestive," it is a confirmed-repeat failure signature. Still not a
   formal rerun-rate (organic sample only, denominator not tracked as
-  tightly as the 2026-09-04 census's), so still below this ledger's ≥20/≥50
-  bar for a fix PR, but it should be weighted at least as high as
+  tightly as the 2026-09-04 census's), so still below the ≥20/≥50 sample
+  size this role's own evidentiary bar (not the intake form) calls for
+  before a fix PR, but it should be weighted at least as high as
   `live_upgrade` for the next rerun campaign, not treated as the minor
   entry it was when it had n=1.
 - **Status**: under active investigation, same rerun campaign as
