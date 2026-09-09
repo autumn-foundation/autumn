@@ -2273,7 +2273,10 @@ async fn run_job_handler_inner(
             .await
             {
                 Ok(Ok(())) => JobExecutionOutcome::Succeeded,
-                Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
+                // `message`, not `Display`: this string is persisted in a
+                // failure capsule and compared byte for byte on replay, so
+                // it must not move when `Display` gains the field list.
+                Ok(Err(error)) => JobExecutionOutcome::Failed(error.message()),
                 Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
             }
         }
@@ -2639,7 +2642,8 @@ fn fill_enqueue(
             // `DateTime` is not total.
             delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
             due_at,
-            error: error.map(ToString::to_string),
+            // `message`, not `Display`: recorded on the capsule tape.
+            error: error.map(crate::AutumnError::message),
         },
     );
 }

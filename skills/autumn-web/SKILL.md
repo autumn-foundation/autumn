@@ -84,7 +84,7 @@ the framework almost certainly already generates or ships it:
 | Hand-parsed `Range` headers / manual `206 Partial Content` / `Content-Range` / `416` for seekable media or resumable downloads | `autumn_web::range` (`resolve` + `partial_bytes_response`) and `Download::into_response_ranged(&headers).await` — RFC 7233 single-range parsing, multi-range single-range collapse, `If-Range` via `.etag(..)`/`.last_modified(..)`, blob slices via `BlobStore::get_range` (no whole-object buffering) (0.6.0) |
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
-| A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
+| A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument, 256 instruments, 8 labels/series by default) instead of leaking series (0.7.0, issue #1378); those three are the `[metrics]` section — `max_series_per_metric` / `max_instruments` / `max_labels_per_series`, plus `AUTUMN_METRICS__*` — so an app with a genuinely larger label space raises them rather than losing series, while the name/value/help-length caps stay fixed. Lowering a cap never evicts a retained series (that would reset a counter); an out-of-range value fails the boot naming the key. `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
@@ -3255,6 +3255,39 @@ on `/actuator/health` under the `sqlite-replication` indicator; the indicator go
 `[alerts]` pipeline escalates (see `AlertCondition::HealthIndicatorDown`).
 Verification is a **real restore** on an interval, not a checksum. See
 `docs/guide/sqlite-in-production.md`.
+
+### SQLite migration dialect and `migrate check` (issue #1906)
+
+`autumn migrate check` classifies migration SQL against the app's own backend.
+On SQLite it never recommends `CREATE INDEX CONCURRENTLY` (no such syntax) and
+does not flag a plain `DROP INDEX` (a cheap catalog edit, and a precondition of
+`DROP COLUMN`). A new `unsupported` risk level marks statements SQLite rejects
+outright, and fails the gate:
+
+| Statement | Why SQLite rejects it | Write instead |
+| --- | --- | --- |
+| `ALTER TABLE … ALTER COLUMN …` (any form) | SQLite's `ALTER TABLE` supports only `RENAME`, `ADD COLUMN`, `DROP COLUMN` | Rebuild the table — `autumn schema diff --write-migration` emits it |
+| `ADD COLUMN … NOT NULL` with no `DEFAULT` | Cannot backfill existing rows | Give a constant `DEFAULT`, or add the column nullable |
+| `ADD COLUMN … UNIQUE` / `PRIMARY KEY` | Inline constraint not allowed | Add the column, then `CREATE UNIQUE INDEX` |
+| `ADD COLUMN … DEFAULT CURRENT_TIMESTAMP` or `DEFAULT (expr)` | The default must be a constant | Use a literal, or backfill with `UPDATE` |
+| More than one action in one `ALTER TABLE` | SQLite takes one action per statement | Split into one `ALTER TABLE` per action |
+| `TRUNCATE` | No such statement | `DELETE FROM <table>;` |
+| Sequences, types, extensions, materialized views, `COMMENT ON`, `GRANT`/`REVOKE` | Postgres-only objects | Remove, or gate the migration to Postgres |
+
+One rule Autumn deliberately does **not** report: SQLite rejects an added
+`REFERENCES` column with a non-NULL default only when `PRAGMA foreign_keys` is
+ON, and the migration connection leaves it OFF, so the statement applies.
+
+`DROP COLUMN` also fails on SQLite when the column is a primary key, is `UNIQUE`,
+is named by any index (including a partial index's `WHERE`), or appears in a
+`CHECK`, generated column, view or trigger. `autumn generate migration
+Remove…From…` handles the index case: it reads the project's earlier
+`migrations/*/up.sql`, emits `DROP INDEX IF EXISTS` for every live index that
+names the removed column — composite, partial, expression and hand-named
+included — before the `DROP COLUMN`, and re-creates them in `down.sql`. An index
+created outside `migrations/` stays invisible; drop it in the same migration.
+
+Postgres classification and generated Postgres DDL are unchanged.
 
 ### VPS deploys and fleets — `autumn deploy` (0.6.0; fleets 0.7.0, issues #1607/#1621)
 
