@@ -103,6 +103,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   620,067 → 381,893 per render (-38.4%); `escape`'s own share of the profile
   72% → 54%; allocation bytes/blocks per render unchanged (both paths make
   exactly one `String` allocation).
+- **⚡ Bolt: `hmac_sha256_hex` hex-encoding; findings, no fix:** the existing
+  `autumn/benches/csrf_verify.rs` (a `GET` that mints a signed CSRF cookie
+  plus two `POST`s that verify it, through the real `CsrfLayer`) attributes
+  `security::config::hmac_sha256_hex` 16.86% of the profile's instructions
+  under `valgrind --tool=callgrind`, most of it the real HMAC-SHA256
+  compression (`sha2::sha256::compress256`, 10.42% — inherent crypto work,
+  not a target). The remaining hex-encoding tail walks the 32-byte MAC output
+  one byte at a time with `write!(acc, "{b:02x}")`, routing every byte
+  through `core::fmt::write` → `Formatter::pad_integral` → `LowerHex::fmt`
+  (7.43% of the whole profile, inclusive) instead of a direct nibble lookup.
+  Swapping it for `hex::encode` — already used for identical byte-to-hex
+  encoding elsewhere in this crate (`ledger.rs`, `migrate.rs`, `sigv4.rs`,
+  `auth/remember.rs`, ...) — was measured on the same bench/machine:
+  instructions 806,998,060 → 769,584,433 total (base-subtracted per-request
+  132,954.8 → 126,764.3 Ir, -4.66%); DHAT allocation blocks/bytes unchanged
+  (both approaches make exactly one `String` allocation). -4.66% clears
+  neither the 5%-of-instructions nor the 10%-of-allocations impact floor —
+  it is the ceiling of what this narrow, safe substitution can remove, since
+  the untouchable SHA-256 compression dominates the rest of the function's
+  cost — so no fix is shipped. Recorded as a findings issue rather than
+  shipped; the profiling coverage and negative result are the lasting
+  artifact.
 
 ### Changed
 

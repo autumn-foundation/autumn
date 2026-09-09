@@ -237,6 +237,30 @@ pub fn validate_signing_secret(
 
 /// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
 ///
+/// Signs (and, via [`ResolvedSigningKeys::verify`]) verifies every CSRF token,
+/// session cookie, and local-storage payload, so this runs at least once per
+/// mutating request. `benches/csrf_verify.rs` (a `GET` that mints a token plus
+/// two `POST`s that verify it, through the real `CsrfLayer`) attributes
+/// `hmac_sha256_hex` 16.86% of the profile's instructions under `valgrind
+/// --tool=callgrind` (136,026,523 of 806,998,060 Ir, base-subtracted per
+/// the bench's own 0-vs-2000-iteration convention) — most of it the real
+/// HMAC-SHA256 compression (`sha2::sha256::compress256`, 10.42% of the whole
+/// profile), which is inherent crypto work, not a target.
+///
+/// **Negative result (checked, not shipped):** the per-byte hex fold below
+/// routes every one of the 32 output bytes through `core::fmt::write` ->
+/// `Formatter::pad_integral` -> `LowerHex::fmt` (7.43% of the whole profile,
+/// inclusive) instead of a direct nibble lookup. Swapping it for
+/// `hex::encode` (already used for identical byte-to-hex encoding elsewhere
+/// in this crate: `ledger.rs`, `migrate.rs`, `sigv4.rs`, ...) was measured on
+/// the same bench/machine: instructions 806,998,060 -> 769,584,433 total
+/// (base-subtracted per-request 132,954.8 -> 126,764.3 Ir, -4.66%), DHAT
+/// allocation blocks and bytes unchanged (both approaches make exactly one
+/// `String` allocation). -4.66% clears neither the 5%-of-instructions nor the
+/// 10%-of-allocations impact floor — it is the ceiling of what this narrow,
+/// safe substitution can remove, since the untouchable SHA-256 compression
+/// dominates the rest of this function's cost — so no fix is shipped.
+///
 /// # Panics
 ///
 /// This should not panic because HMAC accepts keys of any length. A panic would
