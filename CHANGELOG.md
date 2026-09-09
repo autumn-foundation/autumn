@@ -532,6 +532,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original addresses. Each target's compaction reconnects and re-checks the
   endpoint before running, so a failed `\connect` in that pass cannot compact
   the previous target's database.
+  The dependency walk now traverses ordinary views. `pg_depend` records only the
+  hop a rewrite rule actually took, so matching a materialized view's dependency
+  straight against the set of materialized views lost both hops of `a_report ->
+  bridge_view -> z_source` and left two roots that sorted by name. Measured:
+  `a_report` refreshed FIRST from a `z_source` still holding pre-scrub rows, and
+  since refreshing a source does not update a view built from it, the run
+  reported success with `users` at 2 rows, 0 original addresses in the base
+  tables and in `z_source`, and all 200 still in `a_report`. Rule dependencies
+  are now read between relations of any kind and walked through anything that is
+  not a materialized view, so the edge is recovered however many ordinary views
+  sit in between.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the

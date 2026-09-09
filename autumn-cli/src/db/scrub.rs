@@ -3350,6 +3350,20 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
 /// (`mv`), the source-to-dependent edges among them (`edge`), the closure the
 /// run has to refresh (`needed`), and those edges restricted to it (`nedge`).
 ///
+/// `edge` is derived rather than read straight out of the catalog, because a
+/// materialized view can read another THROUGH an ordinary view and `pg_depend`
+/// records only the hop it actually took. Matching a rewrite rule's dependency
+/// directly against the set of materialized views drops both hops of `a_report
+/// -> bridge_view -> z_source`, leaving two roots that then sort by name.
+/// Measured on `PostgreSQL` 16.13: `a_report` refreshed FIRST, from a `z_source`
+/// still holding pre-scrub rows, and refreshing `z_source` afterwards does not
+/// touch it — `users` scrubbed to 2 rows with 0 original addresses, `z_source`
+/// clean, and `a_report` holding all 200, under a reported success. So
+/// `rel_edge` takes every rewrite-rule dependency between relations, `reach`
+/// walks it from each materialized view through anything that is not one, and
+/// `edge` keeps the pairs that land on one. `reach` recurses with `UNION` over a
+/// finite set of pairs, so it terminates whatever the view graph looks like.
+///
 /// `needed` is every POPULATED view, plus every view one of those reads, however
 /// deep. Both halves matter:
 ///
@@ -3376,14 +3390,23 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
      SELECT rel.oid, rel.relispopulated FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind = 'm' \
- ), edge AS ( \
+ ), rel_edge AS ( \
      SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source \
      FROM pg_depend d \
      JOIN pg_rewrite r ON r.oid = d.objid \
      WHERE d.classid = 'pg_rewrite'::regclass \
-       AND r.ev_class IN (SELECT oid FROM mv) \
-       AND d.refobjid IN (SELECT oid FROM mv) \
+       AND d.refclassid = 'pg_class'::regclass \
        AND d.refobjid <> r.ev_class \
+ ), reach AS ( \
+     SELECT m.oid AS dependent, e.source FROM mv m \
+     JOIN rel_edge e ON e.dependent = m.oid \
+     UNION \
+     SELECT h.dependent, e.source FROM reach h \
+     JOIN rel_edge e ON e.dependent = h.source \
+     WHERE h.source NOT IN (SELECT oid FROM mv) \
+ ), edge AS ( \
+     SELECT DISTINCT dependent, source FROM reach \
+     WHERE source IN (SELECT oid FROM mv) \
  ), needed AS ( \
      SELECT oid FROM mv WHERE relispopulated \
      UNION \

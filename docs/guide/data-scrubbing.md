@@ -729,8 +729,9 @@ apply-time error.
 - **Triggers are warned about, not disabled.** An audit or history trigger can
   copy the pre-scrub row into another table as the rewrite runs. The scrub names
   the tables carrying user triggers; check or disable them on the copy.
-- **Materialized views are refreshed** (in dependency order, inside the scrub's
-  own transaction) since they hold their own copy of whatever they selected — so
+- **Materialized views are refreshed** (in dependency order — traced through
+  ordinary views too, since a materialized view that reads another through one
+  must still be rebuilt after it — inside the scrub's own transaction) since they hold their own copy of whatever they selected — so
   a refresh the role is not allowed to run rolls the rewrites back rather than
   committing base tables a stale view contradicts. A view left `WITH NO DATA` is
   the one exception: it holds no rows to scrub, so it is skipped rather than

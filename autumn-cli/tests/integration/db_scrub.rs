@@ -2306,6 +2306,71 @@ async fn an_unpopulated_materialized_view_is_left_unpopulated() {
     }
 }
 
+/// A materialized view that reads another THROUGH an ordinary view is refreshed
+/// after it, not before.
+///
+/// `pg_depend` records only the hop a rewrite rule actually took, so matching a
+/// view's dependency straight against the set of materialized views loses both
+/// hops of `a_report -> bridge_view -> z_source`. The two then look like
+/// independent roots and sort by name — and `a_report` sorts first, so it was
+/// rebuilt from a `z_source` still holding pre-scrub rows, and refreshing
+/// `z_source` afterwards does not touch it.
+///
+/// Measured before the fix, on this exact shape: `users` scrubbed to 2 rows with
+/// 0 original addresses, `z_source` clean, `a_report` holding all 200, under
+/// `✓ Scrub complete`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_reached_through_an_ordinary_view_is_refreshed_in_dependency_order() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "matview_bridge").await;
+    // Named so the dependent sorts BEFORE its source: without the traversal the
+    // order is alphabetical, and a fixture that happens to sort correctly would
+    // pass either way.
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE VIEW bridge_view AS SELECT id, email FROM z_source; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT id, email FROM bridge_view;",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seeded_rows(&client, "a_report", "email").await,
+        200,
+        "the dependent must start holding the addresses the scrub has to remove"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/matview_bridge");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "the source must be refreshed before the view that reads it through the \
+         ordinary view: {stderr}"
+    );
+    // The order is the point, but the leak is what it costs.
+    for view in ["z_source", "a_report"] {
+        assert_eq!(
+            seeded_rows(&client, view, "email").await,
+            0,
+            "{view} must be rebuilt from the scrubbed rows: {stderr}"
+        );
+    }
+}
+
 /// A purged framework table is compacted and measured like any other.
 ///
 /// `[framework] purge` empties its tables, and `DELETE` frees no file space, so
