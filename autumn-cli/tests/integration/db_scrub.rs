@@ -322,6 +322,33 @@ async fn start_postgres() -> (
     (container, host, port)
 }
 
+/// Same, on a server new enough to have `BEGIN ATOMIC` function bodies.
+///
+/// The module default above is `postgres:11-alpine`, and it stays that way on
+/// purpose: it is the oldest server the scrub claims to run on, so every test
+/// that does not need a newer feature keeps proving that claim. `BEGIN ATOMIC`
+/// and the `pg_proc.prosqlbody` column that records it are both `PostgreSQL` 14,
+/// so the two tests about following a tracked function through the catalog
+/// cannot be written against 11 — the fixture itself is a syntax error there.
+async fn start_postgres_with_atomic_bodies() -> (
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    String,
+    u16,
+) {
+    use testcontainers::ImageExt as _;
+    use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("failed to start Postgres testcontainer — is Docker running?");
+    let host = container.get_host().await.unwrap().to_string();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    (container, host, port)
+}
+
 // ─── AC #6: the round trip ──────────────────────────────────────────────────
 
 #[tokio::test]
@@ -578,17 +605,33 @@ async fn scrub_anonymizes_a_resolved_database_url_in_place() {
         .get(0);
     assert_eq!(outbox_before, 1, "--check must not empty a purged table");
 
-    // `--dry-run` prints the statement and still writes nothing.
-    let (_o, dry_err) = run_autumn_ok(dir, &["db", "scrub", "--dry-run"], &envs);
-    // Schema-qualified on purpose — do not "simplify" this to a bare
-    // `UPDATE "users"`. Every catalog read that built the plan is scoped to
-    // `public`, so the writes are too: under a database- or role-level
-    // `search_path` (which Autumn supports for tenant schemas) a bare
-    // identifier would resolve to a DIFFERENT table than the one classified,
-    // leaving the classified rows unscrubbed. This assertion pins that.
+    // `--dry-run` reports the plan, withholds the script, and writes nothing.
+    //
+    // `User::api_token` is `#[encrypted]`, and that rewrite has no SQL text: the
+    // replacement is sealed per row under this target's key. A script printed
+    // without it samples and empties exactly as advertised while leaving every
+    // kept row's production ciphertext in place, and nothing in a pasted stream
+    // can stop it partway — an aborted transaction ends at the next `COMMIT`.
+    // So the runnable script is refused whole. The plan report above it still
+    // has to stand: that is what `--dry-run` is for.
+    //
+    // `run_autumn_fail`, not `run_autumn_ok`: withholding the script is a
+    // refusal and exits non-zero, like every other thing this command declines
+    // to do. Getting that wrong is how this test went red in CI while passing
+    // here — it is `#[ignore]`d behind Docker, so the Docker sweep is the only
+    // place it runs.
+    let (_o, dry_err) = run_autumn_fail(dir, &["db", "scrub", "--dry-run"], &envs);
     assert!(
-        dry_err.contains("UPDATE \"public\".\"users\" SET"),
-        "dry run should print the schema-qualified statement: {dry_err}"
+        dry_err.contains("cannot print a runnable script") && dry_err.contains("users.api_token"),
+        "the dry run must refuse the script and name the column: {dry_err}"
+    );
+    assert!(
+        !dry_err.contains("UPDATE \"public\".\"users\" SET"),
+        "and withhold the script whole, not print it minus the rewrite: {dry_err}"
+    );
+    assert!(
+        dry_err.contains("users.email") && dry_err.contains("autumn_sync_rows"),
+        "while still reporting the classification and the purge: {dry_err}"
     );
     assert!(
         !occurrences(&client, "Alice Realname").await.is_empty(),
@@ -718,6 +761,24 @@ async fn scrub_refuses_a_production_profile_without_force() {
         "a refused scrub must not have written anything"
     );
 
+    // A sample is refused by the same guard, on the same terms — the guard runs
+    // before anything reads the schema, so no flag can slip past it.
+    let (_o, sample_refusal) =
+        run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &prod_envs);
+    assert!(
+        sample_refusal.contains("Refusing to scrub") && sample_refusal.contains("prod"),
+        "a sampled scrub must be refused on prod too: {sample_refusal}"
+    );
+    let survivors: i64 = client
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        survivors, 2,
+        "a refused sample must not have deleted anything"
+    );
+
     // With --force it proceeds (the operator has said they mean it).
     run_autumn_ok(dir, &["db", "scrub", "--force"], &prod_envs);
     assert_no_secrets_survive(&client).await;
@@ -813,6 +874,19 @@ impl ServerGuard {
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
+        // The server is a GRANDCHILD (spawned through `cargo run`), so killing
+        // the child leaves it running — and, since #1636, still connected to
+        // the database the next leg of this test compacts with a `VACUUM FULL`.
+        // That takes an ACCESS EXCLUSIVE lock, so an orphan holding an open
+        // transaction would stall it. The child is spawned into its own process
+        // group, so the whole group goes down together.
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("--")
+                .arg(format!("-{}", self.child.id()))
+                .status();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -842,7 +916,9 @@ fn patch_generated_cargo_toml(project_dir: &Path) {
 ///
 /// Scaffolds, migrates, seeds, scrubs, re-checks migrations and then compiles
 /// and boots the app, so it needs the `diesel` CLI on `PATH` in addition to
-/// Docker — it runs in the generator-conformance Postgres gate.
+/// Docker — it runs in the generator-conformance Postgres gate. It then repeats
+/// the last two steps with `--sample` (issue #1636), which is the same
+/// criterion for a SAMPLED database and reuses the one expensive compile.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "slow: compiles and boots a generated app; needs Docker + diesel CLI"]
 #[allow(clippy::too_many_lines)]
@@ -910,9 +986,58 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
     );
 
     // ── The app boots against it and answers GET /health ────────────────────
+    assert_app_serves_health(&project, &url).await;
+
+    // ── #1636: the same drill, now with a sample ────────────────────────────
+    //
+    // Re-scrubbing the (already scrubbed) database with `--sample` is the one
+    // AC the Docker sweep cannot cover either: a SAMPLED database must also
+    // migrate clean and boot. The app is already compiled by this point, so
+    // this second leg costs a boot rather than a build.
+    run_autumn_ok(&project, &["db", "scrub", "--sample", "users=50%"], &envs);
+    let sampled_users: i64 = client
+        .query_one("SELECT count(*) FROM users", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(sampled_users, 1, "50% of two users is one row");
+    let orphans: i64 = client
+        .query_one(
+            "SELECT count(*) FROM comments c \
+             LEFT JOIN users u ON u.id = c.user_id WHERE u.id IS NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(orphans, 0, "every foreign key must resolve in the subset");
+    let kept_comments: i64 = client
+        .query_one("SELECT count(*) FROM comments", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        kept_comments, 1,
+        "the kept user's comment must come with it \u{2014} a zero here would satisfy \
+         the orphan check vacuously"
+    );
+
+    let (_o, sampled_migrate) = run_autumn_ok(&project, &["migrate"], &envs);
+    assert!(
+        sampled_migrate.contains("Migrations are already up to date.")
+            || sampled_migrate.contains("Migrations applied successfully."),
+        "migrations must report a clean status against the sampled database: \
+         {sampled_migrate}"
+    );
+    assert_app_serves_health(&project, &url).await;
+}
+
+/// Boot the generated app in `project` against `url` and require `GET /health`
+/// to answer 200, killing the server on the way out.
+async fn assert_app_serves_health(project: &Path, url: &str) {
     let build = Command::new("cargo")
         .args(["build"])
-        .current_dir(&project)
+        .current_dir(project)
         .output()
         .expect("cargo build");
     assert!(
@@ -926,13 +1051,21 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         listener.local_addr().unwrap().port()
     };
-    let stdout_path = project.join("app-stdout.log");
-    let stderr_path = project.join("app-stderr.log");
-    let child = Command::new("cargo")
+    let stdout_path = project.join(format!("app-stdout-{app_port}.log"));
+    let stderr_path = project.join(format!("app-stderr-{app_port}.log"));
+    let mut command = Command::new("cargo");
+    // Its own process group, so `ServerGuard` can take the whole tree down —
+    // `cargo run`'s grandchild server outlives a plain kill of `cargo`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let child = command
         .args(["run"])
-        .current_dir(&project)
+        .current_dir(project)
         .env("AUTUMN_SERVER__PORT", app_port.to_string())
-        .env("AUTUMN_DATABASE__URL", &url)
+        .env("AUTUMN_DATABASE__URL", url)
         .stdout(Stdio::from(
             std::fs::File::create(&stdout_path).expect("create the app stdout log"),
         ))
@@ -969,5 +1102,2904 @@ async fn scrubbed_database_migrates_clean_and_boots_the_app() {
         Some(200),
         "the app must boot against the scrubbed database and answer GET /health \
          with 200\n{output}"
+    );
+}
+
+// ─── `--sample`: laptop-sized, referentially-intact subsets (issue #1636) ────
+
+/// The sampling fixture: a `countries` lookup every user points at, a
+/// `comments` child hanging off `users`, and an `audit_logs` table connected to
+/// nothing. Together they exercise all four sample roles — root, related,
+/// always-include and never-include — in one schema.
+const SAMPLE_SCHEMA: &str = "\
+    CREATE TABLE countries ( \
+        id BIGSERIAL PRIMARY KEY, \
+        code TEXT NOT NULL UNIQUE, \
+        name TEXT NOT NULL \
+    ); \
+    CREATE TABLE users ( \
+        id BIGSERIAL PRIMARY KEY, \
+        country_id BIGINT NOT NULL REFERENCES countries (id), \
+        email TEXT NOT NULL UNIQUE, \
+        full_name TEXT NOT NULL, \
+        created_at TIMESTAMP NOT NULL DEFAULT NOW() \
+    ); \
+    CREATE TABLE comments ( \
+        id BIGSERIAL PRIMARY KEY, \
+        user_id BIGINT NOT NULL REFERENCES users (id), \
+        body TEXT NOT NULL, \
+        created_at TIMESTAMP NOT NULL DEFAULT NOW() \
+    ); \
+    CREATE TABLE audit_logs ( \
+        id BIGSERIAL PRIMARY KEY, \
+        actor_email TEXT NOT NULL, \
+        action TEXT NOT NULL \
+    ); \
+    CREATE TABLE tags ( \
+        id BIGSERIAL PRIMARY KEY, \
+        label TEXT NOT NULL \
+    ); \
+    CREATE TABLE user_tags ( \
+        user_id BIGINT NOT NULL REFERENCES users (id), \
+        tag_id BIGINT NOT NULL REFERENCES tags (id), \
+        PRIMARY KEY (user_id, tag_id) \
+    ); \
+    CREATE TABLE user_tag_notes ( \
+        id BIGSERIAL PRIMARY KEY, \
+        user_id BIGINT NOT NULL, \
+        tag_id BIGINT NOT NULL, \
+        note TEXT NOT NULL, \
+        FOREIGN KEY (user_id, tag_id) REFERENCES user_tags (user_id, tag_id) \
+    );";
+
+/// 3 countries, 200 users, 400 comments, 500 audit rows — enough volume that a
+/// 1% sample is a real subset rather than a rounding artefact. Generated from
+/// `generate_series`, so two databases seeded this way hold identical ids and a
+/// same-seed comparison is exact.
+const SAMPLE_ROWS: &str = "\
+    INSERT INTO countries (code, name) \
+        SELECT 'C' || i, 'Country ' || i FROM generate_series(1, 3) AS i; \
+    INSERT INTO users (country_id, email, full_name) \
+        SELECT 1 + (i % 3), 'user' || i || '@real-corp.example', 'Real Person ' || i \
+        FROM generate_series(1, 200) AS i; \
+    INSERT INTO comments (user_id, body) \
+        SELECT id, 'secret note ' || id FROM users \
+        UNION ALL SELECT id, 'second secret note ' || id FROM users; \
+    INSERT INTO audit_logs (actor_email, action) \
+        SELECT 'admin' || i || '@real-corp.example', 'login' \
+        FROM generate_series(1, 500) AS i; \
+    INSERT INTO tags (label) SELECT 'tag ' || i FROM generate_series(1, 5) AS i; \
+    INSERT INTO user_tags (user_id, tag_id) \
+        SELECT id, 1 + (id % 5) FROM users; \
+    INSERT INTO user_tag_notes (user_id, tag_id, note) \
+        SELECT user_id, tag_id, 'secret note about ' || user_id FROM user_tags;";
+
+/// The sampling fixture's declaration. `comments` is absent on purpose: it is
+/// registered with the GDPR anonymize strategy by `write_project_sources`, so
+/// the scrub classifies it with no declaration at all.
+const SAMPLE_SCRUB_TOML: &str = r#"
+[defaults]
+safe_columns = ["id", "created_at"]
+
+[tables.countries]
+safe = ["code", "name"]
+
+[tables.users]
+safe = ["country_id"]
+
+[tables.users.pii]
+email = "email"
+full_name = "name"
+
+[tables.audit_logs]
+safe = ["action"]
+
+[tables.audit_logs.pii]
+actor_email = "email"
+
+[tables.tags]
+safe = ["label"]
+
+# A composite primary key, and a composite foreign key onto it: the row key and
+# the walk's join both have to carry every component.
+[tables.user_tags]
+safe = ["user_id", "tag_id"]
+
+[tables.user_tag_notes]
+safe = ["user_id", "tag_id"]
+
+[tables.user_tag_notes.pii]
+note = "redact"
+
+# Reference data is copied whole; the audit trail is not copied at all.
+[sample]
+always_include = ["countries"]
+never_include = ["audit_logs"]
+"#;
+
+/// The domain every address `SAMPLE_ROWS` seeds carries.
+///
+/// Assertions that look for original values surviving a run must match on THIS
+/// and not on a plausible-looking domain the fixture never writes. A predicate
+/// that cannot match counts zero whether or not anything leaked, so "nothing
+/// spilled" passes with the leak fully present — which is what nine of the
+/// assertions below were doing until CI ran them: dropping the refusal and
+/// letting the emptying pass fire put 500 rows into `comments`, and the
+/// `%@example.com` predicate they used still reported 0.
+const SEEDED_DOMAIN: &str = "@real-corp.example";
+
+/// Rows of `table` whose `column` still holds an address the fixture seeded.
+///
+/// Single-sourced so the domain cannot drift back out of step with the seed.
+async fn seeded_rows(client: &Client, table: &str, column: &str) -> i64 {
+    count(
+        client,
+        &format!("SELECT count(*) FROM {table} WHERE {column} LIKE '%{SEEDED_DOMAIN}'"),
+    )
+    .await
+}
+
+/// Create `name`, seed the sampling fixture into it and return a client.
+async fn seed_sample_fixture(admin: &Client, base: &str, name: &str) -> Client {
+    admin
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+    let client = connect(&format!("{base}/{name}")).await;
+    client.batch_execute(SAMPLE_SCHEMA).await.unwrap();
+    client.batch_execute(SAMPLE_ROWS).await.unwrap();
+    // Prove the seed and `seeded_rows` agree, here and once, rather than
+    // trusting each call site: if the seed ever stops writing SEEDED_DOMAIN,
+    // every leak assertion in this file silently reports zero and passes.
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        200,
+        "the seed must write addresses the leak assertions can match"
+    );
+    client
+}
+
+/// A project directory wired for the sampling fixture.
+fn sample_project(dir: &Path) {
+    write_project_sources(dir);
+    std::fs::write(dir.join("scrub.toml"), SAMPLE_SCRUB_TOML).unwrap();
+}
+
+async fn count(client: &Client, sql: &str) -> i64 {
+    client
+        .query_one(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .get(0)
+}
+
+/// The ids the sample kept, ascending — the exact row set a seed selects.
+async fn kept_user_ids(client: &Client) -> Vec<i64> {
+    client
+        .query("SELECT id FROM users ORDER BY id", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// AC #1/#2/#3/#6/#8: one pass produces a scrubbed **and** sampled database
+/// that is smaller than the source, keeps every foreign key resolvable, honours
+/// the per-table rules, and carries none of the original values.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[allow(clippy::too_many_lines)]
+async fn sampled_scrub_is_smaller_referentially_intact_and_pii_free() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_target").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_target");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("Scrub complete"),
+        "the sampled scrub should complete: {stderr}"
+    );
+
+    // ── AC #2: the root is sized as asked, related rows follow ──────────────
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        2,
+        "1% of 200 users is 2 rows"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM comments").await,
+        4,
+        "each kept user brings its two comments and nothing else"
+    );
+
+    // ── AC #3: per-table rules ──────────────────────────────────────────────
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM countries").await,
+        3,
+        "an always-include lookup table is copied whole"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "a never-include table is excluded entirely"
+    );
+
+    // ── AC #2/#6: every foreign key still resolves ──────────────────────────
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM comments c \
+             LEFT JOIN users u ON u.id = c.user_id WHERE u.id IS NULL"
+        )
+        .await,
+        0,
+        "no comment may point at a user the sample dropped"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM users u \
+             LEFT JOIN countries c ON c.id = u.country_id WHERE c.id IS NULL"
+        )
+        .await,
+        0,
+        "no user may point at a country the sample dropped"
+    );
+
+    // ── Composite keys: a two-column primary key, and a two-column foreign
+    //    key onto it. Both the row key and the walk's join must carry every
+    //    component, in key order.
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM user_tags").await,
+        2,
+        "each kept user brings its one tag row, keyed on the composite key"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM user_tag_notes").await,
+        2,
+        "and the rows hanging off that composite key follow it"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM user_tag_notes n \
+             LEFT JOIN user_tags t \
+             ON t.user_id = n.user_id AND t.tag_id = n.tag_id \
+             WHERE t.user_id IS NULL"
+        )
+        .await,
+        0,
+        "a composite reference must still resolve"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM user_tags t \
+             LEFT JOIN tags g ON g.id = t.tag_id WHERE g.id IS NULL"
+        )
+        .await,
+        0,
+        "the tags a kept row points at must be kept"
+    );
+
+    // ── AC #1/#8: sampled AND scrubbed, in one pass ─────────────────────────
+    //
+    // Swept across every character column of every table rather than by a
+    // hand-written column list, so a value that landed somewhere unexpected is
+    // caught too.
+    for secret in [SEEDED_DOMAIN, "Real Person", "secret note"] {
+        let hits = occurrences(&client, secret).await;
+        assert!(
+            hits.is_empty(),
+            "the sampled copy still contains {secret:?} in: {}",
+            hits.join(", ")
+        );
+    }
+
+    // ── AC #6: the run reports what it produced ─────────────────────────────
+    assert!(
+        stderr.contains("users: 200 \u{2192} 2 row(s)"),
+        "the report must give per-table row counts: {stderr}"
+    );
+    assert!(
+        stderr.contains("Total: ") && stderr.contains("of the source"),
+        "the report must compare the subset to the source: {stderr}"
+    );
+    assert!(
+        stderr.contains("foreign key(s) re-verified"),
+        "the run must verify referential integrity itself: {stderr}"
+    );
+    assert!(
+        stderr.contains("Table size: "),
+        "the report must give the size versus the source: {stderr}"
+    );
+    assert!(
+        !stderr.contains("postgres://"),
+        "no message may print the connection URL: {stderr}"
+    );
+}
+
+/// AC #4: the same seed selects the identical row set, and a different one does
+/// not — the property that lets a teammate reproduce the exact subset that
+/// exhibits a bug.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_same_seed_selects_the_identical_row_set() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    let mut selections = Vec::new();
+    for (name, seed) in [("seed_a", "99"), ("seed_b", "99"), ("seed_c", "100")] {
+        let client = seed_sample_fixture(&admin, &base, name).await;
+        let url = format!("{base}/{name}");
+        run_autumn_ok(
+            dir,
+            &["db", "scrub", "--sample", "users=10", "--seed", seed],
+            &[("AUTUMN_DATABASE__URL", url.as_str())],
+        );
+        let ids = kept_user_ids(&client).await;
+        assert_eq!(ids.len(), 10, "{name} should keep exactly 10 users");
+        selections.push(ids);
+    }
+
+    assert_eq!(
+        selections[0], selections[1],
+        "the same seed against the same source data must select the identical rows"
+    );
+    assert_ne!(
+        selections[0], selections[2],
+        "a different seed must select a different subset"
+    );
+}
+
+/// AC #5: a table the walk cannot reach aborts with a non-zero exit that names
+/// it — sampling never empties a table without saying so.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_a_table_no_root_can_reach() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_gap").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // Drop the rule that accounted for `audit_logs`: nothing references it, so
+    // the walk can no longer reach it.
+    std::fs::write(
+        dir.join("scrub.toml"),
+        SAMPLE_SCRUB_TOML.replace("never_include = [\"audit_logs\"]", "never_include = []"),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_gap");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("audit_logs"),
+        "the refusal must name the uncovered table: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot be reached"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused sample must not have deleted anything"
+    );
+
+    // The same gap is caught by `--check`, which is the CI gate.
+    let (_o, check_err) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--check", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        check_err.contains("audit_logs"),
+        "--check must catch the gap before any restore: {check_err}"
+    );
+}
+
+/// A trigger that writes PII into a purged table AFTER the rewrites must not
+/// leave it there.
+///
+/// `[framework] purge` runs early so the sample's deletes are possible, but an
+/// `UPDATE` trigger on a scrubbed table copies `OLD` values — the real PII —
+/// into its audit table while the rewrites run, long after that early pass. The
+/// purge after the rewrites is what makes the guarantee true; without it the run
+/// reports `autumn_jobs (emptied)` while the original addresses sit in it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_trigger_cannot_refill_a_purged_table_with_pii() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "purge_trigger").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            CREATE FUNCTION audit_user() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO autumn_jobs (args) VALUES (OLD.email); \
+                RETURN NEW; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER users_audit BEFORE UPDATE ON users \
+                FOR EACH ROW EXECUTE FUNCTION audit_user();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/purge_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the trigger's rows must be purged after the rewrites, not before them"
+    );
+    assert_eq!(
+        seeded_rows(&client, "autumn_jobs", "args").await,
+        0,
+        "no original address may survive in the purged table"
+    );
+}
+
+/// The refusal follows `pg_inherits` down: `DELETE FROM parent` fires a trigger
+/// declared on a leaf partition, so a trigger anywhere below an emptied table
+/// has to mark it.
+///
+/// Without the walk the check compares names only, sees no trigger on the
+/// partitioned parent, and lets the run through — which commits the leak, since
+/// a trigger that spills sideways into a classified table refills nothing and
+/// so passes the promised-empty re-count.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_delete_trigger_on_a_leaf_partition_of_an_emptied_table_is_refused() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "leaf_partition_trigger").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL NOT NULL, \
+                shard INT NOT NULL, \
+                args TEXT NOT NULL \
+            ) PARTITION BY RANGE (shard); \
+            CREATE TABLE autumn_jobs_p0 PARTITION OF autumn_jobs \
+                FOR VALUES FROM (0) TO (10); \
+            CREATE FUNCTION refill_jobs() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO autumn_jobs (shard, args) VALUES (1, OLD.email); \
+                RETURN NEW; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER users_refill BEFORE UPDATE ON users \
+                FOR EACH ROW EXECUTE FUNCTION refill_jobs(); \
+            CREATE FUNCTION spill_leaf() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO comments (user_id, body) \
+                    SELECT id, OLD.args FROM users LIMIT 1; \
+                RETURN OLD; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER leaf_spill AFTER DELETE ON autumn_jobs_p0 \
+                FOR EACH ROW EXECUTE FUNCTION spill_leaf();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/leaf_partition_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    // Unsampled: the leak reaches an ordinary scrub through `[framework] purge`,
+    // and the partitioned parent is what the emptying statement names.
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub"], &envs);
+    assert!(
+        stderr.contains("autumn_jobs") && stderr.contains("DELETE"),
+        "the refusal must name the PARENT the statement empties: {stderr}"
+    );
+    assert_eq!(
+        seeded_rows(&client, "comments", "body").await,
+        0,
+        "and nothing may have spilled into the classified table"
+    );
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        200,
+        "a refusal before any write leaves the source untouched"
+    );
+}
+
+/// A composite key whose column names contain the aggregate separator.
+///
+/// The constraint probe used to join each side's column names with `U+001F` and
+/// split them back apart, on the assumption that no identifier could contain
+/// it. Postgres accepts any character in a quoted identifier, so such a name was
+/// torn in half and the halves zipped against the other side's — emitting a join
+/// over columns that do not exist, or (when only one side was affected) a
+/// shorter, WEAKER join over ones that do.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_composite_key_survives_a_control_character_in_a_column_name() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    admin
+        .batch_execute("CREATE DATABASE control_char_key")
+        .await
+        .unwrap();
+    let client = connect(&format!("{base}/control_char_key")).await;
+    let us = '\u{1f}';
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE parents (id INT PRIMARY KEY, a INT NOT NULL, \"b{us}c\" INT NOT NULL, \
+                UNIQUE (a, \"b{us}c\")); \
+             CREATE TABLE kids (id INT PRIMARY KEY, pa INT NOT NULL, \"pb{us}c\" INT NOT NULL, \
+                FOREIGN KEY (pa, \"pb{us}c\") REFERENCES parents (a, \"b{us}c\")); \
+             INSERT INTO parents SELECT g, g, g FROM generate_series(1, 10) g; \
+             INSERT INTO kids SELECT g, g, g FROM generate_series(1, 10) g;"
+        ))
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project_sources(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        "[defaults]\nsafe_columns = [\"id\"]\n\n\
+         [tables.parents]\nsafe = [\"a\", \"b\\u001Fc\"]\n\n\
+         [tables.parents.encrypted]\n\n\
+         [tables.kids]\nsafe = [\"pa\", \"pb\\u001Fc\"]\n",
+    )
+    .unwrap();
+    let url = format!("{base}/control_char_key");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "parents=50%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM parents").await,
+        5,
+        "the sample must apply rather than fail on a column it mis-parsed"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM kids").await,
+        5,
+        "and the composite key must have carried the children along"
+    );
+}
+
+/// A rewrite rule is the other way a `DELETE` runs code the plan never saw.
+///
+/// `ON DELETE ... DO ALSO` copies `OLD` wherever the rule says, and the
+/// emptying pass is the run's last write — so the copy lands after every
+/// rewrite, in a table nothing verifies. The trigger refusal alone did not see
+/// it, because rules live in `pg_rewrite`, not `pg_trigger`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_on_delete_rule_on_an_emptied_table_is_refused() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "delete_rule").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            CREATE RULE audit_archive AS ON DELETE TO audit_logs \
+                DO ALSO INSERT INTO autumn_jobs (args) VALUES (OLD.actor_email);",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/delete_rule");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        stderr.contains("audit_logs") && stderr.contains("rule"),
+        "the refusal must name the table and say a rule is why: {stderr}"
+    );
+    assert_eq!(
+        seeded_rows(&client, "autumn_jobs", "args").await,
+        0,
+        "nothing may have been archived by a refused run"
+    );
+
+    // And the remedy the refusal names has to work.
+    client
+        .batch_execute("DROP RULE audit_archive ON audit_logs")
+        .await
+        .unwrap();
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "the never_include table must still be emptied"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "and the rule that can no longer fire must have archived nothing"
+    );
+}
+
+/// A statement-level trigger on a leaf must not refuse the run.
+///
+/// `DELETE FROM parent` fires a child's **row**-level triggers and not its
+/// statement-level ones — measured on `PostgreSQL` 16, for declarative partitions
+/// and legacy `INHERITS` alike. Propagating every `DELETE` trigger up the tree
+/// therefore refuses runs over a trigger that cannot execute, which is worse
+/// than a false warning: the remedy on offer is to drop a trigger that was
+/// never a hazard.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_statement_level_leaf_trigger_does_not_refuse_the_run() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "leaf_statement_trigger").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL NOT NULL, \
+                shard INT NOT NULL, \
+                args TEXT NOT NULL \
+            ) PARTITION BY RANGE (shard); \
+            CREATE TABLE autumn_jobs_p0 PARTITION OF autumn_jobs \
+                FOR VALUES FROM (0) TO (10); \
+            INSERT INTO autumn_jobs (shard, args) VALUES (1, 'payload'); \
+            CREATE FUNCTION noop_stmt() RETURNS TRIGGER AS $$ \
+            BEGIN RETURN NULL; END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER leaf_stmt AFTER DELETE ON autumn_jobs_p0 \
+                FOR EACH STATEMENT EXECUTE FUNCTION noop_stmt();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/leaf_statement_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the purge must still empty the partitioned table"
+    );
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        0,
+        "and the scrub must still run"
+    );
+}
+
+/// Disabling the trigger has to actually work — the refusal says to do it.
+///
+/// `ALTER TABLE ... DISABLE TRIGGER` leaves the row in `pg_trigger` with
+/// `tgenabled = 'D'`, so a catalog query that ignores that column keeps
+/// refusing and the documented remedy does nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn disabling_the_delete_trigger_lifts_the_refusal() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "disabled_trigger").await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION spill_audit() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO comments (user_id, body) \
+                    SELECT id, OLD.actor_email FROM users LIMIT 1; \
+                RETURN OLD; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER audit_spill AFTER DELETE ON audit_logs \
+                FOR EACH ROW EXECUTE FUNCTION spill_audit();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/disabled_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    client
+        .batch_execute("ALTER TABLE audit_logs DISABLE TRIGGER audit_spill")
+        .await
+        .unwrap();
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "the never_include table must still be emptied"
+    );
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        0,
+        "and the PII must still be scrubbed"
+    );
+    assert_eq!(
+        seeded_rows(&client, "comments", "body").await,
+        0,
+        "with nothing spilled by the trigger that can no longer fire"
+    );
+}
+
+/// The re-count reaches an outside child of a table the sample keeps whole.
+///
+/// Neither side of that edge loses a row — a framework-owned table nothing
+/// empties, pointing at an `always_include` table — so the sample cannot break
+/// the reference, which is why the edge used to be dropped from the plan
+/// entirely. That is exactly backwards for the one job this re-count has:
+/// Postgres never revalidates a `NOT VALID` constraint against rows that
+/// predate it, so an orphan there survives while the run reports that every
+/// checked reference resolves.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_recount_covers_an_outside_child_of_a_full_copy_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "outside_child_recount").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                country_id BIGINT NOT NULL, \
+                args TEXT NOT NULL \
+            ); \
+            INSERT INTO autumn_jobs (country_id, args) VALUES (999999, 'orphaned'); \
+            ALTER TABLE autumn_jobs ADD CONSTRAINT autumn_jobs_country_fk \
+                FOREIGN KEY (country_id) REFERENCES countries (id) NOT VALID;",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/outside_child_recount");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        stderr.contains("autumn_jobs_country_fk"),
+        "the re-count must name the edge it found unresolved: {stderr}"
+    );
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        200,
+        "and the run must roll back rather than commit over it"
+    );
+
+    // The legitimate case still passes: repair the orphan and the same run
+    // completes, with the edge counted rather than skipped.
+    client
+        .batch_execute("UPDATE autumn_jobs SET country_id = (SELECT min(id) FROM countries)")
+        .await
+        .unwrap();
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        0,
+        "the repaired run must scrub as usual"
+    );
+}
+
+/// A `DELETE` trigger on a table the run empties is refused before any write.
+///
+/// The emptying pass has to run LAST — that is what makes "this table ends up
+/// empty" survive a rewrite trigger re-filling it. The cost is that its own
+/// `DELETE` triggers fire after every column rewrite, so an archive trigger on
+/// a purged or `never_include` table can copy the rows it removes into an
+/// ordinary classified table that has already been scrubbed. Nothing downstream
+/// catches it: the run verifies these tables are EMPTY, not where their
+/// triggers wrote, and `--output` would then capture the result.
+///
+/// No ordering fixes it (the trigger graph decides, and can be cyclic) and no
+/// postcondition covers it (a trigger body can write anywhere), so it is
+/// refused up front. Here the chain ends in `comments` — a classified app
+/// table — which is the shape that actually leaks.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_delete_trigger_on_an_emptied_table_is_refused_before_any_write() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "empty_chain").await;
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            CREATE FUNCTION archive_audit() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO autumn_jobs (args) VALUES (OLD.actor_email); \
+                INSERT INTO comments (user_id, body) \
+                    SELECT id, OLD.actor_email FROM users LIMIT 1; \
+                RETURN OLD; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER audit_archive BEFORE DELETE ON audit_logs \
+                FOR EACH ROW EXECUTE FUNCTION archive_audit();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/empty_chain");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        stderr.contains("audit_logs") && stderr.contains("DELETE"),
+        "the refusal must name the emptied table carrying the trigger: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refusal before any write must leave the source untouched"
+    );
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        200,
+        "and no PII may be left half-scrubbed"
+    );
+    assert_eq!(
+        seeded_rows(&client, "comments", "body").await,
+        0,
+        "and nothing may have spilled into the scrubbed app table"
+    );
+    // `--check` and `--dry-run` reach it too: an operator must find this out
+    // before restoring a copy, not while running the scrub on one.
+    for extra in ["--check", "--dry-run"] {
+        let (_o, stderr) =
+            run_autumn_fail(dir, &["db", "scrub", extra, "--sample", "users=50%"], &envs);
+        assert!(
+            stderr.contains("audit_logs"),
+            "{extra} must refuse for the same reason: {stderr}"
+        );
+    }
+}
+
+/// Legacy `INHERITS` is refused rather than sampled wrong.
+///
+/// An inheritance child is an ordinary table the plan would sample separately,
+/// but `DELETE FROM parent` reaches its rows too — the statements are not
+/// written `ONLY parent`. Parent and child would select independently and
+/// delete each other's rows, so the run refuses instead.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_legacy_table_inheritance() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "legacy_inherit").await;
+    client
+        .batch_execute("CREATE TABLE archived_comments () INHERITS (comments);")
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // The child is an ordinary relation of its own, so the classification sees
+    // it as a table like any other and refuses the unsampled leg below until it
+    // is declared. That refusal is correct and covered elsewhere; declaring the
+    // child here keeps THIS test about inheritance.
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!(
+            "{SAMPLE_SCRUB_TOML}\n[tables.archived_comments]\n\
+             safe = [\"user_id\"]\n\n[tables.archived_comments.pii]\nbody = \"redact\"\n"
+        ),
+    )
+    .unwrap();
+    let url = format!("{base}/legacy_inherit");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("archived_comments") && stderr.contains("inherits"),
+        "the refusal must name the inheriting table: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused run must not have deleted anything"
+    );
+
+    // A scrub WITHOUT --sample is unaffected: the rewrites are per-row UPDATEs
+    // that reach the child's rows correctly either way.
+    run_autumn_ok(dir, &["db", "scrub"], &envs);
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        0,
+        "the unsampled scrub must still run and scrub the PII"
+    );
+}
+
+/// `--dry-run` refuses a target whose connection boundary it cannot print.
+///
+/// The printed script is destructive, and the `\connect` line above each block
+/// is the only thing pointing psql at the right database. A keyword-form
+/// connection string cannot be printed with its password removed for certain,
+/// so the boundary is withheld — and a block without it does not fail when
+/// pasted: it runs THIS target's plan against whatever database the session is
+/// already on. The command refuses rather than advertising such a script.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_dry_run_refuses_a_target_it_cannot_print_a_boundary_for() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "unprintable").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let keyword =
+        format!("host={host} port={port} user=postgres password=postgres dbname=unprintable");
+    let envs = [("AUTUMN_DATABASE__URL", keyword.as_str())];
+
+    let (stdout, stderr) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=50%"],
+        &envs,
+    );
+    assert!(
+        stderr.contains("--dry-run") && stderr.contains("control"),
+        "the refusal must say which target it cannot print: {stderr}"
+    );
+    // The point of refusing is that nothing runnable is advertised. Before the
+    // fix the output carried a `-- connect yourself` comment and then the whole
+    // destructive block.
+    for output in [&stdout, &stderr] {
+        assert!(
+            !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+            "no destructive block may be printed without its boundary: {output}"
+        );
+    }
+
+    // And the same target scrubs normally: this is a printing refusal, not a
+    // rejection of keyword-form connection strings.
+    let (_o, ok) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        ok.contains("Scrub complete"),
+        "a keyword-form target must still scrub: {ok}"
+    );
+}
+
+/// A target whose connection string omits its port cannot be printed.
+///
+/// psql reports the RESOLVED port in `:PORT`, and the block's proof that
+/// `\connect` reached the intended endpoint pins it. Measured on `PostgreSQL`
+/// 16.13, the same host-only URI resolves to 5433 under `PGPORT=5433` and to
+/// 5432 without it — two different servers. Accepting any port for the host
+/// would drop the discriminator on exactly the pair this proof exists to tell
+/// apart, and embedding a port the run computed itself would mean replicating a
+/// libpq resolution that can read a service file this command does not.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scrub_refuses_to_print_a_target_with_no_stated_port() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "portless").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // Host stated, port left to libpq — supplied through PGPORT so the run can
+    // still connect, which is exactly the shape that makes this ambiguous.
+    let url = format!("postgres://postgres:postgres@{host}/portless");
+    let port = port.to_string();
+    let envs = [
+        ("AUTUMN_DATABASE__URL", url.as_str()),
+        ("PGPORT", port.as_str()),
+    ];
+
+    let (stdout, stderr) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=50%"],
+        &envs,
+    );
+    assert!(
+        stderr.contains("--dry-run") && stderr.contains("control"),
+        "the refusal must say which target it cannot print: {stderr}"
+    );
+    // Nothing runnable may be advertised alongside a refusal.
+    for output in [&stdout, &stderr] {
+        assert!(
+            !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+            "no destructive block may be printed without its boundary: {output}"
+        );
+    }
+
+    // And the same target still scrubs: this is a printing refusal, not a
+    // rejection of the configuration. Without `--dry-run` the command holds its
+    // own connection and never has to prove which one it is.
+    let (_o, ok) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+    assert!(
+        ok.contains("Scrub complete"),
+        "a port-less target must still scrub: {ok}"
+    );
+}
+
+/// A later target that cannot be sized prints nothing for the earlier ones.
+///
+/// Sizing opens its own connection and reads live counts, so it is fallible and
+/// it used to run inside the emission loop — a failure on the SECOND target
+/// landed after the FIRST target's complete transaction had been printed,
+/// `COMMIT` included. Saving that output and running it scrubs the first
+/// database and leaves the second untouched, which is exactly the
+/// half-anonymized topology the classify-then-apply split exists to prevent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_target_that_cannot_be_sized_prints_no_script_for_the_others() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let control = seed_sample_fixture(&admin, &base, "mt_control").await;
+    let shard = seed_sample_fixture(&admin, &base, "mt_shard").await;
+
+    // A role that reads the catalogs on both, but cannot count the shard's
+    // rows. Classification passes; only the sizing read fails.
+    admin
+        .batch_execute("CREATE ROLE scrubber LOGIN PASSWORD 'pw'")
+        .await
+        .unwrap();
+    for db in [&control, &shard] {
+        db.batch_execute(
+            "GRANT ALL ON SCHEMA public TO scrubber;              GRANT ALL ON ALL TABLES IN SCHEMA public TO scrubber;              GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO scrubber;",
+        )
+        .await
+        .unwrap();
+    }
+    shard
+        .batch_execute("REVOKE SELECT ON users FROM scrubber")
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("autumn.toml"),
+        format!(
+            "[app]\nname = \"mt\"\n\n\
+             [database]\nprimary_url = \"postgres://scrubber:pw@{host}:{port}/mt_control\"\n\n\
+             [[database.shards]]\nname = \"one\"\n\
+             primary_url = \"postgres://scrubber:pw@{host}:{port}/mt_shard\"\n"
+        ),
+    )
+    .unwrap();
+
+    let (stdout, stderr) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &[],
+    );
+    for output in [&stdout, &stderr] {
+        for runnable in ["BEGIN;", "COMMIT;", "DELETE FROM", "ON_ERROR_STOP"] {
+            assert!(
+                !output.contains(runnable),
+                "no target's script may be printed when another cannot be sized \
+                 (found {runnable}): {output}"
+            );
+        }
+    }
+
+    // And once it CAN be sized, both targets print in full.
+    shard
+        .batch_execute("GRANT SELECT ON users TO scrubber")
+        .await
+        .unwrap();
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &[],
+    );
+    assert_eq!(
+        ok.matches("COMMIT;").count(),
+        2,
+        "both targets must print a complete transaction: {ok}"
+    );
+}
+
+/// A view function that writes into a promised-empty table is caught.
+///
+/// `REFRESH` runs the view's query, and that query can call a function whose
+/// body INSERTs. The refreshes are the last writes in the transaction, so a
+/// check that ran before them reported success over a table that had been
+/// refilled — measured, `audit_logs: 503 -> 0 row(s)` and `Scrub complete`
+/// while the table held three rows carrying real addresses. Volatility does not
+/// identify such a function either: `CREATE FUNCTION ... STABLE BEGIN ATOMIC
+/// INSERT ...` is accepted, so the proof is a check after every write rather
+/// than a guess about which functions can write.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_function_that_refills_an_emptied_table_is_refused() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "mv_refill").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    client
+        .batch_execute(
+            "CREATE FUNCTION refill(bigint) RETURNS bigint LANGUAGE sql VOLATILE \
+             BEGIN ATOMIC \
+                 INSERT INTO audit_logs (actor_email, action) \
+                 VALUES ('leaked' || $1 || '@real-corp.example', 'refilled') \
+                 RETURNING id; \
+             END; \
+             CREATE MATERIALIZED VIEW a_refill AS SELECT refill(c.id) AS v FROM countries c;",
+        )
+        .await
+        .unwrap();
+    let before = count(&client, "SELECT count(*)::bigint FROM users").await;
+    let url = format!("{base}/mv_refill");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("promised would be empty still hold rows"),
+        "a refill by a view's function must be caught: {refusal}"
+    );
+    assert!(
+        refusal.contains("audit_logs"),
+        "the refusal must name the table: {refusal}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*)::bigint FROM users").await,
+        before,
+        "and nothing may be committed: {refusal}"
+    );
+}
+
+/// A fully tracked aggregate is not mistaken for an opaque function.
+///
+/// An aggregate's `pg_proc` row is a shell with no body of any kind, so
+/// `prosqlbody` is NULL for a perfectly traceable one. Measured before the
+/// exemption: an aggregate whose transition function is a tracked `BEGIN
+/// ATOMIC` body was refused as `a_report via gather`, blocking a valid scrub.
+/// Exempting the shell loses nothing, because everything the aggregate runs is
+/// a separate `pg_proc` the closure already reaches.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_tracked_aggregate_is_not_refused_but_an_opaque_one_is() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    // Tracked transition function: the chain is followable, so it must scrub,
+    // and the source view must still be refreshed before the dependent.
+    let ok = seed_sample_fixture(&admin, &base, "agg_tracked").await;
+    ok.batch_execute(
+        "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+         CREATE FUNCTION agg_step(text, bigint) RETURNS text LANGUAGE sql STABLE \
+             BEGIN ATOMIC \
+                 SELECT coalesce($1, '') \
+                 || coalesce((SELECT email FROM z_source WHERE id = $2), ''); \
+             END; \
+         CREATE AGGREGATE gather(bigint) (SFUNC = agg_step, STYPE = text); \
+         CREATE MATERIALIZED VIEW a_report AS \
+             SELECT gather(id) AS harvested FROM countries;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/agg_tracked");
+    let (_o, stderr) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "the aggregate's reads must still order the refresh: {stderr}"
+    );
+
+    // Opaque transition function: still refused, and named — the exemption
+    // covers the shell only, never the implementation reached through it.
+    // Dollar-quoted rather than `BEGIN ATOMIC`, so the body stays a string
+    // literal and `prosqlbody` stays NULL (measured).
+    let bad = seed_sample_fixture(&admin, &base, "agg_opaque").await;
+    bad.batch_execute(
+        "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+         CREATE FUNCTION agg_step(text, bigint) RETURNS text LANGUAGE sql STABLE \
+             AS $body$ SELECT coalesce($1, '') \
+                 || coalesce((SELECT email FROM z_source WHERE id = $2), '') $body$; \
+         CREATE AGGREGATE gather(bigint) (SFUNC = agg_step, STYPE = text); \
+         CREATE MATERIALIZED VIEW a_report AS \
+             SELECT gather(id) AS harvested FROM countries;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/agg_opaque");
+    let (_o, refusal) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        refusal.contains("a_report via agg_step"),
+        "the opaque implementation must be named, not the aggregate shell: {refusal}"
+    );
+}
+
+/// Rules and views the refresh never evaluates do not refuse the run.
+///
+/// Two false refusals, both measured. A base table reached from a view can
+/// carry unrelated DML rules, and a `REFRESH` is a `SELECT`: an `ON INSERT`
+/// rule on `users` calling a `plpgsql` function refused the whole run as
+/// `a_view via log_it`. And a standalone view left `WITH NO DATA` only ever
+/// gets `REFRESH ... WITH NO DATA`, which never runs its query, yet an opaque
+/// function in its definition refused the run as `lonely via opaque_fn`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unevaluated_rule_or_view_does_not_refuse_the_scrub() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    // An INSERT rule on the very table the view reads.
+    let dml = seed_sample_fixture(&admin, &base, "dml_rule").await;
+    dml.batch_execute(
+        "CREATE FUNCTION log_it(text) RETURNS bigint LANGUAGE plpgsql \
+             AS $fn$ BEGIN RETURN 1; END; $fn$; \
+         CREATE RULE users_ins AS ON INSERT TO users DO ALSO SELECT log_it(NEW.email); \
+         CREATE MATERIALIZED VIEW a_view AS SELECT id, email FROM users;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/dml_rule");
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        ok.contains("Scrub complete"),
+        "a DML rule a refresh cannot fire must not refuse the run: {ok}"
+    );
+
+    // A standalone view that will only ever be refreshed WITH NO DATA.
+    let nodata = seed_sample_fixture(&admin, &base, "nodata_opaque").await;
+    nodata
+        .batch_execute(
+            "CREATE FUNCTION opaque_fn() RETURNS TABLE(id bigint, email text) LANGUAGE plpgsql \
+                 AS $fn$ BEGIN RETURN QUERY SELECT u.id, u.email FROM users u; END; $fn$; \
+             CREATE MATERIALIZED VIEW lonely AS SELECT * FROM opaque_fn() WITH NO DATA; \
+             CREATE MATERIALIZED VIEW ordinary AS SELECT id, email FROM users;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/nodata_opaque");
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        ok.contains("Scrub complete"),
+        "an unpopulated standalone view must not refuse the run: {ok}"
+    );
+}
+
+/// A view that names its source inside a string the server executes is refused.
+///
+/// `query_to_xml` takes its query as text, so `PostgreSQL` records no dependency
+/// on what it reads — measured, the rule of a view defined
+/// `SELECT query_to_xml('SELECT email FROM z_source', …)` records only itself.
+/// Refresh order comes from those dependencies, so the two views sorted by name
+/// and the run reported `Scrub complete` with the base tables clean and all 200
+/// original addresses still in the dependent view. `table_to_xml` is NOT
+/// refused: its `regclass` argument is recorded like any other reference
+/// (measured, `pg_class -> users`).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_reading_a_relation_named_in_a_string_is_refused() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    let client = seed_sample_fixture(&admin, &base, "by_name").await;
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT pg_catalog.query_to_xml( \
+                 'SELECT email FROM z_source', false, true, '')::text AS harvested;",
+        )
+        .await
+        .unwrap();
+    let before = seeded_rows(&client, "users", "email").await;
+    let url = format!("{base}/by_name");
+    let (_o, refusal) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        refusal.contains("a_report via query_to_xml"),
+        "the view and the function must both be named: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        before,
+        "and it must refuse before writing anything: {refusal}"
+    );
+
+    // The same family with a `regclass` argument records its dependency, so it
+    // is ordered rather than refused.
+    let fine = seed_sample_fixture(&admin, &base, "by_regclass").await;
+    fine.batch_execute(
+        "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+         CREATE MATERIALIZED VIEW a_report AS \
+             SELECT pg_catalog.table_to_xml('users'::regclass, false, true, '')::text AS v;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/by_regclass");
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        ok.contains("Scrub complete"),
+        "a recorded regclass reference must not be refused: {ok}"
+    );
+}
+
+/// An endpoint chosen by the environment is not printable either.
+///
+/// `hostaddr` has more than one source, and psql reports none of them. All
+/// measured reaching 127.0.0.1 through a `host` that does not resolve:
+/// `PGHOSTADDR`, and a service file named by `PGSERVICE` or by `service=` in
+/// the connection string. A pasting session brings its own environment, so what
+/// this run resolved need not be what it resolves.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scrub_refuses_to_print_a_target_whose_endpoint_comes_from_the_environment() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "ambient").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    let service = dir.join("pg_service.conf");
+    std::fs::write(&service, format!("[redirect]\nhostaddr={host}\n")).unwrap();
+    let service = service.to_string_lossy().to_string();
+    let plain = format!("postgres://postgres:postgres@{host}:{port}/ambient");
+    let via_service = format!("{plain}?service=redirect");
+
+    // The same target prints when nothing ambient is in play.
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", plain.as_str())],
+    );
+    assert!(ok.contains("BEGIN;"), "the clean target must print: {ok}");
+
+    for (label, envs) in [
+        (
+            "PGHOSTADDR",
+            vec![
+                ("AUTUMN_DATABASE__URL", plain.as_str()),
+                ("PGHOSTADDR", host.as_str()),
+            ],
+        ),
+        (
+            "PGSERVICE",
+            vec![
+                ("AUTUMN_DATABASE__URL", plain.as_str()),
+                ("PGSERVICE", "redirect"),
+                ("PGSERVICEFILE", service.as_str()),
+            ],
+        ),
+        (
+            "service=",
+            vec![
+                ("AUTUMN_DATABASE__URL", via_service.as_str()),
+                ("PGSERVICEFILE", service.as_str()),
+            ],
+        ),
+    ] {
+        let (stdout, stderr) = run_autumn_fail(
+            dir,
+            &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+            &envs,
+        );
+        for output in [&stdout, &stderr] {
+            assert!(
+                !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+                "{label} must leave nothing runnable printed: {output}"
+            );
+        }
+    }
+}
+
+/// A view function that writes into a SAMPLED table is caught too.
+///
+/// The sibling check covers tables promised empty. `sample::apply` selects the
+/// subset, deletes, verifies the foreign keys and counts — all before the
+/// refreshes, which can INSERT. Measured, a tracked `BEGIN ATOMIC` function
+/// writing into `comments` left the run reporting `comments: 403 -> 4 row(s)`
+/// and `Scrub complete` over a table holding 7 rows, 3 of them never rewritten:
+/// the subset was not the subset, and the reported number was not the number.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_function_that_adds_rows_to_a_sampled_table_is_refused() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "mv_sampled").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    client
+        .batch_execute(
+            "CREATE FUNCTION add_comment(bigint) RETURNS bigint LANGUAGE sql VOLATILE \
+             BEGIN ATOMIC \
+                 INSERT INTO comments (user_id, body) \
+                 SELECT u.id, 'leaked note for ' || u.email FROM users u ORDER BY u.id LIMIT 1 \
+                 RETURNING id; \
+             END; \
+             CREATE MATERIALIZED VIEW a_add AS SELECT add_comment(c.id) AS v FROM countries c;",
+        )
+        .await
+        .unwrap();
+    let before = count(&client, "SELECT count(*)::bigint FROM users").await;
+    let url = format!("{base}/mv_sampled");
+    let (_o, refusal) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        refusal.contains("changed by a materialized view's refresh"),
+        "a refresh that adds rows to a sampled table must be caught: {refusal}"
+    );
+    assert!(
+        refusal.contains("comments"),
+        "the refusal must name the table: {refusal}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*)::bigint FROM users").await,
+        before,
+        "and nothing may be committed: {refusal}"
+    );
+}
+
+/// A target whose connection string cannot name ONE endpoint is not printed.
+///
+/// Two shapes, both measured on `PostgreSQL` 16.13. `hostaddr` selects the
+/// endpoint independently of `host` — `host=not-a-real-host.example
+/// hostaddr=127.0.0.1` connects although that name does not resolve, and psql
+/// still reports `HOST=not-a-real-host.example` — and psql has no `:HOSTADDR`
+/// to pin instead, so two such targets are indistinguishable to the proof. A
+/// multi-host conninfo is worse than indistinguishable: libpq picks a member
+/// per connection (20 connections with `load_balance_hosts=random` split 7/13
+/// across two members), so the run sizes the sample on one and the pasted
+/// script runs on another. Against a two-member URI whose first member held 200
+/// rows and whose second none, ten dry runs printed `LIMIT 2` six times and
+/// `LIMIT 0` four times — and `LIMIT 0` selects no root rows, so the delete pass
+/// empties the table rather than sampling it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scrub_refuses_to_print_a_target_without_one_stated_endpoint() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "unpinned").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    for url in [
+        // `hostaddr` carries the real endpoint; `host` is only a label.
+        format!("postgres://postgres:postgres@{host}:{port}/unpinned?hostaddr=127.0.0.1"),
+        // Two endpoints named, one chosen per connection.
+        format!(
+            "postgres://postgres:postgres@{host}:{port}/unpinned             ?host={host},{host}&port={port},{port}"
+        ),
+    ] {
+        let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+        let (stdout, stderr) = run_autumn_fail(
+            dir,
+            &["db", "scrub", "--dry-run", "--sample", "users=50%"],
+            &envs,
+        );
+        assert!(
+            stderr.contains("--dry-run") && stderr.contains("control"),
+            "the refusal must say which target it cannot print: {stderr}"
+        );
+        for output in [&stdout, &stderr] {
+            assert!(
+                !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+                "no destructive block may be printed without a pinned endpoint: {output}"
+            );
+        }
+        // A printing refusal, not a rejection of the configuration.
+        let (_o, ok) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+        assert!(
+            ok.contains("Scrub complete"),
+            "the same target must still scrub: {ok}"
+        );
+    }
+}
+
+/// The size report covers the materialized views the run refreshes.
+///
+/// A view is rebuilt from whatever survives the sample, so one over reference
+/// data — an `always_include` table — is exactly as large afterwards as before.
+/// Measuring the sampled base tables alone therefore answers the report's one
+/// question ("does this fit on a laptop?") with a number that omits the largest
+/// thing in the database, while naming the refreshed view three lines above.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_size_report_counts_a_refreshed_materialized_view() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "matview_size").await;
+    // Padded so the view dwarfs the base tables, and built over `countries`,
+    // which `[sample] always_include` keeps whole — so REFRESH rebuilds it at
+    // full size and the sample reclaims nothing from it.
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW big_report AS \
+                SELECT g AS id, c.name, repeat('x', 900) AS pad \
+                FROM countries c CROSS JOIN generate_series(1, 15000) g;",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/matview_size");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let view_bytes = count(
+        &client,
+        "SELECT pg_total_relation_size('big_report')::bigint",
+    )
+    .await;
+    assert!(
+        view_bytes > 8 * 1024 * 1024,
+        "the fixture must make the view the dominant relation, not a rounding \
+         error against the base tables: {view_bytes} bytes"
+    );
+
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("big_report (materialized view refreshed)"),
+        "the run must refresh the view, or this test is measuring nothing: {stderr}"
+    );
+
+    // The view survives the sample at full size, so both sides of the ratio
+    // must exceed it. Before the fix the line read `488.0 kB -> 232.0 kB` on a
+    // database still holding 44 MB.
+    let size_line = stderr
+        .lines()
+        .find(|line| line.contains("Table size:"))
+        .unwrap_or_else(|| panic!("the run must report a size: {stderr}"));
+    let after_view = count(
+        &client,
+        "SELECT pg_total_relation_size('big_report')::bigint",
+    )
+    .await;
+    assert!(
+        after_view > 8 * 1024 * 1024,
+        "the refreshed view must still be the dominant relation: {after_view} bytes"
+    );
+    for figure in size_line
+        .split("Table size:")
+        .nth(1)
+        .unwrap()
+        .split('\u{2192}')
+    {
+        assert!(
+            figure.contains("MB") || figure.contains("GB"),
+            "both sides of the ratio must count the view that dominates the \
+             database, not just the sampled base tables: {size_line}"
+        );
+    }
+}
+
+/// A materialized view left `WITH NO DATA` is left `WITH NO DATA`.
+///
+/// The refresh pass exists so a view's own heap cannot keep serving the PII the
+/// base tables just lost. A view created — or last refreshed — `WITH NO DATA`
+/// holds no rows at all, so it has nothing to leak, and refreshing it would run
+/// the view's query and materialize a heap the database deliberately does not
+/// have. On the expensive query such a view usually guards, that is time and
+/// disk the scrub was never asked to spend — inside the transaction, so
+/// exhausting either rolls the whole run back.
+///
+/// The exception is a view a POPULATED view reads: `REFRESH` on the dependent
+/// fails outright while its source is unpopulated, and an unrefreshed populated
+/// view keeps its pre-scrub rows. So the source is refreshed after all — and
+/// emptied again once the dependent has been rebuilt from it, which leaves both
+/// exactly as the run found them.
+///
+/// Every unpopulated view gets that closing `REFRESH ... WITH NO DATA`, not only
+/// the one populated for a dependent, because skipping one outright left a race:
+/// probing runs before the apply transaction, and nothing that transaction locks
+/// stops another session populating a view this run does not refresh.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unpopulated_materialized_view_is_left_unpopulated() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "matview_nodata").await;
+    client
+        .batch_execute(
+            // `deferred_report` is the standalone case, `source_report` the one
+            // `dependent_report` reads — unpopulated only after the dependent
+            // was built, which is the only way that shape can arise.
+            "CREATE MATERIALIZED VIEW kept_report AS SELECT id, email FROM users; \
+             CREATE MATERIALIZED VIEW deferred_report AS \
+                 SELECT id, email FROM users WITH NO DATA; \
+             CREATE MATERIALIZED VIEW source_report AS SELECT id, email FROM users; \
+             CREATE MATERIALIZED VIEW dependent_report AS \
+                 SELECT id, email FROM source_report; \
+             REFRESH MATERIALIZED VIEW source_report WITH NO DATA;",
+        )
+        .await
+        .unwrap();
+    let unpopulated = |view: &str| {
+        format!(
+            "SELECT count(*) FROM pg_class rel \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             WHERE rel.relname = '{view}' AND NOT rel.relispopulated"
+        )
+    };
+    for view in ["deferred_report", "source_report"] {
+        assert_eq!(
+            count(&client, &unpopulated(view)).await,
+            1,
+            "{view} must start unpopulated, or this test proves nothing"
+        );
+    }
+    // The dependent kept its rows when its source was emptied, so it is a
+    // populated view still holding pre-scrub addresses.
+    assert_eq!(
+        seeded_rows(&client, "dependent_report", "email").await,
+        200,
+        "the dependent must start holding the addresses the scrub has to remove"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/matview_nodata");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+
+    assert!(
+        stderr.contains("kept_report (materialized view refreshed)"),
+        "a populated view must still be refreshed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("deferred_report (materialized view refreshed)"),
+        "the standalone unpopulated view must not be REFRESHED — that would run \
+         the query it was left unpopulated to avoid: {stderr}"
+    );
+    // It is still emptied, though. Probing runs on its own connection before the
+    // apply transaction, and nothing that transaction locks stops another
+    // session refreshing a view this run skipped: measured on PostgreSQL 16.13,
+    // a concurrent `REFRESH` fired while the scrub held `SHARE ROW EXCLUSIVE` on
+    // `users` did not wait, and the run committed with `users` at 2 rows and the
+    // view holding all 200 original addresses. A closing `REFRESH ... WITH NO
+    // DATA` takes `ACCESS EXCLUSIVE` and costs nothing — it does not run the
+    // view's query (measured: it succeeds on a view defined as `SELECT 1/0`,
+    // where a plain `REFRESH` raises `division by zero`).
+    assert!(
+        stderr.contains("deferred_report (materialized view left unpopulated)"),
+        "the standalone unpopulated view must still be emptied under lock: {stderr}"
+    );
+    assert!(
+        stderr.contains("source_report (materialized view refreshed)")
+            && stderr.contains("source_report (materialized view left unpopulated)"),
+        "the source a populated view reads must be refreshed and then emptied \
+         again: {stderr}"
+    );
+
+    for view in ["deferred_report", "source_report"] {
+        assert_eq!(
+            count(&client, &unpopulated(view)).await,
+            1,
+            "the scrub must leave {view} unpopulated"
+        );
+    }
+    // And the refreshes that do run still do their job: each populated view is
+    // rebuilt from the scrubbed base table rather than left holding what it
+    // copied — including the one whose source had to be repopulated first.
+    for view in ["kept_report", "dependent_report"] {
+        assert_eq!(
+            seeded_rows(&client, view, "email").await,
+            0,
+            "{view} must be rebuilt from the scrubbed rows"
+        );
+    }
+}
+
+/// A materialized view that reads another THROUGH an ordinary view is refreshed
+/// after it, not before.
+///
+/// `pg_depend` records only the hop a rewrite rule actually took, so matching a
+/// view's dependency straight against the set of materialized views loses both
+/// hops of `a_report -> bridge_view -> z_source`. The two then look like
+/// independent roots and sort by name — and `a_report` sorts first, so it was
+/// rebuilt from a `z_source` still holding pre-scrub rows, and refreshing
+/// `z_source` afterwards does not touch it.
+///
+/// Measured before the fix, on this exact shape: `users` scrubbed to 2 rows with
+/// 0 original addresses, `z_source` clean, `a_report` holding all 200, under
+/// `✓ Scrub complete`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_reached_through_an_ordinary_view_is_refreshed_in_dependency_order() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "matview_bridge").await;
+    // Named so the dependent sorts BEFORE its source: without the traversal the
+    // order is alphabetical, and a fixture that happens to sort correctly would
+    // pass either way.
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE VIEW bridge_view AS SELECT id, email FROM z_source; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT id, email FROM bridge_view;",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        seeded_rows(&client, "a_report", "email").await,
+        200,
+        "the dependent must start holding the addresses the scrub has to remove"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/matview_bridge");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "the source must be refreshed before the view that reads it through the \
+         ordinary view: {stderr}"
+    );
+    // The order is the point, but the leak is what it costs.
+    for view in ["z_source", "a_report"] {
+        assert_eq!(
+            seeded_rows(&client, view, "email").await,
+            0,
+            "{view} must be rebuilt from the scrubbed rows: {stderr}"
+        );
+    }
+}
+
+/// A view read through a function `PostgreSQL` does not track is refused; one
+/// read through a `BEGIN ATOMIC` function is ordered normally.
+///
+/// Refresh order comes from the dependency graph the catalog records, and it
+/// records nothing about what a function whose body is a string literal reads.
+/// Measured on `a_report -> bridge_fn() -> z_source`: `pg_depend` holds
+/// `a_report -> pg_proc(bridge_fn)`, the function holds NO relation dependency
+/// at all, the two views sorted by name, `a_report` refreshed FIRST from a
+/// stale `z_source`, and the run reported success with `users` at 2 rows, both
+/// base tables clean, and all 200 original addresses still in `a_report`.
+///
+/// A `BEGIN ATOMIC` body does record its reads, so that chain is followed
+/// rather than refused — the distinction this test exists to hold.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_read_through_an_untracked_function_is_refused() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let opaque = seed_sample_fixture(&admin, &base, "fn_opaque").await;
+    opaque
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION bridge_fn() RETURNS TABLE(id bigint, email text) \
+                 AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM bridge_fn();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/fn_opaque");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("a_report via bridge_fn"),
+        "the refusal must name the view and the function it cannot follow: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&opaque, "users", "email").await,
+        200,
+        "and it must refuse BEFORE writing anything: {refusal}"
+    );
+
+    // The same function one hop further away, behind an ordinary view, where
+    // only the VIEW's rule names it. The walk crosses ordinary views, so this is
+    // exactly as invisible — and a check that looked only at materialized views
+    // missed it: measured, `a_report` refreshed first from a stale `z_source`
+    // and kept all 200 original addresses under a reported success.
+    let indirect = seed_sample_fixture(&admin, &base, "fn_via_view").await;
+    indirect
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION bridge_fn() RETURNS TABLE(id bigint, email text) \
+                 AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
+             CREATE VIEW bridge_view AS SELECT * FROM bridge_fn(); \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM bridge_view;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_via_view");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("a_report via bridge_fn"),
+        "a function called by an ordinary view in the chain must be caught too: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&indirect, "users", "email").await,
+        200,
+        "and that refusal must also precede every write: {refusal}"
+    );
+
+    // An opaque function reached only THROUGH a tracked one. The outer function
+    // has a relation dependency of its own, so it looks traceable; the body that
+    // actually reads `z_source` is the one nothing can see into. Measured: the
+    // run reported success with all 200 original addresses left in `a_report`.
+    let nested = seed_sample_fixture(&admin, &base, "fn_nested_opaque").await;
+    nested
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION opaque_inner() RETURNS TABLE(id bigint, email text) \
+                 AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
+             CREATE FUNCTION outer_fn() RETURNS TABLE(id bigint, email text) LANGUAGE sql \
+                 BEGIN ATOMIC SELECT f.id, f.email FROM opaque_inner() f \
+                     WHERE EXISTS (SELECT 1 FROM countries); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM outer_fn();",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_nested_opaque");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("a_report via opaque_inner"),
+        "the opaque body must be named, not the tracked function that vouches \
+         for it: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&nested, "users", "email").await,
+        200,
+        "and that refusal must precede every write: {refusal}"
+    );
+}
+
+/// A view read through TRACKED functions is ordered by them, not refused.
+///
+/// A `BEGIN ATOMIC` body records what it reads, so the chain is followed —
+/// including function-to-function calls. `z_source` sorts AFTER `a_report`, so
+/// refreshing it first can only come from the hops being traversed. Measured
+/// before the closure covered nested calls: reading only the outer function's
+/// own relation dependencies yielded no edge at all, `a_report` refreshed first
+/// from a stale `z_source`, and the run reported success with all 200 original
+/// addresses still in `a_report`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_read_through_a_tracked_function_is_refreshed_in_order() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let atomic = seed_sample_fixture(&admin, &base, "fn_atomic").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // Two tracked functions deep, and `atomic_outer` is a PURE WRAPPER — it reads
+    // no relation of its own. That is deliberate: it makes the fixture exercise
+    // both halves at once. The traversal has to close over function-to-function
+    // calls to find `z_source` at all, and the opacity check has to read
+    // `prosqlbody` rather than "records a relation dependency", which would
+    // refuse this wrapper outright. An earlier version of this fixture gave the
+    // wrapper a `countries` read and masked the second half.
+    atomic
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION atomic_fn() RETURNS TABLE(id bigint, email text) LANGUAGE sql \
+                 BEGIN ATOMIC SELECT id, email FROM z_source; END; \
+             CREATE FUNCTION atomic_outer() RETURNS TABLE(id bigint, email text) LANGUAGE sql \
+                 BEGIN ATOMIC SELECT id, email FROM atomic_fn(); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM atomic_outer();",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_atomic");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "a tracked function body must still order the refresh: {stderr}"
+    );
+    for view in ["z_source", "a_report"] {
+        assert_eq!(
+            seeded_rows(&atomic, view, "email").await,
+            0,
+            "{view} must be rebuilt from the scrubbed rows: {stderr}"
+        );
+    }
+}
+
+/// A view reaching another only through a user-defined OPERATOR is ordered.
+///
+/// The rewrite rule records `pg_operator`, and no `pg_proc` row at all, so
+/// seeding the function closure from the rule's `pg_proc` dependencies alone
+/// found nothing. Measured before this was followed: `a_report` reads
+/// `z_source` only through `1 ==> 200`, whose implementation is a tracked
+/// `BEGIN ATOMIC` function, and the run reported `Scrub complete` with `users`
+/// at 2 rows, `z_source` clean, and all 200 original addresses still sitting in
+/// `a_report`. `z_source` sorts AFTER `a_report`, so refreshing it first can
+/// only come from the operator hop being traversed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_read_through_a_custom_operator_is_refreshed_in_order() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "fn_operator").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // The operator's implementation returns the addresses themselves, so a
+    // stale `z_source` is not a subtle ordering wrinkle — it is the PII,
+    // copied verbatim into the dependent view.
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION op_impl(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC \
+                     SELECT string_agg(s.email, ',' ORDER BY s.id) FROM z_source s \
+                     WHERE s.id BETWEEN $1 AND $2; \
+                 END; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = op_impl); \
+             CREATE MATERIALIZED VIEW a_report AS \
+                 SELECT (1::bigint ==> 200::bigint) AS harvested;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_operator");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "an operator's implementation must order the refresh: {stderr}"
+    );
+    assert_eq!(
+        seeded_rows(&client, "z_source", "email").await,
+        0,
+        "the source view must be rebuilt from the scrubbed rows: {stderr}"
+    );
+    let leaked = count(
+        &client,
+        &format!(
+            "SELECT count(*)::bigint FROM a_report \
+             WHERE harvested LIKE '%{SEEDED_DOMAIN}%'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        leaked, 0,
+        "the dependent must not keep addresses harvested from a stale source: {stderr}"
+    );
+}
+
+/// An operator reached from INSIDE a tracked function still orders the refresh.
+///
+/// The previous round resolved `pg_operator` and `pg_type` while seeding the
+/// closure from a rewrite rule, but the recursive arm still followed only
+/// `pg_proc -> pg_proc`. A tracked function that uses a custom operator records
+/// `pg_proc -> pg_operator`, so the implementation never entered the closure.
+/// Measured: `a_report -> harvest() -> (1 ==> 200) -> z_source` produced no
+/// edge, `a_report` refreshed FIRST, and the run reported `Scrub complete` with
+/// `users` at 2 rows, `z_source` clean, and all 200 addresses in `a_report`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_operator_reached_inside_a_function_is_refreshed_in_order() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "fn_op_nested").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION op_impl(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC \
+                     SELECT string_agg(s.email, ',' ORDER BY s.id) FROM z_source s \
+                     WHERE s.id BETWEEN $1 AND $2; \
+                 END; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = op_impl); \
+             CREATE FUNCTION harvest() RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC SELECT (1::bigint ==> 200::bigint); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT harvest() AS harvested;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_op_nested");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "an operator used inside a function must order the refresh: {stderr}"
+    );
+    let leaked = count(
+        &client,
+        &format!(
+            "SELECT count(*)::bigint FROM a_report \
+             WHERE harvested LIKE '%{SEEDED_DOMAIN}%'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        leaked, 0,
+        "the dependent must not keep stale addresses: {stderr}"
+    );
+}
+
+/// An opaque body behind an operator or a domain CHECK is refused, not ordered.
+///
+/// Same blind spot as the ordering above, on the refusal side: the opacity
+/// check joined the rule straight to `pg_proc`, so a function a rule reaches
+/// through `pg_operator` or `pg_type` was never inspected at all. Measured
+/// before the seed covered them, both cases returned nothing to refuse.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_opaque_body_behind_an_operator_or_domain_is_refused() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+
+    for (db, fixture) in [
+        (
+            "fn_op_opaque",
+            "CREATE FUNCTION opaque_op(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 AS 'SELECT string_agg(email, '','') FROM z_source WHERE id BETWEEN $1 AND $2'; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = opaque_op); \
+             CREATE MATERIALIZED VIEW a_report AS \
+                 SELECT (1::bigint ==> 200::bigint) AS harvested;",
+        ),
+        (
+            "fn_dom_opaque",
+            "CREATE FUNCTION opaque_dom(text) RETURNS boolean LANGUAGE plpgsql STABLE \
+                 AS $$ BEGIN RETURN EXISTS (SELECT 1 FROM z_source WHERE email = $1); END; $$; \
+             CREATE DOMAIN known_email AS text CHECK (opaque_dom(VALUE)); \
+             CREATE MATERIALIZED VIEW a_report AS \
+                 SELECT (u.email::known_email)::text AS addr FROM users u;",
+        ),
+        // The same two, one hop further in: the VIEW calls a tracked function,
+        // and it is that FUNCTION which reaches the operator or the domain. The
+        // recursive arm has to resolve those paths too, not only the seed.
+        (
+            "fn_op_opaque_nested",
+            "CREATE FUNCTION opaque_op(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 AS 'SELECT string_agg(email, '','') FROM z_source WHERE id BETWEEN $1 AND $2'; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = opaque_op); \
+             CREATE FUNCTION wrapper() RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC SELECT (1::bigint ==> 200::bigint); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT wrapper() AS harvested;",
+        ),
+        (
+            "fn_dom_opaque_nested",
+            // The check READS `z_source` and then accepts unconditionally. It has
+            // to accept, or the fixture's own `CREATE MATERIALIZED VIEW` fails the
+            // constraint before the command is ever run; what the test needs is a
+            // reachable opaque body, not a rejection.
+            "CREATE FUNCTION opaque_dom(text) RETURNS boolean LANGUAGE plpgsql STABLE \
+                 AS $$ BEGIN PERFORM 1 FROM z_source WHERE email = $1; RETURN true; END; $$; \
+             CREATE DOMAIN known_email AS text CHECK (opaque_dom(VALUE)); \
+             CREATE FUNCTION wrapper() RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC SELECT ('x'::known_email)::text; END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT wrapper() AS addr;",
+        ),
+    ] {
+        let client = seed_sample_fixture(&admin, &base, db).await;
+        client
+            .batch_execute(&format!(
+                "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; {fixture}"
+            ))
+            .await
+            .unwrap();
+        let before = seeded_rows(&client, "users", "email").await;
+        assert!(before > 0, "{db} must start with seeded addresses");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        sample_project(dir);
+        let url = format!("{base}/{db}");
+        let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+        let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+        assert!(
+            stderr.contains("read through a function this run cannot follow"),
+            "{db} must be refused rather than ordered around the gap: {stderr}"
+        );
+        assert_eq!(
+            seeded_rows(&client, "users", "email").await,
+            before,
+            "{db} must be refused before anything is written: {stderr}"
+        );
+    }
+}
+
+/// A purged framework table is compacted and measured like any other.
+///
+/// `[framework] purge` empties its tables, and `DELETE` frees no file space, so
+/// an emptied offline-sync buffer keeps its whole file until something rewrites
+/// it. It sits outside the classified universe the sample plans over, so both
+/// the compaction and the size report used to skip it — leaving the command
+/// reporting a laptop-sized result for a database still holding the largest
+/// thing the run removed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_compacts_and_measures_the_purged_framework_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_purge_size").await;
+    // Deliberately far larger than every app table put together, so "the run
+    // reclaimed almost everything" and "the run reclaimed almost nothing" are
+    // not close enough to confuse.
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args TEXT NOT NULL \
+            ); \
+            INSERT INTO autumn_jobs (args) \
+                SELECT repeat('x', 900) FROM generate_series(1, 8000);",
+        )
+        .await
+        .unwrap();
+    let jobs_size = "SELECT pg_total_relation_size('autumn_jobs')::bigint";
+    let before = count(&client, jobs_size).await;
+    assert!(
+        before > 4 * 1024 * 1024,
+        "the fixture must be big enough to notice: {before} byte(s)"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project_sources(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!("{SAMPLE_SCRUB_TOML}\n[framework]\npurge = [\"autumn_jobs\"]\n"),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_purge_size");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    // The dry run advertises the exact SQL, so the purged table has to appear in
+    // the printed compaction too — an operator running it must reclaim the same
+    // disk the command does.
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        dry_err.contains(r#"VACUUM (FULL, ANALYZE) "public"."autumn_jobs""#),
+        "the printed compaction must cover the purged table: {dry_err}"
+    );
+    // And it must come after EVERY target's transaction, warning-only, because
+    // that is where the executor runs it. Printed inside the per-target block it
+    // was neither: measured on two TCP targets under `ON_ERROR_STOP on`, a
+    // first-target `VACUUM` that timed out against a concurrent reader ended the
+    // script at rc=3 with that database scrubbed and the SECOND still holding
+    // all 200 of its own original addresses.
+    let vacuum_at = dry_err.find("VACUUM (FULL, ANALYZE)").unwrap();
+    assert!(
+        dry_err.rfind("COMMIT;").unwrap() < vacuum_at,
+        "compaction must follow the last target's COMMIT: {dry_err}"
+    );
+    assert!(
+        dry_err
+            .find("\\set ON_ERROR_STOP off")
+            .is_some_and(|off| off < vacuum_at),
+        "a failed compaction must not stop the script, as it does not stop the \
+         command: {dry_err}"
+    );
+
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the purge must still empty it"
+    );
+    let after = count(&client, jobs_size).await;
+    assert!(
+        after * 8 < before,
+        "the purged table's file must actually shrink: {before} -> {after} byte(s)\n{stderr}"
+    );
+    // And the size report has to have counted it on the way in, or it describes
+    // a reclamation it did not measure.
+    assert!(
+        stderr.contains("Table size: ") && stderr.contains(" MB \u{2192} "),
+        "the reported source size must include the purged table: {stderr}"
+    );
+}
+
+/// The printed dry run has to be the loop, not the statements plus a comment.
+///
+/// `walk_statements` is one pass; `apply` repeats it to a fixpoint. Within a
+/// pass the statements run in list order, and that order comes from the
+/// catalog — so a chain deeper than the order happens to favour is only partly
+/// selected, and everything below is deleted. Nothing catches it: dropping a
+/// descendant leaves every foreign key satisfied, so all three integrity
+/// assertions still pass and the script commits a copy that is quietly missing
+/// rows the real command keeps.
+///
+/// This fixture is that unfavourable order on purpose — the constraints are
+/// added deepest-first, so `tag_votes -> note_tags` is walked before the edge
+/// that seeds `notes`. The assertion is the invariant that matters: running the
+/// advertised SQL leaves the same database the command does.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_printed_dry_run_walks_to_the_same_fixpoint_the_command_does() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+
+    let mut clients = Vec::new();
+    for name in ["deep_real", "deep_printed"] {
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .await
+            .unwrap();
+        let client = connect(&format!("{base}/{name}")).await;
+        client.batch_execute(DEEP_CHAIN_SCHEMA).await.unwrap();
+        clients.push(client);
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::create_dir_all(dir.join("src").join("models")).unwrap();
+    std::fs::write(
+        dir.join("src").join("models").join("user.rs"),
+        "pub struct User { pub id: i32, pub email: String }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("scrub.toml"), DEEP_CHAIN_SCRUB_TOML).unwrap();
+
+    // The real command, on the first database.
+    let real_url = format!("{base}/deep_real");
+    let (_o, real_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=2", "--seed", "7"],
+        &[("AUTUMN_DATABASE__URL", real_url.as_str())],
+    );
+
+    // The dry run, on the second — then the SQL it printed, run verbatim.
+    let printed_url = format!("{base}/deep_printed");
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &[
+            "db",
+            "scrub",
+            "--dry-run",
+            "--sample",
+            "users=2",
+            "--seed",
+            "7",
+        ],
+        &[("AUTUMN_DATABASE__URL", printed_url.as_str())],
+    );
+    assert!(
+        dry_err.contains("EXIT WHEN total = 0;"),
+        "the walk must print as a loop, not as statements plus a comment saying \
+         to repeat them: {dry_err}"
+    );
+    // The session pins `execute` sets, and the boundary that says which database
+    // the transaction belongs to. Without the pins a role-level `search_path`
+    // resolves the generated `md5` somewhere else and the paste writes different
+    // values than the command does; without the boundary a multi-target stream
+    // runs every transaction against whichever database psql is on.
+    assert!(
+        dry_err.contains("SET LOCAL search_path = pg_catalog, public;")
+            && dry_err.contains("SET LOCAL standard_conforming_strings = on;")
+            && dry_err.contains("SET LOCAL DateStyle = 'ISO, YMD';"),
+        "the printed transaction must pin the same session settings: {dry_err}"
+    );
+    assert!(
+        dry_err.contains(r#"\connect -reuse-previous=off ""#)
+            && dry_err.contains("/deep_printed")
+            && !dry_err.contains("postgres:postgres@"),
+        "and must move the session to this target's own endpoint, inheriting \
+         nothing from the previous one and printing no password: {dry_err}"
+    );
+    let script = printed_transaction(&dry_err);
+    clients[1]
+        .batch_execute(&script)
+        .await
+        .unwrap_or_else(|e| panic!("the printed SQL must run as printed: {e}\n{script}"));
+
+    // The fixture has to actually need more than one pass, or this proves
+    // nothing: `settled in N pass(es)` is the command's own report of that.
+    assert!(
+        !real_err.contains("settled in 1 pass"),
+        "the fixture must exercise a multi-pass closure: {real_err}"
+    );
+    for table in ["users", "notes", "note_tags", "tag_votes"] {
+        let sql = format!("SELECT count(*) FROM {table}");
+        let real = count(&clients[0], &sql).await;
+        let printed = count(&clients[1], &sql).await;
+        assert_eq!(
+            printed, real,
+            "{table}: the printed SQL kept {printed} row(s), the command kept {real}"
+        );
+        assert!(
+            real > 0,
+            "{table} must survive the sample, or the comparison is vacuous"
+        );
+    }
+}
+
+/// The `BEGIN;` \u{2026} `COMMIT;` the dry run printed, unindented.
+///
+/// The compaction after it is deliberately left out: `VACUUM (FULL)` cannot run
+/// inside a transaction, and a batch send is one.
+fn printed_transaction(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim() == "BEGIN;")
+        .expect("the dry run must print the transaction it opens");
+    let end = lines
+        .iter()
+        .position(|l| l.trim() == "COMMIT;")
+        .expect("the dry run must print the commit");
+    let body: Vec<String> = lines[start..=end]
+        .iter()
+        .map(|l| l.strip_prefix("  ").unwrap_or(l))
+        // `\gset` is psql's, not the server's: it hands this SELECT's value to
+        // the post-commit fence, and psql consumes the suffix as the statement
+        // terminator. Sent down the wire instead — which is what this test does,
+        // having no psql — the server sees it and answers `syntax error at or
+        // near "\"`, measured on PostgreSQL 16.13. The SELECT itself is ordinary
+        // SQL, so the suffix becomes the semicolon psql would have supplied.
+        .map(|l| {
+            l.strip_suffix(" \\gset")
+                .map_or_else(|| (*l).to_owned(), |sql| format!("{sql};"))
+        })
+        .collect();
+    // Nothing ELSE in the transaction may be a psql meta-command. One would not
+    // run here at all, and skipping it silently would leave this test claiming it
+    // executed the printed SQL when it had quietly dropped a line of it.
+    for line in &body {
+        assert!(
+            !line.trim_start().starts_with('\\'),
+            "the printed transaction must hold no psql meta-command this test \
+             would have to skip: {line}"
+        );
+    }
+    body.join("\n")
+}
+
+/// A root and three levels below it, with the foreign keys added deepest-first
+/// so the catalog reports them in the order that needs the most passes.
+const DEEP_CHAIN_SCHEMA: &str = "\
+    CREATE TABLE users (id int PRIMARY KEY, email text NOT NULL); \
+    CREATE TABLE notes (id int PRIMARY KEY, user_id int NOT NULL, body text NOT NULL); \
+    CREATE TABLE note_tags (id int PRIMARY KEY, note_id int NOT NULL, label text NOT NULL); \
+    CREATE TABLE tag_votes (id int PRIMARY KEY, note_tag_id int NOT NULL, voter text NOT NULL); \
+    ALTER TABLE tag_votes ADD CONSTRAINT tag_votes_note_tag_fk \
+        FOREIGN KEY (note_tag_id) REFERENCES note_tags(id); \
+    ALTER TABLE note_tags ADD CONSTRAINT note_tags_note_fk \
+        FOREIGN KEY (note_id) REFERENCES notes(id); \
+    ALTER TABLE notes ADD CONSTRAINT notes_user_fk \
+        FOREIGN KEY (user_id) REFERENCES users(id); \
+    INSERT INTO users SELECT g, 'user' || g || '@example.com' FROM generate_series(1, 4) g; \
+    INSERT INTO notes SELECT g, g, 'note ' || g FROM generate_series(1, 4) g; \
+    INSERT INTO note_tags SELECT g, g, 'tag ' || g FROM generate_series(1, 4) g; \
+    INSERT INTO tag_votes SELECT g, g, 'voter' || g FROM generate_series(1, 4) g;";
+
+const DEEP_CHAIN_SCRUB_TOML: &str = r#"
+[defaults]
+safe_columns = ["id"]
+
+[tables.users]
+safe = []
+
+[tables.users.pii]
+email = "email"
+
+[tables.users.encrypted]
+
+[tables.notes]
+safe = ["user_id", "body"]
+
+[tables.note_tags]
+safe = ["note_id", "label"]
+
+[tables.tag_votes]
+safe = ["note_tag_id", "voter"]
+"#;
+
+/// The same leak, through a `never_include` table rather than a purged one.
+///
+/// `never_include` promises the table ends up empty. The sample empties it, but
+/// that runs before the column rewrites, so a trigger on a scrubbed table can
+/// insert the original PII into it afterwards. Both promises — `[framework]
+/// purge` and `never_include` — are re-enforced after every write.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_trigger_cannot_refill_a_never_include_table_with_pii() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "never_trigger").await;
+    // `audit_logs` is the fixture's never_include table.
+    client
+        .batch_execute(
+            "CREATE FUNCTION audit_user() RETURNS TRIGGER AS $$ \
+            BEGIN \
+                INSERT INTO audit_logs (actor_email, action) VALUES (OLD.email, 'update'); \
+                RETURN NEW; \
+            END; \
+            $$ LANGUAGE plpgsql; \
+            CREATE TRIGGER users_audit BEFORE UPDATE ON users \
+                FOR EACH ROW EXECUTE FUNCTION audit_user();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/never_trigger");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "never_include promises an empty table even when a trigger refills it"
+    );
+}
+
+/// A purge the sample's own emptied rows reference has to wait for the sample.
+///
+/// `[framework] purge` runs at the START of the transaction so a framework table
+/// referencing a sampled one is already empty when the sample removes its
+/// parents. That order is wrong for the mirror shape — an app table pointing INTO
+/// a purged table — so the plan defers that one purge. Without the deferral the
+/// `DELETE FROM autumn_jobs` hits `audit_logs`'s rows and the whole run rolls
+/// back, which is exactly what this asserts does not happen.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_purge_an_emptied_table_references_runs_after_the_sample() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_purge_order").await;
+    // A framework-owned table, and an excluded app table that references it.
+    // `audit_logs` is `never_include`, so the sample empties it — which is what
+    // makes the deferred purge possible at all.
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args JSONB NOT NULL \
+            ); \
+            INSERT INTO autumn_jobs (args) VALUES ('{\"note\": \"payload\"}'); \
+            ALTER TABLE audit_logs ADD COLUMN job_id BIGINT REFERENCES autumn_jobs (id); \
+            UPDATE audit_logs SET job_id = (SELECT id FROM autumn_jobs LIMIT 1);",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!(
+            "{}\n[framework]\npurge = [\"autumn_jobs\"]\n",
+            SAMPLE_SCRUB_TOML.replace(
+                "[tables.audit_logs]\nsafe = [\"action\"]",
+                "[tables.audit_logs]\nsafe = [\"action\", \"job_id\"]",
+            )
+        ),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_purge_order");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    // The dry run advertises itself as the exact SQL in execution order, so it
+    // has to hold the deferred purge back too — printing it first would show a
+    // sequence that fails if a reader actually ran it.
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &envs,
+    );
+    let purge_at = dry_err
+        .find(r#"DELETE FROM "public"."autumn_jobs""#)
+        .expect("the dry run must print the purge");
+    let sample_at = dry_err
+        .find(r#"DELETE FROM "public"."audit_logs""#)
+        .expect("the dry run must print the sample's own delete");
+    assert!(
+        sample_at < purge_at,
+        "the deferred purge must print AFTER the sample empties its child:\n{dry_err}"
+    );
+
+    run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM autumn_jobs").await,
+        0,
+        "the deferred purge must still empty its table"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        0,
+        "and the excluded table it referenced is emptied by the sample"
+    );
+    assert!(
+        count(&client, "SELECT count(*) FROM users").await < 200,
+        "the sample itself must still have run"
+    );
+}
+
+/// The shape no order satisfies: rows the sample KEEPS reference a purged table.
+/// Purging before the sample hits them and purging after still hits them, so the
+/// run refuses up front rather than failing mid-transaction.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_a_retained_reference_into_a_purged_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_purge_conflict").await;
+    // Same edge, but from `tags`, whose rows the sample keeps.
+    client
+        .batch_execute(
+            "CREATE TABLE autumn_jobs ( \
+                id BIGSERIAL PRIMARY KEY, \
+                args JSONB NOT NULL \
+            ); \
+            ALTER TABLE tags ADD COLUMN job_id BIGINT REFERENCES autumn_jobs (id);",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!(
+            "{}\n[framework]\npurge = [\"autumn_jobs\"]\n",
+            SAMPLE_SCRUB_TOML.replace(
+                "[tables.tags]\nsafe = [\"label\"]",
+                "[tables.tags]\nsafe = [\"label\", \"job_id\"]",
+            )
+        ),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_purge_conflict");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("autumn_jobs"),
+        "the refusal must name the purged table: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused sample must not have deleted anything"
+    );
+}
+
+/// AC #5's other refusal shape, end to end: a reference INTO an excluded table
+/// would dangle, so the run aborts non-zero naming the edge.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sampling_refuses_a_reference_into_an_excluded_table() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_dangling").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // `users` references `countries`, so excluding the lookup table entirely
+    // would leave every kept user pointing at nothing.
+    std::fs::write(
+        dir.join("scrub.toml"),
+        SAMPLE_SCRUB_TOML
+            .replace("always_include = [\"countries\"]", "always_include = []")
+            .replace(
+                "never_include = [\"audit_logs\"]",
+                "never_include = [\"audit_logs\", \"countries\"]",
+            ),
+    )
+    .unwrap();
+    let url = format!("{base}/sample_dangling");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("users -> countries"),
+        "the refusal must name the offending reference: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "a refused sample must not have deleted anything"
+    );
+}
+
+/// AC #1's other half: the sample's row removals are part of the scrub's
+/// transaction, so a failure AFTER they run takes them with it.
+///
+/// A trigger that raises on `UPDATE users` fails the rewrite that follows the
+/// removals — the only way to reach that window from outside the command.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failure_after_the_sample_rolls_its_removals_back() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_rollback").await;
+    client
+        .batch_execute(
+            "CREATE FUNCTION refuse_update() RETURNS trigger AS $$ \
+             BEGIN RAISE EXCEPTION 'no rewrites here'; END; $$ LANGUAGE plpgsql; \
+             CREATE TRIGGER users_refuse_update BEFORE UPDATE ON users \
+             FOR EACH ROW EXECUTE FUNCTION refuse_update();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_rollback");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("no rewrites here"),
+        "the rewrite must be what failed: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "the sample's removals must roll back with the rewrite that failed"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        500,
+        "and so must the excluded table's removal"
+    );
+}
+
+/// AC #1: there is no path that emits sampled-but-unscrubbed rows. A
+/// classification failure refuses before the sample deletes a single row,
+/// because both are phases of one transaction.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unclassified_column_refuses_before_the_sample_deletes_anything() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_unclassified").await;
+    client
+        .batch_execute("ALTER TABLE users ADD COLUMN ssn TEXT;")
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_unclassified");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        stderr.contains("users.ssn"),
+        "the undeclared column must still be refused: {stderr}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "no row may be sampled away by a run that refuses to scrub"
+    );
+}
+
+/// `--check` and `--dry-run` write nothing, sample included.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sample_check_and_dry_run_write_nothing() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "sample_no_write").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/sample_no_write");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, check_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--check", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        check_err.contains("Every table is covered by the sample"),
+        "--check must confirm the sample plan is complete: {check_err}"
+    );
+
+    let (_o, dry_err) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &envs,
+    );
+    assert!(
+        dry_err.contains("DELETE FROM \"public\".\"audit_logs\""),
+        "the dry run must print the sample's own statements: {dry_err}"
+    );
+    // Schema-qualified on purpose — do not "simplify" this to a bare
+    // `UPDATE "users"`. Every catalog read that built the plan is scoped to
+    // `public`, so the writes are too: under a database- or role-level
+    // `search_path` (which Autumn supports for tenant schemas) a bare
+    // identifier would resolve to a DIFFERENT table than the one classified,
+    // leaving the classified rows unscrubbed. This assertion pins that, and
+    // lives here rather than on the main fixture because that fixture's
+    // `#[encrypted]` column makes its script unprintable by design.
+    assert!(
+        dry_err.contains("UPDATE \"public\".\"users\" SET"),
+        "and print the column rewrite schema-qualified: {dry_err}"
+    );
+
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM users").await,
+        200,
+        "neither mode may write"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*) FROM audit_logs").await,
+        500,
+        "neither mode may empty an excluded table"
     );
 }
