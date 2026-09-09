@@ -412,7 +412,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has one; `column = "tenant_id"` is also a compile error),
   string filters cast to `TEXT` so Postgres `citext` compares bytewise too,
   `column = "id"` and a self-referential derivation reading the column it
-  maintains (its `fk` and `tenant` columns included) are compile errors,
+  maintains (its `fk` and `tenant` columns included) are compile errors, and
+  so is a derivation reading a column another derivation or counter cache of
+  its model maintains on its table (across models the registry refuses it at
+  boot); an `#[id]` or `fk` field renamed with `#[diesel(column_name)]`
+  reaches the spec under its physical column,
   reconciliation holds the state table for its transaction so replicas
   booting together take turns, `recompute` sweeps a self-referential table
   one parent per batch with the same deadlock retry, `sum(...)` rejects

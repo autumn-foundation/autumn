@@ -2597,6 +2597,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         child_table: #table,
                         parent_table: #table,
                         column: #column,
+                        direct_sql: true,
                         module_path: ::core::module_path!(),
                     }
                 }

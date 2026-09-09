@@ -342,9 +342,19 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   and the parent `UPDATE` runs on the child's connection, so a sharded setup
   must keep parent and child on the same shard.
 - **Column names come from field names.** A filter field, summed field or
-  `tenant` field renamed with `#[diesel(column_name = "...")]` is rejected. A
-  foreign-key field renamed that way is not detected, so keep `fk` fields
-  unrenamed.
+  `tenant` field renamed with `#[diesel(column_name = "...")]` is rejected. The
+  `#[id]` and `fk` fields may be renamed that way: the spec reaches SQL under
+  the physical column.
+- **A derivation cannot read a column something else maintains on its table.**
+  A source (the summed field, or a field in the filter) that another
+  derivation, a `counter_cache`, a vote tally or an ordering position maintains
+  on the child's table moves under direct SQL, with no delta carrying the change
+  up: a comment's `child_score` moves and the post's `sum(child_score)` never
+  hears of it. Within one model this is a compile error; across models the
+  registry refuses it at boot. The `#[lock_version]` token and the tenant
+  discriminator move only under the repository's own hooked paths, so reading
+  one is fine. Maintain a multi-level aggregate one level at a time, from the
+  leaves up, each as its own derivation over source data.
 - **The parent primary key and tenant discriminator are not maintainable
   columns**: `column = "id"` and `column = "tenant_id"` are compile errors, and
   a model's `tenant_id` field also claims its column in the registry, so a

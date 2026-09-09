@@ -286,6 +286,13 @@ pub struct CounterCacheClaim {
     pub parent_table: &'static str,
     /// The maintained column.
     pub column: &'static str,
+    /// Whether the column is maintained by direct SQL that runs no repository
+    /// hook (a counter cache, a vote tally, an ordering position), as opposed
+    /// to a column only the repository's own hooked paths write (the
+    /// `#[lock_version]` token, the tenant discriminator). A derivation may
+    /// not read the former as a source: its own contribution would then
+    /// change without the delta that carries the change up.
+    pub direct_sql: bool,
     /// Where the declaration lives, for the boot error.
     pub module_path: &'static str,
 }
@@ -313,6 +320,7 @@ fn registered_column_claims() -> Vec<CounterCacheClaim> {
                     child_table: descriptor.spec.comments_table,
                     parent_table: descriptor.spec.parent_table,
                     column,
+                    direct_sql: true,
                     module_path: "#[commentable]",
                 })
             }),
@@ -366,7 +374,86 @@ fn find(name: &str) -> Option<&'static DerivationDef> {
 /// every entry point checks them rather than only the boot path.
 fn check_registry(defs: &[&DerivationDef]) -> AutumnResult<()> {
     check_unique_names(defs)?;
-    check_unique_columns(defs, &registered_column_claims())
+    let claims = registered_column_claims();
+    check_unique_columns(defs, &claims)?;
+    check_source_columns(defs, &claims)
+}
+
+/// The child columns a definition reads: every `{c}."<column>"` in its
+/// contribution and its lowered filter.
+fn source_columns(def: &DerivationDef) -> Vec<&'static str> {
+    let mut columns = Vec::new();
+    for sql in [def.contrib_sql, def.filter_sql] {
+        let mut rest = sql;
+        while let Some(start) = rest.find("{c}.\"") {
+            let after = &rest[start + 5..];
+            let Some(end) = after.find('"') else { break };
+            columns.push(&after[..end]);
+            rest = &after[end + 1..];
+        }
+    }
+    columns
+}
+
+/// Reject a derivation whose source is a column something maintains by direct
+/// SQL on the child's table.
+///
+/// A parent-side update runs no repository hook, so when the column it writes
+/// is another derivation's source, that derivation's contribution changes with
+/// no delta carrying the change up: a comment's `child_score` moves and the
+/// post's `sum(child_score)` never hears of it. The same holds for a plain
+/// counter cache, a vote tally or an ordering position on the child's table.
+/// Columns only the repository's hooked paths write (the `#[lock_version]`
+/// token, the tenant discriminator) are fine to read.
+fn check_source_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -> AutumnResult<()> {
+    for def in defs {
+        let sources = source_columns(def);
+        // The table whose columns are this derivation's sources: the child's.
+        let source_table = def.child_table;
+        if let Some(other) = defs.iter().find(|other| {
+            other.name != def.name
+                && other.parent_table == source_table
+                && sources.contains(&other.column)
+        }) {
+            return Err(AutumnError::from(std::io::Error::other(format!(
+                "derivation `{}` on {}::{} reads `{}.{}`, which derivation `{}` on {}::{} \
+                 maintains. The parent-side update runs no repository hook, so `{}`'s \
+                 contribution would change without the delta that carries it up. Read a \
+                 column nothing maintains, or maintain the aggregate one level at a time",
+                def.name,
+                def.module_path,
+                def.model,
+                def.child_table,
+                other.column,
+                other.name,
+                other.module_path,
+                other.model,
+                def.name,
+            ))));
+        }
+        if let Some(claim) = claims.iter().find(|claim| {
+            claim.direct_sql
+                && claim.parent_table == source_table
+                && sources.contains(&claim.column)
+        }) {
+            return Err(AutumnError::from(std::io::Error::other(format!(
+                "derivation `{}` on {}::{} reads `{}.{}`, which {}::{} (child table `{}`) \
+                 maintains by direct SQL. That update runs no repository hook, so `{}`'s \
+                 contribution would change without the delta that carries it up. Read a \
+                 column nothing maintains, or maintain the aggregate one level at a time",
+                def.name,
+                def.module_path,
+                def.model,
+                def.child_table,
+                claim.column,
+                claim.module_path,
+                claim.model,
+                claim.child_table,
+                def.name,
+            ))));
+        }
+    }
+    Ok(())
 }
 
 /// Reject two derivations claiming one name.
@@ -1576,6 +1663,93 @@ mod tests {
     }
 
     #[test]
+    fn source_columns_are_read_off_the_lowered_sql() {
+        assert_eq!(source_columns(&count_def()), ["published"]);
+        assert_eq!(source_columns(&sum_def()), ["score", "published", "score"]);
+        let cast = DerivationDef {
+            filter_sql: " AND (CAST({c}.\"status\" AS TEXT) = 'featured' {bin})",
+            ..count_def()
+        };
+        assert_eq!(source_columns(&cast), ["status"]);
+    }
+
+    #[test]
+    fn a_derivation_cannot_read_a_column_another_derivation_maintains_on_its_table() {
+        // `dv_comments.child_score` moves under the leaf derivation's direct
+        // SQL, so the post's `sum(child_score)` would never hear of a change.
+        let leaf = DerivationDef {
+            name: "dv_comments.child_score",
+            parent_table: "dv_comments",
+            column: "child_score",
+            transform: "sum(score)",
+            filter: "",
+            filter_sql: "",
+            contrib_sql: "{c}.\"score\"",
+            ..count_def()
+        };
+        let grand = DerivationDef {
+            name: "dv_posts.grand_score",
+            column: "grand_score",
+            transform: "sum(child_score)",
+            filter: "",
+            filter_sql: "",
+            contrib_sql: "{c}.\"child_score\"",
+            ..count_def()
+        };
+        let message = check_source_columns(&[&leaf, &grand], &[])
+            .expect_err("a maintained column is not a source")
+            .to_string();
+        assert!(message.contains("dv_posts.grand_score"), "{message}");
+        assert!(message.contains("dv_comments.child_score"), "{message}");
+
+        // A filter naming it is the same read.
+        let hot = DerivationDef {
+            name: "dv_posts.hot_comment_count",
+            column: "hot_comment_count",
+            filter: "child_score > 0",
+            filter_sql: " AND ({c}.\"child_score\" > 0)",
+            ..count_def()
+        };
+        check_source_columns(&[&leaf, &hot], &[]).expect_err("a filter read is a read");
+
+        // A derivation over a column nothing maintains coexists with the leaf.
+        check_source_columns(&[&leaf, &sum_def()], &[]).expect("unmaintained sources are fine");
+    }
+
+    #[test]
+    fn a_derivation_cannot_read_a_column_a_counter_cache_maintains_but_may_read_a_hooked_one() {
+        let def = sum_def();
+        let tally = CounterCacheClaim {
+            model: "DvVote",
+            child_table: "dv_votes",
+            parent_table: "dv_comments",
+            column: "score",
+            direct_sql: true,
+            module_path: "votes::module",
+        };
+        let message = check_source_columns(&[&def], &[tally])
+            .expect_err("a counter cache's column is not a source")
+            .to_string();
+        assert!(message.contains("votes::module"), "{message}");
+        assert!(message.contains("dv_posts.visible_score"), "{message}");
+
+        // The `#[lock_version]` token and the tenant discriminator move only
+        // under the repository's hooked paths, so reading one is fine.
+        let hooked = CounterCacheClaim {
+            direct_sql: false,
+            ..tally
+        };
+        check_source_columns(&[&def], &[hooked]).expect("hooked columns may be read");
+
+        // The same column name on another table is unrelated.
+        let elsewhere = CounterCacheClaim {
+            parent_table: "dv_posts",
+            ..tally
+        };
+        check_source_columns(&[&def], &[elsewhere]).expect("another table's column is unrelated");
+    }
+
+    #[test]
     fn a_derivation_on_a_plain_counter_cache_column_is_rejected() {
         // A plain `counter_cache` has no `DerivationDef`, so without its claim
         // the column check would see one derivation and pass. Both would then
@@ -1588,6 +1762,7 @@ mod tests {
             child_table: "dv_likes",
             parent_table: def.parent_table,
             column: def.column,
+            direct_sql: true,
             module_path: "likes::module",
         };
         let err = check_unique_columns(&[&def], &[claim])

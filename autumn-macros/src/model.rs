@@ -2135,6 +2135,7 @@ fn emit_counter_caches_impl(
                         child_table: #table_name,
                         parent_table: #table_name,
                         column: #column,
+                        direct_sql: false,
                         module_path: ::core::module_path!(),
                     }
                 }
@@ -2144,6 +2145,36 @@ fn emit_counter_caches_impl(
     if cached.is_empty() && derivations.is_empty() {
         return Ok(quote! { #(#implicit_claims)* });
     }
+
+    // Every column something in THIS model maintains on its own table by
+    // direct SQL: a derivation onto its own table, or a `counter_cache` leg
+    // pointing back at it. No derivation may read one of them as a source
+    // (see below); the registry repeats the check across models at boot.
+    let maintained_here: Vec<(Option<usize>, String, String)> = derivations
+        .iter()
+        .enumerate()
+        .filter(|(_, decl)| derivation_parent_table(decl) == table_name)
+        .map(|(index, decl)| {
+            (
+                Some(index),
+                decl.column.clone(),
+                "another `#[derivation]` of this model".to_owned(),
+            )
+        })
+        .chain(
+            cached
+                .iter()
+                .filter(|assoc| infer_table_name(&assoc.target) == table_name)
+                .map(|assoc| {
+                    (
+                        None,
+                        counter_cache_column(model_ident, assoc)
+                            .expect("filtered to a counter-cached association above"),
+                        "a `counter_cache` of this model".to_owned(),
+                    )
+                }),
+        )
+        .collect();
 
     // Both declaration kinds share every validation below, so the diagnostics
     // name whichever one the model actually used.
@@ -2200,8 +2231,15 @@ fn emit_counter_caches_impl(
             ),
         ));
     };
-    // The unraw name: the primary key reaches SQL as a column name.
-    let pk_column = unraw_ident(pk_ident);
+    // The unraw name is what `sum(<field>)` is compared against; the column
+    // the primary key reaches SQL under is its physical name, which a
+    // `#[diesel(column_name = ...)]` on the `#[id]` field may have renamed.
+    let pk_field_name = unraw_ident(pk_ident);
+    let pk_column = all_fields
+        .iter()
+        .find(|f| f.ident.as_ref() == Some(pk_ident))
+        .and_then(|f| diesel_column_name(f))
+        .unwrap_or_else(|| pk_field_name.clone());
 
     // One shared primary-key extractor: the bulk update path matches a
     // post-update record back to the foreign keys captured for it before the
@@ -2328,6 +2366,7 @@ fn emit_counter_caches_impl(
                     child_table: #table_name,
                     parent_table: #parent_table,
                     column: #column,
+                    direct_sql: true,
                     module_path: ::core::module_path!(),
                 }
             }
@@ -2375,28 +2414,50 @@ fn emit_counter_caches_impl(
         // the parent-side UPDATE runs no repository hook, so a node's new
         // aggregate would change its own contribution (or its eligibility)
         // toward its parent without that parent ever hearing about it.
-        if self_referential {
-            let reads_own_column = match &decl.transform {
-                DerivationTransform::Sum { field, .. } => field == column,
+        let reads = |source: &str| {
+            let summed = match &decl.transform {
+                DerivationTransform::Sum { field, .. } => field == source,
                 DerivationTransform::Count => false,
-            } || decl
-                .filter
-                .as_ref()
-                .is_some_and(|expr| expr_mentions_field(expr, column));
-            if reads_own_column {
-                return Err(syn::Error::new(
-                    decl.span,
-                    format!(
-                        "`#[derivation]` onto its own table cannot read the column it \
-                         maintains: `{column}` is both the maintained column and a \
-                         source of the contribution (in `transform` or `filter`), and \
-                         the parent-side update runs no repository hook, so a row's new \
-                         aggregate would change what it contributes to its own parent \
-                         without that parent being maintained. Read another column, or \
-                         maintain another one"
-                    ),
-                ));
-            }
+            };
+            summed
+                || decl
+                    .filter
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_field(expr, source))
+        };
+        if self_referential && reads(column) {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` onto its own table cannot read the column it \
+                     maintains: `{column}` is both the maintained column and a \
+                     source of the contribution (in `transform` or `filter`), and \
+                     the parent-side update runs no repository hook, so a row's new \
+                     aggregate would change what it contributes to its own parent \
+                     without that parent being maintained. Read another column, or \
+                     maintain another one"
+                ),
+            ));
+        }
+        // The same hole one level over: a source that something else in this
+        // model maintains on this table moves under direct SQL, and the
+        // contribution built from it changes with no delta carrying the change
+        // up. A comment's `child_score` moves; the post's `sum(child_score)`
+        // never hears of it.
+        if let Some((_, source, by)) = maintained_here
+            .iter()
+            .find(|(owner, source, _)| *owner != Some(index) && reads(source))
+        {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot read `{source}` as a source: {by} maintains \
+                     `{table_name}.{source}` by direct SQL, which runs no repository \
+                     hook, so this contribution would change without the delta that \
+                     carries it up. Read a column nothing maintains, or maintain the \
+                     aggregate one level at a time"
+                ),
+            ));
         }
         let fk = derivation_fk(model_ident, decl, assocs)?;
         let Some(fk_field) = all_fields
@@ -2412,13 +2473,16 @@ fn emit_counter_caches_impl(
                 ),
             ));
         };
+        // `fk` names the Rust field; the column it reaches SQL under is the
+        // physical one, which `#[diesel(column_name = ...)]` may have renamed.
+        let fk_column = diesel_column_name(fk_field).unwrap_or_else(|| fk.clone());
         // The grouping key and the tenant discriminator are read by every
         // aggregate as well, `transform` and `filter` aside, so onto its own
         // table a derivation must not maintain either: the parent-side update
         // would re-parent (or re-tenant) the row without the repository hook
         // that carries the contribution off the old parent.
         if self_referential {
-            let implicit = if *column == fk {
+            let implicit = if *column == fk_column {
                 Some("foreign key")
             } else if decl.tenant_column.as_deref() == Some(column.as_str()) {
                 Some("tenant column")
@@ -2529,7 +2593,7 @@ fn emit_counter_caches_impl(
                 };
                 // The two columns that are never data to aggregate: the child's
                 // own id, and the parent id the derivation groups by.
-                if *field == pk_column {
+                if *field == pk_field_name {
                     return Err(syn::Error::new(
                         *span,
                         format!(
@@ -2634,7 +2698,7 @@ fn emit_counter_caches_impl(
                     child_table: #table_name,
                     child_pk: #pk_column,
                     child_soft_delete: #has_deleted_at,
-                    fk_column: #fk,
+                    fk_column: #fk_column,
                     parent_table: #parent_table,
                     parent_pk: "id",
                     column: #column,
@@ -2657,7 +2721,7 @@ fn emit_counter_caches_impl(
                 child_table: #table_name,
                 child_pk: #pk_column,
                 child_soft_delete: #has_deleted_at,
-                fk_column: #fk,
+                fk_column: #fk_column,
                 parent_table: #parent_table,
                 parent_pk: "id",
                 counter_column: #column,
@@ -3969,6 +4033,7 @@ fn emit_votable_items(
                 child_table: #edge_table_name,
                 parent_table: #table_name_str,
                 column: #agg_column_name,
+                direct_sql: true,
                 module_path: ::core::module_path!(),
             }
         }
@@ -11170,6 +11235,123 @@ mod tests {
         assert!(
             !generated.contains("cannot maintain its"),
             "only a self-referential derivation reads the column it maintains: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_read_a_column_another_maintainer_writes_on_its_table() {
+        // `child_score` is maintained on `nodes` by direct SQL, so a sibling
+        // reading it (as a sum, or in a filter, onto its own table or another)
+        // would see it move with no delta carrying the change up.
+        for (second, target) in [
+            (
+                quote! { #[derivation(Node, column = "grand_score", fk = parent_id, transform = sum(child_score))] },
+                "sum onto the same table",
+            ),
+            (
+                quote! { #[derivation(Node, column = "hot_children", fk = parent_id, filter = child_score > 0)] },
+                "filter onto the same table",
+            ),
+            (
+                quote! { #[derivation(Tree, column = "total_score", fk = tree_id, transform = sum(child_score))] },
+                "sum onto another table",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #[derivation(Node, column = "child_score", fk = parent_id, transform = sum(score))]
+                    #second
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub tree_id: i64,
+                        pub score: i64,
+                        pub child_score: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot read `child_score` as a source")
+                    && generated.contains("another `#[derivation]` of this model"),
+                "{target}: {generated}"
+            );
+        }
+        // A `counter_cache` leg back onto the same table maintains its column
+        // the same way.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Node, fk = parent_id, counter_cache = "reply_count")]
+                #[derivation(Node, column = "weighted", fk = parent_id, transform = sum(reply_count))]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub reply_count: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot read `reply_count` as a source")
+                && generated.contains("a `counter_cache` of this model"),
+            "{generated}"
+        );
+        // Reading a column nothing maintains, next to a maintained one, is fine.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Node, column = "child_score", fk = parent_id, transform = sum(score))]
+                #[derivation(Node, column = "child_count", fk = parent_id, filter = score > 0)]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub score: i64,
+                    pub child_score: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("as a source"),
+            "two derivations over an unmaintained source coexist: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_spec_names_the_physical_pk_and_fk_columns() {
+        // `#[diesel(column_name = ...)]` on the `#[id]` or `fk` field renames
+        // the database column; the spec reaches SQL under the physical name.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "reaction_count", fk = article)]
+                pub struct Reaction {
+                    #[id]
+                    #[diesel(column_name = reaction_id)]
+                    pub id: i64,
+                    #[diesel(column_name = "article_id")]
+                    pub article: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("child_pk : \"reaction_id\""),
+            "the child primary key is spelled physically: {generated}"
+        );
+        assert!(
+            generated.contains("fk_column : \"article_id\""),
+            "the foreign key is spelled physically: {generated}"
+        );
+        assert!(
+            !generated.contains("child_pk : \"id\"")
+                && !generated.contains("fk_column : \"article\""),
+            "no Rust-named column reaches SQL: {generated}"
         );
     }
 
