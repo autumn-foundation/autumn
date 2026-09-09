@@ -35,8 +35,8 @@
 #![allow(clippy::cast_possible_wrap)] // fixture indices are bounded well under i64::MAX
 
 use autumn_web::hooks::MutationHooks;
+use diesel::PgConnection;
 use diesel::connection::SimpleConnection;
-use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -44,6 +44,15 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+
+// No top-level `diesel::prelude::*` / `diesel_async::RunQueryDsl` glob: this
+// file's `#[autumn_web::model]`/`#[autumn_web::repository]`-generated code
+// (async) and this harness's own diagnostic `PgConnection` helpers (sync)
+// each need a DIFFERENT `RunQueryDsl`, and Rust's ambiguous-trait-method
+// resolution does not let a function-local `use` shadow a module-level glob
+// that also provides a same-named method (E0034) — so each `RunQueryDsl`
+// variant is imported only inside the function that needs it, never at
+// module scope, and never both at once.
 
 diesel::table! {
     ledger_upsert_lock_records (id) {
@@ -162,7 +171,7 @@ const fn build_repo(pool: Pool<AsyncPgConnection>) -> PgLedgerUpsertLockRecordRe
     }
 }
 
-#[derive(QueryableByName, Debug)]
+#[derive(diesel::QueryableByName, Debug)]
 struct StatementRow {
     #[diesel(sql_type = Text)]
     query: String,
@@ -182,6 +191,8 @@ fn reset_stats(conn: &mut PgConnection) {
 /// unchanged read (`ledger_upsert_lock_records` `SELECT ... FOR UPDATE`) and
 /// write (`INSERT ... ON CONFLICT`) statements this fix doesn't touch.
 fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64) {
+    use diesel::RunQueryDsl as _;
+
     println!("\n=== pg_stat_statements: {label} ===");
     let rows = diesel::sql_query(
         "SELECT query, calls, (shared_blks_hit + shared_blks_read) AS buffers \
@@ -209,7 +220,7 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64) {
     (lock_calls, lock_buffers)
 }
 
-#[derive(QueryableByName, Debug)]
+#[derive(diesel::QueryableByName, Debug)]
 struct ExplainLine {
     #[diesel(sql_type = Text, column_name = "QUERY PLAN")]
     line: String,
@@ -223,6 +234,8 @@ struct ExplainLine {
 /// no scan to speed up, so this section is illustrative of the PLAN SHAPE,
 /// not a buffers claim.
 fn explain(conn: &mut PgConnection, label: &str, sql: &str) {
+    use diesel::RunQueryDsl as _;
+
     println!("\n=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): {label} ===");
     println!("{sql}");
     let lines = diesel::sql_query(format!(
@@ -239,6 +252,8 @@ fn explain(conn: &mut PgConnection, label: &str, sql: &str) {
 #[ignore = "requires Docker (testcontainers)"]
 #[allow(clippy::too_many_lines)] // one linear profiling script, clearest unsplit
 async fn repository_upsert_many_advisory_lock_batching_profile() {
+    use diesel::Connection as _;
+
     let (pool, url, _container) = setup_pool().await;
     let repo = build_repo(pool);
 
