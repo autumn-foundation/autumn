@@ -488,6 +488,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured with two targets and a failure in the first, the second target's
   `\connect` and its entire destructive block used to run anyway, leaving a
   partially scrubbed topology and a stream that ends with no error at all.
+  The printed transaction now also emits the `REFRESH MATERIALIZED VIEW`
+  statements the run performs, in the same dependency order and the same place
+  inside the envelope. A materialized view keeps its own physical copy of what
+  it selected, so a script that skipped them left the view's heap holding the
+  pre-scrub rows — measured against a view over `users.email`, the base table
+  finished with 0 original addresses and the view still held all 200.
   Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and

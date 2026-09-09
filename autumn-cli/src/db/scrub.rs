@@ -2772,6 +2772,18 @@ fn classify_and_apply(
             for (table, _) in &phases.final_pass {
                 eprintln!("  {};", emptiness_assertion(table));
             }
+            // Last inside the transaction, exactly where `execute` runs them: a
+            // materialized view keeps its own physical copy of whatever it
+            // selected, so a script that skips this leaves the view's heap
+            // holding the pre-scrub rows — including the PII just removed from
+            // the base tables it reads. In dependency order, so a view over
+            // another is rebuilt from the refreshed one rather than the stale
+            // one. Inside the envelope like the rest, so a refresh the role may
+            // not run rolls the rewrites back instead of committing base tables
+            // a stale view contradicts.
+            for view in &facts.materialized_views {
+                eprintln!("  REFRESH MATERIALIZED VIEW {};", qualified_ident(view));
+            }
             // The last statement inside the transaction, and the whole reason
             // the compaction below can tell a scrubbed target from an aborted
             // one. In an aborted transaction this SELECT is refused like every
