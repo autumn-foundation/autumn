@@ -48,6 +48,28 @@ pub fn normalize_slug(slug: &str, title: &str) -> String {
     }
 }
 
+/// The longest menu-item label accepted, matching the `#[validate]` cap
+/// declared on the `MenuItem` model.
+///
+/// Declared here as well because the bounded insert goes through plain Diesel —
+/// which is what puts the cap check and the insert in one transaction, and is
+/// also what bypasses the model's own validator.
+pub const MAX_MENU_ITEM_LABEL: usize = 200;
+
+/// Apply the `MenuItem` model's declared rules to a direct insert.
+pub fn validate_new_menu_item(new: &crate::models::NewMenuItem) -> AutumnResult<()> {
+    let label = new.label.trim();
+    if label.is_empty() {
+        return Err(AutumnError::unprocessable_msg("A menu item needs a label"));
+    }
+    if label.chars().count() > MAX_MENU_ITEM_LABEL {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A menu item label must be at most {MAX_MENU_ITEM_LABEL} characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Statuses a post may be *created* in. `future`, `private` and `trash` are
 /// reachable only by transitioning from one of these, so the state machine sees
 /// every move into them.

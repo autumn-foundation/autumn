@@ -62,6 +62,11 @@ pub struct EditContext {
     /// here, or a trash transition composed after it. Declared by the caller
     /// because the answer is about the transaction, not about this call.
     pub may_touch_hierarchy: bool,
+    /// The account making the edit, re-authorized against the row *as locked*.
+    ///
+    /// `None` is a path with no acting user — the scheduler, the seeder and the
+    /// importer, whose authority is the process's rather than a session's.
+    pub actor: Option<crate::models::User>,
 }
 
 pub async fn update_post_with_revision(
@@ -76,6 +81,7 @@ pub async fn update_post_with_revision(
         expected_lock_version,
         record_revision,
         may_touch_hierarchy,
+        actor,
     } = context;
     conn.transaction(async move |conn| {
         // The hierarchy lock first, when this edit could need it — see
@@ -102,6 +108,29 @@ pub async fn update_post_with_revision(
             .first(conn)
             .await
             .map_err(AutumnError::not_found)?;
+
+        // Authorization is re-checked against the row *as locked*, exactly as
+        // `transition_status` does — the handler's check ran on a connection
+        // released before this transaction opened. A Contributor saving their
+        // draft while an Editor publishes it was authorized by the stale
+        // `draft` and then wrote over content they may no longer touch.
+        //
+        // The stale-edit check below does not close this: `lock_version` is
+        // form data, so a crafted request can name the version the row will
+        // have *after* the transition it is racing and sail through. An
+        // authorization decision cannot rest on a number the caller chooses.
+        if let Some(actor) = &actor
+            && !crate::capabilities::can_edit_post(
+                actor.role(),
+                actor.id,
+                post.author_id,
+                &post.status,
+            )
+        {
+            return Err(AutumnError::forbidden_msg(
+                "You do not have permission to edit this content",
+            ));
+        }
 
         // Stale-edit detection. The row lock above serializes concurrent
         // saves but does not make the second one *correct*: without this,
@@ -2680,6 +2709,90 @@ pub async fn search_published(
     });
 
     Ok((rows, usize::try_from(total).unwrap_or(0)))
+}
+
+/// Add a menu item, refusing one the menu could never show.
+///
+/// The screen that manages a menu and the navigation that renders it both read
+/// the first `limit` items ordered by `(position, id)` — bounded so a menu
+/// cannot make every page view unbounded. An unbounded *insert* behind a
+/// bounded read is the gap: the item is accepted, appears nowhere, and has no
+/// delete control, so the only way to reach it is to remove a visible item
+/// first. Refusing is the honest answer, and it names the way out.
+///
+/// The count and the insert are one transaction, over the menu's items locked
+/// `FOR UPDATE`, so two administrators filling the last slot cannot both see
+/// room. With no items there is nothing to lock and nothing to race over.
+pub async fn insert_menu_item(
+    conn: &mut AsyncPgConnection,
+    new: crate::models::NewMenuItem,
+    limit: i64,
+) -> AutumnResult<()> {
+    // The model's declared rules, which this direct insert never runs.
+    crate::hooks::validate_new_menu_item(&new)?;
+    conn.transaction(async move |conn| {
+        let _locked: Vec<i64> = menu_items::table
+            .filter(menu_items::menu_id.eq(new.menu_id))
+            .select(menu_items::id)
+            .for_update()
+            .load(conn)
+            .await?;
+        let existing: i64 = menu_items::table
+            .filter(menu_items::menu_id.eq(new.menu_id))
+            .count()
+            .get_result(conn)
+            .await?;
+        if existing >= limit {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "This menu already has {limit} items, which is as many as the \
+                 navigation shows. Remove one before adding another."
+            )));
+        }
+        diesel::insert_into(menu_items::table)
+            .values(&new)
+            .execute(conn)
+            .await?;
+        Ok::<_, AutumnError>(())
+    })
+    .await
+}
+
+/// Add a sidebar widget, refusing one the sidebar could never show.
+///
+/// Same shape as [`insert_menu_item`]: the Appearance screen and every public
+/// page read the first `limit` widgets of the sidebar, so an unbounded insert
+/// behind that bounded read produces a widget that is invisible and
+/// undeletable.
+pub async fn insert_widget(
+    conn: &mut AsyncPgConnection,
+    new: crate::models::NewWidget,
+    limit: i64,
+) -> AutumnResult<()> {
+    conn.transaction(async move |conn| {
+        let _locked: Vec<i64> = widgets::table
+            .filter(widgets::sidebar.eq(&new.sidebar))
+            .select(widgets::id)
+            .for_update()
+            .load(conn)
+            .await?;
+        let existing: i64 = widgets::table
+            .filter(widgets::sidebar.eq(&new.sidebar))
+            .count()
+            .get_result(conn)
+            .await?;
+        if existing >= limit {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "This sidebar already has {limit} widgets, which is as many as it \
+                 shows. Remove one before adding another."
+            )));
+        }
+        diesel::insert_into(widgets::table)
+            .values(&new)
+            .execute(conn)
+            .await?;
+        Ok::<_, AutumnError>(())
+    })
+    .await
 }
 
 /// The location index, which is an answer to give the administrator.

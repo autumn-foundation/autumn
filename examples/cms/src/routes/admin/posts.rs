@@ -1308,6 +1308,11 @@ pub async fn update(
                             // transaction on the opposite order from every
                             // create and re-parent — see `transition_status`.
                             may_touch_hierarchy: registered.hierarchical || status == "trash",
+                            // Re-authorized against the row as locked. The
+                            // check above this transaction ran on a released
+                            // connection, and `lock_version` cannot stand in
+                            // for it — it is form data.
+                            actor: Some(user.clone()),
                         },
                         move |post| {
                             let (

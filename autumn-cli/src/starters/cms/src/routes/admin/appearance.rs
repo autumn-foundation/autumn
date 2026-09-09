@@ -476,16 +476,26 @@ pub async fn create_menu_item(
         None => None,
     };
 
+    // Bounded, because the read is. Both this screen and the navigation show
+    // the first `MENU_ITEMS_SHOWN` items, so accepting more produced an item
+    // that appears nowhere and has no delete control — reachable only by
+    // removing a visible one first.
     repos
-        .menu_items
-        .save(&NewMenuItem {
-            menu_id,
-            parent_id,
-            label: form.label.trim().to_owned(),
-            url: form.url.trim().to_owned(),
-            post_id: parse(&form.post_id),
-            term_id: parse(&form.term_id),
-            position: form.position.trim().parse::<i32>().unwrap_or(0),
+        .with_conn(async |conn| {
+            content::insert_menu_item(
+                conn,
+                NewMenuItem {
+                    menu_id,
+                    parent_id,
+                    label: form.label.trim().to_owned(),
+                    url: form.url.trim().to_owned(),
+                    post_id: parse(&form.post_id),
+                    term_id: parse(&form.term_id),
+                    position: form.position.trim().parse::<i32>().unwrap_or(0),
+                },
+                MENU_ITEMS_SHOWN,
+            )
+            .await
         })
         .await?;
     Ok(Redirect::to("/admin/appearance").into_response())
@@ -540,14 +550,23 @@ pub async fn create_widget(
         )));
     }
 
+    // Bounded, for the same reason `create_menu_item` is: the sidebar renders
+    // its first `MAX_SIDEBAR_WIDGETS` and so does this screen, so a widget past
+    // that is invisible and undeletable.
     repos
-        .widgets
-        .save(&NewWidget {
-            sidebar: "primary".to_owned(),
-            kind: kind.slug().to_owned(),
-            title: title.to_owned(),
-            settings,
-            position: form.position.trim().parse::<i32>().unwrap_or(0),
+        .with_conn(async |conn| {
+            content::insert_widget(
+                conn,
+                NewWidget {
+                    sidebar: "primary".to_owned(),
+                    kind: kind.slug().to_owned(),
+                    title: title.to_owned(),
+                    settings,
+                    position: form.position.trim().parse::<i32>().unwrap_or(0),
+                },
+                crate::routes::site::MAX_SIDEBAR_WIDGETS,
+            )
+            .await
         })
         .await?;
     Ok(Redirect::to("/admin/appearance").into_response())

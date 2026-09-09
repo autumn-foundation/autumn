@@ -3643,6 +3643,216 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// The edit path authorizes against the row as locked, not against what a
+/// caller checked earlier.
+///
+/// The handler's `can_edit_post` runs on a connection released before the
+/// save's transaction opens, and `lock_version` cannot stand in for it: it is
+/// form data, so a crafted request names the version the row will have *after*
+/// the transition it is racing. This asserts the guarantee at the function that
+/// does the write, because that is where it has to hold — see the review thread
+/// for why the end-to-end request is refused a step earlier today, and why
+/// depending on that is the shape this PR keeps finding.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_edit_path_refuses_an_actor_the_locked_row_forbids() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+
+    // Published, and authored by the administrator — so a Contributor may edit
+    // it on neither count. Created before the second account registers, because
+    // registering rotates the session the first cookie names.
+    let id = create_post(&client, &owner, "Theirs", "Not yours.", "publish").await;
+
+    let _contributor = register(&client, "scribe").await;
+    try_execute(
+        TestDb::shared().await,
+        "UPDATE users SET role = 'contributor' WHERE username = 'scribe'",
+    )
+    .await
+    .expect("demote to contributor");
+
+    let contributor: {{crate_name}}::models::User = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::users::table
+                .filter({{crate_name}}::schema::users::username.eq("scribe"))
+                .select({{crate_name}}::models::User::as_select()),
+            &mut conn,
+        )
+        .await
+        .expect("the contributor")
+    };
+
+    let outcome = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::update_post_with_revision(
+            &mut conn,
+            id,
+            {{crate_name}}::content::EditContext {
+                editor_id: contributor.id,
+                summary: "Edited".to_owned(),
+                // `None`, so nothing but the authorization check can refuse
+                // this — a mismatched version would be a different answer.
+                expected_lock_version: None,
+                record_revision: false,
+                may_touch_hierarchy: false,
+                actor: Some(contributor.clone()),
+            },
+            |post| post.body = "Overwritten.".to_owned(),
+        )
+        .await
+    };
+    let error = outcome.expect_err("a Contributor may not edit somebody else's published post");
+    assert_eq!(
+        error.status(),
+        autumn_web::prelude::StatusCode::FORBIDDEN,
+        "and is told so rather than getting a generic failure: {error}"
+    );
+
+    let body: String = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::posts::table
+                .find(id)
+                .select({{crate_name}}::schema::posts::body),
+            &mut conn,
+        )
+        .await
+        .expect("the post")
+    };
+    assert_eq!(body, "Not yours.", "and nothing was written");
+
+    // The same call by an actor who *is* allowed goes through, so the check is
+    // a real predicate rather than a blanket refusal.
+    let owner_user: {{crate_name}}::models::User = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::users::table
+                .filter({{crate_name}}::schema::users::username.eq("owner"))
+                .select({{crate_name}}::models::User::as_select()),
+            &mut conn,
+        )
+        .await
+        .expect("the owner")
+    };
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::update_post_with_revision(
+            &mut conn,
+            id,
+            {{crate_name}}::content::EditContext {
+                editor_id: owner_user.id,
+                summary: "Edited".to_owned(),
+                expected_lock_version: None,
+                record_revision: false,
+                may_touch_hierarchy: false,
+                actor: Some(owner_user.clone()),
+            },
+            |post| post.body = "Theirs to write.".to_owned(),
+        )
+        .await
+        .expect("an administrator may edit it");
+    }
+}
+
+/// A menu cannot accept an item it will never show.
+///
+/// The management screen and the navigation both read the first
+/// `MENU_ITEMS_SHOWN` items, so an unbounded insert behind that bounded read
+/// produced an item that appears nowhere and has no delete control — reachable
+/// only by removing a visible one first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_menu_refuses_an_item_it_cannot_show() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Main"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Fill the menu to the bound, directly — a hundred form posts is the test's
+    // runtime, not its subject.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO menu_items (menu_id, parent_id, label, url, position)
+         SELECT 1, NULL, 'Item ' || g, '/', 0 FROM generate_series(1, 100) AS g",
+    )
+    .await
+    .expect("fill the menu");
+
+    let refused = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("label", "One too many"),
+            ("url", "/late"),
+            ("parent_id", ""),
+            ("post_id", ""),
+            ("term_id", ""),
+            ("position", "0"),
+        ]))
+        .send()
+        .await;
+    assert_ne!(
+        refused.status, 303,
+        "an item past the bound must be refused, not silently hidden"
+    );
+    assert!(
+        refused.text().contains("Remove one"),
+        "and must say how to make room:\n{}",
+        refused.text()
+    );
+}
+
+/// A sidebar cannot accept a widget it will never show.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_sidebar_refuses_a_widget_it_cannot_show() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO widgets (sidebar, kind, title, settings, position)
+         SELECT 'primary', 'text', 'Widget ' || g, '{\"text\":\"x\"}'::jsonb, 0
+         FROM generate_series(1, 30) AS g",
+    )
+    .await
+    .expect("fill the sidebar");
+
+    let refused = client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("kind", "text"),
+            ("title", "One too many"),
+            ("text", "Invisible."),
+            ("count", "5"),
+            ("taxonomy", "category"),
+            ("position", "0"),
+        ]))
+        .send()
+        .await;
+    assert_ne!(
+        refused.status, 303,
+        "a widget past the bound must be refused, not silently hidden"
+    );
+    assert!(
+        refused.text().contains("Remove one"),
+        "and must say how to make room:\n{}",
+        refused.text()
+    );
+}
+
 /// A menu-slug race allocates the next suffix rather than reporting a conflict.
 ///
 /// Allocation is a read followed by a write, so two administrators creating
