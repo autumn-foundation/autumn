@@ -187,6 +187,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint is mounted. The document itself is still exported either way — the
   gate governs serving, not whether the contract can be written down.
 
+- **openapi:** the external-scalar identity check compares the real type path,
+  not a crate-name prefix (issue #802). `chrono`'s date/time types and
+  `uuid::Uuid` are matched by the macro on their last path segment, and a
+  runtime check then confirmed the identity really was external — but that check
+  was `starts_with("chrono::")`, which accepts *every* type in a crate that
+  happens to be named `chrono`. A downstream crate of that name defining its own
+  `DateTime` was inlined as a string even when serde writes an object, and no
+  opaque component was emitted, so `--strict` could not see it. Each scalar now
+  compares against `type_name` of the genuine type, reached through
+  `autumn_web::reexports` — so the check cannot drift if `chrono` moves a type
+  between internal modules, and cannot be satisfied by a namespace collision.
+  `DateTime<Tz>` compares the path before the `<`, so every zone still
+  qualifies. `uuid` joins the `reexports` module for this.
+
 
 ### Changed
 

@@ -728,11 +728,16 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         // for `String`, `bool` and the numerics, where the stakes are lower: a
         // colliding `String` would have to be a non-string-serializing type of
         // that exact name.)
+        // The predicate is derived from the REAL type through `autumn_web`'s
+        // re-export (see `scalar_identity_predicate`), not from a hand-written
+        // prefix: `starts_with("chrono::")` accepted every type in a crate of
+        // that name, and a downstream crate named `chrono` with its own
+        // `DateTime` was inlined as a string even when serde writes an object.
+        let identity_predicate = scalar_identity_predicate(&name)
+            .expect("scalar_json_schema and scalar_identity_predicate cover the same names");
         return emit_identity_guarded(
             ty,
-            &quote! {
-                __identity.starts_with("chrono::") || __identity.starts_with("uuid::")
-            },
+            &identity_predicate,
             &quote! {{
                 let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
                 __scalar.insert("type".to_owned(), #json_type.into());
@@ -939,6 +944,43 @@ fn scalar_json_schema(
         "Uuid" => ("string", Some("uuid"), None),
         _ => return None,
     })
+}
+
+/// A runtime predicate that is `true` only for the GENUINE external scalar this
+/// table entry describes.
+///
+/// The identity is compared against `type_name` of the real type, reached
+/// through `autumn_web`'s own re-export — never against a hand-written string.
+/// Two things follow. It cannot drift from the dependency: if `chrono` moves
+/// `NaiveDateTime` between internal modules, both sides move together. And it
+/// is exact rather than namespace-wide: the previous `starts_with("chrono::")`
+/// accepted ANY type in a crate that happens to be named `chrono` — including a
+/// downstream crate of that name defining its own `DateTime` — and inlined it as
+/// a string even when serde writes an object, with no opaque component for
+/// `--strict` to catch.
+///
+/// `DateTime<Tz>` is compared on the part before `<`, because the zone is a
+/// parameter: `DateTime<Utc>`, `DateTime<Local>` and `DateTime<Tz>` are all
+/// genuinely chrono's. Everything else is compared whole.
+fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
+    let chrono = quote! { ::autumn_web::reexports::chrono };
+    let real: TokenStream = match name {
+        "DateTime" => {
+            // Generic: match the path up to the `<`, so any zone qualifies while
+            // an unrelated `DateTime` still does not.
+            return Some(quote! {{
+                let __real = ::core::any::type_name::<#chrono::DateTime<#chrono::Utc>>();
+                let __head = |__s: &'static str| __s.split('<').next().unwrap_or(__s);
+                __head(__identity) == __head(__real)
+            }});
+        }
+        "NaiveDate" => quote! { #chrono::NaiveDate },
+        "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
+        "NaiveTime" => quote! { #chrono::NaiveTime },
+        "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
+        _ => return None,
+    };
+    Some(quote! { __identity == ::core::any::type_name::<#real>() })
 }
 
 /// Emit the body of `OpenApiSchema::schema()` for a list of fields.
