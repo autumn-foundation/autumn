@@ -10,6 +10,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use autumn_web::config::DatabaseBackend;
+
 use super::{Flags, GenerateError, provenance};
 
 /// One filesystem operation the generator wants to perform.
@@ -339,12 +341,14 @@ impl Revert {
                 }
             }
             Self::CargoAutumnWebFeature { feature, .. } => {
-                if autumn_web_feature_still_needed_elsewhere(
-                    feature,
-                    project_root,
-                    excluding,
-                    overrides,
-                ) {
+                if autumn_web_feature_pinned_by_backend(feature, project_root)
+                    || autumn_web_feature_still_needed_elsewhere(
+                        feature,
+                        project_root,
+                        excluding,
+                        overrides,
+                    )
+                {
                     content.to_owned()
                 } else {
                     remove_autumn_web_feature(content, feature)
@@ -1501,6 +1505,18 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
 /// `src/`, `tests/`, or `benches/` trees, other than in `excluding` — see
 /// [`autumn_web_feature_markers`]. Always `false` (never blocks removal) for
 /// a feature with no known marker.
+/// Whether an `autumn-web` `feature` is pinned by the app's own database
+/// backend rather than by any generated resource (issue #1924).
+///
+/// `sqlite` is a whole-app backend flip: `autumn new` never writes it, no
+/// generated code contains a marker naming it, and without it the app's
+/// `sqlite://` URL is refused at boot with `UnsupportedBackend`. Destroying the
+/// last model must not take it out from under a `SQLite` app, so the backend
+/// decides here rather than the generic `owner_dir` rule.
+fn autumn_web_feature_pinned_by_backend(feature: &str, project_root: &Path) -> bool {
+    feature == "sqlite" && super::detect_backend(project_root) == DatabaseBackend::Sqlite
+}
+
 fn autumn_web_feature_still_needed_elsewhere(
     feature: &str,
     project_root: &Path,

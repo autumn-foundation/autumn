@@ -1269,6 +1269,27 @@ time = { version = ">=0.3, <0.4" }
 
 JSON clients receive `application/problem+json`.
 
+Read accessors, for a caller with no HTTP response to parse (a GraphQL
+resolver, a `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl):
+
+- `status() -> StatusCode`
+- `details() -> Option<&HashMap<String, Vec<String>>>` - per-field validation
+  messages, `None` when the error did not come from validation
+- `code() -> Cow<'static, str>` - the same stable code the `problem+json`
+  body carries (`autumn.validation_failed`, `autumn.not_found`, ...)
+- `message() -> String` - the wrapped error's message alone. Not redacted,
+  and `status()` is not the guard: it reports the assigned status, while the
+  renderer reclassifies a cancelled database statement to a redacted `503`.
+  Render the error when you need a client-safe string
+- `source_chain() -> Vec<String>`
+- `downcast_ref::<T>()` / `downcast_chain_ref::<T>()`
+
+`Display` on a validation error appends the failing fields to `message()`,
+sorted by field name: `Validation failed: email: Must be a valid email
+address`. The `problem+json` `detail` is unchanged - it stays the bare title,
+with the fields in `errors`. Keep untrusted text out of validation messages;
+`Display` output reaches logs.
+
 ## Signed webhook API
 
 Provider presets:

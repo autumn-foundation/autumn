@@ -597,7 +597,12 @@ than 500.
 registration; do it once at startup. A timer guard records on drop, so bind it
 to a named variable and use `stop()` when you want the measurement to end before
 the rest of the handler. Label values must come from a small closed set the code
-owns.
+owns. The cardinality caps default to 0.7.0's values but come from `[metrics]`
+(`max_series_per_metric`, `max_instruments`, `max_labels_per_series`); raise one
+when the app's label space is genuinely larger, not to quiet
+`autumn_metrics_series_dropped_total` — a retained series is never evicted, so
+the cap bounds permanent memory. `max_labels_per_series` changes series
+identity, so set it before the app ships.
 
 ## Testing helpers
 

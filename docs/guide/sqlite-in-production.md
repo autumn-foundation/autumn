@@ -178,9 +178,10 @@ published support contract**. Available **today**:
 - **Backend-aware DDL generator** — `autumn generate` emits SQLite column types
   for the supported field kinds (see
   [field-type support](#sqlite-field-type-support)).
+- **Backend-aware app dependencies (#1924)** — a SQLite app's `Cargo.toml` gets
+  diesel on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
+  and `autumn-web`'s `sqlite` feature, so the generated code actually compiles.
 - **Generate-time rejections**, each naming its tracking issue:
-  - `Uuid` / `Decimal` / `Attachment` / `DateTime<Utc>` / `Enum` field kinds —
-    #1924.
   - `--id uuid` primary keys — #2555.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
@@ -474,11 +475,12 @@ rather than holding up a write.
 ## SQLite field-type support
 
 The backend-aware generator maps model field kinds to SQLite storage types at
-`autumn generate` time. Like the capability matrix above, this tier lands in
-slices: a field kind is either **mapped** to a working SQLite column type, or
-**rejected at generate time** with an actionable message that names its tracking
-issue — never emitted as output that compiles on Postgres but breaks at migrate
-time on SQLite.
+`autumn generate` time. As of #1924 **every** field kind maps to a working SQLite
+column type and a Rust type that compiles; two of them render an `autumn-web`
+newtype rather than the crate type Postgres uses (see [foreign field
+types](#foreign-field-types-on-sqlite)). A future kind with no working conversion
+is **rejected at generate time** with an actionable message rather than emitted
+as output that compiles on Postgres but breaks on SQLite.
 
 | Field kind | On SQLite | SQLite type | Note |
 | --- | :---: | --- | --- |
@@ -490,11 +492,91 @@ time on SQLite.
 | `f64` | ✅ | `REAL` | |
 | `Bytea` | ✅ | `BLOB` | |
 | `NaiveDateTime` | ✅ | `Timestamp` (TEXT) | Core, ungated `diesel::sql_types::Timestamp`. |
-| `DateTime<Utc>` | ⛔ | — | **Rejected at generate time — #1924.** Its only working SQLite conversion needs diesel's `TimestamptzSqlite`, exported only behind diesel's `sqlite` feature, which the generated app's Postgres-oriented deps do not enable. |
-| `Enum` | ⛔ | — | **Rejected at generate time — #1924.** The generated enum emits only Postgres (`Pg`) `ToSql`/`FromSql<Text>` impls, so SQLite repository loads/inserts do not compile. |
-| `Uuid` | ⛔ | — | **Rejected at generate time — #1924.** No working diesel SQLite `FromSql`/`ToSql` in the app's diesel feature set. |
-| `Decimal` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
-| `Attachment` / `Blob` | ⛔ | — | **Rejected at generate time — #1924.** Same reason. |
+| `DateTime<Utc>` | ✅ | `TimestamptzSqlite` (TEXT) | RFC 3339 UTC text, so the column sorts chronologically. |
+| `json` / `jsonb` | ✅ | `Json` (TEXT) | diesel's own `serde_json::Value` conversion. |
+| `Attachment` / `Blob` | ✅ | `TEXT` | The blob metadata JSON. `Blob` is an `autumn-web` type, so it carries its own `Text`/`Sqlite` conversion. |
+| `Enum` | ✅ | `TEXT` | The generated enum is local to your app, so `autumn generate` emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. |
+| `Uuid` | ✅ | `TEXT` | Renders as `autumn_web::db::sqlite_types::SqliteUuid` — see [foreign field types](#foreign-field-types-on-sqlite). |
+| `Decimal` | ✅ | `TEXT` + `CHECK` | Renders as `autumn_web::db::sqlite_types::SqliteDecimal`; the `CHECK` enforces the declared precision and scale — see [foreign field types](#foreign-field-types-on-sqlite). |
+
+<a id="foreign-field-types-on-sqlite"></a>
+
+### Foreign field types on SQLite
+
+Two field kinds render a different Rust type on SQLite:
+
+| Field kind | Postgres | SQLite |
+| --- | --- | --- |
+| `Uuid` | `uuid::Uuid` | `autumn_web::db::sqlite_types::SqliteUuid` |
+| `decimal{p,s}` | `rust_decimal::Decimal` | `autumn_web::db::sqlite_types::SqliteDecimal` |
+
+`uuid::Uuid` and `rust_decimal::Decimal` belong to other crates, and so does
+every diesel item their SQLite conversion would name, so `autumn-web` can
+implement nothing for them — diesel already blanket-implements `AsExpression`
+for every `Expression`, which rules out even a custom SQL type. A newtype is the
+wrapper diesel prescribes for exactly this case.
+
+Both wrappers are `Copy`, deref to the wrapped type, convert with `From`/`Into`,
+and are `#[serde(transparent)]`, so `Display`, `FromStr` and JSON match the
+wrapped type exactly:
+
+```rust
+use autumn_web::db::sqlite_types::SqliteUuid;
+
+let id: SqliteUuid = some_uuid.into();
+assert_eq!(id.to_string(), some_uuid.to_string());
+let back: uuid::Uuid = *id;
+```
+
+Both store `TEXT`, and both write a **canonical** form, because SQLite compares
+`TEXT` byte for byte — two spellings of one value would break `=` and `UNIQUE`.
+`SqliteUuid` writes hyphenated lowercase; `SqliteDecimal` writes the normalized
+decimal, so `19.990` and `19.99` are one row. The value stays numerically exact,
+which `REAL` would not.
+
+**Precision and scale are enforced by a `CHECK`.** The column is `TEXT`, so the
+migration carries a generated `CHECK` that holds the declared budget — at most
+`scale` fractional digits and `precision - scale` integer digits — that the
+value is a plain decimal literal at all, and that it is genuinely stored as
+`TEXT`, so a hand-written row cannot satisfy the constraint and then fail to
+load. (That last one matters because `TEXT` affinity converts an unquoted number
+but *not* a blob: `x'31392e3939'` would otherwise sit in the column spelling
+`19.99` while refusing to load.) Postgres *rounds* a value to `scale`; SQLite
+has no way to, so it rejects instead. Round before saving
+(`Decimal::round_dp`) if your input can carry more digits than the column
+declares.
+
+A `--default` on a decimal column is written as a quoted, normalized text
+literal for the same reason the runtime normalizes: the default and every later
+write must be the same text, or a row holding its own default would not match a
+lookup for that value.
+
+**Scale is not padded.** Postgres `NUMERIC(10,2)` reads `19.9` back as `19.90`;
+SQLite reads it back as `19.9`. The two are numerically equal — format for
+display rather than relying on the stored scale.
+
+**Ordering.** A `TEXT` column sorts lexicographically, so `ORDER BY` / `<` / `>`
+on a `SqliteDecimal` column compares strings, not numbers (`"9"` after `"10"`,
+`"-1.4"` before `"-1.5"`). Sort or range-filter in Rust, or store minor units in
+an `i64`, when SQL ordering matters. For this reason a scaffolded index does not
+offer a sortable header on a decimal column on SQLite — a dead link that stamped
+a misleading `aria-sort` would be worse than no control. `SqliteUuid` is
+unaffected: hyphenated lowercase text sorts in UUID byte order. Postgres
+`NUMERIC` columns are unaffected.
+
+**Equality on rows Autumn did not write.** `=` and `UNIQUE` match the stored
+bytes. Everything written through these types is canonical, so lookups agree with
+Rust equality. A row inserted by hand or migrated from elsewhere may not be:
+`SqliteUuid` *reads* any form `Uuid::parse_str` accepts (braced, URN,
+unhyphenated, uppercase), and such a row loads correctly but will not match a
+`find_by_…` for the same UUID. Write canonical text.
+
+**Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` still uses
+`autumn_web::test::TestDb`, a Postgres-only testcontainer, so `cargo test` on a
+generated SQLite app does not compile yet — `autumn generate scaffold` warns
+about this on a SQLite app. The app itself is unaffected: `cargo run`, `cargo
+build` and `autumn migrate` all work. A SQLite `TestDb` lands with the runtime
+slice, #1905.
 
 Additional generator shapes are refused on SQLite:
 
@@ -539,12 +621,48 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
 - **Rollback drops indexes before columns.** On the SQLite rollback path the
   generator emits `DROP INDEX` before `DROP COLUMN`, since SQLite will not drop a
   column that an index still references.
-- **Known limitation — dropping a pre-existing indexed column.** A
-  `Remove…From…` migration that drops a column which was indexed by an *earlier*
-  migration can still fail on SQLite, because the generator has no knowledge of
-  the original table's indexes and so cannot emit the matching `DROP INDEX`
-  first. Drop the index in the same migration, or drop the column via a manual
-  table rebuild. Tracked under the SQLite migrations issue #1906.
+- **Pre-existing indexes are dropped too (#1906).** A `Remove…From…` migration
+  reads the project's earlier `migrations/*/up.sql` and emits a `DROP INDEX IF
+  EXISTS` for every index still live on the table that names the removed column.
+  Composite, partial, expression and hand-named indexes are all covered, as are
+  indexes carried through an `ALTER TABLE … RENAME TO`. `down.sql` re-creates
+  them after re-adding the column.
+
+  Three kinds stay invisible, and each still fails at apply time:
+  - an index created by hand against the database, outside `migrations/`;
+  - an index created in a migration's `down.sql` rather than its `up.sql`;
+  - the implicit index behind an inline `UNIQUE` or `PRIMARY KEY` column
+    constraint in a `CREATE TABLE`. SQLite refuses to drop such a column in any
+    case, and refuses to drop its `sqlite_autoindex_*` index too.
+
+  For all three, rebuild the table — `autumn schema diff --write-migration`
+  emits the rebuild.
+- **`autumn migrate check` applies SQLite rules (#1906).** The safety classifier
+  reads the app's backend. It never recommends `CREATE INDEX CONCURRENTLY` (no
+  such syntax), does not flag a plain `DROP INDEX` (a cheap catalog edit, and a
+  precondition of `DROP COLUMN`), and reports statements SQLite cannot run at a
+  new **`unsupported`** risk level, which fails the `up.sql` gate:
+
+  | Statement | Write instead |
+  | --- | --- |
+  | Any `ALTER TABLE` subcommand outside `RENAME`, `ADD COLUMN`, `DROP COLUMN` — `ALTER COLUMN`, `ADD`/`DROP CONSTRAINT`, `SET SCHEMA`, `OWNER TO` | Rebuild the table |
+  | `ADD COLUMN … NOT NULL` with no `DEFAULT`, or `DEFAULT NULL` | A constant `DEFAULT`, or a nullable column |
+  | `ADD COLUMN` with a non-constant `DEFAULT` — `CURRENT_TIMESTAMP`, `now()`, `(1+2)` | A literal, or backfill with `UPDATE` |
+  | `ADD COLUMN` with inline `UNIQUE` / `PRIMARY KEY`, or `GENERATED … STORED` | Add the column, then `CREATE UNIQUE INDEX`; or use `VIRTUAL` |
+  | `CREATE INDEX … USING` / `INCLUDE` / `WITH` / `TABLESPACE` | Drop the clause — SQLite indexes are always B-trees |
+  | `CREATE TABLE … PARTITION BY` / `AS IDENTITY` / `INHERITS` | `INTEGER PRIMARY KEY AUTOINCREMENT`; partition in the app |
+  | `TRUNCATE` | `DELETE FROM <table>;` |
+  | `MERGE`, `SELECT … FOR UPDATE`, `ON CONFLICT ON CONSTRAINT`, a writing CTE | `INSERT … ON CONFLICT (<columns>)`; separate statements |
+  | Sequences, types, extensions, materialized views, `COMMENT ON`, `GRANT`/`REVOKE` | Remove, or gate the migration to Postgres |
+  | `DROP INDEX sqlite_autoindex_*` | Rebuild the table without the constraint |
+
+  A table the same migration creates is exempt from the `ADD COLUMN` rules: it
+  has no rows, so SQLite accepts them. `down.sql` findings are reported but do
+  not decide the exit code — that migration runs on `autumn migrate down`.
+
+  One rule Autumn deliberately does **not** apply: SQLite rejects an added
+  `REFERENCES` column with a non-NULL default only when `PRAGMA foreign_keys` is
+  ON, and the migration connection leaves it OFF, so the statement applies.
 
 ---
 
@@ -595,9 +713,8 @@ never as a runtime surprise on some unlucky code path days later.
   Postgres-only job/scheduler backend, a multi-replica lock) fails at boot with
   an actionable diagnostic.
 - A **generator** that would emit output which compiles on Postgres but breaks
-  on SQLite (for example a `Uuid` / `Decimal` field kind or an `--id uuid`
-  primary key) is rejected at **generate time**, with the reason stated — never
-  silent output that fails later.
+  on SQLite (for example an `--id uuid` primary key) is rejected at **generate
+  time**, with the reason stated — never silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is
 **configured** to use is supported on SQLite. There is no third state where an

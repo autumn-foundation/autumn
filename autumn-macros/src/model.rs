@@ -2813,7 +2813,7 @@ fn emit_association_items(
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
                             .filter(#filter_col.eq_any(__keys))
-                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select())
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -2880,7 +2880,7 @@ fn emit_association_items(
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
                             .filter(#target_table::#fk_ident.eq_any(__keys))
-                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select())
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
@@ -3026,7 +3026,7 @@ fn emit_association_items(
                                     )
                                     .select((
                                         #join_mod_ident::#join_table_ident::#fk_ident,
-                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select(),
+                                        <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select(),
                                     ))
                                     .load::<(i64, #target)>(&mut *conn)
                                     .await
@@ -5559,6 +5559,11 @@ fn fake_expr_core(name: &str, ty: &syn::Type) -> Option<TokenStream> {
         "bool" => Some(quote! { ::autumn_web::fake::boolean() }),
         "Decimal" => Some(quote! { ::autumn_web::fake::decimal() }),
         "Uuid" => Some(quote! { ::autumn_web::fake::uuid() }),
+        // The SQLite newtypes (issue #1924) wrap exactly those values. Without
+        // these arms every faked row falls back to `Default` — one shared nil
+        // UUID, which collides on a `:unique` column the first time twice.
+        "SqliteDecimal" => Some(quote! { ::autumn_web::fake::decimal().into() }),
+        "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
         // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
         // `FixedOffset`) fall through to Default to avoid a type mismatch.
@@ -5726,7 +5731,7 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
                 step: ::core::option::Option::Some(::std::string::String::from("1")),
             }
         },
-        "f32" | "f64" | "Decimal" | "BigDecimal" => quote! {
+        "f32" | "f64" | "Decimal" | "BigDecimal" | "SqliteDecimal" => quote! {
             ::autumn_web::form::FieldControl::Number {
                 step: ::core::option::Option::Some(::std::string::String::from("any")),
             }
@@ -9227,6 +9232,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 | "f64"
                 | "Decimal"
                 | "Uuid"
+                // `SqliteUuid` (issue #1924) is hyphenated lowercase text, which
+                // sorts in UUID byte order. `SqliteDecimal` is deliberately
+                // absent: its column is TEXT, so SQL would order it
+                // lexicographically ("9" after "10") and the header would lie.
+                | "SqliteUuid"
                 | "NaiveDateTime"
                 | "NaiveDate"
                 | "NaiveTime"
