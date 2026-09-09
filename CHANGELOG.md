@@ -819,6 +819,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function is still named (measured on both). A window function is not exempt —
   it has no body because it is written in C, which is opacity rather than a
   shell.
+- **cli:** `autumn db scrub` refuses a materialized view that reads relations
+  named in a **string the server executes**. `query_to_xml` takes its query as
+  text, and `schema_to_xml`/`database_to_xml` take no relation argument at all,
+  so `pg_depend` records nothing about what they read — measured, a view defined
+  `SELECT query_to_xml('SELECT email FROM z_source', …)` records only itself.
+  Refresh order comes from those dependencies, so the two views sorted by name,
+  the dependent refreshed FIRST from a stale source, and the run reported
+  `✓ Scrub complete` with the base tables clean and all 200 original addresses
+  still in the dependent. Nothing in the catalog can recover the edge, so it is
+  refused. `table_to_xml` is not refused: measured, its `regclass` argument
+  records `pg_class -> users` like any other reference. Detected from the rule's
+  PARSED tree, so a column or literal that merely spells the name cannot trip it.
+- **cli:** `autumn db scrub` no longer refuses on rules and views its refresh
+  never evaluates. Two false refusals, both measured: an `ON INSERT` rule on a
+  table a view reads refused the run as `a_view via log_it`, though a `REFRESH`
+  is a `SELECT` and can never fire it — the walk now follows only `_RETURN`
+  rules, the ones that define a view. And a standalone view left `WITH NO DATA`
+  refused the run as `lonely via opaque_fn`, though it only ever gets
+  `REFRESH ... WITH NO DATA`, which provably never runs its query — the opacity
+  walk now covers the views the run will actually evaluate.
+- **cli:** `autumn db scrub --dry-run` refuses a target whose endpoint is chosen
+  by the environment rather than by `host`/`port`: `PGHOSTADDR`, or a service
+  file named by `service=` in the connection string or by `PGSERVICE`. All three
+  were measured reaching 127.0.0.1 through `host=not-a-real-host.example`, a
+  name that does not resolve, with psql still reporting that name as `:HOST`. A
+  pasting session brings its own environment, so what this run resolved need not
+  be what it resolves. Each still scrubs without `--dry-run`.
 - **web:** `AutumnError` now reads back its own validation details (issue
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem

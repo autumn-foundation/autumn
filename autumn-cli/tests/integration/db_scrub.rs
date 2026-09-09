@@ -2402,6 +2402,206 @@ async fn a_tracked_aggregate_is_not_refused_but_an_opaque_one_is() {
     );
 }
 
+/// Rules and views the refresh never evaluates do not refuse the run.
+///
+/// Two false refusals, both measured. A base table reached from a view can
+/// carry unrelated DML rules, and a `REFRESH` is a `SELECT`: an `ON INSERT`
+/// rule on `users` calling a `plpgsql` function refused the whole run as
+/// `a_view via log_it`. And a standalone view left `WITH NO DATA` only ever
+/// gets `REFRESH ... WITH NO DATA`, which never runs its query, yet an opaque
+/// function in its definition refused the run as `lonely via opaque_fn`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unevaluated_rule_or_view_does_not_refuse_the_scrub() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    // An INSERT rule on the very table the view reads.
+    let dml = seed_sample_fixture(&admin, &base, "dml_rule").await;
+    dml.batch_execute(
+        "CREATE FUNCTION log_it(text) RETURNS bigint LANGUAGE plpgsql \
+             AS $fn$ BEGIN RETURN 1; END; $fn$; \
+         CREATE RULE users_ins AS ON INSERT TO users DO ALSO SELECT log_it(NEW.email); \
+         CREATE MATERIALIZED VIEW a_view AS SELECT id, email FROM users;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/dml_rule");
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        ok.contains("Scrub complete"),
+        "a DML rule a refresh cannot fire must not refuse the run: {ok}"
+    );
+
+    // A standalone view that will only ever be refreshed WITH NO DATA.
+    let nodata = seed_sample_fixture(&admin, &base, "nodata_opaque").await;
+    nodata
+        .batch_execute(
+            "CREATE FUNCTION opaque_fn() RETURNS TABLE(id bigint, email text) LANGUAGE plpgsql \
+                 AS $fn$ BEGIN RETURN QUERY SELECT u.id, u.email FROM users u; END; $fn$; \
+             CREATE MATERIALIZED VIEW lonely AS SELECT * FROM opaque_fn() WITH NO DATA; \
+             CREATE MATERIALIZED VIEW ordinary AS SELECT id, email FROM users;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/nodata_opaque");
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        ok.contains("Scrub complete"),
+        "an unpopulated standalone view must not refuse the run: {ok}"
+    );
+}
+
+/// A view that names its source inside a string the server executes is refused.
+///
+/// `query_to_xml` takes its query as text, so `PostgreSQL` records no dependency
+/// on what it reads — measured, the rule of a view defined
+/// `SELECT query_to_xml('SELECT email FROM z_source', …)` records only itself.
+/// Refresh order comes from those dependencies, so the two views sorted by name
+/// and the run reported `Scrub complete` with the base tables clean and all 200
+/// original addresses still in the dependent view. `table_to_xml` is NOT
+/// refused: its `regclass` argument is recorded like any other reference
+/// (measured, `pg_class -> users`).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_reading_a_relation_named_in_a_string_is_refused() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    let client = seed_sample_fixture(&admin, &base, "by_name").await;
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT pg_catalog.query_to_xml( \
+                 'SELECT email FROM z_source', false, true, '')::text AS harvested;",
+        )
+        .await
+        .unwrap();
+    let before = seeded_rows(&client, "users", "email").await;
+    let url = format!("{base}/by_name");
+    let (_o, refusal) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        refusal.contains("a_report via query_to_xml"),
+        "the view and the function must both be named: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&client, "users", "email").await,
+        before,
+        "and it must refuse before writing anything: {refusal}"
+    );
+
+    // The same family with a `regclass` argument records its dependency, so it
+    // is ordered rather than refused.
+    let fine = seed_sample_fixture(&admin, &base, "by_regclass").await;
+    fine.batch_execute(
+        "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+         CREATE MATERIALIZED VIEW a_report AS \
+             SELECT pg_catalog.table_to_xml('users'::regclass, false, true, '')::text AS v;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/by_regclass");
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        ok.contains("Scrub complete"),
+        "a recorded regclass reference must not be refused: {ok}"
+    );
+}
+
+/// An endpoint chosen by the environment is not printable either.
+///
+/// `hostaddr` has more than one source, and psql reports none of them. All
+/// measured reaching 127.0.0.1 through a `host` that does not resolve:
+/// `PGHOSTADDR`, and a service file named by `PGSERVICE` or by `service=` in
+/// the connection string. A pasting session brings its own environment, so what
+/// this run resolved need not be what it resolves.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scrub_refuses_to_print_a_target_whose_endpoint_comes_from_the_environment() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "ambient").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    let service = dir.join("pg_service.conf");
+    std::fs::write(&service, format!("[redirect]\nhostaddr={host}\n")).unwrap();
+    let service = service.to_string_lossy().to_string();
+    let plain = format!("postgres://postgres:postgres@{host}:{port}/ambient");
+    let via_service = format!("{plain}?service=redirect");
+
+    // The same target prints when nothing ambient is in play.
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", plain.as_str())],
+    );
+    assert!(ok.contains("BEGIN;"), "the clean target must print: {ok}");
+
+    for (label, envs) in [
+        (
+            "PGHOSTADDR",
+            vec![
+                ("AUTUMN_DATABASE__URL", plain.as_str()),
+                ("PGHOSTADDR", host.as_str()),
+            ],
+        ),
+        (
+            "PGSERVICE",
+            vec![
+                ("AUTUMN_DATABASE__URL", plain.as_str()),
+                ("PGSERVICE", "redirect"),
+                ("PGSERVICEFILE", service.as_str()),
+            ],
+        ),
+        (
+            "service=",
+            vec![
+                ("AUTUMN_DATABASE__URL", via_service.as_str()),
+                ("PGSERVICEFILE", service.as_str()),
+            ],
+        ),
+    ] {
+        let (stdout, stderr) = run_autumn_fail(
+            dir,
+            &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+            &envs,
+        );
+        for output in [&stdout, &stderr] {
+            assert!(
+                !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+                "{label} must leave nothing runnable printed: {output}"
+            );
+        }
+    }
+}
+
 /// A target whose connection string cannot name ONE endpoint is not printed.
 ///
 /// Two shapes, both measured on `PostgreSQL` 16.13. `hostaddr` selects the

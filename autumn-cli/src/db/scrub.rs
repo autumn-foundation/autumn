@@ -327,6 +327,13 @@ pub enum ScrubError {
         /// The target labels, sorted.
         targets: Vec<String>,
     },
+    /// A materialized view this run refreshes reads relations named in a STRING
+    /// the server executes at runtime, so the catalog records no dependency on
+    /// them and the refresh order cannot be derived.
+    ViewReadsRelationsByName {
+        /// `view via function`, sorted.
+        views: Vec<String>,
+    },
     /// `--dry-run` cannot print a runnable script for a target whose connection
     /// string names more than one endpoint. Which member libpq picks is decided
     /// per connection, so the counts baked into the script and the session that
@@ -621,6 +628,25 @@ impl std::fmt::Display for ScrubError {
                 views.len(),
                 bullet_list(views),
             ),
+            Self::ViewReadsRelationsByName { views } => write!(
+                f,
+                "{} materialized view(s) read relations named in a string the server \
+                 executes:\n{}\n  \
+                 `query_to_xml` takes its query as text, and `schema_to_xml` and \
+                 `database_to_xml` take no relation argument at all, so PostgreSQL \
+                 records no dependency on anything they read — measured, a view \
+                 defined `SELECT query_to_xml('SELECT email FROM z_source', …)` records \
+                 only itself. Refresh order comes from those dependencies, so the views \
+                 sorted by name instead: measured, the dependent refreshed FIRST from a \
+                 stale source and kept all 200 pre-scrub addresses under a reported \
+                 success. Nothing in the catalog can recover the edge, so it is refused \
+                 rather than ordered around a gap. `table_to_xml` is fine and not \
+                 refused: its `regclass` argument IS recorded. Name the relation in the \
+                 view's own query, or take the view out of the database this run \
+                 scrubs.",
+                views.len(),
+                bullet_list(views),
+            ),
             Self::UnprintableMultiHostTarget { targets } => write!(
                 f,
                 "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
@@ -643,18 +669,21 @@ impl std::fmt::Display for ScrubError {
             Self::UnprintableHostaddrTarget { targets } => write!(
                 f,
                 "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
-                 Their connection strings state `hostaddr`, which selects the endpoint \
-                 independently of `host` — measured, `host=not-a-real-host.example \
-                 hostaddr=127.0.0.1` connects to 127.0.0.1 although the name does not \
-                 resolve at all, and psql still reports `HOST=not-a-real-host.example`. \
-                 psql exposes no `:HOSTADDR` to pin instead: `\\echo [:HOSTADDR]` prints \
-                 the name back unexpanded. So two targets sharing a host, port and \
-                 database name but reaching different servers through different \
-                 `hostaddr` values are indistinguishable to the reconnect proof, which \
-                 is the one thing it exists to tell apart. Drop `hostaddr` and name the \
-                 endpoint in `host` (`postgres://user@10.0.0.7:5432/db`), or run without \
-                 `--dry-run`, where the command holds its own connection and never has \
-                 to prove which one it is.",
+                 Something other than `host` and `port` chooses their endpoint — \
+                 `hostaddr` in the connection string, `PGHOSTADDR` in the environment, \
+                 or a service file named by `service=` or `PGSERVICE`. All three were \
+                 measured reaching 127.0.0.1 through `host=not-a-real-host.example`, a \
+                 name that does not resolve at all, with psql still reporting \
+                 `HOST=not-a-real-host.example`. psql exposes no `:HOSTADDR` to pin \
+                 instead: `\\echo [:HOSTADDR]` prints the name back unexpanded. So two \
+                 targets sharing a host, port and database name but reaching different \
+                 servers are indistinguishable to the reconnect proof, which is the one \
+                 thing it exists to tell apart — and a pasting session brings its own \
+                 environment, so what this run resolved need not be what it resolves. \
+                 Name the endpoint in `host` (`postgres://user@10.0.0.7:5432/db`) with \
+                 no `hostaddr`, `service`, `PGHOSTADDR` or `PGSERVICE` in play, or run \
+                 without `--dry-run`, where the command holds its own connection and \
+                 never has to prove which one it is.",
                 targets.len(),
                 bullet_list(targets),
             ),
@@ -2647,6 +2676,11 @@ fn classify_and_apply(
         // calls a function whose body PostgreSQL does not track. Refused before
         // the reachability check below, which can only compare two lists built
         // from a graph this shape is missing from entirely.
+        if !facts.views_reading_by_name.is_empty() {
+            return Err(ScrubError::ViewReadsRelationsByName {
+                views: facts.views_reading_by_name,
+            });
+        }
         if !facts.untraceable_view_functions.is_empty() {
             return Err(ScrubError::UntraceableViewFunction {
                 views: facts.untraceable_view_functions,
@@ -2890,7 +2924,7 @@ fn classify_and_apply(
         let mut addressed: Vec<String> = plans
             .iter()
             .filter(|(_, url, _, _, _)| {
-                password_free_conninfo(url).is_some_and(|c| states_hostaddr(&c))
+                password_free_conninfo(url).is_some_and(|c| endpoint_can_come_from_elsewhere(&c))
             })
             .map(|(label, _, _, _, _)| (*label).clone())
             .collect();
@@ -3650,17 +3684,21 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
      SELECT rel.oid, rel.relispopulated FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind = 'm' \
+ ), viewrule AS ( \
+     SELECT oid, ev_class FROM pg_rewrite WHERE rulename = '_RETURN' AND ev_type = '1' \
  ), dep_fn AS ( \
      SELECT d.classid, d.objid, d.refobjid AS fn \
      FROM pg_depend d \
      WHERE d.classid IN ('pg_rewrite'::regclass, 'pg_proc'::regclass) \
        AND d.refclassid = 'pg_proc'::regclass \
+       AND (d.classid = 'pg_proc'::regclass OR d.objid IN (SELECT oid FROM viewrule)) \
      UNION \
      SELECT d.classid, d.objid, o.oprcode \
      FROM pg_depend d \
      JOIN pg_operator o ON o.oid = d.refobjid \
      WHERE d.classid IN ('pg_rewrite'::regclass, 'pg_proc'::regclass) \
        AND d.refclassid = 'pg_operator'::regclass AND o.oprcode <> 0 \
+       AND (d.classid = 'pg_proc'::regclass OR d.objid IN (SELECT oid FROM viewrule)) \
      UNION \
      SELECT d.classid, d.objid, cd.refobjid \
      FROM pg_depend d \
@@ -3669,6 +3707,7 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
        AND cd.objid = con.oid AND cd.refclassid = 'pg_proc'::regclass \
      WHERE d.classid IN ('pg_rewrite'::regclass, 'pg_proc'::regclass) \
        AND d.refclassid = 'pg_type'::regclass \
+       AND (d.classid = 'pg_proc'::regclass OR d.objid IN (SELECT oid FROM viewrule)) \
  ), fn_reach AS ( \
      SELECT df.objid AS rule, df.fn FROM dep_fn df \
      WHERE df.classid = 'pg_rewrite'::regclass \
@@ -3678,13 +3717,13 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
  ), rel_edge AS ( \
      SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source \
      FROM pg_depend d \
-     JOIN pg_rewrite r ON r.oid = d.objid \
+     JOIN viewrule r ON r.oid = d.objid \
      WHERE d.classid = 'pg_rewrite'::regclass \
        AND d.refclassid = 'pg_class'::regclass \
        AND d.refobjid <> r.ev_class \
      UNION \
      SELECT DISTINCT r.ev_class AS dependent, fd.refobjid AS source \
-     FROM pg_rewrite r \
+     FROM viewrule r \
      JOIN fn_reach fr ON fr.rule = r.oid \
      JOIN pg_depend fd ON fd.classid = 'pg_proc'::regclass \
        AND fd.objid = fr.fn AND fd.refclassid = 'pg_class'::regclass \
@@ -3934,6 +3973,19 @@ pub struct DatabaseFacts {
     /// function reached from a view", not "none": before 14 no SQL body is
     /// parsed into the catalog, so none of them can be followed.
     ///
+    /// Read over the views this run will actually EVALUATE — `needed`, not every
+    /// materialized view. A standalone view left `WITH NO DATA` only ever gets
+    /// `REFRESH ... WITH NO DATA`, which provably never runs its query
+    /// (measured on a view defined `SELECT 1/0`, where it succeeds), so an
+    /// opaque function in its definition can hide nothing. Refusing on it
+    /// blocked a whole valid scrub.
+    ///
+    /// And only through `_RETURN` rules, the ones that DEFINE a view. A base
+    /// table reached from a view can carry unrelated DML rules, and a `REFRESH`
+    /// is a `SELECT`: measured, an `ON INSERT` rule on `users` calling a
+    /// `plpgsql` function refused the run as `a_view via log_it`, for a rule
+    /// the refresh can never fire.
+    ///
     /// Read over every relation REACHABLE from a materialized view, not only the
     /// views themselves: the walk crosses ordinary views, so a function called by
     /// one of those is just as invisible and just as able to reorder the
@@ -3942,6 +3994,14 @@ pub struct DatabaseFacts {
     /// and the outer function's own relation dependency would otherwise vouch
     /// for a body nothing can see into.
     pub untraceable_view_functions: Vec<String>,
+    /// `view via function` for every view this run refreshes whose definition
+    /// calls a catalog function that reads relations named in a string.
+    ///
+    /// These record no dependency at all — not an opaque body the walk could
+    /// refuse for, but nothing to walk. `table_to_xml` is excluded: its
+    /// `regclass` argument is recorded like any other relation reference
+    /// (measured, `pg_class -> users`), so its order is derivable.
+    pub views_reading_by_name: Vec<String>,
     /// Non-system schemas other than `public` that hold base tables. The whole
     /// classification universe is `public`-only, so these are refused.
     pub other_schemas: BTreeSet<String>,
@@ -4541,19 +4601,50 @@ fn probe_database_facts(
     let untraceable_view_functions = names(
         &format!(
             "{MV_REFRESH_CLOSURE}, node AS ( \
-                 SELECT oid AS root, oid AS relation FROM mv \
+                 SELECT oid AS root, oid AS relation FROM needed \
                  UNION \
-                 SELECT dependent, source FROM reach \
+                 SELECT h.dependent, h.source FROM reach h \
+                 JOIN needed nd ON nd.oid = h.dependent \
              ) \
              SELECT DISTINCT root.relname || ' via ' || p.proname AS name \
              FROM node n \
              JOIN pg_class root ON root.oid = n.root \
-             JOIN pg_rewrite rw ON rw.ev_class = n.relation \
+             JOIN viewrule rw ON rw.ev_class = n.relation \
              JOIN fn_reach fr ON fr.rule = rw.oid \
              JOIN pg_proc p ON p.oid = fr.fn \
              JOIN pg_namespace pn ON pn.oid = p.pronamespace \
              WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema') \
                AND {opaque_body} \
+             ORDER BY name"
+        ),
+        &mut conn,
+    )?;
+
+    // Views that read relations named in a STRING. Not an opaque body — there is
+    // no dependency recorded at all, because the relation is named in text the
+    // server parses at runtime. Detected from the rule's PARSED tree rather than
+    // its SQL text, so a column or literal that merely spells the name cannot
+    // trip it.
+    let views_reading_by_name = names(
+        &format!(
+            "{MV_REFRESH_CLOSURE}, node AS ( \
+                 SELECT oid AS root, oid AS relation FROM needed \
+                 UNION \
+                 SELECT h.dependent, h.source FROM reach h \
+                 JOIN needed nd ON nd.oid = h.dependent \
+             ) \
+             SELECT DISTINCT root.relname || ' via ' || p.proname AS name \
+             FROM node n \
+             JOIN pg_class root ON root.oid = n.root \
+             JOIN viewrule rw ON rw.ev_class = n.relation \
+             JOIN pg_rewrite rr ON rr.oid = rw.oid \
+             JOIN pg_proc p ON p.proname IN ( \
+                     'query_to_xml', 'query_to_xmlschema', 'query_to_xml_and_xmlschema', \
+                     'schema_to_xml', 'schema_to_xmlschema', 'schema_to_xml_and_xmlschema', \
+                     'database_to_xml', 'database_to_xmlschema', \
+                     'database_to_xml_and_xmlschema') \
+             JOIN pg_namespace pn ON pn.oid = p.pronamespace AND pn.nspname = 'pg_catalog' \
+             WHERE rr.ev_action ~ (':funcid ' || p.oid || '\\y') \
              ORDER BY name"
         ),
         &mut conn,
@@ -4627,6 +4718,7 @@ fn probe_database_facts(
         all_materialized_views,
         unpopulated_views,
         untraceable_view_functions,
+        views_reading_by_name,
         other_schemas,
         framework_tables,
         public_columns,
@@ -4836,18 +4928,34 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
 /// CORRECT paste. An omitted component also cannot be what distinguishes two
 /// targets — libpq resolves it identically for both, so two conninfos that
 /// differ only there are the same endpoint written twice.
-/// Whether the conninfo states `hostaddr`, in the URI query or as a keyword.
+/// Whether anything outside `host`/`port` can choose this target's endpoint.
 ///
 /// `hostaddr` selects the endpoint independently of `host`, and psql reports no
-/// variable for it, so a printed reconnect proof cannot pin it. See
+/// variable for it, so a printed reconnect proof cannot pin it. It has more than
+/// one source, and all of them were measured on `PostgreSQL` 16.13 reaching
+/// 127.0.0.1 through a `host` that does not resolve:
+///
+/// - `hostaddr` in the conninfo itself;
+/// - `PGHOSTADDR` in the environment;
+/// - a service file, named by `service=` in the conninfo or by `PGSERVICE`,
+///   which supplies `hostaddr` for an otherwise explicit URI.
+///
+/// A service file also cannot be read back reliably (`PGSERVICEFILE`, then
+/// `~/.pg_service.conf`, then a build-time system path), so a target that uses
+/// one is refused whether or not this run could find the file. See
 /// `ScrubError::UnprintableHostaddrTarget`.
-fn states_hostaddr(conninfo: &str) -> bool {
+fn endpoint_can_come_from_elsewhere(conninfo: &str) -> bool {
+    if std::env::var("PGHOSTADDR").is_ok_and(|v| !v.is_empty())
+        || std::env::var("PGSERVICE").is_ok_and(|v| !v.is_empty())
+    {
+        return true;
+    }
     let Ok(parsed) = url::Url::parse(conninfo) else {
         return false;
     };
     crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or(""))
         .into_iter()
-        .any(|(key, value)| key == "hostaddr" && !value.is_empty())
+        .any(|(key, value)| (key == "hostaddr" || key == "service") && !value.is_empty())
 }
 
 /// Whether the conninfo names more than one endpoint.
