@@ -3643,6 +3643,243 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// A stale plain permalink answers 404, not the front page.
+///
+/// `?p=` naming a deleted row, or one whose type was since registered
+/// `public: false`, fell out of its condition and rendered the front page with
+/// a 200 — so a canonical URL that no longer resolves became a soft redirect
+/// home, and a search engine told "200, and here is the homepage" keeps the
+/// dead URL indexed under the homepage's content. `/archives/123` and every
+/// slug permalink answer the same case with the themed 404.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_stale_plain_permalink_is_a_404() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Briefly", "Body.", "publish").await;
+
+    sign_out(&client);
+    client
+        .get(&format!("/?p={id}"))
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+
+    // Gone.
+    try_execute(
+        TestDb::shared().await,
+        &format!("DELETE FROM posts WHERE id = {id}"),
+    )
+    .await
+    .expect("delete the post");
+
+    let stale = client.get(&format!("/?p={id}")).send().await;
+    assert_eq!(
+        stale.status,
+        404,
+        "a permalink that no longer resolves must say so: {}",
+        stale.text()
+    );
+    // And the same answer `/archives/<id>` already gave.
+    assert_eq!(
+        client.get(&format!("/archives/{id}")).send().await.status,
+        404
+    );
+
+    // The front page itself is untouched.
+    client.get("/").send().await.assert_ok();
+}
+
+/// A backup carries custom fields.
+///
+/// A plugin storing per-post data through the `PostMeta` repository had every
+/// field silently dropped by an export and restore, with nothing in the file or
+/// the report to say so. The importer's own private keys stay out of the file,
+/// and are refused on the way in whatever a file claims.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_export_carries_custom_fields() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Annotated", "Body.", "publish").await;
+
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO post_meta (post_id, meta_key, meta_value) VALUES
+               ({id}, 'subtitle', 'A plugin wrote this'),
+               ({id}, 'reading_time', '4')"
+        ),
+    )
+    .await
+    .expect("seed the fields");
+
+    let payload = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        payload.contains("A plugin wrote this") && payload.contains("reading_time"),
+        "the fields travel:\n{payload}"
+    );
+    assert!(
+        !payload.contains("_import_source_slug") && !payload.contains("_import_completed"),
+        "and the importer's own markers do not"
+    );
+
+    let fresh = db_client().await;
+    let cookie = register(&fresh, "owner").await;
+    import_export(&fresh, &cookie, &payload).await.assert_ok();
+
+    let restored: Vec<(String, String)> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::load(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::meta_key.ne_all({{crate_name}}::content::INTERNAL_META_KEYS))
+                .order({{crate_name}}::schema::post_meta::meta_key.asc())
+                .select((
+                    {{crate_name}}::schema::post_meta::meta_key,
+                    {{crate_name}}::schema::post_meta::meta_value,
+                )),
+            &mut conn,
+        )
+        .await
+        .expect("the fields")
+    };
+    assert_eq!(
+        restored,
+        vec![
+            ("reading_time".to_owned(), "4".to_owned()),
+            ("subtitle".to_owned(), "A plugin wrote this".to_owned()),
+        ],
+        "both come back, and nothing else does"
+    );
+
+    // Re-running replaces rather than appends: `post_meta` has no uniqueness
+    // constraint, so a second copy of every field would be a reader's coin toss.
+    import_export(&fresh, &cookie, &payload).await.assert_ok();
+    let total: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::get_result(
+            {{crate_name}}::schema::post_meta::table
+                .filter({{crate_name}}::schema::post_meta::meta_key.ne_all({{crate_name}}::content::INTERNAL_META_KEYS))
+                .count(),
+            &mut conn,
+        )
+        .await
+        .expect("the count")
+    };
+    assert_eq!(total, 2, "a second import does not duplicate them");
+}
+
+/// A featured image has to be an image.
+///
+/// The selector listed every attachment, so an editor could pick a PDF, the
+/// save would succeed, and the post would render nothing — the editor said yes
+/// and the site said nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_featured_image_has_to_be_an_image() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Illustrated", "Body.", "publish").await;
+
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO attachments (title, slug, mime_type, byte_size, alt_text, caption)
+         VALUES ('Spreadsheet', 'spreadsheet-aaaa', 'text/csv', 1, '', ''),
+                ('Picture', 'picture-bbbb', 'image/png', 1, '', '')",
+    )
+    .await
+    .expect("seed the library");
+
+    let ids = async |mime: &'static str| -> i64 {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::attachments::table
+                .filter({{crate_name}}::schema::attachments::mime_type.eq(mime))
+                .select({{crate_name}}::schema::attachments::id),
+            &mut conn,
+        )
+        .await
+        .expect("the attachment")
+    };
+    let csv = ids("text/csv").await;
+    let png = ids("image/png").await;
+
+    // The picker offers the image and not the spreadsheet.
+    let editor = client
+        .get(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(editor.contains("Picture"), "an image is offered");
+    assert!(
+        !editor.contains("Spreadsheet"),
+        "and a file the post cannot render is not:\n{editor}"
+    );
+
+    // And a crafted submission is refused rather than stored and ignored.
+    let refused = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Illustrated"),
+                    ("slug", "illustrated"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("featured_media_id", &csv.to_string()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    assert_ne!(refused.status, 303, "a non-image must be refused");
+
+    // The image is accepted.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Illustrated"),
+                    ("slug", "illustrated"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("featured_media_id", &png.to_string()),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+}
+
 /// An ordinary save does not move a published post's date.
 ///
 /// The `datetime-local` control is prefilled from the stored date and submits

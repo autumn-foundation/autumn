@@ -215,11 +215,23 @@ pub async fn front_page(
     // `/?p=123` is the `plain` permalink structure. It is honoured whatever the
     // configured structure is, so links minted before a settings change keep
     // working.
-    if let Some(post_id) = params.p
-        && let Some(post) = repos.posts.find_by_id(post_id).await?
-        && is_publicly_routable(&post)
-    {
-        return single_post(&repos, &session, &csrf, post, thread_view).await;
+    //
+    // A complete branch, not a condition to fall out of: `?p=` naming a row
+    // that was deleted or a type since registered `public: false` used to
+    // render the front page with a 200, so a stale canonical permalink became a
+    // soft redirect home. `/archives/123` and every slug permalink answer the
+    // same case with the themed 404, and a search engine told "200, and here is
+    // the homepage" keeps the dead URL indexed under the homepage's content.
+    if let Some(post_id) = params.p {
+        return match repos
+            .posts
+            .find_by_id(post_id)
+            .await?
+            .filter(is_publicly_routable)
+        {
+            Some(post) => single_post(&repos, &session, &csrf, post, thread_view).await,
+            None => not_found(&repos, &session, &csrf).await,
+        };
     }
 
     let settings = repos.settings().await?;

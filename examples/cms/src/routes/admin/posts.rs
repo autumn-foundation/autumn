@@ -206,6 +206,33 @@ fn same_minute(stored: Option<chrono::NaiveDateTime>, submitted: chrono::NaiveDa
     })
 }
 
+/// Resolve a submitted featured-media id, refusing anything that is not an
+/// image.
+///
+/// The picker offers images only, but a select is a browser convenience a
+/// crafted POST ignores — and `single_post` renders a featured image and
+/// nothing else, so a stored PDF is a field the editor set and the site
+/// silently drops. Refusing names the reason instead.
+async fn resolve_featured_media(
+    repos: &Repos,
+    submitted: Option<i64>,
+) -> AutumnResult<Option<i64>> {
+    let Some(id) = submitted else {
+        return Ok(None);
+    };
+    let attachment = repos
+        .attachments
+        .find_by_id(id)
+        .await?
+        .ok_or_else(|| AutumnError::unprocessable_msg("That featured image does not exist"))?;
+    if !attachment.is_image() {
+        return Err(AutumnError::unprocessable_msg(
+            "A featured image has to be an image — that file is not one",
+        ));
+    }
+    Ok(Some(id))
+}
+
 fn scheduled_at(
     form: &PostForm,
     settings: &crate::settings::Settings,
@@ -696,8 +723,11 @@ impl EditorContext {
         let (media, media_truncated) = if registered.supports_thumbnail {
             let (rows, total) = repos
                 .with_conn(async |conn| {
-                    let rows = content::attachments_page(conn, 0, MEDIA_PICKER_LIMIT).await?;
-                    let total = content::attachment_count(conn).await?;
+                    // Images only: `single_post` renders a featured image and
+                    // nothing else, so offering a PDF here is offering a choice
+                    // the site will silently ignore.
+                    let rows = content::images_page(conn, 0, MEDIA_PICKER_LIMIT).await?;
+                    let total = content::image_count(conn).await?;
                     Ok((rows, total))
                 })
                 .await?;
@@ -1063,6 +1093,9 @@ pub async fn create(
     // needs only the type and the form.
     let term_ids = resolve_term_ids(&repos, registered.slug, None, &form).await?;
 
+    let featured_media =
+        resolve_featured_media(&repos, optional_id(form.featured_media_id.as_ref())).await?;
+
     let draft = NewPost {
         post_type: registered.slug.to_owned(),
         title: form.title.trim().to_owned(),
@@ -1079,7 +1112,7 @@ pub async fn create(
         },
         author_id: user.id,
         parent_id: optional_id(form.parent_id.as_ref()),
-        featured_media_id: optional_id(form.featured_media_id.as_ref()),
+        featured_media_id: featured_media,
         menu_order: optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
         comment_status: form
             .comment_status
@@ -1222,6 +1255,9 @@ pub async fn update(
     }
 
     let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
+    let featured_media =
+        resolve_featured_media(&repos, optional_id(form.featured_media_id.as_ref())).await?;
+
     let form_snapshot = (
         form.title.trim().to_owned(),
         form.excerpt.trim().to_owned(),
@@ -1230,7 +1266,7 @@ pub async fn update(
         form.sticky.is_some(),
         form.comment_status.is_some(),
         optional_id(form.parent_id.as_ref()),
-        optional_id(form.featured_media_id.as_ref()),
+        featured_media,
         optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
     );
 

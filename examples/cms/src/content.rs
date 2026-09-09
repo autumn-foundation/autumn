@@ -3172,6 +3172,9 @@ pub struct ExportRows {
     pub terms_by_post: std::collections::HashMap<i64, Vec<Term>>,
     /// Every attachment, oldest first.
     pub attachments: Vec<crate::models::Attachment>,
+    /// Custom fields on the exported posts, by post id, excluding the
+    /// importer's own private keys.
+    pub meta_by_post: std::collections::HashMap<i64, Vec<(String, String)>>,
     /// Every comment on the exported posts, by post id, in creation order.
     ///
     /// All statuses, not just approved: a backup that restores a site without
@@ -3290,6 +3293,31 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
             .push(comment.clone());
     }
 
+    // Custom fields. The importer's own markers are deliberately excluded: they
+    // record where a row came from *in this database*, so carrying them into a
+    // file would make the next restore treat a fresh row as one it had already
+    // finished — and skip its terms, status and ancestry forever.
+    let meta_rows: Vec<(i64, String, String)> = if post_ids.is_empty() {
+        Vec::new()
+    } else {
+        post_meta::table
+            .filter(post_meta::post_id.eq_any(&post_ids))
+            .filter(post_meta::meta_key.ne_all(INTERNAL_META_KEYS))
+            .order((post_meta::post_id.asc(), post_meta::id.asc()))
+            .select((
+                post_meta::post_id,
+                post_meta::meta_key,
+                post_meta::meta_value,
+            ))
+            .load(conn)
+            .await?
+    };
+    let mut meta_by_post: std::collections::HashMap<i64, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for (post_id, key, value) in meta_rows {
+        meta_by_post.entry(post_id).or_default().push((key, value));
+    }
+
     // Post authors *and* comment authors. Resolving only the former left every
     // registered commenter exported as a guest, so a restore would strip their
     // account from their own comments.
@@ -3342,9 +3370,73 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
         terms_by_post,
         attachments,
         attachments_by_id,
+        meta_by_post,
         comments_by_post,
     })
 }
+
+/// The `post_meta` keys this application owns.
+///
+/// Everything else in `post_meta` is a plugin's custom field, which an export
+/// carries and an import restores. These two do not travel: they record where a
+/// row came from *in this database*, so a file carrying them would make the next
+/// restore treat a fresh row as one it had already finished — and skip its
+/// terms, status and ancestry forever.
+pub const INTERNAL_META_KEYS: &[&str] = &[IMPORT_SOURCE_SLUG_KEY, IMPORT_COMPLETED_KEY];
+
+/// Restore a post's custom fields.
+///
+/// Returns how many rows this call created. The importer's own keys are refused
+/// whatever a file claims — see [`INTERNAL_META_KEYS`] — so a hand-edited or
+/// hostile backup cannot mark its rows as already-imported and make every later
+/// restore skip them.
+///
+/// Replaces rather than appends: `post_meta` has no uniqueness constraint, so
+/// re-running an import would otherwise give a post a second copy of every
+/// field, and a reader taking "the" value would get whichever came back first.
+pub async fn import_post_meta(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    fields: &[(String, String)],
+) -> AutumnResult<usize> {
+    let fields: Vec<(String, String)> = fields
+        .iter()
+        .filter(|(key, _)| !INTERNAL_META_KEYS.contains(&key.as_str()))
+        .filter(|(key, _)| !key.trim().is_empty() && key.len() <= MAX_META_KEY)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if fields.is_empty() {
+        return Ok(0);
+    }
+    conn.transaction(async move |conn| {
+        let keys: Vec<&str> = fields.iter().map(|(key, _)| key.as_str()).collect();
+        diesel::delete(
+            post_meta::table
+                .filter(post_meta::post_id.eq(post_id))
+                .filter(post_meta::meta_key.eq_any(&keys)),
+        )
+        .execute(conn)
+        .await?;
+        for (key, value) in &fields {
+            diesel::insert_into(post_meta::table)
+                .values((
+                    post_meta::post_id.eq(post_id),
+                    post_meta::meta_key.eq(key),
+                    post_meta::meta_value.eq(value),
+                ))
+                .execute(conn)
+                .await?;
+        }
+        Ok::<_, AutumnError>(fields.len())
+    })
+    .await
+}
+
+/// The longest custom-field key accepted from a file.
+///
+/// A key is an identifier a plugin looks rows up by, not prose; a file naming a
+/// megabyte-long one is not a backup this site wrote.
+pub const MAX_META_KEY: usize = 255;
 
 /// The `post_meta` key under which the importer records the slug a post carried
 /// in the file it came from.
@@ -4631,6 +4723,38 @@ pub async fn attachments_page(
         .limit(limit.max(0))
         .select(crate::models::Attachment::as_select())
         .load(conn)
+        .await?)
+}
+
+/// One page of the images in the library, for a picker that can only use
+/// images.
+///
+/// The featured-image select listed *every* attachment, so an editor could pick
+/// a PDF or a CSV, the save would succeed, and the post would render no image
+/// at all — the editor said yes and the site said nothing. Filtering in SQL
+/// rather than in Rust keeps the page size meaningful: filtering afterwards
+/// would show fewer than a page of images while claiming the page was full.
+pub async fn images_page(
+    conn: &mut AsyncPgConnection,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<crate::models::Attachment>> {
+    Ok(attachments::table
+        .filter(attachments::mime_type.like("image/%"))
+        .order((attachments::created_at.desc(), attachments::id.desc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(crate::models::Attachment::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// How many images the library holds.
+pub async fn image_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
+    Ok(attachments::table
+        .filter(attachments::mime_type.like("image/%"))
+        .count()
+        .get_result(conn)
         .await?)
 }
 

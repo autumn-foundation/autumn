@@ -422,8 +422,14 @@ fn unique_slug(filename: &str, rng: &autumn_web::entropy::Rng) -> String {
     }
     // A random suffix rather than a counter: a counter needs a read-then-write
     // against the table and still races.
-    let uuid = rng.uuid_v4().simple().to_string();
-    let suffix = &uuid[..12];
+    // The whole UUID, not a prefix of it. Twelve hex characters is 48 bits, and
+    // the consequence of a birthday collision here is not a retry: the blob is
+    // written *before* the attachment row, so a colliding key first overwrites
+    // the existing object's bytes, and then the row's unique violation drops
+    // `OrphanedBlobGuard`, which deletes that now-shared key — taking the
+    // pre-existing attachment's file with it. A cheaper key is not worth a
+    // failure mode that destroys somebody else's upload.
+    let suffix = rng.uuid_v4().simple().to_string();
     // Already ASCII alphanumeric by the match above, so lowercasing is the whole
     // normalization — `slugify` would only reintroduce the fallback token.
     match ext {
@@ -589,6 +595,31 @@ mod tests {
         assert!(unique_slug("report.csv", &rng).ends_with(".csv"));
         assert!(unique_slug("archive.TAR", &rng).ends_with(".tar"));
         assert!(unique_slug("shot.PNG", &rng).ends_with(".png"));
+    }
+
+    /// The key keeps the whole UUID.
+    ///
+    /// A truncated one is not just a smaller namespace: the blob is written
+    /// before the attachment row, so a colliding key overwrites the existing
+    /// object's bytes, and the row's unique violation then drops
+    /// `OrphanedBlobGuard`, which deletes the shared key — destroying a
+    /// pre-existing upload rather than failing the new one.
+    #[test]
+    fn a_key_keeps_the_whole_uuid() {
+        let rng =
+            autumn_web::entropy::Rng::from_source(autumn_web::entropy::SeededEntropy::shared(11));
+        let slug = unique_slug("photo.png", &rng);
+        let suffix = slug
+            .strip_prefix("photo-")
+            .and_then(|rest| rest.strip_suffix(".png"))
+            .expect("the shape is base-suffix.ext");
+        assert_eq!(
+            suffix.len(),
+            32,
+            "a UUID is 32 hex characters; anything shorter trades a collision \
+             that destroys somebody else's file for a shorter URL: {slug}"
+        );
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// `display_title` strips the extension, so the title alone saved

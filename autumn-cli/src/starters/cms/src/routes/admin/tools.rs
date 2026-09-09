@@ -123,6 +123,15 @@ pub struct ExportPost {
     /// was unrecoverable even with the blob store backed up.
     #[serde(default)]
     pub featured_media: Option<String>,
+    /// Custom fields, as `key` → `value` pairs.
+    ///
+    /// Carried in version 5 alongside the comments. A plugin storing per-post
+    /// data through the `PostMeta` repository had it silently dropped by a
+    /// backup-and-restore, with nothing in the file or the report to say so.
+    /// The importer's own private keys are excluded on the way out and refused
+    /// on the way in — see `content::INTERNAL_META_KEYS`.
+    #[serde(default)]
+    pub meta: Vec<ExportMeta>,
     /// The post's discussion, nested as it is rendered.
     ///
     /// Carried in version 5. Without it a backup restored a site with every
@@ -132,6 +141,14 @@ pub struct ExportPost {
     /// `wp:comment` for exactly this reason.
     #[serde(default)]
     pub comments: Vec<ExportComment>,
+}
+
+/// One custom field in an export file.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportMeta {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
 }
 
 /// One comment in an export file.
@@ -422,6 +439,16 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 })
                 .collect(),
             featured_media,
+            meta: rows
+                .meta_by_post
+                .get(&post.id)
+                .into_iter()
+                .flatten()
+                .map(|(key, value)| ExportMeta {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
             // Nested from the flat rows, which are already in creation order.
             comments: export_comments(rows.comments_by_post.get(&post.id), &rows.usernames),
         });
@@ -463,6 +490,13 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
             autumn_web::slugify(&settings.site_title)
         ))
         .into_response())
+}
+
+/// The file's custom fields, in the shape `content::import_post_meta` restores.
+fn imported_meta(meta: &[ExportMeta]) -> Vec<(String, String)> {
+    meta.iter()
+        .map(|field| (field.key.clone(), field.value.clone()))
+        .collect()
 }
 
 /// The file's comment tree, in the shape `content::import_comments` restores.
@@ -874,6 +908,10 @@ pub async fn import(
             comments_restored += repos
                 .with_conn(async |conn| content::import_comments(conn, ours.id, &incoming).await)
                 .await?;
+            let fields = imported_meta(&post.meta);
+            repos
+                .with_conn(async |conn| content::import_post_meta(conn, ours.id, &fields).await)
+                .await?;
             created_ids.push((
                 ours.id,
                 post.post_type.clone(),
@@ -1033,6 +1071,10 @@ pub async fn import(
         let incoming = imported_comments(&post.comments);
         comments_restored += repos
             .with_conn(async |conn| content::import_comments(conn, created_id, &incoming).await)
+            .await?;
+        let fields = imported_meta(&post.meta);
+        repos
+            .with_conn(async |conn| content::import_post_meta(conn, created_id, &fields).await)
             .await?;
         created_ids.push((
             created_id,
