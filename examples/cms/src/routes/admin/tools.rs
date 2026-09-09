@@ -514,15 +514,30 @@ pub async fn import(
         // so the advertised idempotent re-run duplicated content precisely
         // where the allocator had done its job. The source slug is recorded in
         // `post_meta` at import time and consulted here.
-        let already_here = repos
+        let existing = repos
             .posts
             .find_by_slug(post.slug.clone())
             .await?
             .into_iter()
-            .any(|p| p.post_type == post.post_type)
-            || imported_source_slugs.contains(&(post.post_type.clone(), post.slug.clone()));
-        if already_here {
+            .find(|p| p.post_type == post.post_type)
+            .or(
+                match imported_source_slugs.get(&(post.post_type.clone(), post.slug.clone())) {
+                    Some(id) => repos.posts.find_by_id(*id).await?,
+                    None => None,
+                },
+            );
+        if let Some(existing) = existing {
+            // Skipped for content, but still offered to the ancestry pass
+            // below. A retry after a partial import would otherwise never
+            // repair a parent link, because the row it belongs to is "already
+            // present" and the pass only ever saw rows this run created.
             skipped += 1;
+            created_ids.push((
+                existing.id,
+                post.post_type.clone(),
+                post.slug.clone(),
+                post.parent.clone(),
+            ));
             continue;
         }
 
@@ -602,18 +617,35 @@ pub async fn import(
                 term_ids.push(term.id);
             }
         }
-        if !term_ids.is_empty() {
-            repos
-                .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
-                .await?;
-        }
-
-        if post.status != "draft" {
-            repos
-                .with_conn(async |conn| {
-                    content::transition_status(conn, created.id, &post.status, Some(user.id)).await
+        // The terms and the transition commit together. They were separate
+        // transactions after an already-committed insert, so a failure in
+        // either left the post present but unfinished — and the dedupe above
+        // then reported it "already present" on every retry, so the missing
+        // status and taxonomy were never restored. A backup that restores
+        // silently-partial content is worse than one that fails.
+        //
+        // The insert itself stays outside: it goes through
+        // `save_post_with_unique_slug`, whose retry-on-collision needs its own
+        // connection. A failure after it leaves a draft with no source marker,
+        // which the next run treats as an ordinary slug collision and re-imports
+        // beside — visible, rather than silently skipped.
+        let wanted_status = post.status.clone();
+        let transitioned = repos
+            .with_conn(async |conn| {
+                use diesel_async::AsyncConnection as _;
+                conn.transaction(async move |conn| {
+                    content::set_post_terms(conn, created.id, term_ids).await?;
+                    if wanted_status != "draft" {
+                        content::transition_status(conn, created.id, &wanted_status, Some(user.id))
+                            .await?;
+                        return Ok::<_, AutumnError>(true);
+                    }
+                    Ok::<_, AutumnError>(false)
                 })
-                .await?;
+                .await
+            })
+            .await?;
+        if transitioned {
             transitioned_ids.push(created.id);
         }
         created_ids.push((

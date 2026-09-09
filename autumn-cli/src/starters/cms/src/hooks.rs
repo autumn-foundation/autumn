@@ -389,18 +389,13 @@ impl MutationHooks for UserHooks {
         _ctx: &mut MutationContext,
         new: &mut NewUser,
     ) -> AutumnResult<()> {
-        new.username = new.username.trim().to_lowercase();
-        new.email = new.email.trim().to_lowercase();
-        if new.username.is_empty() {
-            return Err(AutumnError::unprocessable_msg("Username is required"));
-        }
-        // An unrecognised role degrades to the least-privileged one rather than
-        // being stored verbatim, so `users.role` can only ever hold a value
-        // `Role::parse` round-trips.
-        new.role = crate::capabilities::Role::parse(&new.role)
-            .slug()
-            .to_owned();
-        Ok(())
+        // Delegated, not duplicated. This hook carried its own copy of the
+        // normalisation, so the routable-username rule added to
+        // `normalize_new_user` reached the registration path and not the
+        // admin's "add user" screen — an administrator could still create
+        // `alice/news`, whose bylines all 404. One definition is what stops the
+        // two drifting again.
+        normalize_new_user(new)
     }
 
     async fn before_update(

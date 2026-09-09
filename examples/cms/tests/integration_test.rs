@@ -4854,3 +4854,181 @@ async fn a_registered_custom_taxonomy_is_editable() {
     .await;
     assert!(still.is_err(), "clearing the control must detach the term");
 }
+
+/// A save cannot create an unbounded number of terms.
+///
+/// Find-or-create means one lookup and possibly one insert per name, and the
+/// field is free text — a crafted save could carry millions of names inside the
+/// framework's request limit, holding the request open and leaving a permanent
+/// term set behind.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_save_cannot_create_unbounded_terms() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Tagged", "Body.", "publish").await;
+
+    let save = |tags: &str| {
+        form(&[
+            ("title", "Tagged"),
+            ("slug", "tagged"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("comment_status", "open"),
+            ("taxonomy_names[post_tag]", tags),
+        ])
+    };
+
+    // Far more than any editor types.
+    let many: Vec<String> = (0..500).map(|n| format!("tag{n}")).collect();
+    let refused = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&save(&many.join(",")))
+        .send()
+        .await;
+    assert_eq!(refused.status, 422, "body: {}", refused.text());
+
+    // A single absurdly long name is refused too.
+    let refused = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&save(&"a".repeat(500)))
+        .send()
+        .await;
+    assert_eq!(refused.status, 422, "body: {}", refused.text());
+
+    // Nothing was created by either attempt.
+    let terms: serde_json::Value = client
+        .get("/api/v1/terms?taxonomy=post_tag")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(terms.as_array().map(Vec::len), Some(0));
+
+    // An ordinary handful still works.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&save("rust, web, async"))
+        .send()
+        .await
+        .assert_status(303);
+    let terms: serde_json::Value = client
+        .get("/api/v1/terms?taxonomy=post_tag")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(terms.as_array().map(Vec::len), Some(3));
+}
+
+/// Scheduling requires a date that is actually in the future.
+///
+/// A published post moved back to draft keeps its original `published_at`, and
+/// the editor pre-fills it — so choosing "Scheduled" without touching the field
+/// produced a row that was already due, and the next sweep republished it
+/// within the minute instead of scheduling it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_requires_a_future_date() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Was Live", "Body.", "publish").await;
+
+    // Back to draft; the row keeps its past publish date.
+    client
+        .post(&format!("/admin/content/post/{id}/status?to=draft"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    let save = |publish_at: &str| {
+        let mut fields = vec![
+            ("title", "Was Live"),
+            ("slug", "was-live"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "future"),
+            ("password", ""),
+            ("comment_status", "open"),
+        ];
+        if !publish_at.is_empty() {
+            fields.push(("publish_at", publish_at));
+        }
+        form(&fields)
+    };
+
+    // No date at all, and a date in the past, are both refused.
+    for attempt in ["", "2020-01-01T09:00"] {
+        let refused = client
+            .post(&format!("/admin/content/post/{id}"))
+            .header("cookie", &cookie)
+            .form(&save(attempt))
+            .send()
+            .await;
+        assert_eq!(
+            refused.status,
+            422,
+            "`{attempt}` is not a future publish date: {}",
+            refused.text()
+        );
+    }
+
+    // A genuinely future one schedules.
+    let future = (chrono::Utc::now() + chrono::Duration::days(7))
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&save(&future))
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// An administrator-created account is held to the same username rule.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_admin_created_username_must_be_a_url_segment() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let refused = client
+        .post("/admin/users")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("username", "alice/news"),
+            ("email", "alice@example.com"),
+            ("password", "correct-horse-battery-staple"),
+            ("role", "author"),
+            ("display_name", "Alice"),
+        ]))
+        .send()
+        .await;
+    assert_ne!(
+        refused.status,
+        303,
+        "the admin screen must apply the same rule as registration: {}",
+        refused.text()
+    );
+
+    client
+        .post("/admin/users")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("username", "alice-news"),
+            ("email", "alice@example.com"),
+            ("password", "correct-horse-battery-staple"),
+            ("role", "author"),
+            ("display_name", "Alice"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+}

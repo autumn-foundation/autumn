@@ -23,6 +23,32 @@ use crate::require_capability;
 use super::super::site::{Csrf, Repos};
 use super::layout;
 
+/// A scheduled post needs a date that is actually in the future.
+///
+/// "Has a date" was not enough on the update path: a published post moved back
+/// to draft keeps its original `published_at`, the editor pre-fills that past
+/// timestamp, and choosing "Scheduled" without touching the field produced a
+/// row that was already due — the next sweep republished it within the minute
+/// instead of scheduling it. Nothing about that reads as scheduling to the
+/// person who did it.
+fn require_future_publish_date(
+    status: &str,
+    scheduled_for: Option<chrono::NaiveDateTime>,
+) -> AutumnResult<()> {
+    if status != "future" {
+        return Ok(());
+    }
+    match scheduled_for {
+        Some(when) if when > chrono::Utc::now().naive_utc() => Ok(()),
+        Some(_) => Err(AutumnError::unprocessable_msg(
+            "A scheduled post needs a publish date in the future",
+        )),
+        None => Err(AutumnError::unprocessable_msg(
+            "Pick a publish date for a scheduled post",
+        )),
+    }
+}
+
 /// The statuses the editor's dropdown offers, in workflow order.
 const STATUS_CHOICES: &[(&str, &str)] = &[
     ("draft", "Draft"),
@@ -792,11 +818,7 @@ pub async fn create(
     // `status = 'future' AND published_at <= now()` — would never see it
     // again: the post would sit in `future` forever.
     let scheduled_for = scheduled_at(&form);
-    if status == "future" && scheduled_for.is_none() {
-        return Err(AutumnError::unprocessable_msg(
-            "Pick a publish date for a scheduled post",
-        ));
-    }
+    require_future_publish_date(&status, scheduled_for)?;
 
     // Asked before anything is written. `private` and `future` are reached by
     // transitioning the draft this creates, and that edge carries the
@@ -916,11 +938,9 @@ pub async fn update(
 
     let status = requested_status(&form, &user);
     let scheduled_for = scheduled_at(&form);
-    if status == "future" && scheduled_for.is_none() && existing.published_at.is_none() {
-        return Err(AutumnError::unprocessable_msg(
-            "Pick a publish date for a scheduled post",
-        ));
-    }
+    // The submitted date, not the stored one. Falling back to
+    // `existing.published_at` is what let a past timestamp through.
+    require_future_publish_date(&status, scheduled_for)?;
 
     // Validate the status change BEFORE anything is written. The content edit
     // and the term assignment each commit in their own transaction, so a
@@ -1137,10 +1157,40 @@ async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> Autumn
             let Some(submitted) = form.taxonomy_names.get(taxonomy.slug) else {
                 continue;
             };
+            // Bounded *before* any database work. Find-or-create means one
+            // lookup and possibly one insert per name, and the field is free
+            // text: a crafted save could carry millions of comma-separated
+            // names inside the framework's default request limit, holding the
+            // request open for that many sequential queries and leaving a
+            // permanent term set behind. An editor tagging a post types a
+            // handful.
+            const MAX_TERMS_PER_SAVE: usize = 50;
+            if submitted
+                .split(',')
+                .filter(|n| !n.trim().is_empty())
+                .count()
+                > MAX_TERMS_PER_SAVE
+            {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "At most {MAX_TERMS_PER_SAVE} {} can be applied in one save",
+                    taxonomy.plural.to_lowercase()
+                )));
+            }
             for raw in submitted.split(',') {
                 let name = raw.trim();
                 if name.is_empty() {
                     continue;
+                }
+                // The model's own limit, checked here so an over-long name is a
+                // clear message rather than a validation failure after the
+                // lookup has already run.
+                const MAX_TERM_NAME: usize = 200;
+                if name.chars().count() > MAX_TERM_NAME {
+                    return Err(AutumnError::unprocessable_msg(format!(
+                        "`{}…` is too long; {} names are limited to {MAX_TERM_NAME} characters",
+                        name.chars().take(30).collect::<String>(),
+                        taxonomy.singular.to_lowercase()
+                    )));
                 }
                 let slug = autumn_web::slugify(name);
                 if slug.is_empty() {

@@ -1871,21 +1871,27 @@ pub async fn populated_terms(
 /// in WordPress's convention for meta the UI does not show.
 pub const IMPORT_SOURCE_SLUG_KEY: &str = "_import_source_slug";
 
-/// Every `(post_type, source slug)` pair a previous import recorded.
+/// Every `(post_type, source slug)` a previous import recorded, and the row it
+/// produced.
+///
+/// The id matters as well as the membership: a retry has to be able to reach
+/// the existing row to finish work an interrupted run left undone, not merely
+/// know that it should skip it.
 ///
 /// Joined to `posts` so a row deleted since the import it came from does not
 /// keep its slug reserved — re-importing content the site no longer holds is a
 /// restore, and should work.
 pub async fn imported_source_slugs(
     conn: &mut AsyncPgConnection,
-) -> AutumnResult<std::collections::HashSet<(String, String)>> {
+) -> AutumnResult<std::collections::HashMap<(String, String), i64>> {
     Ok(post_meta::table
         .inner_join(posts::table.on(posts::id.eq(post_meta::post_id)))
         .filter(post_meta::meta_key.eq(IMPORT_SOURCE_SLUG_KEY))
-        .select((posts::post_type, post_meta::meta_value))
-        .load::<(String, String)>(conn)
+        .select((posts::post_type, post_meta::meta_value, posts::id))
+        .load::<(String, String, i64)>(conn)
         .await?
         .into_iter()
+        .map(|(post_type, slug, id)| ((post_type, slug), id))
         .collect())
 }
 
