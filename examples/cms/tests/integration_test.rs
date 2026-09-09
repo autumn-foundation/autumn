@@ -10046,7 +10046,7 @@ async fn comment_urls_survive_the_plain_permalink_structure() {
         "the marker must be a second parameter, not part of `p`"
     );
     client
-        .get(&location)
+        .get(location)
         .send()
         .await
         .assert_ok()
@@ -10102,7 +10102,7 @@ async fn a_new_comment_redirects_to_the_page_that_holds_it() {
         .1
         .to_owned();
     // The promise the anchor makes has to hold on the page it points at.
-    let landed = client.get(&location).send().await;
+    let landed = client.get(location).send().await;
     let html = landed.assert_ok().text();
     assert!(
         html.contains(&format!("id=\"{anchor}\"")),
