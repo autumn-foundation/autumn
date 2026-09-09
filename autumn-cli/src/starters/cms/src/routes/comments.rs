@@ -38,8 +38,9 @@ pub async fn render_thread(
     session: &Session,
     csrf: &Csrf,
     post: &Post,
-    page: i64,
+    view: super::front::ThreadView,
 ) -> AutumnResult<Markup> {
+    let page = view.page;
     let settings = repos.settings().await?;
     let viewer = repos.current_user(session).await?;
 
@@ -55,7 +56,11 @@ pub async fn render_thread(
     // The post's own URL, so the pager links back to the page it is on.
     let permalink = repos.permalink(post, &settings).await?;
     let mut conn = repos.conn().await?;
-    let (rows, total_roots) = content::approved_thread_page(
+    let content::ThreadPage {
+        comments: rows,
+        total_roots,
+        truncated,
+    } = content::approved_thread_page(
         &mut conn,
         post.id,
         (page - 1) * content::THREAD_ROOTS_PER_PAGE,
@@ -71,9 +76,9 @@ pub async fn render_thread(
     // under their *current* public name; a guest renders under the name they
     // gave at the time.
     // One query for the whole page of comments, not one per distinct account.
-    // The rows are bounded at `MAX_THREAD_COMMENTS`, but a thread of two
-    // hundred comments by two hundred people still made an ordinary public page
-    // view cost two hundred sequential round trips.
+    // The rows are bounded at `MAX_THREAD_COMMENTS`, but a page of two hundred
+    // comments by two hundred people still made an ordinary public page view
+    // cost two hundred sequential round trips.
     let account_ids: Vec<i64> = rows.iter().filter_map(|c| c.author_id).collect();
     let names: std::collections::HashMap<i64, String> = repos
         .with_conn(async move |conn| crate::content::users_by_ids(conn, &account_ids).await)
@@ -113,24 +118,35 @@ pub async fn render_thread(
                 (autumn_web::format::pluralize(post.comment_count, "comment"))
             }
 
+            (unapproved_notice(view.moderated))
+
             @if views.is_empty() {
                 p class="text-gray-500 text-sm mb-8" { "No comments yet." }
             } @else {
                 (render_nodes(&views, 0, &thread_ctx))
             }
 
+            @if truncated {
+                p class="text-sm text-gray-500 mb-8" {
+                    "Showing the first "
+                    (autumn_web::format::pluralize(
+                        i64::try_from(sorted.len()).unwrap_or(0), "comment"))
+                    " on this page; some replies are not shown."
+                }
+            }
+
             @if last_page > 1 {
                 nav aria-label="Comment pages"
                     class="flex items-center justify-between text-sm mb-8" {
                     @if page > 1 {
-                        a href=(format!("{permalink}?comments={}#comments-heading", page - 1))
+                        a href=(comment_page_url(&permalink, page - 1))
                           class="text-indigo-700 hover:underline" { "← Earlier comments" }
                     } @else {
                         span {}
                     }
                     span class="text-gray-500" { "Page " (page) " of " (last_page) }
                     @if page < last_page {
-                        a href=(format!("{permalink}?comments={}#comments-heading", page + 1))
+                        a href=(comment_page_url(&permalink, page + 1))
                           class="text-indigo-700 hover:underline" { "Later comments →" }
                     } @else {
                         span {}
@@ -150,6 +166,19 @@ pub async fn render_thread(
             }
         }
     })
+}
+
+/// A comment page's URL: the post's permalink, the page, and the anchor that
+/// puts the reader at the top of the thread rather than the top of the post.
+///
+/// Built with [`crate::permalinks::with_query`] rather than a `?` of its own:
+/// the `Plain` permalink structure renders `/?p=123`, and a second `?` made
+/// every one of these links a broken URL on that structure.
+fn comment_page_url(permalink: &str, page: i64) -> String {
+    format!(
+        "{}#comments-heading",
+        crate::permalinks::with_query(permalink, "comments", &page.to_string())
+    )
 }
 
 /// What the thread renderer needs to draw a reply control under each comment.
@@ -454,6 +483,14 @@ pub async fn post_comment(
     )
     .await?;
 
+    // Which page of the thread the new comment is on, asked on the connection
+    // that is already open. A thread pages by root, so an approved root past the
+    // fiftieth — and every reply to one — lives on a later page: redirecting to
+    // the bare permalink dropped the reader on page one, where the
+    // `#comment-<id>` anchor they were promised does not exist. `None` is the
+    // held-for-moderation root, which has no page yet.
+    let thread_page = content::approved_thread_page_of(&mut conn, created.id).await?;
+
     // Released before the permalink read below, so the handler never holds two.
     drop(conn);
 
@@ -462,12 +499,19 @@ pub async fn post_comment(
         do_action(Action::CommentApproved, created.id);
     }
 
-    let permalink = repos.permalink(&post, &settings).await?;
-    let destination = if status == "approved" {
-        format!("{permalink}#comment-{}", created.id)
+    // Every parameter goes on through `with_query`, because a permalink may
+    // already carry one: the `Plain` structure's is `/?p=<id>`.
+    let mut destination = repos.permalink(&post, &settings).await?;
+    if let Some(page) = thread_page
+        && page > 1
+    {
+        destination = crate::permalinks::with_query(&destination, "comments", &page.to_string());
+    }
+    if status == "approved" {
+        destination = format!("{destination}#comment-{}", created.id);
     } else {
-        format!("{permalink}?moderated=1")
-    };
+        destination = crate::permalinks::with_query(&destination, "moderated", "1");
+    }
     Ok(Redirect::to(&destination).into_response())
 }
 
@@ -476,8 +520,13 @@ pub async fn post_comment(
 /// Rendered from the `?moderated=1` marker the redirect above sets, so the
 /// reader is told their comment was received rather than left staring at an
 /// unchanged page wondering whether the button worked.
+///
+/// It is rendered by [`render_thread`], at the top of the thread. Nothing
+/// called it before: the redirect set a parameter that no screen read and no
+/// query type even declared, so the reader of a moderated site saw exactly the
+/// unchanged page this was written to prevent.
 #[must_use]
-pub fn unapproved_notice(moderated: bool) -> Markup {
+fn unapproved_notice(moderated: bool) -> Markup {
     html! {
         @if moderated {
             p class="mb-6 px-4 py-3 rounded bg-amber-50 text-amber-900 text-sm" role="status" {

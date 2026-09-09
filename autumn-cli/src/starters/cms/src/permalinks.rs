@@ -331,6 +331,59 @@ fn percent_decode(segment: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Percent-encode a value for use in a query string.
+///
+/// maud escapes an attribute for HTML, which is a different job: an unescaped
+/// `&` or `#` in the value would still end the parameter, so a search for
+/// "rock & roll" paged as a search for "rock". Unreserved characters pass
+/// through; a space becomes `+`, matching what a browser submits from a form.
+#[must_use]
+pub fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Add a query parameter to a URL that may already have a query, a fragment,
+/// or both.
+///
+/// A permalink is not always a bare path: the `Plain` structure renders
+/// `/?p=123`, so `format!("{permalink}?comments=2")` produced
+/// `/?p=123?comments=2`. That is one parameter named `p` whose value is
+/// `123?comments=2`, which fails to parse as the `i64` the handler declares —
+/// so on the one structure that needs it most, every comment pager link and the
+/// post-a-comment redirect landed on an error instead of the page. The
+/// separator has to be decided from the URL rather than assumed.
+///
+/// The parameter goes *before* any fragment, because `/a#b?c=1` puts `?c=1`
+/// inside the fragment where no server ever sees it.
+#[must_use]
+pub fn with_query(url: &str, key: &str, value: &str) -> String {
+    let (base, fragment) = match url.split_once('#') {
+        Some((base, fragment)) => (base, Some(fragment)),
+        None => (url, None),
+    };
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let mut out = format!(
+        "{base}{separator}{}={}",
+        query_escape(key),
+        query_escape(value)
+    );
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
 /// A representative `Post`, shared by the tests in this crate that need one.
 #[cfg(test)]
 pub(crate) mod tests_support {
@@ -394,6 +447,82 @@ mod tests {
             PermalinkStructure::DayAndName.permalink(&post, &[], chrono_tz::UTC),
             "/2026/09/07/sample-post"
         );
+    }
+
+    /// The `Plain` structure is the whole reason `with_query` exists: its
+    /// permalink *is* a query string, so a second `?` would bury the parameter
+    /// inside `p`'s value.
+    #[test]
+    fn a_parameter_is_appended_with_the_right_separator() {
+        assert_eq!(
+            with_query("/sample-post", "comments", "2"),
+            "/sample-post?comments=2"
+        );
+        assert_eq!(with_query("/?p=123", "comments", "2"), "/?p=123&comments=2");
+        assert_eq!(
+            with_query("/?p=123&comments=2", "moderated", "1"),
+            "/?p=123&comments=2&moderated=1"
+        );
+    }
+
+    /// Every structure, not just the one that happens to have a query today: a
+    /// structure that grows a query string later must not silently break the
+    /// comment pager again.
+    #[test]
+    fn every_structure_takes_a_parameter_that_survives_parsing() {
+        let post = sample_post();
+        for structure in PermalinkStructure::all() {
+            let url = with_query(
+                &structure.permalink(&post, &[], chrono_tz::UTC),
+                "comments",
+                "2",
+            );
+            let query = url.split_once('?').expect("a parameter was added").1;
+            let parsed: Vec<(String, String)> = query
+                .split('&')
+                .map(|pair| {
+                    let (key, value) = pair.split_once('=').expect("key=value");
+                    (key.to_owned(), value.to_owned())
+                })
+                .collect();
+            assert!(
+                parsed.iter().any(|(k, v)| k == "comments" && v == "2"),
+                "{url} did not carry comments=2"
+            );
+            // The `Plain` structure's own parameter has to survive intact, or
+            // the page it links to is a different post — or none.
+            if *structure == PermalinkStructure::Plain {
+                assert!(
+                    parsed
+                        .iter()
+                        .any(|(k, v)| k == "p" && *v == post.id.to_string()),
+                    "{url} lost the post id"
+                );
+            }
+        }
+    }
+
+    /// A fragment ends the URL, so a parameter appended after one is never sent
+    /// to the server.
+    #[test]
+    fn a_parameter_goes_before_the_fragment() {
+        assert_eq!(
+            with_query("/sample-post#comments-heading", "comments", "2"),
+            "/sample-post?comments=2#comments-heading"
+        );
+        assert_eq!(
+            with_query("/?p=123#comment-9", "comments", "2"),
+            "/?p=123&comments=2#comment-9"
+        );
+    }
+
+    #[test]
+    fn a_query_value_is_escaped() {
+        assert_eq!(
+            with_query("/search", "s", "rock & roll"),
+            "/search?s=rock+%26+roll"
+        );
+        assert_eq!(with_query("/search", "s", "a#b"), "/search?s=a%23b");
     }
 
     /// The property that keeps a permalink-settings change from 404ing every

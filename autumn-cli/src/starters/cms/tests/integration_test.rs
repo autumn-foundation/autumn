@@ -9959,6 +9959,239 @@ async fn seeding_skips_a_slug_the_other_bare_type_already_holds() {
     assert_eq!(taken, 1, "the seed must not duplicate a taken bare path");
 }
 
+/// A comment URL survives the one permalink structure that is already a query.
+///
+/// `Plain` renders `/?p=123`, so appending `?comments=2` produced
+/// `/?p=123?comments=2` — one parameter named `p` whose value is
+/// `123?comments=2`, which does not parse as the `i64` the handler declares. On
+/// that structure every pager link and the post-a-comment redirect landed on a
+/// page that could not find the post.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn comment_urls_survive_the_plain_permalink_structure() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Plain Thread", "Body.", "publish").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("permalink_structure", "plain")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // More than one page of roots, so a pager renders at all.
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             SELECT {post_id}, NULL, 1, 'Owner', 'owner@example.com', '', '',
+                    'Plain ' || lpad(g::text, 3, '0'), 'approved',
+                    NOW() - ((100 - g) || ' minutes')::interval
+             FROM generate_series(1, 60) AS g"
+        ),
+    )
+    .await
+    .expect("seed the roots");
+
+    let first = client.get(&format!("/?p={post_id}")).send().await;
+    let html = first.assert_ok().text();
+    // maud escapes the ampersand for HTML; the browser sends `&`.
+    assert!(
+        html.contains(&format!("/?p={post_id}&amp;comments=2")),
+        "the pager must extend the existing query, not start a second one:\n{html}"
+    );
+
+    // And the URL it minted actually resolves to page two of this post.
+    let second = client
+        .get(&format!("/?p={post_id}&comments=2"))
+        .send()
+        .await;
+    second
+        .assert_ok()
+        .assert_body_contains("Plain 060")
+        .assert_body_contains("Page 2 of 2");
+
+    // The redirect the comment form issues is built the same way, and the held
+    // banner it promises is rendered on arrival.
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[
+            ("permalink_structure", "plain"),
+            ("comment_moderation", "on"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    let posted = client
+        .post(&format!("/comments/{post_id}"))
+        .form(&form(&[
+            ("body", "A guest comment"),
+            ("author_name", "Guest"),
+            ("author_email", "guest@example.com"),
+        ]))
+        .send()
+        .await;
+    let location = posted
+        .assert_status(303)
+        .header("location")
+        .expect("a redirect");
+    assert_eq!(
+        location,
+        format!("/?p={post_id}&moderated=1"),
+        "the marker must be a second parameter, not part of `p`"
+    );
+    client
+        .get(&location)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("awaiting moderation");
+}
+
+/// A new comment lands on the page of the thread that actually holds it.
+///
+/// The redirect always targeted the unpaginated permalink, so once a post had
+/// more than one page of roots the commenter was dropped on page one with an
+/// `#comment-<id>` anchor for a comment that is not there — indistinguishable
+/// from a comment that was silently thrown away.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_new_comment_redirects_to_the_page_that_holds_it() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Deep Thread", "Body.", "publish").await;
+
+    // Exactly one full page of roots, so the next root starts page two.
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             SELECT {post_id}, NULL, 1, 'Owner', 'owner@example.com', '', '',
+                    'Seed ' || lpad(g::text, 3, '0'), 'approved',
+                    NOW() - ((100 - g) || ' minutes')::interval
+             FROM generate_series(1, 50) AS g"
+        ),
+    )
+    .await
+    .expect("seed a full page of roots");
+
+    // A signed-in comment is approved immediately, so it is the 51st root.
+    let posted = client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "The fifty-first root")]))
+        .send()
+        .await;
+    let location = posted
+        .assert_status(303)
+        .header("location")
+        .expect("a redirect");
+    assert!(
+        location.contains("comments=2"),
+        "a root past the first page belongs on page two: {location}"
+    );
+    let anchor = location
+        .rsplit_once('#')
+        .expect("an anchor to the new comment")
+        .1
+        .to_owned();
+    // The promise the anchor makes has to hold on the page it points at.
+    let landed = client.get(&location).send().await;
+    let html = landed.assert_ok().text();
+    assert!(
+        html.contains(&format!("id=\"{anchor}\"")),
+        "the anchor must exist on the page the redirect chose:\n{html}"
+    );
+
+    // A reply travels with its root, so it belongs on the root's page too —
+    // even though the reply itself is the newest comment on the post.
+    let reply = client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("body", "A reply to the first root"),
+            ("reply_to", "1"),
+        ]))
+        .send()
+        .await;
+    let reply_location = reply
+        .assert_status(303)
+        .header("location")
+        .expect("a redirect");
+    assert!(
+        !reply_location.contains("comments="),
+        "a reply to a root on page one belongs on page one: {reply_location}"
+    );
+}
+
+/// One popular root cannot make a public page view unbounded.
+///
+/// Pagination bounds the roots and the write path bounds the nesting, but
+/// neither bounds breadth: every approved descendant of the fifty roots on a
+/// page was loaded with no row limit, so a single root with a hundred thousand
+/// replies made an ordinary post request transfer, resolve authors for and
+/// render all of them.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn one_popular_root_cannot_unbound_a_comment_page() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Popular", "Body.", "publish").await;
+
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             VALUES ({post_id}, NULL, 1, 'Owner', 'owner@example.com', '', '',
+                     'The root', 'approved', NOW())"
+        ),
+    )
+    .await
+    .expect("seed the root");
+    // Comfortably past `MAX_THREAD_COMMENTS`, all one level down so the depth
+    // cap has nothing to say about them.
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             SELECT {post_id}, (SELECT id FROM comments WHERE body = 'The root'),
+                    1, 'Owner', 'owner@example.com', '', '',
+                    'Reply ' || lpad(g::text, 5, '0'), 'approved',
+                    NOW() + (g || ' seconds')::interval
+             FROM generate_series(1, 2500) AS g"
+        ),
+    )
+    .await
+    .expect("seed the replies");
+
+    sign_out(&client);
+    let page = client.get("/popular").send().await;
+    let html = page.assert_ok().text();
+    let rendered = html.matches("id=\"comment-").count();
+    assert!(
+        rendered <= 1000,
+        "a page must stay bounded whatever one root collects, rendered {rendered}"
+    );
+    assert!(
+        html.contains("some replies are not shown"),
+        "and must say so rather than pretending the thread is complete:\n{}",
+        &html[..html.len().min(4000)]
+    );
+    // The tree still assembles: what is dropped is the tail, never a parent.
+    assert!(
+        html.contains("The root") && html.contains("Reply 00001"),
+        "the oldest replies are the ones kept"
+    );
+}
+
 /// Every approved comment is reachable, however long the thread gets.
 ///
 /// The thread loaded a flat window of the oldest 200, so once a post passed

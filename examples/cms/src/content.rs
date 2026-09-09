@@ -3319,16 +3319,23 @@ pub async fn terms_page(
         .await?)
 }
 
-/// The most approved comments one rendered thread holds.
+/// The most approved comments one *page* of a rendered thread holds.
 ///
 /// A public post's thread is served to anyone, and with guest comments enabled
 /// anyone can also grow it. Without a bound, a post that has accumulated tens
 /// of thousands of comments makes every single page view cost the whole set in
 /// database and application memory — and the pending, spam and trashed rows a
 /// moderation queue collects made it worse, because they were loaded and then
-/// discarded in Rust. The bound is generous enough that no real discussion
-/// reaches it, and the renderer says so when one does.
-pub const MAX_THREAD_COMMENTS: i64 = 200;
+/// discarded in Rust.
+///
+/// [`THREAD_ROOTS_PER_PAGE`] bounds the roots and [`MAX_COMMENT_DEPTH`] bounds
+/// the nesting, but neither bounds *breadth*: a single popular root can carry
+/// any number of direct replies, so a page of fifty roots was unbounded again
+/// by a different route. This is the bound on the total, and the renderer says
+/// so when a page reaches it.
+///
+/// Twenty per root is generous enough that no real discussion reaches it.
+pub const MAX_THREAD_COMMENTS: i64 = THREAD_ROOTS_PER_PAGE * 20;
 
 /// One page of a moderation queue, newest first, ordered and bounded in SQL.
 ///
@@ -3408,19 +3415,36 @@ pub async fn approved_comments_page(
 /// page, and every reply is on the page its root is.
 pub const THREAD_ROOTS_PER_PAGE: i64 = 50;
 
-/// One page of a post's approved thread: a window of roots, plus every approved
-/// descendant of those roots.
+/// One page of a post's approved thread.
 ///
-/// Returns the comments and the total number of roots, so the caller can page.
+/// The rows are a window of roots plus their approved descendants, the total
+/// number of roots so the caller can page, and whether the page hit
+/// [`MAX_THREAD_COMMENTS`] so the caller can say so.
+pub struct ThreadPage {
+    pub comments: Vec<Comment>,
+    pub total_roots: i64,
+    /// Whether replies were left off because the page filled up.
+    pub truncated: bool,
+}
+
+/// Load one page of a post's approved thread: a window of roots, plus the
+/// approved descendants of those roots that fit in [`MAX_THREAD_COMMENTS`].
+///
 /// The descendant walk is level by level and bounded by `MAX_COMMENT_DEPTH`,
 /// which the write path enforces — so it is a handful of queries whatever the
-/// thread looks like.
+/// thread looks like. Each level is *also* bounded by what is left of the row
+/// budget, because depth is not breadth: one root with fifty thousand direct
+/// replies is five queries and fifty thousand rows.
+///
+/// Truncation happens at a level boundary and takes the oldest rows first, so a
+/// comment is never included without its parent — the tree always assembles,
+/// and what is dropped is always the tail of the newest level reached.
 pub async fn approved_thread_page(
     conn: &mut AsyncPgConnection,
     post_id: i64,
     offset: i64,
     roots_per_page: i64,
-) -> AutumnResult<(Vec<Comment>, i64)> {
+) -> AutumnResult<ThreadPage> {
     let total_roots: i64 = comments::table
         .filter(comments::post_id.eq(post_id))
         .filter(comments::status.eq("approved"))
@@ -3435,30 +3459,119 @@ pub async fn approved_thread_page(
         .filter(comments::parent_id.is_null())
         .order((comments::created_at.asc(), comments::id.asc()))
         .offset(offset.max(0))
-        .limit(roots_per_page.max(0))
+        .limit(roots_per_page.clamp(0, MAX_THREAD_COMMENTS))
         .select(Comment::as_select())
         .load(conn)
         .await?;
 
+    let mut truncated = false;
     let mut frontier: Vec<i64> = collected.iter().map(|comment| comment.id).collect();
     for _ in 0..=MAX_COMMENT_DEPTH {
         if frontier.is_empty() {
             break;
         }
-        let children: Vec<Comment> = comments::table
+        let budget = MAX_THREAD_COMMENTS - i64::try_from(collected.len()).unwrap_or(i64::MAX);
+        if budget <= 0 {
+            truncated = true;
+            break;
+        }
+        // One more than the budget, so a full page is distinguishable from a
+        // page that exactly fits.
+        let mut children: Vec<Comment> = comments::table
             .filter(comments::status.eq("approved"))
             .filter(comments::parent_id.eq_any(&frontier))
             .order((comments::created_at.asc(), comments::id.asc()))
+            .limit(budget + 1)
             .select(Comment::as_select())
             .load(conn)
             .await?;
+        if i64::try_from(children.len()).unwrap_or(i64::MAX) > budget {
+            children.truncate(usize::try_from(budget).unwrap_or(0));
+            truncated = true;
+        }
         frontier = children.iter().map(|comment| comment.id).collect();
         collected.extend(children);
+        if truncated {
+            break;
+        }
     }
 
     // `assemble_thread` expects the rows in creation order.
     collected.sort_by_key(|comment| (comment.created_at, comment.id));
-    Ok((collected, total_roots))
+    Ok(ThreadPage {
+        comments: collected,
+        total_roots,
+        truncated,
+    })
+}
+
+/// Which page of a post's approved thread a comment appears on, if any.
+///
+/// A comment is rendered on the page its *root* is on, so this walks up to the
+/// root and counts the approved roots ordered before it. `None` means the
+/// comment has no page: it was deleted underneath us, or its root is not
+/// approved.
+///
+/// The post-a-comment redirect needs this. Sending the browser to the bare
+/// permalink lands it on page one, where the `#comment-<id>` anchor it was
+/// promised does not exist — the comment is real, approved and simply somewhere
+/// else, which reads exactly like a comment that was silently dropped.
+pub async fn approved_thread_page_of(
+    conn: &mut AsyncPgConnection,
+    comment_id: i64,
+) -> AutumnResult<Option<i64>> {
+    let Some(mut current): Option<Comment> = comments::table
+        .find(comment_id)
+        .select(Comment::as_select())
+        .first(conn)
+        .await
+        .optional()?
+    else {
+        return Ok(None);
+    };
+
+    // Bounded like `reply_depth`, and for the same reason: a cycle introduced
+    // by a bad import must terminate the walk rather than spin.
+    let mut steps = 0_usize;
+    while let Some(parent_id) = current.parent_id {
+        steps += 1;
+        if steps > MAX_COMMENT_DEPTH + 2 {
+            return Ok(None);
+        }
+        let Some(parent): Option<Comment> = comments::table
+            .find(parent_id)
+            .select(Comment::as_select())
+            .first(conn)
+            .await
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        current = parent;
+    }
+
+    if current.status != "approved" {
+        return Ok(None);
+    }
+
+    // The same ordering the page window uses, so the count and the offset can
+    // never disagree about which page a root is on.
+    let earlier: i64 = comments::table
+        .filter(comments::post_id.eq(current.post_id))
+        .filter(comments::status.eq("approved"))
+        .filter(comments::parent_id.is_null())
+        .filter(
+            comments::created_at
+                .lt(current.created_at)
+                .or(comments::created_at
+                    .eq(current.created_at)
+                    .and(comments::id.lt(current.id))),
+        )
+        .count()
+        .get_result(conn)
+        .await?;
+
+    Ok(Some(earlier / THREAD_ROOTS_PER_PAGE + 1))
 }
 
 /// Rebuild a post's approved-comment counter from ground truth, under its lock.
