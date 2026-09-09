@@ -734,9 +734,9 @@ the CSRF layer.
 
 The form helpers emit labels and error wiring for you. When you build a field by
 hand, use the typed primitives in `autumn_web::a11y` rather than raw markup:
-`TextField`, `TextArea`, `Select`, `Checkbox`, and `FileField` **do not
-implement `Render` until a label is attached**, so an unlabeled field is not
-merely discouraged — it does not compile.
+`TextField`, `TextArea`, `Select`, `Checkbox`, `FileField` and `RadioGroup`
+**do not implement `Render` until a label is attached**, so an unlabeled field
+is not merely discouraged — it does not compile.
 
 ```rust,ignore
 use autumn_web::a11y::TextField;

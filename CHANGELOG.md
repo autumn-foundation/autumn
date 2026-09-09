@@ -671,6 +671,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **a11y:** `autumn a11y verify` now keys its findings to the **routes** that
+  serve them, and rolls them up by WCAG success criterion (part of #1706). The
+  scan reads the route attribute macros — `#[get]`, `#[post]`, `#[put]`,
+  `#[patch]`, `#[delete]`, `#[static_get]` — out of the token stream it already
+  walks, indexes every function and the free functions it calls, then walks out
+  from each handler to the markup it reaches, so a defect in a shared partial
+  names the routes that reach it, not just a file and a line. The JSON manifest gains a `routes` array
+  (per-route `pass`/`fail` with a finding count), a `routes` list on each
+  finding, and a `wcag` rollup that splits the multi-criterion rules so `label`
+  reports separately under 1.3.1, 3.3.2 and 4.1.2; the summary gains `routes`,
+  `routes_failing` and `unrouted`. Attribution is a conservative lower bound in
+  the same spirit as the scanner: a call is followed only when the called name
+  is defined exactly once across the scan as a free item (a nested or
+  associated `fn` is not a bare-call target); method calls, type-qualified
+  associated calls (`Widget::new()`), functions passed by name and names a
+  parameter or local shadows are not resolved; and the path is the one declared on the handler (mount-time prefixes
+  are applied at runtime and are not resolved). So `status: "pass"` means no
+  finding was attributed to that route, which `summary.unrouted` qualifies.
+  Exit codes are unchanged — route data reports, it does not gate.
+
+- **a11y:** new typed `a11y::RadioGroup` / `a11y::RadioOption` primitives (part
+  of #1706) — the last common form control without a compile-time label
+  obligation. A radio group needs two accessible names, and both are now
+  type-level: `RadioOption::new(value, label)` requires the choice label, and
+  `RadioGroup::new(name, first)` returns a `RadioGroup<NoLabel>` that does not
+  implement `Render` until `.label(..)`/`.aria_label(..)`/`.labelled_by(..)`
+  transitions it to `RadioGroup<Labeled>`, so an unnamed group is
+  unrepresentable as markup (proven by trybuild fixtures). The first choice is a
+  constructor argument, so a group of choices always has one. A visible name
+  renders `<fieldset><legend>`, the ARIA variants a `<div>`, both with
+  `role="radiogroup"` — `<fieldset>` alone maps to role `group`, which does not
+  support `aria-required`. `aria-invalid` and `hx-*` land on each `<input>`,
+  where assistive technology reads validity and htmx reads a value;
+  `aria-describedby` and `aria-required` stay on the group. `checked_value(..)`
+  sets the single selection authoritatively, and each choice gets an id pairing
+  it with its own `<label for=…>` — derived from the group name and the choice
+  value with any `-` doubled, so two groups cannot collide, and prefixable with
+  `.id_prefix(..)` when the same group is rendered repeatedly.
+
 - **cli:** `autumn db scrub --sample <table>=<count|percent%>` emits a
   **referentially-intact subset** instead of the whole scrubbed copy (issue
   #1636), so a production copy fits on a laptop. The subset is anchored on
@@ -1159,6 +1198,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after every refresh, and the run refuses and rolls back if either moved. A
   refresh that UPDATEs in place without changing a count or invalidating a
   reference is not detected, and is not claimed to be.
+
 - **An actuator path drift gate for the docs corpus [no-plugin]:** the five
   docs gates that came before it cover the link a reader clicks
   (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the

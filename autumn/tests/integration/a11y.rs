@@ -9,7 +9,8 @@
 #![cfg(feature = "maud")]
 
 use autumn_web::a11y::{
-    Button, Checkbox, FileField, Img, Link, MenuItem, Select, SelectOption, TextArea, TextField,
+    Button, Checkbox, FileField, Img, Link, MenuItem, RadioGroup, RadioOption, Select,
+    SelectOption, TextArea, TextField,
 };
 use autumn_web::html;
 use maud::Render;
@@ -577,6 +578,7 @@ fn splices_inside_html_block() {
     let page = html! {
         (Img::new("/logo.svg", "Autumn logo"))
         (TextField::new("email").input_type("email").label("Email address"))
+        (RadioGroup::new("speed", RadioOption::new("standard", "Standard")).label("Shipping speed"))
         (Button::new("Save").submit())
     };
     let s = page.into_string();
@@ -585,5 +587,48 @@ fn splices_inside_html_block() {
         s.contains("<label for=\"email\">Email address</label>"),
         "{s}"
     );
+    assert!(s.contains("<legend>Shipping speed</legend>"), "{s}");
     assert!(s.contains(">Save<"), "{s}");
+}
+
+#[test]
+fn radio_group_renders_a_named_group_of_named_choices() {
+    let markup = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+        .option(RadioOption::new("express", "Express"))
+        .checked_value("express")
+        .label("Shipping speed")
+        .render()
+        .into_string();
+    // The group names itself…
+    assert!(markup.contains("role=\"radiogroup\""), "{markup}");
+    assert!(
+        markup.contains("<legend>Shipping speed</legend>"),
+        "{markup}"
+    );
+    // …and every choice names itself, paired to its own control by id.
+    assert!(
+        markup.contains("<label for=\"speed-standard\">Standard</label>"),
+        "{markup}"
+    );
+    assert!(
+        markup.contains("<label for=\"speed-express\">Express</label>"),
+        "{markup}"
+    );
+    assert_eq!(markup.matches("name=\"speed\"").count(), 2, "{markup}");
+    assert_eq!(markup.matches(" checked").count(), 1, "{markup}");
+}
+
+#[test]
+fn radio_group_aria_named_variant_renders_no_legend() {
+    let markup = RadioGroup::new("billing", RadioOption::new("monthly", "Monthly"))
+        .aria_label("Billing period")
+        .render()
+        .into_string();
+    assert!(markup.contains("role=\"radiogroup\""), "{markup}");
+    assert!(markup.contains("aria-label=\"Billing period\""), "{markup}");
+    assert!(!markup.contains("<legend"), "{markup}");
+    assert!(
+        markup.contains("<label for=\"billing-monthly\">Monthly</label>"),
+        "{markup}"
+    );
 }

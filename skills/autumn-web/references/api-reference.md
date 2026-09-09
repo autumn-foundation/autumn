@@ -609,8 +609,8 @@ compile error enforced via trybuild, not a runtime `autumn a11y verify` miss).
 Each maps to a WCAG 2.1 success criterion. Full narrative in
 `docs/guide/accessibility.md`. `Img`, `Button`, `ButtonType`, `Link`,
 `MenuItem`, and `TextField` are prelude re-exported; the remaining form
-primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`) are
-reached via the `autumn_web::a11y` path.
+primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`,
+`RadioGroup` + `RadioOption`) are reached via the `autumn_web::a11y` path.
 
 - `Img::new(src, alt)` (alt required) / `Img::decorative(src)` (explicit
   `alt=""` + `aria-hidden="true"`); `.class(..)` / `.width(u32)` /
@@ -625,7 +625,7 @@ reached via the `autumn_web::a11y` path.
   switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
   WCAG 4.1.2.
 
-### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField`)
+### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` / `RadioGroup`)
 
 Each starts in a `NoLabel` typestate that does **not** implement `Render`. Only
 after a label is attached — `.label(text)` (visible `<label for=…>`),
@@ -637,7 +637,7 @@ validation setters are chainable in **either** typestate and none supplies an
 accessible name, so none lifts the compile-time label obligation — the guarantee
 is additive.
 
-Shared setters on all five: `.required()` (native `required`),
+Shared setters on all six: `.required()` (native `required`),
 `.aria_required()` (mirroring `aria-required="true"`, matching the scaffold
 generator's non-nullable ARIA wiring), `.class(s)` (on the control),
 `.label_class(s)` (on the visible `<label>`), `.aria_invalid(bool)`
@@ -660,6 +660,14 @@ Per-primitive setters (in addition to the shared set):
 - **`Checkbox::new(name)`** — `.value(s)`, `.checked(bool)`.
 - **`FileField::new(name)`** — `.accept(s)` (MIME/extension filter),
   `.multiple()` (sets the `multiple` attribute).
+- **`RadioGroup::new(name, first)`** — the first `RadioOption` is a constructor
+  argument, so a group always has a choice; `.option(RadioOption)` /
+  `.options(iter)`, `.checked_value(s)`, `.id_prefix(s)` (for the same group
+  rendered repeatedly). `RadioOption::new(value, label)`
+  requires the choice label; `.checked()` / `.disabled()`. The group renders
+  `<fieldset><legend>` (visible name) or `<div>` (ARIA name), both with
+  `role="radiogroup"`; `aria-invalid` and `hx-*` land on each `<input>`,
+  `aria-describedby` and `aria-required` on the group.
 
 ## View widgets and UI (all 0.6.0)
 
