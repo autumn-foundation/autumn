@@ -38,22 +38,60 @@ pub const REVISION_LIMIT: i64 = 25;
 /// The revision snapshots the row **as it was before** the edit, which is what
 /// makes "restore this revision" mean something: the newest revision is the
 /// state you would return to by undoing the current content.
-/// `expected_lock_version` is the version the editor's form was rendered from.
-/// When it does not match the row read under the lock, someone else saved in
-/// between and this submission is built on content that no longer exists — the
-/// write is refused with `409 Conflict` rather than overwriting their work.
-/// `None` skips the check, for callers with no form behind them.
+/// Everything about an edit except the edit itself: who made it, whether it is
+/// worth a snapshot, and what the transaction is allowed to touch.
+///
+/// A struct rather than five more parameters — the call site reads as prose,
+/// and a new question about an edit does not mean another positional `bool`
+/// nobody can tell apart at the call site.
+pub struct EditContext {
+    /// The account that made the edit — who the revision is credited to, which
+    /// is not necessarily the post's author.
+    pub editor_id: i64,
+    /// The revision's one-line description.
+    pub summary: String,
+    /// The version the editor's form was rendered from. When it does not match
+    /// the row read under the lock, someone else saved in between and this
+    /// submission is built on content that no longer exists — the write is
+    /// refused with `409 Conflict` rather than overwriting their work. `None`
+    /// skips the check, for callers with no form behind them.
+    pub expected_lock_version: Option<i32>,
+    /// Whether the registered type takes revisions.
+    pub record_revision: bool,
+    /// Whether this *transaction* may touch the page hierarchy — a re-parent
+    /// here, or a trash transition composed after it. Declared by the caller
+    /// because the answer is about the transaction, not about this call.
+    pub may_touch_hierarchy: bool,
+}
+
 pub async fn update_post_with_revision(
     conn: &mut AsyncPgConnection,
     post_id: i64,
-    editor_id: i64,
-    summary: &str,
-    expected_lock_version: Option<i32>,
-    record_revision: bool,
+    context: EditContext,
     apply: impl for<'a> FnOnce(&'a mut Post) + Send + 'static,
 ) -> AutumnResult<Post> {
-    let summary = summary.to_owned();
+    let EditContext {
+        editor_id,
+        summary,
+        expected_lock_version,
+        record_revision,
+        may_touch_hierarchy,
+    } = context;
     conn.transaction(async move |conn| {
+        // The hierarchy lock first, when this edit could need it — see
+        // `transition_status` for the order and why it is that way round.
+        //
+        // Whether it is needed cannot be decided here: the answer depends on
+        // the *transaction*, not on this call. Only a re-parent needs it, and a
+        // re-parent is only visible after `apply` has run against the locked
+        // row — by which point the order is already wrong. So the caller
+        // declares it, and a caller composing this with a trash transition
+        // declares it for the whole transaction rather than letting the second
+        // operation reach for the lock behind the first one's row lock.
+        if may_touch_hierarchy {
+            lock_page_hierarchy(conn).await?;
+        }
+
         // Lock the row for the duration: two editors saving the same post
         // must serialise, or the second silently overwrites the first and
         // the revision trail records an edit that never happened.
@@ -94,16 +132,23 @@ pub async fn update_post_with_revision(
         apply(&mut post);
 
         // Re-parenting is validated *here*, inside the transaction that writes
-        // it, under an advisory lock over the whole hierarchy. Validating on a
-        // connection released before this one opens let two editors each check
-        // an acyclic tree and both commit the edge that closed a cycle.
+        // it, under the advisory lock over the whole hierarchy taken at the top.
+        // Validating on a connection released before this one opens let two
+        // editors each check an acyclic tree and both commit the edge that
+        // closed a cycle.
         //
-        // Only a write that actually moves the post takes the lock, so ordinary
-        // edits never contend for it.
+        // A caller that can re-parent must have declared it: without the lock
+        // this check is back to racing another editor, so say so loudly rather
+        // than validating against a tree that can move underneath the answer.
         if post.parent_id != before.parent_id
             && let Some(parent_id) = post.parent_id
         {
-            lock_page_hierarchy(conn).await?;
+            if !may_touch_hierarchy {
+                return Err(AutumnError::internal_server_error_msg(
+                    "This edit moves the post in the page tree but did not take the \
+                     hierarchy lock",
+                ));
+            }
             validate_parent(conn, Some(post_id), &post.post_type, parent_id).await?;
         }
 
@@ -174,6 +219,24 @@ pub async fn transition_status(
 ) -> AutumnResult<Post> {
     let target = target.to_owned();
     conn.transaction(async move |conn| {
+        // Before the row lock, not after it. A trash guarded by the hierarchy
+        // lock but locking the post row first sat on the opposite order from
+        // every create and re-parent, which take the hierarchy lock and then
+        // key-share the parent row through the foreign key: each holds what the
+        // other is waiting for, and PostgreSQL aborts one valid operation.
+        //
+        // The rule this establishes, and the one every path here follows:
+        // **the page-hierarchy lock is taken before any post row lock.** It is
+        // a single global mutex, so once it is held no other hierarchy mutation
+        // is running to deadlock against, whatever row locks follow.
+        //
+        // Taken on `target` rather than on the state machine's answer, because
+        // the answer needs the row — and `transition_status_to` only ever
+        // returns the target or an error, so the two agree.
+        if target == "trash" {
+            lock_page_hierarchy(conn).await?;
+        }
+
         let post: Post = posts::table
             .find(post_id)
             .select(Post::as_select())
@@ -250,11 +313,11 @@ pub async fn transition_status(
         // without being asked is worse than one that says what is in the way.
         // The editor can trash or move the children first.
         if new_status == "trash" {
-            // Counted under the hierarchy lock and held through the status
-            // update, so a create or re-parent cannot attach a child after the
-            // count and before the commit — which would leave exactly the
-            // orphaned permalink this guard exists to prevent.
-            lock_page_hierarchy(conn).await?;
+            // The hierarchy lock is already held, taken above the row lock and
+            // held through this count and the status update — so a create or
+            // re-parent cannot attach a child after the count and before the
+            // commit, which would leave exactly the orphaned permalink this
+            // guard exists to prevent.
             let children = live_child_count(conn, post_id).await?;
             if children > 0 {
                 return Err(AutumnError::unprocessable_msg(format!(

@@ -10183,6 +10183,111 @@ async fn the_export_reads_one_snapshot() {
     );
 }
 
+/// A file that names the trash restores a draft, not a deletion.
+///
+/// The exporter excludes trash, so a file carrying it was hand-edited or came
+/// from another tool. Restoring straight into the trash is meaningless — a
+/// backup restores content, not deletions — and `trash` is the one status whose
+/// transition reaches for the page-hierarchy lock, which on the import path
+/// would be taken behind the post row lock `set_post_terms` already holds.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_import_never_restores_into_the_trash() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 2,
+        "site_title": "Imported",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [
+            {
+                "post_type": "post", "title": "Deleted Elsewhere", "slug": "deleted-elsewhere",
+                "excerpt": "", "body": "Body.", "status": "trash",
+                "comment_status": "open", "password": "", "author": "owner",
+                "published_at": null, "parent": null, "terms": []
+            }
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    let status: String = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("deleted-elsewhere"))
+            .select(cms::schema::posts::status)
+            .first(&mut conn)
+            .await
+            .expect("the imported row")
+    };
+    assert_eq!(
+        status, "draft",
+        "a trashed row in a file must land as a visible draft"
+    );
+}
+
+/// The page-hierarchy lock is taken before any post row lock.
+///
+/// Every create and re-parent takes the hierarchy lock and then key-shares the
+/// parent row through the foreign key. Trashing did the reverse — the post row
+/// `FOR UPDATE` first, the hierarchy lock only once the guard was reached — so
+/// a create beneath a parent that another request was trashing left each
+/// holding what the other waited for, and PostgreSQL aborted one of them.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_hierarchy_lock_comes_before_any_post_row_lock() {
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Doomed", "Body.", "publish").await;
+
+    // Another session holding the hierarchy lock, which is what a concurrent
+    // create beneath a parent holds while it waits for that parent's row.
+    let mut holder = TestDb::shared().await.pool().get().await.expect("conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    diesel::sql_query(format!(
+        "SELECT pg_advisory_xact_lock({})",
+        cms::content::PAGE_HIERARCHY_LOCK_KEY
+    ))
+    .execute(&mut holder)
+    .await
+    .expect("hold the hierarchy");
+
+    let trash = tokio::spawn(async move {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::content::transition_status(&mut conn, post_id, "trash", None, None).await
+    });
+
+    let blocked_pid = wait_for_a_blocked_backend().await;
+
+    // `SELECT ... FOR UPDATE` on `posts` takes a `RowShareLock` on the table and
+    // keeps it for the transaction. Holding one while waiting for the hierarchy
+    // lock is the inverted order — the half of the cycle a create closes.
+    let held = granted_locks(blocked_pid, "posts", "RowShareLock").await;
+    assert_eq!(
+        held, 0,
+        "the trash must reach the hierarchy lock before it locks the post row"
+    );
+
+    diesel::sql_query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("commit");
+    trash.await.expect("the task").expect("the trash succeeds");
+}
+
 /// Poll until some backend is waiting on a lock, and return its pid.
 ///
 /// A row-level wait shows up as an ungranted lock on the *transaction* holding

@@ -1296,10 +1296,19 @@ pub async fn update(
                     let updated = content::update_post_with_revision(
                         conn,
                         id,
-                        user.id,
-                        "Edited",
-                        expected_lock_version,
-                        registered.supports_revisions,
+                        content::EditContext {
+                            editor_id: user.id,
+                            summary: "Edited".to_owned(),
+                            expected_lock_version,
+                            record_revision: registered.supports_revisions,
+                            // Declared for the whole transaction, not for this
+                            // call alone: a hierarchical type may be re-parented
+                            // here, and a trash below reaches for the same lock.
+                            // Either one taking it after this row lock puts the
+                            // transaction on the opposite order from every
+                            // create and re-parent — see `transition_status`.
+                            may_touch_hierarchy: registered.hierarchical || status == "trash",
+                        },
                         move |post| {
                             let (
                                 title,

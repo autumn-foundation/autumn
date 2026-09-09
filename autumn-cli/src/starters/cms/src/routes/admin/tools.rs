@@ -495,6 +495,15 @@ async fn find_local(
 /// have published these within a minute of their due time, so publishing them
 /// now is what the file actually asked for.
 fn import_status(status: &str, published_at: Option<chrono::NaiveDateTime>) -> &str {
+    // The exporter excludes trash, so a file carrying it was hand-edited or
+    // came from another tool. Restoring straight into the trash is meaningless
+    // — a backup restores content, not deletions — and it is the one status
+    // whose transition reaches for the page-hierarchy lock, which on this path
+    // would be taken behind a post row lock `set_post_terms` already holds.
+    // Landing it as a draft keeps the content and puts it somewhere visible.
+    if status == "trash" {
+        return "draft";
+    }
     if status == "future" && published_at.is_none_or(|when| when <= chrono::Utc::now().naive_utc())
     {
         return "publish";
