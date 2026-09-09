@@ -552,7 +552,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   components a conninfo STATES are asserted: `PGPORT` can differ between the
   machine that planned the run and the one pasting the script, so a guessed
   default would refuse a correct paste, and an omitted component cannot be what
-  distinguishes two targets anyway.
+  distinguishes two targets anyway — and a comma-separated FAILOVER list is
+  matched by membership, since psql's `:HOST`/`:PORT` name the single server it
+  selected (measured: `?host=127.0.0.9,127.0.0.1` reports `HOST=127.0.0.1`).
+  The compaction pass carries the same proof, not the endpoint alone: it is a
+  second `\connect` with the same retained-connection failure, and a
+  `VACUUM (FULL)` on the wrong target locks and rewrites every table it names.
+  The printed transaction also asserts `session_replication_role = origin`, the
+  precondition the run refuses to PLAN without. `origin` fires `O`/`A` triggers
+  and `replica` fires `R`/`A`, and the trigger walk only ever inspected the
+  first set — but the script inherits whatever the pasting session is in.
+  Measured: with the session in `replica` and the printed `\connect` failing, so
+  that session is retained ON the right endpoint and passes both the psql proof
+  and the endpoint guard, the assertion raised and the transaction aborted with
+  the database untouched at 200 rows. Asserted rather than pinned, as the
+  command refuses rather than resets: the setting is `SUSET`, so a `SET LOCAL`
+  would fail for the ordinary role the script is written for.
   The dependency walk now traverses ordinary views. `pg_depend` records only the
   hop a rewrite rule actually took, so matching a materialized view's dependency
   straight against the set of materialized views lost both hops of `a_report ->

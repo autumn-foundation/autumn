@@ -441,6 +441,16 @@ what the connection string states is asserted; a port left to libpq is not
 guessed, since `PGPORT` can differ between the machine that planned the run and
 the one pasting the script.
 
+A failover list (`host=db1,db2`) is matched by membership, since psql reports the
+one server it selected. The compaction pass reconnects too, and carries the same
+proof for the same reason.
+
+The printed transaction also asserts `session_replication_role = origin` — the
+precondition the run refuses to plan without. `origin` fires `O`/`A` triggers and
+`replica` fires `R`/`A`, and the trigger analysis only ever saw the first set; the
+script inherits whatever the pasting session is in, so it checks rather than
+assumes.
+
 That boundary is then checked again inside the transaction. `\connect` does **not** close the
 existing connection when the new one fails: psql prints `Previous connection
 kept` and the session carries on, so the block below it would run against the

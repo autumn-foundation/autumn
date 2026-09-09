@@ -2837,6 +2837,10 @@ fn classify_and_apply(
             for statement in session_settings() {
                 eprintln!("  {statement};");
             }
+            // The precondition the run refuses to plan without, asserted here
+            // because the pasting session brings its own — see
+            // `replication_role_assertion`.
+            eprintln!("  {}", replication_role_assertion());
             // Inside the transaction, so a `\connect` that silently failed
             // aborts this block instead of running it against the previous
             // target. Before every destructive statement: nothing may run until
@@ -2955,9 +2959,20 @@ fn classify_and_apply(
                 // The same fail-closed shape the fence uses: false first, so a
                 // `\gset` whose query fails cannot carry the previous target's
                 // answer into this one's VACUUM statements.
+                //
+                // And the SAME psql proof the transaction opens with, not the
+                // endpoint alone: this is a second `\connect`, with the same
+                // retained-connection failure mode, and server-reported identity
+                // cannot tell two clones behind colliding addresses apart. A
+                // `VACUUM (FULL)` on the wrong target takes an ACCESS EXCLUSIVE
+                // lock and rewrites every table it names.
                 eprintln!("  \\set autumn_here false");
                 eprintln!(
-                    "  SELECT NOT ({}) AS autumn_here \\gset",
+                    "  SELECT ({} AND NOT ({})) AS autumn_here \\gset",
+                    password_free_conninfo(url).map_or_else(
+                        || "false".to_owned(),
+                        |conninfo| psql_connection_terms(&conninfo, &facts.endpoint.database),
+                    ),
                     endpoint_mismatch(&facts.endpoint)
                 );
                 eprintln!("  \\if :autumn_here");
@@ -4518,27 +4533,51 @@ fn stated_host_and_port(conninfo: &str) -> (Option<String>, Option<String>) {
 ///
 /// The comparison is `pg_catalog`-qualified so a `public.=` cannot answer it,
 /// and the flag is cleared first so a `\gset` whose query fails leaves it false.
-fn psql_connection_assertion(conninfo: &str, database: &str) -> Vec<String> {
+fn psql_connection_terms(conninfo: &str, database: &str) -> String {
+    // Membership, not equality, because libpq takes comma-separated FAILOVER
+    // lists in both `host` and `port` — and psql's `:HOST`/`:PORT` describe the
+    // single server it actually selected. Measured: with
+    // `?host=127.0.0.9,127.0.0.1`, psql reported `HOST=127.0.0.1`. Comparing a
+    // list verbatim made a CORRECT paste skip its own block and every later
+    // target with it — measured on a
+    // `postgres://postgres@127.0.0.9,127.0.0.1:5433/dry_t1` target, 83 statements
+    // reported `query ignored` and the database stayed at 200 rows.
+    //
+    // Host and port are matched independently rather than paired by position:
+    // the question is whether psql landed on one of the endpoints this block was
+    // planned for, and every pair drawn from those lists is one.
+    let members = |value: &str| {
+        value
+            .split(',')
+            .filter(|part| !part.is_empty())
+            .map(quote_literal)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let (host, port) = stated_host_and_port(conninfo);
     let mut terms = vec![format!(
         ":'DBNAME' OPERATOR(pg_catalog.=) {}",
         quote_literal(database)
     )];
-    if let Some(host) = host {
-        terms.push(format!(
-            ":'HOST' OPERATOR(pg_catalog.=) {}",
-            quote_literal(&host)
-        ));
+    for (variable, stated) in [("HOST", host), ("PORT", port)] {
+        if let Some(stated) = stated.filter(|s| !s.is_empty()) {
+            terms.push(format!(
+                ":'{variable}' OPERATOR(pg_catalog.=) ANY (ARRAY[{}]::pg_catalog.text[])",
+                members(&stated)
+            ));
+        }
     }
-    if let Some(port) = port {
-        terms.push(format!(
-            ":'PORT' OPERATOR(pg_catalog.=) {}",
-            quote_literal(&port)
-        ));
-    }
+    terms.join(" AND ")
+}
+
+/// Those terms as the psql conditional each target's transaction opens with.
+fn psql_connection_assertion(conninfo: &str, database: &str) -> Vec<String> {
     vec![
         "\\set autumn_ok false".to_owned(),
-        format!("SELECT ({}) AS autumn_ok \\gset", terms.join(" AND ")),
+        format!(
+            "SELECT ({}) AS autumn_ok \\gset",
+            psql_connection_terms(conninfo, database)
+        ),
         "\\if :autumn_ok".to_owned(),
     ]
 }
@@ -4632,6 +4671,36 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
              when one fails)"
         ),
     );
+    let tag = sample::dollar_tag(&body);
+    format!("DO {tag}{body}{tag};")
+}
+
+/// Abort the transaction unless the pasting session fires the same triggers the
+/// plan was built against.
+///
+/// `session_replication_role` decides which triggers fire: `origin` fires `O`
+/// and `A`, `replica` fires `R` and `A`. The run REFUSES to plan from a
+/// connection that is not `origin`, because `triggers_reaching` only ever
+/// inspected the `O`/`A` set — but the printed script inherits whatever the
+/// pasting session is in, and nothing in it said so. An operator already
+/// connected to the right endpoint in `replica` can paste a block whose
+/// `\connect` fails (the printed conninfo has its password removed on purpose),
+/// keep that session, pass both the psql proof and the endpoint guard — every
+/// value matches, it IS the right database — and then fire a replica-only
+/// trigger on a table the final pass empties, copying `OLD` rows into one the
+/// rewrites already scrubbed.
+///
+/// Asserted rather than pinned, exactly as the command refuses rather than
+/// resets: `session_replication_role` is `SUSET`, so a `SET LOCAL` would fail
+/// for the ordinary role this script is written for, and silently switching a
+/// superuser out of a mode they chose is not this command's call.
+fn replication_role_assertion() -> String {
+    let body = " BEGIN IF pg_catalog.current_setting('session_replication_role') <> 'origin' \
+                 THEN RAISE EXCEPTION 'this block was planned against \
+                 session_replication_role = origin, but this session is in % — a \
+                 replica-only trigger fires here that the plan never inspected'\
+                 , pg_catalog.current_setting('session_replication_role'); END IF; END "
+        .to_owned();
     let tag = sample::dollar_tag(&body);
     format!("DO {tag}{body}{tag};")
 }
@@ -5559,8 +5628,8 @@ mod tests {
         // The operator's endpoint, which is what `\connect` acted on — NOT the
         // 5434 the server behind that forward reports for itself.
         assert!(
-            probe.contains(":'PORT' OPERATOR(pg_catalog.=) '25433'")
-                && probe.contains(":'HOST' OPERATOR(pg_catalog.=) '127.0.0.1'")
+            probe.contains(":'PORT' OPERATOR(pg_catalog.=) ANY (ARRAY['25433']")
+                && probe.contains(":'HOST' OPERATOR(pg_catalog.=) ANY (ARRAY['127.0.0.1']")
                 && probe.contains(":'DBNAME' OPERATOR(pg_catalog.=) 'dry_t2'"),
             "every stated component must be pinned to psql's own value: {probe}"
         );
@@ -5591,7 +5660,7 @@ mod tests {
             .find(|l| l.contains("\\gset"))
             .expect("the probe must be emitted");
         assert!(
-            probe.contains(":'HOST' OPERATOR(pg_catalog.=) 'db.internal'")
+            probe.contains(":'HOST' OPERATOR(pg_catalog.=) ANY (ARRAY['db.internal']")
                 && probe.contains(":'DBNAME' OPERATOR(pg_catalog.=) 'app'"),
             "what the conninfo does state is still pinned: {probe}"
         );
@@ -5607,8 +5676,54 @@ mod tests {
                 .find(|l| l.contains("\\gset"))
                 .expect("the probe must be emitted");
         assert!(
-            overridden.contains(":'PORT' OPERATOR(pg_catalog.=) '6000'"),
+            overridden.contains(":'PORT' OPERATOR(pg_catalog.=) ANY (ARRAY['6000']"),
             "the query pair wins over the authority: {overridden}"
+        );
+    }
+
+    /// A failover list is membership, not a string to match verbatim.
+    ///
+    /// libpq takes comma-separated lists in `host` and `port`, and psql's
+    /// `:HOST`/`:PORT` name the ONE server it selected — measured, a connection
+    /// made with `?host=127.0.0.9,127.0.0.1` reports `HOST=127.0.0.1`. Comparing
+    /// the list verbatim made a CORRECT paste skip its own block and every later
+    /// target with it: measured end to end, 83 statements reported `query
+    /// ignored` and the database stayed at 200 rows.
+    #[test]
+    fn a_failover_list_is_matched_by_membership() {
+        let probe = super::psql_connection_terms(
+            "postgres://postgres@127.0.0.9,127.0.0.1:5433/dry_t1",
+            "dry_t1",
+        );
+        assert!(
+            probe.contains(":'HOST' OPERATOR(pg_catalog.=) ANY (ARRAY['127.0.0.9', '127.0.0.1']"),
+            "every host libpq may select must satisfy the proof: {probe}"
+        );
+    }
+
+    /// The pasting session must fire the triggers the plan was built against.
+    ///
+    /// The run refuses to PLAN from a connection that is not `origin`, because
+    /// the trigger walk only inspects the `O`/`A` set — but the printed script
+    /// inherits whatever the pasting session is in. Measured: with the session
+    /// in `replica` and the printed `\connect` failing (so that session is
+    /// retained, on the right endpoint, past both the psql proof and the
+    /// endpoint guard), this assertion raised and the transaction aborted with
+    /// the database untouched at 200 rows.
+    #[test]
+    fn the_pasting_session_must_be_in_the_origin_replication_role() {
+        let assertion = super::replication_role_assertion();
+        assert!(
+            assertion
+                .contains("pg_catalog.current_setting('session_replication_role') <> 'origin'")
+                && assertion.contains("RAISE EXCEPTION"),
+            "the script must assert what the command refuses to plan without: {assertion}"
+        );
+        // Asserted, not pinned: the setting is SUSET, so a `SET LOCAL` would fail
+        // for the ordinary role this script is written for.
+        assert!(
+            !assertion.contains("SET LOCAL"),
+            "it must not try to reset a setting an ordinary role cannot: {assertion}"
         );
     }
 
