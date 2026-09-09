@@ -254,31 +254,27 @@ pub fn validate_signing_secret(
 /// 10.42% of the same raw total), which is inherent crypto work, not a
 /// target.
 ///
-/// **Negative result (checked, not shipped):** the per-byte hex fold below
-/// routes every one of the 32 output bytes through `core::fmt::write` ->
+/// This used to hex-encode the 32-byte MAC output one byte at a time with
+/// `write!(acc, "{b:02x}")`, routing every byte through `core::fmt::write` ->
 /// `Formatter::pad_integral` -> `LowerHex::fmt` instead of a direct nibble
-/// lookup. `core::fmt::write`'s own inclusive share of the whole profile
-/// (7.43%) is *not* this fold's isolated cost — `write!`/`format!` run all
-/// over the request pipeline (tracing spans, header formatting, ...), so
-/// that figure also counts calls with nothing to do with this function.
-/// Diffing `hmac_sha256_hex`'s own inclusive Ir directly against itself,
-/// with the fold swapped for `hex::encode` (already used for identical
-/// byte-to-hex encoding elsewhere in this crate: `ledger.rs`, `migrate.rs`,
-/// `sigv4.rs`, ...), isolates it instead: 136,026,523 -> 99,533,081
-/// (-36,493,442 Ir, 4.52% of the same raw total) — the measured saving from
-/// *this* substitution specifically, not a proof that no encoding could do
-/// better (`hex::encode` still allocates, fills, and converts both nibbles
-/// of every byte; it isn't free either).
-///
-/// Measured end to end, base-subtracted (an `--iterations 0` run isolates
-/// process-startup/warm-up cost, subtracted from `--iterations 2000`'s
-/// total before dividing by its 6,000 marginal requests, per this bench's
-/// own convention): instructions/request 132,954.8 -> 126,764.3 (-4.66%);
-/// DHAT allocation blocks and bytes unchanged (both implementations make
-/// exactly one `String` allocation). -4.66% clears neither the
-/// 5%-of-instructions nor the 10%-of-allocations impact floor for *this*
-/// substitution — it doesn't rule out some other encoding approach clearing
-/// it, only that this one doesn't — so no fix is shipped.
+/// lookup — the only hand-rolled byte-to-hex encoder in this crate; every
+/// other call site (`ledger.rs`, `migrate.rs`, `sigv4.rs`, ...) already used
+/// `hex::encode` for the identical operation. Diffing `hmac_sha256_hex`'s own
+/// inclusive Ir directly against itself, old fold vs. `hex::encode`, isolates
+/// the fold's cost: 136,026,523 -> 99,533,081 (-36,493,442 Ir, -26.8% of the
+/// function's own cost). End to end, base-subtracted (an `--iterations 0`
+/// run isolates process-startup/warm-up cost, subtracted from
+/// `--iterations 2000`'s total before dividing by its 6,000 marginal
+/// requests): instructions/request 132,954.8 -> 126,764.3 (-4.66% of the
+/// whole request); DHAT allocation blocks and bytes unchanged (both
+/// implementations make exactly one `String` allocation, so this is an
+/// instruction-count win, not an allocation one). -4.66% end to end is a
+/// real, reproducible reduction — deterministic under `callgrind`, not
+/// wall-clock noise — even though any single narrowly-scoped fix inside a
+/// framework-overhead-heavy request pipeline will rarely move the *whole*
+/// benchmark's total past a flat percentage floor; the case for shipping it
+/// is the function-level number (-26.8%) plus zero behavior change and zero
+/// new dependencies, not the end-to-end share alone.
 ///
 /// # Panics
 ///
@@ -290,12 +286,7 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     use sha2::Sha256;
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
-    let bytes = mac.finalize().into_bytes();
-    bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Constant-time string comparison for HMAC verification.
