@@ -587,7 +587,13 @@ async fn scrub_anonymizes_a_resolved_database_url_in_place() {
     // can stop it partway — an aborted transaction ends at the next `COMMIT`.
     // So the runnable script is refused whole. The plan report above it still
     // has to stand: that is what `--dry-run` is for.
-    let (_o, dry_err) = run_autumn_ok(dir, &["db", "scrub", "--dry-run"], &envs);
+    //
+    // `run_autumn_fail`, not `run_autumn_ok`: withholding the script is a
+    // refusal and exits non-zero, like every other thing this command declines
+    // to do. Getting that wrong is how this test went red in CI while passing
+    // here — it is `#[ignore]`d behind Docker, so the Docker sweep is the only
+    // place it runs.
+    let (_o, dry_err) = run_autumn_fail(dir, &["db", "scrub", "--dry-run"], &envs);
     assert!(
         dry_err.contains("cannot print a runnable script") && dry_err.contains("users.api_token"),
         "the dry run must refuse the script and name the column: {dry_err}"
