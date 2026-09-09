@@ -242,6 +242,13 @@ pub enum SampleError {
         tables: Vec<String>,
     },
     /// The post-sample foreign key verification found unresolved references.
+    /// A materialized view's refresh changed a table the sample had already
+    /// settled. The refreshes are the last writes in the transaction, so the
+    /// counts and the integrity checks above no longer describe the result.
+    SampleMutatedByRefresh {
+        /// `table (n row(s), sampled to m)`, sorted.
+        tables: Vec<String>,
+    },
     IntegrityViolation {
         /// `constraint: child -> parent (n row(s))` descriptions, sorted.
         violations: Vec<String>,
@@ -429,6 +436,21 @@ impl std::fmt::Display for SampleError {
                  since `REFRESH` runs that query. Nothing is committed. Disable the \
                  triggers on the copy before scrubbing, drop the write from the view's \
                  function, or stop promising a table is emptied when something refills it.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::SampleMutatedByRefresh { tables } => write!(
+                f,
+                "{} sampled table(s) were changed by a materialized view's \
+                 refresh:\n{}\n  \
+                 The refreshes are the last writes in the transaction, so rows a \
+                 view's function adds land after the subset was selected, after the \
+                 rewrites that remove PII, and after the counts this run reports — \
+                 measured, a view whose function INSERTs into a sampled table left \
+                 the run reporting `403 -> 4 row(s)` over a table holding 7, three \
+                 of them never rewritten. Nothing is committed. Drop the write from \
+                 the view's function, or take the view out of the database this run \
+                 scrubs.",
                 tables.len(),
                 bullets(tables),
             ),

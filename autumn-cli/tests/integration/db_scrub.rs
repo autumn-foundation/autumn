@@ -2602,6 +2602,58 @@ async fn scrub_refuses_to_print_a_target_whose_endpoint_comes_from_the_environme
     }
 }
 
+/// A view function that writes into a SAMPLED table is caught too.
+///
+/// The sibling check covers tables promised empty. `sample::apply` selects the
+/// subset, deletes, verifies the foreign keys and counts — all before the
+/// refreshes, which can INSERT. Measured, a tracked `BEGIN ATOMIC` function
+/// writing into `comments` left the run reporting `comments: 403 -> 4 row(s)`
+/// and `Scrub complete` over a table holding 7 rows, 3 of them never rewritten:
+/// the subset was not the subset, and the reported number was not the number.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_function_that_adds_rows_to_a_sampled_table_is_refused() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "mv_sampled").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    client
+        .batch_execute(
+            "CREATE FUNCTION add_comment(bigint) RETURNS bigint LANGUAGE sql VOLATILE \
+             BEGIN ATOMIC \
+                 INSERT INTO comments (user_id, body) \
+                 SELECT u.id, 'leaked note for ' || u.email FROM users u ORDER BY u.id LIMIT 1 \
+                 RETURNING id; \
+             END; \
+             CREATE MATERIALIZED VIEW a_add AS SELECT add_comment(c.id) AS v FROM countries c;",
+        )
+        .await
+        .unwrap();
+    let before = count(&client, "SELECT count(*)::bigint FROM users").await;
+    let url = format!("{base}/mv_sampled");
+    let (_o, refusal) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        refusal.contains("changed by a materialized view's refresh"),
+        "a refresh that adds rows to a sampled table must be caught: {refusal}"
+    );
+    assert!(
+        refusal.contains("comments"),
+        "the refusal must name the table: {refusal}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*)::bigint FROM users").await,
+        before,
+        "and nothing may be committed: {refusal}"
+    );
+}
+
 /// A target whose connection string cannot name ONE endpoint is not printed.
 ///
 /// Two shapes, both measured on `PostgreSQL` 16.13. `hostaddr` selects the

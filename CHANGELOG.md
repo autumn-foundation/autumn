@@ -846,6 +846,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name that does not resolve, with psql still reporting that name as `:HOST`. A
   pasting session brings its own environment, so what this run resolved need not
   be what it resolves. Each still scrubs without `--dry-run`.
+- **cli:** `autumn db scrub` re-checks the sample's own postconditions after the
+  materialized-view refreshes. `sample::apply` selects the subset, deletes,
+  verifies the foreign keys and counts — all before the refreshes, which are the
+  last writes in the transaction and can perform DML of their own. Measured, a
+  tracked `BEGIN ATOMIC` function writing into `comments` left the run reporting
+  `comments: 403 → 4 row(s)` and `✓ Scrub complete` over a table holding 7 rows,
+  3 of them never rewritten: the subset was not the subset, and the reported
+  number was not the number. The counts and the foreign-key checks now run again
+  after every refresh, and the run refuses and rolls back if either moved. A
+  refresh that UPDATEs in place without changing a count or breaking a reference
+  is not detected, and is not claimed to be.
 - **web:** `AutumnError` now reads back its own validation details (issue
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem

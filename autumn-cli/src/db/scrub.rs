@@ -5653,6 +5653,61 @@ struct ViewRefresh<'a> {
     unpopulated: &'a [String],
 }
 
+/// Re-check the sample's postconditions after every materialized view refresh.
+///
+/// `sample::apply` selects the subset, deletes, verifies the foreign keys and
+/// counts — all BEFORE the refreshes, which are the last writes in the
+/// transaction and can perform DML of their own. Measured, a tracked `BEGIN
+/// ATOMIC` function writing into `comments` left the run reporting
+/// `comments: 403 -> 4 row(s)` and `Scrub complete` over a table holding 7 rows,
+/// 3 of them never rewritten: the subset was not the subset, and the reported
+/// number was not the number.
+///
+/// A refresh can also UPDATE, which moves no count. Re-running the foreign-key
+/// checks catches the part of that which breaks the subset's integrity; an
+/// in-place edit that keeps every reference valid is not something this run can
+/// see, and is not claimed to be.
+fn verify_sample_survived_refreshes(
+    conn: &mut PgConnection,
+    settled: &sample::SampleOutcome,
+    plan: &sample::SamplePlan,
+) -> Result<(), sample::SampleFailure> {
+    let mut moved = Vec::new();
+    for count in &settled.counts {
+        let now: RowCount = sql_query(format!(
+            "SELECT count(*) AS n FROM {}",
+            qualified_ident(&count.table)
+        ))
+        .get_result(conn)?;
+        if now.n != count.after {
+            moved.push(format!(
+                "{} ({} row(s), sampled to {})",
+                count.table, now.n, count.after
+            ));
+        }
+    }
+    if !moved.is_empty() {
+        moved.sort();
+        return Err(sample::SampleFailure::Refused(
+            sample::SampleError::SampleMutatedByRefresh { tables: moved },
+        ));
+    }
+    let mut violations = Vec::new();
+    for (label, sql) in &plan.integrity_statements() {
+        let orphans: RowCount = sql_query(sql).get_result(conn)?;
+        if orphans.n > 0 {
+            violations.push(format!("{label}: {} unresolved reference(s)", orphans.n));
+        }
+    }
+    if !violations.is_empty() {
+        violations.sort();
+        return Err(sample::SampleFailure::Refused(
+            sample::SampleError::IntegrityViolation { violations },
+        ));
+    }
+    Ok(())
+}
+
 /// Run every statement for one database inside a single transaction, so a
 /// failure can never leave a half-scrubbed database behind.
 fn execute(
@@ -5826,6 +5881,13 @@ fn execute(
             return Err(sample::SampleFailure::Refused(
                 sample::SampleError::NotEmptied { tables: refilled },
             ));
+        }
+
+        // The sample's own postconditions belong here for the same reason: they
+        // are checked BEFORE the refreshes, which can write. See
+        // `verify_sample_survived_refreshes`.
+        if let (Some(settled), Some(plan)) = (outcome.as_ref(), sampling) {
+            verify_sample_survived_refreshes(conn, settled, plan)?;
         }
         Ok(())
     })
