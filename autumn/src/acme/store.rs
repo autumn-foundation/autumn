@@ -10,14 +10,12 @@
 //! browser-untrusted staging cert still has ~90d validity, so an un-namespaced
 //! leaf would silently be served for weeks).
 
-use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
 /// A boxed, pinned future returned by [`AcmeStore`] operations, so the trait
 /// stays object-safe (`Arc<dyn AcmeStore>`).
-pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub use crate::custom_domain::StoreFuture;
 
 /// Stable identifier for a certificate, derived from its (sorted) domain set.
 ///
@@ -86,6 +84,18 @@ pub trait AcmeStore: Send + Sync {
         id: &'a CertId,
         cert: &'a StoredCert,
     ) -> StoreFuture<'a, io::Result<()>>;
+
+    /// Delete the certificate for `id`. Deleting an absent one succeeds.
+    ///
+    /// Offboarding a tenant custom domain (#1635) deletes its certificate here
+    /// rather than leaving it on disk forever.
+    ///
+    /// Defaulted to a no-op so an existing store keeps compiling. A store that
+    /// does not override it retains offboarded certificates; override it if
+    /// that matters for your deployment.
+    fn delete_cert<'a>(&'a self, _id: &'a CertId) -> StoreFuture<'a, io::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Filesystem-backed [`AcmeStore`] rooted at a cache directory.
@@ -272,6 +282,27 @@ impl AcmeStore for FsAcmeStore {
             publish_staged(key_tmp, &key_path).await
         })
     }
+
+    fn delete_cert<'a>(&'a self, id: &'a CertId) -> StoreFuture<'a, io::Result<()>> {
+        let chain_path = self.chain_path(id);
+        let key_path = self.key_path(id);
+        Box::pin(async move {
+            // Remove the key first: a crash between the two leaves a chain with
+            // no key, which every loader already treats as absent — the reverse
+            // would leave a usable private key for a domain no longer served.
+            remove_optional(&key_path).await?;
+            remove_optional(&chain_path).await
+        })
+    }
+}
+
+/// Remove a file, treating "already gone" as success.
+async fn remove_optional(path: &Path) -> io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Read a file, returning `Ok(None)` when it does not exist.
@@ -329,16 +360,14 @@ async fn publish_staged(staged: crate::fs_atomic::StagedFile, path: &Path) -> io
     blocking(move || crate::fs_atomic::publish_staged(staged, &path)).await
 }
 
-/// Run a blocking `std::fs` operation on tokio's blocking thread pool,
-/// converting a task panic into an `io::Error` (not expected in practice —
-/// these closures only perform fallible filesystem I/O, they don't panic).
+/// Run a blocking `std::fs` operation on tokio's blocking thread pool.
+///
+/// Thin alias for [`crate::fs_atomic::blocking`], kept so this module's
+/// wrappers read the same as they always have.
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(result) => result,
-        Err(join_error) => Err(io::Error::other(join_error)),
-    }
+    crate::fs_atomic::blocking(f).await
 }
 
 #[cfg(test)]

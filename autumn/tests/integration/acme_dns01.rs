@@ -374,6 +374,7 @@ fn wildcard_config(app: &WildcardApp, ca: &FakeCa, ca_root: std::path::PathBuf) 
             resolvers: vec!["127.0.0.1:53".to_owned()],
             command: vec!["/bin/true".to_owned()],
         }),
+        custom_domains: None,
     }
 }
 

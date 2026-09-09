@@ -144,6 +144,26 @@ pub fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
     publish_staged(staged, path)
 }
 
+/// Run a blocking `std::fs` operation on tokio's blocking thread pool,
+/// converting a task panic into an `io::Error`.
+///
+/// The one async wrapper the filesystem-backed stores share, so a store does
+/// not have to re-derive it. Not expected to panic in practice: the closures
+/// only perform fallible filesystem I/O.
+///
+/// # Errors
+///
+/// Propagates the closure's error, or reports a join failure as
+/// [`std::io::Error::other`].
+pub async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(join_error) => Err(std::io::Error::other(join_error)),
+    }
+}
+
 /// An unpredictable sibling path for the temp file.
 ///
 /// A fixed `<path>.tmp` name is guessable, and `create_new` on a guessable
