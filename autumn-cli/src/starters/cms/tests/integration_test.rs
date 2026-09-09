@@ -7998,3 +7998,377 @@ async fn the_import_ceiling_follows_the_configured_request_limit() {
         "and name the knob that changes it"
     );
 }
+
+/// Deleting an account cannot silently re-root somebody else's pages.
+///
+/// `posts.author_id ... ON DELETE CASCADE` removes the account's content and
+/// `posts.parent_id ... ON DELETE SET NULL` then moves a surviving child to the
+/// top level — its canonical URL changes from `/parent/child` to `/child` and
+/// every inbound link and sitemap entry for it breaks. The explicit trash path
+/// already refuses for this reason; deleting the author was the way around it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_an_account_will_not_orphan_another_authors_pages() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+
+    sign_out(&client);
+    let author = register(&client, "author").await;
+    client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "author"),
+            ("email", "author@example.com"),
+            ("display_name", "Author"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The author owns a parent page; the owner owns a child under it.
+    let parent = client
+        .post("/admin/content/page")
+        .header("cookie", &author)
+        .form(&form(&[
+            ("title", "Guides"),
+            ("slug", "guides"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(parent.status, 303, "body: {}", parent.text());
+    let parent_id = parent
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    client
+        .post("/admin/content/page")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("title", "Install"),
+            ("slug", "install"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("parent_id", parent_id.as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client.get("/guides/install").send().await.assert_ok();
+
+    // Deleting the author would take the parent with it.
+    let refused = client
+        .post("/admin/users/2/delete")
+        .header("cookie", &owner)
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "the deletion must be refused rather than re-rooting the child: {}",
+        refused.text()
+    );
+
+    // The account and the hierarchy are both intact.
+    sign_out(&client);
+    client
+        .get("/guides/install")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+
+    // Trashing the child first makes the deletion allowed — the rule is a
+    // precondition, not a permanent block.
+    let child: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("install"))
+            .select({{crate_name}}::schema::posts::id)
+            .first(&mut conn)
+            .await
+            .expect("the child page")
+    };
+    client
+        .post(&format!("/admin/content/page/{child}/status?to=trash"))
+        .header("cookie", &owner)
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post("/admin/users/2/delete")
+        .header("cookie", &owner)
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// A slug cannot collide with the framework's own probe routes.
+///
+/// `health.enabled` is on by default, so `GET /health`, `/live`, `/ready` and
+/// `/startup` are mounted by the framework — not by `all_routes()`, which is
+/// why the reservation list built from what the app declares had no reason to
+/// include them. A literal route beats the front controller's wildcard, so a
+/// post that took the bare slug `health` advertised a permalink it could never
+/// be served at.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_slug_cannot_shadow_a_framework_probe_route() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for probe in ["health", "live", "ready", "startup"] {
+        let created = client
+            .post("/admin/content/post")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("title", probe),
+                ("slug", probe),
+                ("excerpt", ""),
+                ("body", "Body."),
+                ("status", "publish"),
+                ("password", ""),
+            ]))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "body: {}", created.text());
+
+        let slug: String = {
+            use diesel::prelude::*;
+            use diesel_async::RunQueryDsl;
+            let id: i64 = created
+                .header("location")
+                .expect("redirect")
+                .rsplit('/')
+                .next()
+                .expect("id")
+                .parse()
+                .expect("id");
+            let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+            {{crate_name}}::schema::posts::table
+                .find(id)
+                .select({{crate_name}}::schema::posts::slug)
+                .first(&mut conn)
+                .await
+                .expect("the post")
+        };
+        assert_ne!(
+            slug, probe,
+            "`{probe}` is mounted by the framework, so a post taking it bare is unreachable"
+        );
+        assert!(
+            slug.starts_with(probe),
+            "the allocator should suffix rather than rename: {slug}"
+        );
+    }
+}
+
+/// The publish sweep works in bounded batches.
+///
+/// Loading every due post held each one's whole body in memory before
+/// publishing any of them, so a backlog — downtime, or many authors scheduling
+/// the same slot — could exhaust the task or run past its next tick.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_publish_sweep_drains_a_backlog_in_batches() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Anchor", "Body.", "draft").await;
+
+    // 150 posts all due, more than one batch. Seeded directly: scheduling them
+    // through the editor is not what this is about.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO posts (post_type, title, slug, excerpt, body, status, author_id,
+                            password, comment_status, menu_order, published_at)
+         SELECT 'post',
+                'Due ' || lpad(g::text, 3, '0'),
+                'due-' || lpad(g::text, 3, '0'),
+                '', 'Body.', 'future', 1, '', 'open', 0,
+                NOW() - (g || ' minutes')::interval
+         FROM generate_series(1, 150) AS g",
+    )
+    .await
+    .expect("seed the backlog");
+
+    let due_count = async || -> i64 {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::status.eq("future"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the backlog")
+    };
+    assert_eq!(due_count().await, 150);
+
+    // One sweep claims a bounded batch, not the lot.
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let batch = {{crate_name}}::content::due_scheduled_posts(&mut conn, {{crate_name}}::tasks::PUBLISH_BATCH)
+        .await
+        .expect("a batch");
+    assert_eq!(
+        batch.len(),
+        100,
+        "a sweep must claim a bounded batch, not the whole backlog"
+    );
+
+    // Oldest first, so a backlog drains in the order the schedules were meant
+    // to fire rather than starving the earliest posts. `due-150` is the one
+    // seeded furthest in the past.
+    assert_eq!(batch[0].slug, "due-150");
+    assert_eq!(batch[99].slug, "due-051");
+
+    // Publishing that batch leaves exactly the remainder for the next tick.
+    for post in &batch {
+        let status = post
+            .transition_status_to("publish")
+            .expect("a due post publishes");
+        {{crate_name}}::content::publish_due_post(&mut conn, post.id, post.published_at, &status)
+            .await
+            .expect("publish");
+    }
+    assert_eq!(due_count().await, 50, "the rest wait for the next tick");
+    let batch = {{crate_name}}::content::due_scheduled_posts(&mut conn, {{crate_name}}::tasks::PUBLISH_BATCH)
+        .await
+        .expect("a batch");
+    assert_eq!(batch.len(), 50, "and the next tick drains them");
+}
+
+/// A batched menu resolves to the same URLs it did item by item.
+///
+/// The resolution moved from a query per item — plus one per ancestor for a
+/// page — to two set queries and one more per level of hierarchy. That is a
+/// cost change, not a behaviour change, and the cost is not observable through
+/// the endpoint: this is a correctness guard on the rewrite rather than a test
+/// that fails without it. What a single batched pass can quietly lose is the
+/// per-item detail, so it pins all three link kinds and a nested page's full
+/// ancestry.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_batched_menu_resolves_every_link_kind() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let page = async |title: &str, slug: &str, parent: Option<&str>| -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ];
+        if let Some(parent) = parent {
+            fields.push(("parent_id", parent));
+        }
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating {title}: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+
+    // Three levels, so the ancestry walk has to cross more than one map lookup.
+    let about = page("About", "about", None).await;
+    let team = page("Team", "team", Some(&about)).await;
+    let nested = page("Alice", "alice", Some(&team)).await;
+
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "News"),
+            ("slug", ""),
+            ("description", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let term: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::terms::table
+            .filter({{crate_name}}::schema::terms::slug.eq("news"))
+            .select({{crate_name}}::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the term")
+    };
+
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Primary"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+    let menu: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::menus::table
+            .select({{crate_name}}::schema::menus::id)
+            .first(&mut conn)
+            .await
+            .expect("the menu")
+    };
+
+    // One item of each kind the editor offers.
+    for fields in [
+        vec![("label", "Deep page"), ("post_id", nested.as_str())],
+        vec![("label", "News"), ("term_id", &term.to_string())],
+        vec![("label", "Elsewhere"), ("url", "https://example.com/x")],
+    ] {
+        let mut all = fields.clone();
+        all.push(("parent_id", ""));
+        client
+            .post(&format!("/admin/appearance/menus/{menu}/items"))
+            .header("cookie", &cookie)
+            .form(&form(&all))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    sign_out(&client);
+    let home = client.get("/").send().await;
+    home.assert_ok();
+    let home = home.text();
+    assert!(
+        home.contains("/about/team/alice"),
+        "a page target keeps its full ancestry through the batched walk:\n{home}"
+    );
+    assert!(home.contains("/category/news"), "a term target resolves");
+    assert!(
+        home.contains("https://example.com/x"),
+        "a raw URL passes through"
+    );
+}

@@ -196,38 +196,33 @@ impl Repos {
         };
         let items = self.menu_items.find_by_menu_id(menu.id).await?;
 
-        // Resolve every post- and term-targeted item up front, so building the
-        // tree is a pure function and needs no database access per node.
-        let mut resolved: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-        for item in &items {
-            resolved.insert(item.id, self.menu_item_url(item, settings).await?);
-        }
+        // Every target loaded in two set queries — plus one per level of page
+        // hierarchy — rather than one query per item and one more per ancestor.
+        // This runs on *every* public page render and the item count is
+        // whatever an editor has added, so the per-item shape made a large but
+        // perfectly valid menu a few hundred round trips on the front page.
+        let post_ids: Vec<i64> = items.iter().filter_map(|item| item.post_id).collect();
+        let term_ids: Vec<i64> = items.iter().filter_map(|item| item.term_id).collect();
+        let (posts, terms) = self
+            .with_conn(async move |conn| {
+                let posts = crate::content::posts_with_ancestors(conn, &post_ids).await?;
+                let terms = crate::content::terms_by_ids(conn, &term_ids).await?;
+                Ok((posts, terms))
+            })
+            .await?;
+
+        // Building the tree is a pure function over those maps and needs no
+        // database access per node.
+        let resolved: std::collections::HashMap<i64, String> = items
+            .iter()
+            .map(|item| (item.id, menu_item_url(item, &posts, &terms, settings)))
+            .collect();
         Ok(theme::build_nav(&items, &|item: &MenuItem| {
             resolved
                 .get(&item.id)
                 .cloned()
                 .unwrap_or_else(|| "/".to_owned())
         }))
-    }
-
-    /// A menu item's target: its post, its term, or its raw URL — in that
-    /// order, matching the three link kinds the menu editor offers.
-    async fn menu_item_url(&self, item: &MenuItem, settings: &Settings) -> AutumnResult<String> {
-        if let Some(post_id) = item.post_id
-            && let Some(post) = self.posts.find_by_id(post_id).await.ok().flatten()
-        {
-            return self.permalink(&post, settings).await;
-        }
-        if let Some(term_id) = item.term_id
-            && let Some(term) = self.terms.find_by_id(term_id).await.ok().flatten()
-        {
-            return Ok(theme::term_url(&term));
-        }
-        Ok(if item.url.trim().is_empty() {
-            "/".to_owned()
-        } else {
-            item.url.clone()
-        })
     }
 
     /// Render the primary sidebar.
@@ -578,4 +573,63 @@ impl Submit {
             .as_ref()
             .map_or("", autumn_web::security::SubmitToken::token)
     }
+}
+
+/// A menu item's target: its post, its term, or its raw URL — in that order,
+/// matching the three link kinds the menu editor offers.
+///
+/// Pure, over maps the caller loaded in bulk. It used to take `&self` and query
+/// per item, which is what made a menu cost a round trip per entry on every
+/// public render.
+fn menu_item_url(
+    item: &MenuItem,
+    posts: &std::collections::HashMap<i64, Post>,
+    terms: &std::collections::HashMap<i64, crate::models::Term>,
+    settings: &Settings,
+) -> String {
+    if let Some(post) = item.post_id.and_then(|id| posts.get(&id)) {
+        let ancestry = if post.post_type == "page" {
+            ancestry_from(post, posts)
+        } else {
+            Vec::new()
+        };
+        return settings
+            .permalink_structure
+            .permalink(post, &ancestry, settings.zone());
+    }
+    if let Some(term) = item.term_id.and_then(|id| terms.get(&id)) {
+        return theme::term_url(term);
+    }
+    if item.url.trim().is_empty() {
+        "/".to_owned()
+    } else {
+        item.url.clone()
+    }
+}
+
+/// A page's ancestor slugs, outermost first, read from an already-loaded map.
+///
+/// The same bound and the same cycle guard as `Repos::page_ancestry`; an
+/// ancestor missing from the map ends the walk, exactly as a missing row does
+/// there.
+fn ancestry_from(post: &Post, posts: &std::collections::HashMap<i64, Post>) -> Vec<String> {
+    const MAX_DEPTH: usize = crate::content::MAX_PAGE_DEPTH;
+    let mut slugs = Vec::new();
+    let mut cursor = post.parent_id;
+    let mut seen = vec![post.id];
+    while let Some(parent_id) = cursor {
+        if slugs.len() >= MAX_DEPTH || seen.contains(&parent_id) {
+            break;
+        }
+        seen.push(parent_id);
+        match posts.get(&parent_id) {
+            Some(parent) => {
+                slugs.push(parent.slug.clone());
+                cursor = parent.parent_id;
+            }
+            None => break,
+        }
+    }
+    slugs.reverse();
+    slugs
 }

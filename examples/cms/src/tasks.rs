@@ -7,12 +7,15 @@
 //! 3am publishes at 3am on a site nobody visits at 3am.
 
 use autumn_web::prelude::*;
-use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
 
-use crate::models::Post;
 use crate::plugins::{Action, do_action};
-use crate::schema::posts;
+
+/// How many scheduled posts one sweep publishes.
+///
+/// Generous enough that an ordinary site never notices — a backlog this large
+/// means something was down — and small enough that the task's memory and
+/// runtime are bounded by the constant rather than by the backlog.
+pub const PUBLISH_BATCH: i64 = 100;
 
 /// Publish posts whose scheduled time has arrived.
 ///
@@ -26,13 +29,10 @@ pub async fn publish_scheduled(state: AppState) -> AutumnResult<()> {
         .ok_or_else(|| AutumnError::service_unavailable_msg("No database pool"))?;
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
 
-    let now = chrono::Utc::now().naive_utc();
-    let due: Vec<Post> = posts::table
-        .filter(posts::status.eq("future"))
-        .filter(posts::published_at.le(now))
-        .select(Post::as_select())
-        .load(&mut conn)
-        .await?;
+    // One bounded batch per tick — see `content::due_scheduled_posts`. The
+    // remainder is drained by the following runs, which is what a sweep that
+    // fires every minute is for.
+    let due = crate::content::due_scheduled_posts(&mut conn, PUBLISH_BATCH).await?;
 
     if due.is_empty() {
         return Ok(());

@@ -1043,6 +1043,43 @@ pub async fn live_child_count(conn: &mut AsyncPgConnection, post_id: i64) -> Aut
         .await?)
 }
 
+/// How many live posts would be re-rooted by deleting `author_id`'s content.
+///
+/// A child whose parent is deleted has its `parent_id` set to `NULL` by the
+/// foreign key, so it moves to the top level and its canonical URL changes from
+/// `/parent/child` to `/child` — every inbound link and every sitemap entry for
+/// it breaks, silently. Children the same author owns are deleted alongside
+/// their parent and so are not at risk; it is the ones somebody *else* owns
+/// that survive the cascade and get re-rooted.
+///
+/// The same argument `transition_status` makes about trashing a parent, applied
+/// to the other path that can remove one.
+pub async fn orphaned_by_deleting_author(
+    conn: &mut AsyncPgConnection,
+    author_id: i64,
+) -> AutumnResult<i64> {
+    // Raw SQL because this is a self-join on `posts`, which the query builder
+    // needs a table alias for; the shape is simple enough that the alias would
+    // cost more than it explains.
+    use diesel::sql_types::BigInt;
+
+    #[derive(diesel::QueryableByName)]
+    struct Total {
+        #[diesel(sql_type = BigInt)]
+        count: i64,
+    }
+
+    Ok(diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM posts child \
+         JOIN posts parent ON parent.id = child.parent_id \
+         WHERE parent.author_id = $1 AND child.author_id <> $1 AND child.status <> 'trash'",
+    )
+    .bind::<BigInt, _>(author_id)
+    .get_result::<Total>(conn)
+    .await?
+    .count)
+}
+
 /// Persist a whole settings form in one transaction.
 ///
 /// Option-by-option commits let two administrators saving at once interleave
@@ -1236,6 +1273,27 @@ pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> Autumn
                 // `post_terms` row takes `FOR KEY SHARE` on the post it
                 // references, and that conflicts, so a concurrent filing waits
                 // for this transaction rather than racing it.
+                // Refused before anything is deleted, and inside the
+                // transaction so the answer cannot go stale: another author's
+                // live page filed under one of these would be silently
+                // re-rooted by `parent_id ... ON DELETE SET NULL`, changing its
+                // canonical URL and breaking every link to it. The explicit
+                // trash path already refuses for this reason; deleting the
+                // author was the way around it.
+                let orphaned = orphaned_by_deleting_author(conn, target_id).await?;
+                if orphaned > 0 {
+                    return Err(AutumnError::unprocessable_msg(format!(
+                        "{} other {} filed under this account's pages and would lose \
+                         their place in the hierarchy. Re-file or trash them first.",
+                        orphaned,
+                        if orphaned == 1 {
+                            "page is"
+                        } else {
+                            "pages are"
+                        }
+                    )));
+                }
+
                 let post_ids: Vec<i64> = posts::table
                     .filter(posts::author_id.eq(target_id))
                     .select(posts::id)
@@ -1583,6 +1641,22 @@ const RESERVED_PATHS: &[&str] = &[
     "static",
     "archives",
     "author",
+    // Mounted by the *framework*, not by this app, which is exactly why they
+    // were missing: nothing in `all_routes()` mentions them, so the list built
+    // from what the app declares had no reason to include them. They are on by
+    // default (`health.enabled`), and a literal route beats the front
+    // controller's wildcard — so a page titled "Health" took the bare slug
+    // `health`, advertised `/health` as its permalink, and was unreachable at
+    // it forever.
+    //
+    // Spelled without the leading slash to match the rest of this list, which
+    // holds first path segments. An operator who renames them in `autumn.toml`
+    // narrows the reservation rather than widening it, which is the safe
+    // direction: a reserved slug nothing serves costs one suffixed URL.
+    "health",
+    "live",
+    "ready",
+    "startup",
 ];
 
 /// Whether a slug would be shadowed by one of the application's own routes.
@@ -2495,6 +2569,43 @@ pub async fn terms_page_with_total(
     Ok((rows, total))
 }
 
+/// The posts named by `ids`, plus every ancestor needed to build their
+/// permalinks, as one map.
+///
+/// A menu resolved item by item cost one query per entry and, for a page, one
+/// more per ancestor — on every public page render, with the item count bounded
+/// only by what an editor has added. This is instead one query per *level* of
+/// the hierarchy, at most `MAX_PAGE_DEPTH` of them, whatever the menu's size.
+///
+/// The walk stops on a row already in the map, so a `parent_id` cycle (only
+/// reachable by a direct write) terminates rather than looping.
+pub async fn posts_with_ancestors(
+    conn: &mut AsyncPgConnection,
+    ids: &[i64],
+) -> AutumnResult<std::collections::HashMap<i64, Post>> {
+    let mut found: std::collections::HashMap<i64, Post> = std::collections::HashMap::new();
+    let mut wanted: Vec<i64> = ids.to_vec();
+    for _ in 0..=MAX_PAGE_DEPTH {
+        wanted.retain(|id| !found.contains_key(id));
+        if wanted.is_empty() {
+            break;
+        }
+        let rows: Vec<Post> = posts::table
+            .filter(posts::id.eq_any(&wanted))
+            .select(Post::as_select())
+            .load(&mut *conn)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        wanted = rows.iter().filter_map(|post| post.parent_id).collect();
+        for post in rows {
+            found.insert(post.id, post);
+        }
+    }
+    Ok(found)
+}
+
 /// Which of `ids` are terms in `taxonomy`, in one query.
 ///
 /// The editor resolved a submitted id set one lookup at a time, so a crafted
@@ -2851,6 +2962,28 @@ pub async fn attachments_page(
 /// How many rows the media library holds, for its pager.
 pub async fn attachment_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
     Ok(attachments::table.count().get_result(conn).await?)
+}
+
+/// One bounded batch of scheduled posts whose time has arrived, oldest first.
+///
+/// Bounded and ordered in SQL. The sweep loaded *every* due post — full bodies
+/// and all — before publishing any of them, so a backlog (downtime, or many
+/// authors scheduling the same slot) could exhaust the task's memory or run
+/// past its next tick and delay every publication behind it. Oldest first so a
+/// backlog drains in the order the schedules were meant to fire, rather than
+/// starving the earliest posts behind newer ones.
+pub async fn due_scheduled_posts(
+    conn: &mut AsyncPgConnection,
+    limit: i64,
+) -> AutumnResult<Vec<Post>> {
+    Ok(posts::table
+        .filter(posts::status.eq("future"))
+        .filter(posts::published_at.le(chrono::Utc::now().naive_utc()))
+        .order((posts::published_at.asc(), posts::id.asc()))
+        .limit(limit.max(0))
+        .select(Post::as_select())
+        .load(conn)
+        .await?)
 }
 
 /// Publish one due scheduled post and rebuild its terms' counts — atomically.
