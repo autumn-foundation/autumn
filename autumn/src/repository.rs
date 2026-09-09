@@ -201,11 +201,10 @@ pub async fn dependent_nullify<M: 'static>(
 /// unlocked read has no such re-check: it can return a row that is reparented
 /// and committed away before the caller's later DELETE/decrement run,
 /// decrementing the wrong parent's counter cache for a row that was never
-/// actually removed. The deterministic `ORDER BY id` acquisition order also
-/// matters on its own even with no counter caches to decrement: it is what
-/// keeps two concurrent cascades that reach an overlapping child set through
-/// different foreign keys from deadlocking against each other (see
-/// [`dependent_delete_all`]'s doc comment).
+/// actually removed. Used only when a counter-cache decrement needs the ids
+/// back afterwards — see [`lock_dependent_children_for_update`] for the
+/// id-free variant, and [`dependent_delete_all`]'s doc comment for why the
+/// `ORDER BY id` acquisition order matters even with no counter caches.
 #[cfg(feature = "db")]
 async fn dependent_child_ids_for_update(
     conn: &mut crate::db::RuntimeConnection,
@@ -238,23 +237,65 @@ async fn dependent_child_ids_for_update(
     .collect())
 }
 
+/// Take the same `FOR UPDATE`, ascending-id locks [`dependent_child_ids_for_update`]
+/// does, without materializing the ids.
+///
+/// Codex review, PR #2647: [`dependent_delete_all`]'s deterministic pre-lock
+/// only needs ids at all when there are counter caches to decrement; a
+/// cache-free cascade needs the LOCKS (for deadlock-free ordering against a
+/// concurrent cascade through a different foreign key) but never reads an id
+/// back. Loading them into a `Vec<i64>` just to discard it would turn a
+/// `delete_all`/leaf-`destroy` cascade with a huge fan-out back into an
+/// O(rows) *memory*/network operation even though it stays O(1) *statements*
+/// — exactly the blowup this PR exists to remove. `execute` runs the query to
+/// completion — taking every lock — and reads back only the row count from
+/// the command tag, the same pattern [`position_advisory_lock`] already uses
+/// for a lock-only `SELECT`.
+#[cfg(feature = "db")]
+async fn lock_dependent_children_for_update(
+    conn: &mut crate::db::RuntimeConnection,
+    table: &str,
+    fk_column: &str,
+    parent_id: i64,
+) -> crate::AutumnResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    let for_update: &str = crate::backend_select! {
+        pg => { " FOR UPDATE" },
+        sqlite => { "" },
+    };
+
+    diesel::sql_query(format!(
+        "SELECT id FROM \"{table}\" WHERE \"{fk_column}\" = $1 ORDER BY id{for_update}"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(parent_id)
+    .execute(conn)
+    .await
+    .map_err(crate::AutumnError::from)?;
+    Ok(())
+}
+
 /// Bulk-delete every child row pointing at `parent_id`.
 ///
 /// #1325: same shape as [`dependent_nullify`] — the rows are about to go, so
 /// their counter-cached parents are decremented first, across every spec.
 ///
-/// Codex review, PR #2647: the child-id snapshot is taken (and locked, in
-/// ascending id order) unconditionally, not only when `has_counter_caches` —
-/// without it, two concurrent cascades hitting an overlapping child set
-/// through *different* foreign keys (a diamond: the same child table
-/// `dependent(..., on_delete = destroy)` of two different parents) would each
-/// fall straight through to a plan-dependent-order bulk `DELETE`, and two
-/// deletes locking the same overlapping rows in opposite orders can deadlock,
-/// aborting one parent's cascade. The pre-lock, taken in the same `ORDER BY
-/// id` every concurrent caller uses, makes the acquisition order deterministic
-/// regardless of which foreign key drove the scan — matching the per-row
-/// Destroy loop's existing guarantee. Still O(1) statements: one extra locked
-/// `SELECT`, not one per row.
+/// Codex review, PR #2647: an ordered pre-lock now runs unconditionally, not
+/// only when `has_counter_caches` — without it, two concurrent cascades
+/// hitting an overlapping child set through *different* foreign keys (a
+/// diamond: the same child table `dependent(..., on_delete = destroy)` of two
+/// different parents) would each fall straight through to a plan-dependent-
+/// order bulk `DELETE`, and two deletes locking the same overlapping rows in
+/// opposite orders can deadlock, aborting one parent's cascade. The pre-lock,
+/// taken in the same `ORDER BY id` every concurrent caller uses, makes the
+/// acquisition order deterministic regardless of which foreign key drove the
+/// scan — matching the per-row Destroy loop's existing guarantee. Which
+/// pre-lock variant runs depends on whether the ids are needed afterwards:
+/// [`dependent_child_ids_for_update`] when a counter-cache decrement will read
+/// them back, [`lock_dependent_children_for_update`] otherwise, so a cache-free
+/// cascade over a huge fan-out never materializes a child id it doesn't need.
+/// Either way this stays O(1) statements: one extra locked `SELECT`, not one
+/// per row.
 ///
 /// This is a runtime support function for code generated by Autumn proc macros.
 /// It is semver-exempt; do not call it directly.
@@ -275,9 +316,11 @@ pub async fn dependent_delete_all<M: 'static>(
 ) -> crate::AutumnResult<()> {
     use diesel_async::RunQueryDsl;
 
-    let ids = dependent_child_ids_for_update(conn, table, fk_column, parent_id).await?;
     if has_counter_caches {
+        let ids = dependent_child_ids_for_update(conn, table, fk_column, parent_id).await?;
         counter_cache_before_delete_many(conn, specs, &ids).await?;
+    } else {
+        lock_dependent_children_for_update(conn, table, fk_column, parent_id).await?;
     }
 
     diesel::sql_query(format!(
