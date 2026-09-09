@@ -392,8 +392,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/guide/coming-from-other-frameworks.md` is the sharp one: its
   Spring→Autumn actuator table exists for the sole purpose of telling a
   migrating reader what an endpoint is *called* here, and its `scheduledtasks`
-  row said the name was unchanged. It is not — Autumn serves the same
-  `{"scheduled_tasks": […]}` payload at `/actuator/tasks` — so the one page
+  row said the name was unchanged. It is not — Autumn serves scheduled tasks at
+  `/actuator/tasks`, as a `scheduled_tasks` object keyed by task name rather
+  than Spring's per-trigger-type lists — so the one page
   written to prevent that 404 was the page causing it, and because the real
   endpoint shares no token with the word the reader searched for, searching
   again could not rescue them. `docs/guide/generators.md` and
