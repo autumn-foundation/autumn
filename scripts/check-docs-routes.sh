@@ -116,6 +116,13 @@
 #     COMPILES `examples/wiki/content/*.md` in and SERVES them at `/docs/…`
 #     (`check-docs-toml.sh` notes the same), so four actuator paths there are
 #     shown by a running app rather than read from a repo.
+#   - every file a `Cargo.toml` names with `readme = "…"`. That file is the
+#     crate's crates.io landing page, so it is reader-facing by PUBLICATION
+#     rather than by where it sits in the tree, which is why no directory rule
+#     reaches it. `autumn-admin-plugin/README.md` documents the actuator prefix.
+#     Reading the manifests also discriminates, where a blanket `*/README.md`
+#     would not: `autumn/vendor/README.md`, `benchmarks/*/README.md` and the
+#     CLI's starter templates are working notes that nothing publishes.
 #   - `.claude/skills/`, a SECOND skill tree rather than a copy of `skills/`.
 #     `check-docs-orphans.sh` seeds both as reader entry surfaces because the
 #     agent machinery loads each by name, and `run-autumn` lives only here. Its
@@ -322,6 +329,36 @@ def in_scope(path):
     return path.startswith(INCLUDE_DIRS) or path in INCLUDE_FILES
 
 
+# `readme = "…"` in a crate manifest. The file it names is the crate's
+# crates.io landing page, so it is reader-facing by publication rather than by
+# where it sits in the tree — which is why a directory-shaped corpus rule cannot
+# reach it, and why the answer is to read the manifests rather than to add seven
+# more directories to `INCLUDE_DIRS` and miss the eighth.
+#
+# Deriving it also DISCRIMINATES, which a blanket `*/README.md` would not:
+# `autumn/vendor/README.md`, `benchmarks/*/README.md` and the CLI's starter
+# templates are working notes, not published pages, and none of them is named by
+# a manifest.
+CARGO_README = re.compile(r"^\s*readme\s*=\s*\"([^\"]+)\"", re.M)
+
+
+def package_readmes(root):
+    """Every file a `Cargo.toml` publishes as its crate's README."""
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "*Cargo.toml"],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout
+    out = set()
+    for rel in filter(None, listing.split("\0")):
+        manifest = pathlib.PurePosixPath(rel)
+        text = (root / rel).read_text(encoding="utf-8", errors="ignore")
+        for named in CARGO_README.findall(text):
+            # `readme = "../README.md"` points at the workspace root's page.
+            resolved = os.path.normpath(str(manifest.parent / named))
+            out.add(resolved.replace(os.sep, "/"))
+    return out
+
+
 def corpus(root):
     """The reader-facing pages, including the one written into a new project.
 
@@ -340,8 +377,9 @@ def corpus(root):
     out = subprocess.run(["git", "ls-files", "-z", "*.md", "*.md.tmpl"],
                          cwd=root, capture_output=True, text=True,
                          check=True).stdout
+    published = package_readmes(root)
     return [f for f in out.split("\0")
-            if f and (in_scope(f) or f.endswith(".md.tmpl"))]
+            if f and (in_scope(f) or f.endswith(".md.tmpl") or f in published)]
 
 
 # ── Extraction ───────────────────────────────────────────────────────────────
@@ -421,8 +459,16 @@ TRAILING = ".,;:!?)\"'`]}>"
 # the handful the corpus happens to use, for the same reason `PATH_CHARS` is the
 # grammar rather than a hand-picked set: a method left out is a request line
 # read as prose, and the standard already enumerates them.
+#
+# `wget` and friends join `curl` because the corpus already uses them:
+# `examples/bookmarks-distributed/README.md:200` runs
+# `wget -qO- localhost:3000/actuator/health` inside a health-check loop. A
+# client left out is a copyable request read as prose. `http` (HTTPie's command)
+# is deliberately absent — it is an ordinary English word here, and matching it
+# would classify prose about "http" as a request.
 REQUEST_LINE = re.compile(
-    r"\bcurl\b|\b(?:GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH)"
+    r"\b(?:curl|wget|xh|httpie)\b"
+    r"|\b(?:GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH)"
     r"\s+(?:https?://[^\s/]+)?/")
 
 # `<!-- route-surface-allow: /actuator/x — reason -->`. The reason is required:
@@ -870,6 +916,10 @@ def self_test():
         ("/actuator/*  GET      -> actuator", False),
         # A route-listing table row: the `|` is not a scheme.
         ("| GET | /actuator/health | liveness |", False),
+        # Clients other than curl, which the corpus already uses:
+        # bookmarks-distributed/README.md runs a `wget` health-check loop.
+        ("wget -qO- localhost:3000/actuator/health", True),
+        ("xh GET localhost:3000/actuator/health", True),
         # Every standard method, not the handful the corpus happens to use.
         ("OPTIONS /actuator/webhooks", True),
         ("TRACE /actuator/webhooks", True),
@@ -926,10 +976,20 @@ def self_test():
     # The scaffolded README is a `.md.tmpl`; `.claude/skills/` is a second skill
     # tree the agent machinery loads by name; the wiki example compiles its
     # content pages in and serves them at `/docs/...`.
+    here = corpus(ROOT)
     for path in ("autumn-cli/src/templates/README.md.tmpl",
                  ".claude/skills/run-autumn/SKILL.md",
-                 "examples/wiki/content/configuration.md"):
-        cases.append((f"`{path}` is in the corpus", path in corpus(ROOT), True))
+                 "examples/wiki/content/configuration.md",
+                 # A crates.io landing page: reader-facing by publication
+                 # rather than by where it sits, and it documents `/actuator`.
+                 "autumn-admin-plugin/README.md"):
+        cases.append((f"`{path}` is in the corpus", path in here, True))
+
+    # Reading the manifests DISCRIMINATES, which a blanket `*/README.md` would
+    # not. These are working notes, published by nothing, and must stay out.
+    for path in ("autumn/vendor/README.md", "benchmarks/runtime/README.md",
+                 "autumn-cli/src/starters/saas/README.md"):
+        cases.append((f"`{path}` is NOT in the corpus", path in here, False))
 
     passed = failed = 0
     for label, got, want in cases:

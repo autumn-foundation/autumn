@@ -376,15 +376,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`check-docs-toml.sh`) and the Rust path they import
   (`check-docs-symbols.sh`). None of them looks at the sixth thing a reader
   copies off a page: the **URL they curl**. `scripts/check-docs-routes.sh`
-  resolves every `/actuator/…` path in the corpus — **249 occurrences across
-  199 files** — against the paths the framework actually mounts, and it runs in
+  resolves every `/actuator/…` path in the corpus — **250 occurrences across
+  206 files** — against the paths the framework actually mounts, and it runs in
   CI's docs-only job beside the other five. The corpus is every markdown surface
   a reader can end up holding, which is wider than a `docs/`-shaped view of one:
   besides the guide it covers every `*.md.tmpl` (`new.rs` writes
   `templates/README.md.tmpl` as every scaffolded application's README), all of
   `examples/` (the wiki example compiles `content/*.md` in and serves them at
-  `/docs/…`), and `.claude/skills/` (a second skill tree the agent machinery
-  loads by name, whose `run-autumn` drives a real server with `curl`).
+  `/docs/…`), `.claude/skills/` (a second skill tree the agent machinery loads
+  by name, whose `run-autumn` drives a real server with `curl`), and every file
+  a `Cargo.toml` names with `readme = "…"` — a crates.io landing page is
+  reader-facing by publication rather than by where it sits, and reading the
+  manifests keeps vendor notes and starter templates out.
   It is the only one of the six whose failure lands against a *running app*
   rather than while the reader is still reading, and the actuator is the
   operator surface: `/actuator/health` is what a load balancer probes,
