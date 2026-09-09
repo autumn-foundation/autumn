@@ -504,13 +504,30 @@ statements on the origin, each taking an `ACCESS EXCLUSIVE` lock and rewriting
 the table. So psql decides that part instead of the server:
 
 ```
+\set autumn_scrubbed false
+BEGIN;
+... the guarded transaction ...
+SELECT true AS autumn_scrubbed \gset      -- its last statement
+COMMIT;
+\set autumn_commit_error :ERROR
 SET search_path = pg_catalog, public;
-SELECT NOT (...the same predicate the guard uses...) AS autumn_on_target \gset
+SELECT (:'autumn_scrubbed'::bool AND NOT :'autumn_commit_error'::bool
+        AND NOT (...the same predicate the guard uses...)) AS autumn_on_target \gset
 \if :autumn_on_target
 SET lock_timeout = '30s';
 VACUUM (FULL, ANALYZE) "public"."users";
 \endif
 ```
+
+Being on the right server is not the same as having scrubbed it, so the fence
+asks both. A statement failing inside the transaction for a reason the guard
+knows nothing about — a lock timeout, a constraint — aborts it, and the printed
+`COMMIT` still clears that state; measured, an endpoint-only probe then ran all
+six compaction statements against a target whose scrub had just rolled back.
+psql's `:ERROR` does not close it either, because psql reports that `ROLLBACK`
+as a *success*. The transaction's last statement therefore sets a variable an
+aborted transaction cannot set, and `:ERROR` is captured immediately after
+`COMMIT` — by a `\set`, which executes no query and so does not reset it.
 
 Both failure modes are closed, measured on psql 16.13: a false value prints
 `query ignored` for every statement in the block, and a `\gset` whose query

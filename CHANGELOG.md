@@ -459,7 +459,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EXCLUSIVE` lock. The script now emits the same predicate through `\gset` and
   wraps the compaction in `\if`; both failure modes are closed (a false value
   prints `query ignored`, and a `\gset` whose query errored leaves the variable
-  unset, which `\if` reports and still skips).
+  unset, which `\if` reports and still skips). That fence also requires the
+  transaction to have SUCCEEDED, not merely to be on the right server: measured,
+  a statement failing inside the transaction for a reason the guard knows
+  nothing about still left an endpoint-only probe true, and all six
+  `VACUUM (FULL, ANALYZE)` ran — `ACCESS EXCLUSIVE` locks and full rewrites on a
+  target whose scrub had just rolled back. psql's own `:ERROR` does not catch it
+  (it reports that `ROLLBACK` as success), so the transaction's last statement
+  sets a `\gset` flag that an aborted transaction cannot set.
   Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and

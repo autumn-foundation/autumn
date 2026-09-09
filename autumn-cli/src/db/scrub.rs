@@ -2670,6 +2670,11 @@ fn classify_and_apply(
             for line in psql_connect(label, url) {
                 eprintln!("  {line}");
             }
+            // Reset per target: a previous target's success must not vouch for
+            // this one. `\gset` leaves a variable untouched when its query
+            // fails, so this explicit `false` is what survives an aborted
+            // transaction.
+            eprintln!("  \\set autumn_scrubbed false");
             eprintln!("  BEGIN;");
             // The same session pins `execute` sets, before anything reads or
             // writes: without them a role-level `search_path` resolves the
@@ -2720,6 +2725,11 @@ fn classify_and_apply(
             for (table, _) in &phases.final_pass {
                 eprintln!("  {};", emptiness_assertion(table));
             }
+            // The last statement inside the transaction, and the whole reason
+            // the compaction below can tell a scrubbed target from an aborted
+            // one. In an aborted transaction this SELECT is refused like every
+            // other, so `\gset` assigns nothing and the `false` above stands.
+            eprintln!("  SELECT true AS autumn_scrubbed \\gset");
             eprintln!("  COMMIT;");
             // Deliberately outside the envelope, as in `execute`: VACUUM (FULL)
             // cannot run inside a transaction block. Printed as the real
@@ -4236,9 +4246,14 @@ fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
 /// pasting session's path happens to be.
 fn post_commit_fence(endpoint: &ServerEndpoint) -> Vec<String> {
     vec![
+        // FIRST, before any statement runs: a query would reset psql's own
+        // `:ERROR`, and this is the only moment it still describes the `COMMIT`.
+        // `\set` is a meta-command and executes nothing, so it is safe here.
+        "\\set autumn_commit_error :ERROR".to_owned(),
         "SET search_path = pg_catalog, public;".to_owned(),
         format!(
-            "SELECT NOT ({}) AS autumn_on_target \\gset",
+            "SELECT (:'autumn_scrubbed'::bool AND NOT :'autumn_commit_error'::bool \
+             AND NOT ({})) AS autumn_on_target \\gset",
             endpoint_mismatch(endpoint),
         ),
         "\\if :autumn_on_target".to_owned(),
@@ -4801,15 +4816,38 @@ mod tests {
         // The run's own pins are SET LOCAL, so they belong to the transaction
         // that just rolled back. Without re-pinning, the operators below resolve
         // through the pasting session's own search_path.
-        assert_eq!(
-            fence.first().map(String::as_str),
-            Some("SET search_path = pg_catalog, public;"),
+        assert!(
+            fence
+                .iter()
+                .any(|line| line == "SET search_path = pg_catalog, public;"),
             "the fence must re-pin the path it needs: {fence:?}"
         );
         assert!(
             fence.iter().any(|line| line.contains("\\gset"))
                 && fence.iter().any(|line| line == "\\if :autumn_on_target"),
             "psql, not the server, has to decide this one: {fence:?}"
+        );
+        // Being on the right server is not the same as having scrubbed it.
+        // Measured: with a statement inside the transaction failing for a
+        // reason the guard knows nothing about, `COMMIT` returned ROLLBACK and
+        // an endpoint-only probe still ran all six VACUUM (FULL, ANALYZE) —
+        // ACCESS EXCLUSIVE locks and full rewrites on a target whose scrub had
+        // just rolled back. `:ERROR` does not catch it either: measured, psql
+        // reports that ROLLBACK as SUCCESS, so it is false there. Hence the
+        // explicit flag, set as the transaction's last statement.
+        assert!(
+            fence
+                .iter()
+                .any(|line| line.contains("autumn_scrubbed") && line.contains("::bool")),
+            "the fence must require the transaction to have succeeded: {fence:?}"
+        );
+        // And `:ERROR` must be captured before anything else runs, because a
+        // statement of any kind resets it — `\set` is a meta-command and
+        // executes nothing, which is why it can come first.
+        assert_eq!(
+            fence.first().map(String::as_str),
+            Some("\\set autumn_commit_error :ERROR"),
+            "the commit's own error state has to be read before it is lost: {fence:?}"
         );
         // The same predicate as the guard, so the two cannot come to disagree
         // about what counts as the right server.
