@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **web:** the `application/problem+json` `errors` array no longer includes a
+  field whose validation entry carries zero messages — it now matches
+  `AutumnError`'s `Display`, which already skipped such a field (issue
+  #2587 follow-up). `AutumnError::validation(...)` takes a raw
+  `HashMap<String, Vec<String>>`, so an app that inserts a field
+  unconditionally but only pushes a message when it actually fails produced
+  a body like `{"field":"title","messages":[]}` — a client reading `errors`
+  saw a field named as failing with no reason given, while the same error's
+  logged `Display` output correctly omitted it. `errors` now filters
+  empty-message fields the same way `Display` does.
+
 ### Security
 
 - **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
@@ -82,6 +95,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `docs/security/2026-09-08-aliased-authorize-idempotency-bypass/`.
 
 ### Performance
+
+- **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
+  (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade
+  (`autumn-macros/src/repository.rs`) selected child ids in bulk but then
+  reloaded and deleted each one individually — two statements per row,
+  even when the child has no `hooks`, isn't `soft_delete`/`versioned`/
+  `position(...)`, and declares no `dependent(...)`/`#[has_many(dependent =
+  ...)]` of its own, so nothing in that configuration ever read the
+  reload. That exact configuration now routes through the same
+  `dependent_delete_all` runtime helper `on_delete = delete_all` already
+  uses (which already batches its optional counter-cache decrement),
+  guarded by a cheap runtime check for model-attribute grandchildren
+  invisible to the macro's own attributes. Every other configuration
+  (hooks, soft-delete, versioned, broadcasting, positioned, or any
+  grandchildren) is unaffected and keeps the exact prior per-row loop.
+  `dependent_delete_all` itself now always takes a locked, ascending-id
+  pre-lock before its bulk `DELETE` — closing a stale-reparent counter-cache
+  race and a cross-cascade deadlock window the original per-row loop never
+  had, wrapped in an outer `count(*)` so locking a huge fan-out costs O(1)
+  memory and network, not one row per child — which applies equally to the
+  pre-existing `delete_all` caller. Profiled against a 500-post/~23k-comment
+  fixture cascading a 5,000-comment delete: `pg_stat_statements` calls
+  10,002 → 3, buffers 45,583 → 10,192. Full existing `dependent`/`has_many`
+  suite (29 tests, including diamond-cascade and hook/soft-delete cases)
+  passes unchanged. See
+  `docs/reports/2026-09-08-ledger-dependent-destroy-leaf-batch/`.
 
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
   `autumn/benches/feed_render.rs` profiling harness — rendering a realistic
@@ -584,6 +623,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sets the single selection authoritatively, and each choice gets an id unique
   within the group, pairing it with its own `<label for=…>`.
 
+- **An actuator path drift gate for the docs corpus [no-plugin]:** the five
+  docs gates that came before it cover the link a reader clicks
+  (`check-docs-links.sh`), the command they run (`check-docs-cli.sh`), the
+  variable they set (`check-docs-config.sh`), the config key they write
+  (`check-docs-toml.sh`) and the Rust path they import
+  (`check-docs-symbols.sh`). None of them looks at the sixth thing a reader
+  copies off a page: the **URL they curl**. `scripts/check-docs-routes.sh`
+  resolves every `/actuator/…` path in the corpus — **250 occurrences across
+  206 files** — against the paths the framework actually mounts, and it runs in
+  CI's docs-only job beside the other five. The corpus is every markdown surface
+  a reader can end up holding, which is wider than a `docs/`-shaped view of one:
+  besides the guide it covers every `*.md.tmpl` (`new.rs` writes
+  `templates/README.md.tmpl` as every scaffolded application's README), all of
+  `examples/` (the wiki example compiles `content/*.md` in and serves them at
+  `/docs/…`), `.claude/skills/` (a second skill tree the agent machinery loads
+  by name, whose `run-autumn` drives a real server with `curl`), and every file
+  a `Cargo.toml` names with `readme = "…"` — a crates.io landing page is
+  reader-facing by publication rather than by where it sits, and reading the
+  manifests keeps vendor notes and starter templates out.
+  It is the only one of the six whose failure lands against a *running app*
+  rather than while the reader is still reading, and the actuator is the
+  operator surface: `/actuator/health` is what a load balancer probes,
+  `/actuator/jobs` and `/actuator/tasks` are what someone opens at 3am to find
+  out why a scheduled backup stopped. `curl` answers `404 Not Found` with no
+  hint of the right name, and because most of the surface sits behind
+  `[actuator] sensitive = true`, that 404 reads like an endpoint they failed to
+  *enable* rather than one that was never there — so the reader goes and debugs
+  their own deployment instead of doubting the page.
+  It found **4 live defects**, all fixed here.
+  `docs/guide/coming-from-other-frameworks.md` is the sharp one: its
+  Spring→Autumn actuator table exists for the sole purpose of telling a
+  migrating reader what an endpoint is *called* here, and its `scheduledtasks`
+  row said the name was unchanged. It is not — Autumn serves scheduled tasks at
+  `/actuator/tasks`, as a `scheduled_tasks` object keyed by task name rather
+  than Spring's per-trigger-type lists — so the one page
+  written to prevent that 404 was the page causing it, and because the real
+  endpoint shares no token with the word the reader searched for, searching
+  again could not rescue them. `docs/guide/generators.md` and
+  `docs/guide/tutorial/07-htmx.md` both told readers that `autumn routes` and
+  `/actuator/routes` report the declared method behind an HTMX method override;
+  there is no `/actuator/routes`, and the route table with its declared methods
+  is served from `/actuator/graph`. The fourth is the one worth pausing on:
+  `.claude/skills/run-autumn/SKILL.md` had *already discovered* that
+  `/actuator/routes` 404s — someone hit it driving a real server and wrote the
+  warning down — but concluded "the route table comes from the CLI, not the
+  actuator", which is also wrong. So the corpus held the mistaken claim and its
+  own correction in different files, each stale in its own direction, with
+  nothing connecting them. That is precisely the state a drift gate exists to
+  make impossible.
+  The truth set is the string literals passed to `actuator_route_path()` at a
+  `.route(…)` **mount**, across non-test workspace Rust source — the one path
+  builder every actuator mount goes through, whose own doc comment says why
+  ("so paths match byte-for-byte"). Nothing to regenerate: a renamed endpoint
+  lands in the same commit as the rename. The same builder is also called from
+  two inventories (`actuator_endpoint_paths`, `actuator_mutating_routes`) and
+  from `alerts.rs`; those are read as second copies of a list, never as evidence
+  that a URL answers, so an endpoint dropped from the router but left in an
+  inventory cannot go on blessing documentation for a path nothing serves.
+  `#[cfg(test)] mod` bodies are stripped for the same reason — a drift gate must
+  not be able to inherit the drift it is checking for. Resolution is deliberately permissive in three ways that each make the
+  gate report *fewer* paths — a mounted `{param}` matches a concrete value
+  (`/actuator/loggers/root`), a documented path that is a prefix of a mounted
+  one resolves *when a page names it* (`/actuator/webhooks`), and a `*` segment
+  matches anything (`/actuator/*`) — and none of them can rescue a name that is
+  simply not there. On a line that hands the reader a **request** — a `curl`, or
+  an HTTP method followed by a path — the prefix rule is withdrawn, since there
+  a prefix is a URL someone sends and `curl …/actuator/webhooks` is a 404. A page that must name a foreign framework's endpoint waives it in
+  place with `<!-- route-surface-allow: /actuator/… — reason -->`, scoped to its
+  own block and the one above it. Run it with
+  `./scripts/check-docs-routes.sh` (`--list` for the mounted surface,
+  `--self-test` for the matcher's own cases).
+
 - **sqlite:** durable background jobs and a single-host scheduler on the SQLite
   tier (issue #1907). `jobs.backend = "sqlite"` puts the queue in an
   `autumn_jobs` table in the app's own database file, so `#[job]` work is
@@ -963,6 +1074,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🛣️ Onramp: corrected the "Local development" guidance in
+  `docs/guide/getting-started.md` about what `autumn doctor`'s
+  `version_compat` check can actually catch (docs overclaim → accurate):**
+  the guide said a source-built CLI "may scaffold projects pinning an
+  `autumn-web` version that is not on crates.io yet" and that
+  `version_compat` "reports the two versions side by side; if they
+  disagree" — implying a green check rules out version skew. In reality
+  `autumn new` always pins the CLI's own frozen-until-release
+  `CARGO_PKG_VERSION` (CLAUDE.md: never bump the workspace version outside a
+  release), which is normally already published; it is the *code* behind
+  that version number that has moved on between releases. `version_compat`
+  compares version strings, so it prints `✅ version_compat — autumn-cli
+  0.7.0 matches autumn-web 0.7.0` regardless — confirmed live on
+  `quickstart-gate.yml`'s `local-dev-quickstart` job (red since #2459
+  landed, still red as of this fix, always on this exact version-strings-
+  match-but-code-diverged path). The guide now says so plainly: don't trust
+  a green `version_compat` to rule out version skew, watch for a `cargo
+  build` failure referencing `autumn_web::` right after `autumn new`
+  instead, and apply the `[patch.crates-io]` workaround proactively when
+  building from a checkout that's ahead of the last release tag. No code
+  changes — `version_compat` still cannot see this drift (a version bump is
+  the only real fix, out of scope here), so nothing to re-measure on the
+  quickstart-gate harness; this closes the gap between what the docs
+  promised and what the check actually does.
 - **macros:** the `#[model]` association preloader named `diesel::pg::Pg`
   directly, so a `--belongs-to … --counter-cache` scaffold did not compile on a
   SQLite app. It now names `autumn_web::RuntimeBackend`, the alias that already

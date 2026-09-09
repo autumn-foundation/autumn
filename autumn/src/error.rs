@@ -1211,6 +1211,7 @@ fn validation_errors(
     let mut errors: Vec<_> = details
         .into_iter()
         .flat_map(std::collections::HashMap::iter)
+        .filter(|(_, messages)| !messages.is_empty())
         .map(|(field, messages)| ProblemFieldError {
             field: field.clone(),
             messages: messages.clone(),
@@ -2089,6 +2090,22 @@ mod tests {
             AutumnError::validation(details_map(&[("title", &[])])).to_string(),
             "Validation failed"
         );
+    }
+
+    #[tokio::test]
+    async fn json_errors_skip_a_field_with_no_messages_like_display_does() -> Result<(), axum::Error>
+    {
+        // `display_falls_back_to_the_title_without_field_messages` pins this
+        // for `Display`; the `errors` array in the JSON body must agree
+        // rather than emitting a `{"field":"title","messages":[]}` entry that
+        // names a field as failing without ever saying why (issue #2587
+        // follow-up).
+        let err = AutumnError::validation(details_map(&[("title", &[])]));
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(json["errors"], serde_json::json!([]));
+        Ok(())
     }
 
     #[test]
