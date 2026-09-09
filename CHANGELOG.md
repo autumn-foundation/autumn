@@ -29,11 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Limiter::extract_key` and `#[throttle]`'s per-route guard now fold
   `CURRENT_TENANT` into the bucket key (not into the value handed to
   `with_tier_hook`, which still receives the bare principal id its
-  documented signature promises). Apps without tenancy enabled compute the
-  same key as before. **Compatibility note:** upgrading resets any
-  in-flight bucket for a tenant-enabled `authenticated_principal`/`principal`
-  key — a one-time full-bucket refill, not a correctness change. See
-  `docs/security/2026-09-09-rate-limit-tenant-key/`.
+  documented signature promises), tagging both the tenant-present and
+  tenant-absent cases so a caller with a self-chosen principal id can never
+  forge one into colliding with the other. **Compatibility note:**
+  upgrading resets any in-flight `authenticated_principal`/`principal`
+  bucket, tenancy-enabled or not — a one-time full-bucket refill, not a
+  correctness change. See `docs/security/2026-09-09-rate-limit-tenant-key/`.
 
 - **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
   layers in SSG/ISR (`dist`) mode, closing an authn-bypass gap (🛡 Warden):**

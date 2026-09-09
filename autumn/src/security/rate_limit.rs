@@ -751,31 +751,49 @@ fn strip_key_prefix(key: &str) -> &str {
 /// prefix is preserved (rather than replaced) so `key_class_label` still
 /// recognizes the key as an authenticated principal in logs/responses.
 ///
-/// A no-op for `Ip`/`ApiToken` keys and for the IP fallback (no principal
-/// resolved): those either have no tenant-collision-prone identity or are
-/// already inherently un-shared across tenants (a bearer token is a random
-/// unique string; falling back to IP is an existing, accepted limitation).
+/// A no-op for `Ip`/`ApiToken` keys, and for the unauthenticated-IP fallback
+/// (`raw_key` does not start with `"principal:"` at all in that case): none
+/// of those carry a tenant-collision-prone identity, and none can ever
+/// collide with a `"principal:"`-prefixed key by construction.
 ///
-/// Joins the tenant and the id with a length prefix on the tenant, not a
-/// delimiter byte: `principal:tenant[<tenant.len()>]=<tenant><id>`. No
-/// delimiter byte is excludable here — `CURRENT_TENANT` can be sourced from
-/// a header (rejects control bytes at the `HeaderValue` layer) but also from
-/// a session value or a JWT claim (`tenancy.rs`'s `"session"`/`"jwt"` arms
-/// only reject an empty-after-trim value, so a `\0`, `:`, or any other byte
-/// can appear there), and `RateLimitPrincipal` wraps an equally unrestricted
-/// app-supplied `String`. A length prefix sidesteps the question entirely:
-/// decoding never searches the tenant/id bytes for a separator, so no
-/// content either string could contain changes where the boundary falls.
-/// `tenant.len()` is a byte length, matching the byte slice taken below.
+/// Both remaining `AuthenticatedPrincipal` cases — tenant resolved, or
+/// tenant absent — route through the *same* explicit tagged encoding rather
+/// than returning `raw_key` unchanged in the no-tenant case. That matters
+/// because `id` (and, when present, `tenant`)
+/// are arbitrary app-supplied strings with no excluded byte: `tenancy.rs`'s
+/// `"session"`/`"jwt"` source arms only reject an empty-after-trim tenant
+/// value, and `RateLimitPrincipal` wraps an unrestricted `String` (a
+/// username or email, not necessarily a framework-generated numeric id). If
+/// the no-tenant case had stayed as bare `principal:<id>`, an attacker able
+/// to choose their own `id` on a tenant-absent request (an app not using
+/// `[tenancy]`, or one authenticated request to a `tenancy.public_paths`
+/// route) could craft `id` to reproduce byte-for-byte whatever a *different*
+/// tenant+id pair's tagged encoding would render, colliding with that real
+/// tenant-scoped user's bucket. Tagging both cases with a literal,
+/// input-independent marker — `t` (tenant present) vs `n` (no tenant) —
+/// immediately after `principal:` makes the two families disjoint no matter
+/// what either string contains: which literal byte gets written there is
+/// chosen by which branch of the `match` runs, not by any value an attacker
+/// controls, so a `t`-tagged key can never equal an `n`-tagged one. Within
+/// the `t` case, the tenant is still length-prefixed
+/// (`principal:t<tenant.len()>:<tenant><id>`) rather than delimited, for the
+/// same reason `\0`/`:` delimiters were rejected in earlier rounds:
+/// decoding never searches the tenant/id bytes for a separator, so their
+/// content can never change where the boundary falls. `tenant.len()` is a
+/// byte length, matching the byte slice taken at decode time.
 fn tenant_qualify_bucket_key(key_strategy: KeyStrategy, raw_key: &str) -> String {
-    if key_strategy == KeyStrategy::AuthenticatedPrincipal
-        && let Some(id) = raw_key.strip_prefix("principal:")
-        && let Ok(Some(tenant)) = crate::tenancy::CURRENT_TENANT.try_with(Clone::clone)
-    {
-        let tenant_len = tenant.len();
-        format!("principal:tenant[{tenant_len}]={tenant}{id}")
-    } else {
-        raw_key.to_owned()
+    let Some(id) = (key_strategy == KeyStrategy::AuthenticatedPrincipal)
+        .then(|| raw_key.strip_prefix("principal:"))
+        .flatten()
+    else {
+        return raw_key.to_owned();
+    };
+    match crate::tenancy::CURRENT_TENANT.try_with(Clone::clone) {
+        Ok(Some(tenant)) => {
+            let tenant_len = tenant.len();
+            format!("principal:t{tenant_len}:{tenant}{id}")
+        }
+        _ => format!("principal:n:{id}"),
     }
 }
 
@@ -2437,10 +2455,45 @@ mod tests {
     }
 
     #[test]
-    fn tenant_qualify_bucket_key_is_noop_without_tenant() {
+    fn tenant_qualify_bucket_key_tags_when_tenant_absent() {
         assert_eq!(
             tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:user-42"),
-            "principal:user-42"
+            "principal:n:user-42"
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_ip_fallback_is_noop() {
+        // `raw_key` never starts with "principal:" here (the caller never
+        // resolved a `RateLimitPrincipal`), so it passes through untouched —
+        // and can never collide with a tagged key, which always does.
+        assert_eq!(
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "1.2.3.4"),
+            "1.2.3.4"
+        );
+    }
+
+    #[test]
+    fn tenant_qualify_bucket_key_tenant_present_and_absent_families_are_disjoint() {
+        // Regression for Codex's PR #2653 follow-up: round 2's fix left the
+        // tenant-absent case as bare `principal:<id>`, so an attacker able to
+        // choose their own `id` on a tenant-absent request (no `[tenancy]`,
+        // or a `tenancy.public_paths` route) could craft it to reproduce
+        // byte-for-byte whatever a *different* real tenant+id pair's
+        // round-2-encoded key would render — using their own example,
+        // tenant="a" id="bc" rendered as "principal:tenant[1]=abc", exactly
+        // what an id of "tenant[1]=abc" on a tenant-absent request would
+        // also render. The `t`/`n` tag makes the two families disjoint
+        // regardless of what either string contains.
+        let tenant_present = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a".to_owned()), || {
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:bc")
+        });
+        let tenant_absent =
+            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:t1:abc");
+        assert_ne!(
+            tenant_present, tenant_absent,
+            "a tenant-qualified key must never equal a tenant-absent key, however the \
+             tenant-absent request's principal id is crafted"
         );
     }
 

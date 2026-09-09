@@ -102,14 +102,15 @@ free, distinct principal strings.
 
 ## 🩹 Fix
 
-Added `tenant_qualify_bucket_key(key_strategy, raw_key)` in
-`rate_limit.rs`: for an `AuthenticatedPrincipal` key that actually resolved
-a principal (`raw_key` starts with `"principal:"`), it reads
-`CURRENT_TENANT` and — when present — rewrites the key to
-`principal:tenant[<tenant.len()>]=<tenant><id>` (a length prefix on the
-tenant, not a delimiter byte — see "Codex review findings" below),
-preserving the `"principal:"` prefix so `key_class_label` still reports
-"authenticated principal". Applied at both call sites:
+Added `tenant_qualify_bucket_key(key_strategy, raw_key)` in `rate_limit.rs`:
+for an `AuthenticatedPrincipal` key that actually resolved a principal
+(`raw_key` starts with `"principal:"`), it reads `CURRENT_TENANT` and emits
+one of two tagged, mutually disjoint forms — `principal:t<tenant.len()>:
+<tenant><id>` when a tenant is ambient, `principal:n:<id>` when it is not
+(both preserving the `"principal:"` prefix so `key_class_label` still
+reports "authenticated principal") — see "Codex review findings" below for
+why *both* cases needed to be tagged, not just the tenant-present one.
+Applied at both call sites:
 
 ```rust
 // resolve_key_and_params (global tower layer)
@@ -135,7 +136,8 @@ bug.
 ## 🤖 Codex review findings (PR #2653)
 
 Codex's automated review left three findings on the fix commit (`050efa4c`),
-then a fourth follow-up after the round-1 fix landed. Disposition:
+then two further follow-up findings, one after each subsequent round.
+Disposition:
 
 1. **P2, key-join ambiguity** (`tenant:id` via `:` is not injective) —
    **valid, fixed in round 1**: switched the separator to `\0`, matching
@@ -155,7 +157,30 @@ then a fourth follow-up after the round-1 fix landed. Disposition:
    reproducing the exact `tenant="a", id="b\0c"` vs `tenant="a\0b", id="c"`
    collision Codex named, alongside the round-1 colon test (renamed
    `..._with_colons`).
-3. **P1, header-sourced tenant not bound to the authenticated session** — a
+3. **P2 follow-up #2, tenant-present and tenant-absent families collide** —
+   round 2's length-prefix fix only made the *tenant-present* case
+   injective against itself; the *tenant-absent* case still returned bare
+   `principal:<id>` unchanged, sharing the same `"principal:"`-prefixed
+   namespace. Since `id` is fully attacker-supplied, a caller on a
+   tenant-absent request (no `[tenancy]`, or a `tenancy.public_paths`
+   route) could set `id` to `"tenant[1]=abc"` and land exactly on
+   `principal:tenant[1]=abc` — byte-for-byte what tenant `"a"` + id `"bc"`
+   would render, colliding with that real tenant-scoped user's bucket.
+   **Valid, fixed in round 3**: both cases now go through the same
+   function, tagged with a literal, input-independent marker right after
+   `principal:` — `t<tenant.len()>:` when a tenant is ambient, `n:` when
+   it is not — so the two families can never collide regardless of what
+   either string contains (which byte lands there is chosen by which
+   branch of the `match` runs, not by any attacker-supplied value). Added
+   `tenant_qualify_bucket_key_tenant_present_and_absent_families_are_disjoint`
+   reproducing Codex's own `tenant="a", id="bc"` example against a
+   tenant-absent id crafted to match the *old* encoding, plus
+   `tenant_qualify_bucket_key_tags_when_tenant_absent` and
+   `tenant_qualify_bucket_key_ip_fallback_is_noop` pinning the two
+   remaining no-tenant shapes (tagged bare-principal vs the untouched IP
+   fallback, which never carries a `"principal:"` prefix to collide with
+   in the first place).
+4. **P1, header-sourced tenant not bound to the authenticated session** — a
    caller with a valid tenant-A session can send an arbitrary `x-tenant-id`
    header and have `CURRENT_TENANT` (and now the bucket key) resolve to
    whatever tenant that header names, regardless of which tenant issued
@@ -173,10 +198,10 @@ then a fourth follow-up after the round-1 fix landed. Disposition:
    scope, and out of scope for a "fold the tenant into a cache/bucket key"
    fix specifically. Replied on the review thread; not resolving it (a
    human call, not mine, per the ambiguous/architectural-finding rule).
-4. **P1, `tenancy.public_paths` routes stay unqualified** — correct
+5. **P1, `tenancy.public_paths` routes stay unqualified** — correct
    mechanically (`tenancy_middleware` returns before entering the
    `CURRENT_TENANT` scope for an exempt path, so `tenant_qualify_bucket_key`
-   sees `None` and no-ops there, same as before the fix). **Not a gap
+   sees `None` and falls to the `n:`-tagged, still-shared case). **Not a gap
    introduced by this fix** — it is the same "public path stays tenantless"
    property `idempotency_tenant_scope.rs`'s
    `session_tenancy_public_path_alias_stays_tenantless` test already asserts
@@ -273,9 +298,13 @@ then a fourth follow-up after the round-1 fix landed. Disposition:
 
 - No macro or config *input* syntax changed.
 - Behavior change, recorded in `CHANGELOG.md` under `## [Unreleased]` →
-  `### Security`: upgrading resets any in-flight bucket for a
-  tenant-enabled `authenticated_principal`/`principal` key (new key string
-  → fresh bucket) — a one-time full-bucket refill, not a correctness
-  change, and not marked `**Breaking:**` since no app-visible contract
-  (config shape, response shape, `with_tier_hook` signature) changed.
+  `### Security`: upgrading resets any in-flight bucket for an
+  `authenticated_principal`/`principal` key — a one-time full-bucket
+  refill, not a correctness change, and not marked `**Breaking:**` since no
+  app-visible contract (config shape, response shape, `with_tier_hook`
+  signature) changed. As of round 3 this refill applies to every app using
+  that key strategy, not only tenancy-enabled ones — the tenant-absent case
+  is now also tagged (`principal:n:<id>`, was bare `principal:<id>`), to
+  close the round-2-vs-tenant-absent collision Codex's second follow-up
+  found. Still a one-time bucket reset, not a correctness change.
 - No config default changed; no migration required.
