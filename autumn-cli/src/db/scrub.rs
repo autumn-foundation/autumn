@@ -279,6 +279,16 @@ pub enum ScrubError {
         /// The columns that cannot be printed, as `target: table.column`, sorted.
         columns: Vec<String>,
     },
+    /// `--dry-run` cannot print a runnable script for a profile the command
+    /// refuses to scrub without `--force`.
+    ///
+    /// The script is executable and its `\connect` names the protected target,
+    /// so printing it hands over exactly the run the profile guard exists to
+    /// stop — and the password is removed on purpose, which `.pgpass` supplies.
+    UnprintableProductionTarget {
+        /// The refused profile.
+        profile: String,
+    },
     /// A table this run promises to empty carries a user-defined trigger or
     /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
     /// write, so anything it writes lands after every rewrite and is never
@@ -563,6 +573,17 @@ impl std::fmt::Display for ScrubError {
                  without --dry-run to apply it.",
                 columns.len(),
                 bullet_list(columns),
+            ),
+            Self::UnprintableProductionTarget { profile } => write!(
+                f,
+                "`--dry-run` cannot print a runnable script for the {profile:?} profile.\n  \
+                 A scrub REWRITES data in place, and this command refuses to run against \
+                 {profile:?} without `--force`. The script it prints is executable and its \
+                 `\\connect` line names that same database — with the password removed on \
+                 purpose, which is what `.pgpass` is for — so printing it would hand over \
+                 the run the profile guard exists to stop. The plan above is complete and \
+                 accurate; add `--force` to print the script too, or point `--profile` at a \
+                 staging target.",
             ),
             Self::ReplicaSessionRole { role } => write!(
                 f,
@@ -2619,6 +2640,18 @@ fn classify_and_apply(
         // trailing `echo` in the same measurement. Fail closed instead, exactly
         // as above: the plan is still reported in full, only the runnable script
         // is withheld.
+        // And refuse for a profile this command will not scrub. `writes` is
+        // false for a dry run, so `guard_scrub_target` never ran — harmless
+        // when the dry run only described a plan, and not harmless now that it
+        // prints a paste-ready script whose `\connect` names the protected
+        // target. Measured: `--dry-run --profile production` printed 14
+        // runnable lines, including that `\connect`, for a database the same
+        // command refuses to touch without `--force`.
+        guard_scrub_target(profile, args.force).map_err(|_| {
+            ScrubError::UnprintableProductionTarget {
+                profile: profile.to_owned(),
+            }
+        })?;
         let mut encrypted_rewrites: Vec<String> = plans
             .iter()
             .flat_map(|(label, _, plan, _, _)| {
@@ -4174,9 +4207,24 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
          RAISE EXCEPTION {message}, {name}, {addr}, {port}, {sysid}, {server_port}, \
          {datadir_want}, \
          pg_catalog.current_database(), pg_catalog.inet_server_addr()::text, \
-         pg_catalog.inet_server_port()::text, {sysid_call}, \
-         pg_catalog.current_setting('port'), nullif({datadir}, ''); END IF; END ",
+         pg_catalog.inet_server_port()::text, {sysid_seen}, \
+         pg_catalog.current_setting('port'), {datadir_seen}; END IF; END ",
         mismatch = endpoint_mismatch(endpoint),
+        // Report a discriminator the planning role could not read as unknown
+        // rather than calling for it: `pg_control_system()` raises for a role
+        // without EXECUTE, and a RAISE whose own argument raises replaces the
+        // mismatch this block exists to explain with `permission denied for
+        // function pg_control_system`.
+        sysid_seen = if endpoint.system_identifier.is_some() {
+            sysid_call.to_owned()
+        } else {
+            "NULL".to_owned()
+        },
+        datadir_seen = if endpoint.data_directory.is_some() {
+            format!("nullif({datadir}, '')")
+        } else {
+            "NULL".to_owned()
+        },
         name = quote_literal(&endpoint.database),
         addr = literal(endpoint.address.as_ref()),
         port = literal(endpoint.port.as_ref()),
@@ -4203,22 +4251,51 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
 fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
     let literal =
         |value: Option<&String>| value.map_or_else(|| "NULL".to_owned(), |v| quote_literal(v));
-    format!(
-        "pg_catalog.current_database() <> {name} \
-         OR pg_catalog.inet_server_addr()::text IS DISTINCT FROM {addr} \
-         OR pg_catalog.inet_server_port()::text IS DISTINCT FROM {port} \
-         OR (SELECT system_identifier::text FROM pg_catalog.pg_control_system()) \
-         IS DISTINCT FROM {sysid} \
-         OR pg_catalog.current_setting('port') IS DISTINCT FROM {server_port} \
-         OR nullif(coalesce((SELECT setting FROM pg_catalog.pg_settings \
-         WHERE name = 'data_directory'), ''), '') IS DISTINCT FROM {datadir}",
-        name = quote_literal(&endpoint.database),
-        addr = literal(endpoint.address.as_ref()),
-        port = literal(endpoint.port.as_ref()),
-        sysid = literal(endpoint.system_identifier.as_ref()),
-        server_port = literal(endpoint.server_port.as_ref()),
-        datadir = literal(endpoint.data_directory.as_ref()),
-    )
+    // Address and port are compared even when `None`, because there `None` is
+    // the target's REAL answer: both are NULL for every Unix-socket connection,
+    // and pinning that is what stops a socket block running against a TCP one.
+    let mut terms = vec![
+        format!(
+            "pg_catalog.current_database() <> {}",
+            quote_literal(&endpoint.database)
+        ),
+        format!(
+            "pg_catalog.inet_server_addr()::text IS DISTINCT FROM {}",
+            literal(endpoint.address.as_ref())
+        ),
+        format!(
+            "pg_catalog.inet_server_port()::text IS DISTINCT FROM {}",
+            literal(endpoint.port.as_ref())
+        ),
+        format!(
+            "pg_catalog.current_setting('port') IS DISTINCT FROM {}",
+            literal(endpoint.server_port.as_ref())
+        ),
+    ];
+    // These two are different: `None` means the PLANNING role could not read the
+    // value, not that the target has none — every live server has both. A term
+    // comparing against a value we never learned can only be wrong. It refuses a
+    // CORRECT paste whenever the pasting role can read what the planning role
+    // could not, and `pg_control_system()` is worse still: measured, with its
+    // EXECUTE revoked an ordinary role gets `permission denied for function
+    // pg_control_system`, which inside the guard aborts the transaction and
+    // takes the whole paste down. So an unreadable discriminator is dropped
+    // rather than guessed at; the four above still identify the endpoint.
+    if let Some(sysid) = endpoint.system_identifier.as_ref() {
+        terms.push(format!(
+            "(SELECT system_identifier::text FROM pg_catalog.pg_control_system()) \
+             IS DISTINCT FROM {}",
+            quote_literal(sysid)
+        ));
+    }
+    if let Some(datadir) = endpoint.data_directory.as_ref() {
+        terms.push(format!(
+            "nullif(coalesce((SELECT setting FROM pg_catalog.pg_settings \
+             WHERE name = 'data_directory'), ''), '') IS DISTINCT FROM {}",
+            quote_literal(datadir)
+        ));
+    }
+    terms.join(" OR ")
 }
 
 /// The psql conditional that fences everything a target block does AFTER its
@@ -4960,9 +5037,28 @@ mod tests {
         );
         assert_eq!(
             socket.matches("IS DISTINCT FROM NULL").count(),
-            5,
-            "address, port, cluster, configured port and data directory are all \
-             unknown for a default endpoint: {socket}"
+            3,
+            "address, port and the configured port are compared even when NULL — \
+             for a socket target that IS the answer: {socket}"
+        );
+        // The cluster identifier and the data directory are NOT compared when
+        // the planning role could not read them: there, `None` means "unknown",
+        // not "the target has none". A term comparing against a value never
+        // learned refuses a CORRECT paste whenever the pasting role can read
+        // what the planning role could not — and for `pg_control_system()` it
+        // is worse: measured, with EXECUTE revoked an ordinary role gets
+        // `permission denied for function pg_control_system`, which inside the
+        // guard aborts the transaction and takes the whole paste with it.
+        assert!(
+            !socket.contains("pg_control_system()) IS DISTINCT FROM")
+                && !socket.contains("'data_directory'), ''), '') IS DISTINCT FROM"),
+            "an unreadable discriminator must be dropped, not guessed at: {socket}"
+        );
+        // Nor may the RAISE call for one: an argument that raises would replace
+        // the mismatch this block exists to explain with a permission error.
+        assert!(
+            !socket.contains("pg_catalog.pg_control_system()"),
+            "and the message must not call for it either: {socket}"
         );
 
         // The database name comes from the target connection, so a quote in it

@@ -442,7 +442,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denied to examine ...` for a role without it: the view omits the row, both
   sides compare NULL, and an ordinary role loses the discriminator rather than
   the run — verified with a plain `LOGIN` role, which still refuses the clone on
-  the port alone.
+  the port alone. A discriminator the PLANNING role could not read is now
+  dropped from the guard rather than compared against the value it never
+  learned: `None` there means "unknown", not "the target has none", and such a
+  term refuses a CORRECT paste whenever the pasting role can read what the
+  planning role could not — measured, with `EXECUTE` revoked on
+  `pg_control_system()` (a per-database ACL) the emitted guard aborted the whole
+  paste with `permission denied for function pg_control_system`. Address and
+  port are still compared when NULL, because for a Unix-socket target that IS
+  the answer.
+  `--dry-run` now also refuses to print a runnable script for a profile the
+  command will not scrub without `--force`. The guard runs only when the run
+  writes, which was harmless while the dry run merely described a plan and is
+  not now that it prints a paste-ready script whose `\connect` names the
+  protected database — measured, `--dry-run --profile production` printed 14
+  runnable lines for a target the same command refuses to touch, with the
+  password removed on purpose and `.pgpass` to supply it. The plan report is
+  unchanged; only the script is withheld.
   A positive `--sample` percentage of a nonempty table now always selects at
   least one row. `ceil` alone did not guarantee the documented round-up: a
   denormal percentage (`5e-324` parses as finite and greater than zero) makes
