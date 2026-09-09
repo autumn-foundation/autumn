@@ -422,7 +422,7 @@ fn translate_requiressl_param(pairs: &mut Vec<(String, String)>) {
 /// that — so reading a query string through `query_pairs()` would silently
 /// turn `application_name=ops+cli` into `ops cli` before this sanitizer
 /// even got a chance to look at it.
-fn parse_raw_query_pairs(query: &str) -> Vec<(String, String)> {
+pub fn parse_raw_query_pairs(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|segment| !segment.is_empty())
@@ -438,11 +438,25 @@ fn parse_raw_query_pairs(query: &str) -> Vec<(String, String)> {
 /// `form_urlencoded` serialization encodes a space as `+`, which
 /// `tokio_postgres`'s own query-string decoder (pure percent-decoding, see
 /// `UrlParser::decode`) would then read back as a literal `+` rather than a
-/// space. `NON_ALPHANUMERIC` is broader than strictly necessary (it also
-/// escapes `-`/`_`/`.`/`~`, which are already query-safe), but over-encoding
-/// is harmless to a decoder that only ever percent-decodes.
-fn query_value_token(s: &str) -> String {
-    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+/// space.
+///
+/// Everything outside RFC 3986's *unreserved* set is escaped, which covers
+/// every character that could change the meaning of a query string — `&`, `=`,
+/// `?`, `#`, `%`, `+` and space among them. The four unreserved punctuation
+/// marks are deliberately left alone: a decoder that only percent-decodes reads
+/// them identically either way, and `autumn db scrub --dry-run` prints one of
+/// these strings into a `\connect` line an operator has to read before pasting,
+/// where `application%5Fname=ops%20cli` is strictly worse than
+/// `application_name=ops%20cli` for no gain.
+pub fn query_value_token(s: &str) -> String {
+    /// RFC 3986 unreserved: `A-Z a-z 0-9 - . _ ~` pass through, all else is
+    /// escaped.
+    const RESERVED: percent_encoding::AsciiSet = percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(s, &RESERVED).to_string()
 }
 
 /// Quote `value` in `libpq` keyword/value form if needed (empty, contains
