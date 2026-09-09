@@ -1,0 +1,5 @@
+error: `#[derivation]` tenant column `tenant_id` is not a field of model `Comment`: the maintenance scopes its statements by `comments.tenant_id`, so it must be a column of the child
+  --> tests/compile-fail/model_derivation_tenant_non_field.rs:32:3
+   |
+32 | #[derivation(Post, column = "published_comment_count", filter = published, tenant = "tenant_id")]
+   |   ^^^^^^^^^^

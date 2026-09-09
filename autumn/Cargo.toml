@@ -811,6 +811,14 @@ path = "tests/sqlite_upsert_isolation.rs"
 name = "sqlite_votable"
 path = "tests/sqlite_votable.rs"
 
+# SQLite proof for maintained derived read models (issue #1769). The Postgres
+# suite is server-gated, so this is the only place the `sqlite` arms a
+# derivation adds are type-checked and run. Needs `--features sqlite`.
+# See the file's module doc for what it pins and how to run it.
+[[test]]
+name = "sqlite_derivation"
+path = "tests/sqlite_derivation.rs"
+
 # SQLite version-history end-to-end proof (issue #1996). Drives a
 # `versioned = true` repository against an in-memory SQLite pool: a create +
 # update + delete each append a `_autumn_version_history` row, `version_history()`

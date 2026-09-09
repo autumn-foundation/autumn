@@ -710,14 +710,14 @@ fn parse_assoc_attr(
                 input.parse::<syn::Ident>()?.to_string()
             };
             if key == "counter_cache" {
-                check_counter_cache_column(&key, &value)?;
+                check_column_ident(&key, "counter_cache", &value)?;
                 counter_cache = Some(CounterCacheDecl {
                     column: Some(value),
                     tenant_column: None,
                     span: key.span(),
                 });
             } else if key == "counter_cache_tenant" {
-                check_counter_cache_column(&key, &value)?;
+                check_column_ident(&key, "counter_cache", &value)?;
                 counter_cache_tenant = Some((value, key.span()));
             } else if key == "fk" {
                 explicit_fk = Some(value);
@@ -890,14 +890,17 @@ fn option_inner(ty: &syn::Type) -> Option<&syn::Type> {
     })
 }
 
-/// Reject a `counter_cache = "<column>"` value that is not a plain identifier.
+/// Reject a column-naming attribute value that is not a plain identifier.
 ///
 /// The value is spliced verbatim into generated SQL — `UPDATE posts SET
 /// <column> = <column> + $1 …` — so it is the one user-controlled name in the
-/// counter-cache codegen that reaches `format!`. Rejecting it here, spanned on
-/// the key, is what keeps that splice safe; the run-time
+/// counter-cache and derivation codegen that reaches `format!`. Rejecting it
+/// here, spanned on the key, is what keeps that splice safe; the run-time
 /// `is_plain_identifier` guard in `autumn_web::counter_cache` is the backstop.
-fn check_counter_cache_column(key: &syn::Ident, value: &str) -> syn::Result<()> {
+///
+/// `keyword` is the attribute key as the diagnostic should spell it
+/// (`counter_cache`, `column`, `tenant`).
+fn check_column_ident(key: &syn::Ident, keyword: &str, value: &str) -> syn::Result<()> {
     let plain = !value.is_empty()
         && !value.starts_with(|c: char| c.is_ascii_digit())
         && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -907,7 +910,7 @@ fn check_counter_cache_column(key: &syn::Ident, value: &str) -> syn::Result<()> 
     Err(syn::Error::new_spanned(
         key,
         format!(
-            "`{value}` is not a valid column name for `counter_cache = ...`: \
+            "`{value}` is not a valid column name for `{keyword} = ...`: \
              the value is spliced verbatim into the generated `UPDATE <parent> \
              SET <column> = <column> + $1` statement, so it must be a plain \
              identifier — ASCII letters, digits and underscores only, and no \
@@ -994,6 +997,928 @@ fn check_counter_cache_collisions(
         seen.push(key);
     }
     Ok(())
+}
+
+// ── `#[derivation]` (#1769) ──────────────────────────────────────────────
+//
+// A derivation is a counter cache with a filter and a contribution: the same
+// `CounterCacheSpec` maintains it, so every generated mutation path keeps it
+// current for free. One filter declaration is lowered twice — to a Rust
+// predicate for the record-shaped paths and to a SQL predicate for the
+// set-based ones — because a divergence between the two is drift.
+
+/// How a `#[derivation]` folds qualifying child rows into the parent column.
+#[derive(Clone, Debug)]
+enum DerivationTransform {
+    /// `transform = count` (the default): a qualifying row contributes 1.
+    Count,
+    /// `transform = sum(<field>)`: a qualifying row contributes that field.
+    Sum {
+        /// The summed child column, which must be a non-nullable integer
+        /// field. Raw-identifier prefixes are already stripped.
+        field: String,
+        /// Span of the field name, for the type diagnostics raised later.
+        span: proc_macro2::Span,
+    },
+}
+
+impl DerivationTransform {
+    /// The canonical spelling recorded in the emitted `DerivationDef`.
+    fn as_source(&self) -> String {
+        match self {
+            Self::Count => "count".to_owned(),
+            Self::Sum { field, .. } => format!("sum({field})"),
+        }
+    }
+}
+
+/// A parsed `#[derivation(Parent, column = "...", ...)]` declaration.
+///
+/// Parsing needs only the attribute; resolving the foreign key needs the
+/// model's associations, and lowering the filter needs its fields, so both
+/// happen later.
+#[derive(Clone)]
+struct DerivationDecl {
+    /// The parent model type carrying the maintained column.
+    target: syn::Ident,
+    /// The maintained column on the parent. Always a plain identifier.
+    column: String,
+    /// The aggregate. Defaults to `count`.
+    transform: DerivationTransform,
+    /// The `filter = <expr>` predicate, if any.
+    filter: Option<syn::Expr>,
+    /// The `fk = <column>` override. `None` means the convention applies.
+    explicit_fk: Option<String>,
+    /// The parent's tenant-discriminator column, from `tenant = "<column>"`.
+    /// Same semantics — and same reason to be explicit — as
+    /// `counter_cache_tenant`.
+    tenant_column: Option<String>,
+    /// The `name = "<name>"` override. `None` means
+    /// `{parent_table}.{column}`.
+    name: Option<String>,
+    /// The `parent_table = "<table>"` override. `None` means the table name
+    /// inferred from the parent type.
+    parent_table: Option<String>,
+    /// Span of the attribute, for diagnostics raised after parsing.
+    span: proc_macro2::Span,
+}
+
+/// Whether an attribute is a `#[derivation(...)]` declaration consumed by
+/// `#[model]` (and therefore must not be re-emitted onto the Diesel struct).
+fn is_derivation_attr(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("derivation")
+}
+
+/// Parse the value after `transform =`: `count`, or `sum(<field>)`.
+fn parse_derivation_transform(input: syn::parse::ParseStream) -> syn::Result<DerivationTransform> {
+    let kind: syn::Ident = input.parse()?;
+    if kind == "count" {
+        return Ok(DerivationTransform::Count);
+    }
+    if kind == "sum" {
+        let inner;
+        syn::parenthesized!(inner in input);
+        let field: syn::Ident = inner.parse()?;
+        // `sum(score + bonus)` or `sum(score, bonus)` must not be read as
+        // `sum(score)`: the maintained aggregate would differ from what the
+        // source says, silently.
+        if !inner.is_empty() {
+            return Err(inner.error(
+                "`sum(...)` takes exactly one field name: an expression, a second field or \
+                 anything else after it is not part of the derivation grammar",
+            ));
+        }
+        return Ok(DerivationTransform::Sum {
+            // The unraw name: `r#match` is the Rust spelling of column
+            // `match`, and the contribution SQL names the column.
+            field: unraw_ident(&field),
+            span: field.span(),
+        });
+    }
+    Err(syn::Error::new_spanned(
+        &kind,
+        format!("unknown transform `{kind}`; expected `count` or `sum(<field>)`"),
+    ))
+}
+
+/// Record one `#[derivation(...)]` key, rejecting a second spelling of it.
+///
+/// A repeated key would silently keep one value and drop the other, so the
+/// second is an error at its own span.
+fn set_derivation_key<T>(slot: &mut Option<T>, key: &syn::Ident, value: T) -> syn::Result<()> {
+    if slot.is_some() {
+        return Err(syn::Error::new_spanned(
+            key,
+            format!(
+                "duplicate `{key} = ...` in `#[derivation(...)]`: each key may \
+                 appear once, and a repeat would silently drop one of the two \
+                 values"
+            ),
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// The largest `name = "..."` a derivation may carry.
+///
+/// The name is the primary key of the `_autumn_derivations` state row and the
+/// key of the actuator report, so it stays short enough to index and read.
+const DERIVATION_NAME_MAX_BYTES: usize = 128;
+/// Must match `autumn_web::derivation::PARKING_PREFIX`.
+const DERIVATION_PARKING_PREFIX: &str = "parked::";
+
+/// Reject a `name = "..."` that cannot serve as a registry key.
+fn check_derivation_name(key: &syn::Ident, value: &str) -> syn::Result<()> {
+    let reason = if value.is_empty() {
+        "it must not be empty"
+    } else if value.len() > DERIVATION_NAME_MAX_BYTES {
+        "it must be at most 128 bytes"
+    } else if value.chars().any(char::is_control) {
+        "it must not contain control characters"
+    } else if value.starts_with(DERIVATION_PARKING_PREFIX) {
+        // `ensure_derivations` parks a row being adopted by a renamed
+        // derivation under this prefix between its two passes.
+        "the `parked::` prefix is reserved for the framework"
+    } else {
+        return Ok(());
+    };
+    Err(syn::Error::new_spanned(
+        key,
+        format!(
+            "`{value}` is not a valid `name = \"<name>\"` for a \
+             `#[derivation]`: {reason}. The name is the primary key of the \
+             `_autumn_derivations` state row and the key of the \
+             `/actuator/derivations` report"
+        ),
+    ))
+}
+
+/// Parse one `#[derivation(Parent, ...)]` attribute body.
+fn parse_derivation_attr(attr: &syn::Attribute) -> syn::Result<DerivationDecl> {
+    use syn::parse::ParseStream;
+
+    let span = attr
+        .path()
+        .get_ident()
+        .map_or_else(proc_macro2::Span::call_site, syn::Ident::span);
+
+    let (target, column, transform, filter, explicit_fk, tenant_column, name, parent_table) = attr
+        .parse_args_with(|input: ParseStream| {
+            let target: syn::Ident = input.parse()?;
+            let mut column: Option<String> = None;
+            let mut transform: Option<DerivationTransform> = None;
+            let mut filter: Option<syn::Expr> = None;
+            let mut explicit_fk: Option<String> = None;
+            let mut tenant_column: Option<String> = None;
+            let mut name: Option<String> = None;
+            let mut parent_table: Option<String> = None;
+            while input.peek(syn::Token![,]) {
+                input.parse::<syn::Token![,]>()?;
+                if input.is_empty() {
+                    break;
+                }
+                let key: syn::Ident = input.parse()?;
+                input.parse::<syn::Token![=]>()?;
+                if key == "transform" {
+                    set_derivation_key(&mut transform, &key, parse_derivation_transform(input)?)?;
+                    continue;
+                }
+                if key == "filter" {
+                    set_derivation_key(&mut filter, &key, input.parse()?)?;
+                    continue;
+                }
+                // Every remaining key takes a bare identifier or a string
+                // literal, the same pair the association attributes accept.
+                // A bare identifier drops its raw prefix: `r#type` is the Rust
+                // spelling of column `type`.
+                let value = if input.peek(LitStr) {
+                    input.parse::<LitStr>()?.value()
+                } else {
+                    unraw_ident(&input.parse::<syn::Ident>()?)
+                };
+                if key == "column" {
+                    check_column_ident(&key, "column", &value)?;
+                    set_derivation_key(&mut column, &key, value)?;
+                } else if key == "fk" {
+                    // Checked before `format_ident!` sees it: an invalid
+                    // identifier there panics with no span.
+                    check_column_ident(&key, "fk", &value)?;
+                    set_derivation_key(&mut explicit_fk, &key, value)?;
+                } else if key == "tenant" {
+                    check_column_ident(&key, "tenant", &value)?;
+                    set_derivation_key(&mut tenant_column, &key, value)?;
+                } else if key == "parent_table" {
+                    check_column_ident(&key, "parent_table", &value)?;
+                    set_derivation_key(&mut parent_table, &key, value)?;
+                } else if key == "name" {
+                    check_derivation_name(&key, &value)?;
+                    set_derivation_key(&mut name, &key, value)?;
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        &key,
+                        "expected `column = \"<column>\"`, `transform = count` / \
+                         `transform = sum(<field>)`, `filter = <expr>`, \
+                         `fk = <column>`, `tenant = \"<column>\"`, \
+                         `parent_table = \"<table>\"`, or `name = \"<name>\"` in \
+                         `#[derivation(...)]`",
+                    ));
+                }
+            }
+            Ok((
+                target,
+                column,
+                transform,
+                filter,
+                explicit_fk,
+                tenant_column,
+                name,
+                parent_table,
+            ))
+        })?;
+
+    let Some(column) = column else {
+        return Err(syn::Error::new(
+            span,
+            "`#[derivation(...)]` requires `column = \"<column>\"`: the column \
+             on the parent this derivation maintains",
+        ));
+    };
+
+    Ok(DerivationDecl {
+        target,
+        column,
+        transform: transform.unwrap_or(DerivationTransform::Count),
+        filter,
+        explicit_fk,
+        tenant_column,
+        name,
+        parent_table,
+        span,
+    })
+}
+
+/// Collect and validate every `#[derivation]` on a model, in source order.
+fn resolve_derivations(
+    model_ident: &syn::Ident,
+    attrs: &[syn::Attribute],
+    assocs: &[Association],
+) -> syn::Result<Vec<DerivationDecl>> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        if !is_derivation_attr(attr) {
+            continue;
+        }
+        out.push(parse_derivation_attr(attr)?);
+    }
+    check_derivation_collisions(model_ident, assocs, &out)?;
+    Ok(out)
+}
+
+/// The parent table this derivation maintains: the explicit
+/// `parent_table = "..."`, else the name inferred from the parent type.
+///
+/// The override exists for a parent that carries `#[model(table = "...")]`,
+/// which this macro cannot see from the child.
+fn derivation_parent_table(decl: &DerivationDecl) -> String {
+    decl.parent_table
+        .clone()
+        .unwrap_or_else(|| infer_table_name(&decl.target))
+}
+
+/// The derivation's registry name: the explicit `name = "..."`, else
+/// `{parent_table}.{column}`.
+fn derivation_name(decl: &DerivationDecl, parent_table: &str) -> String {
+    decl.name
+        .clone()
+        .unwrap_or_else(|| format!("{parent_table}.{}", decl.column))
+}
+
+/// The child column holding the parent's id: the explicit `fk = <column>`,
+/// else the `#[belongs_to]` leg pointing at the same parent type, else the
+/// `{snake(Parent)}_id` convention.
+///
+/// Preferring the association keeps a model with `#[belongs_to(Post, fk =
+/// article_id)]` from needing to repeat the column on every derivation.
+fn derivation_fk(
+    model_ident: &syn::Ident,
+    decl: &DerivationDecl,
+    assocs: &[Association],
+) -> syn::Result<String> {
+    if let Some(fk) = decl.explicit_fk.clone() {
+        return Ok(fk);
+    }
+    let legs: Vec<&Association> = assocs
+        .iter()
+        .filter(|a| {
+            a.kind == AssocKind::BelongsTo && a.target == decl.target && a.through.is_none()
+        })
+        .collect();
+    // Two legs to one parent (`Message` -> `sender` / `recipient`) give no
+    // ground to prefer either key, and guessing would count the wrong parent.
+    if legs.len() > 1 {
+        let listed = legs
+            .iter()
+            .map(|a| format!("`{}`", a.fk))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let target = &decl.target;
+        return Err(syn::Error::new(
+            decl.span,
+            format!(
+                "`#[derivation({target}, ...)]` cannot pick a foreign key: \
+                 model `{model_ident}` has {} `#[belongs_to({target})]` legs \
+                 ({listed}). Name the one this derivation counts with \
+                 `fk = <column>`",
+                legs.len()
+            ),
+        ));
+    }
+    if let Some(assoc) = legs.first() {
+        return Ok(assoc.fk.clone());
+    }
+    Ok(format!("{}_id", pascal_to_snake(&decl.target.to_string())))
+}
+
+/// Reject a `#[derivation]` that maintains a `(parent table, column)` pair
+/// another derivation — or a counter cache — on the same model already
+/// maintains.
+///
+/// Both would move the one column on every insert, double-counting silently
+/// and permanently. This is the same hazard `check_counter_cache_collisions`
+/// guards, over the union of both declaration kinds.
+fn check_derivation_collisions(
+    model_ident: &syn::Ident,
+    assocs: &[Association],
+    derivations: &[DerivationDecl],
+) -> syn::Result<()> {
+    // The flag records whether the pair came from a counter cache, so the
+    // error can name the declaration to change.
+    let mut seen: Vec<((String, String), bool)> = Vec::new();
+    for assoc in assocs {
+        if let Some(column) = counter_cache_column(model_ident, assoc) {
+            seen.push(((infer_table_name(&assoc.target), column), true));
+        }
+    }
+    for decl in derivations {
+        let parent_table = derivation_parent_table(decl);
+        let key = (parent_table.clone(), decl.column.clone());
+        if let Some((_, from_counter_cache)) = seen.iter().find(|(seen_key, _)| *seen_key == key) {
+            let column = &decl.column;
+            // Two spellings, so the derivation/derivation case does not read
+            // "a `#[derivation]` and another `#[derivation]`".
+            let subject = if *from_counter_cache {
+                format!(
+                    "a `#[derivation]` and a `counter_cache` association on \
+                     `{model_ident}`"
+                )
+            } else {
+                format!("two `#[derivation]`s on `{model_ident}`")
+            };
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "{subject} both maintain `{parent_table}.{column}`, so \
+                     every insert would count twice: give one of them a \
+                     different `column = \"<column>\"`"
+                ),
+            ));
+        }
+        seen.push((key, false));
+    }
+    Ok(())
+}
+
+/// The scalar shape a field must have to appear in a derivation filter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FilterScalar {
+    Bool,
+    Int,
+    Str,
+}
+
+/// A filterable child field: its scalar kind, and whether it is `Option<T>`
+/// (NULL-able, so the Rust lowering has to match SQL's NULL semantics).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FilterField {
+    kind: FilterScalar,
+    optional: bool,
+    /// Whether the field carries `#[diesel(column_name = ...)]`, which renames
+    /// the database column out from under the Rust field name.
+    renamed: bool,
+}
+
+/// Every named field of the child model, mapped to its filter classification.
+/// `None` marks a field whose type the grammar does not support, so naming it
+/// yields a type error rather than "not a field".
+type FilterFields = std::collections::BTreeMap<String, Option<FilterField>>;
+
+/// Classify a field type for the filter grammar, or `None` if unsupported.
+///
+/// Matches the LAST path segment, so every spelling of a type takes the same
+/// arm (`String`, `std::string::String`, `Option<i64>`,
+/// `::core::option::Option<i64>`).
+fn classify_filter_field(field: &syn::Field) -> Option<FilterField> {
+    let ty = &field.ty;
+    let (inner, optional) = option_inner(ty).map_or((ty, false), |inner| (inner, true));
+    let syn::Type::Path(path) = inner else {
+        return None;
+    };
+    let kind = match path.path.segments.last()?.ident.to_string().as_str() {
+        "bool" => FilterScalar::Bool,
+        "i8" | "i16" | "i32" | "i64" => FilterScalar::Int,
+        "String" => FilterScalar::Str,
+        _ => return None,
+    };
+    Some(FilterField {
+        kind,
+        optional,
+        renamed: field_has_diesel_column_name(field),
+    })
+}
+
+/// The body of a `fn(&Model) -> Option<String>` reading `field` as text, the
+/// way the database spells `CAST(<column> AS TEXT)` for an integer or string
+/// column: `Some(field.to_string())`, or the `Option` forwarded.
+///
+/// `None` for a field of any other type (or an unnamed one): a leg whose
+/// tenant the maintenance cannot read as text stays exactly as it was, and a
+/// `#[derivation]` rejects such a tenant field outright.
+fn tenant_text_body(field: &syn::Field) -> Option<TokenStream> {
+    let ident = field.ident.as_ref()?;
+    let classified = classify_filter_field(field)?;
+    if classified.kind == FilterScalar::Bool {
+        return None;
+    }
+    Some(if classified.optional {
+        quote! {
+            __autumn_cc_record
+                .#ident
+                .as_ref()
+                .map(::std::string::ToString::to_string)
+        }
+    } else {
+        quote! {
+            ::core::option::Option::Some(::std::string::ToString::to_string(
+                &__autumn_cc_record.#ident,
+            ))
+        }
+    })
+}
+
+/// Build the filter classification map for a model's fields.
+fn filter_field_map(all_fields: &[&syn::Field]) -> FilterFields {
+    all_fields
+        .iter()
+        .filter_map(|field| {
+            field
+                .ident
+                .as_ref()
+                .map(|ident| (ident.to_string(), classify_filter_field(field)))
+        })
+        .collect()
+}
+
+/// One filter declaration, lowered twice: a Rust predicate over `__r: &Model`
+/// and the matching SQL predicate over the `{c}` child alias placeholder.
+#[derive(Debug)]
+struct LoweredFilter {
+    rust: TokenStream,
+    sql: String,
+}
+
+/// The grammar rejection, listing what a filter may contain.
+fn filter_grammar_error<T: quote::ToTokens>(tokens: T) -> syn::Error {
+    syn::Error::new_spanned(
+        tokens,
+        "unsupported expression in `#[derivation(filter = ...)]`; the grammar \
+         accepts `field` and `!field` (bool fields), `field OP <literal>` with \
+         OP one of `==` `!=` `<` `<=` `>` `>=` and an integer, bool or string \
+         literal, `field.is_some()`, `field.is_none()`, `a && b`, and \
+         parentheses",
+    )
+}
+
+/// The SQL spelling of a comparison operator, or `None` if the operator is
+/// outside the grammar.
+const fn sql_comparison_op(op: &syn::BinOp) -> Option<&'static str> {
+    Some(match op {
+        syn::BinOp::Eq(_) => "=",
+        syn::BinOp::Ne(_) => "<>",
+        syn::BinOp::Lt(_) => "<",
+        syn::BinOp::Le(_) => "<=",
+        syn::BinOp::Gt(_) => ">",
+        syn::BinOp::Ge(_) => ">=",
+        _ => return None,
+    })
+}
+
+/// A literal on the right of a filter comparison.
+enum FilterLiteral {
+    /// An integer literal, with its Rust tokens (a leading `-` included) and
+    /// its SQL text.
+    Int {
+        tokens: TokenStream,
+        sql: String,
+    },
+    Bool(bool),
+    Str(LitStr),
+}
+
+impl FilterLiteral {
+    /// How the literal is named in a type-mismatch diagnostic.
+    const fn describe(&self) -> &'static str {
+        match self {
+            Self::Int { .. } => "an integer",
+            Self::Bool(_) => "a bool",
+            Self::Str(_) => "a string",
+        }
+    }
+}
+
+/// Extract the literal on the right of a filter comparison.
+///
+/// Floats are rejected by name: a Rust `f64` comparison and a SQL numeric
+/// comparison round differently, so the two lowerings could disagree.
+fn filter_literal(expr: &syn::Expr) -> syn::Result<FilterLiteral> {
+    match expr {
+        syn::Expr::Paren(paren) => filter_literal(&paren.expr),
+        syn::Expr::Group(group) => filter_literal(&group.expr),
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Int(value) => Ok(FilterLiteral::Int {
+                tokens: quote! { #value },
+                sql: value.base10_digits().to_owned(),
+            }),
+            syn::Lit::Bool(value) => Ok(FilterLiteral::Bool(value.value)),
+            syn::Lit::Str(value) => Ok(FilterLiteral::Str(value.clone())),
+            syn::Lit::Float(value) => Err(filter_float_error(value)),
+            other => Err(filter_grammar_error(other)),
+        },
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr: inner,
+            ..
+        }) => match &**inner {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(value),
+                ..
+            }) => Ok(FilterLiteral::Int {
+                tokens: quote! { -#value },
+                sql: format!("-{}", value.base10_digits()),
+            }),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Float(value),
+                ..
+            }) => Err(filter_float_error(value)),
+            other => Err(filter_grammar_error(other)),
+        },
+        other => Err(filter_grammar_error(other)),
+    }
+}
+
+/// The float rejection, shared by the signed and unsigned literal arms.
+fn filter_float_error<T: quote::ToTokens>(tokens: T) -> syn::Error {
+    syn::Error::new_spanned(
+        tokens,
+        "float literals are not supported in `#[derivation(filter = ...)]`: a \
+         Rust float comparison and a SQL numeric comparison round differently, \
+         so the two lowerings of one filter could disagree — compare an \
+         integer column instead",
+    )
+}
+
+/// The SQL text of a string literal: single-quoted, with `'` doubled.
+///
+/// A brace is rejected because `{c}` in the emitted SQL is the child-alias
+/// placeholder the runtime substitutes. Letting a literal carry a brace would
+/// let it forge one.
+///
+/// A backslash, a NUL and any other control character are rejected too. `'`
+/// doubling is the whole escape rule for a standard SQL literal, but some
+/// backends read a backslash as an escape, and a control character in a
+/// statement is unreadable in a log. A `;` or a `--` needs no rejection: both
+/// are inert inside a quoted literal.
+fn filter_sql_string(lit: &LitStr) -> syn::Result<String> {
+    let value = lit.value();
+    if value.contains('{') || value.contains('}') {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "a `{` or `}` is not allowed in a `#[derivation(filter = ...)]` \
+             string literal: `{c}` in the emitted SQL is the child-alias \
+             placeholder the runtime substitutes, and a literal brace could \
+             forge one",
+        ));
+    }
+    if value.contains('\\') || value.chars().any(char::is_control) {
+        return Err(syn::Error::new_spanned(
+            lit,
+            "a backslash, a NUL or a control character is not allowed in a \
+             `#[derivation(filter = ...)]` string literal: the literal is \
+             spliced into SQL as a quoted constant, `''` is the only escape \
+             every backend agrees on, and a control character makes the \
+             statement unreadable in a log",
+        ));
+    }
+    Ok(format!("'{}'", value.replace('\'', "''")))
+}
+
+/// Resolve a bare field reference in a filter to its name and classification.
+fn filter_field(
+    expr: &syn::Expr,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<(syn::Ident, FilterField)> {
+    let syn::Expr::Path(path) = expr else {
+        return Err(filter_grammar_error(expr));
+    };
+    if path.qself.is_some() || path.path.leading_colon.is_some() || path.path.segments.len() != 1 {
+        return Err(filter_grammar_error(expr));
+    }
+    let segment = &path.path.segments[0];
+    if !matches!(segment.arguments, syn::PathArguments::None) {
+        return Err(filter_grammar_error(expr));
+    }
+    let ident = segment.ident.clone();
+    let name = ident.to_string();
+    match fields.get(&name) {
+        None => Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "`{name}` is not a field of model `{model_ident}`, so it cannot \
+                 appear in `#[derivation(filter = ...)]`"
+            ),
+        )),
+        Some(None) => Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "field `{name}` of model `{model_ident}` has a type the \
+                 derivation filter grammar does not support; a filter accepts \
+                 `bool`, integer and `String` fields, and their `Option<...>` \
+                 forms"
+            ),
+        )),
+        // The lowering names the column after the Rust field, so a renamed
+        // database column would be spliced under a name the table does not
+        // have. Same rule, and same reason, as `#[translatable]`.
+        Some(Some(field)) if field.renamed => Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "field `{name}` of model `{model_ident}` carries \
+                 `#[diesel(column_name = ...)]`, so it cannot appear in \
+                 `#[derivation(filter = ...)]`: the filter is lowered to SQL \
+                 that names the column after the Rust field. Name the Rust \
+                 field after the column instead"
+            ),
+        )),
+        Some(Some(field)) => Ok((ident, *field)),
+    }
+}
+
+/// Lower a bare (or negated) bool field condition.
+fn lower_filter_bool(
+    expr: &syn::Expr,
+    negated: bool,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    let (ident, field) = filter_field(expr, model_ident, fields)?;
+    if field.kind != FilterScalar::Bool {
+        return Err(syn::Error::new_spanned(
+            &ident,
+            format!(
+                "`{ident}` is not a `bool` field, so it cannot stand alone as a \
+                 derivation filter condition — compare it, e.g. \
+                 `{ident} == <literal>`"
+            ),
+        ));
+    }
+    let column = unraw_ident(&ident);
+    // A NULL bool is counted by nobody, matching SQL: `NULL = TRUE` is NULL,
+    // which the WHERE clause treats as false.
+    let wanted = !negated;
+    let rust = if field.optional {
+        quote! { __r.#ident == ::core::option::Option::Some(#wanted) }
+    } else if negated {
+        quote! { !__r.#ident }
+    } else {
+        quote! { __r.#ident }
+    };
+    let keyword = if negated { "FALSE" } else { "TRUE" };
+    Ok(LoweredFilter {
+        rust,
+        sql: format!("{{c}}.\"{column}\" = {keyword}"),
+    })
+}
+
+/// Lower `field.is_some()` / `field.is_none()` to a NULL predicate.
+fn lower_filter_probe(
+    call: &syn::ExprMethodCall,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    if !call.args.is_empty() || call.turbofish.is_some() {
+        return Err(filter_grammar_error(call));
+    }
+    let method = call.method.to_string();
+    let is_none = match method.as_str() {
+        "is_some" => false,
+        "is_none" => true,
+        _ => return Err(filter_grammar_error(call)),
+    };
+    let (ident, field) = filter_field(&call.receiver, model_ident, fields)?;
+    if !field.optional {
+        return Err(syn::Error::new_spanned(
+            &call.method,
+            format!(
+                "`{ident}` is not an `Option<...>` field of model \
+                 `{model_ident}`, so `{method}()` is a constant — drop the \
+                 condition"
+            ),
+        ));
+    }
+    let column = unraw_ident(&ident);
+    let probe = &call.method;
+    let predicate = if is_none { "IS NULL" } else { "IS NOT NULL" };
+    Ok(LoweredFilter {
+        rust: quote! { __r.#ident.#probe() },
+        sql: format!("{{c}}.\"{column}\" {predicate}"),
+    })
+}
+
+/// Lower `field OP <literal>`.
+///
+/// An `Option<T>` field lowers so that a NULL row is excluded, which is what
+/// SQL already does: every comparison against NULL is NULL, and a WHERE clause
+/// drops it.
+fn lower_filter_comparison(
+    binary: &syn::ExprBinary,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    let Some(sql_op) = sql_comparison_op(&binary.op) else {
+        // Spanned on the operator, not the whole expression: the operator is
+        // the part to change.
+        return Err(filter_grammar_error(binary.op));
+    };
+    let (ident, field) = filter_field(&binary.left, model_ident, fields)?;
+    let literal = filter_literal(&binary.right)?;
+    let column = unraw_ident(&ident);
+    let is_eq = matches!(binary.op, syn::BinOp::Eq(_));
+    let ordering = !is_eq && !matches!(binary.op, syn::BinOp::Ne(_));
+    let op = &binary.op;
+    match (field.kind, &literal) {
+        (FilterScalar::Bool, FilterLiteral::Bool(value)) => {
+            if ordering {
+                return Err(filter_grammar_error(binary));
+            }
+            // `f == true` is the bare condition and `f == false` its negation,
+            // so both share one lowering with `f` / `!f`.
+            lower_filter_bool(&binary.left, is_eq != *value, model_ident, fields)
+        }
+        (FilterScalar::Int, FilterLiteral::Int { tokens, sql }) => {
+            let rust = if field.optional {
+                quote! { __r.#ident.is_some_and(|__v| __v #op #tokens) }
+            } else {
+                quote! { __r.#ident #op #tokens }
+            };
+            Ok(LoweredFilter {
+                rust,
+                sql: format!("{{c}}.\"{column}\" {sql_op} {sql}"),
+            })
+        }
+        (FilterScalar::Str, FilterLiteral::Str(lit)) => {
+            if ordering {
+                return Err(syn::Error::new_spanned(
+                    op,
+                    format!(
+                        "ordering comparisons on a string field are not \
+                         supported in a derivation filter: Rust compares bytes \
+                         and SQL compares by collation, so the two lowerings of \
+                         one filter would disagree — compare `{ident}` with \
+                         `==` or `!=`"
+                    ),
+                ));
+            }
+            let sql_literal = filter_sql_string(lit)?;
+            let rust = match (field.optional, is_eq) {
+                (false, _) => quote! { __r.#ident #op #lit },
+                (true, true) => {
+                    quote! { __r.#ident.as_deref() == ::core::option::Option::Some(#lit) }
+                }
+                // `as_deref() != Some(s)` would count a NULL row, but SQL's
+                // `col <> 's'` is NULL for a NULL column and excludes it.
+                (true, false) => {
+                    quote! { __r.#ident.as_deref().is_some_and(|__v| __v != #lit) }
+                }
+            };
+            // `{bin}` resolves to the backend's bytewise collation (`COLLATE
+            // "C"`, `COLLATE BINARY`): Rust compares bytes, and a `NOCASE`
+            // column would otherwise make SQL call `"PUB"` and `'pub'` equal
+            // where the Rust lowering of the same filter does not, so the
+            // record paths and the set-based paths would disagree. The cast
+            // covers Postgres `citext`, whose own equality operator folds case
+            // whatever the collation says: as `TEXT` the comparison is the
+            // plain one the collation governs. On SQLite the cast is a no-op.
+            Ok(LoweredFilter {
+                rust,
+                sql: format!("CAST({{c}}.\"{column}\" AS TEXT) {sql_op} {sql_literal} {{bin}}"),
+            })
+        }
+        (kind, literal) => {
+            let expected = match kind {
+                FilterScalar::Bool => "a `bool`",
+                FilterScalar::Int => "an integer",
+                FilterScalar::Str => "a string",
+            };
+            Err(syn::Error::new_spanned(
+                &binary.right,
+                format!(
+                    "`{ident}` is {expected} field of model `{model_ident}`, so \
+                     it cannot be compared with {} literal in a derivation \
+                     filter",
+                    literal.describe()
+                ),
+            ))
+        }
+    }
+}
+
+/// Whether a filter expression names `field` anywhere: as a bare operand, the
+/// receiver of a NULL probe, or a side of a comparison or `&&`.
+fn expr_mentions_field(expr: &syn::Expr, field: &str) -> bool {
+    match expr {
+        syn::Expr::Path(path) => path
+            .path
+            .get_ident()
+            .is_some_and(|ident| unraw_ident(ident) == field),
+        syn::Expr::Paren(paren) => expr_mentions_field(&paren.expr, field),
+        syn::Expr::Unary(unary) => expr_mentions_field(&unary.expr, field),
+        syn::Expr::Binary(binary) => {
+            expr_mentions_field(&binary.left, field) || expr_mentions_field(&binary.right, field)
+        }
+        syn::Expr::MethodCall(call) => expr_mentions_field(&call.receiver, field),
+        _ => false,
+    }
+}
+
+/// Lower one filter expression to its Rust and SQL forms.
+///
+/// Parentheses are transparent: `a && b` already parenthesises both sides in
+/// both lowerings, so grouping never changes the meaning.
+fn lower_filter(
+    expr: &syn::Expr,
+    model_ident: &syn::Ident,
+    fields: &FilterFields,
+) -> syn::Result<LoweredFilter> {
+    match expr {
+        syn::Expr::Paren(paren) => lower_filter(&paren.expr, model_ident, fields),
+        syn::Expr::Group(group) => lower_filter(&group.expr, model_ident, fields),
+        syn::Expr::Path(_) => lower_filter_bool(expr, false, model_ident, fields),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Not(_),
+            expr: inner,
+            ..
+        }) => lower_filter_bool(inner, true, model_ident, fields),
+        syn::Expr::MethodCall(call) => lower_filter_probe(call, model_ident, fields),
+        syn::Expr::Binary(binary) if matches!(binary.op, syn::BinOp::And(_)) => {
+            let left = lower_filter(&binary.left, model_ident, fields)?;
+            let right = lower_filter(&binary.right, model_ident, fields)?;
+            let (left_rust, right_rust) = (&left.rust, &right.rust);
+            Ok(LoweredFilter {
+                rust: quote! { (#left_rust) && (#right_rust) },
+                sql: format!("({}) AND ({})", left.sql, right.sql),
+            })
+        }
+        syn::Expr::Binary(binary) => lower_filter_comparison(binary, model_ident, fields),
+        other => Err(filter_grammar_error(other)),
+    }
+}
+
+/// Whether a type is `i64`, however it is spelled.
+///
+/// An `i64` contribution is read as-is; the narrower widths go through
+/// `i64::from`.
+fn is_i64_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "i64")
+}
+
+/// Whether a type is one of the integer widths `sum(<field>)` accepts.
+fn is_sum_integer_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    path.path.segments.last().is_some_and(|segment| {
+        matches!(
+            segment.ident.to_string().as_str(),
+            "i8" | "i16" | "i32" | "i64"
+        )
+    })
 }
 
 /// The singular form used to derive a many-to-many association's mutation
@@ -1173,11 +2098,18 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
 /// generated repository consults to keep each parent's `{child}_count` column
 /// current.
 ///
-/// Only produced when at least one `#[belongs_to(…, counter_cache)]` is
-/// declared; otherwise the blanket `AutumnCounterCaches` impl supplies `false` /
-/// an empty slice and this emits nothing, so a model without counter caches
-/// keeps its exact prior codegen and its repository's mutation paths stay on
-/// their existing (transaction-free, where they were) shape.
+/// `#[derivation]` legs (#1769) are appended to the SAME slice, after the
+/// counter-cache legs, and each also emits an item-level `DerivationDef` static
+/// plus its inventory registration. Sharing the slice is what makes a
+/// derivation ride every mutation path a counter cache already rides: a counter
+/// cache is the unfiltered `count` special case, and its emitted SQL stays
+/// byte-identical (`contrib_sql` `"1"`, empty `filter_sql`).
+///
+/// Only produced when at least one `#[belongs_to(…, counter_cache)]` or
+/// `#[derivation]` is declared; otherwise the blanket `AutumnCounterCaches`
+/// impl supplies `false` / an empty slice and this emits nothing, so a model
+/// without either keeps its exact prior codegen and its repository's mutation
+/// paths stay on their existing (transaction-free, where they were) shape.
 ///
 /// Both items are **inherent**, which is what shadows the blanket impl — and
 /// which is why the generated repository names them by concrete path
@@ -1190,8 +2122,9 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
 /// which doubles as the type guard: a foreign-key field that is not `i64` /
 /// `Option<i64>` fails to coerce to `fn(&Model) -> Option<i64>`.
 // One resolution + validation arm per spec field (column, tenant column, the
-// foreign key's existence and nullability, the primary key's arity), so it grows
-// past the line lint as counter-cache options are added.
+// foreign key's existence and nullability, the primary key's arity, the filter
+// lowering and the summed field's type), so it grows past the line lint as
+// counter-cache and derivation options are added.
 #[allow(clippy::too_many_lines)]
 fn emit_counter_caches_impl(
     model_ident: &syn::Ident,
@@ -1199,15 +2132,102 @@ fn emit_counter_caches_impl(
     pk_ident: Option<&syn::Ident>,
     has_deleted_at: bool,
     assocs: &[Association],
+    derivations: &[DerivationDecl],
     all_fields: &[&syn::Field],
 ) -> syn::Result<TokenStream> {
     let cached: Vec<&Association> = assocs
         .iter()
         .filter(|a| a.counter_cache.is_some())
         .collect();
-    if cached.is_empty() {
-        return Ok(TokenStream::new());
+    // The `#[lock_version]` column is a maintained column too: every update
+    // increments it as the optimistic-concurrency token, so a derivation
+    // adjusting it as an aggregate would break the protocol and the backfill
+    // would erase it. Its claim is emitted whether or not this model keeps a
+    // counter cache of its own, since the usual shape is a parent that keeps
+    // none while a child's derivation names one of its columns (#1769).
+    // So is the `tenant_id` field, the framework's tenant discriminator
+    // (`#[repository(tenant_scoped)]` filters on it, and every read scope
+    // keys off it): a derivation maintaining it would move the parent to
+    // another tenant, and on a sharded deployment leave it on the wrong shard.
+    // And so is `deleted_at`, the soft-delete marker: a maintained value
+    // would hide the parent from every `deleted_at IS NULL` read (on SQLite an
+    // integer aggregate simply lands in it; on Postgres the type mismatch
+    // fails the write).
+    let implicit_claims: Vec<TokenStream> = all_fields
+        .iter()
+        .filter(|f| has_attr(f, "lock_version") || is_tenant_id_field(f) || is_deleted_at_field(f))
+        .filter_map(|field| Some((field, field.ident.as_ref()?)))
+        .map(|(field, ident)| {
+            // The claim names the *database* column: a field Diesel renames
+            // with `#[diesel(column_name = ...)]` stores the token under the
+            // physical name, and that is the name a derivation would spell.
+            let column = diesel_column_name(field).unwrap_or_else(|| unraw_ident(ident));
+            quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::derivation::CounterCacheClaim {
+                        model: ::core::stringify!(#model_ident),
+                        child_table: #table_name,
+                        parent_table: #table_name,
+                        column: #column,
+                        direct_sql: false,
+                        module_path: ::core::module_path!(),
+                    }
+                }
+            }
+        })
+        .collect();
+    if cached.is_empty() && derivations.is_empty() {
+        return Ok(quote! { #(#implicit_claims)* });
     }
+
+    // Every column something in THIS model maintains on its own table by
+    // direct SQL: a derivation onto its own table, or a `counter_cache` leg
+    // pointing back at it. No derivation may read one of them as a source
+    // (see below); the registry repeats the check across models at boot.
+    let maintained_here: Vec<(Option<usize>, String, String)> = derivations
+        .iter()
+        .enumerate()
+        .filter(|(_, decl)| derivation_parent_table(decl) == table_name)
+        .map(|(index, decl)| {
+            (
+                Some(index),
+                decl.column.clone(),
+                "another `#[derivation]` of this model".to_owned(),
+            )
+        })
+        .chain(
+            cached
+                .iter()
+                .filter(|assoc| infer_table_name(&assoc.target) == table_name)
+                .map(|assoc| {
+                    (
+                        None,
+                        counter_cache_column(model_ident, assoc)
+                            .expect("filtered to a counter-cached association above"),
+                        "a `counter_cache` of this model".to_owned(),
+                    )
+                }),
+        )
+        .collect();
+
+    // Both declaration kinds share every validation below, so the diagnostics
+    // name whichever one the model actually used.
+    let feature = if cached.is_empty() {
+        "derivation"
+    } else {
+        "counter_cache"
+    };
+    let feature_span = cached
+        .first()
+        .and_then(|assoc| assoc.counter_cache.as_ref())
+        .map_or_else(
+            || {
+                derivations
+                    .first()
+                    .map_or_else(proc_macro2::Span::call_site, |decl| decl.span)
+            },
+            |decl| decl.span,
+        );
 
     // A composite key cannot back a counter cache: the maintenance addresses the
     // child by ONE value, so with two `#[id]` fields the decrement would key on
@@ -1225,14 +2245,10 @@ fn emit_counter_caches_impl(
             .map(|i| format!("`{i}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        let span = cached[0]
-            .counter_cache
-            .as_ref()
-            .map_or_else(proc_macro2::Span::call_site, |d| d.span);
         return Err(syn::Error::new(
-            span,
+            feature_span,
             format!(
-                "`counter_cache` requires a single primary key: model \
+                "`{feature}` requires a single primary key: model \
                  `{model_ident}` declares a composite key ({listed}), and the \
                  counter maintenance identifies its child row by one id — the \
                  decrement would key on every row sharing the first component"
@@ -1242,12 +2258,22 @@ fn emit_counter_caches_impl(
     let Some(pk_ident) = pk_ident else {
         return Err(syn::Error::new_spanned(
             model_ident,
-            "`counter_cache` requires the child model to have a primary-key \
-             field: the maintenance resolves the parent from the child row by \
-             primary key. Mark one with `#[id]`",
+            format!(
+                "`{feature}` requires the child model to have a primary-key \
+                 field: the maintenance resolves the parent from the child row \
+                 by primary key. Mark one with `#[id]`"
+            ),
         ));
     };
-    let pk_column = pk_ident.to_string();
+    // The unraw name is what `sum(<field>)` is compared against; the column
+    // the primary key reaches SQL under is its physical name, which a
+    // `#[diesel(column_name = ...)]` on the `#[id]` field may have renamed.
+    let pk_field_name = unraw_ident(pk_ident);
+    let pk_column = all_fields
+        .iter()
+        .find(|f| f.ident.as_ref() == Some(pk_ident))
+        .and_then(|f| diesel_column_name(f))
+        .unwrap_or_else(|| pk_field_name.clone());
 
     // One shared primary-key extractor: the bulk update path matches a
     // post-update record back to the foreign keys captured for it before the
@@ -1273,7 +2299,22 @@ fn emit_counter_caches_impl(
             }
         },
     ];
+    // A counter cache counts rows, so every live row contributes 1. The
+    // derivation legs below each get their own contribution fn instead.
+    if !cached.is_empty() {
+        fk_fns.push(quote! {
+            fn __autumn_counter_cache_contrib_one(__autumn_cc_record: &#model_ident) -> i64 {
+                let _ = __autumn_cc_record;
+                1
+            }
+        });
+    }
     let mut spec_entries: Vec<TokenStream> = Vec::new();
+    // One link-time claim per plain counter cache, so the derivation registry
+    // can refuse a `#[derivation]` on another model that maintains the same
+    // parent column (#1769): the two would double count, and the backfill
+    // would then overwrite the counter cache's rows.
+    let mut claim_items: Vec<TokenStream> = implicit_claims;
     for (index, assoc) in cached.iter().enumerate() {
         let decl = assoc
             .counter_cache
@@ -1290,6 +2331,32 @@ fn emit_counter_caches_impl(
             || quote! { ::core::option::Option::None },
             |tenant| quote! { ::core::option::Option::Some(#tenant) },
         );
+        // The tenant as text, when the child carries the column as a field the
+        // maintenance can read: then a child moved between tenants takes its
+        // contribution off the old parent under the old tenant.
+        let tenant_of = decl
+            .tenant_column
+            .as_deref()
+            .and_then(|tenant| {
+                all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant))
+            })
+            .and_then(|field| tenant_text_body(field))
+            .map_or_else(
+                || quote! { ::core::option::Option::None },
+                |body| {
+                    let tenant_fn = format_ident!("__autumn_counter_cache_tenant_{index}");
+                    fk_fns.push(quote! {
+                        fn #tenant_fn(
+                            __autumn_cc_record: &#model_ident,
+                        ) -> ::core::option::Option<::std::string::String> {
+                            #body
+                        }
+                    });
+                    quote! { ::core::option::Option::Some(#tenant_fn) }
+                },
+            );
         let parent_table = infer_table_name(&assoc.target);
         let fk = &assoc.fk;
         let fk_ident = format_ident!("{fk}");
@@ -1343,20 +2410,454 @@ fn emit_counter_caches_impl(
                 pk_of: __autumn_counter_cache_pk,
                 live_of: __autumn_counter_cache_live,
                 tenant_column: #tenant_column,
+                tenant_of: #tenant_of,
+                contrib_of: __autumn_counter_cache_contrib_one,
+                contrib_sql: "1",
+                filter_sql: "",
+                derivation: ::core::option::Option::None,
+            }
+        });
+        // Submitted as a literal rather than through a named `static`: the
+        // claim is all `&'static str`, so it is const-constructible in place,
+        // and a name would have to be unique across every model in a module.
+        claim_items.push(quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::derivation::CounterCacheClaim {
+                    model: ::core::stringify!(#model_ident),
+                    child_table: #table_name,
+                    parent_table: #parent_table,
+                    column: #column,
+                    direct_sql: true,
+                    module_path: ::core::module_path!(),
+                }
+            }
+        });
+    }
+
+    // ── Derivation legs (#1769) ───────────────────────────────────────────
+    // Appended to the SAME spec slice, after the counter-cache legs: the
+    // repository dispatch is shared, so a derivation rides every mutation path
+    // a counter cache already rides.
+    let filter_fields = filter_field_map(all_fields);
+    let mut derivation_items: Vec<TokenStream> = Vec::new();
+    for (index, decl) in derivations.iter().enumerate() {
+        let column = &decl.column;
+        let parent_table = derivation_parent_table(decl);
+        // The parent primary key is `id` (see `parent_pk` below), and a
+        // derivation maintaining it would rewrite the parent's identity on the
+        // first qualifying mutation.
+        if column == "id" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.id`: that is the \
+                     parent's primary key, and a maintained value would rewrite the \
+                     parent's identity. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        // `tenant_id` is the framework's tenant discriminator on every model
+        // that has it (see `is_tenant_id_field`), so a maintained value would
+        // move the parent to another tenant. The parent's own claim catches
+        // this at boot as well; this is the earlier, clearer diagnostic.
+        if column == "tenant_id" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.tenant_id`: that is the \
+                     parent's tenant discriminator, and a maintained value would move the \
+                     parent to another tenant. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        // `deleted_at` is the soft-delete marker wherever it appears: any
+        // non-NULL value hides the row from every soft-deleting read.
+        if column == "deleted_at" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.deleted_at`: that is the \
+                     parent's soft-delete marker, and any maintained value (a zero \
+                     included) would hide the parent from every `deleted_at IS NULL` \
+                     read. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        let self_referential = parent_table == table_name;
+        let fk = derivation_fk(model_ident, decl, assocs)?;
+        let Some(fk_field) = all_fields
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == fk))
+        else {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` foreign key `{fk}` is not a field of model \
+                     `{model_ident}`; add it, or name the right column with \
+                     `fk = <column>`"
+                ),
+            ));
+        };
+        // `fk` names the Rust field; the column it reaches SQL under is the
+        // physical one, which `#[diesel(column_name = ...)]` may have renamed.
+        let fk_column = diesel_column_name(fk_field).unwrap_or_else(|| fk.clone());
+        // The grouping key and the tenant discriminator are read by every
+        // aggregate as well, `transform` and `filter` aside, so onto its own
+        // table a derivation must not maintain either: the parent-side update
+        // would re-parent (or re-tenant) the row without the repository hook
+        // that carries the contribution off the old parent.
+        if self_referential {
+            let implicit = if *column == fk_column {
+                Some("foreign key")
+            } else if decl.tenant_column.as_deref() == Some(column.as_str()) {
+                Some("tenant column")
+            } else {
+                None
+            };
+            if let Some(role) = implicit {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` onto its own table cannot maintain its {role}: \
+                         `{column}` groups the contributions, and the parent-side update \
+                         runs no repository hook, so a maintained value would re-parent \
+                         the row without carrying its contribution off the old parent. \
+                         Maintain a dedicated aggregate column"
+                    ),
+                ));
+            }
+        }
+        // A derivation onto its own table must not read the column it writes:
+        // the parent-side UPDATE runs no repository hook, so a node's new
+        // aggregate would change its own contribution (or its eligibility)
+        // toward its parent without that parent ever hearing about it.
+        // What this derivation reads off the child row: the summed field, the
+        // filter's fields, and the two every aggregate reads implicitly, the
+        // grouping key and the tenant column.
+        let reads = |source: &str| {
+            let summed = match &decl.transform {
+                DerivationTransform::Sum { field, .. } => field == source,
+                DerivationTransform::Count => false,
+            };
+            summed
+                || decl
+                    .filter
+                    .as_ref()
+                    .is_some_and(|expr| expr_mentions_field(expr, source))
+                || fk_column == source
+                || decl.tenant_column.as_deref() == Some(source)
+        };
+        if self_referential && reads(column) {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` onto its own table cannot read the column it \
+                     maintains: `{column}` is both the maintained column and a \
+                     source of the contribution (in `transform` or `filter`), and \
+                     the parent-side update runs no repository hook, so a row's new \
+                     aggregate would change what it contributes to its own parent \
+                     without that parent being maintained. Read another column, or \
+                     maintain another one"
+                ),
+            ));
+        }
+        // The same hole one level over: a source that something else in this
+        // model maintains on this table moves under direct SQL, and the
+        // contribution built from it changes with no delta carrying the change
+        // up. A comment's `child_score` moves; the post's `sum(child_score)`
+        // never hears of it.
+        if let Some((_, source, by)) = maintained_here
+            .iter()
+            .find(|(owner, source, _)| *owner != Some(index) && reads(source))
+        {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot read `{source}` as a source (summed, filtered \
+                     on, grouped by, or scoped by): {by} maintains `{table_name}.{source}` \
+                     by direct SQL, which runs no repository hook, so this contribution \
+                     would change without the delta that carries it up. Read a column \
+                     nothing maintains, or maintain the aggregate one level at a time"
+                ),
+            ));
+        }
+        // Read through the field's own ident, which keeps a raw-identifier
+        // spelling (`r#type`) that the column name (`type`) has dropped.
+        let fk_ident = fk_field
+            .ident
+            .as_ref()
+            .expect("matched a named field above");
+        // Same wrapping rule as a counter cache: a nullable foreign key
+        // forwards as-is so an unparented child moves nothing, and the emitted
+        // `fn` signature is what enforces `i64`.
+        let fk_expr = if option_inner(&fk_field.ty).is_some() {
+            quote! { __autumn_cc_record.#fk_ident }
+        } else {
+            quote! { ::core::option::Option::Some(__autumn_cc_record.#fk_ident) }
+        };
+        let fk_fn = format_ident!("__autumn_derivation_fk_{index}");
+        fk_fns.push(quote! {
+            fn #fk_fn(__autumn_cc_record: &#model_ident) -> ::core::option::Option<i64> {
+                #fk_expr
+            }
+        });
+
+        // Unlike `counter_cache_tenant`, a derivation's tenant column is read
+        // from the CHILD row (`child.tenant`), so the macro can check it.
+        let tenant_of = if let Some(tenant) = decl.tenant_column.as_deref() {
+            let Some(tenant_field) = all_fields
+                .iter()
+                .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == tenant))
+            else {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` is not a \
+                         field of model `{model_ident}`: the maintenance \
+                         scopes its statements by `{table_name}.{tenant}`, so \
+                         it must be a column of the child"
+                    ),
+                ));
+            };
+            // The name is spliced into SQL as the physical column of both
+            // tables, so a Rust field that is not the column's name would scope
+            // every statement by a column the child table does not have — and
+            // naming the database column instead fails the lookup above.
+            if field_has_diesel_column_name(tenant_field) {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` names a field \
+                         carrying `#[diesel(column_name = ...)]`: the \
+                         maintenance scopes its statements by \
+                         `{table_name}.{tenant}` and by the same column of the \
+                         parent, spelled after the Rust field, so a renamed \
+                         database column would be spliced under a name the \
+                         tables do not have. Name the Rust field after the \
+                         column instead"
+                    ),
+                ));
+            }
+            // The maintenance reads the tenant off the record as text and
+            // compares it with the database's `CAST(... AS TEXT)` of the
+            // pre-update row, so the two spellings have to agree: integers
+            // and strings do, anything else does not.
+            let Some(body) = tenant_text_body(tenant_field) else {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`#[derivation]` tenant column `{tenant}` must be an integer \
+                         or `String` field (or an `Option` of one): the maintenance \
+                         reads it as text to tell a child moved between tenants from \
+                         one that stayed"
+                    ),
+                ));
+            };
+            let tenant_fn = format_ident!("__autumn_derivation_tenant_{index}");
+            fk_fns.push(quote! {
+                fn #tenant_fn(
+                    __autumn_cc_record: &#model_ident,
+                ) -> ::core::option::Option<::std::string::String> {
+                    #body
+                }
+            });
+            quote! { ::core::option::Option::Some(#tenant_fn) }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
+
+        let lowered = decl
+            .filter
+            .as_ref()
+            .map(|expr| lower_filter(expr, model_ident, &filter_fields))
+            .transpose()?;
+        // The leading ` AND ` is included so every statement builder can
+        // concatenate the fragment without knowing whether it is empty.
+        let filter_sql = lowered
+            .as_ref()
+            .map_or_else(String::new, |l| format!(" AND ({})", l.sql));
+        let filter_src = decl
+            .filter
+            .as_ref()
+            .map_or_else(String::new, |expr| expr.to_token_stream().to_string());
+
+        let (contrib_expr, contrib_sql) = match &decl.transform {
+            DerivationTransform::Count => (quote! { 1 }, "1".to_owned()),
+            DerivationTransform::Sum { field, span } => {
+                let Some(sum_field) = all_fields
+                    .iter()
+                    .find(|f| f.ident.as_ref().is_some_and(|i| unraw_ident(i) == *field))
+                else {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` names `{field}`, which is not a \
+                             field of model `{model_ident}`"
+                        ),
+                    ));
+                };
+                // The two columns that are never data to aggregate: the child's
+                // own id, and the parent id the derivation groups by.
+                if *field == pk_field_name {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` sums the primary key of model \
+                             `{model_ident}`: the total would be a sum of row \
+                             ids, not of the child's data. Sum a value column, \
+                             or use `transform = count`"
+                        ),
+                    ));
+                }
+                if *field == fk {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` sums the foreign key this \
+                             derivation groups by: every qualifying row carries \
+                             the same parent id, so the total would be that id \
+                             times the row count. Use `transform = count`"
+                        ),
+                    ));
+                }
+                if option_inner(&sum_field.ty).is_some() || !is_sum_integer_type(&sum_field.ty) {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` requires a non-nullable integer \
+                             field: `{field}` must be `i8`, `i16`, `i32` or \
+                             `i64`. A nullable or floating-point sum would make \
+                             the Rust and SQL lowerings of one derivation \
+                             disagree"
+                        ),
+                    ));
+                }
+                if field_has_diesel_column_name(sum_field) {
+                    return Err(syn::Error::new(
+                        *span,
+                        format!(
+                            "`sum({field})` names a field carrying \
+                             `#[diesel(column_name = ...)]`: the contribution \
+                             SQL names the column after the Rust field, so a \
+                             renamed database column would be spliced under a \
+                             name the table does not have. Name the Rust field \
+                             after the column instead"
+                        ),
+                    ));
+                }
+                // Read through the field's own ident, which keeps a raw
+                // prefix the column name has dropped.
+                let sum_ident = sum_field
+                    .ident
+                    .as_ref()
+                    .expect("matched a named field above");
+                // An `i64` field needs no widening; `i64::from` covers the
+                // narrower widths.
+                let read = if is_i64_type(&sum_field.ty) {
+                    quote! { __r.#sum_ident }
+                } else {
+                    quote! { i64::from(__r.#sum_ident) }
+                };
+                (read, format!("{{c}}.\"{field}\""))
+            }
+        };
+        let contrib_fn = format_ident!("__autumn_derivation_contrib_{index}");
+        let contrib_body = match (lowered.as_ref(), &decl.transform) {
+            (Some(filter), _) => {
+                let predicate = &filter.rust;
+                quote! { if #predicate { #contrib_expr } else { 0 } }
+            }
+            // An unfiltered count never reads the record.
+            (None, DerivationTransform::Count) => quote! { let _ = __r; #contrib_expr },
+            (None, DerivationTransform::Sum { .. }) => quote! { #contrib_expr },
+        };
+        fk_fns.push(quote! {
+            fn #contrib_fn(__r: &#model_ident) -> i64 {
+                #contrib_body
+            }
+        });
+
+        let tenant_column = decl.tenant_column.as_deref().map_or_else(
+            || quote! { ::core::option::Option::None },
+            |tenant| quote! { ::core::option::Option::Some(#tenant) },
+        );
+        let name = derivation_name(decl, &parent_table);
+        let transform_src = decl.transform.as_source();
+        let def_ident = format_ident!("__AUTUMN_DERIVATION_{}_{}", model_ident, index);
+        let target = &decl.target;
+        derivation_items.push(quote! {
+            /// The parent type is otherwise never named in the expansion: the
+            /// parent table is a string and the maintenance is SQL. This makes
+            /// a typo in `#[derivation(Psot, ...)]` a compile error.
+            const _: ::core::marker::PhantomData<#target> =
+                ::core::marker::PhantomData;
+
+            /// Registered definition of one `#[derivation]` on this model
+            /// (#1769): framework plumbing, not a public API.
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            pub static #def_ident: ::autumn_web::derivation::DerivationDef =
+                ::autumn_web::derivation::DerivationDef {
+                    name: #name,
+                    model: ::core::stringify!(#model_ident),
+                    child_table: #table_name,
+                    child_pk: #pk_column,
+                    child_soft_delete: #has_deleted_at,
+                    fk_column: #fk_column,
+                    parent_table: #parent_table,
+                    parent_pk: "id",
+                    column: #column,
+                    transform: #transform_src,
+                    filter: #filter_src,
+                    filter_sql: #filter_sql,
+                    contrib_sql: #contrib_sql,
+                    tenant_column: #tenant_column,
+                    module_path: ::core::module_path!(),
+                    file: ::core::file!(),
+                    line: ::core::line!(),
+                };
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::derivation::DerivationDescriptor { def: &#def_ident }
+            }
+        });
+        spec_entries.push(quote! {
+            ::autumn_web::repository::CounterCacheSpec {
+                child_table: #table_name,
+                child_pk: #pk_column,
+                child_soft_delete: #has_deleted_at,
+                fk_column: #fk_column,
+                parent_table: #parent_table,
+                parent_pk: "id",
+                counter_column: #column,
+                fk_of: #fk_fn,
+                pk_of: __autumn_counter_cache_pk,
+                live_of: __autumn_counter_cache_live,
+                tenant_column: #tenant_column,
+                tenant_of: #tenant_of,
+                contrib_of: #contrib_fn,
+                contrib_sql: #contrib_sql,
+                filter_sql: #filter_sql,
+                derivation: ::core::option::Option::Some(&#def_ident),
             }
         });
     }
 
     Ok(quote! {
+        #(#claim_items)*
+        #(#derivation_items)*
+
         impl #model_ident {
-            /// Whether this model maintains any counter cache (#1325). An
-            /// inherent shadow of `AutumnCounterCaches::HAS_COUNTER_CACHES`;
-            /// framework plumbing, not a public API.
+            /// Whether this model maintains any counter cache (#1325) or
+            /// derivation (#1769). An inherent shadow of
+            /// `AutumnCounterCaches::HAS_COUNTER_CACHES`; framework plumbing,
+            /// not a public API.
             #[doc(hidden)]
             pub const HAS_COUNTER_CACHES: bool = true;
 
             /// Runtime counter-cache specs consulted by this model's generated
-            /// repository (#1325). An inherent shadow of
+            /// repository (#1325), with the model's derivations (#1769)
+            /// appended. An inherent shadow of
             /// `AutumnCounterCaches::counter_caches`; framework plumbing, not a
             /// public API.
             #[doc(hidden)]
@@ -2076,6 +3577,9 @@ fn emit_votable_items(
     let reactor_fk = format_ident!("{}", spec.reactor_fk);
     let target_fk = format_ident!("{}", spec.target_fk);
     let agg_column = format_ident!("{}", spec.column);
+    let edge_table_name = spec.table.as_str();
+    let table_name_str = table_ident.to_string();
+    let agg_column_name = spec.column.as_str();
     // The target projection must name the model's real primary-key column:
     // `react()` locks and updates `WHERE #pk_column = $target_id`, and a
     // hard-coded `id` would miss (or worse, hit an unrelated column on) a
@@ -2624,6 +4128,21 @@ fn emit_votable_items(
     );
 
     quote! {
+        // The aggregate column this model keeps from its reaction edges is a
+        // framework-maintained column like a counter cache's, so it is
+        // registered as a claim: a `#[derivation]` on another model naming
+        // the same `(table, column)` would discard this aggregate on every
+        // mutation and backfill, and the boot refuses the pair (#1769).
+        ::autumn_web::reexports::inventory::submit! {
+            ::autumn_web::derivation::CounterCacheClaim {
+                model: ::core::stringify!(#model_ident),
+                child_table: #edge_table_name,
+                parent_table: #table_name_str,
+                column: #agg_column_name,
+                direct_sql: true,
+                module_path: ::core::module_path!(),
+            }
+        }
         #hidden_module
 
         #pk_guard
@@ -3538,20 +5057,52 @@ fn unraw_ident(ident: &syn::Ident) -> String {
     raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
 }
 
+/// Whether a field is the framework's tenant discriminator: the model macro
+/// keys tenant scoping off a field named `tenant_id`, wherever it appears.
+fn is_tenant_id_field(field: &syn::Field) -> bool {
+    field.ident.as_ref().is_some_and(|i| i == "tenant_id")
+}
+
+/// Whether a field is the framework's soft-delete marker, `deleted_at`.
+fn is_deleted_at_field(field: &syn::Field) -> bool {
+    field.ident.as_ref().is_some_and(|i| i == "deleted_at")
+}
+
 /// Whether a field carries `#[diesel(column_name = ...)]`, which renames the
 /// database column out from under the Rust field name.
 fn field_has_diesel_column_name(field: &syn::Field) -> bool {
-    let mut found = false;
+    diesel_column_name(field).is_some()
+}
+
+/// The database column a field's `#[diesel(column_name = ...)]` names, when it
+/// carries one. Diesel accepts both spellings, `column_name = revision` and
+/// `column_name = "revision"`, and so does this.
+///
+/// A `column_name` whose value is neither is still reported, as an empty name:
+/// this is a detector, not a validator (Diesel's own derive reports malformed
+/// input with a better message), and a caller asking "is this field renamed?"
+/// must not answer "no" because the rename did not parse.
+fn diesel_column_name(field: &syn::Field) -> Option<String> {
+    let mut found = None;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
-        // Swallow any parse error: this is a detector, not a validator —
-        // diesel's own derive reports malformed input with a better message.
+        // Swallow any parse error, for the reason above.
         let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("column_name") {
-                found = true;
-            }
-            let _ = meta
+            let value = meta
                 .value()
                 .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
+            if meta.path.is_ident("column_name") {
+                let name = match value {
+                    Ok(syn::Expr::Path(path)) => {
+                        path.path.get_ident().map(unraw_ident).unwrap_or_default()
+                    }
+                    Ok(syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(lit),
+                        ..
+                    })) => lit.value(),
+                    _ => String::new(),
+                };
+                found = Some(name);
+            }
             Ok(())
         });
     }
@@ -5249,6 +6800,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let association_items = emit_association_items(name, &table_ident, vis, &associations);
     let dependents_impl = emit_dependents_impl(name, &associations);
 
+    // `#[derivation(Parent, column = "...", ...)]` (#1769). Parsed here beside
+    // the associations, because the default foreign key comes from the
+    // `#[belongs_to]` leg targeting the same parent. The filter is lowered
+    // below, once `all_fields` is known.
+    let derivations = match resolve_derivations(name, outer_attrs, &associations) {
+        Ok(decls) => decls,
+        Err(err) => return err.to_compile_error(),
+    };
+
     // `#[votable(by = ..., ...)]` (#1362). Resolved here next to the
     // associations; emitted below, once `all_fields` is known (the aggregate
     // column must name a real field, and the soft-delete guard is emitted only
@@ -5279,6 +6839,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Some(spec) = commentable.as_ref() {
         graph_relation_tables.push(spec.table.clone());
     }
+    // A `#[derivation]` writes the parent's table from the child's repository,
+    // so the parent is reached without ever being named in a route.
+    for decl in &derivations {
+        graph_relation_tables.push(derivation_parent_table(decl));
+    }
     graph_relation_tables.sort();
     graph_relation_tables.dedup();
     let graph_relations = if graph_relation_tables.is_empty() {
@@ -5295,6 +6860,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 && !is_association_attr(a)
                 && !is_votable_attr(a)
                 && !is_commentable_attr(a)
+                && !is_derivation_attr(a)
                 && !a.path().is_ident("shard_key")
         })
         .collect();
@@ -5592,6 +7158,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             cc_pk_ident,
             cc_has_deleted_at,
             &associations,
+            &derivations,
             &all_fields,
         ) {
             Ok(tokens) => tokens,
@@ -9128,6 +10695,1420 @@ mod tests {
         ];
         let assocs = resolve_associations(&model, &attrs).expect("parse ok");
         assert_eq!(assocs.len(), 2);
+    }
+
+    // ── `#[derivation]` (#1769) ───────────────────────────────────────────
+    //
+    // One declaration produces two lowerings of the same filter: a Rust
+    // predicate the repository evaluates on a record, and a SQL predicate the
+    // set-based statements splice. Every row of the lowering table is asserted
+    // pairwise, because a divergence between the two is exactly the drift this
+    // feature exists to prevent.
+
+    /// Named fields of a struct literal, for building a filter field map.
+    fn deriv_fields(input: TokenStream) -> Vec<syn::Field> {
+        let item: syn::ItemStruct = syn::parse2(input).expect("struct");
+        match item.fields {
+            syn::Fields::Named(named) => named.named.into_iter().collect(),
+            _ => panic!("expected named fields"),
+        }
+    }
+
+    /// The filter field map for a struct written inline in a test.
+    fn deriv_field_map(input: TokenStream) -> FilterFields {
+        let fields = deriv_fields(input);
+        let refs: Vec<&syn::Field> = fields.iter().collect();
+        filter_field_map(&refs)
+    }
+
+    /// Lower `filter` against a one-field child model of the given type.
+    fn lower_one(ty: &TokenStream, filter: &syn::Expr) -> syn::Result<LoweredFilter> {
+        let map = deriv_field_map(quote! { struct C { pub id: i64, pub f: #ty } });
+        let model: syn::Ident = syn::parse_quote!(C);
+        lower_filter(filter, &model, &map)
+    }
+
+    /// The error message from a filter the grammar must reject.
+    fn lower_one_err(ty: &TokenStream, filter: &syn::Expr) -> String {
+        match lower_one(ty, filter) {
+            Ok(_) => panic!("expected the filter to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// The error message from a rejected `#[derivation]` attribute.
+    fn expect_derivation_error(
+        model: &syn::Ident,
+        attrs: &[syn::Attribute],
+        assocs: &[Association],
+    ) -> String {
+        match resolve_derivations(model, attrs, assocs) {
+            Ok(_) => panic!("expected the derivation to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn filter_bare_bool_field_lowers_to_both() {
+        let lowered = lower_one(&quote!(bool), &syn::parse_quote!(f)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" = TRUE");
+    }
+
+    #[test]
+    fn filter_bare_option_bool_uses_option_semantics() {
+        let lowered = lower_one(&quote!(Option<bool>), &syn::parse_quote!(f)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f == ::core::option::Option::Some(true) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" = TRUE");
+    }
+
+    #[test]
+    fn filter_negated_bool_lowers_to_false() {
+        let lowered = lower_one(&quote!(bool), &syn::parse_quote!(!f)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { !__r.f }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" = FALSE");
+    }
+
+    #[test]
+    fn filter_negated_option_bool_compares_to_some_false() {
+        let lowered = lower_one(&quote!(Option<bool>), &syn::parse_quote!(!f)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f == ::core::option::Option::Some(false) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" = FALSE");
+    }
+
+    #[test]
+    fn filter_bool_literal_comparison_folds_to_the_bare_form() {
+        let eq_true = lower_one(&quote!(bool), &syn::parse_quote!(f == true)).expect("lower");
+        assert_eq!(eq_true.rust.to_string(), quote! { __r.f }.to_string());
+        assert_eq!(eq_true.sql, "{c}.\"f\" = TRUE");
+
+        let eq_false = lower_one(&quote!(bool), &syn::parse_quote!(f == false)).expect("lower");
+        assert_eq!(eq_false.rust.to_string(), quote! { !__r.f }.to_string());
+        assert_eq!(eq_false.sql, "{c}.\"f\" = FALSE");
+
+        let ne_true = lower_one(&quote!(bool), &syn::parse_quote!(f != true)).expect("lower");
+        assert_eq!(ne_true.sql, "{c}.\"f\" = FALSE");
+    }
+
+    #[test]
+    fn filter_int_comparison_lowers_verbatim() {
+        let lowered = lower_one(&quote!(i64), &syn::parse_quote!(f > 3)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f > 3 }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" > 3");
+    }
+
+    #[test]
+    fn filter_negative_int_literal_is_accepted() {
+        let lowered = lower_one(&quote!(i64), &syn::parse_quote!(f >= -5)).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f >= -5 }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" >= -5");
+    }
+
+    #[test]
+    fn filter_option_int_comparison_excludes_null() {
+        let lowered = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f > 3)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.is_some_and(|__v| __v > 3) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" > 3");
+    }
+
+    #[test]
+    fn filter_option_int_inequality_excludes_null() {
+        // `__r.f != Some(3)` would count a NULL row, but SQL `f <> 3` is NULL
+        // (excluded) for a NULL `f`. `is_some_and` makes the two agree.
+        let lowered = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f != 3)).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.is_some_and(|__v| __v != 3) }.to_string()
+        );
+        assert_eq!(lowered.sql, "{c}.\"f\" <> 3");
+    }
+
+    #[test]
+    fn filter_string_equality_lowers_to_a_quoted_literal() {
+        let lowered = lower_one(&quote!(String), &syn::parse_quote!(f == "pub")).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f == "pub" }.to_string()
+        );
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'pub' {bin}");
+    }
+
+    #[test]
+    fn filter_option_string_equality_uses_as_deref() {
+        let lowered =
+            lower_one(&quote!(Option<String>), &syn::parse_quote!(f == "pub")).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.as_deref() == ::core::option::Option::Some("pub") }.to_string()
+        );
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'pub' {bin}");
+    }
+
+    #[test]
+    fn filter_option_string_inequality_excludes_null() {
+        let lowered =
+            lower_one(&quote!(Option<String>), &syn::parse_quote!(f != "pub")).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { __r.f.as_deref().is_some_and(|__v| __v != "pub") }.to_string()
+        );
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) <> 'pub' {bin}");
+    }
+
+    #[test]
+    fn filter_string_literal_quote_is_escaped_for_sql() {
+        let lowered =
+            lower_one(&quote!(String), &syn::parse_quote!(f == "o'brien")).expect("lower");
+        assert_eq!(lowered.sql, "CAST({c}.\"f\" AS TEXT) = 'o''brien' {bin}");
+    }
+
+    #[test]
+    fn filter_string_literal_with_a_brace_is_rejected() {
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f == "{c}"));
+        assert!(message.contains("placeholder"), "{message}");
+    }
+
+    #[test]
+    fn filter_option_probes_lower_to_null_predicates() {
+        let some = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f.is_some())).expect("lower");
+        assert_eq!(
+            some.rust.to_string(),
+            quote! { __r.f.is_some() }.to_string()
+        );
+        assert_eq!(some.sql, "{c}.\"f\" IS NOT NULL");
+
+        let none = lower_one(&quote!(Option<i64>), &syn::parse_quote!(f.is_none())).expect("lower");
+        assert_eq!(
+            none.rust.to_string(),
+            quote! { __r.f.is_none() }.to_string()
+        );
+        assert_eq!(none.sql, "{c}.\"f\" IS NULL");
+    }
+
+    #[test]
+    fn filter_conjunction_parenthesises_both_sides() {
+        let map = deriv_field_map(quote! {
+            struct C { pub id: i64, pub published: bool, pub score: i64 }
+        });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let lowered =
+            lower_filter(&syn::parse_quote!(published && score > 0), &model, &map).expect("lower");
+        assert_eq!(
+            lowered.rust.to_string(),
+            quote! { (__r.published) && (__r.score > 0) }.to_string()
+        );
+        assert_eq!(
+            lowered.sql,
+            "({c}.\"published\" = TRUE) AND ({c}.\"score\" > 0)"
+        );
+    }
+
+    #[test]
+    fn filter_parentheses_are_transparent() {
+        let lowered = lower_one(&quote!(bool), &syn::parse_quote!((f))).expect("lower");
+        assert_eq!(lowered.rust.to_string(), quote! { __r.f }.to_string());
+        assert_eq!(lowered.sql, "{c}.\"f\" = TRUE");
+    }
+
+    #[test]
+    fn filter_float_literal_is_rejected() {
+        let message = lower_one_err(&quote!(i64), &syn::parse_quote!(f > 1.5));
+        assert!(message.contains("float"), "{message}");
+    }
+
+    #[test]
+    fn filter_naming_a_non_field_is_rejected() {
+        let message = lower_one_err(&quote!(bool), &syn::parse_quote!(missing));
+        assert!(
+            message.contains("`missing` is not a field"),
+            "the error must name the unknown field: {message}"
+        );
+    }
+
+    #[test]
+    fn filter_over_an_unsupported_field_type_is_rejected() {
+        let map = deriv_field_map(quote! {
+            struct C { pub id: i64, pub at: chrono::NaiveDateTime }
+        });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let err = lower_filter(&syn::parse_quote!(at == 1), &model, &map)
+            .expect_err("timestamps are outside the filter grammar");
+        assert!(err.to_string().contains("`at`"), "{err}");
+    }
+
+    #[test]
+    fn filter_outside_the_grammar_lists_the_grammar() {
+        let message = lower_one_err(&quote!(bool), &syn::parse_quote!(f || f));
+        assert!(
+            message.contains("field.is_some()") && message.contains("a && b"),
+            "the error must list the accepted grammar: {message}"
+        );
+    }
+
+    #[test]
+    fn filter_string_ordering_is_rejected() {
+        // Rust compares bytes, SQL compares by collation: the two lowerings
+        // would disagree, which is the drift this feature prevents.
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f > "a"));
+        assert!(message.contains("collation"), "{message}");
+    }
+
+    #[test]
+    fn filter_is_some_on_a_non_option_field_is_rejected() {
+        let message = lower_one_err(&quote!(i64), &syn::parse_quote!(f.is_some()));
+        assert!(message.contains("not an `Option"), "{message}");
+    }
+
+    #[test]
+    fn filter_comparison_type_mismatch_is_rejected() {
+        let message = lower_one_err(&quote!(i64), &syn::parse_quote!(f == "x"));
+        assert!(message.contains("integer"), "{message}");
+    }
+
+    // ── attribute parsing and defaults ────────────────────────────────────
+
+    #[test]
+    fn derivation_defaults_to_count_and_no_filter() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "comment_count")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].column, "comment_count");
+        assert_eq!(decls[0].transform.as_source(), "count");
+        assert!(decls[0].filter.is_none());
+        assert!(decls[0].name.is_none());
+    }
+
+    #[test]
+    fn derivation_name_defaults_to_parent_table_and_column() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "published_comment_count")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(
+            derivation_name(&decls[0], "posts"),
+            "posts.published_comment_count"
+        );
+    }
+
+    #[test]
+    fn derivation_name_override_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "posts.custom")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(derivation_name(&decls[0], "posts"), "posts.custom");
+    }
+
+    #[test]
+    fn derivation_fk_defaults_to_the_belongs_to_leg() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, fk = article_id)])];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &assocs).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &assocs).expect("resolved"),
+            "article_id"
+        );
+    }
+
+    #[test]
+    fn derivation_fk_falls_back_to_the_convention() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &[]).expect("resolved"),
+            "post_id"
+        );
+    }
+
+    #[test]
+    fn derivation_fk_override_wins() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", fk = article_id)])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &[]).expect("resolved"),
+            "article_id"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_transform_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "s", transform = sum(score))])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls[0].transform.as_source(), "sum(score)");
+    }
+
+    #[test]
+    fn derivation_sum_transform_rejects_anything_after_the_field() {
+        // `sum(score + bonus)` must not be read as `sum(score)`: the maintained
+        // aggregate would silently differ from what the source says.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        for attr in [
+            quote! { #[derivation(Post, column = "s", transform = sum(score + bonus))] },
+            quote! { #[derivation(Post, column = "s", transform = sum(score, bonus))] },
+        ] {
+            let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#attr)];
+            let Err(err) = resolve_derivations(&model, &attrs, &[]) else {
+                panic!("extra tokens inside sum(...) must be an error")
+            };
+            assert!(err.to_string().contains("exactly one field name"), "{err}");
+        }
+    }
+
+    #[test]
+    fn derivation_tenant_column_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", tenant = "tenant_id")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls[0].tenant_column.as_deref(), Some("tenant_id"));
+    }
+
+    #[test]
+    fn derivation_unknown_key_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", wat = "x")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("column = "), "{message}");
+    }
+
+    #[test]
+    fn derivation_without_a_column_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post)])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("`column = \"<column>\"`"), "{message}");
+    }
+
+    #[test]
+    fn derivation_non_identifier_column_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c; DROP TABLE posts")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn derivation_unknown_transform_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", transform = avg(score))])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("`count`"), "{message}");
+    }
+
+    #[test]
+    fn two_derivations_onto_one_parent_column_collide() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c", filter = published)]),
+            syn::parse_quote!(#[derivation(Post, column = "c")]),
+        ];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("posts.c"), "{message}");
+    }
+
+    #[test]
+    fn a_derivation_colliding_with_a_counter_cache_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(Post, counter_cache)])];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "comment_count")])];
+        let message = expect_derivation_error(&model, &attrs, &assocs);
+        assert!(
+            message.contains("posts.comment_count") && message.contains("counter_cache"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn two_derivations_onto_different_parents_may_share_a_column_name() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c")]),
+            syn::parse_quote!(#[derivation(Team, column = "c")]),
+        ];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(decls.len(), 2);
+    }
+
+    // ── #1769 review follow-ups (M1-M12) ──────────────────────────────────
+
+    #[test]
+    fn filter_on_a_raw_identifier_field_names_the_plain_column() {
+        // `r#type` is the Rust spelling; the column is `type`.
+        let map = deriv_field_map(quote! { struct C { pub id: i64, pub r#type: String } });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let filter: syn::Expr = syn::parse_quote!(r#type == "post");
+        let lowered = lower_filter(&filter, &model, &map).expect("lower");
+        assert_eq!(lowered.sql, "CAST({c}.\"type\" AS TEXT) = 'post' {bin}");
+    }
+
+    #[test]
+    fn filter_on_a_diesel_renamed_field_is_rejected() {
+        let map = deriv_field_map(quote! {
+            struct C {
+                pub id: i64,
+                #[diesel(column_name = is_live)]
+                pub published: bool,
+            }
+        });
+        let model: syn::Ident = syn::parse_quote!(C);
+        let filter: syn::Expr = syn::parse_quote!(published);
+        let message = match lower_filter(&filter, &model, &map) {
+            Ok(_) => panic!("expected the renamed field to be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(message.contains("column_name"), "{message}");
+    }
+
+    #[test]
+    fn filter_comparison_over_narrow_integers_lowers_to_both() {
+        for ty in [quote!(i8), quote!(i16), quote!(i32)] {
+            let lowered = lower_one(&ty, &syn::parse_quote!(f >= 3)).expect("lower");
+            assert_eq!(lowered.rust.to_string(), quote! { __r.f >= 3 }.to_string());
+            assert_eq!(lowered.sql, "{c}.\"f\" >= 3");
+        }
+    }
+
+    #[test]
+    fn filter_string_literal_with_a_backslash_is_rejected() {
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f == "a\\b"));
+        assert!(message.contains("backslash"), "{message}");
+    }
+
+    #[test]
+    fn filter_string_literal_with_a_control_character_is_rejected() {
+        let message = lower_one_err(&quote!(String), &syn::parse_quote!(f == "a\u{0}b"));
+        assert!(message.contains("backslash"), "{message}");
+    }
+
+    #[test]
+    fn derivation_parent_table_override_is_recorded() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", parent_table = "articles")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(derivation_parent_table(&decls[0]), "articles");
+        assert_eq!(
+            derivation_name(&decls[0], &derivation_parent_table(&decls[0])),
+            "articles.c"
+        );
+    }
+
+    #[test]
+    fn derivation_parent_table_defaults_to_the_inferred_name() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &[]).expect("parse ok");
+        assert_eq!(derivation_parent_table(&decls[0]), "posts");
+    }
+
+    #[test]
+    fn derivation_parent_table_must_be_a_plain_identifier() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c", parent_table = "posts; DROP TABLE posts")]),
+        ];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn derivation_duplicate_key_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "a", column = "b")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("duplicate `column"), "{message}");
+    }
+
+    #[test]
+    fn derivation_fk_must_be_a_plain_identifier() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[derivation(Post, column = "c", fk = "post_id; DROP TABLE posts")]),
+        ];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("plain identifier"), "{message}");
+    }
+
+    #[test]
+    fn derivation_empty_name_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("empty"), "{message}");
+    }
+
+    #[test]
+    fn derivation_overlong_name_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let long = "n".repeat(129);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = #long)])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("128"), "{message}");
+    }
+
+    #[test]
+    fn derivation_name_under_the_parking_prefix_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "parked::c")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("reserved"), "{message}");
+    }
+
+    #[test]
+    fn derivation_name_with_a_control_character_is_rejected() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", name = "a\nb")])];
+        let message = expect_derivation_error(&model, &attrs, &[]);
+        assert!(message.contains("control"), "{message}");
+    }
+
+    #[test]
+    fn derivation_ambiguous_default_fk_is_rejected() {
+        // Two legs to one parent and no `fk =`: the macro must not guess.
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, fk = post_id, name = post)]),
+            syn::parse_quote!(#[belongs_to(Post, fk = origin_id, name = origin)]),
+        ];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[derivation(Post, column = "c")])];
+        let decls = resolve_derivations(&model, &attrs, &assocs).expect("parse ok");
+        let message = match derivation_fk(&model, &decls[0], &assocs) {
+            Ok(fk) => panic!("expected an ambiguity error, got `{fk}`"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            message.contains("post_id") && message.contains("origin_id"),
+            "both candidate keys must be named: {message}"
+        );
+    }
+
+    #[test]
+    fn derivation_ambiguous_default_fk_is_resolved_by_the_override() {
+        let model: syn::Ident = syn::parse_quote!(Comment);
+        let assoc_attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(Post, fk = post_id, name = post)]),
+            syn::parse_quote!(#[belongs_to(Post, fk = origin_id, name = origin)]),
+        ];
+        let assocs = resolve_associations(&model, &assoc_attrs).expect("assocs");
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[derivation(Post, column = "c", fk = origin_id)])];
+        let decls = resolve_derivations(&model, &attrs, &assocs).expect("parse ok");
+        assert_eq!(
+            derivation_fk(&model, &decls[0], &assocs).expect("resolved"),
+            "origin_id"
+        );
+    }
+    // ── emission ──────────────────────────────────────────────────────────
+
+    /// Expand `#[model]` over a child model carrying one `#[derivation]`.
+    fn derivation_model_output(attrs: &TokenStream, body: &TokenStream) -> String {
+        model_macro(
+            TokenStream::new(),
+            quote! {
+                #attrs
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                    pub published: bool,
+                    pub score: i32,
+                    #body
+                }
+            },
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn model_emits_a_derivation_static_and_registers_it() {
+        let generated = derivation_model_output(
+            &quote! {
+                #[derivation(Post, column = "published_comment_count", filter = published)]
+            },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("__AUTUMN_DERIVATION_Comment_0"),
+            "the definition static must be named per model and index: {generated}"
+        );
+        assert!(
+            generated.contains("DerivationDescriptor"),
+            "the definition must be submitted to the inventory registry: {generated}"
+        );
+        assert!(
+            generated.contains("\"posts.published_comment_count\""),
+            "the default name is `{{parent_table}}.{{column}}`: {generated}"
+        );
+        assert!(
+            generated.contains("\" AND ({c}.\\\"published\\\" = TRUE)\""),
+            "the emitted filter SQL must carry the alias placeholder: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_derivation_contrib_0"),
+            "the Rust contribution must be emitted as a plain fn: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_a_sum_contribution() {
+        let generated = derivation_model_output(
+            &quote! {
+                #[derivation(Post, column = "visible_score", transform = sum(score), filter = published)]
+            },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("\"{c}.\\\"score\\\"\""),
+            "the contribution SQL must name the summed column: {generated}"
+        );
+        assert!(
+            generated.contains("i64 :: from (__r . score)"),
+            "the Rust contribution must widen the summed field: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_maintain_the_parent_primary_key() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "id", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.id`"),
+            "the parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_tenant_id_field_claims_its_column() {
+        // The tenant discriminator is a maintained column in the registry's
+        // sense: a derivation onto it would move the parent between tenants,
+        // so a model carrying one claims it whether or not it keeps a counter
+        // cache of its own.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub tenant_id: Option<String>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("CounterCacheClaim") && generated.contains("column : \"tenant_id\""),
+            "a `tenant_id` field must claim its column: {generated}"
+        );
+        let without = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !without.contains("CounterCacheClaim"),
+            "a model with neither token nor tenant claims nothing: {without}"
+        );
+    }
+
+    #[test]
+    fn model_deleted_at_field_claims_its_column_and_is_not_a_derivation_target() {
+        // The soft-delete marker is a maintained column in the registry's
+        // sense: a value written into it hides the parent from every
+        // soft-deleting read.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("CounterCacheClaim")
+                && generated.contains("column : \"deleted_at\""),
+            "a `deleted_at` field must claim its column: {generated}"
+        );
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "deleted_at", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.deleted_at`"),
+            "the soft-delete marker is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_maintain_the_parent_tenant_id() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "tenant_id", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.tenant_id`"),
+            "the tenant discriminator is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_tenant_reads_the_child_tenant_as_text() {
+        // The pre-update capture reads the tenant with `CAST(... AS TEXT)`, and
+        // the record side must spell it the same way, so the accessor is
+        // emitted for integer and string fields (`Option` forwarded) and a
+        // field of any other type is rejected.
+        for ty in [quote! { i64 }, quote! { String }, quote! { Option<String> }] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #[derivation(Post, column = "reaction_count", fk = post_id, tenant = "org_id")]
+                    pub struct Reaction {
+                        #[id]
+                        pub id: i64,
+                        pub post_id: i64,
+                        pub org_id: #ty,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("tenant_of : :: core :: option :: Option :: Some"),
+                "a readable tenant field gets an accessor: {generated}"
+            );
+        }
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "reaction_count", fk = post_id, tenant = "flag")]
+                pub struct Reaction {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                    pub flag: bool,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("must be an integer or `String` field"),
+            "a tenant the maintenance cannot read as text is rejected: {generated}"
+        );
+        // A plain counter cache with a tenant it cannot read keeps its SQL:
+        // no accessor, no capture of the tenant.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache, counter_cache_tenant = "tenant_id")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("tenant_of : :: core :: option :: Option :: None"),
+            "a leg without the field reads no tenant: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_lock_version_claim_names_the_physical_column() {
+        // The registry matches a derivation's `column` against the claim by
+        // database name, so a `#[diesel(column_name)]` rename must be resolved
+        // rather than recorded under the Rust field name.
+        for rename in [quote! { revision }, quote! { "revision" }] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    pub struct Doc {
+                        #[id]
+                        pub id: i64,
+                        #[lock_version]
+                        #[diesel(column_name = #rename)]
+                        pub version: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("column : \"revision\""),
+                "the claim must carry the physical column: {generated}"
+            );
+            assert!(
+                !generated.contains("column : \"version\""),
+                "the Rust field name is not a column on the table: {generated}"
+            );
+        }
+        let plain = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    #[lock_version]
+                    pub r#version: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            plain.contains("column : \"version\""),
+            "an unrenamed token claims its (unrawed) field name: {plain}"
+        );
+    }
+
+    #[test]
+    fn model_self_referential_derivation_cannot_maintain_its_fk_or_tenant() {
+        // The grouping key and the tenant discriminator are implicit sources:
+        // every aggregate reads them, so maintaining one onto the same table
+        // would re-parent the row behind the repository's back.
+        for (attr, role) in [
+            (
+                quote! { #[derivation(Node, column = "parent_id", fk = parent_id)] },
+                "foreign key",
+            ),
+            (
+                quote! { #[derivation(Node, column = "org_id", fk = parent_id, tenant = "org_id")] },
+                "tenant column",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attr
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub org_id: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains(&format!("cannot maintain its {role}")),
+                "{role} is an implicit source of every contribution: {generated}"
+            );
+        }
+        // The same declaration onto another table is fine: the parent's
+        // `parent_id` is an ordinary column there.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "parent_id", fk = parent_id)]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("cannot maintain its"),
+            "only a self-referential derivation reads the column it maintains: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_read_a_column_another_maintainer_writes_on_its_table() {
+        // `child_score` is maintained on `nodes` by direct SQL, so a sibling
+        // reading it (as a sum, or in a filter, onto its own table or another)
+        // would see it move with no delta carrying the change up.
+        for (second, target) in [
+            (
+                quote! { #[derivation(Node, column = "grand_score", fk = parent_id, transform = sum(child_score))] },
+                "sum onto the same table",
+            ),
+            (
+                quote! { #[derivation(Node, column = "hot_children", fk = parent_id, filter = child_score > 0)] },
+                "filter onto the same table",
+            ),
+            (
+                quote! { #[derivation(Tree, column = "total_score", fk = tree_id, transform = sum(child_score))] },
+                "sum onto another table",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #[derivation(Node, column = "child_score", fk = parent_id, transform = sum(score))]
+                    #second
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub tree_id: i64,
+                        pub score: i64,
+                        pub child_score: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot read `child_score` as a source")
+                    && generated.contains("another `#[derivation]` of this model"),
+                "{target}: {generated}"
+            );
+        }
+        // A `counter_cache` leg back onto the same table maintains its column
+        // the same way.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Node, fk = parent_id, counter_cache = "reply_count")]
+                #[derivation(Node, column = "weighted", fk = parent_id, transform = sum(reply_count))]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub reply_count: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot read `reply_count` as a source")
+                && generated.contains("a `counter_cache` of this model"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_group_or_scope_by_a_column_a_sibling_maintains() {
+        // The grouping key and the tenant column are read implicitly by every
+        // aggregate, so a sibling maintaining one is the same hole.
+        for (attrs, source) in [
+            (
+                quote! {
+                    #[derivation(Node, column = "parent_id", fk = tree_id)]
+                    #[derivation(Node, column = "child_count", fk = parent_id)]
+                },
+                "parent_id",
+            ),
+            (
+                quote! {
+                    #[derivation(Node, column = "org_id", fk = parent_id)]
+                    #[derivation(Tree, column = "node_count", fk = tree_id, tenant = "org_id")]
+                },
+                "org_id",
+            ),
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attrs
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub tree_id: i64,
+                        pub org_id: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains(&format!("cannot read `{source}` as a source")),
+                "{source} is an implicit source: {generated}"
+            );
+        }
+        // Reading a column nothing maintains, next to a maintained one, is fine.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Node, column = "child_score", fk = parent_id, transform = sum(score))]
+                #[derivation(Node, column = "child_count", fk = parent_id, filter = score > 0)]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub score: i64,
+                    pub child_score: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("as a source"),
+            "two derivations over an unmaintained source coexist: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_spec_names_the_physical_pk_and_fk_columns() {
+        // `#[diesel(column_name = ...)]` on the `#[id]` or `fk` field renames
+        // the database column; the spec reaches SQL under the physical name.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "reaction_count", fk = article)]
+                pub struct Reaction {
+                    #[id]
+                    #[diesel(column_name = reaction_id)]
+                    pub id: i64,
+                    #[diesel(column_name = "article_id")]
+                    pub article: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("child_pk : \"reaction_id\""),
+            "the child primary key is spelled physically: {generated}"
+        );
+        assert!(
+            generated.contains("fk_column : \"article_id\""),
+            "the foreign key is spelled physically: {generated}"
+        );
+        assert!(
+            !generated.contains("child_pk : \"id\"")
+                && !generated.contains("fk_column : \"article\""),
+            "no Rust-named column reaches SQL: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_self_referential_derivation_cannot_read_the_column_it_maintains() {
+        // Onto its own table, summing (or filtering on) the maintained column
+        // would make a row's new aggregate change its own contribution to its
+        // parent with no hook to carry that change up.
+        for attr in [
+            quote! { #[derivation(Node, column = "score", fk = parent_id, transform = sum(score))] },
+            quote! { #[derivation(Node, column = "score", fk = parent_id, filter = score > 0)] },
+        ] {
+            let generated = model_macro(
+                TokenStream::new(),
+                quote! {
+                    #attr
+                    pub struct Node {
+                        #[id]
+                        pub id: i64,
+                        pub parent_id: Option<i64>,
+                        pub score: i64,
+                    }
+                },
+            )
+            .to_string();
+            assert!(
+                generated.contains("cannot read the column it maintains"),
+                "{generated}"
+            );
+        }
+        // Reading another column of its own table is fine.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Node, column = "score", fk = parent_id, transform = sum(weight))]
+                pub struct Node {
+                    #[id]
+                    pub id: i64,
+                    pub parent_id: Option<i64>,
+                    pub score: i64,
+                    pub weight: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "a self-referential derivation over another column expands: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_counter_cache_spec_carries_neutral_derivation_fields() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("contrib_sql : \"1\""),
+            "a counter cache contributes 1 per row: {generated}"
+        );
+        assert!(
+            generated.contains("filter_sql : \"\""),
+            "a counter cache has no filter, so its SQL stays byte-identical: {generated}"
+        );
+        assert!(
+            generated.contains("derivation : :: core :: option :: Option :: None"),
+            "a counter cache is not a derivation: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_parent_table_is_declared_as_a_graph_relation() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("relations : & [\"posts\"]"),
+            "the maintained parent table must appear in the architecture graph: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_attribute_is_stripped_from_the_generated_struct() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            !generated.contains("# [derivation"),
+            "`#[derivation]` is consumed by `#[model]`: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_a_non_integer_field_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(published))] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error"),
+            "summing a bool must be a compile error: {generated}"
+        );
+        assert!(generated.contains("integer"), "{generated}");
+    }
+
+    #[test]
+    fn derivation_sum_over_an_option_field_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(bonus))] },
+            &quote! { pub bonus: Option<i64>, },
+        );
+        assert!(
+            generated.contains("compile_error"),
+            "summing a nullable field must be a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_over_a_missing_foreign_key_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Team, column = "c")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("team_id"),
+            "the missing foreign key must be named: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_a_phantom_data_guard_for_the_parent_type() {
+        // The parent type is otherwise never named in the expansion, so a typo
+        // would compile and only fail at run time.
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "comment_count")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("PhantomData < Post >"),
+            "the parent type must be type-checked: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_the_parent_table_override() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", parent_table = "articles")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("parent_table : \"articles\""),
+            "the override must reach the spec and the definition: {generated}"
+        );
+        assert!(
+            generated.contains("\"articles.c\""),
+            "the default name must use the overridden table: {generated}"
+        );
+        assert!(
+            generated.contains("relations : & [\"articles\"]"),
+            "the graph relation must use the overridden table: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_tenant_reaches_both_the_spec_and_the_definition() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", tenant = "tenant_id")] },
+            &quote! { pub tenant_id: i64, },
+        );
+        let occurrences = generated
+            .matches("tenant_column : :: core :: option :: Option :: Some (\"tenant_id\")")
+            .count();
+        assert_eq!(
+            occurrences, 2,
+            "the tenant column belongs to both the spec and the definition: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_tenant_must_name_a_field_of_the_child() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", tenant = "tenant_id")] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("tenant_id"),
+            "the maintenance scopes by a child column, so it must exist: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_emits_a_bare_read_for_an_i64_sum() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(weight))] },
+            &quote! { pub weight: i64, },
+        );
+        assert!(
+            generated.contains("__r . weight"),
+            "an i64 field needs no widening: {generated}"
+        );
+        assert!(
+            !generated.contains("i64 :: from"),
+            "`i64::from` is for the narrow widths only: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_the_primary_key_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(id))] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("primary key"),
+            "summing the primary key is never an aggregate: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_the_foreign_key_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(post_id))] },
+            &TokenStream::new(),
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("foreign key"),
+            "summing the foreign key restates the parent id: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_a_diesel_renamed_field_is_rejected() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(weight))] },
+            &quote! {
+                #[diesel(column_name = mass)]
+                pub weight: i64,
+            },
+        );
+        assert!(
+            generated.contains("compile_error") && generated.contains("column_name"),
+            "the contribution SQL names the Rust field: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_sum_over_a_raw_identifier_field_names_the_plain_column() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c", transform = sum(r#match))] },
+            &quote! { pub r#match: i64, },
+        );
+        assert!(
+            generated.contains("\"{c}.\\\"match\\\"\""),
+            "the column drops the raw-identifier prefix: {generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_on_a_soft_delete_child_records_it() {
+        let generated = derivation_model_output(
+            &quote! { #[derivation(Post, column = "c")] },
+            &quote! { pub deleted_at: Option<chrono::NaiveDateTime>, },
+        );
+        assert!(
+            generated.contains("child_soft_delete : true"),
+            "a soft-deleted child is counted by nobody: {generated}"
+        );
     }
 
     #[test]

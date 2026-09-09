@@ -3603,6 +3603,124 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
 }
 
+/// `GET <actuator-prefix>/derivations` -- maintained derived read models
+/// (issue #1769).
+///
+/// Reports every `#[derivation]` this binary declares: its definition hash, the
+/// hash and backfill state recorded in `_autumn_derivations`, and its current
+/// drift from the source of truth. `drift: 0` on every row is the healthy
+/// answer; a nonzero one names the derivation to recompute.
+///
+/// Sensitive-gated, like `/env` and `/graph`: the document names parent tables,
+/// child tables and the columns joining them.
+///
+/// Each drift figure is one aggregate over a parent table, so this is an
+/// operator endpoint rather than a monitoring one. Do not scrape it.
+///
+/// A process with no database pool answers `503` rather than `404`, so an
+/// operator can tell "this build has no such endpoint" apart from "this process
+/// has no database to report against".
+#[cfg(feature = "db")]
+pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> axum::response::Response {
+    // The control pool is one target among several: a shard-only deployment
+    // (`[[database.shards]]` with no control role, which the config accepts)
+    // has none, and its derivations live on the shards. Only a process with
+    // no database at all is a 503.
+    let mut report = Vec::new();
+    if let Some(pool) = state.pool() {
+        // The control target fails the same way a shard does: one error row,
+        // so a control pool that cannot be reached does not hide the shards
+        // that maintain the derivations. Only a process with no shards at all
+        // turns a control failure into the response's own status.
+        let statuses = match pool.get().await {
+            Ok(mut conn) => crate::derivation::derivation_status(&mut conn).await,
+            Err(error) => Err(crate::AutumnError::from(std::io::Error::other(
+                error.to_string(),
+            ))),
+        };
+        match statuses {
+            Ok(statuses) => report.extend(derivation_report("control", statuses)),
+            Err(error) if state.shards().is_some() => report.push(serde_json::json!({
+                "target": "control",
+                "error": "could not read derivation state",
+                "detail": error.to_string(),
+            })),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "could not read derivation state",
+                        "target": "control",
+                        "detail": error.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else if state.shards().is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no database pool is configured in this process",
+                "hint": "derivation state lives in the `_autumn_derivations` table, so \
+                         reporting it needs a database connection",
+            })),
+        )
+            .into_response();
+    }
+    // A sharded app maintains its derivations on every shard primary (that is
+    // where the tenant rows live, and where startup reconciles and sweeps), so
+    // the control database alone would report a clean slate while a shard sat
+    // pending or drifted. One shard that cannot answer is reported as such
+    // rather than hiding the rest.
+    if let Some(shards) = state.shards() {
+        for shard in shards.iter() {
+            let target = shard.name();
+            let statuses = match shard.primary_pool().get().await {
+                Ok(mut conn) => crate::derivation::derivation_status(&mut conn).await,
+                Err(error) => Err(crate::AutumnError::from(std::io::Error::other(
+                    error.to_string(),
+                ))),
+            };
+            match statuses {
+                Ok(statuses) => report.extend(derivation_report(target, statuses)),
+                Err(error) => report.push(serde_json::json!({
+                    "target": target,
+                    "error": "could not read derivation state",
+                    "detail": error.to_string(),
+                })),
+            }
+        }
+    }
+    (StatusCode::OK, Json(report)).into_response()
+}
+
+/// One database's derivation statuses as the endpoint's rows, each naming the
+/// `target` it was read from (`"control"`, or a shard's name).
+#[cfg(feature = "db")]
+fn derivation_report(
+    target: &str,
+    statuses: Vec<crate::derivation::DerivationStatus>,
+) -> Vec<serde_json::Value> {
+    statuses
+        .into_iter()
+        .map(|status| {
+            let mut row = serde_json::to_value(status).unwrap_or_else(
+                |error| serde_json::json!({ "error": format!("unserialisable status: {error}") }),
+            );
+            if let serde_json::Value::Object(ref mut map) = row {
+                map.insert(
+                    "target".to_owned(),
+                    serde_json::Value::String(target.to_owned()),
+                );
+            }
+            row
+        })
+        .collect()
+}
+
 /// `GET <actuator-prefix>/graph` -- the application's architecture graph
 /// (issue #1747).
 ///
@@ -4035,6 +4153,10 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
         paths.push(actuator_route_path(prefix, "/graph"));
+        #[cfg(feature = "db")]
+        {
+            paths.push(actuator_route_path(prefix, "/derivations"));
+        }
         #[cfg(feature = "system-info")]
         {
             paths.push(actuator_route_path(prefix, "/system"));
@@ -4188,6 +4310,13 @@ pub(crate) fn actuator_router_with_prefix<
                 &actuator_route_path(prefix, "/graph"),
                 axum::routing::get(graph_endpoint),
             );
+        #[cfg(feature = "db")]
+        {
+            router = router.route(
+                &actuator_route_path(prefix, "/derivations"),
+                axum::routing::get(derivations_endpoint::<S>),
+            );
+        }
         #[cfg(feature = "http-client")]
         {
             router = router
@@ -5622,6 +5751,128 @@ mod tests {
             "the listing must match the mounts, or the startup barrier seeds a path \
              that is not served"
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn actuator_derivations_path_is_listed_only_in_sensitive_mode() {
+        // The listing seeds the startup barrier's allow-list, so a mount without
+        // a listed path is a route the barrier holds shut. The document names
+        // parent and child tables, so it is sensitive-gated like `/graph`.
+        assert!(
+            actuator_endpoint_paths("/actuator", true, true)
+                .contains(&"/actuator/derivations".to_owned())
+        );
+        assert!(
+            !actuator_endpoint_paths("/actuator", false, true)
+                .contains(&"/actuator/derivations".to_owned()),
+            "the listing must match the mounts, or the startup barrier seeds a path \
+             that is not served"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_derivations_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/derivations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn actuator_derivations_200_body_is_an_array_of_status_objects() {
+        // The endpoint answers `Json(Vec<DerivationStatus>)`, so this pins the
+        // body an operator and a dashboard parse. The no-pool and hidden cases
+        // are covered below; this is the success shape, which needs no database.
+        let statuses = vec![
+            crate::derivation::DerivationStatus {
+                name: "posts.published_comment_count".to_owned(),
+                definition_hash: Some("a".repeat(64)),
+                stored_hash: Some("a".repeat(64)),
+                backfill_state: Some(crate::derivation::BackfillState::Complete),
+                checkpoint: Some(42),
+                backfilled_rows: 7,
+                updated_at: Some("2026-09-07 00:00:00+00".to_owned()),
+                drift: Some(0),
+                drift_error: None,
+            },
+            crate::derivation::DerivationStatus {
+                name: "posts.removed".to_owned(),
+                definition_hash: None,
+                stored_hash: Some("b".repeat(64)),
+                backfill_state: Some(crate::derivation::BackfillState::Unregistered),
+                checkpoint: None,
+                backfilled_rows: 0,
+                updated_at: None,
+                drift: None,
+                drift_error: Some("column does not exist".to_owned()),
+            },
+        ];
+        let body = serde_json::Value::Array(derivation_report("control", statuses));
+        let rows = body.as_array().expect("the body is a JSON array");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row["target"], "control", "every row names its database");
+        }
+        for row in rows {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("each row is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "backfill_state",
+                    "backfilled_rows",
+                    "checkpoint",
+                    "definition_hash",
+                    "drift",
+                    "drift_error",
+                    "name",
+                    "stored_hash",
+                    "target",
+                    "updated_at",
+                ],
+                "{row}"
+            );
+        }
+        assert_eq!(rows[0]["backfill_state"], serde_json::json!("complete"));
+        assert_eq!(rows[0]["drift"], serde_json::json!(0));
+        // A state row this binary declares no derivation for: reported, with no
+        // definition hash and no drift figure.
+        assert_eq!(rows[1]["backfill_state"], serde_json::json!("unregistered"));
+        assert!(rows[1]["definition_hash"].is_null());
+        assert!(rows[1]["drift"].is_null());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn actuator_derivations_reports_no_pool_as_unavailable() {
+        // 503, not 404: an operator has to be able to tell "this build has no
+        // such endpoint" from "this process has no database to report against".
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/derivations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

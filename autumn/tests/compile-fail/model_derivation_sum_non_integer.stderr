@@ -1,0 +1,5 @@
+error: `sum(status)` requires a non-nullable integer field: `status` must be `i8`, `i16`, `i32` or `i64`. A nullable or floating-point sum would make the Rust and SQL lowerings of one derivation disagree
+  --> tests/compile-fail/model_derivation_sum_non_integer.rs:33:72
+   |
+33 | #[derivation(Post, column = "published_comment_count", transform = sum(status))]
+   |                                                                        ^^^^^^

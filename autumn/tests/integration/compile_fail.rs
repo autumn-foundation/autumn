@@ -151,6 +151,49 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_counter_cache_duplicate_column.rs");
 
+    // Derivations (#1769): one `filter` declaration is lowered to both a Rust
+    // predicate and a SQL predicate, so the grammar admits only what provably
+    // lowers the same way in both, its identifiers must name real fields, and
+    // `sum` needs a non-nullable integer. `column` is required and, as for a
+    // counter cache, two declarations onto one parent column would
+    // double-count every insert.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_bad_filter.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_filter_non_field.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_missing_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_unknown_key.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_sum_non_integer.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_duplicate_column.rs");
+    // The two macro-time guards that carry the injection argument: the
+    // maintained column is spliced into `UPDATE <parent> SET ...`, and a brace
+    // in a filter literal could forge the `{c}` child-alias placeholder.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_bad_column.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_brace_literal.rs");
+    // A filter names the column after the Rust field, so a field renamed by
+    // `#[diesel(column_name = ...)]` cannot appear in one.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_diesel_column_name.rs");
+    // Two `#[belongs_to]` legs to one parent leave the default foreign key
+    // ambiguous, and `tenant` names a column of the child.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_ambiguous_fk.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_tenant_non_field.rs");
+    // `sum(...)` takes exactly one field name, and `tenant` cannot name a field
+    // renamed by `#[diesel(column_name = ...)]` (the lowering spells the
+    // discriminator after the Rust field).
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_sum_extra_tokens.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_derivation_tenant_renamed.rs");
+
     // Model-declared dependent cascades (#1702): `dependent = <action>` /
     // `on_delete = <action>` is a `has_many`/`has_one` option, only the four
     // documented actions are accepted, and it cannot ride on a `through =`
@@ -670,6 +713,13 @@ fn compile_pass_tests_b() {
     // boundary is a plain value again and reaches the `Json` sink.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/classified_declassify.rs");
+
+    // Derivations (#1769): every production of the filter grammar, both
+    // transforms, a model carrying a counter cache and derivations at once, and
+    // one with neither — each branch of the shared spec emitter, with the two
+    // lowerings of every filter asserted at run time.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_derivation.rs");
 }
 
 #[cfg(feature = "db")]

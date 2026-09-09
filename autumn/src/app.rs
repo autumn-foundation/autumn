@@ -6665,6 +6665,7 @@ impl AppBuilder {
             migrations,
             crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
             crate::version_history::has_versioned_repository_descriptors(),
+            crate::derivation::has_derivation_descriptors(),
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
 
@@ -6719,6 +6720,8 @@ impl AppBuilder {
         let disambiguation_sets =
             migration_sets_for_disambiguation(&migrations, config.database.has_shards());
         let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+        #[cfg(feature = "sqlite")]
+        let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
 
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
@@ -6736,6 +6739,22 @@ impl AppBuilder {
                 #[cfg(not(feature = "sqlite"))]
                 let is_sqlite_control = false;
                 if is_sqlite_control {
+                    // A migration this database already ran under a version the
+                    // map now gives a substitute keeps its record, moved to that
+                    // substitute, rather than running twice (same as the CLI's
+                    // SQLite path).
+                    #[cfg(feature = "sqlite")]
+                    if let Err(error) = crate::migrate::adopt_sqlite_collision_history(
+                        url,
+                        &sqlite_history_sets,
+                        &disambiguated,
+                    ) {
+                        eprintln!(
+                            "autumn migrate: could not move an already-applied migration's \
+                             version record (target control): {error}"
+                        );
+                        std::process::exit(1);
+                    }
                     #[cfg(feature = "sqlite")]
                     for (_, mig) in &migrations {
                         total += apply_pending_sqlite_or_exit(
@@ -10777,6 +10796,7 @@ async fn setup_database(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
         crate::version_history::has_versioned_repository_descriptors(),
+        crate::derivation::has_derivation_descriptors(),
         hook_queue_migration_mode,
     );
     // Directory routing is only actually active when the app did NOT supply an
@@ -10919,6 +10939,23 @@ async fn setup_database(
     )
     .await;
 
+    // Derivations (#1769): the state table exists by now, so reconcile each
+    // declared `#[derivation]` against it and repair whatever changed. A
+    // registry collision stops the boot; a database failure only logs, because
+    // a derivation whose backfill has not run is stale rather than broken and
+    // `/actuator/derivations` reports exactly that.
+    // Needs an explicit `if let` rather than `?`, so the managed-pg child is
+    // stopped before unwinding. `?` would skip the cfg-gated stop call.
+    #[allow(clippy::question_mark)]
+    if runtime_boot
+        && crate::derivation::has_derivation_descriptors()
+        && let Err(e) = start_derivation_backfill(topology.as_ref(), shards.as_ref()).await
+    {
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        return Err(e);
+    }
+
     let (replica_readiness, replica_migration_check) = if topology
         .as_ref()
         .is_some_and(|topology| check_replica_migrations && topology.replica().is_some())
@@ -10972,6 +11009,166 @@ async fn setup_database(
         replica_readiness,
         replica_migration_check,
     })
+}
+
+/// Batches one boot backfill round runs before it returns its connection.
+///
+/// The connection goes back to the pool between rounds. A `SQLite` pool is often
+/// size 1, so a sweep that held its only connection would stall every request
+/// for the length of the sweep.
+#[cfg(feature = "db")]
+const BOOT_BACKFILL_BATCHES: usize = 8;
+
+/// Reconcile the declared derivations on every primary, then repair them in the
+/// background.
+///
+/// Reconciliation runs inline because it is two statements per derivation and
+/// the answer decides what the backfill has to do. The backfill itself is
+/// spawned: it sweeps whole parent tables, so blocking the boot on it would
+/// delay serving traffic the maintained columns are already correct for.
+///
+/// A sharded app reconciles and repairs on **every shard primary** as well as on
+/// the control primary. The state-table migration is applied to shards too, and
+/// shards are where the tenant rows live, so a shard that never reconciled would
+/// hold a stale derived column forever.
+///
+/// A registry collision is returned to the caller and stops the boot. Two
+/// derivations on one parent column double count every mutation, which is data
+/// corruption, so booting on it is worse than not booting.
+///
+/// A database failure is logged and skipped instead. The backfill is **not**
+/// spawned for a target whose reconcile failed: the sweep reads the state the
+/// reconcile writes, so sweeping after a failed reconcile would work from a
+/// stale answer.
+#[cfg(feature = "db")]
+async fn start_derivation_backfill(
+    topology: Option<&crate::db::DatabaseTopology>,
+    shards: Option<&crate::sharding::ShardSet>,
+) -> Result<(), String> {
+    // No connection needed, so a collision is caught before any data is touched.
+    crate::derivation::check_registered_derivations()
+        .map_err(|error| format!("Invalid `#[derivation]` registry: {error}"))?;
+
+    let mut targets: Vec<(String, crate::db::Pool<crate::db::RuntimeConnection>)> = Vec::new();
+    if let Some(topology) = topology {
+        targets.push(("control".to_owned(), topology.primary().clone()));
+    }
+    if let Some(shards) = shards {
+        for shard in shards.iter() {
+            targets.push((
+                format!("shard {}", shard.name()),
+                shard.primary_pool().clone(),
+            ));
+        }
+    }
+
+    for (label, pool) in targets {
+        let mut conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    database = %label,
+                    "no connection to reconcile derivation definitions"
+                );
+                continue;
+            }
+        };
+        match crate::derivation::ensure_derivations(&mut conn).await {
+            Ok(enqueued) => {
+                if !enqueued.is_empty() {
+                    tracing::info!(
+                        database = %label,
+                        derivations = ?enqueued,
+                        "derivation definitions changed; backfill enqueued"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    database = %label,
+                    "could not reconcile derivation definitions; \
+                     see /actuator/derivations"
+                );
+                continue;
+            }
+        }
+        drop(conn);
+        spawn_derivation_backfill(label, pool);
+    }
+    Ok(())
+}
+
+/// Sweep one target's enqueued derivations in the background, a few batches per
+/// pooled connection.
+///
+/// The loop is what keeps the connection borrowed briefly. Each round checks out
+/// a connection, runs [`BOOT_BACKFILL_BATCHES`] batches, returns the connection
+/// and repeats while the report still lists work. Several replicas doing this
+/// cooperate: each batch locks the derivation's state row, so they take turns on
+/// one sweep instead of racing.
+#[cfg(feature = "db")]
+fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::RuntimeConnection>) {
+    tokio::spawn(async move {
+        let options = crate::derivation::BackfillOptions {
+            max_batches: Some(BOOT_BACKFILL_BATCHES),
+            ..crate::derivation::BackfillOptions::default()
+        };
+        let mut completed: Vec<String> = Vec::new();
+        let mut rows_repaired = 0usize;
+        let mut rounds = 0usize;
+        loop {
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        database = %label,
+                        "no connection to backfill derivations"
+                    );
+                    return;
+                }
+            };
+            let report = match crate::derivation::run_backfill(&mut conn, &options).await {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::warn!(%error, database = %label, "derivation backfill failed");
+                    return;
+                }
+            };
+            drop(conn);
+            completed.extend(report.completed);
+            rows_repaired += report.rows_repaired;
+            if report.in_progress.is_empty() {
+                break;
+            }
+            rounds += 1;
+            // A round that left work behind but advanced no checkpoint is
+            // stuck, not slow: nothing a further round would do differently.
+            // A round that advanced one is progress, however many parents are
+            // left (a self-referential derivation sweeps one per batch, so a
+            // large table takes many rounds), and a checkpoint only moves
+            // forward, so the sweep terminates on its own.
+            if report.batches_run == 0 {
+                tracing::warn!(
+                    database = %label,
+                    pending = ?report.in_progress,
+                    rounds,
+                    "derivation backfill made no progress; see /actuator/derivations"
+                );
+                break;
+            }
+        }
+        if !completed.is_empty() || rows_repaired > 0 {
+            tracing::info!(
+                database = %label,
+                completed = ?completed,
+                rows_repaired,
+                "derivation backfill finished"
+            );
+        }
+    });
 }
 
 /// Apply the embedded migration sets control-first, then to each shard in
@@ -11370,6 +11567,8 @@ async fn run_startup_migrations(
     let disambiguation_sets =
         migration_sets_for_disambiguation(&migrations, config.database.has_shards());
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+    #[cfg(feature = "sqlite")]
+    let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
     let migration_result = tokio::task::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
@@ -11383,6 +11582,25 @@ async fn run_startup_migrations(
             && crate::config::DatabaseBackend::detect(url)
                 == Some(crate::config::DatabaseBackend::Sqlite)
         {
+            // Only when this boot applies (the same decision `auto_migrate_sqlite`
+            // makes): a migration this database already ran under a version the
+            // map now gives a substitute keeps its record, moved to that
+            // substitute, rather than running twice. A report-only boot touches
+            // nothing.
+            if crate::migrate::should_auto_apply(profile.as_deref(), auto_migrate, auto_in_prod)
+                && let Err(error) = crate::migrate::adopt_sqlite_collision_history(
+                    url,
+                    &sqlite_history_sets,
+                    &disambiguated,
+                )
+            {
+                tracing::error!(
+                    error = %error,
+                    target = "control",
+                    "Could not move an already-applied migration's version record"
+                );
+                std::process::exit(1);
+            }
             for (_, mig) in &migrations {
                 crate::migrate::auto_migrate_sqlite(
                     url,
@@ -11521,6 +11739,9 @@ const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
 
 #[cfg(feature = "db")]
 const VERSION_HISTORY_MIGRATION: &str = "20260526000000_create_version_history";
+
+#[cfg(feature = "db")]
+const DERIVATION_MIGRATION: &str = "20260907101530_create_derivations";
 
 /// Whether startup should create the control-plane `_autumn_shard_directory`
 /// table. It is required only when directory routing is enabled AND shards are
@@ -11719,6 +11940,7 @@ fn migrations_with_repository_framework_migrations(
     mut migrations: Vec<(&'static str, crate::migrate::EmbeddedMigrations)>,
     hook_queue_required: bool,
     version_history_required: bool,
+    derivations_required: bool,
     mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Vec<(&'static str, crate::migrate::EmbeddedMigrations)> {
     if hook_queue_required
@@ -11738,6 +11960,16 @@ fn migrations_with_repository_framework_migrations(
             "version-history",
             crate::version_history::VERSION_HISTORY_MIGRATIONS,
         ));
+    }
+    // The derivation state table follows the same rule as the two above: it is a
+    // shard-applied set, it is appended only when the binary actually links a
+    // `#[derivation]`, and never during a static build, which renders assets
+    // and must not touch the database.
+    if derivations_required
+        && mode == RepositoryCommitHookQueueMigrationMode::Runtime
+        && !shard_applied_sets_include(&migrations, DERIVATION_MIGRATION)
+    {
+        migrations.push(("derivations", crate::derivation::DERIVATION_MIGRATIONS));
     }
     migrations
 }
@@ -11803,6 +12035,7 @@ fn migration_set_is_control_framework(set: &crate::migrate::EmbeddedMigrations) 
     for shard_required in [
         &crate::version_history::VERSION_HISTORY_MIGRATIONS,
         &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+        &crate::derivation::DERIVATION_MIGRATIONS,
     ] {
         for name in names(shard_required) {
             control_only.remove(&name);
@@ -15314,6 +15547,7 @@ mod tests {
             vec![("app", APP_TEST_MIGRATIONS)],
             true,
             false,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -15337,6 +15571,7 @@ mod tests {
             Vec::new(),
             true,
             false,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -15356,6 +15591,7 @@ mod tests {
             vec![("app", APP_TEST_MIGRATIONS)],
             false,
             true,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -15379,6 +15615,7 @@ mod tests {
             Vec::new(),
             false,
             true,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -15394,6 +15631,7 @@ mod tests {
     fn static_builds_do_not_auto_add_hook_queue_when_no_migrations_registered() {
         let migrations = migrations_with_repository_framework_migrations(
             Vec::new(),
+            true,
             true,
             true,
             RepositoryCommitHookQueueMigrationMode::StaticBuild,
@@ -15443,12 +15681,55 @@ mod tests {
             Vec::new(),
             false,
             false,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
 
         assert!(
             migrations.is_empty(),
             "unhooked apps should not get durable hook queue migrations for free"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn apps_with_a_derivation_include_the_derivation_state_migration() {
+        let migrations = migrations_with_repository_framework_migrations(
+            vec![("app", APP_TEST_MIGRATIONS)],
+            false,
+            false,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names.iter().any(|name| name == DERIVATION_MIGRATION),
+            "an app that declares a `#[derivation]` must auto-register its \
+             backfill state table: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains("version_history")),
+            "a derivation alone must not drag in unrelated framework tables: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn apps_without_a_derivation_do_not_get_the_state_table() {
+        // The whole feature is gated on a linked descriptor, so an app that
+        // declares none pays for none of it, not even an empty table.
+        let migrations = migrations_with_repository_framework_migrations(
+            vec![("app", APP_TEST_MIGRATIONS)],
+            false,
+            false,
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        assert!(
+            !migration_names(&migrations)
+                .iter()
+                .any(|name| name == DERIVATION_MIGRATION)
         );
     }
 
@@ -15483,6 +15764,9 @@ mod tests {
         assert!(!migration_set_is_control_framework(
             &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS
         ));
+        assert!(!migration_set_is_control_framework(
+            &crate::derivation::DERIVATION_MIGRATIONS
+        ));
     }
 
     #[cfg(feature = "db")]
@@ -15499,6 +15783,7 @@ mod tests {
         // shards never get those tables.
         let migrations = migrations_with_repository_framework_migrations(
             vec![("app", crate::migrate::FRAMEWORK_MIGRATIONS)],
+            true,
             true,
             true,
             RepositoryCommitHookQueueMigrationMode::Runtime,
@@ -15530,6 +15815,11 @@ mod tests {
                 .any(|name| name == VERSION_HISTORY_MIGRATION),
             "shards must receive the version-history migration even when the full \
              control framework set is also registered: {shard_names:?}"
+        );
+        assert!(
+            shard_names.iter().any(|name| name == DERIVATION_MIGRATION),
+            "shards maintain derivations too, so they need the state table: \
+             {shard_names:?}"
         );
     }
 

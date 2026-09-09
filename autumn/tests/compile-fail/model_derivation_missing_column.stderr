@@ -1,0 +1,5 @@
+error: `#[derivation(...)]` requires `column = "<column>"`: the column on the parent this derivation maintains
+  --> tests/compile-fail/model_derivation_missing_column.rs:33:3
+   |
+33 | #[derivation(Post)]
+   |   ^^^^^^^^^^

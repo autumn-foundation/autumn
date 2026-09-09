@@ -671,6 +671,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **db:** `#[derivation]` maintains a **filtered or weighted** derived column on
+  a parent row (#1769). Declared on the child, below `#[model]`:
+  `#[derivation(Post, column = "published_comment_count", filter = published)]`,
+  or `#[derivation(Post, column = "visible_score", transform = sum(score),
+  filter = published && score > 0)]`. One filter declaration is lowered twice,
+  to a Rust predicate for the record paths and to a SQL predicate for the
+  set-based ones, so the two can never disagree; the grammar covers `bool`,
+  integer and `String` fields and their `Option` forms, with SQL NULL semantics.
+  Every generated repository mutation maintains it **inside the same transaction
+  as the row mutation** with atomic set-based SQL, including bulk paths,
+  soft delete, restore, `dependent` cascades, a re-parent (the old contribution
+  off the old parent, the new one onto the new) and a filter flip on an unchanged
+  parent. A `#[derivation]` is a superset of `counter_cache`, which is now its
+  unfiltered special case with byte-identical SQL. Each derivation is
+  content-addressed by a `definition_hash` over its lowered shape, so a changed
+  filter enqueues a resumable, checkpointed, idempotent backfill (`run_backfill`,
+  `BackfillOptions`) and a rename or reformat does not (a renamed derivation
+  adopts its old state row, finished backfill included, matched by hash before
+  name so two derivations that swapped names both keep theirs); the framework-owned
+  `_autumn_derivations` state table ships in the framework migration set (so
+  `autumn migrate` creates it on the control database, and on a `sqlite://`
+  target applies the SQLite variants of the shard-required sets, which it had
+  skipped, version-disambiguated together with the app's own set so a shared
+  version masks nothing, and an app migration a database already ran under
+  such a version keeps its record under its new tracked version instead of
+  running twice, and `autumn migrate down` plans and reverts under the same
+  identities; on a Postgres target, where the app set goes through the
+  `diesel` CLI, it refuses to apply or roll back, and says so in `status`,
+  while an app migration shares a version with a framework migration that
+  target receives, naming both and the rename to make) and as a standalone
+  set the runtime applies when a
+  derivation is
+  registered (on every shard primary too).
+  Each batch locks its state row, so replicas take turns on one sweep.
+  `GET /actuator/derivations` (sensitive-gated) reports each derivation's
+  hashes, backfill state, checkpoint and current drift (capped at
+  `DRIFT_SCAN_LIMIT`, with a per-derivation `drift_error` and an `unregistered`
+  state for a leftover row), and `recompute(conn, name)` repairs it. Beyond
+  `column`, `transform` and `filter`, the attribute takes `fk`, `parent_table`,
+  `tenant` and `name`; a duplicate parent column or derivation name stops the
+  boot before it opens a connection, and so does a derivation on a column a
+  plain `counter_cache` on another model already maintains. A string filter
+  compares bytewise on both sides (`COLLATE "C"` / `COLLATE BINARY`), so a
+  `NOCASE` column cannot make the SQL and Rust lowerings disagree. A
+  derivation onto its own table sweeps one parent per batch, a batch the
+  database aborts to break a deadlock is retried from its checkpoint, every
+  mutation on such a table takes a per-table advisory lock before its first
+  row lock (a save before its insert, `upsert_many` before the `FOR UPDATE`
+  load it diffs against, the delete family and retention before theirs) so
+  crossing mutations wait rather than deadlock (a raw write of your own takes
+  it first through the now-public `counter_cache_serialize_self_referential`,
+  and `autumn migrate down` on SQLite moves a legacy record to its tracked
+  identity before planning, as the apply path would; `recompute` and
+  `resweep` run the registry check before selecting a definition), the
+  registry refuses a
+  derivation column that is the parent's primary key under the backend's
+  identifier rules (`"ID"` on SQLite), and
+  `derivation::resweep` re-enqueues one derivation for the settling pass a
+  rolling deployment that changed a definition needs (see the guide). The
+  collision check also covers the column a `#[commentable(counter_cache)]`
+  parent keeps, a `#[votable]` model's aggregate column, a repository's
+  `position(...)` ordering column, a model's `#[lock_version]` token, its
+  `tenant_id` discriminator and its `deleted_at` marker (each under its
+  `#[diesel(column_name)]` when it has one; `column = "tenant_id"` and
+  `column = "deleted_at"` are also compile errors),
+  string filters cast to `TEXT` so Postgres `citext` compares bytewise too,
+  a tenant-scoped leg captures the child's tenant before an update so a child
+  moved between tenants leaves its old parent under the old tenant (the
+  `tenant` field must be an integer or string),
+  `column = "id"` and a self-referential derivation reading the column it
+  maintains (its `fk` and `tenant` columns included) are compile errors, and
+  so is a derivation reading a column another derivation or counter cache of
+  its model maintains on its table (across models the registry refuses it at
+  boot); an `#[id]` or `fk` field renamed with `#[diesel(column_name)]`
+  reaches the spec under its physical column,
+  reconciliation holds the state table for its transaction so replicas
+  booting together take turns, `recompute` sweeps a self-referential table
+  one parent per batch with the same deadlock retry, `sum(...)` rejects
+  anything after its one field name, `BackfillReport::batches_run` lets a paced caller tell "more
+  to do" from "stuck" (the boot sweep now stops on no progress rather than
+  after a fixed number of rounds), a tenant-scoped leg orders each parent's
+  deltas so no intermediate value overflows, and `/actuator/derivations`
+  still reports leftover rows after the last derivation is removed. `CounterCacheSpec`
+  gains four plumbing fields `#[model]` fills in (`contrib_of`, `contrib_sql`,
+  `filter_sql`, `derivation`), so a hand-written spec literal needs four more
+  lines; it is framework plumbing and not constructed by hand. The one other
+  API-visible change is that the doc-hidden
+  `counter_cache_capture_fks`/`_many` now return `(parent, contribution)` pairs
+  rather than parent ids. See `docs/guide/derivations.md`.
+
 - **a11y:** `autumn a11y verify` now keys its findings to the **routes** that
   serve them, and rolls them up by WCAG success criterion (part of #1706). The
   scan reads the route attribute macros — `#[get]`, `#[post]`, `#[put]`,

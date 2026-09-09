@@ -38,8 +38,17 @@ pub use crate::counter_cache::{
     counter_cache_apply_delta_by_child_id, counter_cache_before_delete_by_id,
     counter_cache_before_delete_many, counter_cache_before_detach_many,
     counter_cache_before_restore_by_id, counter_cache_capture_fks, counter_cache_capture_fks_many,
-    counter_cache_recompute,
+    counter_cache_recompute, counter_cache_serialize_self_referential,
 };
+#[doc(inline)]
+pub use crate::counter_cache::{Captured, CapturedContribution, CapturedContributions};
+
+// Derivations (#1769) are maintained through the counter-cache specs above, so
+// the hooks a generated repository calls are already in scope from that
+// re-export. What `#[model]` needs additionally is the registry it submits each
+// declared derivation into.
+#[doc(inline)]
+pub use crate::derivation::{DerivationDef, DerivationDescriptor};
 
 // ── Dependent-cascade primitives (issue #2309 follow-up) ─────────────
 //
@@ -322,6 +331,11 @@ pub async fn dependent_delete_all<M: 'static>(
     use diesel_async::RunQueryDsl;
 
     if has_counter_caches {
+        // The id selection below row-locks the children before the
+        // counter-cache hook can take the lock that serializes mutations on
+        // a table with a leg onto itself, so take it here first (see
+        // `counter_cache_serialize_self_referential`).
+        counter_cache_serialize_self_referential(conn, specs).await?;
         let ids = dependent_child_ids_for_update(conn, table, fk_column, parent_id).await?;
         counter_cache_before_delete_many(conn, specs, &ids).await?;
     } else {
