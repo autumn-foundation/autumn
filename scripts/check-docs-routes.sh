@@ -485,6 +485,38 @@ def waived_lines(text):
     return covered
 
 
+def logical_lines(text):
+    """Yield (start_line_no, text) with backslash continuations folded into one.
+
+    A shell command wrapped across lines is ONE command, and the corpus writes
+    them that way — `clustering.md:271` is `curl -s localhost:3000/actuator/health
+    \\` continued onto the next line. Without folding, `curl` sits on the first
+    line and a path on the second, so `REQUEST_LINE` sees a command with no path
+    and `DOC_PATH` sees a path with no command: the request rule silently does
+    not apply to exactly the multi-line commands most likely to be copied whole.
+
+    `check-docs-cli.sh` folds continuations before tokenizing for the same
+    reason, and attributes the result to the line the command STARTS on, which
+    is the line a reader is sent to. This does the same.
+    """
+    held, held_at = [], None
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.rstrip()
+        if stripped.endswith("\\"):
+            if held_at is None:
+                held_at = lineno
+            held.append(stripped[:-1])
+            continue
+        if held:
+            held.append(line)
+            yield held_at, " ".join(held)
+            held, held_at = [], None
+        else:
+            yield lineno, line
+    if held:
+        yield held_at, " ".join(held)
+
+
 def documented(text):
     """Yield (line_no, path, requested) for every `/actuator/…` path a page shows.
 
@@ -504,7 +536,7 @@ def documented(text):
     this extractor can honestly draw: a `curl` line, or an HTTP method followed
     by a path. `check-docs-cli.sh` separates its two populations the same way.
     """
-    for lineno, line in enumerate(blank_comments(text).splitlines(), 1):
+    for lineno, line in logical_lines(blank_comments(text)):
         requested = bool(REQUEST_LINE.search(line))
         for match in DOC_PATH.finditer(line):
             path = match.group(0).rstrip(TRAILING)
@@ -870,6 +902,25 @@ def self_test():
             f"`{spelling}` does not resolve",
             resolves(spelling, surface), False,
         ))
+
+    # A wrapped shell command is ONE command. Unfolded, `curl` sits on the first
+    # line and the path on the second, so the request rule silently skipped
+    # exactly the multi-line commands most likely to be copied whole.
+    wrapped_curl = ('curl -s -H "Accept: application/json" \\\n'
+                    "  http://localhost:3000/actuator/webhooks\n")
+    cases.append((
+        "a wrapped curl carries request context to its path",
+        [r for _, _, r in documented(wrapped_curl)], [True],
+    ))
+    cases.append((
+        "…and the defect is attributed to the line the command starts on",
+        [n for n, _, _ in documented(wrapped_curl)], [1],
+    ))
+    cases.append((
+        "an unwrapped line is untouched by folding",
+        [(n, q) for n, q, _r in documented("a\nb /actuator/health\n")],
+        [(2, "/actuator/health")],
+    ))
 
     # Reader-facing surfaces a `*.md`-under-`docs/` view of the corpus misses.
     # The scaffolded README is a `.md.tmpl`; `.claude/skills/` is a second skill
