@@ -104,10 +104,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   72% → 54%; allocation bytes/blocks per render unchanged (both paths make
   exactly one `String` allocation).
 - **⚡ Bolt: `hmac_sha256_hex` hex-encoding; findings, no fix:** the existing
-  `autumn/benches/csrf_verify.rs` (a `GET` that mints a signed CSRF cookie
-  plus two `POST`s that verify it, through the real `CsrfLayer`) attributes
-  `security::config::hmac_sha256_hex` 16.86% of the profile's instructions
-  under `valgrind --tool=callgrind --iterations 2000` (136,026,523 of that
+  `autumn/benches/csrf_verify.rs` drives the real `CsrfLayer`: a one-time
+  mint before the measured loop, then a `GET` plus two `POST`s per round
+  that all verify the already-minted cookie's HMAC (`CsrfLayer` validates
+  the cookie signature on every request, safe methods included, and
+  additionally checks the submitted token on the two `POST`s). This
+  attributes `security::config::hmac_sha256_hex` 16.86% of the profile's
+  instructions under `valgrind --tool=callgrind --iterations 2000` (136,026,523 of that
   run's raw, un-base-subtracted 806,998,060 Ir total —
   `callgrind_annotate --inclusive=yes`'s own "% of PROGRAM TOTALS"), most
   of it the real HMAC-SHA256 compression (`sha2::sha256::compress256`,

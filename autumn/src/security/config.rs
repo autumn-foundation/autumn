@@ -241,9 +241,13 @@ pub fn validate_signing_secret(
 /// session cookies when a signing secret is configured (`security.csrf.enabled`
 /// / session signing) — not local-storage payloads, which sign themselves via
 /// their own `sign`/`sign_upload` in `storage/local.rs`. `benches/csrf_verify.rs`
-/// (a `GET` that mints a token plus two `POST`s that verify it, through the
-/// real `CsrfLayer`) attributes `hmac_sha256_hex` 16.86% of the profile's
-/// instructions under `valgrind --tool=callgrind --iterations 2000`
+/// drives the real `CsrfLayer`: a one-time mint before the measured loop,
+/// then a `GET` plus two `POST`s per round that all verify the
+/// already-minted cookie's HMAC (`CsrfLayer` validates the cookie signature
+/// on every request, safe methods included, and additionally checks the
+/// submitted token on the two `POST`s). This attributes `hmac_sha256_hex`
+/// 16.86% of the profile's instructions under
+/// `valgrind --tool=callgrind --iterations 2000`
 /// (136,026,523 of that run's raw, un-base-subtracted 806,998,060 Ir total —
 /// `callgrind_annotate --inclusive=yes`'s own "% of PROGRAM TOTALS") — most
 /// of it the real HMAC-SHA256 compression (`sha2::sha256::compress256`,
