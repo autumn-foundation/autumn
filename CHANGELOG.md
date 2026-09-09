@@ -225,6 +225,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than the whole `AppState`, which is all it ever read, so the export
   still opens no database.
 
+- **openapi:** `autumn openapi export` runs the two config-only guards that stop
+  a boot before anything route-shaped is looked at (issue #802): a `web`/`worker`
+  process role on a non-durable jobs backend — where the web replica enqueues
+  into an in-memory queue no worker can drain — and a duplicate `#[scheduled]`
+  task name, which spawns two loops competing for one coordination lock. Either
+  refuses to start, and neither was reachable from the router, so an export that
+  mirrored the router faithfully still approved the contract. Both now live in a
+  `validate_config_preconditions` the two paths share. The task check validates
+  the list with the framework's `[retention]` sweep merged in, exactly as the
+  serving path does — the collision it most often catches is between a
+  hand-declared task and that generated one, so validating the unmerged list
+  would miss the very case it exists for.
+
 
 ### Changed
 

@@ -3633,17 +3633,13 @@ impl AppBuilder {
         // rather than in `validate()`, so the doctor can still load the config.
         // A combined role is always fine.
         let role = config.role;
-        if crate::config::split_role_requires_durable_backend(role, &config.jobs.backend) {
-            tracing::error!(
-                role = role.as_str(),
-                jobs_backend = %config.jobs.backend,
-                "process role '{}' requires a durable jobs backend: backend '{}' is not \
-                 a recognized durable backend and falls through to the in-process 'local' \
-                 runtime, which cannot be shared across a split web/worker topology. \
-                 Set jobs.backend = \"postgres\" or \"redis\", or run the combined role.",
-                role.as_str(),
-                config.jobs.backend,
-            );
+        // Both config-only preconditions, through the same helper the no-boot
+        // export calls — the split-role/durable-backend rule and the merged
+        // scheduled-task-name check. The helper returns the message rather than
+        // exiting, because this path has a database pool to stop on the way out
+        // and the export has none.
+        if let Err(message) = validate_config_preconditions(&config, &tasks) {
+            tracing::error!("{message}");
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
@@ -6394,6 +6390,7 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
             policy_registrations,
+            tasks,
             ..
         } = self;
 
@@ -6438,6 +6435,14 @@ impl AppBuilder {
         //
         // Ordered as the serving path orders them, so an app with more than one
         // problem reports the same first error either way.
+        // The config-only preconditions first, in `run()`'s order: a split role
+        // on a non-durable jobs backend, or a duplicate scheduled task name,
+        // stops startup before anything route-shaped is even looked at.
+        if let Err(message) = validate_config_preconditions(&config, &tasks) {
+            eprintln!("\u{2717} Cannot export a spec for an app that cannot start: {message}");
+            std::process::exit(1);
+        }
+
         // `.policy::<R, _>(...)` / `.scope::<R, _>(...)` are DEFERRED closures the
         // serving path replays onto live state before checking that every
         // `#[repository(policy = X)]` route actually has an X registered. The
@@ -11738,6 +11743,51 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
     });
 
     preflight.map_err(|error| error.to_string())
+}
+
+/// Every CONFIG-only precondition the serving path enforces before it boots.
+///
+/// Sibling of [`validate_pre_router_preconditions`], which covers the
+/// route-shaped ones. Both are things `run()` does that
+/// `build_router_pre_state` does not, so an export that mirrored the router
+/// faithfully still approved a spec for an app that refuses to start (issue
+/// #802):
+///
+/// * a `web`/`worker` process role on a non-durable jobs backend — the web
+///   replica would enqueue into an in-memory queue no worker can drain;
+/// * a duplicate `#[scheduled]` task name, which spawns two loops competing for
+///   one coordination lock. The framework's own `[retention]` sweep is merged in
+///   first, exactly as `run()` merges it, because the collision this catches is
+///   most often between a hand-declared task and that generated one — validating
+///   the unmerged list would miss precisely the case the check exists for.
+///
+/// Returns the message to report; the caller decides how to fail, because the
+/// serving path also has a database pool to stop on the way out and the export
+/// has none.
+fn validate_config_preconditions(
+    config: &AutumnConfig,
+    tasks: &[crate::task::TaskInfo],
+) -> Result<(), String> {
+    if crate::config::split_role_requires_durable_backend(config.role, &config.jobs.backend) {
+        return Err(format!(
+            "process role '{role}' requires a durable jobs backend: backend '{backend}' is not \
+             a recognized durable backend and falls through to the in-process 'local' runtime, \
+             which cannot be shared across a split web/worker topology. Set jobs.backend = \
+             \"postgres\" or \"redis\", or run the combined role.",
+            role = config.role.as_str(),
+            backend = config.jobs.backend,
+        ));
+    }
+
+    let retention_task = crate::data_retention::framework_retention_task(&config.retention);
+    crate::task::validate_unique_task_names(
+        tasks
+            .iter()
+            .chain(retention_task.iter())
+            .map(|task| task.name.as_str()),
+    )?;
+
+    Ok(())
 }
 
 /// Every route/config precondition the serving path enforces BEFORE it hands
