@@ -347,6 +347,27 @@ mod tests {
         );
     }
 
+    /// Characterization test (Echo refactor, clone class: the
+    /// `split_leading_items_and_fn` + asyncness-check + marker-check preamble
+    /// shared byte-for-byte with `step_up`/`throttle`/`authorize`): pins the
+    /// exact async-required message so factoring the preamble into
+    /// `param_helpers` cannot silently change it or misattribute it to the
+    /// wrong attribute name.
+    #[test]
+    fn secured_rejects_sync_functions_with_the_attribute_named_in_the_message() {
+        let generated = secured_macro(
+            quote! { "admin" },
+            quote! {
+                fn sync_handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("#[secured] can only be applied to async functions"),
+            "should emit the exact async-required message naming #[secured]:\n{generated}"
+        );
+    }
+
     #[test]
     fn secured_rejects_when_invoked_on_a_static_route_handler_via_an_alias() {
         // Simulates real source using `use ::autumn_web::secured as auth;`:

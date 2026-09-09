@@ -522,6 +522,42 @@ pub fn reject_if_ambiguous_authorize_shape(input_fn: &syn::ItemFn) -> Option<Tok
 mod tests {
     use super::*;
 
+    /// Characterization test (Echo refactor, clone class: the
+    /// `split_leading_items_and_fn` + asyncness-check + marker-check preamble
+    /// and the `original_response` construction, both shared byte-for-byte
+    /// with `secured`/`step_up`): pins `#[authorize("update", resource =
+    /// Post)]`'s exact expansion so factoring either shared piece into
+    /// `param_helpers` cannot silently change a single token of it.
+    #[test]
+    fn authorize_macro_expansion_is_unchanged_by_the_preamble_refactor() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                async fn handler() -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            generated,
+            include_str!("../testdata/authorize_golden.txt").trim_end()
+        );
+    }
+
+    #[test]
+    fn authorize_rejects_sync_functions_with_the_attribute_named_in_the_message() {
+        let generated = authorize_macro(
+            quote::quote! { "update", resource = Post },
+            quote::quote! {
+                fn sync_handler(note: Note) -> &'static str { "ok" }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("#[authorize] can only be applied to async functions"),
+            "should emit the exact async-required message naming #[authorize]:\n{generated}"
+        );
+    }
+
     // ── `attr_is_authorize_shaped` / `reject_if_ambiguous_authorize_shape`
     //    (Codex review on #2628 — two rounds) ────────────────────────────────
 
