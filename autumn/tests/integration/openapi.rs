@@ -100,6 +100,58 @@ async fn post_widgets(axum::Json(_body): axum::Json<Vec<Widget>>) -> http::Statu
     http::StatusCode::OK
 }
 
+// `Option` and `Vec` are matched on the LAST PATH SEGMENT here too, so an
+// application's own generic of that name reaches the `Nullable` / `Array` arms
+// of the route macro's schema-entry builder. Neither is nullable nor an array.
+//
+// Each impostor gets its own module so it shadows exactly one prelude name:
+// declaring both in one module would silently re-point every bare `Option` /
+// `Vec` in it.
+mod impostor_opt {
+    /// Last segment `Option`, but an ordinary struct: an object, never `null`.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Option<T> {
+        pub held: T,
+    }
+}
+
+mod impostor_vec {
+    /// Last segment `Vec`, but an ordinary struct: an object, not an array.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Vec<T> {
+        pub head: T,
+    }
+}
+
+#[get("/impostor-option")]
+async fn get_impostor_option() -> axum::Json<impostor_opt::Option<Widget>> {
+    axum::Json(impostor_opt::Option {
+        held: Widget { id: 0 },
+    })
+}
+
+#[get("/impostor-vec")]
+async fn get_impostor_vec() -> axum::Json<impostor_vec::Vec<Widget>> {
+    axum::Json(impostor_vec::Vec {
+        head: Widget { id: 0 },
+    })
+}
+
+// A handler that genuinely deals in arbitrary JSON. Nothing registers a schema
+// for `serde_json::Value`, so a named `$ref` to it back-fills into the opaque
+// `{"type":"object"}` placeholder — which misdescribes every array, scalar and
+// null the handler legitimately returns, and fails `--strict` for a handler that
+// is behaving correctly.
+#[get("/arbitrary")]
+async fn get_arbitrary_json() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!([1, 2, 3]))
+}
+
+#[get("/maybe-arbitrary")]
+async fn get_optional_arbitrary_json() -> axum::Json<Option<serde_json::Value>> {
+    axum::Json(None)
+}
+
 // `Valid<Json<T>>` is Autumn's documented validation pattern. The
 // generator must see straight through the wrapper so the resulting
 // spec still reports a request body.
@@ -313,6 +365,121 @@ fn json_vec_response_is_emitted_as_array_schema() {
         media.schema["items"]["$ref"], "#/components/schemas/Widget",
         "array items must still ref the element type"
     );
+}
+
+/// An application `Option<T>` is an ordinary named type. Rendering the route's
+/// response as `oneOf [<inner>, null]` advertised both a null the handler never
+/// emits and the WRONG payload — the inner type, which this wrapper does not
+/// wrap. The wrapper entry carries its own `type_name`, so the generator can
+/// tell it from `std`'s `Option` and emit an honest `$ref` instead.
+#[test]
+fn an_impostor_option_response_is_a_ref_not_a_nullable() {
+    let route = __autumn_route_info_get_impostor_option();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/impostor-option"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert!(
+        schema.get("oneOf").is_none(),
+        "an application `Option` must not be advertised as nullable: {schema}"
+    );
+    assert!(
+        schema["$ref"]
+            .as_str()
+            .is_some_and(|r| r.contains("Option")),
+        "it is an ordinary named component: {schema}"
+    );
+}
+
+/// The same collision one level over: an application `Vec<T>` is an object, so
+/// `type: array` + `items` described a shape the handler never serializes.
+#[test]
+fn an_impostor_vec_response_is_a_ref_not_an_array() {
+    let route = __autumn_route_info_get_impostor_vec();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/impostor-vec"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert_ne!(
+        schema["type"], "array",
+        "an application `Vec` must not be advertised as an array: {schema}"
+    );
+    assert!(
+        schema.get("items").is_none(),
+        "and it must carry no `items`: {schema}"
+    );
+    assert!(
+        schema["$ref"].as_str().is_some_and(|r| r.contains("Vec")),
+        "it is an ordinary named component: {schema}"
+    );
+}
+
+/// `Json<serde_json::Value>` is unconstrained, not an object, and earns no
+/// component at all — registering one is exactly how it became a placeholder.
+#[test]
+fn route_level_serde_json_value_is_unconstrained() {
+    let route = __autumn_route_info_get_arbitrary_json();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema =
+        &spec.paths["/arbitrary"].get.as_ref().unwrap().responses["200"].content["application/json"]
+            .schema;
+
+    assert!(
+        schema.get("$ref").is_none(),
+        "arbitrary JSON must be described inline, not referred to: {schema}"
+    );
+    assert!(
+        schema.get("type").is_none(),
+        "and it must not be constrained to any one type: {schema}"
+    );
+    assert!(
+        spec.components
+            .as_ref()
+            .is_none_or(|c| !c.schemas.contains_key("Value")),
+        "no component may be registered for it, or the back-fill turns it into \
+         the opaque placeholder that `--strict` reports"
+    );
+    assert!(
+        autumn_web::openapi::opaque_component_schemas(&spec).is_empty(),
+        "so a spec whose only untyped thing is genuine arbitrary JSON is clean"
+    );
+}
+
+/// The optional form must NOT gain a null branch: `oneOf` demands that exactly
+/// one branch match, and the unconstrained schema already admits null — so
+/// `oneOf [{unconstrained}, {"type":"null"}]` would reject the very null it is
+/// meant to permit.
+#[test]
+fn route_level_optional_serde_json_value_is_not_wrapped() {
+    let route = __autumn_route_info_get_optional_arbitrary_json();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let schema = &spec.paths["/maybe-arbitrary"]
+        .get
+        .as_ref()
+        .unwrap()
+        .responses["200"]
+        .content["application/json"]
+        .schema;
+
+    assert!(
+        schema.get("oneOf").is_none(),
+        "wrapping unconstrained JSON in a nullable oneOf rejects its own null: {schema}"
+    );
+    assert!(schema.get("$ref").is_none(), "{schema}");
 }
 
 #[test]

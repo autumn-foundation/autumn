@@ -374,6 +374,62 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-symbols.sh --self-test && ./scripts/check-docs-symbols.sh
+      - name: Actuator path drift gate
+        # The five gates above cover the link a reader clicks, the command they
+        # run, the variable they set, the config key they write and the Rust
+        # path they import. This one covers the sixth thing they copy off a
+        # page: the URL they curl.
+        #
+        # It is the only one of the six whose failure lands against a RUNNING
+        # APP rather than while the reader is still reading, and the actuator is
+        # the operator surface — `/actuator/health` is what a load balancer
+        # probes, `/actuator/jobs` and `/actuator/tasks` are what someone opens
+        # at 3am. `curl` answers `404 Not Found` with no hint of the right name,
+        # and since most of the surface sits behind `[actuator] sensitive =
+        # true`, that 404 reads like an endpoint they failed to ENABLE rather
+        # than one that was never there — so the reader goes and debugs their
+        # own deployment.
+        #
+        # The corpus is every markdown surface a reader can end up holding —
+        # the set its sibling gates define, plus three that reach readers by a
+        # route other than someone opening a page: `*.md.tmpl` (`new.rs` writes
+        # `templates/README.md.tmpl` as every scaffolded application's README,
+        # so a stale URL there ships into every new project), all of
+        # `examples/` (the wiki example compiles `content/*.md` in and serves
+        # them at `/docs/…`), and `.claude/skills/` (a second skill tree the
+        # agent machinery loads by name, whose `run-autumn` drives a real
+        # server with `curl`).
+        #
+        # The baseline run found four defects over 236 occurrences.
+        # `coming-from-other-frameworks.md` is the sharp one: its Spring→Autumn
+        # actuator table exists precisely to tell a migrating reader what an
+        # endpoint is CALLED here, and its `scheduledtasks` row said the name
+        # was unchanged. Autumn serves that payload at `/actuator/tasks`, so
+        # the one page written to prevent the 404 was causing it — and because
+        # the real endpoint shares no token with the word they searched,
+        # searching again could not rescue them. The other two told readers
+        # that `/actuator/routes` lists declared route methods; the route table
+        # is served from `/actuator/graph`.
+        #
+        # Truth set is the string literals passed to `actuator_route_path()`
+        # at a `.route(…)` MOUNT, across non-test workspace Rust source — the
+        # one path builder every actuator mount goes through, whose own doc
+        # comment says why ("so paths match byte-for-byte"). Nothing to
+        # regenerate: a renamed endpoint lands in the same commit as the
+        # rename.
+        #
+        # The same builder is also called from two inventories
+        # (`actuator_endpoint_paths`, `actuator_mutating_routes`) and from
+        # `alerts.rs`. Those are read as second copies of a list, never as
+        # evidence that a URL answers: an endpoint dropped from the router but
+        # left in an inventory would otherwise keep blessing documentation for
+        # a path nothing serves. A drift gate must not be able to inherit the
+        # drift it is checking for, which is the same reason `#[cfg(test)]`
+        # bodies are stripped.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-routes.sh --self-test && ./scripts/check-docs-routes.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -1453,6 +1509,11 @@ jobs:
           # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          # The #1907 durable job queue and lease scheduler are a large slice of
+          # sqlite-only code; without this lane Codecov reports all of it
+          # uncovered.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_jobs_scheduler_e2e
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
@@ -1537,6 +1598,18 @@ jobs:
         run: cargo build -p autumn-web --features sqlite
       - name: Clippy (autumn-web lib, sqlite backend)
         run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
+      - name: Install protoc (required for telemetry-otlp)
+        # prost/tonic build scripts want it, and ubuntu-latest does not ship it.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - name: Clippy (autumn-web lib, sqlite + telemetry-otlp)
+        # The durable SQLite job backend persists a W3C trace context, so its
+        # `telemetry-otlp` arms only compile under this pair (#1907). Without
+        # this step nothing that blocks a merge builds them — the semver job
+        # does, but only at tag-push time. This is also the enforcing lane that
+        # retires the panic-gate exemption for `middleware/trace_context.rs`.
+        run: cargo clippy -p autumn-web --features "sqlite,telemetry-otlp" --lib -- -D warnings
       - name: Clippy (autumn-web lib, sim-testing op-driver)
         # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
         # dependency for `sim::op` — lint it here (alongside the sqlite lib

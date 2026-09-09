@@ -220,6 +220,8 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(feature = "openapi")]
+mod openapi_export;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
@@ -283,6 +285,11 @@ mod repository_bulk_operations;
 mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
+// Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
+// cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
+// (after the fix) the batched `dependent_delete_all` replacement.
+#[cfg(feature = "db")]
+mod repository_dependent_destroy_leaf_batch_profile;
 #[cfg(feature = "db")]
 mod repository_find_in_batches;
 #[cfg(feature = "db")]
@@ -381,6 +388,8 @@ mod translatable_request;
 mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;
+#[cfg(feature = "db")]
+mod validate_on_insert;
 #[cfg(feature = "db")]
 mod validate_on_update_blind;
 mod validate_patch_option_ip;
