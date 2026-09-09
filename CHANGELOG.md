@@ -449,7 +449,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string cannot be printed with its password removed for certain, so the
   boundary is withheld — and a block without one runs against whichever database
   the pasting session is already on. Configure such a target as a URI to use
-  `--dry-run`. The size report now also counts the materialized views the run
+  `--dry-run`. The URI it does print is re-encoded the way libpq reads one,
+  through the parser and encoder in `pg.rs` rather than `url::Url`'s
+  `query_pairs()`: the latter applies `x-www-form-urlencoded` rules and writes a
+  space back as `+`, which libpq — which only percent-decodes — then reads
+  literally. Measured against psql 16.13, an operator's
+  `?options=-c%20search_path%3Dpg_catalog` connects and sets the path, while the
+  `+` form printed in its place did not connect at all (`FATAL: unrecognized
+  configuration parameter "+search_path"`) — leaving the session on the previous
+  database, which is the case the target guard exists for. The size report now
+  also counts the materialized views the run
   refreshes: a view is rebuilt from whatever survives the sample, so one over
   reference data does not shrink, and measuring the sampled base tables alone
   reported `488.0 kB → 232.0 kB` on a database still holding a 44 MB view.

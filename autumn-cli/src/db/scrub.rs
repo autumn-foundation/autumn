@@ -4267,15 +4267,40 @@ fn password_free_conninfo(url: &str) -> Option<String> {
     // `set_password` returns Err only for a URL that cannot have one
     // (`mailto:` and friends), which a connection string is not.
     parsed.set_password(None).ok()?;
-    let kept: Vec<(String, String)> = parsed
-        .query_pairs()
-        .filter(|(key, _)| !is_secret_keyword(key))
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
+    // Read and rewrite the query the way libpq does, NOT the way
+    // `url::Url::query_pairs()` does. That method applies
+    // `application/x-www-form-urlencoded` rules, and its `query_pairs_mut()`
+    // counterpart serializes a space back as `+` — while libpq's URI parser
+    // only ever percent-decodes, so it reads that `+` literally. Measured
+    // against psql 16.13: an operator's `?options=-c%20search_path%3Dpg_catalog`
+    // connects and sets the path, and the `+` form this used to print does not
+    // connect at all —
+    //
+    //   FATAL:  unrecognized configuration parameter "+search_path"
+    //
+    // which is the failure mode the target guard exists for. `pg.rs` already
+    // holds both halves of the libpq grammar, with the reasoning; this uses
+    // them rather than keeping a second opinion about encoding here.
+    let kept: Vec<(String, String)> =
+        crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or(""))
+            .into_iter()
+            .filter(|(key, _)| !is_secret_keyword(key))
+            .collect();
     if kept.is_empty() {
         parsed.set_query(None);
     } else {
-        parsed.query_pairs_mut().clear().extend_pairs(kept);
+        let query = kept
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    crate::pg::query_value_token(key),
+                    crate::pg::query_value_token(value),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        parsed.set_query(Some(&query));
     }
     Some(parsed.into())
 }
@@ -4975,6 +5000,39 @@ mod tests {
         assert!(
             overridden.contains("host=queryhost") && overridden.contains("dbname=copy"),
             "an override must survive into the printed boundary: {overridden}"
+        );
+
+        // A query value is re-encoded the way libpq reads one, not the way a
+        // web form does. `url::Url::query_pairs()` applies
+        // `x-www-form-urlencoded` rules and `query_pairs_mut()` writes a space
+        // back as `+`; libpq only ever percent-decodes, so it reads that `+`
+        // literally. Measured against psql 16.13, the operator's own value
+        // connects and the `+` form does not:
+        //
+        //   ?options=-c%20search_path%3Dpg_catalog   -> search_path = pg_catalog
+        //   ?options=-c+search_path%3Dpg_catalog     -> FATAL: unrecognized
+        //                                               configuration parameter
+        //                                               "+search_path"
+        //
+        // A boundary that cannot connect is the exact case the target guard
+        // exists for — psql keeps the PREVIOUS connection — so printing one is
+        // not a cosmetic defect.
+        let spaced = super::psql_connect(
+            "control",
+            "postgres://u@h/app?options=-c%20search_path%3Dpg_catalog&password=hunter2",
+        )
+        .join("\n");
+        assert!(
+            !spaced.contains('+'),
+            "a space must be percent-encoded, never written as `+`: {spaced}"
+        );
+        assert!(
+            spaced.contains("%20"),
+            "and it must still be there, not dropped: {spaced}"
+        );
+        assert!(
+            !spaced.contains("hunter2") && !spaced.contains("password"),
+            "while the credential is still removed: {spaced}"
         );
 
         // Keyword form is declined outright rather than tokenized. `libpq`
