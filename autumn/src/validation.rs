@@ -425,6 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_ext_failure_exposes_field_details() {
+        // #2587: a non-HTTP caller reads the field map off the error.
+        #[derive(validator::Validate)]
+        struct Form {
+            #[validate(email(message = "Must be a valid email address"))]
+            email: String,
+        }
+
+        let Err(err) = Form {
+            email: "not-an-email".into(),
+        }
+        .validate() else {
+            panic!("invalid email is rejected");
+        };
+
+        let details = err.details().expect("validation error carries details");
+        assert_eq!(
+            details["email"],
+            ["Must be a valid email address".to_owned()]
+        );
+        assert_eq!(err.code(), "autumn.validation_failed");
+        assert_eq!(
+            err.to_string(),
+            "Validation failed: email: Must be a valid email address"
+        );
+    }
+
+    #[test]
     fn validation_errors_to_map_fallback_message() {
         let mut errors = validator::ValidationErrors::new();
         // Create an error with no custom message

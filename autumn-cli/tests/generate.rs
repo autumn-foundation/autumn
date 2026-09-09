@@ -2049,6 +2049,109 @@ fn generate_model_help_shows_example() {
     assert!(stdout.contains("--force"));
 }
 
+/// The `SQLite` counterpart of [`generated_scaffold_cargo_checks`], and the only
+/// machine proof of issue #1924: a `SQLite`-configured app scaffolded with every
+/// field kind that needed a `SQLite` conversion — `Uuid`, `Option<Uuid>`,
+/// `decimal{p,s}`, `enum{…}`, `DateTime<Utc>`, `Attachment`, `json` — actually
+/// compiles.
+///
+/// Two halves have to be right for this to pass, and neither is visible to a
+/// unit test over the emitted strings:
+///
+/// 1. The dependency set. A `SQLite` app's `Cargo.toml` must carry diesel on its
+///    `sqlite` feature, the bundled `libsqlite3-sys`, and `autumn-web/sqlite` —
+///    and must NOT carry `pq-sys`.
+/// 2. The Rust types. `Uuid` and `decimal` render
+///    `autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}`, and the
+///    generated `enum` carries `Text`/`Sqlite` (not `Pg`) conversions.
+///
+/// `cargo check`, not `--all-targets`: the scaffold's `tests/<model>.rs` smoke
+/// test still uses `autumn_web::test::TestDb`, a Postgres-only testcontainer.
+/// A `SQLite` `TestDb` lands with the runtime slice (#1905) — see
+/// `docs/guide/sqlite-in-production.md`.
+///
+/// Ignored by default; run with:
+/// `cargo test -p autumn-cli --test generate generated_sqlite_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_sqlite_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("sqlite-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    // Point the app at SQLite BEFORE generating: the generator resolves the
+    // backend from this file.
+    fs::write(
+        project.join("autumn.toml"),
+        "[database]\nprimary_url = \"sqlite://./app.db\"\n",
+    )
+    .unwrap();
+
+    // `run_autumn_with_env`, not `run_autumn`: backend detection gives the
+    // environment precedence over `autumn.toml`, so a developer running this
+    // with `DATABASE_URL=postgres://…` exported would silently get Postgres
+    // output and an opaque assertion failure below. Pinning both spellings to
+    // the same SQLite URL makes the run independent of the ambient shell.
+    run_autumn_with_env(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Widget",
+            "name:String",
+            "token:Uuid",
+            "owner:Option<Uuid>",
+            "price:decimal{10,2}",
+            "balance:Option<decimal>",
+            "status:enum{draft,published}",
+            "mood:Option<enum{happy,sad}>",
+            "at:DateTime",
+            "seen_at:Option<NaiveDateTime>",
+            "payload:json",
+            "cover:Attachment",
+        ],
+        &[
+            ("DATABASE_URL", "sqlite://./app.db"),
+            ("AUTUMN_DATABASE__URL", "sqlite://./app.db"),
+        ],
+    );
+
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("libsqlite3-sys"),
+        "SQLite app must link the bundled SQLite amalgamation:\n{cargo}"
+    );
+    assert!(
+        !cargo.contains("pq-sys"),
+        "SQLite app must not link libpq:\n{cargo}"
+    );
+
+    let model = fs::read_to_string(project.join("src/models/widget.rs")).unwrap();
+    assert!(
+        model.contains("autumn_web::db::sqlite_types::SqliteUuid"),
+        "Uuid must render the SQLite newtype:\n{model}"
+    );
+    assert!(
+        model.contains("autumn_web::db::sqlite_types::SqliteDecimal"),
+        "decimal must render the SQLite newtype:\n{model}"
+    );
+    assert!(
+        !model.contains("diesel::pg::Pg"),
+        "the generated enum must carry Sqlite, not Pg, conversions:\n{model}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo check");
+    assert!(
+        check.status.success(),
+        "cargo check failed on the generated SQLite scaffold:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow end-to-end check: scaffold a fresh project, run `autumn generate
 /// scaffold`, and `cargo check --tests` the result against the local `autumn-web`
 /// crate. Verifies the generator adds every dep its emitted code needs and
