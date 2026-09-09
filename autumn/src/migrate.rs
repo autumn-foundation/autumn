@@ -2257,6 +2257,7 @@ fn resolve_applied_user_migrations_sqlite<C>(
     all_migrations: &[Box<dyn Migration<diesel::sqlite::Sqlite>>],
     migrations_dir: &Path,
     identity: &HashMap<String, String>,
+    moves: &[SqliteCollisionMove],
 ) -> Result<Vec<AppliedUserMigration>, MigrationError>
 where
     C: MigrationHarness<diesel::sqlite::Sqlite>,
@@ -2277,11 +2278,21 @@ where
     // belongs to the app migration, is not.
     let framework = sqlite_framework_tracked_versions(identity)?;
 
+    // A record the apply path would move to its substitute (a database that
+    // ran an app migration before the framework migration sharing its version
+    // existed, and has not applied since) is read as already moved, so the
+    // listing sees the app migration under the identity it is planned under.
     let applied: Vec<String> = conn
         .applied_migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?
         .iter()
-        .map(ToString::to_string)
+        .map(|version| {
+            let version = version.to_string();
+            moves
+                .iter()
+                .find(|record| record.from == version)
+                .map_or(version, |record| record.to.clone())
+        })
         .collect();
 
     Ok(classify_applied_user_migrations(
@@ -2316,12 +2327,20 @@ pub fn applied_user_migrations_sqlite(
     })?;
     let source = FileBasedMigrations::from_path(migrations_dir)
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
-    let identity = sqlite_app_identity_map(&source)?;
+    let (sets, identity) = sqlite_app_identity_map(&source)?;
     let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> =
         DisambiguatedMigrations::new(&source, &identity)
             .migrations()
             .map_err(|e| MigrationError::Migration(e.to_string()))?;
-    resolve_applied_user_migrations_sqlite(&mut conn, &all_migrations, migrations_dir, &identity)
+    // Read-only: the legacy record is resolved virtually, never moved here.
+    let moves = sqlite_collision_history_moves(&mut conn, &sets, &identity)?;
+    resolve_applied_user_migrations_sqlite(
+        &mut conn,
+        &all_migrations,
+        migrations_dir,
+        &identity,
+        &moves,
+    )
 }
 
 /// The identity map the `SQLite` apply path
@@ -2338,16 +2357,22 @@ pub fn applied_user_migrations_sqlite(
 #[cfg(feature = "sqlite")]
 fn sqlite_app_identity_map(
     app_migrations: &FileBasedMigrations,
-) -> Result<HashMap<String, String>, MigrationError> {
+) -> Result<(MigrationPairSets, HashMap<String, String>), MigrationError> {
     use diesel::sqlite::Sqlite;
 
-    let mut sets: Vec<Vec<(String, String)>> =
+    let mut sets: MigrationPairSets =
         vec![migration_versions_and_names::<Sqlite, _>(app_migrations)?];
     for set in shard_framework_migration_sets() {
         sets.push(migration_versions_and_names::<Sqlite, _>(set)?);
     }
-    Ok(compute_migration_disambiguation_from_names(sets))
+    let identity = compute_migration_disambiguation_from_names(sets.clone());
+    Ok((sets, identity))
 }
+
+/// Several migration sets, each enumerated to its `(version, full name)`
+/// pairs: the input the collision map and the history adoption share.
+#[cfg(feature = "sqlite")]
+type MigrationPairSets = Vec<Vec<(String, String)>>;
 
 /// [`framework_migration_versions_for`] for `SQLite`, with every framework
 /// migration under the version `identity` tracks it as.
@@ -2414,18 +2439,24 @@ where
         .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
     // Under the apply path's identities, so a remapped migration is found and
     // reverted under the substitute version its record carries.
-    let identity = sqlite_app_identity_map(&source)?;
+    let (sets, identity) = sqlite_app_identity_map(&source)?;
     let all_migrations: Vec<Box<dyn Migration<diesel::sqlite::Sqlite>>> =
         DisambiguatedMigrations::new(&source, &identity)
             .migrations()
             .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
     with_sqlite_migration_lock(&mut conn, |conn| {
+        // A rollback is a write, so a legacy record is moved for real here,
+        // exactly as the apply path would have, before the plan is made; the
+        // revert then finds the migration under the version its record carries.
+        let moves = sqlite_collision_history_moves(conn, &sets, &identity)?;
+        apply_sqlite_collision_moves(conn, &moves)?;
         let applied_user = resolve_applied_user_migrations_sqlite(
             conn,
             &all_migrations,
             migrations_dir,
             &identity,
+            &[],
         )?;
         let versions = plan(&applied_user)?;
 
@@ -3033,75 +3064,121 @@ pub(crate) fn adopt_sqlite_collision_history(
     sets: &[Vec<(String, String)>],
     disambiguated: &HashMap<String, String>,
 ) -> Result<(), MigrationError> {
-    use diesel::RunQueryDsl as _;
-
     if disambiguated.is_empty() {
         return Ok(());
+    }
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
+    })?;
+    with_sqlite_migration_lock(&mut conn, |conn| {
+        let moves = sqlite_collision_history_moves(conn, sets, disambiguated)?;
+        apply_sqlite_collision_moves(conn, &moves)
+    })
+}
+
+/// One record [`adopt_sqlite_collision_history`] moves.
+///
+/// The migration, the plain version its record sits under, and the
+/// substitute it belongs under.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqliteCollisionMove {
+    migration: String,
+    from: String,
+    to: String,
+}
+
+/// The records [`adopt_sqlite_collision_history`] would move, decided on
+/// `conn` without changing anything.
+///
+/// For every remapped migration whose plain version is applied and whose
+/// substitute is not, the framework migration's table says which side ran,
+/// and the remapped side's record moves if it did. The listing path resolves
+/// these virtually and the write paths apply them.
+#[cfg(feature = "sqlite")]
+fn sqlite_collision_history_moves(
+    conn: &mut diesel::SqliteConnection,
+    sets: &[Vec<(String, String)>],
+    disambiguated: &HashMap<String, String>,
+) -> Result<Vec<SqliteCollisionMove>, MigrationError> {
+    let mut moves = Vec::new();
+    if disambiguated.is_empty() {
+        return Ok(moves);
     }
     let version_of: HashMap<&str, &str> = sets
         .iter()
         .flatten()
         .map(|(version, name)| (name.as_str(), version.as_str()))
         .collect();
-    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
-        MigrationError::Connection(crate::db_url::redact_targets_in_message(&e.to_string()))
-    })?;
-    with_sqlite_migration_lock(&mut conn, |conn| {
-        let applied: std::collections::HashSet<String> = conn
-            .applied_migrations()
-            .map_err(|e| MigrationError::Migration(e.to_string()))?
+    let applied: std::collections::HashSet<String> = conn
+        .applied_migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut remapped: Vec<(&String, &String)> = disambiguated.iter().collect();
+    remapped.sort();
+    for (full_name, substitute) in remapped {
+        let Some(version) = version_of.get(full_name.as_str()) else {
+            continue;
+        };
+        if !applied.contains(*version) || applied.contains(substitute) {
+            continue;
+        }
+        // The framework migration in this collision, and its table.
+        let framework = sets
             .iter()
-            .map(ToString::to_string)
-            .collect();
-        let mut remapped: Vec<(&String, &String)> = disambiguated.iter().collect();
-        remapped.sort();
-        for (full_name, substitute) in remapped {
-            let Some(version) = version_of.get(full_name.as_str()) else {
-                continue;
-            };
-            if !applied.contains(*version) || applied.contains(substitute) {
-                continue;
-            }
-            // The framework migration in this collision, and its table.
-            let framework = sets
-                .iter()
-                .flatten()
-                .filter(|(v, _)| v == version)
-                .find_map(|(_, name)| {
-                    SQLITE_FRAMEWORK_MIGRATION_TABLES
-                        .iter()
-                        .find(|(migration, _)| migration == name)
-                        .map(|(migration, table)| (*migration, *table))
-                });
-            let Some((framework_name, table)) = framework else {
-                continue;
-            };
-            let framework_ran = sqlite_table_exists(conn, table)?;
-            let remapped_ran = if framework_name == full_name {
-                framework_ran
-            } else {
-                !framework_ran
-            };
-            if !remapped_ran {
-                continue;
-            }
-            diesel::sql_query(
-                "UPDATE __diesel_schema_migrations SET version = ? WHERE version = ?",
-            )
-            .bind::<diesel::sql_types::Text, _>(substitute)
-            .bind::<diesel::sql_types::Text, _>(*version)
+            .flatten()
+            .filter(|(v, _)| v == version)
+            .find_map(|(_, name)| {
+                SQLITE_FRAMEWORK_MIGRATION_TABLES
+                    .iter()
+                    .find(|(migration, _)| migration == name)
+                    .map(|(migration, table)| (*migration, *table))
+            });
+        let Some((framework_name, table)) = framework else {
+            continue;
+        };
+        let framework_ran = sqlite_table_exists(conn, table)?;
+        let remapped_ran = if framework_name == full_name {
+            framework_ran
+        } else {
+            !framework_ran
+        };
+        if remapped_ran {
+            moves.push(SqliteCollisionMove {
+                migration: full_name.clone(),
+                from: (*version).to_owned(),
+                to: substitute.clone(),
+            });
+        }
+    }
+    Ok(moves)
+}
+
+/// Apply [`sqlite_collision_history_moves`] to `__diesel_schema_migrations`.
+#[cfg(feature = "sqlite")]
+fn apply_sqlite_collision_moves(
+    conn: &mut diesel::SqliteConnection,
+    moves: &[SqliteCollisionMove],
+) -> Result<(), MigrationError> {
+    use diesel::RunQueryDsl as _;
+
+    for record in moves {
+        diesel::sql_query("UPDATE __diesel_schema_migrations SET version = ? WHERE version = ?")
+            .bind::<diesel::sql_types::Text, _>(&record.to)
+            .bind::<diesel::sql_types::Text, _>(&record.from)
             .execute(conn)
             .map_err(|e| MigrationError::Migration(e.to_string()))?;
-            tracing::warn!(
-                migration = %full_name,
-                version = %version,
-                tracked_as = %substitute,
-                "Migration already applied under a version the framework now shares; its record \
-                 was moved to the substitute version instead of running it again"
-            );
-        }
-        Ok(())
-    })
+        tracing::warn!(
+            migration = %record.migration,
+            version = %record.from,
+            tracked_as = %record.to,
+            "Migration already applied under a version the framework now shares; its record \
+             was moved to the substitute version instead of running it again"
+        );
+    }
+    Ok(())
 }
 
 /// The `(version, full name)` pairs of every set in `named_sets`, the input
@@ -3727,6 +3804,73 @@ mod tests {
                 .expect("list")
                 .is_empty()
         );
+    }
+
+    /// The first command after an upgrade is `autumn migrate down`: the app
+    /// migration still sits under the plain version the framework migration
+    /// now claims. The listing resolves the record virtually and shows the
+    /// app migration under its substitute; the revert moves it for real and
+    /// rolls it back, leaving no record of either side.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_direct_sqlite_rollback_adopts_a_legacy_identity_first() {
+        use diesel::RunQueryDsl as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let (migrations_dir, url) = sqlite_scratch("direct-down");
+        let older = migrations_dir.join("20260907101530_zzz_app");
+        std::fs::create_dir_all(&older).expect("app migration dir");
+        std::fs::write(
+            older.join("up.sql"),
+            "CREATE TABLE zzz (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+        run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
+            .expect("the older release applies the app set");
+
+        let listed = applied_user_migrations_sqlite(&url, &migrations_dir).expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "20260907101530_zzz_app");
+        assert!(
+            listed[0].version.starts_with("20260907101530+"),
+            "listed under the identity it is planned under: {}",
+            listed[0].version
+        );
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        let still_plain = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM __diesel_schema_migrations WHERE version = '20260907101530'",
+        )
+        .get_result::<Count>(&mut conn)
+        .expect("count")
+        .n;
+        assert_eq!(still_plain, 1, "the listing moved nothing");
+
+        let reverted = revert_user_migrations_sqlite(
+            &url,
+            &migrations_dir,
+            |applied| Ok(applied.iter().map(|m| m.version.clone()).collect()),
+            |_| {},
+        )
+        .expect("revert");
+        assert_eq!(reverted, 1);
+        diesel::sql_query("SELECT 1 FROM zzz LIMIT 1")
+            .execute(&mut conn)
+            .expect_err("the app table is gone");
+        let any = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM __diesel_schema_migrations \
+             WHERE version LIKE '20260907101530%'",
+        )
+        .get_result::<Count>(&mut conn)
+        .expect("count")
+        .n;
+        assert_eq!(any, 0, "no record of either side remains");
     }
 
     /// The table map used to read collision history names every `SQLite`

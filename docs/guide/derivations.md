@@ -408,8 +408,10 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   it is inserted; `upsert_many` before the `FOR UPDATE` load of the rows it is
   about to diff; a delete before the load for its hook; `delete_many` before
   its preload; a retention sweep before its batch lock) and they take turns;
-  the price is that writes to that table serialize. SQLite serializes writers
-  already.
+  the price is that writes to that table serialize. A raw write of your own
+  on such a table takes the same lock first, through
+  `counter_cache_serialize_self_referential`, before the statement and before
+  `counter_cache_after_insert_by_id`. SQLite serializes writers already.
 - **Weights are ordinary numbers, not the edges of `i64`.** The delta paths
   never overflow on their own (a difference that does not fit goes out as two
   deltas, a bulk mutation's total is netted in `i128`, and a tenant-scoped

@@ -195,6 +195,16 @@ transaction, can opt into the same maintenance instead of hand-rolling `count +
 1`:
 
 ```rust,ignore
+// Before the write: on a table with a leg onto itself this takes the lock
+// every generated mutation takes before its first row lock; elsewhere it
+// issues nothing. A raw insert that skipped it could hold its new row while
+// a generated mutation holds the lock and waits for that row.
+autumn_web::repository::counter_cache_serialize_self_referential(
+    conn,
+    Comment::counter_caches(),
+)
+.await?;
+
 let comment_id: i64 = diesel::insert_into(comments::table)
     .values(/* … */)
     .returning(comments::id)

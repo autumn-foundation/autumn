@@ -48,7 +48,10 @@ use autumn_web::derivation::{
     BackfillOptions, BackfillState, DerivationDef, derivation_status, drift, ensure_derivations,
     recompute, registered_derivations, run_backfill,
 };
-use autumn_web::repository::{AutumnCounterCaches as _, counter_cache_after_insert_by_id};
+use autumn_web::repository::{
+    AutumnCounterCaches as _, counter_cache_after_insert_by_id,
+    counter_cache_serialize_self_referential,
+};
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -906,6 +909,10 @@ async fn ac2_an_aborted_transaction_leaves_the_derived_value_unchanged() {
     assert_eq!((before.persisted_count, before.persisted_sum), (1, 3));
 
     conn.batch_execute("BEGIN").await.expect("begin");
+    // The documented order: the lock, then the raw write, then the hook.
+    counter_cache_serialize_self_referential(&mut conn, DvComment::counter_caches())
+        .await
+        .expect("take the lock first");
     let id = diesel::sql_query(
         "INSERT INTO dv_comments (post_id, published, score) \
          VALUES ($1, TRUE, 9) RETURNING id",

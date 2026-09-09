@@ -636,7 +636,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutation on such a table takes a per-table advisory lock before its first
   row lock (a save before its insert, `upsert_many` before the `FOR UPDATE`
   load it diffs against, the delete family and retention before theirs) so
-  crossing mutations wait rather than deadlock, the registry refuses a
+  crossing mutations wait rather than deadlock (a raw write of your own takes
+  it first through the now-public `counter_cache_serialize_self_referential`,
+  and `autumn migrate down` on SQLite moves a legacy record to its tracked
+  identity before planning, as the apply path would), the registry refuses a
   derivation column that is the parent's primary key under the backend's
   identifier rules (`"ID"` on SQLite), and
   `derivation::resweep` re-enqueues one derivation for the settling pass a

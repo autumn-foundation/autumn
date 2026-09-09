@@ -572,6 +572,11 @@ fn live_predicate(view: &SqlView, want_live: bool) -> String {
 /// Take, for the rest of the transaction, the lock that serializes every
 /// counter-cached mutation on a table with a leg onto itself.
 ///
+/// Call it before a raw write of your own on such a table, ahead of the
+/// `INSERT`, `UPDATE` or `DELETE` itself, and before
+/// [`counter_cache_after_insert_by_id`] or its siblings; see the note on that
+/// function.
+///
 /// Onto its own table, a mutation locks a child row and then a parent row of
 /// the same table. Two such mutations can want each other's rows: one moves
 /// node A under B (holds A, waits for B) while another moves B under A (holds
@@ -593,7 +598,6 @@ fn live_predicate(view: &SqlView, want_live: bool) -> String {
 /// # Errors
 ///
 /// Propagates any database error from the lock statement.
-#[doc(hidden)]
 pub async fn counter_cache_serialize_self_referential<M: 'static>(
     conn: &mut RuntimeConnection,
     specs: &[CounterCacheSpec<M>],
@@ -1089,9 +1093,18 @@ fn specs_in_lock_order<M: 'static>(specs: &[CounterCacheSpec<M>]) -> Vec<usize> 
 /// repository) and still want the framework to own the counter arithmetic:
 ///
 /// ```rust,ignore
+/// counter_cache_serialize_self_referential(conn, Comment::counter_caches()).await?;
 /// let id = diesel::insert_into(comments::table) /* … */ .get_result(conn).await?;
 /// counter_cache_after_insert_by_id(conn, Comment::counter_caches(), id).await?;
 /// ```
+///
+/// The first line matters on a table with a leg onto itself, and costs nothing
+/// on any other: every generated mutation takes that advisory lock before its
+/// first row lock, and an inserted row is locked from the moment it exists (a
+/// concurrent upsert of the same id waits on it through the primary key), so
+/// a raw insert that takes the lock only here, after the row, can hold the
+/// row while a generated mutation holds the lock and waits for the row, and
+/// the database aborts one of them. Take the lock, then write.
 ///
 /// For a soft-deleting child the increment is conditional on the row being live,
 /// mirroring the delete side. Raw SQL can insert a row with `deleted_at` already
