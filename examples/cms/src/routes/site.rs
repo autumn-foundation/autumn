@@ -121,7 +121,12 @@ impl Repos {
         let Ok(user_id) = raw.parse::<i64>() else {
             return Ok(None);
         };
-        Ok(self.users.find_by_id(user_id).await.ok().flatten())
+        // Propagated, not swallowed. `.ok()` turned a pool or database failure
+        // into "no such account", so a protected handler reported an
+        // authentication failure and a public page rendered a signed-in
+        // visitor as anonymous — both hiding a service fault behind a
+        // plausible-looking answer. `Ok(None)` still means the account is gone.
+        self.users.find_by_id(user_id).await
     }
 
     /// The signed-in user, or a 401.
@@ -161,7 +166,11 @@ impl Repos {
                 break;
             }
             seen.push(parent_id);
-            match self.posts.find_by_id(parent_id).await.ok().flatten() {
+            // A failed lookup must not read as "no parent": that truncates the
+            // path, so `/about/team` is published as `/team` — a URL that 404s
+            // or, worse, names different content, and that listings, feeds and
+            // caches then carry.
+            match self.posts.find_by_id(parent_id).await? {
                 Some(parent) => {
                     slugs.push(parent.slug.clone());
                     cursor = parent.parent_id;
@@ -181,7 +190,8 @@ impl Repos {
         csrf: &Csrf,
     ) -> AutumnResult<Chrome> {
         Ok(Chrome {
-            nav: self.primary_nav(settings).await?,
+            nav: self.nav_for("primary", settings).await?,
+            footer_nav: self.nav_for("footer", settings).await?,
             sidebar: Some(self.sidebar(settings).await?),
             current_user: self.current_user(session).await?,
             settings: settings.clone(),
@@ -190,10 +200,16 @@ impl Repos {
     }
 
     /// The menu assigned to the `primary` theme location, resolved to URLs.
-    async fn primary_nav(&self, settings: &Settings) -> AutumnResult<Vec<NavNode>> {
+    /// The menu assigned to a theme location, resolved to URLs.
+    ///
+    /// Takes the location rather than hard-coding `primary`: the Appearance
+    /// screen offers `footer` too, and for as long as this only ever asked for
+    /// one of them, assigning the other saved successfully and rendered
+    /// nowhere.
+    async fn nav_for(&self, location: &str, settings: &Settings) -> AutumnResult<Vec<NavNode>> {
         let Some(menu) = self
             .menus
-            .find_by_location("primary".to_owned())
+            .find_by_location(location.to_owned())
             .await?
             .into_iter()
             .next()
@@ -410,7 +426,7 @@ impl Repos {
         let links = self.post_term_links.find_by_post_id(post_id).await?;
         let mut terms = Vec::with_capacity(links.len());
         for link in links {
-            if let Some(term) = self.terms.find_by_id(link.term_id).await.ok().flatten() {
+            if let Some(term) = self.terms.find_by_id(link.term_id).await? {
                 terms.push(term);
             }
         }

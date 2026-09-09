@@ -174,7 +174,7 @@ pub async fn front_page(
     // configured structure is, so links minted before a settings change keep
     // working.
     if let Some(post_id) = params.p
-        && let Some(post) = repos.posts.find_by_id(post_id).await.ok().flatten()
+        && let Some(post) = repos.posts.find_by_id(post_id).await?
         && is_publicly_routable(&post)
     {
         return single_post(&repos, &session, &csrf, post).await;
@@ -188,7 +188,7 @@ pub async fn front_page(
     // front page whose type was later registered `public: false` falls through
     // to the blog index rather than being served at `/`.
     if let Some(page_id) = settings.front_page_id
-        && let Some(page) = repos.posts.find_by_id(page_id).await.ok().flatten()
+        && let Some(page) = repos.posts.find_by_id(page_id).await?
         && page.is_public()
         && is_publicly_routable(&page)
     {
@@ -333,9 +333,7 @@ pub async fn dispatch(
             match repos
                 .posts
                 .find_by_id(id)
-                .await
-                .ok()
-                .flatten()
+                .await?
                 .filter(is_publicly_routable)
             {
                 Some(post) => single_post(&repos, &session, &csrf, post).await,
@@ -646,9 +644,9 @@ async fn single_post(
     }
 
     let terms = repos.post_terms(post.id).await?;
-    let author = repos.users.find_by_id(post.author_id).await.ok().flatten();
+    let author = repos.users.find_by_id(post.author_id).await?;
     let featured = match post.featured_media_id {
-        Some(id) => repos.attachments.find_by_id(id).await.ok().flatten(),
+        Some(id) => repos.attachments.find_by_id(id).await?,
         None => None,
     };
 

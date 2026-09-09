@@ -1492,7 +1492,9 @@ async fn resolve_term_ids(
                 // The model's own limit, checked here so an over-long name is a
                 // clear message rather than a validation failure after the
                 // lookup has already run.
-                const MAX_TERM_NAME: usize = 200;
+                // The shared constant, so the editor's box and the importer's
+                // direct insert cannot drift — they had.
+                use crate::hooks::MAX_TERM_NAME;
                 if name.chars().count() > MAX_TERM_NAME {
                     return Err(AutumnError::unprocessable_msg(format!(
                         "`{}…` is too long; {} names are limited to {MAX_TERM_NAME} characters",
@@ -1666,7 +1668,7 @@ pub async fn revisions(
     let mut names: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     for author_id in history.iter().filter_map(|revision| revision.author_id) {
         if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(author_id)
-            && let Some(account) = repos.users.find_by_id(author_id).await.ok().flatten()
+            && let Some(account) = repos.users.find_by_id(author_id).await?
         {
             slot.insert(account.public_name().to_owned());
         }

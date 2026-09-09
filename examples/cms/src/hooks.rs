@@ -67,6 +67,10 @@ pub const MAX_COMMENT_EMAIL_BYTES: usize = 254;
 /// The longest account email accepted — the same RFC 5321 bound.
 pub const MAX_EMAIL_BYTES: usize = 254;
 
+/// The longest term name accepted, matching the `#[validate]` cap declared on
+/// the `Term` model — and the term form's `maxlength`.
+pub const MAX_TERM_NAME: usize = 200;
+
 /// The largest commenter website accepted.
 ///
 /// There is no input for it on the form at all, which is exactly why it needs a
@@ -347,6 +351,18 @@ pub fn normalize_new_term(new: &mut NewTerm) -> AutumnResult<()> {
         return Err(AutumnError::unprocessable_msg(
             "Term name must contain at least one alphanumeric character",
         ));
+    }
+
+    // The model's declared cap, which the direct insert never runs.
+    // `content::import_terms` goes through plain Diesel so the rows and their
+    // ancestry commit together, so this is the only place the rule reaches an
+    // imported term — the editor's own box has enforced it since round
+    // twenty-seven, and the two had drifted.
+    new.name = new.name.trim().to_owned();
+    if new.name.chars().count() > MAX_TERM_NAME {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A term name must be at most {MAX_TERM_NAME} characters"
+        )));
     }
     Ok(())
 }

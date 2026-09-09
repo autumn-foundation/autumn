@@ -42,6 +42,8 @@ async fn auth_page(
     let settings = repos.settings().await?;
     let chrome = Chrome {
         nav: Vec::new(),
+        // Nor a footer menu: an auth screen is deliberately a dead end.
+        footer_nav: Vec::new(),
         csrf: csrf.input(),
         // No sidebar on an auth screen: nothing there helps, and a "recent
         // posts" list beside a password field is noise.

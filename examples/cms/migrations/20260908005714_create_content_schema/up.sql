@@ -247,6 +247,13 @@ CREATE TABLE menus (
     location   TEXT      NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+-- One menu per theme location. The application clears the incumbent before
+-- assigning a new one, and this is what makes that hold under concurrency:
+-- without it two administrators assigning `primary` at once each clear what
+-- they saw and both insert, after which the renderer picks one of two with no
+-- defined ordering. `''` is the unassigned marker and is deliberately excluded,
+-- since any number of menus may sit unassigned.
+CREATE UNIQUE INDEX idx_menus_location ON menus (location) WHERE location <> '';
 
 -- A menu item points at a post, a term, or a raw URL — whichever is set wins,
 -- checked in that order. `parent_id` gives WordPress's nested sub-menus.

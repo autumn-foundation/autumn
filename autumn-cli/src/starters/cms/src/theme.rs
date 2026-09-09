@@ -294,6 +294,12 @@ fn render_widget(kind: WidgetKind, widget: &Widget, data: &SidebarData) -> Marku
 pub struct Chrome {
     pub settings: Settings,
     pub nav: Vec<NavNode>,
+    /// The menu assigned to the `footer` location.
+    ///
+    /// The Appearance screen has always offered `Footer` beside `Primary
+    /// navigation`, and nothing rendered it: an administrator could build a
+    /// menu, assign it, save successfully and have visitors never see it.
+    pub footer_nav: Vec<NavNode>,
     pub sidebar: Option<Markup>,
     pub current_user: Option<User>,
     /// The hidden CSRF input for the chrome's own logout form.
@@ -508,6 +514,19 @@ fn default_layout(chrome: &Chrome, page_title: &str, content: Markup) -> Markup 
                 }
 
                 footer class="border-t border-gray-200 mt-12" {
+                    @if !chrome.footer_nav.is_empty() {
+                        nav aria-label="Footer" class="max-w-5xl mx-auto px-4 pt-6" {
+                            ul class="flex flex-wrap gap-4 text-sm" {
+                                @for node in &chrome.footer_nav {
+                                    li {
+                                        a href=(node.url) class="text-gray-600 hover:text-gray-900" {
+                                            (node.label)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     div class="max-w-5xl mx-auto px-4 py-6 text-xs text-gray-500 flex \
                                flex-wrap gap-3 justify-between" {
                         span { "© " (chrono::Utc::now().format("%Y").to_string()) " " (settings.site_title) }

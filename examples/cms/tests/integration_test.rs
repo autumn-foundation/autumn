@@ -9374,3 +9374,277 @@ async fn the_appearance_menu_list_is_bounded() {
     assert!(last.contains("Menu 045"), "the tail is reachable");
     assert!(!last.contains("Menu 001"), "page three is not page one");
 }
+
+/// An import cannot store a term name past the model's cap.
+///
+/// Found by sweeping for the shape rather than by a review: `import_terms`
+/// inserts through direct Diesel so the rows and their ancestry commit
+/// together, which means the model's `#[validate(length(max = 200))]` never
+/// runs — and the cap the editor's own box has enforced since round twenty-seven
+/// lived as a local constant there rather than in the shared normalizer.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_import_cannot_store_an_oversized_term_name() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 4,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "attachments": [],
+        "posts": [],
+        "terms": [
+            {"taxonomy": "category", "name": "x".repeat(201), "slug": "huge", "description": ""}
+        ]
+    })
+    .to_string();
+
+    let refused = import_export(&client, &cookie, payload.as_str()).await;
+    assert_ne!(refused.status, 200, "the import must not report success");
+
+    let terms: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::terms::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(terms, 0, "and must store nothing");
+
+    // A name at the cap still imports — the bound is the model's, not tighter.
+    let payload = serde_json::json!({
+        "version": 4,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "attachments": [],
+        "posts": [],
+        "terms": [
+            {"taxonomy": "category", "name": "x".repeat(200), "slug": "big", "description": ""}
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok();
+    let terms: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::terms::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(terms, 1);
+}
+
+/// A menu assigned to the footer location is rendered there.
+///
+/// The Appearance screen has always offered `Footer` beside `Primary
+/// navigation`, and nothing resolved it: an administrator could build a menu,
+/// assign it, save successfully, and have visitors never see it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_menu_assigned_to_the_footer_is_rendered() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Legal"), ("location", "footer")]))
+        .send()
+        .await
+        .assert_status(303);
+    let menu: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::menus::table
+            .filter(cms::schema::menus::location.eq("footer"))
+            .select(cms::schema::menus::id)
+            .first(&mut conn)
+            .await
+            .expect("the menu")
+    };
+    client
+        .post(&format!("/admin/appearance/menus/{menu}/items"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("label", "Privacy"),
+            ("url", "/privacy"),
+            ("parent_id", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    sign_out(&client);
+    let home = client.get("/").send().await;
+    home.assert_ok();
+    let home = home.text();
+    assert!(
+        home.contains("Privacy") && home.contains("/privacy"),
+        "a footer menu must reach the page it was assigned to:\n{home}"
+    );
+    assert!(
+        home.contains(r#"aria-label="Footer""#),
+        "and be labelled as navigation rather than loose links"
+    );
+}
+
+/// Only one menu can hold a theme location, under concurrency.
+///
+/// The replacement cleared the incumbent and inserted, with nothing
+/// serializing the two — so two administrators assigning `primary` at once
+/// each cleared what they saw and both committed, after which the renderer
+/// picked one of two with no defined ordering.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn only_one_menu_can_hold_a_location() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for name in ["First", "Second", "Third"] {
+        client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", name), ("location", "primary")]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    let holders: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::menus::table
+            .filter(cms::schema::menus::location.eq("primary"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(holders, 1, "the location has exactly one holder");
+
+    // The database enforces it, not only the application: a direct write that
+    // skips `replace_menu_at_location` is refused.
+    let refused = try_execute(
+        TestDb::shared().await,
+        "UPDATE menus SET location = 'primary' WHERE name = 'First'",
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a second holder must be impossible to store at all"
+    );
+}
+
+/// A page's ancestry is either complete or absent, never truncated.
+///
+/// `.ok()` on an ancestor lookup turned a pool or database failure into "no
+/// parent", so `/about/team` would be published as `/team` — a URL that 404s,
+/// into listings, feeds and caches. That is now propagated, at this and seven
+/// other call sites with the same shape.
+///
+/// The error path itself is not covered here, and I would rather say so than
+/// imply it is: a failing `SELECT` cannot be induced through the HTTP surface,
+/// and the change is `.ok().flatten()` becoming `?`. What this pins is the
+/// distinction the fix has to preserve — a nested page keeps its full path, and
+/// a page with genuinely no parent still resolves to `Ok(None)` and keeps its
+/// bare one, rather than the two collapsing into each other.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failed_ancestor_lookup_does_not_truncate_a_permalink() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let about = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "About"),
+            ("slug", "about"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(about.status, 303, "body: {}", about.text());
+    let about_id = about
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Team"),
+            ("slug", "team"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("parent_id", about_id.as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The healthy path, so the failure below is the only variable.
+    sign_out(&client);
+    let listed: serde_json::Value = client
+        .get("/api/v1/posts?post_type=page")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let urls: Vec<&str> = listed
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|post| post["url"].as_str())
+        .collect();
+    assert!(
+        urls.contains(&"/about/team"),
+        "the nested page is published at its full path: {urls:?}"
+    );
+
+    // A page with genuinely no parent is the `Ok(None)` case, which has to keep
+    // behaving exactly as it did — the fix must not turn "no parent" into an
+    // error any more than it left an error looking like "no parent".
+    try_execute(
+        TestDb::shared().await,
+        "UPDATE posts SET parent_id = NULL WHERE slug = 'team'",
+    )
+    .await
+    .expect("detach");
+    let listed: serde_json::Value = client
+        .get("/api/v1/posts?post_type=page")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let urls: Vec<&str> = listed
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|post| post["url"].as_str())
+        .collect();
+    assert!(
+        urls.contains(&"/team"),
+        "a page with genuinely no parent is `Ok(None)` and keeps its bare path: {urls:?}"
+    );
+}

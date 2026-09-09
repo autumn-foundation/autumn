@@ -624,6 +624,32 @@ pub async fn moderate_comment(
     }
     let target = target.to_owned();
     conn.transaction(async move |conn| {
+        // The post row is locked *first*, before any comment is read, so every
+        // moderation of a thread serializes on one thing.
+        //
+        // The ancestor check below reads rows this transaction does not
+        // otherwise lock, so on its own it is a read that another moderator can
+        // invalidate: approve a reply whose parent is approved, have the parent
+        // spammed in between, and the reply commits approved under a hidden
+        // parent — countable but unrenderable, permanently. Locking the
+        // ancestors instead would serialize the two in *opposite* orders and
+        // deadlock; the post is the one resource both paths already touch (the
+        // recount takes it at the end), so taking it up front is what makes the
+        // ordering total.
+        let post_id: i64 = comments::table
+            .find(comment_id)
+            .select(comments::post_id)
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
+        posts::table
+            .find(post_id)
+            .select(posts::id)
+            .for_update()
+            .first::<i64>(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
+
         let comment: Comment = comments::table
             .find(comment_id)
             .select(Comment::as_select())
@@ -2281,6 +2307,19 @@ pub async fn delete_comment(conn: &mut AsyncPgConnection, comment_id: i64) -> Au
             .await
             .map_err(AutumnError::not_found)?;
 
+        // The same lock `moderate_comment` takes first, in the same order: a
+        // delete cascading over a subtree and an approval walking that
+        // subtree's ancestors are the same race, and one lock ordering for
+        // every path that changes a thread is what makes it total rather than
+        // nearly total.
+        posts::table
+            .find(comment.post_id)
+            .select(posts::id)
+            .for_update()
+            .first::<i64>(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
+
         diesel::delete(comments::table.find(comment_id))
             .execute(conn)
             .await?;
@@ -2423,6 +2462,17 @@ pub async fn replace_menu_at_location(
     let location = location.to_owned();
     conn.transaction(async move |conn| {
         if !location.is_empty() {
+            // `FOR UPDATE` on the incumbent, so two administrators assigning
+            // the same location serialize here rather than each clearing what
+            // they saw and both inserting. `idx_menus_location` is the backstop
+            // — it makes the invariant the database's, which is what holds when
+            // there is no incumbent to lock and both inserts race.
+            let _: Vec<i64> = menus::table
+                .filter(menus::location.eq(&location))
+                .select(menus::id)
+                .for_update()
+                .load(conn)
+                .await?;
             diesel::update(menus::table.filter(menus::location.eq(&location)))
                 .set(menus::location.eq(""))
                 .execute(conn)
@@ -2435,7 +2485,25 @@ pub async fn replace_menu_at_location(
                 menus::location.eq(&location),
             ))
             .execute(conn)
-            .await?;
+            .await
+            .map_err(|error| {
+                // The constraint firing means another administrator won the
+                // race between the lock above and this insert — a real answer,
+                // not an internal error.
+                if matches!(
+                    error,
+                    diesel::result::Error::DatabaseError(
+                        diesel::result::DatabaseErrorKind::UniqueViolation,
+                        _
+                    )
+                ) {
+                    AutumnError::conflict_msg(
+                        "Another menu was just assigned to that location; try again",
+                    )
+                } else {
+                    AutumnError::from(error)
+                }
+            })?;
         Ok::<_, AutumnError>(())
     })
     .await
@@ -2874,8 +2942,41 @@ pub async fn menu_items_for(
     if menu_ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
+    // The per-menu bound is applied by Postgres, not after the rows arrive.
+    // Grouping a full `load()` in Rust left the transfer and the memory
+    // proportional to the largest menu — which is the one case the bound exists
+    // for. A window function keeps it one round trip *and* one page of rows.
+    use diesel::sql_types::{Array, BigInt};
+
+    #[derive(diesel::QueryableByName)]
+    struct RankedId {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+
+    // The window function picks the ids; the rows themselves come back through
+    // the DSL, which is what keeps `MenuItem` a plain `#[model]` rather than
+    // needing a hand-written `QueryableByName` that would drift from it.
+    let ids: Vec<i64> = diesel::sql_query(
+        "SELECT id FROM (\
+             SELECT id, ROW_NUMBER() OVER ( \
+                 PARTITION BY menu_id ORDER BY position ASC, id ASC) AS rank \
+             FROM menu_items WHERE menu_id = ANY($1)) ranked \
+         WHERE rank <= $2",
+    )
+    .bind::<Array<BigInt>, _>(menu_ids.to_vec())
+    .bind::<BigInt, _>(per_menu.max(0))
+    .load::<RankedId>(conn)
+    .await?
+    .into_iter()
+    .map(|row| row.id)
+    .collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
     let rows: Vec<crate::models::MenuItem> = menu_items::table
-        .filter(menu_items::menu_id.eq_any(menu_ids))
+        .filter(menu_items::id.eq_any(&ids))
         .order((
             menu_items::menu_id.asc(),
             menu_items::position.asc(),
@@ -2884,15 +2985,11 @@ pub async fn menu_items_for(
         .select(crate::models::MenuItem::as_select())
         .load(conn)
         .await?;
+
     let mut grouped: std::collections::HashMap<i64, Vec<crate::models::MenuItem>> =
         std::collections::HashMap::new();
     for row in rows {
-        let bucket = grouped.entry(row.menu_id).or_default();
-        // Bounded per menu as well as in total: one enormous menu should not be
-        // able to make the screen unusable on its own.
-        if i64::try_from(bucket.len()).unwrap_or(i64::MAX) < per_menu {
-            bucket.push(row);
-        }
+        grouped.entry(row.menu_id).or_default().push(row);
     }
     Ok(grouped)
 }
