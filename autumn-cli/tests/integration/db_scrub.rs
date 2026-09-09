@@ -2473,6 +2473,35 @@ async fn a_view_read_through_an_untracked_function_is_refused() {
         "and it must refuse BEFORE writing anything: {refusal}"
     );
 
+    // The same function one hop further away, behind an ordinary view, where
+    // only the VIEW's rule names it. The walk crosses ordinary views, so this is
+    // exactly as invisible — and a check that looked only at materialized views
+    // missed it: measured, `a_report` refreshed first from a stale `z_source`
+    // and kept all 200 original addresses under a reported success.
+    let indirect = seed_sample_fixture(&admin, &base, "fn_via_view").await;
+    indirect
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION bridge_fn() RETURNS TABLE(id int, email text) \
+                 AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
+             CREATE VIEW bridge_view AS SELECT * FROM bridge_fn(); \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM bridge_view;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_via_view");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("a_report via bridge_fn"),
+        "a function called by an ordinary view in the chain must be caught too: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&indirect, "users", "email").await,
+        200,
+        "and that refusal must also precede every write: {refusal}"
+    );
+
     // The same shape through a tracked body is followed, not refused. `z_source`
     // sorts AFTER `a_report`, so refreshing it first can only come from the
     // function hop being traversed.

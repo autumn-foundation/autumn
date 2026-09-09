@@ -608,7 +608,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   success with `users` at 2 rows, both base tables clean, and all 200 original
   addresses still in `a_report`. The same shape with a `BEGIN ATOMIC` body is
   ordered correctly instead — measured, `z_source` refreshed first despite
-  sorting later, both views ending clean.
+  sorting later, both views ending clean. That refusal covers every relation
+  REACHABLE from a materialized view, not only the views themselves: the walk
+  crosses ordinary views, so a function called by one of those is just as
+  invisible. Measured on `a_report -> bridge_view -> bridge_fn() -> z_source`,
+  where only the ordinary view's rule names the function — a check restricted to
+  materialized views skipped it, `a_report` refreshed first from a stale
+  `z_source`, and the run reported success with all 200 original addresses still
+  in `a_report`.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the

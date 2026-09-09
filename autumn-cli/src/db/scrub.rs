@@ -3748,6 +3748,11 @@ pub struct DatabaseFacts {
     /// `plpgsql` — so the run cannot know whether it reads another materialized
     /// view, and cannot order the refresh around it. A `BEGIN ATOMIC` body does
     /// record its reads and is followed by `MV_REFRESH_CLOSURE` instead.
+    ///
+    /// Read over every relation REACHABLE from a materialized view, not only the
+    /// views themselves: the walk crosses ordinary views, so a function called by
+    /// one of those is just as invisible and just as able to reorder the
+    /// refresh.
     pub untraceable_view_functions: Vec<String>,
     /// Non-system schemas other than `public` that hold base tables. The whole
     /// classification universe is `public`-only, so these are refused.
@@ -4311,21 +4316,35 @@ fn probe_database_facts(
 
     // The views whose order cannot be derived at all. Deliberately not part of
     // the closure query: this is a refusal, not an edge.
+    // Over EVERY relation reachable from a materialized view, not just the views
+    // themselves: `reach` walks through ordinary views, so an untracked function
+    // called by one of THOSE is exactly as invisible. Measured on
+    // `a_report -> bridge_view -> bridge_fn() -> z_source`, where only
+    // `bridge_view`'s rule names the function — the earlier `relkind = 'm'`
+    // predicate skipped it, `a_report` refreshed first from a stale `z_source`,
+    // and the run reported success with all 200 original addresses still in
+    // `a_report`.
     let untraceable_view_functions = names(
-        "SELECT DISTINCT rel.relname || ' via ' || p.proname AS name \
-         FROM pg_depend d \
-         JOIN pg_rewrite r ON r.oid = d.objid \
-         JOIN pg_class rel ON rel.oid = r.ev_class AND rel.relkind = 'm' \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         JOIN pg_proc p ON p.oid = d.refobjid \
-         JOIN pg_namespace pn ON pn.oid = p.pronamespace \
-         WHERE d.classid = 'pg_rewrite'::regclass \
-           AND d.refclassid = 'pg_proc'::regclass \
-           AND pn.nspname NOT IN ('pg_catalog', 'information_schema') \
-           AND NOT EXISTS (SELECT 1 FROM pg_depend fd \
-                           WHERE fd.classid = 'pg_proc'::regclass AND fd.objid = p.oid \
-                             AND fd.refclassid = 'pg_class'::regclass) \
-         ORDER BY name",
+        &format!(
+            "{MV_REFRESH_CLOSURE}, node AS ( \
+                 SELECT oid AS root, oid AS relation FROM mv \
+                 UNION \
+                 SELECT dependent, source FROM reach \
+             ) \
+             SELECT DISTINCT root.relname || ' via ' || p.proname AS name \
+             FROM node n \
+             JOIN pg_class root ON root.oid = n.root \
+             JOIN pg_rewrite rw ON rw.ev_class = n.relation \
+             JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid \
+               AND d.refclassid = 'pg_proc'::regclass \
+             JOIN pg_proc p ON p.oid = d.refobjid \
+             JOIN pg_namespace pn ON pn.oid = p.pronamespace \
+             WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema') \
+               AND NOT EXISTS (SELECT 1 FROM pg_depend fd \
+                               WHERE fd.classid = 'pg_proc'::regclass AND fd.objid = p.oid \
+                                 AND fd.refclassid = 'pg_class'::regclass) \
+             ORDER BY name"
+        ),
         &mut conn,
     )?;
 
