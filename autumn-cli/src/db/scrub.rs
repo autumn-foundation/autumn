@@ -2689,6 +2689,16 @@ fn classify_and_apply(
         // an interactive paste — measured, psql ignores it there — which is what
         // the per-target guard below is for.
         eprintln!("  \\set ON_ERROR_STOP on");
+        // One flag for the whole stream: "everything so far succeeded, and the
+        // last block was on the target it named". `execute` returns on the first
+        // target that fails and never touches the rest, so the script must not
+        // either — measured, without this the next target's `\connect` and its
+        // whole destructive block ran after an earlier target rolled back,
+        // leaving a partially scrubbed topology and a stream that ends without
+        // an error. Nested `\if` carries it: a target whose block is skipped
+        // never reaches the `\gset` that would set the flag true again, so one
+        // failure skips every target after it.
+        eprintln!("  \\set autumn_ok true");
         for (label, url, plan, facts, sampling) in &plans {
             let no_deferral = BTreeSet::new();
             let deferred: &BTreeSet<String> =
@@ -2700,6 +2710,10 @@ fn classify_and_apply(
             // transaction against whichever database the session happens to be
             // connected to — sampling one of them repeatedly, with row counts
             // taken from the others, and leaving the rest untouched.
+            // Gate the WHOLE block, `\connect` included: an earlier target
+            // that rolled back must not be followed by this one connecting and
+            // scrubbing anyway.
+            eprintln!("  \\if :autumn_ok");
             for line in psql_connect(label, url) {
                 eprintln!("  {line}");
             }
@@ -2777,16 +2791,22 @@ fn classify_and_apply(
             // on a clone pasted at its origin every DELETE was refused and six
             // VACUUM (FULL, ANALYZE) statements still ran on the ORIGIN, each
             // taking an ACCESS EXCLUSIVE lock. psql fences them instead.
+            //
+            // The fence is emitted for EVERY target, not only a sampled one: it
+            // is what carries the failure forward, and a target with nothing to
+            // compact still has to say whether it succeeded.
+            for line in post_commit_fence(&facts.endpoint) {
+                eprintln!("  {line}");
+            }
             if let Some(sampling) = sampling {
-                for line in post_commit_fence(&facts.endpoint) {
-                    eprintln!("  {line}");
-                }
                 eprintln!("  SET lock_timeout = '{COMPACT_LOCK_TIMEOUT}';");
                 for table in compacted_tables(sampling, &purged_tables(&purges)) {
                     eprintln!("  VACUUM (FULL, ANALYZE) {};", qualified_ident(table));
                 }
-                eprintln!("  \\endif");
             }
+            eprintln!("  \\endif");
+            // Closes the `\if :autumn_ok` this target opened.
+            eprintln!("  \\endif");
         }
         eprintln!("\n\u{2713} Dry run only \u{2014} nothing was written.");
         return Ok(());
@@ -4328,12 +4348,15 @@ fn post_commit_fence(endpoint: &ServerEndpoint) -> Vec<String> {
         // `\set` is a meta-command and executes nothing, so it is safe here.
         "\\set autumn_commit_error :ERROR".to_owned(),
         "SET search_path = pg_catalog, public;".to_owned(),
+        // False FIRST, so a `\\gset` whose query fails leaves it false instead of
+        // carrying the previous target's success forward.
+        "\\set autumn_ok false".to_owned(),
         format!(
             "SELECT (:'autumn_scrubbed'::bool AND NOT :'autumn_commit_error'::bool \
-             AND NOT ({})) AS autumn_on_target \\gset",
+             AND NOT ({})) AS autumn_ok \\gset",
             endpoint_mismatch(endpoint),
         ),
-        "\\if :autumn_on_target".to_owned(),
+        "\\if :autumn_ok".to_owned(),
     ]
 }
 
@@ -4901,8 +4924,23 @@ mod tests {
         );
         assert!(
             fence.iter().any(|line| line.contains("\\gset"))
-                && fence.iter().any(|line| line == "\\if :autumn_on_target"),
+                && fence.iter().any(|line| line == "\\if :autumn_ok"),
             "psql, not the server, has to decide this one: {fence:?}"
+        );
+        // One flag for the whole stream, not one per target: `execute` returns
+        // on the first target that fails and never touches the rest, and the
+        // script has to match. Measured with two real targets and a non-guard
+        // failure in the first: without it the second target's `\connect` and
+        // its whole destructive block ran anyway, leaving a partially scrubbed
+        // topology and a stream that ends with no error. With it, 90 statements
+        // were skipped and the second target was untouched at 100 rows.
+        assert_eq!(
+            fence
+                .iter()
+                .filter(|line| *line == "\\set autumn_ok false")
+                .count(),
+            1,
+            "the flag must be cleared before the gset that may not run: {fence:?}"
         );
         // Being on the right server is not the same as having scrubbed it.
         // Measured: with a statement inside the transaction failing for a

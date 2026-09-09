@@ -529,6 +529,13 @@ as a *success*. The transaction's last statement therefore sets a variable an
 aborted transaction cannot set, and `:ERROR` is captured immediately after
 `COMMIT` — by a `\set`, which executes no query and so does not reset it.
 
+The same flag spans the whole stream, because `autumn db scrub` itself stops at
+the first target that fails and never touches the rest. Each target block is
+wrapped in `\if :autumn_ok`, so a target that rolls back is not followed by the
+next one connecting and scrubbing anyway — measured with two targets, that used
+to leave a partially scrubbed topology behind a stream that ended without an
+error.
+
 Both failure modes are closed, measured on psql 16.13: a false value prints
 `query ignored` for every statement in the block, and a `\gset` whose query
 *errored* leaves the variable unset, which `\if` reports as `Boolean expected`

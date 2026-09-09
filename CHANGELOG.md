@@ -482,7 +482,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VACUUM (FULL, ANALYZE)` ran — `ACCESS EXCLUSIVE` locks and full rewrites on a
   target whose scrub had just rolled back. psql's own `:ERROR` does not catch it
   (it reports that `ROLLBACK` as success), so the transaction's last statement
-  sets a `\gset` flag that an aborted transaction cannot set.
+  sets a `\gset` flag that an aborted transaction cannot set. That flag spans the
+  whole stream rather than one target: `execute` returns on the first target that
+  fails and never touches the rest, and the printed script now matches —
+  measured with two targets and a failure in the first, the second target's
+  `\connect` and its entire destructive block used to run anyway, leaving a
+  partially scrubbed topology and a stream that ends with no error at all.
   Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and
