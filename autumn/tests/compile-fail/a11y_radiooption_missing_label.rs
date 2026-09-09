@@ -6,8 +6,7 @@ use autumn_web::a11y::{RadioGroup, RadioOption};
 use maud::Render;
 
 fn main() {
-    let _markup = RadioGroup::new("speed")
-        .option(RadioOption::new("standard"))
+    let _markup = RadioGroup::new("speed", RadioOption::new("standard"))
         .label("Shipping speed")
         .render();
 }

@@ -1736,9 +1736,9 @@ enum Commands {
 
     /// Statically audit accessibility of raw `html!` markup at build time.
     ///
-    /// The typed `autumn_web::a11y` primitives (`Img`, `Button`, `Link`,
-    /// `MenuItem`, `TextField`) prove accessible-name obligations at compile
-    /// time. `autumn a11y verify` covers the escape hatch they cannot see: raw
+    /// The typed `autumn_web::a11y` primitives prove accessible-name
+    /// obligations at compile time. `autumn a11y verify` covers the escape
+    /// hatch they cannot see: raw
     /// markup written directly in `html!` blocks. It scans the project's `.rs`
     /// files, reports WCAG-keyed findings, and exits non-zero when any exist.
     /// Findings are keyed to the routes that reach them, and rolled up per

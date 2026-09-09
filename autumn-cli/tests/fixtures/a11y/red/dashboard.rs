@@ -15,7 +15,8 @@
 //!
 //! The markup is split across a route handler and two helpers it calls, so the
 //! fixture also exercises route attribution: every finding — including the ones
-//! in `account_form` and `logo_banner` — is keyed to `GET /settings`.
+//! in `account_form` and `logo_banner` — is keyed to `GET /settings`, while the
+//! second route (`GET /about`), which calls neither helper, stays clean.
 
 use maud::{html, Markup};
 
@@ -54,5 +55,18 @@ fn logo_banner() -> Markup {
     html! {
         // `image-alt` (WCAG 1.1.1) — an `<img>` with no `alt`/aria/title.
         img src="/logo.png";
+    }
+}
+
+/// A second route that renders only accessible markup and calls neither
+/// helper, so the manifest must report it separately and cleanly — proof that
+/// attribution is per route, not "blame every route for every finding".
+#[get("/about")]
+pub async fn about() -> Markup {
+    html! {
+        main {
+            h1 { "About" }
+            p { "A dashboard." }
+        }
     }
 }

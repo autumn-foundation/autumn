@@ -467,16 +467,20 @@ group — so both are required:
 ```rust
 use autumn_web::a11y::{RadioGroup, RadioOption};
 
-let speed = RadioGroup::new("speed")
-    .option(RadioOption::new("standard", "Standard").checked())  // choice label required
-    .option(RadioOption::new("express", "Express"))
-    .label("Shipping speed");                                    // group name required
+let speed = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+    .option(RadioOption::new("express", "Express"))   // each choice names itself
+    .checked_value("express")
+    .label("Shipping speed");                         // the group names itself
 ```
 
-A visible group name renders `<fieldset><legend>`; `.aria_label(..)` /
-`.labelled_by(..)` render `<div role="radiogroup">` instead, so the group keeps
-its role without a competing visible name. Each choice gets a unique `id`
-derived from its value, pairing it with its own `<label for=…>`.
+The first choice is a constructor argument, so a group of choices always has at
+least one. A visible group name renders `<fieldset><legend>`; `.aria_label(..)` /
+`.labelled_by(..)` render a `<div>` instead. Both carry `role="radiogroup"` —
+`<fieldset>` alone maps to role `group`, which does not support `aria-required`.
+Each choice gets an `id` unique within the group, derived from its value, that
+pairs it with its own `<label for=…>`. `aria-invalid` and any `hx-*` attributes
+land on each `<input>`, where assistive technology reads validity and htmx reads
+a value; `aria-describedby` and `aria-required` stay on the group.
 
 `Link::new` takes the visible link text as a required argument (an icon-only
 link routes its name to `aria-label` via `Link::icon`), and `MenuItem::new`
@@ -506,9 +510,7 @@ let _ = TextField::new("email").render();
 
 // error: no method named `render` found for `RadioGroup<NoLabel>`
 //        — a radio group with no group name cannot be turned into markup
-let _ = RadioGroup::new("speed")
-    .option(RadioOption::new("standard", "Standard"))
-    .render();
+let _ = RadioGroup::new("speed", RadioOption::new("standard", "Standard")).render();
 ```
 
 **Fix** — supply the accessible name / attach a label:
@@ -518,9 +520,8 @@ let _ = Img::new("/logo.png", "Company logo");            // ✅ compiles
 let _ = Link::new("/about", "About us");                  // ✅ compiles
 let _ = MenuItem::new("Settings");                        // ✅ compiles
 let _ = TextField::new("email").label("Email").render();  // ✅ compiles
-let _ = RadioGroup::new("speed")                          // ✅ compiles
-    .option(RadioOption::new("standard", "Standard"))
-    .label("Shipping speed")
+let _ = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+    .label("Shipping speed")                              // ✅ compiles
     .render();
 ```
 
@@ -541,9 +542,8 @@ cover those.
 
 ## `autumn a11y verify` (build-time raw-`html!` audit)
 
-The typed primitives above are the *compile-time proof*: code that uses `Img`,
-`Button`, `Link`, `MenuItem`, or `TextField` cannot ship without an accessible
-name, so it never needs re-checking. But a project can always drop down to raw
+The typed primitives above are the *compile-time proof*: code that uses them
+cannot ship without an accessible name, so it never needs re-checking. But a project can always drop down to raw
 `maud::html! { … }` markup, which bypasses the primitives entirely and the type
 system cannot see. `autumn a11y verify` is the net for that escape hatch.
 
@@ -570,10 +570,11 @@ obligation at compile time (`Img::new(src, alt)`, `TextField::new(..).label(..)`
 ### Which route is broken
 
 A file and a line say where a defect is; a route says which page it breaks.
-`verify` reads the route attribute macros (`#[get("/settings")]`, `#[post(..)]`,
-…) out of the same token stream, indexes every function and the free functions
+`verify` reads the route attribute macros — `#[get]`, `#[post]`, `#[put]`,
+`#[patch]`, `#[delete]` and `#[static_get]`, path-qualified or not — out of the
+same token stream, indexes every function and the free functions
 it calls, then walks out from each handler to the markup it reaches. A finding
-in a shared partial names every route that renders it:
+in a shared partial names the routes that reach it:
 
 ```
     src/views/settings.rs:42: <img> [WCAG 1.1.1] Serious — raw <img> has no alt attribute
@@ -584,11 +585,20 @@ in a shared partial names every route that renders it:
 The walk is as conservative as the scanner. A call is followed only when the
 called name is defined **exactly once** across the scan — two functions sharing
 a name cannot be told apart from tokens, and guessing would blame a route that
-never renders the markup. Method calls (`page.sidebar()`) are not resolved at
-all, and the `path` is the path **as declared**: mount-time prefixes (a `scope`,
-a nested router) are applied at runtime and are not resolved here. Attribution
-is therefore a lower bound — a finding with no route is still a finding, counted
-as `unrouted` in the summary.
+never renders the markup. Three call shapes are skipped outright: a method call
+(`page.sidebar()`), a type-qualified associated call (`Widget::new()` — Rust
+names types in `UpperCamelCase`, so `views::sidebar()` still resolves), and a
+function passed by name rather than called (`.map(render_row)`). `#[cfg(test)]`
+items are skipped, and the `path` is the path **as declared**: mount-time
+prefixes (a `scope`, a nested router) are applied at runtime and are not
+resolved here.
+
+Attribution is therefore a lower bound. `status: "pass"` means no finding was
+attributed to that route, not that the page is proven clean — read it alongside
+the summary's `unrouted` count, which is how many findings no route reached. An
+unattributed finding is still a finding, and still fails the build: the exit
+code is computed from severities alone, so attribution reports and never
+gates.
 
 ### Usage
 
@@ -608,8 +618,8 @@ autumn a11y verify --strict
 
 ### `--format json` (conformance manifest)
 
-The JSON output is an array of findings keyed to WCAG success criteria plus a
-summary, suitable for archiving as a conformance manifest:
+The JSON output is a conformance manifest: per-route status, the findings with
+the routes each one breaks, a per-criterion rollup, and a summary.
 
 ```json
 {
@@ -650,11 +660,12 @@ summary, suitable for archiving as a conformance manifest:
 ```
 
 Three views of the same run: `routes` is the per-route conformance status
-(`pass` when the route reaches no finding), `findings` is the defect list with
-the routes each one breaks, and `wcag` rolls the findings up by success
-criterion — the multi-criterion rules are split, so `label` reports separately
-under 1.3.1, 3.3.2 and 4.1.2. A clean run emits an empty `wcag` array and every
-route as `pass`.
+(`pass` when no finding was attributed to the route), `findings` is the defect
+list with the routes each one breaks, and `wcag` rolls the findings up by
+success criterion — the multi-criterion rules are split, so `label` reports
+separately under 1.3.1, 3.3.2 and 4.1.2. A finding no route reaches carries an
+empty `routes` array and is counted in `summary.unrouted`. A clean run emits an
+empty `wcag` array and every route as `pass`.
 
 ### CI integration
 

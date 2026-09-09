@@ -41,8 +41,9 @@ when their details matter:
 - `docs/guide/accessibility.md` - accessible-by-construction UI. Prefer the
   typed `autumn_web::a11y` primitives (`Img` / `Button` / `Link` / `MenuItem`
   plus the labeled-typestate form controls `TextField` / `TextArea` / `Select`
-  (+ `SelectOption`) / `Checkbox` / `FileField`) over raw `<img>` / `<button>` /
-  `<input>` / `<textarea>` / `<select>` in `html!` — the accessible name (alt
+  (+ `SelectOption`) / `Checkbox` / `FileField` / `RadioGroup`
+  (+ `RadioOption`)) over raw `<img>` / `<button>` / `<input>` / `<textarea>` /
+  `<select>` in `html!` — the accessible name (alt
   text, button label, field label) is a required constructor argument (a form
   control cannot render until `.label()` / `.aria_label()` / `.labelled_by()`
   supplies one), so a missing one is a compile error, not a runtime audit miss.

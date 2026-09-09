@@ -145,12 +145,18 @@ fn red_fixture_findings_are_keyed_to_the_route() {
         );
     }
 
+    // Two routes are declared; only the one that reaches the defects fails.
     let routes = report["routes"].as_array().expect("routes array");
-    assert_eq!(routes.len(), 1, "{routes:?}");
-    assert_eq!(routes[0]["method"], "GET");
-    assert_eq!(routes[0]["path"], "/settings");
-    assert_eq!(routes[0]["status"], "fail");
-    assert_eq!(routes[0]["findings"], findings.len());
+    assert_eq!(routes.len(), 2, "{routes:?}");
+    assert_eq!(routes[0]["path"], "/about");
+    assert_eq!(routes[0]["status"], "pass");
+    assert_eq!(routes[0]["findings"], 0);
+    assert_eq!(routes[1]["method"], "GET");
+    assert_eq!(routes[1]["path"], "/settings");
+    assert_eq!(routes[1]["handler"], "view");
+    assert_eq!(routes[1]["status"], "fail");
+    assert_eq!(routes[1]["findings"], findings.len());
+    assert_eq!(report["summary"]["routes"], 2);
     assert_eq!(report["summary"]["routes_failing"], 1);
     assert_eq!(report["summary"]["unrouted"], 0);
 }
@@ -162,18 +168,34 @@ fn red_fixture_report_rolls_up_wcag_criteria() {
     let out = run_verify(&fixture_dir("red"), &["--format", "json"]);
     let report = json_report(&out);
 
-    let criteria: Vec<&str> = report["wcag"]
+    // The RED fixture's numbers are fully determined, so pin the whole rollup:
+    // one alt-less image, two unlabeled controls, one nameless button.
+    let rollup: Vec<(String, u64, Vec<&str>)> = report["wcag"]
         .as_array()
         .expect("wcag array")
         .iter()
-        .filter_map(|c| c["criterion"].as_str())
+        .map(|c| {
+            (
+                c["criterion"].as_str().expect("criterion").to_owned(),
+                c["findings"].as_u64().expect("findings"),
+                c["rules"]
+                    .as_array()
+                    .expect("rules")
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect(),
+            )
+        })
         .collect();
-    for expected in ["1.1.1", "1.3.1", "3.3.2", "4.1.2"] {
-        assert!(
-            criteria.contains(&expected),
-            "expected WCAG {expected} in the rollup; got {criteria:?}",
-        );
-    }
+    assert_eq!(
+        rollup,
+        vec![
+            ("1.1.1".to_owned(), 1, vec!["image-alt"]),
+            ("1.3.1".to_owned(), 2, vec!["label"]),
+            ("3.3.2".to_owned(), 2, vec!["label"]),
+            ("4.1.2".to_owned(), 3, vec!["button-name", "label"]),
+        ],
+    );
 }
 
 /// The GREEN fixture serves the same route, now reported as conformant.
@@ -183,10 +205,11 @@ fn green_fixture_route_is_listed_as_passing() {
     let report = json_report(&out);
 
     let routes = report["routes"].as_array().expect("routes array");
-    assert_eq!(routes.len(), 1, "{routes:?}");
-    assert_eq!(routes[0]["path"], "/settings");
-    assert_eq!(routes[0]["status"], "pass");
-    assert_eq!(routes[0]["findings"], 0);
+    assert_eq!(routes.len(), 2, "{routes:?}");
+    for route in routes {
+        assert_eq!(route["status"], "pass", "{route}");
+        assert_eq!(route["findings"], 0, "{route}");
+    }
     assert!(
         report["wcag"].as_array().expect("wcag array").is_empty(),
         "a clean run breaches no success criterion",

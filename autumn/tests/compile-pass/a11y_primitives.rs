@@ -119,21 +119,21 @@ fn main() {
         .label("Avatar")
         .render();
 
-    // A labeled radio group: every choice names itself, the group names itself.
-    let _speed = RadioGroup::new("speed")
-        .option(RadioOption::new("standard", "Standard").checked())
+    // A labeled radio group: every choice names itself, the group names itself,
+    // and the group always carries at least one choice.
+    let _speed = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
         .options([
             RadioOption::new("express", "Express"),
             RadioOption::new("overnight", "Overnight").disabled(),
         ])
+        .checked_value("express")
         .required()
         .aria_required()
         .label("Shipping speed")
         .render();
 
     // aria-label names the group without a visible legend.
-    let _billing = RadioGroup::new("billing")
-        .option(RadioOption::new("monthly", "Monthly"))
+    let _billing = RadioGroup::new("billing", RadioOption::new("monthly", "Monthly"))
         .aria_label("Billing period")
         .render();
 
