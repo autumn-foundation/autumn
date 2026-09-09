@@ -83,6 +83,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
+  (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade
+  (`autumn-macros/src/repository.rs`) selected child ids in bulk but then
+  reloaded and deleted each one individually — two statements per row,
+  even when the child has no `hooks`, isn't `soft_delete`/`versioned`/
+  `position(...)`, and declares no `dependent(...)`/`#[has_many(dependent =
+  ...)]` of its own, so nothing in that configuration ever read the
+  reload. That exact configuration now routes through the same
+  `dependent_delete_all` runtime helper `on_delete = delete_all` already
+  uses (which already batches its optional counter-cache decrement),
+  guarded by a cheap runtime check for model-attribute grandchildren
+  invisible to the macro's own attributes. Every other configuration
+  (hooks, soft-delete, versioned, broadcasting, positioned, or any
+  grandchildren) is unaffected and keeps the exact prior per-row loop.
+  `dependent_delete_all` itself now always takes a locked, ascending-id
+  pre-lock before its bulk `DELETE` — closing a stale-reparent counter-cache
+  race and a cross-cascade deadlock window the original per-row loop never
+  had, wrapped in an outer `count(*)` so locking a huge fan-out costs O(1)
+  memory and network, not one row per child — which applies equally to the
+  pre-existing `delete_all` caller. Profiled against a 500-post/~23k-comment
+  fixture cascading a 5,000-comment delete: `pg_stat_statements` calls
+  10,002 → 3, buffers 45,583 → 10,192. Full existing `dependent`/`has_many`
+  suite (29 tests, including diamond-cascade and hook/soft-delete cases)
+  passes unchanged. See
+  `docs/reports/2026-09-08-ledger-dependent-destroy-leaf-batch/`.
+
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
   `autumn/benches/feed_render.rs` profiling harness — rendering a realistic
   30-entry Atom feed, the same `Feed::atom(...).entries(...)` shape
