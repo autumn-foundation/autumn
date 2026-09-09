@@ -647,6 +647,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now followed: measured, `z_source` refreshes first against alphabetical order
   and `a_report` ends with 0 original addresses, and an opaque body behind
   either an operator or a domain check is refused rather than ordered around.
+  Those paths are resolved at every step of the closure, not only where it is
+  seeded from a rewrite rule. A tracked function that itself uses a custom
+  operator records `pg_proc -> pg_operator`, and one that casts to a domain
+  records `pg_proc -> pg_type`; following only `pg_proc -> pg_proc` from a
+  reached function missed both. Measured on `a_report -> harvest() ->
+  (1 ==> 200) -> z_source`, every body `BEGIN ATOMIC`: no edge at all, `a_report`
+  refreshed FIRST, and the run reported success with `users` at 2 rows,
+  `z_source` clean and all 200 original addresses still in `a_report`. One
+  relation now resolves a dependency to the function it denotes, and both the
+  seed and the recursive step read it, so the two cannot diverge again.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the
@@ -759,6 +769,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference is skipped under `MATCH SIMPLE` but counted under `MATCH FULL`,
   where it is itself a violation.
 
+- **cli:** `autumn db scrub --dry-run` refuses a target whose connection string
+  cannot name ONE endpoint, alongside the existing socket and port-less
+  refusals. A conninfo stating `hostaddr` selects the endpoint independently of
+  `host`, and psql reports no variable for it — measured,
+  `host=not-a-real-host.example hostaddr=127.0.0.1` connects to 127.0.0.1
+  although the name does not resolve, psql still reports
+  `HOST=not-a-real-host.example`, and `\echo [:HOSTADDR]` prints the name back
+  unexpanded because no such variable exists. One naming several endpoints is
+  chosen between per connection: 20 connections with `load_balance_hosts=random`
+  split 7/13 across two members, so the run sizes the sample on one member and
+  the pasted script runs on another. Against a two-member URI whose first member
+  held 200 rows and whose second held none, ten dry runs printed `LIMIT 2` six
+  times and `LIMIT 0` four times — and `LIMIT 0` selects no root rows, so the
+  delete pass empties the table instead of sampling it. Both still scrub without
+  `--dry-run`, where the command sizes and writes on the one connection it holds.
 - **web:** `AutumnError` now reads back its own validation details (issue
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem

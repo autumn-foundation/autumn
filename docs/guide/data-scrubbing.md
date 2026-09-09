@@ -518,6 +518,21 @@ TCP to use `--dry-run` on it; scrubbing a socket target *without* `--dry-run` is
 unaffected, because the command holds its own connection and never has to prove
 which one it is.
 
+The same reasoning refuses three TCP shapes that cannot name **one** endpoint
+either. A conninfo with **no port** leaves psql to resolve one when the script is
+pasted — measured, the same host-only URI reaches 5433 under `PGPORT=5433` and
+5432 without it. One stating **`hostaddr`** picks the endpoint independently of
+`host`: `host=not-a-real-host.example hostaddr=127.0.0.1` connects although that
+name does not resolve, psql still reports `HOST=not-a-real-host.example`, and
+there is no `:HOSTADDR` to pin instead — `\echo [:HOSTADDR]` prints the name
+back unexpanded. And one naming **several endpoints** is chosen between per
+connection: 20 connections with `load_balance_hosts=random` split 7/13 across two
+members, so the run sizes the sample on one member and the pasted script runs on
+another. Against a two-member URI whose first member held 200 rows and whose
+second held none, ten dry runs printed `LIMIT 2` six times and `LIMIT 0` four
+times — and `LIMIT 0` selects no root rows, so the delete pass empties the table
+instead of sampling it. Each of the three still scrubs without `--dry-run`.
+
 Every value is asked of the target connection while the run plans, never
 parsed out of its URL: libpq defaults an omitted database name to the user name,
 which defaults to the OS user, and the connection already knows the answer those

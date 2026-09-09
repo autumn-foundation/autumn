@@ -319,6 +319,22 @@ pub enum ScrubError {
         /// The target labels, sorted.
         targets: Vec<String>,
     },
+    /// `--dry-run` cannot print a runnable script for a target whose connection
+    /// string states `hostaddr`. It selects the endpoint independently of
+    /// `host`, and psql exposes no variable reporting it, so the reconnect proof
+    /// cannot tell two such targets apart.
+    UnprintableHostaddrTarget {
+        /// The target labels, sorted.
+        targets: Vec<String>,
+    },
+    /// `--dry-run` cannot print a runnable script for a target whose connection
+    /// string names more than one endpoint. Which member libpq picks is decided
+    /// per connection, so the counts baked into the script and the session that
+    /// pastes it need not be the same database.
+    UnprintableMultiHostTarget {
+        /// The target labels, sorted.
+        targets: Vec<String>,
+    },
     /// A table this run promises to empty carries a user-defined trigger or
     /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
     /// write, so anything it writes lands after every rewrite and is never
@@ -604,6 +620,43 @@ impl std::fmt::Display for ScrubError {
                  view, or drop the view and rebuild it after the run.",
                 views.len(),
                 bullet_list(views),
+            ),
+            Self::UnprintableMultiHostTarget { targets } => write!(
+                f,
+                "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
+                 Their connection strings name more than one endpoint, and libpq chooses \
+                 a member per connection — measured on 16.13, 20 connections with \
+                 `load_balance_hosts=random` split 7/13 across two members. The run sizes \
+                 the sample on one connection and the pasted script runs on another, so \
+                 the root `LIMIT` need not describe the database it lands on: measured \
+                 against a two-member URI whose first member held 200 rows and whose \
+                 second held none, ten dry runs printed `LIMIT 2` six times and `LIMIT 0` \
+                 four times, and `LIMIT 0` selects no root rows at all, so the delete pass \
+                 empties the table instead of sampling it. The endpoint proof cannot \
+                 separate the members either — it has to accept any of them, which is the \
+                 discriminator it exists for. Name one endpoint \
+                 (`postgres://user@host:5432/db`), or run without `--dry-run`, where the \
+                 command sizes and writes on the one connection it holds.",
+                targets.len(),
+                bullet_list(targets),
+            ),
+            Self::UnprintableHostaddrTarget { targets } => write!(
+                f,
+                "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
+                 Their connection strings state `hostaddr`, which selects the endpoint \
+                 independently of `host` — measured, `host=not-a-real-host.example \
+                 hostaddr=127.0.0.1` connects to 127.0.0.1 although the name does not \
+                 resolve at all, and psql still reports `HOST=not-a-real-host.example`. \
+                 psql exposes no `:HOSTADDR` to pin instead: `\\echo [:HOSTADDR]` prints \
+                 the name back unexpanded. So two targets sharing a host, port and \
+                 database name but reaching different servers through different \
+                 `hostaddr` values are indistinguishable to the reconnect proof, which \
+                 is the one thing it exists to tell apart. Drop `hostaddr` and name the \
+                 endpoint in `host` (`postgres://user@10.0.0.7:5432/db`), or run without \
+                 `--dry-run`, where the command holds its own connection and never has \
+                 to prove which one it is.",
+                targets.len(),
+                bullet_list(targets),
             ),
             Self::UnprintablePortlessTarget { targets } => write!(
                 f,
@@ -2827,6 +2880,41 @@ fn classify_and_apply(
         if !portless.is_empty() {
             return Err(ScrubError::UnprintablePortlessTarget { targets: portless });
         }
+        // Same reasoning, one parameter over: `hostaddr` picks the endpoint on
+        // its own. Measured, `host=not-a-real-host.example hostaddr=127.0.0.1`
+        // reaches 127.0.0.1 while psql still reports that unresolvable name as
+        // `:HOST`, and there is no `:HOSTADDR` to pin in its place — `\echo
+        // [:HOSTADDR]` prints the name back unexpanded. Two such targets can
+        // therefore agree on every term the proof can state and still be
+        // different servers.
+        let mut addressed: Vec<String> = plans
+            .iter()
+            .filter(|(_, url, _, _, _)| {
+                password_free_conninfo(url).is_some_and(|c| states_hostaddr(&c))
+            })
+            .map(|(label, _, _, _, _)| (*label).clone())
+            .collect();
+        addressed.sort();
+        if !addressed.is_empty() {
+            return Err(ScrubError::UnprintableHostaddrTarget { targets: addressed });
+        }
+        // And a target naming more than one endpoint. The sizing connection and
+        // the pasting session are separate draws, so the printed `LIMIT` can be
+        // computed on a different member than the script runs against —
+        // measured, ten dry runs against a two-member URI printed `LIMIT 2` six
+        // times and `LIMIT 0` four times, and `LIMIT 0` makes the delete pass
+        // empty the root instead of sampling it.
+        let mut multi: Vec<String> = plans
+            .iter()
+            .filter(|(_, url, _, _, _)| {
+                password_free_conninfo(url).is_some_and(|c| states_multiple_endpoints(&c))
+            })
+            .map(|(label, _, _, _, _)| (*label).clone())
+            .collect();
+        multi.sort();
+        if !multi.is_empty() {
+            return Err(ScrubError::UnprintableMultiHostTarget { targets: multi });
+        }
         let mut encrypted_rewrites: Vec<String> = plans
             .iter()
             .flat_map(|(label, _, plan, _, _)| {
@@ -3532,32 +3620,31 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
      SELECT rel.oid, rel.relispopulated FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind = 'm' \
- ), fn_seed AS ( \
-     SELECT r.oid AS rule, d.refobjid AS fn \
+ ), dep_fn AS ( \
+     SELECT d.classid, d.objid, d.refobjid AS fn \
      FROM pg_depend d \
-     JOIN pg_rewrite r ON r.oid = d.objid \
-     WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_proc'::regclass \
+     WHERE d.classid IN ('pg_rewrite'::regclass, 'pg_proc'::regclass) \
+       AND d.refclassid = 'pg_proc'::regclass \
      UNION \
-     SELECT r.oid, o.oprcode \
+     SELECT d.classid, d.objid, o.oprcode \
      FROM pg_depend d \
-     JOIN pg_rewrite r ON r.oid = d.objid \
      JOIN pg_operator o ON o.oid = d.refobjid \
-     WHERE d.classid = 'pg_rewrite'::regclass \
+     WHERE d.classid IN ('pg_rewrite'::regclass, 'pg_proc'::regclass) \
        AND d.refclassid = 'pg_operator'::regclass AND o.oprcode <> 0 \
      UNION \
-     SELECT r.oid, cd.refobjid \
+     SELECT d.classid, d.objid, cd.refobjid \
      FROM pg_depend d \
-     JOIN pg_rewrite r ON r.oid = d.objid \
      JOIN pg_constraint con ON con.contypid = d.refobjid \
      JOIN pg_depend cd ON cd.classid = 'pg_constraint'::regclass \
        AND cd.objid = con.oid AND cd.refclassid = 'pg_proc'::regclass \
-     WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_type'::regclass \
+     WHERE d.classid IN ('pg_rewrite'::regclass, 'pg_proc'::regclass) \
+       AND d.refclassid = 'pg_type'::regclass \
  ), fn_reach AS ( \
-     SELECT rule, fn FROM fn_seed \
+     SELECT df.objid AS rule, df.fn FROM dep_fn df \
+     WHERE df.classid = 'pg_rewrite'::regclass \
      UNION \
-     SELECT r.rule, fd.refobjid FROM fn_reach r \
-     JOIN pg_depend fd ON fd.classid = 'pg_proc'::regclass AND fd.objid = r.fn \
-       AND fd.refclassid = 'pg_proc'::regclass \
+     SELECT r.rule, df.fn FROM fn_reach r \
+     JOIN dep_fn df ON df.classid = 'pg_proc'::regclass AND df.objid = r.fn \
  ), rel_edge AS ( \
      SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source \
      FROM pg_depend d \
@@ -4707,6 +4794,32 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
 /// CORRECT paste. An omitted component also cannot be what distinguishes two
 /// targets — libpq resolves it identically for both, so two conninfos that
 /// differ only there are the same endpoint written twice.
+/// Whether the conninfo states `hostaddr`, in the URI query or as a keyword.
+///
+/// `hostaddr` selects the endpoint independently of `host`, and psql reports no
+/// variable for it, so a printed reconnect proof cannot pin it. See
+/// `ScrubError::UnprintableHostaddrTarget`.
+fn states_hostaddr(conninfo: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(conninfo) else {
+        return false;
+    };
+    crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or(""))
+        .into_iter()
+        .any(|(key, value)| key == "hostaddr" && !value.is_empty())
+}
+
+/// Whether the conninfo names more than one endpoint.
+///
+/// libpq picks a member per connection, so the run's sizing connection and the
+/// session that pastes the script need not reach the same database. See
+/// `ScrubError::UnprintableMultiHostTarget`.
+fn states_multiple_endpoints(conninfo: &str) -> bool {
+    let (host, port) = stated_host_and_port(conninfo);
+    let parts =
+        |value: Option<String>| value.map_or(0, |v| v.split(',').filter(|p| !p.is_empty()).count());
+    parts(host) > 1 || parts(port) > 1
+}
+
 fn stated_host_and_port(conninfo: &str) -> (Option<String>, Option<String>) {
     let Ok(parsed) = url::Url::parse(conninfo) else {
         return (None, None);

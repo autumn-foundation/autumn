@@ -2191,6 +2191,64 @@ async fn scrub_refuses_to_print_a_target_with_no_stated_port() {
     );
 }
 
+/// A target whose connection string cannot name ONE endpoint is not printed.
+///
+/// Two shapes, both measured on `PostgreSQL` 16.13. `hostaddr` selects the
+/// endpoint independently of `host` — `host=not-a-real-host.example
+/// hostaddr=127.0.0.1` connects although that name does not resolve, and psql
+/// still reports `HOST=not-a-real-host.example` — and psql has no `:HOSTADDR`
+/// to pin instead, so two such targets are indistinguishable to the proof. A
+/// multi-host conninfo is worse than indistinguishable: libpq picks a member
+/// per connection (20 connections with `load_balance_hosts=random` split 7/13
+/// across two members), so the run sizes the sample on one and the pasted
+/// script runs on another. Against a two-member URI whose first member held 200
+/// rows and whose second none, ten dry runs printed `LIMIT 2` six times and
+/// `LIMIT 0` four times — and `LIMIT 0` selects no root rows, so the delete pass
+/// empties the table rather than sampling it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scrub_refuses_to_print_a_target_without_one_stated_endpoint() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let _client = seed_sample_fixture(&admin, &base, "unpinned").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    for url in [
+        // `hostaddr` carries the real endpoint; `host` is only a label.
+        format!("postgres://postgres:postgres@{host}:{port}/unpinned?hostaddr=127.0.0.1"),
+        // Two endpoints named, one chosen per connection.
+        format!(
+            "postgres://postgres:postgres@{host}:{port}/unpinned             ?host={host},{host}&port={port},{port}"
+        ),
+    ] {
+        let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+        let (stdout, stderr) = run_autumn_fail(
+            dir,
+            &["db", "scrub", "--dry-run", "--sample", "users=50%"],
+            &envs,
+        );
+        assert!(
+            stderr.contains("--dry-run") && stderr.contains("control"),
+            "the refusal must say which target it cannot print: {stderr}"
+        );
+        for output in [&stdout, &stderr] {
+            assert!(
+                !output.contains("BEGIN;") && !output.contains("DELETE FROM"),
+                "no destructive block may be printed without a pinned endpoint: {output}"
+            );
+        }
+        // A printing refusal, not a rejection of the configuration.
+        let (_o, ok) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=50%"], &envs);
+        assert!(
+            ok.contains("Scrub complete"),
+            "the same target must still scrub: {ok}"
+        );
+    }
+}
+
 /// The size report covers the materialized views the run refreshes.
 ///
 /// A view is rebuilt from whatever survives the sample, so one over reference
@@ -2689,6 +2747,67 @@ async fn a_view_read_through_a_custom_operator_is_refreshed_in_order() {
     );
 }
 
+/// An operator reached from INSIDE a tracked function still orders the refresh.
+///
+/// The previous round resolved `pg_operator` and `pg_type` while seeding the
+/// closure from a rewrite rule, but the recursive arm still followed only
+/// `pg_proc -> pg_proc`. A tracked function that uses a custom operator records
+/// `pg_proc -> pg_operator`, so the implementation never entered the closure.
+/// Measured: `a_report -> harvest() -> (1 ==> 200) -> z_source` produced no
+/// edge, `a_report` refreshed FIRST, and the run reported `Scrub complete` with
+/// `users` at 2 rows, `z_source` clean, and all 200 addresses in `a_report`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_operator_reached_inside_a_function_is_refreshed_in_order() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "fn_op_nested").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION op_impl(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC \
+                     SELECT string_agg(s.email, ',' ORDER BY s.id) FROM z_source s \
+                     WHERE s.id BETWEEN $1 AND $2; \
+                 END; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = op_impl); \
+             CREATE FUNCTION harvest() RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC SELECT (1::bigint ==> 200::bigint); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT harvest() AS harvested;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_op_nested");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "an operator used inside a function must order the refresh: {stderr}"
+    );
+    let leaked = count(
+        &client,
+        &format!(
+            "SELECT count(*)::bigint FROM a_report \
+             WHERE harvested LIKE '%{SEEDED_DOMAIN}%'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        leaked, 0,
+        "the dependent must not keep stale addresses: {stderr}"
+    );
+}
+
 /// An opaque body behind an operator or a domain CHECK is refused, not ordered.
 ///
 /// Same blind spot as the ordering above, on the refusal side: the opacity
@@ -2718,6 +2837,31 @@ async fn an_opaque_body_behind_an_operator_or_domain_is_refused() {
              CREATE DOMAIN known_email AS text CHECK (opaque_dom(VALUE)); \
              CREATE MATERIALIZED VIEW a_report AS \
                  SELECT (u.email::known_email)::text AS addr FROM users u;",
+        ),
+        // The same two, one hop further in: the VIEW calls a tracked function,
+        // and it is that FUNCTION which reaches the operator or the domain. The
+        // recursive arm has to resolve those paths too, not only the seed.
+        (
+            "fn_op_opaque_nested",
+            "CREATE FUNCTION opaque_op(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 AS 'SELECT string_agg(email, '','') FROM z_source WHERE id BETWEEN $1 AND $2'; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = opaque_op); \
+             CREATE FUNCTION wrapper() RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC SELECT (1::bigint ==> 200::bigint); END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT wrapper() AS harvested;",
+        ),
+        (
+            "fn_dom_opaque_nested",
+            // The check READS `z_source` and then accepts unconditionally. It has
+            // to accept, or the fixture's own `CREATE MATERIALIZED VIEW` fails the
+            // constraint before the command is ever run; what the test needs is a
+            // reachable opaque body, not a rejection.
+            "CREATE FUNCTION opaque_dom(text) RETURNS boolean LANGUAGE plpgsql STABLE \
+                 AS $$ BEGIN PERFORM 1 FROM z_source WHERE email = $1; RETURN true; END; $$; \
+             CREATE DOMAIN known_email AS text CHECK (opaque_dom(VALUE)); \
+             CREATE FUNCTION wrapper() RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC SELECT ('x'::known_email)::text; END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT wrapper() AS addr;",
         ),
     ] {
         let client = seed_sample_fixture(&admin, &base, db).await;
