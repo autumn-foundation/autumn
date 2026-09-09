@@ -532,6 +532,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original addresses. Each target's compaction reconnects and re-checks the
   endpoint before running, so a failed `\connect` in that pass cannot compact
   the previous target's database.
+  Each target's block also proves the reconnect landed where it was aimed, from
+  psql's OWN `:HOST`, `:PORT` and `:DBNAME` rather than from anything the server
+  reports. The in-transaction guard compares server-side values, and those are
+  not the connection's identity: `inet_server_addr()`/`inet_server_port()` are
+  the endpoint the SERVER accepted on, measured through a forwarder as
+  `127.0.0.1:5433` for a session connected to `127.0.0.1:15433`. Two servers
+  behind different forwards, or in separate container networks sharing a private
+  address, report the same pair — and with a physical clone's inherited
+  `system_identifier` and a container-local `data_directory`, every value that
+  guard compares can match on two different databases. psql's variables are
+  connection-specific instead, and a failed `\connect` leaves them describing the
+  PREVIOUS connection (measured: `HOST=127.0.0.1 PORT=15433 DBNAME=postgres`
+  before and after a `\connect` to port 25433 failed). Measured end to end — one
+  target's script pasted interactively into a session on another, with the
+  reconnect refused: `Previous connection kept`, then every statement from
+  `BEGIN;` onward reported `query ignored`, the server-side guard never ran at
+  all, and the pasting session's database was untouched at 200 rows. Only the
+  components a conninfo STATES are asserted: `PGPORT` can differ between the
+  machine that planned the run and the one pasting the script, so a guessed
+  default would refuse a correct paste, and an omitted component cannot be what
+  distinguishes two targets anyway.
   The dependency walk now traverses ordinary views. `pg_depend` records only the
   hop a rewrite rule actually took, so matching a materialized view's dependency
   straight against the set of materialized views lost both hops of `a_report ->

@@ -427,7 +427,21 @@ neither, and a `VACUUM` on the first target that timed out against a concurrent
 reader ended the script with that database scrubbed and the second still holding
 its production rows.
 
-That boundary is checked rather than trusted. `\connect` does **not** close the
+The boundary is checked twice, in two different currencies. First by psql, from
+its own `:HOST`, `:PORT` and `:DBNAME` — the conninfo psql resolved, which a
+failed `\connect` leaves describing the previous connection. That check is what
+makes a failed reconnect unable to continue: measured, one target's script pasted
+into a session on another printed `Previous connection kept` and then `query
+ignored` for every statement from `BEGIN;` onward. It matters that this is psql's
+view and not the server's, because `inet_server_addr()` and `inet_server_port()`
+report the endpoint the *server* accepted on, not the one you configured — behind
+a forwarder, a session connected to `127.0.0.1:15433` reports `127.0.0.1:5433`,
+so two servers reached through different forwards can report the same pair. Only
+what the connection string states is asserted; a port left to libpq is not
+guessed, since `PGPORT` can differ between the machine that planned the run and
+the one pasting the script.
+
+That boundary is then checked again inside the transaction. `\connect` does **not** close the
 existing connection when the new one fails: psql prints `Previous connection
 kept` and the session carries on, so the block below it would run against the
 previous target. Removing the password from the printed conninfo is what makes

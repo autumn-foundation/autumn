@@ -2812,6 +2812,15 @@ fn classify_and_apply(
             for line in psql_connect(label, url) {
                 eprintln!("  {line}");
             }
+            // And prove the reconnect landed where it was aimed, before the
+            // BEGIN below. This reads psql's own view of the connection, which
+            // the server's answers cannot stand in for — see
+            // `psql_connection_assertion`.
+            if let Some(conninfo) = password_free_conninfo(url) {
+                for line in psql_connection_assertion(&conninfo, &facts.endpoint.database) {
+                    eprintln!("  {line}");
+                }
+            }
             // Reset per target: a previous target's success must not vouch for
             // this one. `\gset` leaves a variable untouched when its query
             // fails, so this explicit `false` is what survives an aborted
@@ -2902,7 +2911,9 @@ fn classify_and_apply(
             for line in post_commit_fence(&facts.endpoint) {
                 eprintln!("  {line}");
             }
-            // Closes the `\if :autumn_ok` this target opened.
+            // Closes the `\if :autumn_ok` the connection assertion opened, then
+            // the one this target opened.
+            eprintln!("  \\endif");
             eprintln!("  \\endif");
         }
         // Compaction comes after EVERY target's transaction, never between two
@@ -4446,6 +4457,92 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
     )
 }
 
+/// The host and port a conninfo STATES, or `None` where it leaves one to libpq.
+///
+/// A query pair wins over the authority it duplicates — `?host=` beats the URL's
+/// own host, which is why `pg::sanitize_db_url` exists — so both are read and
+/// the query is preferred, the same precedence libpq applies.
+///
+/// Only stated components are returned. A default is deliberately not guessed:
+/// `PGPORT` can differ between the machine that planned the run and the one that
+/// pastes the script, so asserting `5432` for an omitted port would refuse a
+/// CORRECT paste. An omitted component also cannot be what distinguishes two
+/// targets — libpq resolves it identically for both, so two conninfos that
+/// differ only there are the same endpoint written twice.
+fn stated_host_and_port(conninfo: &str) -> (Option<String>, Option<String>) {
+    let Ok(parsed) = url::Url::parse(conninfo) else {
+        return (None, None);
+    };
+    let mut host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned);
+    let mut port = parsed.port().map(|p| p.to_string());
+    for (key, value) in crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or("")) {
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "host" => host = Some(value),
+            "port" => port = Some(value),
+            _ => {}
+        }
+    }
+    (host, port)
+}
+
+/// The psql-level proof that `\connect` actually moved the session, read from
+/// psql's OWN connection variables rather than from anything the server reports.
+///
+/// The in-transaction guard below compares what the server says about itself,
+/// and that is not the connection's identity. `inet_server_addr()` and
+/// `inet_server_port()` are the address and port the SERVER accepted on, not the
+/// endpoint the operator configured — measured through a forwarder, a session
+/// connected to `127.0.0.1:15433` reports `127.0.0.1:5433`. So two servers
+/// behind different forwards, or in separate container networks with the same
+/// private address, report the same pair; add a physical clone's inherited
+/// `system_identifier` and a container-local `data_directory` both answer
+/// `/var/lib/postgresql/data` to, and every value that guard compares can match
+/// on two different databases. (Two colliding networks are not something this
+/// container can build, and I am not claiming to have run that half.)
+///
+/// psql's `:HOST`, `:PORT` and `:DBNAME` are connection-specific in the way the
+/// server's answers are not: they describe the conninfo psql resolved, and a
+/// failed `\connect` leaves them describing the PREVIOUS one. Measured on psql
+/// 16.13 in an interactive session, where `ON_ERROR_STOP` is ignored and a
+/// failed `\connect` keeps the old connection: before, `HOST=127.0.0.1
+/// PORT=15433 DBNAME=postgres`; after a `\connect` to port 25433 failed,
+/// unchanged — and `inet_server_port()` still answered for the old server.
+/// A failed `\connect` sets no error flag to fence on instead: measured,
+/// `:ERROR` is still unset afterwards and `LAST_ERROR_MESSAGE` is empty.
+///
+/// The comparison is `pg_catalog`-qualified so a `public.=` cannot answer it,
+/// and the flag is cleared first so a `\gset` whose query fails leaves it false.
+fn psql_connection_assertion(conninfo: &str, database: &str) -> Vec<String> {
+    let (host, port) = stated_host_and_port(conninfo);
+    let mut terms = vec![format!(
+        ":'DBNAME' OPERATOR(pg_catalog.=) {}",
+        quote_literal(database)
+    )];
+    if let Some(host) = host {
+        terms.push(format!(
+            ":'HOST' OPERATOR(pg_catalog.=) {}",
+            quote_literal(&host)
+        ));
+    }
+    if let Some(port) = port {
+        terms.push(format!(
+            ":'PORT' OPERATOR(pg_catalog.=) {}",
+            quote_literal(&port)
+        ));
+    }
+    vec![
+        "\\set autumn_ok false".to_owned(),
+        format!("SELECT ({}) AS autumn_ok \\gset", terms.join(" AND ")),
+        "\\if :autumn_ok".to_owned(),
+    ]
+}
+
 /// Abort the transaction unless the session is on the target this block is for.
 ///
 /// `\connect` does NOT close the old connection when the new one fails. Measured
@@ -5432,6 +5529,89 @@ mod tests {
     /// Both sides of the size ratio measure the same set of relations.
     ///
     /// The purge targets keep their whole file until compaction rewrites them,
+    /// The reconnect proves itself from psql's view, not the server's.
+    ///
+    /// `inet_server_addr()`/`inet_server_port()` are the endpoint the SERVER
+    /// accepted on, not the one the operator configured — measured through a
+    /// forwarder, a session connected to `127.0.0.1:15433` reports
+    /// `127.0.0.1:5433`. Two servers behind different forwards, or in separate
+    /// container networks sharing a private address, therefore report the same
+    /// pair, and with a physical clone's inherited `system_identifier` and a
+    /// container-local `data_directory` every server-side value can match on two
+    /// different databases.
+    #[test]
+    fn the_reconnect_is_proved_from_psql_own_variables() {
+        let lines = super::psql_connection_assertion(
+            "postgres://postgres@127.0.0.1:25433/dry_t2",
+            "dry_t2",
+        );
+        // False FIRST, so a `\gset` whose query fails cannot carry the previous
+        // target's answer into this target's destructive block.
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("\\set autumn_ok false"),
+            "the flag must be cleared before the gset that may not run: {lines:?}"
+        );
+        let probe = lines
+            .iter()
+            .find(|l| l.contains("\\gset"))
+            .unwrap_or_else(|| panic!("psql, not the server, has to decide this: {lines:?}"));
+        // The operator's endpoint, which is what `\connect` acted on — NOT the
+        // 5434 the server behind that forward reports for itself.
+        assert!(
+            probe.contains(":'PORT' OPERATOR(pg_catalog.=) '25433'")
+                && probe.contains(":'HOST' OPERATOR(pg_catalog.=) '127.0.0.1'")
+                && probe.contains(":'DBNAME' OPERATOR(pg_catalog.=) 'dry_t2'"),
+            "every stated component must be pinned to psql's own value: {probe}"
+        );
+        // `pg_catalog`-qualified, so a `public.=` in the pasting session's path
+        // cannot answer the one comparison the whole block depends on.
+        assert!(
+            !probe.contains(" = '"),
+            "the comparison must not resolve through search_path: {probe}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("\\if :autumn_ok"),
+            "and the block has to sit inside it: {lines:?}"
+        );
+    }
+
+    /// A component the conninfo does not state is not asserted.
+    ///
+    /// `PGPORT` can differ between the machine that planned the run and the one
+    /// pasting the script, so asserting a guessed `5432` would refuse a CORRECT
+    /// paste. An omitted component also cannot be what tells two targets apart:
+    /// libpq resolves it identically for both, so two conninfos differing only
+    /// there are one endpoint written twice.
+    #[test]
+    fn an_unstated_component_is_not_asserted() {
+        let probe = super::psql_connection_assertion("postgres://postgres@db.internal/app", "app")
+            .into_iter()
+            .find(|l| l.contains("\\gset"))
+            .expect("the probe must be emitted");
+        assert!(
+            probe.contains(":'HOST' OPERATOR(pg_catalog.=) 'db.internal'")
+                && probe.contains(":'DBNAME' OPERATOR(pg_catalog.=) 'app'"),
+            "what the conninfo does state is still pinned: {probe}"
+        );
+        assert!(
+            !probe.contains(":'PORT'"),
+            "the port it leaves to libpq is not guessed: {probe}"
+        );
+        // A query pair overrides the authority it duplicates, the same
+        // precedence libpq applies and `pg::sanitize_db_url` normalises.
+        let overridden =
+            super::psql_connection_assertion("postgres://postgres@a.example/app?port=6000", "app")
+                .into_iter()
+                .find(|l| l.contains("\\gset"))
+                .expect("the probe must be emitted");
+        assert!(
+            overridden.contains(":'PORT' OPERATOR(pg_catalog.=) '6000'"),
+            "the query pair wins over the authority: {overridden}"
+        );
+    }
+
     /// and a refreshed materialized view is rebuilt from whatever survives the
     /// sample — a view over reference data does not shrink at all. Measuring
     /// base tables only reported `488.0 kB -> 232.0 kB` on a database still
