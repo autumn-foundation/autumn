@@ -128,6 +128,7 @@ copy of the publish order.
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
+| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802) |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
 | `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
@@ -302,9 +303,11 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
   (`trim`/`downcase`/`upcase`/`squish`/`strip_nul`); `with = path` calls a user
-  `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
-  `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
-  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `fn(&str) -> String`. Runs on the **write** path (`save`, `save_many`,
+  `save_many_skip_invalid` and the create half of `find_or_create_by_*` on
+  insert; `update` via `UpdateDraft::from_patch`) *before* the model's
+  `#[validate]` rules, the `before_create` / `before_update` hooks and the DB
+  write, and on derived `#[repository]`
   `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
   stored `foo@x.com` row). Built-ins are idempotent; composing
   `#[normalize(downcase)]` with a `unique` column yields case-insensitive
@@ -1054,7 +1057,7 @@ double-submits and replays.
 | `jobs(Vec<JobInfo>)` | Background jobs |
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
-| `openapi(OpenApiConfig)` | OpenAPI generation |
+| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
 | `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()` toggle exposure per route (plugin fluent opt-in) |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
@@ -1321,6 +1324,27 @@ time = { version = ">=0.3, <0.4" }
 
 JSON clients receive `application/problem+json`.
 
+Read accessors, for a caller with no HTTP response to parse (a GraphQL
+resolver, a `#[task]`, a CLI, an MCP tool, a `MutationHooks` impl):
+
+- `status() -> StatusCode`
+- `details() -> Option<&HashMap<String, Vec<String>>>` - per-field validation
+  messages, `None` when the error did not come from validation
+- `code() -> Cow<'static, str>` - the same stable code the `problem+json`
+  body carries (`autumn.validation_failed`, `autumn.not_found`, ...)
+- `message() -> String` - the wrapped error's message alone. Not redacted,
+  and `status()` is not the guard: it reports the assigned status, while the
+  renderer reclassifies a cancelled database statement to a redacted `503`.
+  Render the error when you need a client-safe string
+- `source_chain() -> Vec<String>`
+- `downcast_ref::<T>()` / `downcast_chain_ref::<T>()`
+
+`Display` on a validation error appends the failing fields to `message()`,
+sorted by field name: `Validation failed: email: Must be a valid email
+address`. The `problem+json` `detail` is unchanged - it stays the bare title,
+with the fields in `errors`. Keep untrusted text out of validation messages;
+`Display` output reaches logs.
+
 ## Signed webhook API
 
 Provider presets:
@@ -1450,9 +1474,11 @@ Frequently used env keys:
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
 | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
-| `AUTUMN_JOBS__BACKEND` | `jobs.backend` |
+| `AUTUMN_JOBS__BACKEND` | `jobs.backend` (`local` / `postgres` / `redis` / `sqlite`) |
+| `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` |
+| `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
-| `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` |
+| `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |
 | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` |
 | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` |
 | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` | `security.webhooks.replay.backend` |
@@ -1620,6 +1646,73 @@ provider = "cloudflare"
 - A failed issuance/renewal raises #1610's `scheduled_task_failure` operator
   alert for `acme-renewal` and clears it on the next success; the `acme` health
   indicator reports `challenge` and `dns_provider`.
+
+See `docs/guide/tls.md`.
+
+### `[server.tls.acme.custom_domains]` (feature `acme`, unreleased — trunk-dev, #1635)
+
+Lets a **tenant connect its own hostname** (`app.clientco.com`), each getting its
+own verified, auto-renewing certificate served by SNI. Config-only: no per-domain
+entry ever appears in `autumn.toml`, so a 1,000-tenant deployment is the same
+block as a 1-tenant one. Wildcards (#1620) cover subdomain tenants; this covers
+the B2B customer who brings their own domain.
+
+```toml
+[server.tls.acme.custom_domains]
+enabled          = true
+ingress_hostname = "ingress.myapp.com"   # CNAME target for tenant subdomains
+ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
+```
+
+- `enabled` (default `false`), `ingress_hostname` / `ingress_ipv4` /
+  `ingress_ipv6` — at least one target is required; an **apex** domain cannot
+  carry a CNAME, so accepting apex domains needs the addresses.
+- `store_dir` (default `config/acme/domains`), `max_domains` (default `1000`),
+  `cert_cache_size` (default `256`) — certificates load incrementally, so the
+  cache is a memory knob, not a correctness one.
+- `issuance_per_domain_per_day` (default `5`), `issuance_global_per_hour`
+  (default `50`), `failure_backoff_secs` (default `300`, doubling),
+  `max_failure_backoff_secs` (default `86400`), `poll_interval_secs`
+  (default `60`).
+
+The app drives the journey through
+`autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
+`register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
+renders the exact record to show the tenant, and `list_for_tenant` renders
+status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
+active and serving.
+
+**Offboard through `<dyn CustomDomainPruner>::from_state(&state)`** —
+`offboard_domain(hostname)` and `offboard_tenant_domains(tenant)`. The
+registry's own `remove` / `remove_tenant` only drop the record: they stop
+routing, but the certificate and its private key stay in the ACME store until a
+`[retention] custom_domains` window prunes them, which is unset by default.
+`CustomDomainPruner` does both.
+
+Three gates stand between a tenant-supplied hostname and an ACME order: the app
+registered it, DNS independently resolves to this deployment, and the budget has
+headroom. An SNI hostname nobody registered is refused at the handshake without
+contacting the CA. A hostname the deployment already owns (under
+`[server.tls.acme] domains` or `[tenancy] base_domain`) is refused at
+registration, so a tenant cannot claim another tenant's subdomain.
+
+Requests carrying a registered `Host` resolve to the owning tenant — under
+`[tenancy] source = "subdomain"` only, so a client-supplied `Host` never
+outranks an authenticated `jwt`/`session`/`header` tenant. Tenant certificates
+are issued over **HTTP-01** even when the deployment's own uses DNS-01: the
+record lives in the tenant's zone, where autumn holds no credential.
+
+A failure names the domain AND its tenant in the `custom_domains` health
+indicator and raises #1610's `scheduled_task_failure` alert for
+`custom_domain_certificates`, while every other domain keeps serving and
+renewing. `autumn doctor` grades the section and, with `--online`, flags
+registered domains whose DNS no longer points here. Offboarding stops routing,
+serving and renewal and deletes the stored certificate; the `custom_domains`
+retention dataset prunes abandoned registrations and orphaned certificates.
+
+Single-host, like the rest of the ACME path: the HTTP-01 token map and
+certificate store are per-process. Behind a load balancer, terminate TLS there.
 
 See `docs/guide/tls.md`.
 

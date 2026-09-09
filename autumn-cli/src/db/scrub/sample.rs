@@ -1,0 +1,4146 @@
+//! Referentially-intact row subsetting for `autumn db scrub` (issue #1636).
+//!
+//! # Why this exists
+//!
+//! A scrubbed copy of a multi-hundred-GB production database is still a
+//! multi-hundred-GB database: PII-safe, but useless on a laptop. Teams then
+//! either work without realistic data or hand-roll `pg_sample` scripts that know
+//! nothing about PII and silently break foreign keys.
+//!
+//! This module selects a small subset of rows that is **referentially correct by
+//! construction**, in the same pass and the same transaction as the scrub, so no
+//! flag combination can emit sampled-but-unscrubbed rows.
+//!
+//! # How the subset is chosen
+//!
+//! The developer names root entities on the command line
+//! (`--sample users=1%`). Every other row is pulled in by walking the foreign
+//! key graph the database itself reports, to a fixpoint:
+//!
+//! - **Descend** — rows referencing a selected row are selected, and are
+//!   themselves descend-eligible. This is what "1% of users plus all their
+//!   related rows" means.
+//! - **Ascend** — rows a selected row references are selected, but are **not**
+//!   descend-eligible. This is what makes every foreign key resolve, without
+//!   letting one shared parent (an org, a plan) drag its whole subtree back in.
+//!
+//! Two per-table rules refine that: `always_include` tables (reference/lookup
+//! data) start with every row selected and are never descended from;
+//! `never_include` tables (audit logs) are emptied.
+//!
+//! # Fail-closed
+//!
+//! Anything the walk cannot prove is refused before a row is deleted: a table no
+//! root can reach (it would be silently emptied), a foreign key into a
+//! `never_include` table (it would dangle), a table with no primary key (it has
+//! no row identity to select on), a reference cycle between tables (the deletes
+//! have no safe order), and a framework-owned table referencing a sampled one.
+//! After the deletes, every foreign key is re-verified inside the same
+//! transaction, so a violation rolls the whole run back.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use diesel::{PgConnection, RunQueryDsl as _, sql_query};
+
+use super::super::{quote_ident, quote_literal};
+// Every statement is schema-qualified through the scrub's own helper, so a
+// role- or database-level `search_path` cannot redirect a delete to a table
+// nothing classified.
+use super::qualified_ident as qualified;
+
+/// Ceiling on closure passes, purely defensive.
+///
+/// Each pass either selects at least one new row or ends the walk, and the
+/// keep-sets are bounded by the row count, so convergence is guaranteed and this
+/// bound should never be reached. It exists to turn a hypothetical
+/// non-convergence into an error rather than a hung command — so it must sit far
+/// above any legitimate depth: one pass descends one level, and a self-
+/// referential hierarchy is exactly as deep as it is. A bound near a plausible
+/// depth would reject a valid tree for being tall.
+const MAX_PASSES: usize = 100_000;
+
+// ─── Specs ──────────────────────────────────────────────────────────────────
+
+/// How many root rows one `--sample <table>=<spec>` selects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SampleAmount {
+    /// A percentage of the table's rows, rounded up.
+    Percent(f64),
+    /// An absolute row count, capped at the table's size.
+    Count(u64),
+}
+
+/// One parsed `--sample <table>=<spec>` argument.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampleSpec {
+    /// The root table.
+    pub table: String,
+    /// How much of it to select.
+    pub amount: SampleAmount,
+}
+
+/// The `[sample]` section of `scrub.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SampleRules {
+    /// Reference/lookup tables copied in full.
+    #[serde(default)]
+    pub always_include: Vec<String>,
+    /// Tables excluded entirely (their rows are deleted).
+    #[serde(default)]
+    pub never_include: Vec<String>,
+}
+
+/// One foreign key constraint, composite keys included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyConstraint {
+    /// The constraint name, for error messages.
+    pub name: String,
+    /// The referencing table.
+    pub child_table: String,
+    /// The referencing columns, in key order.
+    pub child_columns: Vec<String>,
+    /// The referenced table.
+    pub parent_table: String,
+    /// The referenced columns, in key order.
+    pub parent_columns: Vec<String>,
+    /// True for `MATCH FULL`, whose composite rule differs from the default
+    /// `MATCH SIMPLE`: a tuple must be entirely NULL or entirely populated, so
+    /// a partially-NULL one violates the constraint instead of satisfying it.
+    pub match_full: bool,
+}
+
+/// What decides a table's rows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SampleRole {
+    /// A developer-chosen root: this many rows, chosen deterministically.
+    Root(SampleAmount),
+    /// Copied in full (`[sample] always_include`).
+    AlwaysInclude,
+    /// Emptied (`[sample] never_include`).
+    NeverInclude,
+    /// Selected only by the graph walk.
+    Related,
+}
+
+// ─── Errors ─────────────────────────────────────────────────────────────────
+
+/// Failure modes for sampling. Every variant refuses **before** a row is
+/// deleted, and none embeds a connection URL.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SampleError {
+    /// A `--sample` argument is not `<table>=<count|percent%>`.
+    InvalidSpec {
+        /// The argument as written.
+        spec: String,
+        /// A human-readable reason.
+        detail: String,
+    },
+    /// `--sample` named a table the classified universe does not have.
+    UnknownRoot {
+        /// The quoted table names, sorted, each with a suggestion where
+        /// trimming it would have matched a real table.
+        tables: Vec<String>,
+    },
+    /// The same root table was given twice.
+    DuplicateRoot {
+        /// The table name.
+        table: String,
+    },
+    /// A root table is also declared `never_include`.
+    RootNeverIncluded {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// A root table is also declared `always_include`.
+    RootAlwaysIncluded {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// A table is declared both `always_include` and `never_include`.
+    RuleContradiction {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// `[sample]` names a table the database does not have.
+    StaleRule {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// `[sample]` names a framework-owned table, which sampling never covers.
+    FrameworkRule {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// A table no root can reach through the foreign key graph. Sampling it
+    /// would empty it silently, so the run refuses instead.
+    UncoveredTables {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// A retained table references a `never_include` table, so the reference
+    /// would dangle.
+    NeverIncludeReferenced {
+        /// `child -> parent (constraint)` descriptions, sorted.
+        edges: Vec<String>,
+    },
+    /// A table outside the sampled universe — a framework-owned one — references
+    /// a table the sample subsets, so removing those rows would break it.
+    OutsideTableReferencesSampled {
+        /// `child -> parent (constraint)` descriptions, sorted.
+        edges: Vec<String>,
+    },
+    /// A foreign key declared directly on a leaf partition rather than cloned
+    /// from its partitioned parent. The plan is keyed on the parent, whose rows
+    /// span every partition, so neither the walk nor the integrity re-check can
+    /// represent an edge that binds one partition only.
+    PartitionLocalForeignKey {
+        /// `child -> parent (constraint)` descriptions, sorted.
+        edges: Vec<String>,
+    },
+    /// One `[framework] purge` is required both before the sample (something it
+    /// references is subsetted) and after it (something that references it is
+    /// emptied by the sample). No single position satisfies both.
+    PurgeOrderContradiction {
+        /// One `table: must be emptied before X but after Y` line, sorted.
+        tables: Vec<String>,
+    },
+    /// A table the sample keeps rows in references a framework-owned table that
+    /// `[framework] purge` empties, so no order of the two satisfies the key.
+    RetainedReferencesPurged {
+        /// `child -> parent (constraint)` descriptions, sorted.
+        edges: Vec<String>,
+    },
+    /// A table in the sampled universe has no primary key, so its rows have no
+    /// identity the walk can select on.
+    NoRowKey {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// Two or more tables reference each other, so the deletes have no order
+    /// that keeps every foreign key satisfied.
+    ForeignKeyCycle {
+        /// The table names, sorted.
+        tables: Vec<String>,
+    },
+    /// The closure walk did not converge (defensive; unreachable in practice).
+    IterationLimit,
+    /// A foreign key whose two sides have different column counts. Impossible
+    /// from the catalog, and silently corrupting if it ever happened: the join
+    /// is built by zipping the two lists, so the extra components would simply
+    /// be dropped and the walk would follow a weaker key than the constraint.
+    KeyArityMismatch {
+        /// `constraint (child -> parent): N vs M column(s)`, sorted.
+        keys: Vec<String>,
+    },
+    /// A table the run promised would be empty holds rows once every write is
+    /// done. A trigger fired by one emptying statement can insert into a table
+    /// an earlier statement already emptied, so ordering the deletes cannot rule
+    /// this out — only checking the promise afterwards can.
+    NotEmptied {
+        /// `table (n row(s))` descriptions, sorted.
+        tables: Vec<String>,
+    },
+    /// The post-sample foreign key verification found unresolved references.
+    /// A materialized view's refresh changed a table the sample had already
+    /// settled. The refreshes are the last writes in the transaction, so the
+    /// counts and the integrity checks above no longer describe the result.
+    SampleMutatedByRefresh {
+        /// `table (n row(s), sampled to m)`, sorted.
+        tables: Vec<String>,
+    },
+    IntegrityViolation {
+        /// `constraint: child -> parent (n row(s))` descriptions, sorted.
+        violations: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for SampleError {
+    // One arm per variant, each a single actionable message; splitting the
+    // match would scatter the error copy across helpers for no reader benefit.
+    #[allow(clippy::too_many_lines)]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSpec { spec, detail } => write!(
+                f,
+                "--sample {spec:?} is not a valid sample spec: {detail}\n  \
+                 Write it as `<table>=<count>` or `<table>=<percent>%`, for example \
+                 `--sample users=1%` or `--sample users=500`."
+            ),
+            Self::UnknownRoot { tables } => write!(
+                f,
+                "--sample names {} table(s) that are not part of the sampled \
+                 universe:\n{}\n  \
+                 A root must be one of the app's own tables. Framework-owned tables are \
+                 emptied with `[framework] purge` instead, and a partition is sampled \
+                 through its parent table.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::DuplicateRoot { table } => write!(
+                f,
+                "--sample names {table:?} more than once.\n  \
+                 A root table takes exactly one size; give the one you mean."
+            ),
+            Self::RootNeverIncluded { tables } => write!(
+                f,
+                "--sample names {} table(s) that {SAMPLE_SECTION} excludes:\n{}\n  \
+                 A root is what the sample is built from, so it cannot also be dropped. \
+                 Remove it from `never_include`, or sample a different root.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::RootAlwaysIncluded { tables } => write!(
+                f,
+                "--sample names {} table(s) that {SAMPLE_SECTION} copies whole:\n{}\n  \
+                 A size and \"every row\" are two different answers. Remove it from \
+                 `always_include` to subset it, or drop the --sample root to keep it \
+                 whole.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::RuleContradiction { tables } => write!(
+                f,
+                "{} table(s) are declared both `always_include` and `never_include` in \
+                 {SAMPLE_SECTION}:\n{}\n  Pick one.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::StaleRule { tables } => write!(
+                f,
+                "{SAMPLE_SECTION} names {} table(s) the database does not have:\n{}\n  \
+                 The declaration has drifted from the schema — remove or rename the stale \
+                 entries.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::FrameworkRule { tables } => write!(
+                f,
+                "{SAMPLE_SECTION} names {} framework-owned table(s):\n{}\n  \
+                 Sampling covers the app's own tables only — framework-owned rows are \
+                 emptied with `[framework] purge = [...]` instead.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::UncoveredTables { tables } => write!(
+                f,
+                "{} table(s) cannot be reached from any --sample root through the foreign \
+                 key graph:\n{}\n  \
+                 Sampling would empty them without saying so. Name one as a root \
+                 (`--sample <table>=<n>`), copy it whole (`[sample] always_include`), or \
+                 drop it deliberately (`[sample] never_include`).\n  \
+                 Being connected to a root is not enough: the walk descends only out of a \
+                 root and out of the tables it descended into. A table hanging off one it \
+                 merely ASCENDED into \u{2014} a shared org a kept user points at \u{2014} or off \
+                 an `always_include` lookup table, is not reachable: descending from one \
+                 such row would drag the whole database back in.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::NeverIncludeReferenced { edges } => write!(
+                f,
+                "{} foreign key(s) point at a table {SAMPLE_SECTION} excludes:\n{}\n  \
+                 Emptying the parent would leave those references dangling. Drop the \
+                 referencing table too (`never_include`), or stop excluding the parent.",
+                edges.len(),
+                bullets(edges),
+            ),
+            Self::OutsideTableReferencesSampled { edges } => write!(
+                f,
+                "{} reference(s) come from a table outside the sample:\n{}\n  \
+                 Nothing removes rows from a framework-owned table, so removing the rows \
+                 it points at would break it. Empty it in the same run with \
+                 `[framework] purge = [...]`.",
+                edges.len(),
+                bullets(edges),
+            ),
+            Self::PartitionLocalForeignKey { edges } => write!(
+                f,
+                "{} foreign key(s) are declared on a partition rather than on its \
+                 partitioned parent:\n{}\n  \
+                 The sample selects and removes a partition's rows through that parent, \
+                 whose rows span every partition, so it cannot honour a key that binds \
+                 one partition only. Declare the foreign key on the partitioned parent \
+                 so PostgreSQL clones it to each partition, or drop the table with \
+                 `never_include` in {SAMPLE_SECTION}.",
+                edges.len(),
+                bullets(edges),
+            ),
+            Self::PurgeOrderContradiction { tables } => write!(
+                f,
+                "{} purged table(s) would have to be emptied both before and after \
+                 the sample:\n{}\n  \
+                 A purge normally runs first, so removing the rows it points at is \
+                 safe; but one the sample's own emptied rows reference has to wait \
+                 for the sample instead. A table needing both leaves no order the \
+                 run can take. Stop purging it, or drop the table that references \
+                 it with `never_include` in {SAMPLE_SECTION}.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::RetainedReferencesPurged { edges } => write!(
+                f,
+                "{} reference(s) point from rows the sample keeps into a table \
+                 `[framework] purge` empties:\n{}\n  \
+                 Emptying the parent would leave the kept rows dangling, and no order of \
+                 the two removals avoids it. Stop purging that table, or drop the \
+                 referencing table with `never_include` in {SAMPLE_SECTION}.",
+                edges.len(),
+                bullets(edges),
+            ),
+            Self::NoRowKey { tables } => write!(
+                f,
+                "{} table(s) in the sample have no primary key:\n{}\n  \
+                 Without one the sampler has no row identity to select on, and a \
+                 full-copy table still needs one to join its parents. Add a primary key, \
+                 or drop the table with `never_include` in {SAMPLE_SECTION}.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::ForeignKeyCycle { tables } => write!(
+                f,
+                "{} table(s) reference each other in a cycle:\n{}\n  \
+                 The row removals then have no order that keeps every foreign key \
+                 satisfied at each step. Copy one of them whole (`[sample] \
+                 always_include`), which takes it out of the removals altogether, or \
+                 break the cycle on the copy before sampling.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::KeyArityMismatch { keys } => write!(
+                f,
+                "{} foreign key(s) report a different number of columns on each side:\n{}\n  \
+                 The walk joins the two sides component by component, so a mismatch would \
+                 silently follow a weaker key than the constraint declares \u{2014} keeping or \
+                 removing rows the database never related. The catalog should never report \
+                 this; if it does, the schema is worth inspecting before any sample is taken \
+                 from it.",
+                keys.len(),
+                bullets(keys),
+            ),
+            Self::IterationLimit => write!(
+                f,
+                "The sample selection did not settle after {MAX_PASSES} passes over the \
+                 foreign key graph.\n  \
+                 Nothing was written. Please report this with the schema that produced it."
+            ),
+            Self::NotEmptied { tables } => write!(
+                f,
+                "{} table(s) the run promised would be empty still hold rows after \
+                 every write:\n{}\n  \
+                 Something wrote to them after they were emptied, so the rows are back, \
+                 carrying whatever they carried before. Two things can: a trigger fired by \
+                 one of the emptying statements, inserting into a table an earlier one \
+                 already emptied — an `ON DELETE` archive trigger between two of them will \
+                 do it — or a materialized view whose query calls a function that INSERTs, \
+                 since `REFRESH` runs that query. Nothing is committed. Disable the \
+                 triggers on the copy before scrubbing, drop the write from the view's \
+                 function, or stop promising a table is emptied when something refills it.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::SampleMutatedByRefresh { tables } => write!(
+                f,
+                "{} sampled table(s) were changed by a materialized view's \
+                 refresh:\n{}\n  \
+                 The refreshes are the last writes in the transaction, so rows a \
+                 view's function adds land after the subset was selected, after the \
+                 rewrites that remove PII, and after the counts this run reports — \
+                 measured, a view whose function INSERTs into a sampled table left \
+                 the run reporting `403 -> 4 row(s)` over a table holding 7, three \
+                 of them never rewritten. Nothing is committed. Drop the write from \
+                 the view's function, or take the view out of the database this run \
+                 scrubs.",
+                tables.len(),
+                bullets(tables),
+            ),
+            Self::IntegrityViolation { violations } => write!(
+                f,
+                "The sampled database failed its own foreign key check:\n{}\n  \
+                 Nothing was written — the whole run was rolled back. This means the \
+                 selection walk missed a reference; please report it.",
+                bullets(violations),
+            ),
+        }
+    }
+}
+
+/// The config section these rules are declared in, named once.
+const SAMPLE_SECTION: &str = "`[sample]` in scrub.toml";
+
+/// Render one item per indented line, matching the scrub's own diagnostics.
+fn bullets(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("    - {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ─── Plan ───────────────────────────────────────────────────────────────────
+
+/// One table in the sampled universe.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampleTable {
+    /// The table name.
+    pub table: String,
+    /// What decides its rows.
+    pub role: SampleRole,
+    /// The primary-key columns that identify a row.
+    pub key: Vec<String>,
+    /// The temporary keep-set table name.
+    pub keep: String,
+    /// The temporary descend-set table name.
+    pub descend: String,
+}
+
+/// The resolved sampling plan for one database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplePlan {
+    /// The deterministic seed.
+    pub seed: u64,
+    /// Every table in the sampled universe, in DELETE order (children first).
+    pub tables: Vec<SampleTable>,
+    /// Foreign keys the closure walk follows.
+    pub walk_edges: Vec<ForeignKeyConstraint>,
+    /// Every foreign key inside the universe, for the integrity re-check.
+    pub verify_edges: Vec<ForeignKeyConstraint>,
+    /// Framework-owned tables whose `[framework] purge` must run AFTER the
+    /// sample: a table the sample empties references them, so purging first
+    /// would hit the reference. Every other purge still runs first, so a
+    /// framework table referencing a sampled one is empty before its parents go.
+    pub purge_after: BTreeSet<String>,
+}
+
+/// Everything the planner needs, gathered by the caller.
+pub struct SampleInputs<'a> {
+    /// Root specs from `--sample`, in command-line order.
+    pub roots: &'a [SampleSpec],
+    /// The deterministic seed.
+    pub seed: u64,
+    /// The `[sample]` rules.
+    pub rules: &'a SampleRules,
+    /// The classified user tables (partitions already excluded), as
+    /// `(name, primary-key columns)`.
+    pub tables: &'a [(String, Vec<String>)],
+    /// Every foreign key in `public`.
+    pub foreign_keys: &'a [ForeignKeyConstraint],
+    /// Framework-owned tables present in the database.
+    pub framework_tables: &'a BTreeSet<String>,
+    /// Framework-owned tables `[framework] purge` empties.
+    pub purged: &'a BTreeSet<String>,
+    /// Partitions of a partitioned table. Their rows are selected and removed
+    /// through the parent, and their foreign keys are clones of the parent's,
+    /// so an edge naming one is skipped rather than double-counted.
+    /// Each partition mapped to the top-level table it belongs to.
+    pub partitions: &'a BTreeMap<String, String>,
+}
+
+/// Parse one `--sample <table>=<count|percent%>` argument.
+///
+/// # Errors
+///
+/// Returns [`SampleError::InvalidSpec`] when the argument has no `=`, names an
+/// empty table, or carries an amount that is not a positive count or a
+/// percentage in `(0, 100]`.
+pub fn parse_spec(raw: &str) -> Result<SampleSpec, SampleError> {
+    let invalid = |detail: &str| SampleError::InvalidSpec {
+        spec: raw.to_owned(),
+        detail: detail.to_owned(),
+    };
+    // Split at the LAST `=`, not the first: an amount never contains one, but a
+    // quoted table name may (`CREATE TABLE "events=2026"` is legal), and
+    // splitting at the first left no spelling at all for such a root — the
+    // remainder parsed as the amount and failed.
+    let (table, amount) = raw
+        .rsplit_once('=')
+        .ok_or_else(|| invalid("no `=` between the table and the amount"))?;
+    // The table portion is taken VERBATIM. A quoted identifier may begin or end
+    // with a space (`CREATE TABLE " users"` is legal), and trimming it silently
+    // retargeted the root: measured, `--sample " users=5"` reported "Sampling
+    // control from users" and subsetted `users` — a different table that
+    // happened to exist — while the one the operator named was never a root.
+    // Losing a wrong target beats gaining tolerance for `users = 500`, which
+    // `resolve_roles` now names as a suggestion instead of guessing at.
+    //
+    // The amount is still trimmed: it is a count or a percentage, so it has no
+    // meaningful leading or trailing space to preserve.
+    if table.is_empty() {
+        return Err(invalid("the table name is empty"));
+    }
+    let amount = amount.trim();
+    if amount.is_empty() {
+        return Err(invalid("the amount is empty"));
+    }
+    let amount = if let Some(percent) = amount.strip_suffix('%') {
+        let value: f64 = percent
+            .parse()
+            .map_err(|_| invalid("the percentage is not a number"))?;
+        if !(value.is_finite() && value > 0.0 && value <= 100.0) {
+            return Err(invalid(
+                "a percentage must be greater than 0 and at most 100",
+            ));
+        }
+        SampleAmount::Percent(value)
+    } else {
+        let value: u64 = amount
+            .parse()
+            .map_err(|_| invalid("the count is not a whole number (add `%` for a percentage)"))?;
+        if value == 0 {
+            return Err(invalid("a root of 0 rows would select nothing"));
+        }
+        SampleAmount::Count(value)
+    };
+    Ok(SampleSpec {
+        table: table.to_owned(),
+        amount,
+    })
+}
+
+impl SampleAmount {
+    /// How many root rows this amount selects from a table of `total` rows.
+    ///
+    /// A percentage rounds **up**: 1% of ten rows is one row, not none — a
+    /// sample that silently selected nothing would look like an empty database.
+    #[must_use]
+    pub fn rows(self, total: i64) -> i64 {
+        let total = total.max(0);
+        match self {
+            Self::Count(n) => i64::try_from(n).unwrap_or(i64::MAX).min(total),
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            Self::Percent(pct) => {
+                let wanted = (total as f64 * pct / 100.0).ceil();
+                let rows = (wanted as i64).clamp(0, total);
+                // A positive percentage of a nonempty table is at least one
+                // row, and `ceil` is not enough to guarantee that: the product
+                // UNDERFLOWS for a denormal percentage, and `ceil(0.0)` is 0.
+                // Measured, `pct = 5e-324` (the smallest positive f64, which
+                // parses as finite and > 0 and so is accepted):
+                //
+                //   total=1   -> product 0.0     -> 0 rows
+                //   total=10  -> product 0.0     -> 0 rows
+                //   total=200 -> product 1e-323  -> 1 row
+                //
+                // A zero-row seed does not select nothing harmlessly: the
+                // root's `DELETE ... WHERE NOT EXISTS (keep)` then matches
+                // every row, which is exactly the silently-empty database this
+                // round-up exists to prevent.
+                if total > 0 && pct > 0.0 {
+                    rows.max(1)
+                } else {
+                    rows
+                }
+            }
+        }
+    }
+}
+
+impl SampleRole {
+    /// Whether rows of this table are actually removed.
+    ///
+    /// A root asked for 100% keeps every row, so its `DELETE ... WHERE NOT
+    /// EXISTS (keep)` matches nothing. Treating it as removing would refuse a
+    /// framework table that references it — a reference that cannot break,
+    /// because nothing goes away — and would give it an ordering constraint it
+    /// does not have. It still *descends*: the point of `users=100%` is to keep
+    /// every user and subset what hangs off them.
+    ///
+    /// Only an exact percentage is recognised. A `Count` large enough to cover
+    /// the table is the same no-op in practice, but that depends on the row
+    /// count at run time, and a refusal must not hinge on data that can change
+    /// between planning and applying.
+    fn is_subsetted(self) -> bool {
+        match self {
+            Self::Root(SampleAmount::Percent(p)) => p < 100.0,
+            Self::Root(SampleAmount::Count(_)) | Self::Related | Self::NeverInclude => true,
+            Self::AlwaysInclude => false,
+        }
+    }
+
+    /// Whether the walk may descend from this table into its children *at all*.
+    ///
+    /// A full-copy lookup table may not: descending from one `countries` row
+    /// would pull in every user in that country, and the sample would stop
+    /// being a sample. Whether a given table actually HAS descend-eligible rows
+    /// is a second question — see [`Self::descends_from_seed`].
+    const fn descends(self) -> bool {
+        matches!(self, Self::Root(_) | Self::Related)
+    }
+
+    /// Whether this table starts out with descend-eligible rows, before the
+    /// walk runs. Only a root does: every other descend source is one the walk
+    /// descended into.
+    const fn descends_from_seed(self) -> bool {
+        matches!(self, Self::Root(_))
+    }
+
+    /// A one-word label for the report.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Root(_) => "root",
+            Self::AlwaysInclude => "always-include",
+            Self::NeverInclude => "never-include",
+            Self::Related => "related",
+        }
+    }
+}
+
+/// Resolve the sampling plan, refusing every graph gap before a row is deleted.
+///
+/// # Errors
+///
+/// Returns the [`SampleError`] describing the first refusal.
+pub fn build_plan(inputs: &SampleInputs<'_>) -> Result<SamplePlan, SampleError> {
+    let keys: BTreeMap<&str, &Vec<String>> = inputs
+        .tables
+        .iter()
+        .map(|(name, key)| (name.as_str(), key))
+        .collect();
+
+    check_rules(inputs, &keys)?;
+    let roles = resolve_roles(inputs, &keys)?;
+    let (internal, walk, purge_after) = classify_edges(inputs, &roles)?;
+    check_coverage(&roles, &walk)?;
+    check_row_keys(&roles, &keys)?;
+
+    let numbered: BTreeMap<&str, usize> = keys
+        .keys()
+        .enumerate()
+        .map(|(index, name)| (*name, index))
+        .collect();
+    let ordered = delete_order(&roles, &internal)?;
+    let tables = ordered
+        .into_iter()
+        .map(|name| {
+            let index = numbered[name.as_str()];
+            SampleTable {
+                role: roles[&name],
+                key: keys[name.as_str()].clone(),
+                keep: format!("_autumn_sample_keep_{index}"),
+                descend: format!("_autumn_sample_desc_{index}"),
+                table: name,
+            }
+        })
+        .collect();
+
+    Ok(SamplePlan {
+        seed: inputs.seed,
+        tables,
+        walk_edges: walk,
+        verify_edges: internal,
+        purge_after,
+    })
+}
+
+/// Validate `[sample]` against the live schema before anything is planned.
+fn check_rules(
+    inputs: &SampleInputs<'_>,
+    keys: &BTreeMap<&str, &Vec<String>>,
+) -> Result<(), SampleError> {
+    let declared: Vec<&String> = inputs
+        .rules
+        .always_include
+        .iter()
+        .chain(&inputs.rules.never_include)
+        .collect();
+
+    let framework = sorted_unique(
+        declared
+            .iter()
+            .filter(|t| inputs.framework_tables.contains(**t))
+            .map(|t| (*t).clone()),
+    );
+    if !framework.is_empty() {
+        return Err(SampleError::FrameworkRule { tables: framework });
+    }
+
+    let stale = sorted_unique(
+        declared
+            .iter()
+            .filter(|t| !keys.contains_key(t.as_str()))
+            .map(|t| (*t).clone()),
+    );
+    if !stale.is_empty() {
+        return Err(SampleError::StaleRule { tables: stale });
+    }
+
+    let never: BTreeSet<&String> = inputs.rules.never_include.iter().collect();
+    let both = sorted_unique(
+        inputs
+            .rules
+            .always_include
+            .iter()
+            .filter(|t| never.contains(*t))
+            .cloned(),
+    );
+    if !both.is_empty() {
+        return Err(SampleError::RuleContradiction { tables: both });
+    }
+    Ok(())
+}
+
+/// Assign every table its role, refusing unusable roots.
+fn resolve_roles(
+    inputs: &SampleInputs<'_>,
+    keys: &BTreeMap<&str, &Vec<String>>,
+) -> Result<BTreeMap<String, SampleRole>, SampleError> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for spec in inputs.roots {
+        if !seen.insert(spec.table.as_str()) {
+            return Err(SampleError::DuplicateRoot {
+                table: spec.table.clone(),
+            });
+        }
+    }
+    // Rendered quoted, because the table portion is verbatim and an identifier
+    // may carry leading or trailing space: unquoted, `--sample " users=5"` and
+    // `--sample "users=5"` produce an identical message. Where trimming WOULD
+    // have matched, say so rather than trimming — guessing is what silently
+    // retargeted the root before.
+    let unknown = sorted_unique(inputs.roots.iter().filter_map(|s| {
+        if keys.contains_key(s.table.as_str()) {
+            return None;
+        }
+        let name = &s.table;
+        let trimmed = name.trim();
+        Some(if trimmed == name || !keys.contains_key(trimmed) {
+            format!("{name:?}")
+        } else {
+            format!("{name:?} \u{2014} did you mean {trimmed:?}? the table is taken verbatim, since one may begin or end with a space")
+        })
+    }));
+    if !unknown.is_empty() {
+        return Err(SampleError::UnknownRoot { tables: unknown });
+    }
+    let never: BTreeSet<&String> = inputs.rules.never_include.iter().collect();
+    let excluded = sorted_unique(
+        inputs
+            .roots
+            .iter()
+            .filter(|s| never.contains(&s.table))
+            .map(|s| s.table.clone()),
+    );
+    if !excluded.is_empty() {
+        return Err(SampleError::RootNeverIncluded { tables: excluded });
+    }
+
+    let always: BTreeSet<&String> = inputs.rules.always_include.iter().collect();
+    // A root silently overriding `always_include` would subset a table declared
+    // full-copy AND make it a descend source, which is the blow-up that rule
+    // exists to prevent. Refuse it, exactly as a `never_include` root is
+    // refused.
+    let copied_whole = sorted_unique(
+        inputs
+            .roots
+            .iter()
+            .filter(|s| always.contains(&s.table))
+            .map(|s| s.table.clone()),
+    );
+    if !copied_whole.is_empty() {
+        return Err(SampleError::RootAlwaysIncluded {
+            tables: copied_whole,
+        });
+    }
+
+    let mut roles: BTreeMap<String, SampleRole> = keys
+        .keys()
+        .map(|name| {
+            let owned = (*name).to_owned();
+            let role = if never.contains(&owned) {
+                SampleRole::NeverInclude
+            } else if always.contains(&owned) {
+                SampleRole::AlwaysInclude
+            } else {
+                SampleRole::Related
+            };
+            (owned, role)
+        })
+        .collect();
+    for spec in inputs.roots {
+        roles.insert(spec.table.clone(), SampleRole::Root(spec.amount));
+    }
+    Ok(roles)
+}
+
+/// Split every foreign key into the ones inside the sample and the ones the
+/// walk follows, refusing the two shapes that would dangle.
+type ClassifiedEdges = (
+    Vec<ForeignKeyConstraint>,
+    Vec<ForeignKeyConstraint>,
+    BTreeSet<String>,
+);
+
+/// Refuse a foreign key whose two sides report different column counts.
+///
+/// Every join this module builds zips the child's columns against the parent's,
+/// and `zip` stops at the shorter list — so a mismatch would emit a join WEAKER
+/// than the constraint, silently relating rows the database does not. The
+/// catalog cannot produce one; this exists so that if it ever did, the run would
+/// stop rather than quietly sample the wrong rows.
+fn check_key_arity(foreign_keys: &[ForeignKeyConstraint]) -> Result<(), SampleError> {
+    let mut keys: Vec<String> = foreign_keys
+        .iter()
+        .filter(|edge| edge.child_columns.len() != edge.parent_columns.len())
+        .map(|edge| {
+            format!(
+                "{} ({} -> {}): {} vs {} column(s)",
+                comment_safe(&edge.name),
+                comment_safe(&edge.child_table),
+                comment_safe(&edge.parent_table),
+                edge.child_columns.len(),
+                edge.parent_columns.len(),
+            )
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    keys.sort();
+    Err(SampleError::KeyArityMismatch { keys })
+}
+
+/// What to do with an edge that names a partition.
+enum PartitionVerdict {
+    /// Not a partition edge at all — carry on classifying it.
+    Classify,
+    /// A key the plan cannot express.
+    Refuse,
+    /// Expressible or not, it cannot matter: the run empties every row on the
+    /// side that would reference anything.
+    Ignore,
+}
+
+/// `child -> parent (constraint)`, the shape every refusal here names an edge by.
+fn describe(edge: &ForeignKeyConstraint) -> String {
+    format!(
+        "{} -> {} ({})",
+        edge.child_table, edge.parent_table, edge.name
+    )
+}
+
+/// Keep an ignored leaf edge's say over removal order.
+///
+/// Every row on the child side goes — its top-level parent is `never_include`,
+/// and emptying that takes the leaf with it — so the edge cannot dangle and has
+/// nothing to tell the walk or the re-count. It still has something to say about
+/// ORDER: if the leaf points into a `[framework] purge` table, that purge
+/// otherwise runs first, against rows the leaf has not lost yet. Measured on
+/// `PostgreSQL` 16.13, `audit_logs_p0.job_id -> autumn_jobs` failed the run with
+/// `update or delete on table "autumn_jobs" violates foreign key constraint
+/// "audit_p0_job_fk"`. Dropping the edge for walking was right; dropping it for
+/// ordering was not.
+fn defer_purge_for_excluded_leaf(
+    inputs: &SampleInputs<'_>,
+    roles: &BTreeMap<String, SampleRole>,
+    edge: &ForeignKeyConstraint,
+    purge_after: &mut BTreeSet<String>,
+    purged_after_edges: &mut BTreeMap<String, Vec<String>>,
+    purged_before: &mut BTreeMap<String, Vec<String>>,
+) {
+    if inputs.purged.contains(&edge.parent_table) {
+        purge_after.insert(edge.parent_table.clone());
+        purged_after_edges
+            .entry(edge.parent_table.clone())
+            .or_default()
+            .push(describe(edge));
+    }
+    // The mirror requirement, and the one the excuse itself depends on. When
+    // the LEAF's own top-level parent is purged and the edge points INTO a
+    // subsetted table, the excuse ("the purge removes every leaf row first")
+    // holds only while that purge runs BEFORE the sample — exactly as it does
+    // for a non-partitioned purged child. Recording it lets `check_purge_order`
+    // see a contradiction when some other edge defers the very same purge;
+    // dropping it let the two conclusions stand together and the run failed at
+    // delete time instead of refusing.
+    if let Some(root) = inputs.partitions.get(&edge.child_table)
+        && inputs.purged.contains(root)
+        && roles
+            .get(&edge.parent_table)
+            .is_some_and(|role| role.is_subsetted())
+    {
+        purged_before
+            .entry(root.clone())
+            .or_default()
+            .push(describe(edge));
+    }
+}
+
+/// Whether an edge naming a partition can be planned, must be refused, or is
+/// moot.
+///
+/// A constraint cloned from a partitioned parent was already dropped by the
+/// caller, which tells a clone from a partition-local key by its catalog
+/// parentage. Anything still naming a partition is declared on that partition
+/// alone — which the plan cannot express, because it keys every partition's
+/// rows on the parent.
+///
+/// Unless the run empties the CHILD's whole tree. `DELETE FROM parent` takes
+/// every leaf row with it, so an outgoing key from an excluded leaf has nothing
+/// left to dangle and nothing worth walking — and refusing it would advertise
+/// `never_include` as the remedy for a schema `never_include` cannot rescue.
+/// Only the child side qualifies: emptying the table a key POINTS AT is the
+/// dangling case, not this one.
+fn partition_verdict(
+    inputs: &SampleInputs<'_>,
+    roles: &BTreeMap<String, SampleRole>,
+    edge: &ForeignKeyConstraint,
+) -> PartitionVerdict {
+    // `[framework] purge` empties the child's whole tree exactly as
+    // `never_include` does, so the same reasoning applies — and here it is not
+    // merely symmetry. A framework table cannot be named in `[sample]` at all
+    // (that is its own refusal), so refusing this edge left the operator with
+    // NO configuration remedy while recommending one: measured, a partitioned
+    // `autumn_jobs` with a leaf-local key to `countries` was refused with
+    // "drop the table with `never_include`", and adding it there was refused in
+    // turn with "framework-owned rows are emptied with `[framework] purge`".
+    let excluded_leaf = |table: &String| {
+        inputs.partitions.get(table).is_some_and(|root| {
+            roles.get(root) == Some(&SampleRole::NeverInclude) || inputs.purged.contains(root)
+        })
+    };
+    if excluded_leaf(&edge.child_table) {
+        return PartitionVerdict::Ignore;
+    }
+    if inputs.partitions.contains_key(&edge.child_table)
+        || inputs.partitions.contains_key(&edge.parent_table)
+    {
+        return PartitionVerdict::Refuse;
+    }
+    PartitionVerdict::Classify
+}
+
+fn classify_edges(
+    inputs: &SampleInputs<'_>,
+    roles: &BTreeMap<String, SampleRole>,
+) -> Result<ClassifiedEdges, SampleError> {
+    check_key_arity(inputs.foreign_keys)?;
+    let mut outside_refs = Vec::new();
+    let mut dangling = Vec::new();
+    let mut partition_local = Vec::new();
+    let mut retained_into_purged = Vec::new();
+    let mut purge_after = BTreeSet::new();
+    let mut purged_before: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut purged_after_edges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut purged_internal: Vec<(String, String, String)> = Vec::new();
+    let mut verify_only: Vec<ForeignKeyConstraint> = Vec::new();
+    let mut internal = Vec::new();
+    for edge in inputs.foreign_keys {
+        match partition_verdict(inputs, roles, edge) {
+            PartitionVerdict::Refuse => {
+                partition_local.push(describe(edge));
+                continue;
+            }
+            PartitionVerdict::Ignore => {
+                defer_purge_for_excluded_leaf(
+                    inputs,
+                    roles,
+                    edge,
+                    &mut purge_after,
+                    &mut purged_after_edges,
+                    &mut purged_before,
+                );
+                continue;
+            }
+            PartitionVerdict::Classify => {}
+        }
+        let child = roles.get(&edge.child_table);
+        let parent = roles.get(&edge.parent_table);
+        match (child, parent) {
+            (Some(child_role), Some(parent_role)) => {
+                if *parent_role == SampleRole::NeverInclude
+                    && *child_role != SampleRole::NeverInclude
+                {
+                    dangling.push(describe(edge));
+                }
+                internal.push(edge.clone());
+            }
+            // Nothing removes rows from a table outside the sampled universe —
+            // in practice a framework-owned one — but the rows it points at ARE
+            // removed, unless the parent is copied whole or that table is
+            // emptied in the same run. Keyed on "outside the universe" rather
+            // than on the framework-table list, which holds only the names the
+            // scrub probes for: a name missing from it would otherwise reach
+            // the deletes and fail as a raw constraint violation.
+            (None, Some(parent_role))
+                if parent_role.is_subsetted() && !inputs.purged.contains(&edge.child_table) =>
+            {
+                outside_refs.push(describe(edge));
+            }
+            // The same shape, excused because the child IS purged: its rows are
+            // gone before the sample removes the parents they point at. That
+            // excuse holds only while this purge runs FIRST, so remember the
+            // edge — if the branch below then defers the very same purge, the
+            // two conclusions contradict and neither order is safe.
+            (None, Some(parent_role)) if parent_role.is_subsetted() => {
+                purged_before
+                    .entry(edge.child_table.clone())
+                    .or_default()
+                    .push(describe(edge));
+            }
+            // The mirror of the retained-child case below: an outside child —
+            // framework-owned, and NOT purged, so it keeps its rows — pointing
+            // at a sampled parent that keeps every row of its own (a full-copy
+            // table, or an exact-100% root). The two arms above already took
+            // every subsetted parent, so the sample cannot break this reference:
+            // the parent loses nothing. The re-count still wants it, for the one
+            // reason the re-count exists — a constraint a migration left
+            // `NOT VALID` over a pre-existing orphan is never revalidated by
+            // Postgres, and keeping both sides whole does not repair it. A
+            // purged child is exempt: the run empties it, and an absent row
+            // cannot dangle.
+            (None, Some(_)) if !inputs.purged.contains(&edge.child_table) => {
+                verify_only.push(edge.clone());
+            }
+            // The mirror image: a table the sample removes rows from points INTO
+            // a purged framework table. Purges run before the sample so the case
+            // above holds, which would empty the parent while these rows still
+            // reference it — so this one purge has to wait until the sample has
+            // emptied its child. That is only possible when the sample empties
+            // the child completely; if it keeps rows, no order satisfies the key.
+            (Some(child_role), None) if inputs.purged.contains(&edge.parent_table) => {
+                if *child_role == SampleRole::NeverInclude {
+                    purge_after.insert(edge.parent_table.clone());
+                    purged_after_edges
+                        .entry(edge.parent_table.clone())
+                        .or_default()
+                        .push(describe(edge));
+                } else {
+                    retained_into_purged.push(describe(edge));
+                }
+            }
+            // A retained table pointing at a framework table nothing empties.
+            // The walk has no reason to follow it — the parent keeps every row,
+            // so the reference cannot be broken BY the sample — but the
+            // re-count still wants it. A constraint a migration left `NOT VALID`
+            // over an existing orphan is never revalidated by Postgres, and
+            // keeping the parent whole does not repair it, so without this the
+            // run would report that every checked reference resolves while one
+            // does not.
+            // Keyed on "keeps any rows", NOT on `is_subsetted`: a full-copy
+            // table and an exact-100% root keep EVERY row, so they are the most
+            // likely to still hold a pre-existing orphan, and `is_subsetted` is
+            // false for both. Only a `never_include` child is exempt, because
+            // the run empties it and an absent row cannot dangle.
+            (Some(child_role), None) if *child_role != SampleRole::NeverInclude => {
+                verify_only.push(edge.clone());
+            }
+            // Two purged framework tables referencing each other. Neither is in
+            // the sampled universe, so nothing above decides their order — but
+            // the split below can now put them in DIFFERENT phases, which the
+            // single pre-sample pass never could. Remember the edge so the
+            // deferral can be propagated along it.
+            (None, None)
+                if inputs.purged.contains(&edge.child_table)
+                    && inputs.purged.contains(&edge.parent_table) =>
+            {
+                purged_internal.push((
+                    edge.child_table.clone(),
+                    edge.parent_table.clone(),
+                    describe(edge),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    propagate_deferrals(&purged_internal, &mut purge_after, &mut purged_after_edges);
+
+    raise_edge_refusals(EdgeRefusals {
+        partition_local,
+        retained_into_purged,
+        outside_refs,
+        dangling,
+    })?;
+    check_purge_order(&purge_after, &purged_before, &purged_after_edges)?;
+
+    let walk = internal
+        .iter()
+        .filter(|edge| {
+            roles[&edge.child_table] != SampleRole::NeverInclude
+                && roles[&edge.parent_table] != SampleRole::NeverInclude
+        })
+        .cloned()
+        .collect();
+    internal.extend(verify_only);
+    Ok((internal, walk, purge_after))
+}
+
+/// The edge shapes the plan refuses, gathered so one pass can report them.
+struct EdgeRefusals {
+    partition_local: Vec<String>,
+    retained_into_purged: Vec<String>,
+    outside_refs: Vec<String>,
+    dangling: Vec<String>,
+}
+
+/// Raise the first non-empty refusal, most structural first: a key the plan
+/// cannot express at all, then one no delete order satisfies, then the two
+/// dangling-reference shapes.
+fn raise_edge_refusals(mut found: EdgeRefusals) -> Result<(), SampleError> {
+    for (edges, build) in [
+        (
+            &mut found.partition_local,
+            (|e| SampleError::PartitionLocalForeignKey { edges: e }) as fn(Vec<String>) -> _,
+        ),
+        (
+            &mut found.retained_into_purged,
+            (|e| SampleError::RetainedReferencesPurged { edges: e }) as fn(Vec<String>) -> _,
+        ),
+        (
+            &mut found.outside_refs,
+            (|e| SampleError::OutsideTableReferencesSampled { edges: e }) as fn(Vec<String>) -> _,
+        ),
+        (
+            &mut found.dangling,
+            (|e| SampleError::NeverIncludeReferenced { edges: e }) as fn(Vec<String>) -> _,
+        ),
+    ] {
+        if !edges.is_empty() {
+            edges.sort();
+            return Err(build(std::mem::take(edges)));
+        }
+    }
+    Ok(())
+}
+
+/// Carry a deferred purge's own references into the deferred phase with it.
+///
+/// Emptying a purged parent in the pre-sample pass would hit the rows of a
+/// purged child that is deferred, since those survive until the deferred pass.
+/// Propagating along framework-to-framework edges keeps a connected pair in one
+/// phase. It deliberately does NOT order purges *within* a phase: that is
+/// pre-existing behaviour, and the split's job is only to avoid disturbing it.
+fn propagate_deferrals(
+    edges: &[(String, String, String)],
+    purge_after: &mut BTreeSet<String>,
+    after_edges: &mut BTreeMap<String, Vec<String>>,
+) {
+    let mut settled = false;
+    while !settled {
+        settled = true;
+        for (child, parent, edge) in edges {
+            if purge_after.contains(child) && !purge_after.contains(parent) {
+                purge_after.insert(parent.clone());
+                after_edges
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(edge.clone());
+                settled = false;
+            }
+        }
+    }
+}
+
+/// Refuse a `[framework] purge` that one edge needs before the sample and
+/// another needs after it.
+///
+/// A purge normally runs first, which is what lets `classify_edges` excuse a
+/// framework table referencing a subsetted one: its rows are gone before the
+/// sample removes the parents they point at. A purge whose own child the sample
+/// empties has to wait instead. A table in both sets leaves no position: the
+/// only valid order interleaves the sample's deletes around the purge (excluded
+/// child, then the purge, then the sampled parent), which one atomic sample
+/// between two purge passes cannot express.
+fn check_purge_order(
+    purge_after: &BTreeSet<String>,
+    before: &BTreeMap<String, Vec<String>>,
+    after: &BTreeMap<String, Vec<String>>,
+) -> Result<(), SampleError> {
+    let mut contradictions: Vec<String> = purge_after
+        .iter()
+        .filter_map(|table| {
+            Some(format!(
+                "{table}: before {}, yet after {}",
+                before.get(table)?.join(", "),
+                after.get(table)?.join(", "),
+            ))
+        })
+        .collect();
+    if contradictions.is_empty() {
+        return Ok(());
+    }
+    contradictions.sort();
+    Err(SampleError::PurgeOrderContradiction {
+        tables: contradictions,
+    })
+}
+
+/// Refuse any table rows can never flow into: sampling it would empty it
+/// silently, which is the one outcome AC #5 forbids.
+///
+/// This mirrors the runtime walk exactly rather than asking the looser question
+/// "is the table connected to anything". Two sets grow together:
+///
+/// - **descend sources** — a root, or a table the walk descended into. Only
+///   these have descend-eligible rows, so only these pull their children in. A
+///   table reached purely by ascent (a shared org a kept user points at) is
+///   NOT one, which is what stops one such row from dragging its whole subtree
+///   back in — and therefore what leaves its other children unreachable.
+/// - **covered** — a table rows actually flow into: a root, a full-copy table,
+///   a child of a descend source, or the parent of a covered table.
+fn check_coverage(
+    roles: &BTreeMap<String, SampleRole>,
+    walk: &[ForeignKeyConstraint],
+) -> Result<(), SampleError> {
+    let mut descend: BTreeSet<&str> = roles
+        .iter()
+        .filter(|(_, role)| role.descends_from_seed())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let mut covered: BTreeSet<&str> = roles
+        .iter()
+        .filter(|(_, role)| matches!(role, SampleRole::Root(_) | SampleRole::AlwaysInclude))
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for edge in walk {
+            let (child, parent) = (edge.child_table.as_str(), edge.parent_table.as_str());
+            if descend.contains(parent) && roles[child].descends() {
+                grew |= descend.insert(child);
+            }
+            if descend.contains(parent) {
+                grew |= covered.insert(child);
+            }
+            if covered.contains(child) {
+                grew |= covered.insert(parent);
+            }
+        }
+    }
+
+    let uncovered = sorted_unique(
+        roles
+            .iter()
+            .filter(|(name, role)| {
+                **role == SampleRole::Related && !covered.contains(name.as_str())
+            })
+            .map(|(name, _)| name.clone()),
+    );
+    if uncovered.is_empty() {
+        Ok(())
+    } else {
+        Err(SampleError::UncoveredTables { tables: uncovered })
+    }
+}
+
+/// Every table the sample keeps rows of needs a primary key to identify them.
+fn check_row_keys(
+    roles: &BTreeMap<String, SampleRole>,
+    keys: &BTreeMap<&str, &Vec<String>>,
+) -> Result<(), SampleError> {
+    let missing = sorted_unique(
+        roles
+            .iter()
+            .filter(|(name, role)| {
+                **role != SampleRole::NeverInclude && keys[name.as_str()].is_empty()
+            })
+            .map(|(name, _)| name.clone()),
+    );
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(SampleError::NoRowKey { tables: missing })
+    }
+}
+
+/// Order the tables so a child is always emptied before its parent, which is
+/// what keeps every foreign key satisfied at each step.
+///
+/// A self-reference is fine — a row and the row it points at are removed by the
+/// same statement, and the constraint is checked when that statement ends — but
+/// a cycle between distinct tables has no such order and is refused.
+fn delete_order(
+    roles: &BTreeMap<String, SampleRole>,
+    edges: &[ForeignKeyConstraint],
+) -> Result<Vec<String>, SampleError> {
+    // Only the tables rows are removed from need an order. A full-copy table
+    // keeps every row, so nothing can dangle through it — which is also why
+    // declaring one `always_include` is a real way out of a cycle.
+    let removed: BTreeSet<&str> = roles
+        .iter()
+        .filter(|(_, role)| role.is_subsetted())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let mut parents: BTreeMap<&str, BTreeSet<&str>> =
+        removed.iter().map(|n| (*n, BTreeSet::new())).collect();
+    let mut incoming: BTreeMap<&str, BTreeSet<&str>> =
+        removed.iter().map(|n| (*n, BTreeSet::new())).collect();
+    for edge in edges {
+        let (child, parent) = (edge.child_table.as_str(), edge.parent_table.as_str());
+        if child == parent || !removed.contains(child) || !removed.contains(parent) {
+            continue;
+        }
+        parents.entry(child).or_default().insert(parent);
+        incoming.entry(parent).or_default().insert(child);
+    }
+
+    // Kahn's algorithm, alphabetical among the ready nodes so the order — and
+    // therefore the emitted SQL — is identical on every run.
+    let mut ready: BTreeSet<&str> = incoming
+        .iter()
+        .filter(|(_, children)| children.is_empty())
+        .map(|(name, _)| *name)
+        .collect();
+    let mut remaining = incoming.clone();
+    let mut ordered: Vec<String> = Vec::with_capacity(roles.len());
+    while let Some(next) = ready.iter().next().copied() {
+        ready.remove(next);
+        ordered.push(next.to_owned());
+        for parent in &parents[next] {
+            let children = remaining.get_mut(parent).expect("edge target is a table");
+            children.remove(next);
+            if children.is_empty() {
+                ready.insert(parent);
+            }
+        }
+        remaining.remove(next);
+    }
+
+    if ordered.len() == removed.len() {
+        // The full-copy tables are never deleted from, so they carry no ordering
+        // constraint — but the plan still needs an entry for each (their
+        // keep-sets are what the walk ascends from).
+        ordered.extend(
+            roles
+                .iter()
+                .filter(|(_, role)| !role.is_subsetted())
+                .map(|(name, _)| name.clone()),
+        );
+        return Ok(ordered);
+    }
+
+    // What is left is the cycle plus everything downstream of it. Kahn already
+    // stripped the nodes with no children left; strip the ones with no parents
+    // left too, and only the tables actually in the cycle remain — naming a
+    // blameless parent alongside them would send the reader to the wrong table.
+    let mut residue: BTreeSet<&str> = remaining.keys().copied().collect();
+    loop {
+        let sinks: Vec<&str> = residue
+            .iter()
+            .filter(|name| !parents[**name].iter().any(|p| residue.contains(p)))
+            .copied()
+            .collect();
+        if sinks.is_empty() {
+            break;
+        }
+        for sink in sinks {
+            residue.remove(sink);
+        }
+    }
+    Err(SampleError::ForeignKeyCycle {
+        tables: sorted_unique(residue.into_iter().map(str::to_owned)),
+    })
+}
+
+/// Collect into a sorted, de-duplicated list — the shape every diagnostic uses.
+fn sorted_unique(items: impl Iterator<Item = String>) -> Vec<String> {
+    items.collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+// ─── SQL ────────────────────────────────────────────────────────────────────
+
+/// The expression identifying one row of `key` under `alias`.
+///
+/// A single-column key stays in its own type, so the temporary keep-set keeps
+/// an indexable native column. A composite key becomes text through
+/// `quote_nullable`, which escapes each component — so `('a,b', 'c')` and
+/// `('a', 'b,c')` cannot collapse onto the same key.
+fn key_expr(alias: &str, key: &[String]) -> String {
+    if let [single] = key {
+        return format!("{alias}.{}", quote_ident(single));
+    }
+    let parts: Vec<String> = key
+        .iter()
+        .map(|column| format!("quote_nullable({alias}.{})", quote_ident(column)))
+        .collect();
+    format!("({})", parts.join(" || ',' || "))
+}
+
+/// A constraint name rendered safe for a SQL block comment.
+///
+/// The name comes from `pg_constraint`, which is catalog text rather than a
+/// literal: `*/` inside it would close the comment and let whatever follows
+/// run as part of the statement. It is a label, so anything outside a plain
+/// identifier alphabet becomes `_`.
+/// What the emitted walk loop raises if it somehow fails to settle.
+const ITERATION_LIMIT_MESSAGE: &str = "the sample selection did not settle; the closure walk did \
+                                       not reach a fixpoint";
+
+/// A dollar-quote tag that cannot terminate `body` early.
+///
+/// Dollar quoting is lexical: a `$tag$` sequence ends the literal wherever it
+/// appears, including inside a block comment or a quoted identifier — and a
+/// Postgres identifier may legally contain `$`. Rather than assume the source
+/// has no such name, widen the tag until the body cannot contain it.
+pub fn dollar_tag(body: &str) -> String {
+    let mut tag = String::from("$autumn_walk$");
+    while body.contains(&tag) {
+        tag.insert(tag.len() - 1, '_');
+    }
+    tag
+}
+
+pub fn comment_safe(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The `ON` clause joining a child to its parent across every key component.
+///
+/// The two sides are zipped, and `zip` stops at the shorter one — which would
+/// silently emit a WEAKER join than the constraint, matching rows the key does
+/// not. `classify_edges` refuses a mismatched key before this runs, so the two
+/// lists are known to be the same length here.
+fn join_on(edge: &ForeignKeyConstraint, child: &str, parent: &str) -> String {
+    edge.child_columns
+        .iter()
+        .zip(&edge.parent_columns)
+        .map(|(c, p)| format!("{parent}.{} = {child}.{}", quote_ident(p), quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+impl SamplePlan {
+    /// The table entry for `name`.
+    fn table(&self, name: &str) -> &SampleTable {
+        self.tables
+            .iter()
+            .find(|t| t.table == name)
+            .expect("every edge names a table in the plan")
+    }
+
+    /// The tables that need a keep-set at all.
+    ///
+    /// An excluded table is emptied by a bare `DELETE`, so it needs no row
+    /// identity — which is why it is also the one table allowed to have no
+    /// primary key. Building it a set anyway would render an empty key
+    /// expression and emit invalid SQL.
+    fn keyed_tables(&self) -> impl Iterator<Item = &SampleTable> {
+        self.tables
+            .iter()
+            .filter(|t| t.role != SampleRole::NeverInclude)
+    }
+
+    /// `CREATE TEMP TABLE` for every keep- and descend-set.
+    ///
+    /// `AS SELECT … WITH NO DATA` copies the key's own type rather than casting
+    /// everything to text, so the join back to the source table can use its
+    /// primary-key index. `ON COMMIT DROP` ties every set to the scrub's
+    /// transaction: a rollback leaves nothing behind.
+    #[must_use]
+    pub fn setup_statements(&self) -> Vec<String> {
+        self.keyed_tables()
+            .flat_map(|table| {
+                [&table.keep, &table.descend].map(|set| {
+                    format!(
+                        "CREATE TEMPORARY TABLE {} ON COMMIT DROP AS \
+                         SELECT {} AS k FROM {} AS t WITH NO DATA",
+                        quote_ident(set),
+                        key_expr("t", &table.key),
+                        qualified(&table.table),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Index and analyse every set, run AFTER the roots are seeded.
+    ///
+    /// Order matters twice over: an index built on an empty table is built for
+    /// nothing, and autovacuum never touches a temporary table — so without an
+    /// explicit `ANALYZE` the planner sizes every set at its 10-page default
+    /// and picks a hash join over the index path for the whole first pass.
+    #[must_use]
+    pub fn index_statements(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for table in self.keyed_tables() {
+            for set in [&table.keep, &table.descend] {
+                out.push(format!("CREATE INDEX ON {}(k)", quote_ident(set)));
+                out.push(format!("ANALYZE {}", quote_ident(set)));
+            }
+        }
+        out
+    }
+
+    /// Re-analyse every set, run after each closure pass so the next pass plans
+    /// against the sizes it will actually see.
+    #[must_use]
+    pub fn analyze_statements(&self) -> Vec<String> {
+        self.keyed_tables()
+            .flat_map(|table| {
+                [&table.keep, &table.descend].map(|set| format!("ANALYZE {}", quote_ident(set)))
+            })
+            .collect()
+    }
+
+    /// Seed the roots (deterministically) and the always-include tables.
+    ///
+    /// A root's rows are ordered by a hash of the seed and the row key — not by
+    /// physical order and not by `random()` — so the same seed against the same
+    /// source data selects the identical rows, and `LIMIT` keeps the sort
+    /// bounded (Postgres uses a top-N heapsort) on a table of any size.
+    #[must_use]
+    pub fn seed_statements(&self, counts: &BTreeMap<String, i64>) -> Vec<String> {
+        let seed = quote_literal(&self.seed.to_string());
+        let mut out = Vec::new();
+        for table in &self.tables {
+            let key = key_expr("t", &table.key);
+            match table.role {
+                SampleRole::Root(amount) => {
+                    let rows = amount.rows(counts.get(&table.table).copied().unwrap_or(0));
+                    out.push(format!(
+                        "INSERT INTO {} (k) SELECT k FROM (\
+                         SELECT {key} AS k FROM {} AS t \
+                         ORDER BY md5({seed} || '|' || ({key})::text), ({key})::text \
+                         LIMIT {rows}) AS chosen",
+                        quote_ident(&table.keep),
+                        qualified(&table.table),
+                    ));
+                    out.push(format!(
+                        "INSERT INTO {} (k) SELECT k FROM {}",
+                        quote_ident(&table.descend),
+                        quote_ident(&table.keep),
+                    ));
+                }
+                SampleRole::AlwaysInclude => out.push(format!(
+                    "INSERT INTO {} (k) SELECT {key} FROM {} AS t",
+                    quote_ident(&table.keep),
+                    qualified(&table.table),
+                )),
+                SampleRole::NeverInclude | SampleRole::Related => {}
+            }
+        }
+        out
+    }
+
+    /// One closure pass: ascend then descend over every walked edge. Run
+    /// repeatedly until a pass selects nothing new.
+    #[must_use]
+    pub fn walk_statements(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for edge in &self.walk_edges {
+            let child = self.table(&edge.child_table);
+            let parent = self.table(&edge.parent_table);
+            let child_key = key_expr("c", &child.key);
+            let parent_key = key_expr("p", &parent.key);
+            let on = join_on(edge, "c", "p");
+            let tag = format!("/* {} */ ", comment_safe(&edge.name));
+
+            // Ascend: keep the parent of every kept child, so the reference
+            // resolves. A full-copy parent already holds every row.
+            if parent.role != SampleRole::AlwaysInclude {
+                out.push(format!(
+                    "{tag}INSERT INTO {keep} (k) SELECT DISTINCT {parent_key} \
+                     FROM {parent_table} AS p \
+                     JOIN {child_table} AS c ON {on} \
+                     JOIN {child_keep} AS ck ON ck.k = {child_key} \
+                     WHERE NOT EXISTS (SELECT 1 FROM {keep} AS existing \
+                     WHERE existing.k = {parent_key})",
+                    keep = quote_ident(&parent.keep),
+                    parent_table = qualified(&parent.table),
+                    child_table = qualified(&child.table),
+                    child_keep = quote_ident(&child.keep),
+                ));
+            }
+
+            // Descend: keep every child of a descend-eligible parent, and make
+            // those children descend-eligible in turn. A full-copy child already
+            // holds every row, and nothing ever descends out of it, so neither
+            // of its sets is worth filling.
+            if parent.role.descends() && child.role.descends() {
+                for set in [&child.keep, &child.descend] {
+                    out.push(format!(
+                        "{tag}INSERT INTO {set} (k) SELECT DISTINCT {child_key} \
+                         FROM {child_table} AS c \
+                         JOIN {parent_table} AS p ON {on} \
+                         JOIN {parent_descend} AS pd ON pd.k = {parent_key} \
+                         WHERE NOT EXISTS (SELECT 1 FROM {set} AS existing \
+                         WHERE existing.k = {child_key})",
+                        set = quote_ident(set),
+                        child_table = qualified(&child.table),
+                        parent_table = qualified(&parent.table),
+                        parent_descend = quote_ident(&parent.descend),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// The closure walk as one executable statement: the fixpoint loop itself.
+    ///
+    /// [`Self::walk_statements`] is **one pass**. [`apply`] repeats it until a
+    /// pass selects nothing, and a printed script that runs each statement once
+    /// is a different command: within a pass the statements run in list order,
+    /// so a chain deeper than the order happens to favour is only partly
+    /// selected, and the edge order comes from the catalog rather than from
+    /// anything this module chooses. The rows below the point it reached are
+    /// then deleted — silently, because deleting a descendant breaks no foreign
+    /// key and every integrity assertion still passes.
+    ///
+    /// So the dry run emits this instead of the bare statements: the same
+    /// walk, the same per-pass `ANALYZE`, and the same `MAX_PASSES` ceiling,
+    /// wrapped in the loop that makes them a fixpoint.
+    #[must_use]
+    pub fn walk_loop_statement(&self) -> String {
+        let mut body = vec![
+            "DECLARE".to_owned(),
+            "  moved bigint;".to_owned(),
+            "  total bigint;".to_owned(),
+            "  passes integer := 0;".to_owned(),
+            "BEGIN".to_owned(),
+            "  LOOP".to_owned(),
+            "    total := 0;".to_owned(),
+        ];
+        for statement in self.walk_statements() {
+            body.push(format!("    {statement};"));
+            // Immediately, before the next statement overwrites it.
+            body.push("    GET DIAGNOSTICS moved = ROW_COUNT;".to_owned());
+            body.push("    total := total + moved;".to_owned());
+        }
+        for statement in self.analyze_statements() {
+            body.push(format!("    {statement};"));
+        }
+        body.push("    passes := passes + 1;".to_owned());
+        body.push("    EXIT WHEN total = 0;".to_owned());
+        body.push(format!("    IF passes >= {MAX_PASSES} THEN"));
+        body.push(format!(
+            "      RAISE EXCEPTION {};",
+            quote_literal(ITERATION_LIMIT_MESSAGE),
+        ));
+        body.push("    END IF;".to_owned());
+        body.push("  END LOOP;".to_owned());
+        body.push("END".to_owned());
+        let body = body.join("\n");
+        let tag = dollar_tag(&body);
+        format!("DO {tag}\n{body}\n{tag}")
+    }
+
+    /// The row-removing `DELETE`s, children before parents.
+    #[must_use]
+    pub fn delete_statements(&self) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter_map(|table| match table.role {
+                // Nothing to remove, so nothing to state. An exact-100% root is
+                // the same case as a full copy and is skipped for the same
+                // reason: a `DELETE` matching no rows still fires a
+                // statement-level trigger, and `report_triggers` does not warn
+                // about a table it knows is not subsetted — so the run would
+                // have side effects it never mentioned, on a flag that asks for
+                // everything to be kept.
+                _ if !table.role.is_subsetted() => None,
+                SampleRole::AlwaysInclude => None,
+                SampleRole::NeverInclude => {
+                    Some(format!("DELETE FROM {}", qualified(&table.table)))
+                }
+                SampleRole::Root(_) | SampleRole::Related => Some(format!(
+                    "DELETE FROM {} AS t WHERE NOT EXISTS \
+                     (SELECT 1 FROM {} AS k WHERE k.k = {})",
+                    qualified(&table.table),
+                    quote_ident(&table.keep),
+                    key_expr("t", &table.key),
+                )),
+            })
+            .collect()
+    }
+
+    /// The tables the sample removes rows from, so the caller can rewrite their
+    /// files afterwards. A full-copy table is untouched and needs no rewrite.
+    #[must_use]
+    pub fn subsetted_tables(&self) -> Vec<&str> {
+        self.tables
+            .iter()
+            .filter(|t| t.role.is_subsetted())
+            .map(|t| t.table.as_str())
+            .collect()
+    }
+
+    /// The tables `never_include` promises will be EMPTY, as `(table, DELETE)`.
+    ///
+    /// The sample empties them, but that runs before the column rewrites, and a
+    /// trigger on a scrubbed table can insert into one afterwards — carrying the
+    /// original PII into a table the run reported as emptied. So the caller
+    /// re-runs these after every write, exactly as it re-runs `[framework]
+    /// purge`: a promise of emptiness is only true if it is enforced last.
+    #[must_use]
+    pub fn emptied_tables(&self) -> Vec<(&str, String)> {
+        self.tables
+            .iter()
+            .filter(|t| t.role == SampleRole::NeverInclude)
+            .map(|t| {
+                (
+                    t.table.as_str(),
+                    format!("DELETE FROM {}", qualified(&t.table)),
+                )
+            })
+            .collect()
+    }
+
+    /// Every table the sample reads or writes, which the scrub locks for the
+    /// duration so a row inserted mid-run cannot escape the subset — a
+    /// full-copy table included, because the walk reads it to decide which
+    /// parents to keep.
+    ///
+    /// The foreign key re-count's own endpoints count as reads, which is why
+    /// they are here even when the sample never touches their rows. Two things
+    /// follow from a table being in this list, and the re-count needs both: the
+    /// scrub refuses to run when it has row-level security (a policy would hide
+    /// the very orphan the count exists to find, and it would report success),
+    /// and the rows cannot change under the count before the commit.
+    #[must_use]
+    pub fn locked_tables(&self) -> Vec<&str> {
+        let mut tables: Vec<&str> = self
+            .tables
+            .iter()
+            .map(|t| t.table.as_str())
+            .chain(
+                self.verify_edges
+                    .iter()
+                    .flat_map(|edge| [edge.child_table.as_str(), edge.parent_table.as_str()]),
+            )
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+        tables
+    }
+
+    /// One orphan-counting query per foreign key, as `(label, sql)`.
+    ///
+    /// Postgres enforces these constraints itself, so this is a second opinion
+    /// rather than the only one — and it is the one that catches a constraint
+    /// left `NOT VALID` by a migration, which the server does not re-check.
+    #[must_use]
+    pub fn integrity_statements(&self) -> Vec<(String, String)> {
+        self.verify_edges
+            .iter()
+            .map(|edge| {
+                let on = join_on(edge, "c", "p");
+                // Under the default MATCH SIMPLE a composite reference with any
+                // NULL component is satisfied by definition, so only
+                // fully-populated references are checked for a missing parent.
+                let populated = edge
+                    .child_columns
+                    .iter()
+                    .map(|c| format!("c.{} IS NOT NULL", quote_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let missing = format!("p.{} IS NULL", quote_ident(&edge.parent_columns[0]));
+                // MATCH FULL admits only all-NULL or all-populated tuples, so a
+                // partially-NULL one is itself a violation — and one Postgres
+                // will not re-check for us on a constraint a migration left
+                // `NOT VALID`, which is exactly what this recount is for.
+                let mixed_null = if edge.match_full && edge.child_columns.len() > 1 {
+                    let any_null = edge
+                        .child_columns
+                        .iter()
+                        .map(|c| format!("c.{} IS NULL", quote_ident(c)))
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    Some(format!(
+                        "({any_null}) AND ({populated_any})",
+                        populated_any = edge
+                            .child_columns
+                            .iter()
+                            .map(|c| format!("c.{} IS NOT NULL", quote_ident(c)))
+                            .collect::<Vec<_>>()
+                            .join(" OR ")
+                    ))
+                } else {
+                    None
+                };
+                (
+                    // Sanitized here rather than at the point of use: this label
+                    // is printed into a `--` comment in the dry run, where a
+                    // newline inside a quoted identifier would end the comment
+                    // and leave the rest of the name as executable SQL in a
+                    // sequence advertised as paste-ready.
+                    format!(
+                        "{} ({} -> {})",
+                        comment_safe(&edge.name),
+                        comment_safe(&edge.child_table),
+                        comment_safe(&edge.parent_table),
+                    ),
+                    format!(
+                        "SELECT count(*) AS n FROM {} AS c \
+                         LEFT JOIN {} AS p ON {on} \
+                         WHERE ({populated} AND {missing}){extra}",
+                        qualified(&edge.child_table),
+                        qualified(&edge.parent_table),
+                        extra = mixed_null
+                            .as_ref()
+                            .map_or_else(String::new, |m| format!(" OR ({m})")),
+                    ),
+                )
+            })
+            .collect()
+    }
+}
+
+// ─── Execution ──────────────────────────────────────────────────────────────
+
+/// A single `count(*)`.
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// What one table contributed to the sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleCount {
+    /// The table name.
+    pub table: String,
+    /// Why it holds the rows it does (`root`, `related`, …).
+    pub role: &'static str,
+    /// Rows in the source.
+    pub before: i64,
+    /// Rows in the sample.
+    pub after: i64,
+}
+
+/// What one sampled database ended up with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleOutcome {
+    /// Per-table row counts, in delete order.
+    pub counts: Vec<SampleCount>,
+    /// Closure passes the walk needed.
+    pub passes: usize,
+    /// Foreign keys re-verified after the deletes.
+    pub verified: usize,
+    /// Total relation size of the sampled tables before the deletes, in bytes.
+    pub size_before: i64,
+}
+
+/// The on-disk size of every relation the run touches, indexes and TOAST
+/// included.
+///
+/// Deliberately not `pg_database_size`: that is dominated by the system
+/// catalogs and template data on a small database, so it would report a 99%
+/// "saving" of nothing. The question a sample answers is how much of the app's
+/// own data the copy carries.
+///
+/// `also` carries the relations the run touches from OUTSIDE the plan: the
+/// `[framework] purge` targets it empties, and the materialized views it
+/// refreshes. Both belong on both sides of the ratio. A refreshed view is the
+/// less obvious one and the more misleading to omit — it is rebuilt from
+/// whatever survives the sample, so a view over reference data stays exactly as
+/// large as before while the report, measuring base tables only, announces a
+/// laptop-sized result. Measured: a 44 MB view over an `always_include` table,
+/// reported as `488.0 kB -> 232.0 kB` on a database still holding 44 MB.
+///
+/// # Errors
+///
+/// Returns the database error.
+pub fn data_size(
+    conn: &mut PgConnection,
+    plan: &SamplePlan,
+    also: &[String],
+) -> Result<i64, diesel::result::Error> {
+    // Names, not relkinds: `pg_total_relation_size` answers for a materialized
+    // view the same way it answers for a table, and the walk below reaches a
+    // partitioned parent's leaves either way.
+    let mut measured: Vec<&str> = plan
+        .tables
+        .iter()
+        .map(|t| t.table.as_str())
+        .chain(also.iter().map(String::as_str))
+        .collect();
+    measured.sort_unstable();
+    measured.dedup();
+    let names = measured
+        .into_iter()
+        .map(quote_literal)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.is_empty() {
+        return Ok(0);
+    }
+    // Walked through `pg_inherits` rather than measured directly: a
+    // partitioned parent holds no rows of its own, so `pg_total_relation_size`
+    // on it is zero and a partitioned schema would report a size of nothing.
+    let rows: Vec<CountRow> = sql_query(format!(
+        "WITH RECURSIVE named AS ( \
+           SELECT c.oid FROM pg_class c \
+           JOIN pg_namespace ns ON ns.oid = c.relnamespace AND ns.nspname = 'public' \
+           WHERE c.relname IN ({names}) \
+         ), tree AS ( \
+           SELECT oid FROM named \
+           UNION \
+           SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON t.oid = i.inhparent \
+         ) \
+         SELECT coalesce(sum(pg_total_relation_size(oid)), 0)::bigint AS n FROM tree"
+    ))
+    .load(conn)?;
+    Ok(rows.first().map_or(0, |r| r.n))
+}
+
+/// Live row counts for every table in the sample, which size the roots and
+/// anchor the report.
+///
+/// # Errors
+///
+/// Returns the database error.
+pub fn source_counts(
+    conn: &mut PgConnection,
+    plan: &SamplePlan,
+) -> Result<BTreeMap<String, i64>, diesel::result::Error> {
+    let mut counts = BTreeMap::new();
+    for table in &plan.tables {
+        counts.insert(table.table.clone(), count_rows(conn, &table.table)?);
+    }
+    Ok(counts)
+}
+
+/// The row count of one table.
+fn count_rows(conn: &mut PgConnection, table: &str) -> Result<i64, diesel::result::Error> {
+    let rows: Vec<CountRow> =
+        sql_query(format!("SELECT count(*) AS n FROM {}", qualified(table))).load(conn)?;
+    Ok(rows.first().map_or(0, |r| r.n))
+}
+
+/// Why a sample run inside the scrub's transaction ended.
+///
+/// The two channels are separate so a refusal cannot be mistaken for a database
+/// failure: `diesel` insists a transaction closure's error type be built from
+/// its own, which would otherwise flatten a `SampleError` into an opaque
+/// rollback.
+#[derive(Debug)]
+pub enum SampleFailure {
+    /// The sample itself was refused; the transaction rolls back.
+    Refused(SampleError),
+    /// The database rejected a statement.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for SampleFailure {
+    fn from(e: diesel::result::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+/// Run the sample inside the scrub's own transaction.
+///
+/// A refusal rolls the transaction back, so nothing is ever left half-sampled —
+/// and, because this runs before the scrub's own rewrites in the same
+/// transaction, no rows can be committed sampled but unscrubbed.
+///
+/// # Errors
+///
+/// Returns [`SampleFailure::Refused`] when the sample is refused, or
+/// [`SampleFailure::Db`] when a statement fails.
+pub fn apply(
+    conn: &mut PgConnection,
+    plan: &SamplePlan,
+    also_measured: &[String],
+) -> Result<SampleOutcome, SampleFailure> {
+    // Measured before the sample's deletes, and correct for the purge targets in
+    // `also_measured` even though those purges have already run: `DELETE` frees
+    // no file space, so a purged table still occupies its full size here.
+    let size_before = data_size(conn, plan, also_measured)?;
+
+    let before = source_counts(conn, plan)?;
+
+    for statement in plan.setup_statements() {
+        sql_query(statement).execute(conn)?;
+    }
+    for statement in plan.seed_statements(&before) {
+        sql_query(statement).execute(conn)?;
+    }
+    for statement in plan.index_statements() {
+        sql_query(statement).execute(conn)?;
+    }
+
+    let walk = plan.walk_statements();
+    let analyze = plan.analyze_statements();
+    let mut passes = 0;
+    loop {
+        let mut selected = 0;
+        for statement in &walk {
+            selected += sql_query(statement).execute(conn)?;
+        }
+        for statement in &analyze {
+            sql_query(statement).execute(conn)?;
+        }
+        passes += 1;
+        if selected == 0 {
+            break;
+        }
+        if passes >= MAX_PASSES {
+            return Err(SampleFailure::Refused(SampleError::IterationLimit));
+        }
+    }
+
+    for statement in plan.delete_statements() {
+        sql_query(statement).execute(conn)?;
+    }
+
+    let mut violations = Vec::new();
+    let checks = plan.integrity_statements();
+    for (label, sql) in &checks {
+        let orphans = sql_query(sql)
+            .load::<CountRow>(conn)?
+            .first()
+            .map_or(0, |r| r.n);
+        if orphans > 0 {
+            violations.push(format!("{label}: {orphans} unresolved reference(s)"));
+        }
+    }
+    if !violations.is_empty() {
+        violations.sort();
+        return Err(SampleFailure::Refused(SampleError::IntegrityViolation {
+            violations,
+        }));
+    }
+
+    let mut counts = Vec::with_capacity(plan.tables.len());
+    for table in &plan.tables {
+        counts.push(SampleCount {
+            role: table.role.as_str(),
+            before: before[&table.table],
+            after: count_rows(conn, &table.table)?,
+            table: table.table.clone(),
+        });
+    }
+
+    Ok(SampleOutcome {
+        counts,
+        passes,
+        verified: checks.len(),
+        size_before,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Fixtures ────────────────────────────────────────────────────────────
+
+    fn table(name: &str, key: &[&str]) -> (String, Vec<String>) {
+        (
+            name.to_owned(),
+            key.iter().map(|k| (*k).to_owned()).collect(),
+        )
+    }
+
+    fn fk(
+        name: &str,
+        child: &str,
+        child_col: &str,
+        parent: &str,
+        parent_col: &str,
+    ) -> ForeignKeyConstraint {
+        ForeignKeyConstraint {
+            name: name.to_owned(),
+            child_table: child.to_owned(),
+            child_columns: vec![child_col.to_owned()],
+            parent_table: parent.to_owned(),
+            parent_columns: vec![parent_col.to_owned()],
+            match_full: false,
+        }
+    }
+
+    fn root(table: &str, amount: SampleAmount) -> SampleSpec {
+        SampleSpec {
+            table: table.to_owned(),
+            amount,
+        }
+    }
+
+    /// `users(id) ← comments(user_id)`, plus a `countries` lookup `users`
+    /// references and an unrelated `audit_logs`.
+    fn schema() -> (Vec<(String, Vec<String>)>, Vec<ForeignKeyConstraint>) {
+        (
+            vec![
+                table("users", &["id"]),
+                table("comments", &["id"]),
+                table("countries", &["id"]),
+                table("audit_logs", &["id"]),
+            ],
+            vec![
+                fk("comments_user_fk", "comments", "user_id", "users", "id"),
+                fk("users_country_fk", "users", "country_id", "countries", "id"),
+            ],
+        )
+    }
+
+    fn plan_of(
+        roots: &[SampleSpec],
+        rules: &SampleRules,
+        tables: &[(String, Vec<String>)],
+        foreign_keys: &[ForeignKeyConstraint],
+    ) -> Result<SamplePlan, SampleError> {
+        build_plan(&SampleInputs {
+            roots,
+            seed: 7,
+            rules,
+            tables,
+            foreign_keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+    }
+
+    /// The default rules for the fixture schema: `countries` in full,
+    /// `audit_logs` dropped — without them the fixture has an uncovered table.
+    fn fixture_rules() -> SampleRules {
+        SampleRules {
+            always_include: vec!["countries".to_owned()],
+            never_include: vec!["audit_logs".to_owned()],
+        }
+    }
+
+    fn role_of(plan: &SamplePlan, table: &str) -> SampleRole {
+        plan.tables
+            .iter()
+            .find(|t| t.table == table)
+            .unwrap_or_else(|| panic!("{table} is not in the plan"))
+            .role
+    }
+
+    fn joined(statements: &[String]) -> String {
+        statements.join("\n")
+    }
+
+    // ── Spec parsing ────────────────────────────────────────────────────────
+
+    #[test]
+    fn spec_parses_a_percentage() {
+        assert_eq!(
+            parse_spec("users=1%").unwrap(),
+            root("users", SampleAmount::Percent(1.0))
+        );
+        assert_eq!(
+            parse_spec("users=2.5%").unwrap(),
+            root("users", SampleAmount::Percent(2.5))
+        );
+    }
+
+    #[test]
+    fn spec_parses_an_absolute_count() {
+        assert_eq!(
+            parse_spec("users=500").unwrap(),
+            root("users", SampleAmount::Count(500))
+        );
+    }
+
+    /// A table name may contain `=`; an amount never does.
+    ///
+    /// `CREATE TABLE "events=2026"` is legal `PostgreSQL`, and every identifier
+    /// path in this module already quotes rather than assumes. Splitting the
+    /// spec at the FIRST `=` left such a table with no spelling at all: the
+    /// remainder parsed as the amount and was rejected, so the root could not
+    /// be named however it was written.
+    #[test]
+    fn spec_splits_a_table_name_containing_the_delimiter() {
+        assert_eq!(
+            parse_spec("events=2026=500").unwrap(),
+            root("events=2026", SampleAmount::Count(500))
+        );
+        assert_eq!(
+            parse_spec("events=2026=1%").unwrap(),
+            root("events=2026", SampleAmount::Percent(1.0))
+        );
+        // And the ordinary case is unchanged, which is the whole reason the
+        // last `=` is the safe one to split at.
+        assert_eq!(
+            parse_spec("users=500").unwrap(),
+            root("users", SampleAmount::Count(500))
+        );
+    }
+
+    /// A table name may begin or end with a space; an amount may not.
+    ///
+    /// Trimming the table portion did not merely make such a root unnameable —
+    /// it silently retargeted the run. Measured against `PostgreSQL` 16.13 with
+    /// both `" users"` and `users` present, `--sample " users=5"` reported
+    /// "Sampling control from users" and subsetted `users`: a different table,
+    /// chosen by the parser rather than the operator.
+    #[test]
+    fn spec_keeps_leading_and_trailing_space_in_a_table_name() {
+        assert_eq!(
+            parse_spec(" users=5").unwrap(),
+            root(" users", SampleAmount::Count(5))
+        );
+        assert_eq!(
+            parse_spec("users =5").unwrap(),
+            root("users ", SampleAmount::Count(5))
+        );
+        // The amount is still trimmed — it has no whitespace worth preserving.
+        assert_eq!(
+            parse_spec("users= 5 ").unwrap(),
+            root("users", SampleAmount::Count(5))
+        );
+        assert_eq!(
+            parse_spec("users= 2.5% ").unwrap(),
+            root("users", SampleAmount::Percent(2.5))
+        );
+    }
+
+    #[test]
+    fn spec_rejects_malformed_amounts() {
+        for bad in [
+            "users",      // no amount
+            "=1%",        // no table
+            "users=",     // empty amount
+            "users=0",    // an empty root selects nothing
+            "users=0%",   //
+            "users=101%", // more than the whole table
+            "users=-5",
+            "users=abc",
+            "users=1.5", // fractional rows only make sense as a percentage
+        ] {
+            assert!(
+                matches!(parse_spec(bad), Err(SampleError::InvalidSpec { .. })),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_percentage_rounds_up_to_at_least_one_row() {
+        // 1% of 10 rows is 0.1 — a sample that selected nothing would be a
+        // silently empty database, so it rounds up.
+        assert_eq!(SampleAmount::Percent(1.0).rows(10), 1);
+        assert_eq!(SampleAmount::Percent(1.0).rows(1000), 10);
+        assert_eq!(SampleAmount::Percent(100.0).rows(1000), 1000);
+        // An empty source table stays empty.
+        assert_eq!(SampleAmount::Percent(50.0).rows(0), 0);
+        // `ceil` alone does not deliver the round-up: the product underflows
+        // for a denormal percentage, and `parse_spec` accepts one because it is
+        // finite and greater than zero. Measured before the clamp: 0 rows for a
+        // table of 1 and of 10 — and a zero-row seed makes the root's DELETE
+        // match every row, emptying the table it was asked to sample.
+        assert_eq!(SampleAmount::Percent(5e-324).rows(1), 1);
+        assert_eq!(SampleAmount::Percent(5e-324).rows(10), 1);
+        assert_eq!(SampleAmount::Percent(5e-324).rows(200), 1);
+        // An empty table still selects nothing: there is no row to round up to.
+        assert_eq!(SampleAmount::Percent(5e-324).rows(0), 0);
+    }
+
+    #[test]
+    fn a_count_is_capped_at_the_source_row_count() {
+        assert_eq!(SampleAmount::Count(500).rows(1000), 500);
+        assert_eq!(SampleAmount::Count(5000).rows(1000), 1000);
+    }
+
+    // ── Roles and coverage ──────────────────────────────────────────────────
+
+    #[test]
+    fn plan_assigns_root_always_never_and_derived_roles() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Percent(1.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(
+            role_of(&plan, "users"),
+            SampleRole::Root(SampleAmount::Percent(1.0))
+        );
+        assert_eq!(role_of(&plan, "comments"), SampleRole::Related);
+        assert_eq!(role_of(&plan, "countries"), SampleRole::AlwaysInclude);
+        assert_eq!(role_of(&plan, "audit_logs"), SampleRole::NeverInclude);
+    }
+
+    #[test]
+    fn plan_refuses_a_table_no_root_can_reach() {
+        let (tables, keys) = schema();
+        // `audit_logs` is connected to nothing and declared nothing: sampling
+        // would empty it silently, which is exactly what AC #5 forbids.
+        let err = plan_of(
+            &[root("users", SampleAmount::Percent(1.0))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned()],
+                never_include: Vec::new(),
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::UncoveredTables {
+                tables: vec!["audit_logs".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_covers_a_table_reachable_only_through_a_lookup_table() {
+        // `regions` is reachable from the always-include `countries`, not from
+        // the root — the walk still covers it, so it is not refused.
+        let mut tables = schema().0;
+        tables.push(table("regions", &["id"]));
+        let mut keys = schema().1;
+        keys.push(fk(
+            "countries_region_fk",
+            "countries",
+            "region_id",
+            "regions",
+            "id",
+        ));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Percent(1.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(role_of(&plan, "regions"), SampleRole::Related);
+    }
+
+    #[test]
+    fn plan_refuses_a_table_hanging_off_a_table_the_walk_only_ascended_into() {
+        // `orgs` is reached by ascent (a kept user points at it), so its rows
+        // are never descended from — which means nothing reaches `org_settings`
+        // and it would be emptied silently. Coverage has to model that, not
+        // just "is it connected to something".
+        let (mut tables, mut keys) = schema();
+        tables.push(table("orgs", &["id"]));
+        tables.push(table("org_settings", &["id"]));
+        keys.push(fk("users_org_fk", "users", "org_id", "orgs", "id"));
+        keys.push(fk(
+            "org_settings_org_fk",
+            "org_settings",
+            "org_id",
+            "orgs",
+            "id",
+        ));
+        let err = plan_of(
+            &[root("users", SampleAmount::Percent(1.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::UncoveredTables {
+                tables: vec!["org_settings".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_covers_a_table_below_a_root_through_two_hops() {
+        // The other side of the same rule: descent is transitive, so a
+        // grandchild of a root is covered without any declaration.
+        let (mut tables, mut keys) = schema();
+        tables.push(table("comment_votes", &["id"]));
+        keys.push(fk(
+            "comment_votes_comment_fk",
+            "comment_votes",
+            "comment_id",
+            "comments",
+            "id",
+        ));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Percent(1.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(role_of(&plan, "comment_votes"), SampleRole::Related);
+    }
+
+    #[test]
+    fn plan_refuses_a_reference_into_a_never_include_table() {
+        let (mut tables, mut keys) = schema();
+        tables.push(table("notes", &["id"]));
+        keys.push(fk("notes_user_fk", "notes", "user_id", "users", "id"));
+        keys.push(fk(
+            "notes_audit_fk",
+            "notes",
+            "audit_id",
+            "audit_logs",
+            "id",
+        ));
+        let err = plan_of(
+            &[root("users", SampleAmount::Percent(1.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::NeverIncludeReferenced {
+                edges: vec!["notes -> audit_logs (notes_audit_fk)".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_an_unknown_root() {
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root("nope", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::UnknownRoot {
+                tables: vec!["\"nope\"".to_owned()]
+            },
+            "quoted, so a name whose only oddity is invisible reads as one"
+        );
+    }
+
+    /// A root that differs from a real table only by surrounding space says so.
+    ///
+    /// The parser takes the table verbatim, so `--sample " users=5"` against a
+    /// schema with `users` is an unknown root rather than a silent retarget.
+    /// Unquoted and unexplained, that message would be indistinguishable from
+    /// naming `users` itself and finding it missing.
+    #[test]
+    fn plan_suggests_the_trimmed_name_for_a_space_padded_root() {
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root(" users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        let SampleError::UnknownRoot { tables: reported } = err else {
+            panic!("a space-padded root must be unknown, not silently trimmed");
+        };
+        assert_eq!(reported.len(), 1);
+        assert!(
+            reported[0].contains("\" users\"") && reported[0].contains("did you mean \"users\""),
+            "the message must show the space and name the table it would have hit: {}",
+            reported[0]
+        );
+
+        // A name that trims to nothing real gets no invented suggestion.
+        let err = plan_of(
+            &[root(" nope ", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        let SampleError::UnknownRoot { tables: reported } = err else {
+            panic!("unknown is unknown");
+        };
+        assert!(
+            !reported[0].contains("did you mean"),
+            "no suggestion where trimming would not have matched: {}",
+            reported[0]
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_duplicate_root() {
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[
+                root("users", SampleAmount::Count(10)),
+                root("users", SampleAmount::Count(20)),
+            ],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::DuplicateRoot {
+                table: "users".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_root_that_is_also_never_included() {
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned()],
+                never_include: vec!["users".to_owned(), "audit_logs".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::RootNeverIncluded {
+                tables: vec!["users".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_root_that_is_also_copied_whole() {
+        // A size and "every row" are two different answers, and letting the
+        // root win would quietly make a lookup table a descend source.
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root("countries", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::RootAlwaysIncluded {
+                tables: vec!["countries".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_table_declared_both_always_and_never() {
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned(), "audit_logs".to_owned()],
+                never_include: vec!["audit_logs".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::RuleContradiction {
+                tables: vec!["audit_logs".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_stale_sample_rule() {
+        let (tables, keys) = schema();
+        let err = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned(), "gone".to_owned()],
+                never_include: vec!["audit_logs".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::StaleRule {
+                tables: vec!["gone".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_framework_table_in_the_sample_rules() {
+        let (tables, keys) = schema();
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 0,
+            rules: &SampleRules {
+                always_include: vec!["countries".to_owned()],
+                never_include: vec!["audit_logs".to_owned(), "autumn_jobs".to_owned()],
+            },
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::FrameworkRule {
+                tables: vec!["autumn_jobs".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_table_without_a_primary_key() {
+        let (mut tables, mut keys) = schema();
+        tables.push(table("logins", &[]));
+        keys.push(fk("logins_user_fk", "logins", "user_id", "users", "id"));
+        let err = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::NoRowKey {
+                tables: vec!["logins".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_ignores_a_missing_primary_key_on_a_never_include_table() {
+        // A table that is emptied outright needs no row identity.
+        let (mut tables, keys) = schema();
+        tables.push(table("raw_events", &[]));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned()],
+                never_include: vec!["audit_logs".to_owned(), "raw_events".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(role_of(&plan, "raw_events"), SampleRole::NeverInclude);
+    }
+
+    #[test]
+    fn plan_refuses_a_reference_cycle_between_tables() {
+        let (mut tables, mut keys) = schema();
+        tables.push(table("orgs", &["id"]));
+        keys.push(fk("users_org_fk", "users", "org_id", "orgs", "id"));
+        keys.push(fk("orgs_owner_fk", "orgs", "owner_id", "users", "id"));
+        let err = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::ForeignKeyCycle {
+                tables: vec!["orgs".to_owned(), "users".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_broken_by_copying_one_of_its_tables_whole() {
+        // `always_include` takes a table out of the removals entirely, so the
+        // remaining deletes have an order again — which is exactly what the
+        // cycle diagnostic tells the reader to do.
+        let (mut tables, mut keys) = schema();
+        tables.push(table("orgs", &["id"]));
+        keys.push(fk("users_org_fk", "users", "org_id", "orgs", "id"));
+        keys.push(fk("orgs_owner_fk", "orgs", "owner_id", "users", "id"));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned(), "orgs".to_owned()],
+                never_include: vec!["audit_logs".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(role_of(&plan, "orgs"), SampleRole::AlwaysInclude);
+        assert!(
+            !joined(&plan.delete_statements()).contains("\"orgs\""),
+            "a full-copy table keeps every row, so it is never deleted from"
+        );
+    }
+
+    #[test]
+    fn plan_allows_a_self_referencing_table() {
+        // A row and the row it points at are removed by the same statement, so
+        // the constraint is satisfied when the statement ends.
+        let (tables, mut keys) = schema();
+        keys.push(fk("users_manager_fk", "users", "manager_id", "users", "id"));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        assert!(
+            plan.walk_edges.iter().any(|e| e.name == "users_manager_fk"),
+            "a self-reference is still walked, so managers are pulled in"
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_table_outside_the_sample_that_references_a_sampled_one() {
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 0,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::OutsideTableReferencesSampled {
+                edges: vec!["autumn_jobs -> users (jobs_user_fk)".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_accepts_a_purged_framework_table_referencing_a_sampled_one() {
+        // `[framework] purge` empties it before the sample deletes, so nothing
+        // is left to dangle.
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 0,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.walk_edges
+                .iter()
+                .all(|e| e.child_table != "autumn_jobs"),
+            "a framework table is never part of the walk"
+        );
+    }
+
+    #[test]
+    fn without_a_root_the_app_tables_are_uncovered() {
+        // Nothing descends out of a full-copy table, so an `always_include`
+        // declaration alone reaches nothing. The CLI never gets here (no
+        // `--sample` means no sampling at all); the planner still refuses
+        // rather than emptying every table it was not told about.
+        let (tables, keys) = schema();
+        let err = plan_of(&[], &fixture_rules(), &tables, &keys).unwrap_err();
+        assert_eq!(
+            err,
+            SampleError::UncoveredTables {
+                tables: vec!["comments".to_owned(), "users".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_purge_waits_for_the_sample_when_an_emptied_table_references_it() {
+        // `audit_logs` (never_include, so the sample empties it) references the
+        // purged `autumn_jobs`. Purging first would hit those rows, so the plan
+        // defers that one purge until the sample has emptied its child.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            plan.purge_after,
+            BTreeSet::from(["autumn_jobs".to_owned()]),
+            "the purge its emptied child references must run after the sample"
+        );
+    }
+
+    #[test]
+    fn a_deferred_purge_drags_the_purges_it_references_with_it() {
+        // autumn_jobs is deferred (audit_logs, which the sample empties, points
+        // at it) and itself references autumn_job_tracking. Purging the latter
+        // in the pre-sample pass would hit autumn_jobs's rows, which survive
+        // until the deferred pass — so it has to travel to the same phase.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        keys.push(fk(
+            "jobs_tracking_fk",
+            "autumn_jobs",
+            "tracking_id",
+            "autumn_job_tracking",
+            "id",
+        ));
+        let framework =
+            BTreeSet::from(["autumn_jobs".to_owned(), "autumn_job_tracking".to_owned()]);
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &framework,
+            purged: &framework,
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            plan.purge_after,
+            BTreeSet::from(["autumn_jobs".to_owned(), "autumn_job_tracking".to_owned()]),
+            "the referenced purge must be deferred alongside the one that needs it"
+        );
+    }
+
+    #[test]
+    fn a_propagated_deferral_that_contradicts_is_still_refused() {
+        // Same chain, but autumn_job_tracking also references the sampled
+        // `users`, which pins it BEFORE the sample. Propagation would pin it
+        // after, so the contradiction check has to see the propagated deferral,
+        // not just the directly-recorded ones.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        keys.push(fk(
+            "jobs_tracking_fk",
+            "autumn_jobs",
+            "tracking_id",
+            "autumn_job_tracking",
+            "id",
+        ));
+        keys.push(fk(
+            "tracking_user_fk",
+            "autumn_job_tracking",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let framework =
+            BTreeSet::from(["autumn_jobs".to_owned(), "autumn_job_tracking".to_owned()]);
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &framework,
+            purged: &framework,
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap_err();
+        let SampleError::PurgeOrderContradiction { tables } = err else {
+            panic!("expected a purge-order contradiction, got {err:?}");
+        };
+        assert!(
+            tables.iter().any(|t| t.starts_with("autumn_job_tracking:")),
+            "the propagated deferral must be checked too: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn a_hundred_percent_root_removes_nothing_so_an_outside_reference_is_fine() {
+        // `users=100%` keeps every row, so its DELETE matches nothing and a
+        // framework table referencing it cannot break. Refusing here would
+        // reject a valid run over a reference that is never dangled.
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Percent(100.0))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            role_of(&plan, "users"),
+            SampleRole::Root(SampleAmount::Percent(100.0))
+        );
+    }
+
+    #[test]
+    fn a_partial_root_still_refuses_the_same_outside_reference() {
+        // The contrast that makes the case above meaningful: at 99% rows DO go
+        // away, so the unpurged framework table is refused as before.
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Percent(99.0))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, SampleError::OutsideTableReferencesSampled { .. }),
+            "a partial root must still be treated as removing rows: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_hundred_percent_root_still_descends_into_its_children() {
+        // The behaviour that must NOT change: `users=100%` is still a root the
+        // walk descends from, so `comments` is reachable rather than uncovered.
+        let (tables, keys) = schema();
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Percent(100.0))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert_eq!(role_of(&plan, "comments"), SampleRole::Related);
+    }
+
+    #[test]
+    fn a_purge_needed_both_before_and_after_the_sample_is_refused() {
+        // The interaction the two purge branches miss when read alone:
+        // `audit_logs` (never_include) -> autumn_jobs defers that purge past the
+        // sample, while autumn_jobs -> users is excused ONLY because the purge
+        // runs before the sample removes users rows. Both cannot hold. The one
+        // valid order interleaves the sample's own deletes around the purge
+        // (audit_logs, then autumn_jobs, then users), which a single atomic
+        // sample between two purge passes cannot express — so it is refused.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_logs_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap_err();
+        let SampleError::PurgeOrderContradiction { tables } = err else {
+            panic!("expected a purge-order contradiction, got {err:?}");
+        };
+        assert_eq!(tables.len(), 1);
+        assert!(tables[0].starts_with("autumn_jobs:"), "{tables:?}");
+        assert!(
+            tables[0].contains("jobs_user_fk") && tables[0].contains("audit_logs_job_fk"),
+            "the diagnostic must name both sides of the contradiction: {tables:?}"
+        );
+    }
+
+    #[test]
+    fn a_purge_that_only_references_a_sampled_table_still_runs_first() {
+        // Only the excused direction: autumn_jobs -> users, nothing referencing
+        // autumn_jobs. Purge-first is correct and nothing is deferred.
+        let (tables, mut keys) = schema();
+        keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(plan.purge_after.is_empty());
+    }
+
+    #[test]
+    fn a_purge_a_retained_table_references_is_refused() {
+        // Same edge, but from `comments`, whose rows the sample KEEPS. Purging
+        // before the sample hits them and purging after still hits them, so no
+        // order exists and the plan refuses instead of failing mid-transaction.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "comments_job_fk",
+            "comments",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap_err();
+        let SampleError::RetainedReferencesPurged { edges } = err else {
+            panic!("expected a retained-into-purged refusal, got {err:?}");
+        };
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].contains("comments_job_fk"), "{edges:?}");
+    }
+
+    #[test]
+    fn a_purge_nothing_sampled_references_still_runs_first() {
+        // The unchanged majority: no sampled table points at the purged one, so
+        // nothing is deferred and the single pre-sample pass runs every purge.
+        let (tables, keys) = schema();
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(plan.purge_after.is_empty());
+    }
+
+    #[test]
+    fn a_partition_local_foreign_key_is_refused_rather_than_dropped() {
+        // A key declared on the partition itself, not cloned from the parent
+        // (the caller filters clones out by catalog parentage, so one reaching
+        // here is partition-local). The plan plays every partition's rows
+        // through the partitioned parent, so it cannot honour a key that binds
+        // one partition — dropping it silently would leave the edge out of both
+        // the walk and the integrity re-check, which is the fail-open this
+        // feature exists to avoid.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "comments_2026_local_fk",
+            "comments_2026",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::from([("comments_2026".to_owned(), "comments".to_owned())]),
+        })
+        .unwrap_err();
+        let SampleError::PartitionLocalForeignKey { edges } = err else {
+            panic!("expected a partition-local refusal, got {err:?}");
+        };
+        assert_eq!(edges.len(), 1);
+        assert!(edges[0].contains("comments_2026_local_fk"), "{edges:?}");
+    }
+
+    #[test]
+    fn a_partition_with_no_local_foreign_key_plans_through_its_parent() {
+        // The clone case: with the clones filtered out upstream, no edge names
+        // the partition and the plan plays its rows through the parent.
+        let (tables, keys) = schema();
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::from([("comments_2026".to_owned(), "comments".to_owned())]),
+        })
+        .unwrap();
+        assert!(
+            plan.walk_edges
+                .iter()
+                .all(|e| e.child_table != "comments_2026"),
+            "a partition's cloned constraint must not be walked"
+        );
+        assert!(
+            plan.verify_edges
+                .iter()
+                .all(|e| e.child_table != "comments_2026"),
+            "nor verified twice"
+        );
+    }
+
+    // ── Delete order ────────────────────────────────────────────────────────
+
+    #[test]
+    fn deletes_run_children_before_parents() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let order: Vec<&str> = plan.tables.iter().map(|t| t.table.as_str()).collect();
+        let at = |name: &str| order.iter().position(|t| *t == name).unwrap();
+        assert!(
+            at("comments") < at("users"),
+            "a child must be emptied before its parent: {order:?}"
+        );
+        assert!(
+            at("users") < at("countries"),
+            "the lookup table's parents come last: {order:?}"
+        );
+    }
+
+    // ── Generated SQL ───────────────────────────────────────────────────────
+
+    #[test]
+    fn root_seeding_is_deterministic_bounded_and_seeded() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Percent(1.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let sql = joined(&plan.seed_statements(&BTreeMap::from([
+            ("users".to_owned(), 1000_i64),
+            ("countries".to_owned(), 12),
+        ])));
+        // The order is a hash of the seed and the row key — not physical order,
+        // not `random()`, so the same seed replays the same rows.
+        assert!(sql.contains("md5('7' || '|'"), "seeded order key: {sql}");
+        assert!(sql.contains("ORDER BY"), "{sql}");
+        assert!(sql.contains("LIMIT 10"), "1% of 1000 rows: {sql}");
+        // The lookup table is copied whole, with no ordering or limit.
+        assert!(
+            sql.contains("FROM \"public\".\"countries\""),
+            "always-include tables are seeded in full: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_different_seed_changes_the_order_key() {
+        let (tables, keys) = schema();
+        let counts = BTreeMap::from([("users".to_owned(), 100_i64), ("countries".to_owned(), 1)]);
+        let with_seed = |seed: u64| {
+            build_plan(&SampleInputs {
+                roots: &[root("users", SampleAmount::Count(5))],
+                seed,
+                rules: &fixture_rules(),
+                tables: &tables,
+                foreign_keys: &keys,
+                framework_tables: &BTreeSet::new(),
+                purged: &BTreeSet::new(),
+                partitions: &BTreeMap::new(),
+            })
+            .unwrap()
+            .seed_statements(&counts)
+        };
+        assert_ne!(joined(&with_seed(1)), joined(&with_seed(2)));
+    }
+
+    #[test]
+    fn a_never_include_table_is_never_seeded() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let sql = joined(&plan.seed_statements(&BTreeMap::new()));
+        assert!(
+            !sql.contains("audit_logs"),
+            "an excluded table selects no rows at all: {sql}"
+        );
+        let deletes = joined(&plan.delete_statements());
+        assert!(
+            deletes.contains("DELETE FROM \"public\".\"audit_logs\""),
+            "an excluded table is emptied: {deletes}"
+        );
+    }
+
+    #[test]
+    fn an_always_include_table_is_never_deleted_from() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let deletes = joined(&plan.delete_statements());
+        assert!(
+            !deletes.contains("\"countries\""),
+            "a full-copy table keeps every row: {deletes}"
+        );
+    }
+
+    #[test]
+    fn statements_are_schema_qualified() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let all = format!(
+            "{}\n{}\n{}",
+            joined(&plan.seed_statements(&BTreeMap::from([("users".to_owned(), 10_i64)]))),
+            joined(&plan.walk_statements()),
+            joined(&plan.delete_statements()),
+        );
+        // A tenant `search_path` must not be able to redirect a DELETE to a
+        // table nothing classified — the same rule the scrub's own writes keep.
+        // Checked for EVERY table: one unqualified name is one redirected write.
+        for (name, _) in &tables {
+            let quoted = quote_ident(name);
+            assert_eq!(
+                all.matches(&quoted).count(),
+                all.matches(&format!("\"public\".{quoted}")).count(),
+                "every reference to {name} must be public-qualified: {all}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_integrity_label_cannot_break_out_of_a_sql_comment() {
+        // The label is printed after `-- verifies` in the dry run. A newline
+        // inside a quoted identifier — which Postgres permits — would end that
+        // comment and leave the rest of the name as executable SQL in a
+        // sequence the operator was told to paste verbatim. A `COMMIT;` there
+        // lands between the sample's deletes and the column rewrites, so the
+        // paste commits a sampled but UNSCRUBBED database.
+        let (tables, _) = schema();
+        let hostile = "comments_user_fk\nCOMMIT; SELECT 'INJECTED'; --";
+        let keys = vec![
+            fk(hostile, "comments", "user_id", "users", "id"),
+            fk("users_country_fk", "users", "country_id", "countries", "id"),
+        ];
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let labels: Vec<String> = plan
+            .integrity_statements()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert!(
+            !labels.is_empty(),
+            "the fixture must produce a label to sanitize"
+        );
+        for label in &labels {
+            assert!(
+                !label.contains('\n') && !label.contains('\r'),
+                "a label reaching a `--` comment must stay on one line: {label:?}"
+            );
+        }
+        assert!(
+            labels.iter().any(|l| l.starts_with("comments_user_fk")),
+            "and must still identify the constraint: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_printed_walk_is_a_loop_that_repeats_every_statement() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let walk = plan.walk_statements();
+        let analyze = plan.analyze_statements();
+        let loop_sql = plan.walk_loop_statement();
+
+        // Every statement of a pass is inside the loop, not merely described by
+        // it: a printed walk that runs each statement once selects only as deep
+        // as the catalog's edge order reaches, and the rows below that are then
+        // deleted without breaking any foreign key the assertions check.
+        assert!(
+            !walk.is_empty(),
+            "the fixture must have a walk to loop over"
+        );
+        for statement in &walk {
+            assert!(
+                loop_sql.contains(statement),
+                "the loop must carry {statement}:\n{loop_sql}"
+            );
+        }
+        for statement in &analyze {
+            assert!(
+                loop_sql.contains(statement),
+                "the loop must re-analyze per pass, like `apply`: {statement}"
+            );
+        }
+        // One row count per walk statement, taken immediately after it — a
+        // single `GET DIAGNOSTICS` at the end of the pass would read only the
+        // last statement and stop the loop while rows were still being found.
+        assert_eq!(
+            loop_sql
+                .matches("GET DIAGNOSTICS moved = ROW_COUNT;")
+                .count(),
+            walk.len(),
+            "each statement's own row count must be captured:\n{loop_sql}"
+        );
+        assert!(
+            loop_sql.contains("EXIT WHEN total = 0;"),
+            "the loop must end on a pass that selects nothing:\n{loop_sql}"
+        );
+        assert!(
+            loop_sql.contains(&format!("IF passes >= {MAX_PASSES} THEN")),
+            "the printed loop must carry the same ceiling `apply` does:\n{loop_sql}"
+        );
+    }
+
+    #[test]
+    fn the_walk_loop_is_dollar_quoted_past_any_identifier() {
+        // Dollar quoting is lexical, so a `$autumn_walk$` inside the body would
+        // end the block early and leave the rest as raw SQL. Postgres lets an
+        // identifier contain `$`, so the tag has to widen rather than assume.
+        assert_eq!(dollar_tag("INSERT INTO x"), "$autumn_walk$");
+        assert_eq!(
+            dollar_tag(r#"INSERT INTO "a$autumn_walk$b""#),
+            "$autumn_walk_$"
+        );
+        assert_eq!(
+            dollar_tag(r#""a$autumn_walk$b" "c$autumn_walk_$d""#),
+            "$autumn_walk__$"
+        );
+        let body = r#"x "a$autumn_walk$b""#;
+        assert!(
+            !body.contains(&dollar_tag(body)),
+            "the chosen tag must not appear in the body it quotes"
+        );
+    }
+
+    #[test]
+    fn the_walk_ascends_into_the_parent_and_descends_into_the_child() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let set_of = |table: &str| {
+            let t = plan.tables.iter().find(|t| t.table == table).unwrap();
+            (t.keep.clone(), t.descend.clone())
+        };
+        let (users_keep, users_descend) = set_of("users");
+        let (comments_keep, comments_descend) = set_of("comments");
+        let walk = plan.walk_statements();
+
+        // Ascend fills the PARENT's keep set from the child's. Transposing the
+        // two sets would still produce plausible-looking SQL, so the assertion
+        // names both ends.
+        assert!(
+            walk.iter().any(|s| s.starts_with(&format!(
+                "/* comments_user_fk */ INSERT INTO {}",
+                quote_ident(&users_keep)
+            )) && s.contains(&quote_ident(&comments_keep))),
+            "the ascend must fill users' keep set from comments': {walk:?}"
+        );
+        // Descend fills the CHILD's keep AND descend sets, from the parent's
+        // descend set — never from its keep set, or an ascended-only row would
+        // pull its whole subtree in.
+        for target in [&comments_keep, &comments_descend] {
+            assert!(
+                walk.iter().any(|s| s.starts_with(&format!(
+                    "/* comments_user_fk */ INSERT INTO {}",
+                    quote_ident(target)
+                )) && s.contains(&quote_ident(&users_descend))),
+                "the descend must fill {target} from users' descend set: {walk:?}"
+            );
+        }
+        assert!(
+            !walk.iter().any(|s| s.contains(&format!(
+                "INSERT INTO {} (k) SELECT DISTINCT c.",
+                quote_ident(&users_descend)
+            ))),
+            "ascent must never make a row descend-eligible: {walk:?}"
+        );
+    }
+
+    #[test]
+    fn the_walk_never_descends_out_of_an_always_include_table() {
+        // Descending from a lookup table would pull in every row that
+        // references it — every user in the database — and the sample would
+        // stop being a sample.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let countries = plan
+            .tables
+            .iter()
+            .find(|t| t.table == "countries")
+            .unwrap()
+            .descend
+            .clone();
+        let sql = joined(&plan.walk_statements());
+        assert!(
+            !sql.contains(&countries),
+            "no statement may read or write the lookup table's descend set: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_composite_primary_key_becomes_an_unambiguous_row_key() {
+        let tables = vec![
+            table("users", &["id"]),
+            table("tags", &["id"]),
+            table("user_tags", &["user_id", "tag_id"]),
+        ];
+        let keys = vec![
+            fk("user_tags_user_fk", "user_tags", "user_id", "users", "id"),
+            fk("user_tags_tag_fk", "user_tags", "tag_id", "tags", "id"),
+        ];
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules::default(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let sql = joined(&plan.delete_statements());
+        // `quote_nullable` escapes each component, so `('a,b', 'c')` and
+        // `('a', 'b,c')` cannot collapse onto the same key.
+        assert!(
+            sql.contains("quote_nullable"),
+            "a composite key must be rendered unambiguously: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_composite_foreign_key_joins_on_every_component() {
+        let tables = vec![
+            table("orders", &["tenant_id", "id"]),
+            table("order_lines", &["id"]),
+        ];
+        let keys = vec![ForeignKeyConstraint {
+            name: "order_lines_order_fk".to_owned(),
+            child_table: "order_lines".to_owned(),
+            child_columns: vec!["tenant_id".to_owned(), "order_id".to_owned()],
+            parent_table: "orders".to_owned(),
+            parent_columns: vec!["tenant_id".to_owned(), "id".to_owned()],
+            match_full: false,
+        }];
+        let plan = plan_of(
+            &[root("orders", SampleAmount::Count(10))],
+            &SampleRules::default(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let sql = joined(&plan.walk_statements());
+        // The pairing is what matters, not the mere presence of both names:
+        // `tenant_id` also appears in the parent's own row key.
+        assert!(
+            sql.contains("p.\"tenant_id\" = c.\"tenant_id\" AND p.\"id\" = c.\"order_id\""),
+            "the join must pair every component in key order: {sql}"
+        );
+    }
+
+    #[test]
+    fn integrity_checks_cover_every_foreign_key() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let checks = plan.integrity_statements();
+        assert_eq!(checks.len(), 2, "one check per foreign key");
+        for (_, sql) in plan.integrity_statements() {
+            assert!(sql.contains("count(*)"), "{sql}");
+            assert!(
+                sql.contains("IS NULL"),
+                "an orphan is a missing parent: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_copy_child_of_an_outside_parent_is_still_verified() {
+        // `countries` is always_include, so `is_subsetted` is false for it — but
+        // it keeps every row, including any that already dangled. The re-count
+        // has to cover its reference into a framework table nothing empties.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "countries_job_fk",
+            "countries",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges
+                .iter()
+                .any(|e| e.name == "countries_job_fk"),
+            "a full-copy child's outside reference must still be re-counted"
+        );
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "countries_job_fk"),
+            "but it must not enter the walk"
+        );
+    }
+
+    /// Ignoring an excluded leaf's key for the WALK does not mean ignoring it
+    /// for ORDER.
+    ///
+    /// Its rows all go, so nothing can dangle — but the `[framework] purge` it
+    /// points into still runs before the sample unless something defers it.
+    /// Measured against `PostgreSQL` 16.13 before this was fixed, on a partitioned
+    /// `never_include` `audit_logs` whose leaf carried a partition-local key
+    /// into a purged `autumn_jobs`:
+    ///
+    /// ```text
+    /// ✗ update or delete on table "autumn_jobs" violates foreign key
+    ///   constraint "audit_p0_job_fk" on table "audit_logs_p0"
+    /// ```
+    ///
+    /// After: the run completes, audit 20 -> 0, jobs 20 -> 0, users 200 -> 100.
+    #[test]
+    fn an_excluded_partition_leaf_still_defers_the_purge_it_references() {
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_p0_job_fk",
+            "audit_logs_p0",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let partitions = BTreeMap::from([("audit_logs_p0".to_owned(), "audit_logs".to_owned())]);
+        let purged = BTreeSet::from(["autumn_jobs".to_owned()]);
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &purged,
+            purged: &purged,
+            partitions: &partitions,
+        })
+        .expect("an excluded leaf's key into a purged table must not refuse the run");
+        assert!(
+            plan.purge_after.contains("autumn_jobs"),
+            "the purge must wait until the sample has emptied the leaf: {:?}",
+            plan.purge_after
+        );
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "audit_p0_job_fk"),
+            "and the edge still has nothing to say to the walk"
+        );
+    }
+
+    #[test]
+    fn an_outgoing_key_from_an_excluded_partition_leaf_is_not_refused() {
+        // The refusal's own advice is to drop the table with `never_include` —
+        // so it must not fire on a schema that has already done that. Emptying
+        // the partitioned parent takes every leaf row with it, leaving the key
+        // nothing to dangle and nothing to walk.
+        // A partition is absent from `tables`: the caller plans its rows through
+        // the parent, exactly as `build_sample_plan_for` filters them out.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "leaf_lookup_fk",
+            "audit_logs_p0",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let partitions = BTreeMap::from([("audit_logs_p0".to_owned(), "audit_logs".to_owned())]);
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &partitions,
+        })
+        .expect("an excluded leaf's outgoing key must not be refused");
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "leaf_lookup_fk"),
+            "and it must not enter the walk either"
+        );
+
+        // The same key with the parent NOT excluded is still refused: the plan
+        // keys a partition's rows on its parent and cannot express one binding
+        // a single leaf.
+        let mut kept = fixture_rules();
+        kept.never_include.clear();
+        let err = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &kept,
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &partitions,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, SampleError::PartitionLocalForeignKey { .. }),
+            "a leaf whose rows survive must still be refused: {err}"
+        );
+    }
+
+    #[test]
+    fn an_exact_100_percent_root_is_not_deleted_from() {
+        // The predicate would match no rows, but a statement-level `DELETE`
+        // trigger fires on a zero-row statement all the same — and
+        // `report_triggers` says nothing about a table it knows is not
+        // subsetted, so the run would have side effects it never announced, on
+        // a flag that asked for every row to be kept.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Percent(100.0))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let deletes = plan.delete_statements();
+        assert!(
+            !deletes.iter().any(|s| s.contains(r#""public"."users""#)),
+            "a root that removes nothing must not be deleted from: {deletes:?}"
+        );
+        // Its children are still sampled, so they still are.
+        assert!(
+            deletes.iter().any(|s| s.contains(r#""public"."comments""#)),
+            "but a genuinely subsetted table must be: {deletes:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_whose_sides_disagree_on_arity_is_refused() {
+        // The join zips the two column lists, and `zip` stops at the shorter —
+        // so a mismatch would emit a join WEAKER than the constraint and relate
+        // rows the database does not. The catalog cannot report this, which is
+        // exactly why it must not be handled by silently dropping components.
+        let (tables, _) = schema();
+        let mut lopsided = fk("comments_user_fk", "comments", "user_id", "users", "id");
+        lopsided.child_columns.push("body".to_owned());
+        let err = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &[lopsided],
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, SampleError::KeyArityMismatch { .. }),
+            "a lopsided key must be refused, not zipped short: {message}"
+        );
+        assert!(
+            message.contains("comments_user_fk") && message.contains("2 vs 1"),
+            "and the refusal must name the key and both counts: {message}"
+        );
+    }
+
+    #[test]
+    fn an_outside_child_of_a_full_copy_parent_is_still_verified() {
+        // The mirror of the case above, on the other side of the edge: a
+        // framework-owned table nothing empties pointing INTO a full-copy table.
+        // Neither side loses a row, so the sample cannot break the reference —
+        // which is exactly why it fell through every arm and was dropped. A
+        // `NOT VALID` constraint over a pre-existing orphan is never revalidated
+        // by Postgres, so the run would report every checked reference resolving
+        // while one does not.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "job_country_fk",
+            "autumn_jobs",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges.iter().any(|e| e.name == "job_country_fk"),
+            "an outside child of a full-copy parent must be re-counted: {:?}",
+            plan.verify_edges
+                .iter()
+                .map(|e| &e.name)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            plan.walk_edges.iter().all(|e| e.name != "job_country_fk"),
+            "but it must not enter the walk — nothing outside the universe is sampled"
+        );
+    }
+
+    #[test]
+    fn the_recounts_own_endpoints_are_locked_and_rls_checked() {
+        // `locked_tables` is what the scrub's RLS refusal and its `LOCK TABLE`
+        // set are both built from. An outside child reached only by the
+        // re-count is in neither the plan's tables nor the purge list, so
+        // without this it is read by a check whose answer nothing protects: a
+        // policy hiding the orphan turns "every reference resolves" into a false
+        // clean bill of health.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "job_country_fk",
+            "autumn_jobs",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        let locked = plan.locked_tables();
+        assert!(
+            locked.contains(&"autumn_jobs"),
+            "an outside endpoint of the re-count must be locked and RLS-checked: {locked:?}"
+        );
+        // And every table the plan owns is still there.
+        for table in &plan.tables {
+            assert!(
+                locked.contains(&table.table.as_str()),
+                "{} must stay locked: {locked:?}",
+                table.table
+            );
+        }
+        let mut sorted = locked.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, locked, "the list must be sorted and deduplicated");
+    }
+
+    #[test]
+    fn a_purged_child_of_a_full_copy_parent_needs_no_verification() {
+        // The exemption on this side: the run empties the child, so nothing of
+        // it survives to dangle.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "job_country_fk",
+            "autumn_jobs",
+            "country_id",
+            "countries",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges.iter().all(|e| e.name != "job_country_fk"),
+            "a purged child's references need no re-count"
+        );
+    }
+
+    #[test]
+    fn an_emptied_child_of_an_outside_parent_needs_no_verification() {
+        // The one exemption: `audit_logs` is never_include, so the run empties
+        // it, and a row that does not exist cannot dangle.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "audit_job_fk",
+            "audit_logs",
+            "job_id",
+            "autumn_jobs",
+            "id",
+        ));
+        let plan = build_plan(&SampleInputs {
+            roots: &[root("users", SampleAmount::Count(10))],
+            seed: 7,
+            rules: &fixture_rules(),
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::from(["autumn_jobs".to_owned()]),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .unwrap();
+        assert!(
+            plan.verify_edges.iter().all(|e| e.name != "audit_job_fk"),
+            "an emptied table's references need no re-count"
+        );
+    }
+
+    #[test]
+    fn a_match_full_composite_key_also_counts_partially_null_tuples() {
+        // MATCH FULL admits only all-NULL or all-populated tuples. A
+        // MATCH SIMPLE predicate checks the populated ones alone, so a
+        // half-filled tuple — a violation Postgres will not re-check on a
+        // constraint left NOT VALID — would pass the recount silently.
+        let (tables, mut keys) = schema();
+        // Widen the existing comments -> users edge into a composite MATCH FULL
+        // one, so the plan is the ordinary fixture and only the key shape moves.
+        keys[0].child_columns = vec!["user_id".to_owned(), "tenant_id".to_owned()];
+        keys[0].parent_columns = vec!["id".to_owned(), "tenant_id".to_owned()];
+        keys[0].match_full = true;
+        keys[0].name = "comments_user_full_fk".to_owned();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (_, sql) = plan
+            .integrity_statements()
+            .into_iter()
+            .find(|(label, _)| label.starts_with("comments_user_full_fk"))
+            .expect("the composite key must be checked");
+        assert!(
+            sql.contains(r#""user_id" IS NULL"#) && sql.contains(r#""tenant_id" IS NULL"#),
+            "a partially-NULL tuple must be counted too: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_match_simple_composite_key_ignores_partially_null_tuples() {
+        // The default, unchanged: a NULL component satisfies the reference, so
+        // only fully-populated tuples are checked for a missing parent.
+        let (tables, mut keys) = schema();
+        // The same composite edge, left at the default MATCH SIMPLE.
+        keys[0].child_columns = vec!["user_id".to_owned(), "tenant_id".to_owned()];
+        keys[0].parent_columns = vec!["id".to_owned(), "tenant_id".to_owned()];
+        keys[0].name = "comments_user_simple_fk".to_owned();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let (_, sql) = plan
+            .integrity_statements()
+            .into_iter()
+            .find(|(label, _)| label.starts_with("comments_user_simple_fk"))
+            .expect("the composite key must be checked");
+        assert!(
+            !sql.contains("IS NULL) AND ("),
+            "MATCH SIMPLE must not gain the mixed-NULL arm: {sql}"
+        );
+    }
+
+    #[test]
+    fn an_excluded_table_without_a_primary_key_builds_no_set() {
+        // It is emptied by a bare DELETE, so it needs no row identity — and
+        // building it one would render an empty key expression, which is not
+        // SQL at all. The `never_include` remedy `NoRowKey` prescribes has to
+        // actually work.
+        let (mut tables, keys) = schema();
+        tables.push(table("request_logs", &[]));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &SampleRules {
+                always_include: vec!["countries".to_owned()],
+                never_include: vec!["audit_logs".to_owned(), "request_logs".to_owned()],
+            },
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let setup = joined(&plan.setup_statements());
+        assert!(
+            !setup.contains("request_logs") && !setup.contains("audit_logs"),
+            "an excluded table gets no keep set: {setup}"
+        );
+        assert!(
+            !setup.contains("SELECT  AS k") && !setup.contains("SELECT () AS k"),
+            "no statement may carry an empty row key: {setup}"
+        );
+        assert!(
+            joined(&plan.delete_statements()).contains("DELETE FROM \"public\".\"request_logs\""),
+            "it is still emptied"
+        );
+    }
+
+    #[test]
+    fn a_constraint_name_cannot_escape_its_sql_comment() {
+        // `conname` is catalog text. A name carrying `*/` would close the
+        // comment and let whatever follows run as part of the statement.
+        let (tables, mut keys) = schema();
+        keys.push(fk(
+            "*/WITH z AS(INSERT INTO loot SELECT 1 RETURNING 1)/*",
+            "comments",
+            "user_id",
+            "users",
+            "id",
+        ));
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        for statement in plan.walk_statements() {
+            let Some((tag, _)) = statement
+                .strip_prefix("/* ")
+                .and_then(|rest| rest.split_once(" */ "))
+            else {
+                panic!("every walk statement opens with a tag: {statement}");
+            };
+            assert!(
+                !tag.contains('*') && !tag.contains('/'),
+                "the tag can only be closed by the one that follows it: {tag:?}"
+            );
+        }
+        // Only `*/` closes a block comment, so a surviving `--` is inert; the
+        // characters that could close it are the ones that must go.
+        assert_eq!(
+            comment_safe("*/DROP TABLE users;--"),
+            "__DROP TABLE users_--"
+        );
+    }
+
+    #[test]
+    fn sets_are_indexed_and_analysed_after_the_roots_are_seeded() {
+        // An index built on an empty table is built for nothing, and a
+        // temporary table autovacuum never sees plans at its 10-page default
+        // until something analyses it.
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let index = joined(&plan.index_statements());
+        assert!(
+            index.contains("CREATE INDEX ON") && index.contains("ANALYZE "),
+            "{index}"
+        );
+        assert!(
+            !joined(&plan.setup_statements()).contains("CREATE INDEX"),
+            "the index must not be built before the rows arrive"
+        );
+        assert!(
+            plan.analyze_statements()
+                .iter()
+                .all(|s| s.starts_with("ANALYZE ")),
+            "each pass re-analyses the sets it just grew"
+        );
+    }
+
+    #[test]
+    fn setup_creates_a_keep_and_descend_set_per_table() {
+        let (tables, keys) = schema();
+        let plan = plan_of(
+            &[root("users", SampleAmount::Count(10))],
+            &fixture_rules(),
+            &tables,
+            &keys,
+        )
+        .unwrap();
+        let sql = joined(&plan.setup_statements());
+        let keyed = plan
+            .tables
+            .iter()
+            .filter(|t| t.role != SampleRole::NeverInclude)
+            .count();
+        assert_eq!(
+            sql.matches("CREATE TEMPORARY TABLE").count(),
+            keyed * 2,
+            "{sql}"
+        );
+        assert!(sql.contains("ON COMMIT DROP"), "{sql}");
+    }
+}

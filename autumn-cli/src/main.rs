@@ -41,6 +41,7 @@ mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
+mod openapi;
 mod overload_driver;
 mod paths;
 mod pg;
@@ -452,6 +453,60 @@ pub enum GraphSubcommands {
         #[command(flatten)]
         args: GraphArgs,
     },
+}
+
+/// Arguments for `autumn openapi export`.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct OpenApiExportArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the document to this path instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// Compare a fresh export against this committed document and exit
+    /// non-zero on drift, so an unreviewed contract change fails CI.
+    ///
+    /// Comparison is on parsed JSON, not bytes, so reindenting the committed
+    /// file is not a failure. Takes precedence over `--out`.
+    #[arg(long, value_name = "PATH")]
+    check: Option<PathBuf>,
+    /// Fail when any component schema exports as an opaque `{"type":"object"}`.
+    ///
+    /// Those are the types with no `#[derive(OpenApiSchema)]` and no registered
+    /// schema: they reach a generated client as `unknown`/`serde_json::Value`,
+    /// so a spec meant to drive codegen should not contain them. Reported
+    /// either way; this makes it a gate.
+    #[arg(long)]
+    strict: bool,
+    /// Cargo features to build the app with (repeatable).
+    #[arg(long = "features", value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build with `--all-features`.
+    #[arg(long)]
+    all_features: bool,
+    /// Build with `--no-default-features`.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Export from the release build rather than the debug one.
+    ///
+    /// A route or schema gated behind `#[cfg(not(debug_assertions))]` exists
+    /// only in the release binary, so a debug export can describe a contract
+    /// the deployed build does not serve. Use this wherever `--check` is
+    /// gating the shipped artifact.
+    #[arg(long)]
+    release: bool,
+}
+
+/// Subcommands for `autumn openapi`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum OpenApiSubcommands {
+    /// Emit the app's `OpenAPI` 3.1 document without booting it.
+    Export(OpenApiExportArgs),
 }
 
 /// Subcommands for `autumn agents`.
@@ -1922,6 +1977,28 @@ enum Commands {
     ///   autumn cache audit --strict -p blog
     #[command(subcommand, verbatim_doc_comment)]
     Cache(CacheSubcommands),
+
+    /// `OpenAPI` tooling — get the contract out of the app.
+    ///
+    /// `autumn openapi export` compiles the app, runs it in a dump mode that
+    /// binds no port and touches no database, and writes the same `OpenAPI` 3.1
+    /// document `/openapi.json` serves. That document is the input the standard
+    /// generators want, so a typed client is one pipe away:
+    ///
+    ///   autumn openapi export --out openapi.json
+    ///   npx openapi-typescript openapi.json -o src/api.d.ts
+    ///
+    /// It also reports every component schema that degraded to an opaque
+    /// `{"type":"object"}` — the types a generated client can only see as
+    /// `unknown` — and `--strict` turns that report into a gate.
+    ///
+    /// # Examples
+    ///
+    ///   autumn openapi export
+    ///   autumn openapi export --out openapi.json
+    ///   autumn openapi export --check openapi.json --strict
+    #[command(subcommand, verbatim_doc_comment)]
+    Openapi(OpenApiSubcommands),
     /// Emit the classified-data flow manifest (#1654).
     ///
     /// Compiles the app and reads back the manifest the framework assembles from
@@ -2459,6 +2536,27 @@ enum DbCommands {
         /// staging drill always passes.
         #[arg(long)]
         allow_source_overwrite: bool,
+        /// Emit a referentially-intact SUBSET instead of the whole copy.
+        ///
+        /// Roots the subset on this many rows of TABLE — `--sample users=1%` or
+        /// `--sample users=500` — and repeats for more than one root. Every row
+        /// the selected roots relate to is carried along, so every foreign key
+        /// still resolves, and the subset is scrubbed in the same pass.
+        /// Per-table `always_include` / `never_include` rules live in
+        /// `[sample]` in `scrub.toml`.
+        ///
+        /// The amount applies PER TARGET: with shards configured,
+        /// `--sample users=500` selects up to 500 rows from each database.
+        /// After a successful run every subsetted table is rewritten with
+        /// `VACUUM (FULL, ANALYZE)`, which takes an exclusive lock and needs
+        /// room for a second copy of the table while it runs.
+        #[arg(long, value_name = "TABLE=COUNT|PERCENT%")]
+        sample: Vec<String>,
+        /// The seed `--sample` derives its row selection from. The same seed
+        /// against the same source data reproduces the identical subset, so a
+        /// teammate can rebuild the exact rows that exhibit a bug.
+        #[arg(long, value_name = "N", default_value_t = 0, requires = "sample")]
+        seed: u64,
     },
     /// Report, dry-run, or enforce the retention policy for framework-owned data.
     ///
@@ -4465,6 +4563,8 @@ fn run_command(command: Commands) {
                 dry_run,
                 force,
                 allow_source_overwrite,
+                sample,
+                seed,
             } => db::scrub::run(&db::scrub::ScrubArgs {
                 profile,
                 artifact,
@@ -4474,6 +4574,8 @@ fn run_command(command: Commands) {
                 dry_run,
                 force,
                 allow_source_overwrite,
+                sample,
+                seed,
             }),
             DbCommands::Retention {
                 package,
@@ -4813,6 +4915,22 @@ fn run_command(command: Commands) {
                 json: args.json,
                 strict: args.strict,
                 features,
+            });
+        }
+        Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+            let features = routes::CargoFeatures {
+                features: args.features,
+                all: args.all_features,
+                no_default: args.no_default_features,
+            };
+            openapi::run(&openapi::ExportOptions {
+                package: args.package.as_deref(),
+                bin: args.bin.as_deref(),
+                out: args.out.as_deref(),
+                check: args.check.as_deref(),
+                strict: args.strict,
+                features,
+                release: args.release,
             });
         }
         Commands::Graph(command) => {
@@ -6484,6 +6602,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -7891,6 +8011,8 @@ mod tests {
             dry_run,
             force,
             allow_source_overwrite,
+            sample,
+            seed,
         }) = cli.command
         else {
             panic!("expected db scrub");
@@ -7903,6 +8025,8 @@ mod tests {
         assert!(!check);
         assert!(!dry_run);
         assert!(!force);
+        assert!(sample.is_empty(), "sampling is opt-in");
+        assert_eq!(seed, 0);
     }
 
     #[test]
@@ -7931,6 +8055,8 @@ mod tests {
             dry_run,
             force,
             allow_source_overwrite,
+            sample: _,
+            seed: _,
         }) = cli.command
         else {
             panic!("expected db scrub");
@@ -7949,6 +8075,52 @@ mod tests {
         assert!(!check);
         assert!(!dry_run);
         assert!(force);
+    }
+
+    // ── autumn db scrub --sample tests (issue #1636) ───────────────────────
+
+    #[test]
+    fn parse_db_scrub_with_repeated_sample_roots_and_a_seed() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "scrub",
+            "--sample",
+            "users=1%",
+            "--sample",
+            "orders=500",
+            "--seed",
+            "42",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Scrub { sample, seed, .. }) = cli.command else {
+            panic!("expected db scrub");
+        };
+        assert_eq!(sample, vec!["users=1%".to_owned(), "orders=500".to_owned()]);
+        assert_eq!(seed, 42);
+    }
+
+    #[test]
+    fn parse_db_scrub_seed_requires_sample() {
+        // A seed with nothing to seed is a mistyped command, not a no-op: it
+        // reads as "this run is reproducible" when nothing was subsetted.
+        assert!(
+            Cli::try_parse_from(["autumn", "db", "scrub", "--seed", "42"]).is_err(),
+            "--seed only means something alongside --sample"
+        );
+    }
+
+    #[test]
+    fn parse_db_scrub_sample_works_with_check_and_dry_run() {
+        // Both write nothing, and both must still be able to prove the sample
+        // plan is complete — that is the CI gate for a graph gap.
+        for mode in ["--check", "--dry-run"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "db", "scrub", "--sample", "users=1%", mode])
+                    .is_ok(),
+                "--sample must be inspectable with {mode}"
+            );
+        }
     }
 
     #[test]
@@ -8502,6 +8674,74 @@ mod tests {
         match cli.command {
             Commands::Routes { command, .. } => assert!(command.is_none()),
             _ => panic!("expected Routes command"),
+        }
+    }
+
+    // ── autumn openapi export tests (#802) ─────────────────────────────────
+
+    #[test]
+    fn parse_openapi_export_defaults_to_stdout() {
+        let cli = Cli::try_parse_from(["autumn", "openapi", "export"]).unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert!(args.out.is_none(), "no --out means stdout");
+                assert!(args.check.is_none());
+                assert!(!args.strict);
+                assert!(args.package.is_none());
+                assert!(args.features.is_empty());
+            }
+            _ => panic!("expected Openapi export subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_export_out_and_strict() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "openapi",
+            "export",
+            "--out",
+            "openapi.json",
+            "--strict",
+            "-p",
+            "bookmarks",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert_eq!(args.out.as_deref(), Some(Path::new("openapi.json")));
+                assert!(args.strict);
+                assert!(!args.release, "debug is the default profile");
+                assert_eq!(args.package.as_deref(), Some("bookmarks"));
+            }
+            _ => panic!("expected Openapi export subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_export_check_and_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "openapi",
+            "export",
+            "--check",
+            "contract/openapi.json",
+            "--features",
+            "openapi,mcp",
+            "--no-default-features",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Openapi(OpenApiSubcommands::Export(args)) => {
+                assert_eq!(
+                    args.check.as_deref(),
+                    Some(Path::new("contract/openapi.json"))
+                );
+                assert_eq!(args.features, vec!["openapi,mcp".to_owned()]);
+                assert!(args.no_default_features);
+                assert!(!args.all_features);
+            }
+            _ => panic!("expected Openapi export subcommand"),
         }
     }
 

@@ -180,8 +180,8 @@ async fn hello() -> &'static str {
 **The macro generates (alongside your function):**
 
 ```rust
-pub fn __autumn_route_info_hello() -> ::autumn_web::route::Route {
-    ::autumn_web::route::Route {
+pub fn __autumn_route_info_hello() -> ::autumn_web::Route {
+    ::autumn_web::Route {
         method: ::http::Method::GET,
         path: "/hello",
         handler: ::axum::routing::get(hello),

@@ -85,6 +85,21 @@ The island crate that produces the wasm lives in `examples/island-flock`
 
 ---
 
+### `examples/cms` — WordPress-Parity Content Management
+
+<!-- catalog:example name=cms tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer replacing a WordPress install, or starting a content site |
+| **Journey** | Full CMS: register → author → publish → moderate, with roles, themes and plugins |
+| **Key capabilities** | `#[state_machine]` post lifecycle, `#[searchable]`, `#[cached]` + `invalidates`, `MutationHooks`, `storage::BlobStore`, `#[scheduled]`, capability-based authorization, typed action/filter hooks |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL 12+ (stored generated column), Docker for the full test suite |
+| **Run command** | `cargo run -p cms` |
+| **Success proof** | `curl http://localhost:3000/register` returns the registration screen |
+
+---
+
 ### `examples/bookmarks` — Profiles, Repository Macro, and Scheduled Tasks
 
 <!-- catalog:example name=bookmarks tier=supported -->
@@ -93,7 +108,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer adding operational features to an existing Autumn app |
 | **Journey** | Profiles/tasks: generated CRUD API, actuator endpoints, profile-based config, hourly scheduled task |
-| **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering, app-metrics facade (`autumn_web::metrics` counter + timer on `/actuator/prometheus`) |
+| **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering, app-metrics facade (`autumn_web::metrics` counter + timer on `/actuator/prometheus`), OpenAPI spec + `autumn openapi export` for typed clients |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p bookmarks` |
 | **Success proof** | `curl http://localhost:3000/actuator/health` returns `{"status":"UP"}` |

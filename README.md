@@ -226,6 +226,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/flock`](examples/flock) | WASM island spike: a server-rendered maud page whose home route mounts a Yew CSR "literary boids" widget compiled to `wasm32-unknown-unknown`, with a custom `'wasm-unsafe-eval'` CSP |
 | [`examples/todo-app`](examples/todo-app) | Full-stack CRUD app with Diesel, Maud, htmx, Tailwind, JSON API, bearer-token auth, and MCP tool projection |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
+| [`examples/cms`](examples/cms) | WordPress-parity CMS: posts/pages, taxonomies, media, moderated comments, revisions, roles, themes, plugin hooks |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, actuator endpoints, and app metrics (a domain counter + timer on `/actuator/prometheus`) |
 | [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, a two-node self-clustering substrate needing no coordination service, and Docker Compose deployment |
 | [`examples/bookmarks-sharded`](examples/bookmarks-sharded) | Framework-native horizontal sharding: tenant → slot → shard routing, control database, cross-shard fan-out, and Docker Compose deployment |

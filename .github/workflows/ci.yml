@@ -346,6 +346,100 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-toml.sh --self-test && ./scripts/check-docs-toml.sh
+      - name: Rust symbol drift gate
+        # The four gates above cover the link a reader clicks, the command they
+        # run, the variable they set and the config key they write. None of them
+        # looks at what the guide is mostly MADE of: Rust. The reader-facing
+        # corpus names 1,495 `autumn_web::…` paths — a larger copy-surface than
+        # the env layer and the `autumn.toml` layer together — and nothing in
+        # the tree could tell a live path from a renamed one.
+        #
+        # It catches both ends of the visibility scale, which is why gating the
+        # whole surface beats gating import lines alone. Loud:
+        # maintenance-mode.md hands over
+        # `use autumn_web::middleware::{MaintenanceLayer, MaintenanceState};`
+        # where only the first exists — `MaintenanceState` is in
+        # `autumn_web::maintenance`, a different module with a same-named
+        # sibling under `middleware::` — so the reader gets E0432 on a line
+        # where half the import is right. Silent: `#[autumn_web::main]` emits
+        # `fn main()` fresh and never re-emits the declared return type, so
+        # api-versioning.md's opening fence could say
+        # `-> Result<(), autumn_web::Error>` for a type that does not exist, and
+        # still build. Nothing reported it; the reader just carried away the
+        # wrong name for the framework's error type.
+        #
+        # Truth set is the crate sources themselves — no snapshot to
+        # regenerate, because a rename lands in the same commit as the surface
+        # it renames. Resolution follows what Rust does rather than what the
+        # source looks like (`pub use` re-exports including aliased and
+        # private-facade ones, globs, `#[macro_export]` hoisting to the crate
+        # root, inline `mod` blocks, proc-macro derive names, and hops into
+        # sibling workspace crates), because a documented path is almost never
+        # a path to where the item is defined. It also checks VISIBILITY: only
+        # bare `pub` counts, since a path through one of lib.rs's 49
+        # `pub(crate)` modules is E0603 in the reader's crate however public the
+        # item inside it is. Paths that leave the workspace are reported as
+        # OPAQUE and counted rather than guessed at.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-symbols.sh --self-test && ./scripts/check-docs-symbols.sh
+      - name: Actuator path drift gate
+        # The five gates above cover the link a reader clicks, the command they
+        # run, the variable they set, the config key they write and the Rust
+        # path they import. This one covers the sixth thing they copy off a
+        # page: the URL they curl.
+        #
+        # It is the only one of the six whose failure lands against a RUNNING
+        # APP rather than while the reader is still reading, and the actuator is
+        # the operator surface — `/actuator/health` is what a load balancer
+        # probes, `/actuator/jobs` and `/actuator/tasks` are what someone opens
+        # at 3am. `curl` answers `404 Not Found` with no hint of the right name,
+        # and since most of the surface sits behind `[actuator] sensitive =
+        # true`, that 404 reads like an endpoint they failed to ENABLE rather
+        # than one that was never there — so the reader goes and debugs their
+        # own deployment.
+        #
+        # The corpus is every markdown surface a reader can end up holding —
+        # the set its sibling gates define, plus three that reach readers by a
+        # route other than someone opening a page: `*.md.tmpl` (`new.rs` writes
+        # `templates/README.md.tmpl` as every scaffolded application's README,
+        # so a stale URL there ships into every new project), all of
+        # `examples/` (the wiki example compiles `content/*.md` in and serves
+        # them at `/docs/…`), and `.claude/skills/` (a second skill tree the
+        # agent machinery loads by name, whose `run-autumn` drives a real
+        # server with `curl`).
+        #
+        # The baseline run found four defects over 236 occurrences.
+        # `coming-from-other-frameworks.md` is the sharp one: its Spring→Autumn
+        # actuator table exists precisely to tell a migrating reader what an
+        # endpoint is CALLED here, and its `scheduledtasks` row said the name
+        # was unchanged. Autumn serves that payload at `/actuator/tasks`, so
+        # the one page written to prevent the 404 was causing it — and because
+        # the real endpoint shares no token with the word they searched,
+        # searching again could not rescue them. The other two told readers
+        # that `/actuator/routes` lists declared route methods; the route table
+        # is served from `/actuator/graph`.
+        #
+        # Truth set is the string literals passed to `actuator_route_path()`
+        # at a `.route(…)` MOUNT, across non-test workspace Rust source — the
+        # one path builder every actuator mount goes through, whose own doc
+        # comment says why ("so paths match byte-for-byte"). Nothing to
+        # regenerate: a renamed endpoint lands in the same commit as the
+        # rename.
+        #
+        # The same builder is also called from two inventories
+        # (`actuator_endpoint_paths`, `actuator_mutating_routes`) and from
+        # `alerts.rs`. Those are read as second copies of a list, never as
+        # evidence that a URL answers: an endpoint dropped from the router but
+        # left in an inventory would otherwise keep blessing documentation for
+        # a path nothing serves. A drift gate must not be able to inherit the
+        # drift it is checking for, which is the same reason `#[cfg(test)]`
+        # bodies are stripped.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-routes.sh --self-test && ./scripts/check-docs-routes.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -882,6 +976,12 @@ jobs:
           cargo test -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
+          # The custom-domain SNI resolver + certificate cache (#1635) need
+          # `tls` to compile at all, so the default `test` lane runs only the
+          # feature-free half of `custom_domains`. Run the whole module here.
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests custom_domains:: | tee "${RUNNER_TEMP}/custom-domains.log"
+          assert_ran "${RUNNER_TEMP}/custom-domains.log" "custom_domains"
       - name: Run ACME-gated tests (certificate provisioning + renewal)
         if: matrix.lane == 'acme'
         # `acme` is not a default feature either, so the `test` job's workspace
@@ -915,6 +1015,12 @@ jobs:
           cargo test -p autumn-web --features acme \
             --test integration_tests acme_end_to_end:: | tee "${RUNNER_TEMP}/acme-e2e.log"
           assert_ran "${RUNNER_TEMP}/acme-e2e.log" "acme_end_to_end"
+          # Per-tenant custom-domain issuance, renewal, offboarding and the
+          # retention prune (#1635) — `acme`-gated, so nothing else compiles it.
+          cargo test -p autumn-web --features "acme,test-support" \
+            --test integration_tests custom_domain_issuance:: \
+            | tee "${RUNNER_TEMP}/custom-domain-issuance.log"
+          assert_ran "${RUNNER_TEMP}/custom-domain-issuance.log" "custom_domain_issuance"
       - name: Run real-ACME (Pebble) end-to-end test
         # Issue #1863, deferred from #1608/PR #1858: every ACME test above
         # drives `instant-acme` against `acme_fake_ca`, an in-process stand-in
@@ -1248,6 +1354,26 @@ jobs:
             --skip remember_me_rotates_across_restart_and_detects_theft
           cargo test -p teams -- --ignored --test-threads=1 --exact \
             signup_and_login_failures_redisplay_the_form_with_email_preserved
+          # `examples/cms` — the WordPress-parity CMS starter. Same story as
+          # `saas` and `teams` above: example apps are not auto-swept, so
+          # without this line its Docker-gated `tests/integration_test.rs`
+          # (register -> author -> publish -> moderate, the post state machine,
+          # comment-counter arithmetic, capability limits, password protection,
+          # permalink-structure changes, revision restore, export/import
+          # idempotence, and a CSRF round trip) runs nowhere in CI. Unlike
+          # those two, this suite has been run green as a whole from the start,
+          # so it is NOT narrowed with `--skip`: a new test added to the file
+          # runs here automatically.
+          #
+          # `--test-threads=1` because the suite shares one
+          # `TestDb::shared()` container and each test truncates it, exactly as
+          # the file's own doc comment says.
+          #
+          # The `--test integration_test` filter excludes the crate's other
+          # `#[ignore]`d target, `tests/system/smoke.rs`, which needs Chromium
+          # this job does not provide (it is `system-tests`-gated and so does
+          # not even compile here).
+          cargo test -p cms --test integration_test -- --ignored --test-threads=1
 
 
   test-gate:
@@ -1447,6 +1573,11 @@ jobs:
           # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          # The #1907 durable job queue and lease scheduler are a large slice of
+          # sqlite-only code; without this lane Codecov reports all of it
+          # uncovered.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_jobs_scheduler_e2e
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
@@ -1531,6 +1662,18 @@ jobs:
         run: cargo build -p autumn-web --features sqlite
       - name: Clippy (autumn-web lib, sqlite backend)
         run: cargo clippy -p autumn-web --features sqlite --lib -- -D warnings
+      - name: Install protoc (required for telemetry-otlp)
+        # prost/tonic build scripts want it, and ubuntu-latest does not ship it.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - name: Clippy (autumn-web lib, sqlite + telemetry-otlp)
+        # The durable SQLite job backend persists a W3C trace context, so its
+        # `telemetry-otlp` arms only compile under this pair (#1907). Without
+        # this step nothing that blocks a merge builds them — the semver job
+        # does, but only at tag-push time. This is also the enforcing lane that
+        # retires the panic-gate exemption for `middleware/trace_context.rs`.
+        run: cargo clippy -p autumn-web --features "sqlite,telemetry-otlp" --lib -- -D warnings
       - name: Clippy (autumn-web lib, sim-testing op-driver)
         # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
         # dependency for `sim::op` — lint it here (alongside the sqlite lib
@@ -1586,6 +1729,7 @@ jobs:
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
             --test sqlite_field_conversions \
+            --test sqlite_uuid_decimal_conversions \
             --test sqlite_json_field_conversion \
             --test sqlite_upsert_isolation \
             --test sqlite_votable \

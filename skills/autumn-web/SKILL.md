@@ -84,7 +84,7 @@ the framework almost certainly already generates or ships it:
 | Hand-parsed `Range` headers / manual `206 Partial Content` / `Content-Range` / `416` for seekable media or resumable downloads | `autumn_web::range` (`resolve` + `partial_bytes_response`) and `Download::into_response_ranged(&headers).await` — RFC 7233 single-range parsing, multi-range single-range collapse, `If-Range` via `.etag(..)`/`.last_modified(..)`, blob slices via `BlobStore::get_range` (no whole-object buffering) (0.6.0) |
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
-| A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument) instead of leaking series (0.7.0, issue #1378). `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
+| A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument, 256 instruments, 8 labels/series by default) instead of leaking series (0.7.0, issue #1378); those three are the `[metrics]` section — `max_series_per_metric` / `max_instruments` / `max_labels_per_series`, plus `AUTUMN_METRICS__*` — so an app with a genuinely larger label space raises them rather than losing series, while the name/value/help-length caps stay fixed. Lowering a cap never evicts a retained series (that would reset a counter); an out-of-range value fails the boot naming the key. `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
@@ -929,7 +929,7 @@ raw Diesel:
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
 | `find_in_batches(batch_size)`, `find_each(batch_size)` | **(0.6.0)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
-| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
+| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware, canonicalizing a `#[normalize]` lookup column), else normalizes and validates the payload (#2586 — an existing row still wins over a rejected one, re-checked on the primary) and inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
 | `ledgered = true` / `ledgered(valid_time = "col")` (attr) | **(0.7.0, issue #1699)** Makes the entity bitemporal and tamper-evident: every insert, update and soft-delete appends an immutable, hash-chained revision carrying a **full row snapshot** to `_autumn_ledger_revisions`. Adds `ledger_as_of(id, at)`, `ledger_as_of_at(id, LedgerAsOf)`, `ledger_diff(id, from, to)`, `ledger_revisions(id)`, `ledger_verify(id)`, `ledger_head(id)`, `ledger_high_water(id)` and `ledger_pin(id)` (both at once, from one snapshot — what an audit posture pins outside the database). Implies `versioned = true` and **requires `soft_delete`** (a hard DELETE would erase the row the ledger reconstructs); `purge` is not generated, and `#[version_history(sensitive = [...])]` / `no_versioned_record_impl` are compile errors. See "Ledgered entities" below |
 | `retention(after = "30d", basis = created_at)` / `retention(purge_deleted_after = "90d")` (attr) | **(0.7.0)** Declarative data-retention: reach for this instead of hand-writing a `#[scheduled]` cleanup fn for expiring sessions, drafts, one-time codes, or other transient rows. Compiles to a batched (`batch_size`, default 500), cursor-paginated sweep auto-registered with fleet coordination — no `tasks![...]` entry needed. On a `soft_delete` repository, `after` soft-deletes (never re-touching an already-deleted row) and `purge_deleted_after` hard-purges (re-checking `deleted_at` at delete time so a concurrent `restore()` survives); without `soft_delete`, `after` hard-deletes. Sweeps run across **all** tenants on a `tenant_scoped` repository (no per-tenant opt-out) and are not supported on `sharded` repositories (compile error). `autumn retention --dry-run [--model NAME]` reports rows-that-would-be-swept without deleting. Emits `retention_sweep_rows_total` / `retention_sweep_duration_seconds` metrics + a structured log line per run. See `docs/guide/retention-sweeps.md` |
 
@@ -1014,6 +1014,16 @@ create/update handlers validate the decoded payload before touching the DB:
   `Validate` derive compile to a no-op via the autoref `MaybeValidate`
   specialization (no migration burden), and this applies to plain and
   policy-backed handlers (#1237, #1253). See `docs/guide/pagination.md`.
+- **The repository enforces the same rules itself (#2586)**, so this is no
+  longer an `api = "..."` feature: `save`, `save_many`,
+  `save_many_skip_invalid` and the create half of `find_or_create_by_*` run
+  them after `#[normalize]` and before `before_create`. A GraphQL resolver, a
+  `#[task]` or an admin action gets the same 422. **Not** covered:
+  `Model::factory().create()` (and so `autumn seed`), a hand-written
+  repository, raw `diesel::insert_into`, and `upsert_many`. Update paths are
+  unchanged — see "Partial-update validation" below. A `#[validate]` rule on a
+  column that `before_create` *populates* now rejects every insert, because the
+  rules run first.
 
 ### Partial-update validation — the effective merged model (0.6.0, issue #1778)
 
@@ -2088,8 +2098,9 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
 | `worker` | no (probe-only router) | yes |
 
 - Run a specific tier: `autumn serve --role web|worker|combined`.
-- A split (non-`combined`) role **requires a `postgres`/`redis` jobs backend** —
-  an in-memory queue can't cross processes.
+- A split (non-`combined`) role **requires a `postgres`/`redis`/`sqlite` jobs
+  backend** — an in-memory queue can't cross processes. `sqlite` qualifies only
+  within one host, since its queue is a table in one file (#1907).
 - `release init --split-workers` splices a dedicated `worker:` service into the
   generated **docker-compose** output and sets the web-tier role on the `app`
   service (#1613). See `docs/guide/cloud-native.md`.
@@ -2817,6 +2828,7 @@ autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/Mi
 autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
 autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
+autumn db scrub --sample users=1% --seed 42            # scrub AND subset in one pass: 1% of users plus every row they relate to, reproducibly
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
 autumn seed --count 50 --model Post  # generate+insert 50 faked rows via the model's factory (both flags together)
 autumn serve --role worker       # run only workers + scheduler (web/worker split); also --role web|combined
@@ -2857,7 +2869,19 @@ autumn graph touches posts       # which routes and jobs reach a model, table, o
 autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
+autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
+autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
+autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
 ```
+
+`autumn openapi export` is the way to get the contract out of an app — prefer
+it to booting the server and curling `/openapi.json`, and to `autumn build`
+(which writes `dist/openapi.json` only as a side effect of static generation,
+and bails out entirely on an app with no `#[static_get]` routes). Every run also
+reports the component schemas that degraded to the opaque placeholder, naming
+the operations reaching them; those are the types a generated client can only
+see as `unknown` / `serde_json::Value`. Fix each with
+`#[derive(OpenApiSchema)]` on the type. See `docs/guide/openapi.md`.
 
 Reach for `autumn graph` before reading a codebase to answer a structural
 question. It is derived from the macros at compile time and embedded in the
@@ -3045,10 +3069,11 @@ prunes to the newest N runs. `autumn db restore <ARTIFACT> [--shard NAME]
 same production guard as `db drop` (refuses non-dev/test without `--force`). See
 `docs/guide/deployment.md`.
 
-### `autumn db scrub` (issue #1602)
+### `autumn db scrub` (issues #1602, #1636)
 
 `autumn db scrub [--artifact ARTIFACT] [--output DIR] [--config PATH] [--check]
-[--dry-run] [--force]` turns a production database — or an `autumn db backup`
+[--dry-run] [--force] [--sample TABLE=COUNT|PERCENT%] [--seed N]` turns a
+production database — or an `autumn db backup`
 artifact restored into the resolved target — into an anonymized copy safe for
 staging/dev. It rewrites every PII-classified column with deterministic,
 constraint-valid fake values, resolving the target(s) exactly like `db backup`
@@ -3116,8 +3141,34 @@ database's statements run in one transaction.
 
 `--check` classifies and writes nothing, exiting non-zero on any unclassified
 column — run it in CI after the migrate step. `--dry-run` prints the exact SQL.
-`--output DIR` re-dumps the scrubbed database as a fresh backup run. See
-`docs/guide/data-scrubbing.md`.
+`--output DIR` re-dumps the scrubbed database as a fresh backup run.
+
+**Sampling (#1636).** `--sample users=1%` (or `users=500`, repeatable) emits a
+referentially-intact SUBSET instead of the whole copy, so a production copy fits
+on a laptop. From the named roots the walk follows the database's own foreign key
+graph: it **descends** into rows that reference a selected row (that is "1% of
+users plus all their data") and **ascends** into rows a selected row references
+so every foreign key resolves — but never descends back out of a row it only
+ascended into, or one shared org would drag the whole database back in. Two rules
+sit beside the PII declaration: `[sample] always_include` copies reference data
+whole (and is never descended from), `never_include` drops a table entirely.
+Selection is deterministic — ordered by a hash of `--seed` (default `0`) and the
+row key — so the same seed reproduces the identical subset.
+
+The subset is a phase of the scrub's own transaction, never a separate command,
+so no flag combination emits sampled-but-unscrubbed rows. It is fail-closed like
+the classification and aborts before removing a row when it cannot prove the
+result: a table no root can reach (being *connected* is not enough — see the
+descend rule above), a foreign key into a `never_include` table, a table with no
+primary key, a reference cycle among the tables it deletes from, or a table
+outside the sample that references one it subsets (empty that one with
+`[framework] purge`). Every foreign key is re-counted inside the transaction, so
+a violation rolls the run back, and each run reports per-table row counts and the
+size once the subsetted tables are compacted with `VACUUM (FULL, ANALYZE)`.
+`--check` proves the plan on a sample too. The amount is **per target**: with
+shards, `--sample users=500` selects up to 500 rows from each database.
+
+See `docs/guide/data-scrubbing.md`.
 
 ### `[retention]` + `autumn db retention` (0.7.0, issue #1605)
 
@@ -3294,6 +3345,78 @@ on `/actuator/health` under the `sqlite-replication` indicator; the indicator go
 `[alerts]` pipeline escalates (see `AlertCondition::HealthIndicatorDown`).
 Verification is a **real restore** on an interval, not a checksum. See
 `docs/guide/sqlite-in-production.md`.
+
+### Durable jobs and a single-host scheduler on SQLite (0.7.0, issue #1907)
+
+On the **SQLite** tier, `#[job]` work is durable with no Redis and no Postgres.
+`jobs.backend = "sqlite"` puts the queue in an `autumn_jobs` table in the app's
+own file; a worker claims a row with one
+`UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …`, the single-host analog of
+`FOR UPDATE SKIP LOCKED`, because SQLite serializes writers. A claim a crashed
+worker left behind is re-enqueued once it outlives
+`jobs.sqlite.visibility_timeout_ms`. The runtime creates the table and its
+indexes itself — framework migrations are Postgres SQL.
+
+```toml
+[jobs]
+backend = "sqlite"
+
+[jobs.sqlite]
+visibility_timeout_ms = 30000   # reclaim a dead worker's claim after this
+poll_interval_ms = 250          # no LISTEN/NOTIFY, so an idle worker polls
+
+[scheduler]
+backend = "sqlite"              # or "in_process" (default) for one process
+```
+
+Semantics match Postgres: attempts, backoff, dead-lettering,
+`#[job(unique)]` windows, `#[job(concurrency = N)]`, named queues, `[jobs] pin`,
+tracked-job status, the actuator gauges, and the `/admin/jobs` dashboard, which
+reads the table so every process on the host sees one queue.
+
+`scheduler.backend = "sqlite"` leases each `(task, tick)` in
+`autumn_scheduler_leases`, so several processes on one host elect exactly one
+leader per tick; the lease expires after `scheduler.lease_ttl_secs` rather than
+wedging the task when a leader dies. `autumn_web::lock::Lock` works on the tier
+too, over a lease row rather than a `pg_advisory_lock` session.
+
+Because the queue is a table both processes open, a **split web/worker role is
+valid on SQLite** — but only within one host. Both backends need the non-default
+`sqlite` cargo feature and are refused with an actionable message without it. See
+`docs/guide/sqlite-in-production.md` and `docs/guide/jobs.md`.
+
+### SQLite migration dialect and `migrate check` (issue #1906)
+
+`autumn migrate check` classifies migration SQL against the app's own backend.
+On SQLite it never recommends `CREATE INDEX CONCURRENTLY` (no such syntax) and
+does not flag a plain `DROP INDEX` (a cheap catalog edit, and a precondition of
+`DROP COLUMN`). A new `unsupported` risk level marks statements SQLite rejects
+outright, and fails the gate:
+
+| Statement | Why SQLite rejects it | Write instead |
+| --- | --- | --- |
+| `ALTER TABLE … ALTER COLUMN …` (any form) | SQLite's `ALTER TABLE` supports only `RENAME`, `ADD COLUMN`, `DROP COLUMN` | Rebuild the table — `autumn schema diff --write-migration` emits it |
+| `ADD COLUMN … NOT NULL` with no `DEFAULT` | Cannot backfill existing rows | Give a constant `DEFAULT`, or add the column nullable |
+| `ADD COLUMN … UNIQUE` / `PRIMARY KEY` | Inline constraint not allowed | Add the column, then `CREATE UNIQUE INDEX` |
+| `ADD COLUMN … DEFAULT CURRENT_TIMESTAMP` or `DEFAULT (expr)` | The default must be a constant | Use a literal, or backfill with `UPDATE` |
+| More than one action in one `ALTER TABLE` | SQLite takes one action per statement | Split into one `ALTER TABLE` per action |
+| `TRUNCATE` | No such statement | `DELETE FROM <table>;` |
+| Sequences, types, extensions, materialized views, `COMMENT ON`, `GRANT`/`REVOKE` | Postgres-only objects | Remove, or gate the migration to Postgres |
+
+One rule Autumn deliberately does **not** report: SQLite rejects an added
+`REFERENCES` column with a non-NULL default only when `PRAGMA foreign_keys` is
+ON, and the migration connection leaves it OFF, so the statement applies.
+
+`DROP COLUMN` also fails on SQLite when the column is a primary key, is `UNIQUE`,
+is named by any index (including a partial index's `WHERE`), or appears in a
+`CHECK`, generated column, view or trigger. `autumn generate migration
+Remove…From…` handles the index case: it reads the project's earlier
+`migrations/*/up.sql`, emits `DROP INDEX IF EXISTS` for every live index that
+names the removed column — composite, partial, expression and hand-named
+included — before the `DROP COLUMN`, and re-creates them in `down.sql`. An index
+created outside `migrations/` stays invisible; drop it in the same migration.
+
+Postgres classification and generated Postgres DDL are unchanged.
 
 ### VPS deploys and fleets — `autumn deploy` (0.6.0; fleets 0.7.0, issues #1607/#1621)
 

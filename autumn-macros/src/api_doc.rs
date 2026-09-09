@@ -581,14 +581,30 @@ pub fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type>
 /// * everything else  → `SchemaKind::Ref` with the type's last path
 ///   segment as the schema name (back-filled by the spec generator)
 fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
+    // `Vec` and `Option` are matched on the LAST PATH SEGMENT, so an
+    // application's own `domain::Vec<T>` / `domain::Option<T>` — ordinary
+    // structs that merely spell that segment — lands here too, and neither is
+    // an array nor nullable. Each wrapper entry therefore carries its own
+    // `type_name` identity and its real display name, and the generator checks
+    // that identity before rendering the wrapper shape: an impostor is emitted
+    // as an ordinary `$ref` instead (see `wrapper_is_impostor`). The `name` is
+    // the type's last segment rather than the old `"array"`/`"nullable"`
+    // sentinel because that name is what the component index uses as the
+    // display base — it is never consulted for a genuine wrapper.
+    let wrapper_name = LitStr::new(
+        &last_segment_name(ty).unwrap_or_else(|| "Schema".to_owned()),
+        Span::call_site(),
+    );
     // Vec<T> → array of <schema of T>.
     if let Some(inner) = unwrap_single_generic(ty, "Vec") {
         let inner_tokens = schema_entry_for_type(&inner);
         return quote! {
             ::autumn_web::openapi::SchemaEntry {
-                name: "array",
+                name: #wrapper_name,
                 kind: ::autumn_web::openapi::SchemaKind::Array(&#inner_tokens),
-                identity: ::core::option::Option::None,
+                identity: ::core::option::Option::Some(
+                    ::autumn_web::openapi::type_name_of::<#ty>
+                ),
             }
         };
     }
@@ -597,9 +613,11 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
         let inner_tokens = schema_entry_for_type(&inner);
         return quote! {
             ::autumn_web::openapi::SchemaEntry {
-                name: "nullable",
+                name: #wrapper_name,
                 kind: ::autumn_web::openapi::SchemaKind::Nullable(&#inner_tokens),
-                identity: ::core::option::Option::None,
+                identity: ::core::option::Option::Some(
+                    ::autumn_web::openapi::type_name_of::<#ty>
+                ),
             }
         };
     }
@@ -1054,13 +1072,7 @@ pub fn extract_authorize_bindings(input_fn: &syn::ItemFn) -> Vec<(String, String
     collect_authorize_markers_in_stmts(&input_fn.block.stmts, &mut bindings);
 
     for attr in &input_fn.attrs {
-        if attr.path().is_ident("authorize")
-            || attr
-                .path()
-                .segments
-                .last()
-                .is_some_and(|s| s.ident == "authorize")
-        {
+        if crate::authorize::attr_is_authorize_shaped(attr, input_fn) {
             bindings.extend(authorize_binding_from_attr(attr));
         }
     }

@@ -64,6 +64,7 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 |------|------|----------------|
 | `generated_project_compiles_runs_and_serves` | `e2e.rs` | `autumn new` → `cargo build` + HTTP responses |
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
+| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) → `cargo check`. Not `--all-targets`: the scaffold smoke test is Postgres-only until #1905 (#1924) |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
 | `generated_constrained_scaffold_enforces_validation_end_to_end` | `generate.rs` | scaffold DSL `{…}` constraints + Postgres + live HTTP: rendered HTML5 attributes, 422 + inline errors, nothing stored (#1388) |
@@ -740,7 +741,7 @@ RustSec advisory sits in the tree being published. Run it locally exactly as CI
 does:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite graph, scaffold graph
+./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
@@ -757,9 +758,15 @@ reject it, then to accept it once — and only once — that id is waived.
 additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
 backend graph (`deny-sqlite.toml`), including dev- and build-dependency
 licenses — plus, for advisories only, autumn-web's tree under the policy
-`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). The repository's separate *excluded* sub-workspaces — `fuzz/` and
+`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). It also covers
+the repository's separate *excluded* sub-workspaces — `fuzz/` and
 `examples/island-flock`, which each declare their own `[workspace]` and are
-excluded from the root `Cargo.toml` — are non-shipped harnesses/examples and are
-not gated here. Adding a per-sub-workspace cargo-deny pass (each needs its own
-config, and `fuzz/Cargo.lock` is currently out of sync with its manifest) is a
-possible follow-up.
+excluded from the root `Cargo.toml` for their own build reasons (a
+nightly/ASAN toolchain and a wasm32-only target, respectively), but are still
+real, shipped CI surface: `fuzz` is compiled and run by every `fuzz.yml` job,
+and `island-flock`'s compiled wasm/js bundle is committed and served by the
+`flock` example. Each has its own narrower `deny.toml`
+(`fuzz/deny.toml`, `examples/island-flock/deny.toml` — advisories + sources
+only; licenses aren't gated on either yet, see each file's header) audited by
+`audit_satellite_graphs` in `scripts/check-advisories.sh`. Triage a failing
+satellite check against that satellite's own `deny.toml`, not the root one.

@@ -1465,6 +1465,7 @@ impl ConfigProperties {
         Self::track_telemetry_props(&mut props, config, &defaults, &profile_str);
         Self::track_health_props(&mut props, config, &defaults, &profile_str);
         Self::track_actuator_props(&mut props, config, &defaults, &profile_str);
+        Self::track_metrics_props(&mut props, config, &defaults, &profile_str);
         Self::track_session_props(&mut props, config, &defaults, &profile_str);
         Self::track_channels_props(&mut props, config, &defaults, &profile_str);
 
@@ -1726,6 +1727,35 @@ impl ConfigProperties {
             "actuator.prometheus",
             &config.actuator.prometheus.to_string(),
             &defaults.actuator.prometheus.to_string(),
+            profile_str,
+        );
+    }
+
+    fn track_metrics_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "metrics.max_series_per_metric",
+            &config.metrics.max_series_per_metric.to_string(),
+            &defaults.metrics.max_series_per_metric.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "metrics.max_instruments",
+            &config.metrics.max_instruments.to_string(),
+            &defaults.metrics.max_instruments.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "metrics.max_labels_per_series",
+            &config.metrics.max_labels_per_series.to_string(),
+            &defaults.metrics.max_labels_per_series.to_string(),
             profile_str,
         );
     }

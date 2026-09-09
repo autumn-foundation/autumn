@@ -48,6 +48,7 @@ experiment_assignments  365d       [retention]           sweep            0
 webhook_replay          forever    unset                 backend ttl      —
 sessions                1d         session.max_age_secs  backend ttl      —
 audit_archives          400d       [retention]           archive rewrite  38
+custom_domains          30d        [retention]           store prune      2
 
   ℹ idempotency: enforced at write time: records are stored with a TTL capped at 86400s by the backend, not deleted by this sweep
   ℹ webhook_replay: no retention window configured
@@ -71,6 +72,7 @@ before setting those three.
 | `webhook_replay` | Inbound webhook replay markers | memory / Redis | the endpoint's replay_window_secs (24h by default) | backend TTL |
 | `sessions` | Server-side session records | memory / Redis | session.max_age_secs (the session cookie's lifetime) | backend TTL |
 | `audit_archives` | Entries in the JSONL audit archive | the sink's file | **forever** | archive rewrite |
+| `custom_domains` | Tenant custom-domain registry records and their certificates | `[server.tls.acme.custom_domains] store_dir` and the ACME cache | forever (until the app offboards the domain) | store prune |
 
 **Leaving a dataset unset preserves today's behavior exactly.** With no
 `[retention]` section at all, no sweep task is registered, no scheduler loop is
@@ -413,6 +415,7 @@ experiment_assignments = "365d"
 webhook_replay         = "3d"
 sessions               = "30d"
 audit_archives         = "400d"
+custom_domains         = "30d"
 ```
 
 Four of these keys have a pre-existing 24-hour default bound
@@ -443,6 +446,7 @@ Every key has an environment override:
 | `AUTUMN_RETENTION__WEBHOOK_REPLAY` | `retention.webhook_replay` |
 | `AUTUMN_RETENTION__SESSIONS` | `retention.sessions` |
 | `AUTUMN_RETENTION__AUDIT_ARCHIVES` | `retention.audit_archives` |
+| `AUTUMN_RETENTION__CUSTOM_DOMAINS` | `retention.custom_domains` |
 
 Setting one to the empty string *clears* a window declared in `autumn.toml`,
 restoring today's behavior for that one dataset without editing the file.
@@ -452,7 +456,8 @@ restoring today's behavior for that one dataset without editing the file.
 The sweep is registered as a
 [`coordination = "fleet"` scheduled task](scheduled-multi-replica.md) named
 `autumn-retention-sweep`. Under the `postgres` scheduler backend only one
-replica executes it per tick, however many replicas are running. It runs in
+replica executes it per tick, however many replicas are running; the `sqlite`
+backend gives the same guarantee across the processes on one host. It runs in
 the `worker` and `combined` process roles, not `web`, like every other
 scheduled task.
 

@@ -79,6 +79,9 @@ pub enum RetentionEnforcement {
     BackendTtl,
     /// The audit archive is rewritten in place without the stale entries.
     ArchiveRewrite,
+    /// A framework-owned store on disk is pruned of records the window no
+    /// longer keeps, plus anything already orphaned.
+    StorePrune,
 }
 
 impl std::fmt::Display for RetentionEnforcement {
@@ -87,6 +90,7 @@ impl std::fmt::Display for RetentionEnforcement {
             Self::Sweep => "sweep",
             Self::BackendTtl => "backend ttl",
             Self::ArchiveRewrite => "archive rewrite",
+            Self::StorePrune => "store prune",
         })
     }
 }
@@ -112,13 +116,15 @@ pub enum RetentionDataset {
     Sessions,
     /// Entries in the JSONL audit archive.
     AuditArchives,
+    /// Tenant custom-domain registry records and their certificates.
+    CustomDomains,
 }
 
 /// Every framework-owned dataset, in the order the CLI reports them.
 ///
 /// The single list the config surface, the sweeps, the CLI report and the
 /// docs table all derive from.
-pub const RETENTION_DATASETS: [RetentionDataset; 8] = [
+pub const RETENTION_DATASETS: [RetentionDataset; 9] = [
     RetentionDataset::JobHistory,
     RetentionDataset::CommitHooks,
     RetentionDataset::JobTracking,
@@ -127,6 +133,7 @@ pub const RETENTION_DATASETS: [RetentionDataset; 8] = [
     RetentionDataset::WebhookReplay,
     RetentionDataset::Sessions,
     RetentionDataset::AuditArchives,
+    RetentionDataset::CustomDomains,
 ];
 
 impl RetentionDataset {
@@ -142,6 +149,7 @@ impl RetentionDataset {
             Self::WebhookReplay => "webhook_replay",
             Self::Sessions => "sessions",
             Self::AuditArchives => "audit_archives",
+            Self::CustomDomains => "custom_domains",
         }
     }
 
@@ -170,6 +178,7 @@ impl RetentionDataset {
             Self::WebhookReplay => "Inbound webhook replay markers",
             Self::Sessions => "Server-side session records",
             Self::AuditArchives => "Entries in the JSONL audit archive",
+            Self::CustomDomains => "Tenant custom-domain registry records and their certificates",
         }
     }
 
@@ -184,7 +193,11 @@ impl RetentionDataset {
             Self::CommitHooks => Some("autumn_repository_commit_hooks"),
             Self::JobTracking => Some("autumn_job_tracking"),
             Self::ExperimentAssignments => Some("autumn_experiment_assignments"),
-            Self::Idempotency | Self::WebhookReplay | Self::Sessions | Self::AuditArchives => None,
+            Self::Idempotency
+            | Self::WebhookReplay
+            | Self::Sessions
+            | Self::AuditArchives
+            | Self::CustomDomains => None,
         }
     }
 
@@ -221,6 +234,7 @@ impl RetentionDataset {
                 RetentionEnforcement::BackendTtl
             }
             Self::AuditArchives => RetentionEnforcement::ArchiveRewrite,
+            Self::CustomDomains => RetentionEnforcement::StorePrune,
         }
     }
 
@@ -233,6 +247,9 @@ impl RetentionDataset {
             | Self::CommitHooks
             | Self::ExperimentAssignments
             | Self::AuditArchives => "forever",
+            // A connected domain is kept for as long as it is registered; only
+            // a connection abandoned before DNS was ever published ages out.
+            Self::CustomDomains => "forever (until the app offboards the domain)",
             Self::JobTracking => "jobs.tracking.ttl_secs (24h by default)",
             Self::Idempotency => "idempotency.ttl_secs (24h by default)",
             Self::WebhookReplay => "the endpoint's replay_window_secs (24h by default)",
@@ -283,7 +300,8 @@ impl RetentionDataset {
             Self::JobHistory
             | Self::CommitHooks
             | Self::ExperimentAssignments
-            | Self::AuditArchives => None,
+            | Self::AuditArchives
+            | Self::CustomDomains => None,
         }
     }
 }
@@ -595,6 +613,9 @@ async fn run_one_dataset(
         RetentionEnforcement::ArchiveRewrite => {
             apply_archive_purge(state, cutoff, dry_run, &mut report).await;
         }
+        RetentionEnforcement::StorePrune => {
+            apply_custom_domain_prune(state, cutoff, dry_run, &mut report).await;
+        }
     }
 
     report.duration_ms = elapsed_ms(started);
@@ -641,6 +662,30 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
 
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Prune abandoned custom-domain registrations and orphaned certificates
+/// through the installed [`CustomDomainPruner`](crate::custom_domain::CustomDomainPruner).
+///
+/// Reports "not enabled" rather than a zero when custom domains are off, so a
+/// configured window never reads as an enforced policy over nothing.
+async fn apply_custom_domain_prune(
+    state: &AppState,
+    cutoff: DateTime<Utc>,
+    dry_run: bool,
+    report: &mut RetentionDatasetReport,
+) {
+    let Some(pruner) =
+        state.extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
+    else {
+        report.skipped =
+            Some("custom domains are not enabled ([server.tls.acme.custom_domains])".to_owned());
+        return;
+    };
+    match pruner.prune(cutoff.timestamp(), dry_run).await {
+        Ok(removed) => report.rows_removed = removed,
+        Err(e) => report.error = Some(e),
+    }
 }
 
 /// Purge stale audit-archive entries through the installed [`AuditLogger`].
@@ -751,7 +796,8 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
         RetentionDataset::Idempotency
         | RetentionDataset::WebhookReplay
         | RetentionDataset::Sessions
-        | RetentionDataset::AuditArchives => None,
+        | RetentionDataset::AuditArchives
+        | RetentionDataset::CustomDomains => None,
     }
 }
 
@@ -807,12 +853,16 @@ async fn apply_sweep(
     }
 }
 
-/// The sweep-enforced datasets are Postgres-only: `autumn_jobs`,
-/// `autumn_job_tracking` and `autumn_experiment_assignments` are created by
-/// Postgres-specific migrations (`TIMESTAMPTZ`, `BIGSERIAL`, a `plpgsql`
-/// notify trigger), and the Postgres job backend is itself unsupported under
-/// the `sqlite` feature. Report that rather than pretending a sweep ran —
-/// mirrors `job.rs`'s own `sqlite`-feature fallback.
+/// The sweep itself is Postgres-only. Its predicates and batching are written
+/// against Postgres types and `NOW()`, and `autumn_experiment_assignments` is
+/// created by a Postgres-specific migration, so there is nothing here to run on
+/// `SQLite`. Report that rather than pretending a sweep ran.
+///
+/// The durable `SQLite` job backend (issue #1907) does create `autumn_jobs` and
+/// `autumn_job_tracking` in the app's own file, and prunes them itself from its
+/// maintenance loop — expired tracking records always, and terminal job rows
+/// when `retention.job_history` is set. A `SQLite` sweep driven from
+/// `autumn db retention` is tracked under #1909.
 #[cfg(any(not(feature = "db"), feature = "sqlite"))]
 #[allow(clippy::unused_async)]
 async fn apply_sweep(
@@ -824,8 +874,8 @@ async fn apply_sweep(
 ) {
     report.skipped = Some(
         if cfg!(feature = "sqlite") {
-            "this dataset lives in a Postgres-only framework table, which the sqlite feature \
-             does not create"
+            "the retention sweep is Postgres-only; on SQLite the durable job runtime prunes \
+             its own tables (see retention.job_history) and a sweep for the rest is planned"
         } else {
             "this build has no database support (`db` feature off)"
         }

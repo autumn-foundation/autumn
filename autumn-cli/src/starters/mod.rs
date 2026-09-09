@@ -616,32 +616,38 @@ mod tests {
         ));
     }
 
-    /// The embedded `saas` starter, rendered with project name `saas`, must
-    /// reproduce the committed `examples/saas/` tree exactly — so the flagship
-    /// starter and the drift-gated example can never diverge silently.
+    /// Assert that `starter`, rendered with `project_name`, reproduces the
+    /// committed `examples/{project_name}/` tree exactly.
     ///
-    /// `Cargo.toml` is excluded: the committed example uses an in-workspace path
-    /// dependency (so it compiles in-repo) while the shipped starter uses a
-    /// versioned dependency. Everything else must match byte-for-byte.
-    #[test]
-    fn embedded_saas_matches_example_saas() {
-        let contents = load_from_embedded(&builtin::SAAS).unwrap();
+    /// This is what keeps a shipped starter and its drift-gated example from
+    /// diverging silently. Two files are excluded by contract:
+    ///
+    /// * `Cargo.toml` — the example uses an in-workspace path dependency (so it
+    ///   compiles in-repo) while the shipped starter uses a versioned one.
+    /// * `tests/system/smoke.rs` — workspace-internal e2e tooling (issue #1192)
+    ///   that depends on the path-only `example-e2e` crate. It has no meaning
+    ///   outside this monorepo, the same category of divergence as `Cargo.toml`.
+    ///
+    /// …and `static/css/app.css` is a Tailwind build artefact, not a source file.
+    fn assert_starter_matches_example(starter: &'static Dir<'static>, project_name: &'static str) {
+        let contents = load_from_embedded(starter).unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let dest = tmp.path().join("saas");
-        let crate_name = "saas".to_owned();
+        let dest = tmp.path().join(project_name);
+        let crate_name = project_name.replace('-', "_");
         let vars = TemplateVars {
-            project_name: "saas",
+            project_name,
             crate_name: &crate_name,
             autumn_version: env!("CARGO_PKG_VERSION"),
             rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
         };
         scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
 
-        let example_root =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/saas");
+        let example_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../examples")
+            .join(project_name);
 
-        // Every rendered file matches the committed example. Compare against the
-        // emitted name (the starter ships `Cargo.toml.tmpl`, emitted as
+        // Every rendered file matches the committed example. Compare against
+        // the emitted name (the starter ships `Cargo.toml.tmpl`, emitted as
         // `Cargo.toml`).
         for file in &contents.files {
             let emitted = emit_rel_path(&file.rel_path);
@@ -651,16 +657,17 @@ mod tests {
             let example_path = example_root.join(emitted);
             let rendered = fs::read(dest.join(emitted)).unwrap();
             let committed = fs::read(&example_path).unwrap_or_else(|_| {
-                panic!("examples/saas is missing {emitted} — regenerate it from the starter")
+                panic!(
+                    "examples/{project_name} is missing {emitted} — regenerate it from the starter"
+                )
             });
             assert_eq!(
                 rendered, committed,
-                "drift between embedded saas starter and examples/saas at {emitted}"
+                "drift between embedded {project_name} starter and examples/{project_name} at {emitted}"
             );
         }
 
-        // …and the example has no stray files the starter does not produce
-        // (ignoring build artefacts and the generated CSS).
+        // …and the example has no stray files the starter does not produce.
         let mut starter_paths: std::collections::BTreeSet<String> = contents
             .files
             .iter()
@@ -685,22 +692,90 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
-                // app.css is a build artefact (Tailwind output), not a source file.
-                if rel == "static/css/app.css" {
-                    continue;
-                }
-                // tests/system/smoke.rs is workspace-internal e2e tooling (issue
-                // #1192) that depends on the path-only `example-e2e` crate — it
-                // has no meaning outside the autumn monorepo, same category of
-                // divergence as Cargo.toml's path-vs-versioned dependency above.
-                if rel == "tests/system/smoke.rs" {
+                if rel == "static/css/app.css" || rel == "tests/system/smoke.rs" {
                     continue;
                 }
                 assert!(
                     starter_paths.contains(&rel),
-                    "examples/saas has {rel} which the embedded starter does not produce"
+                    "examples/{project_name} has {rel} which the embedded starter does not produce"
                 );
             }
         }
+    }
+
+    /// Rendering a starter under a project name that is NOT its own must not
+    /// leave the starter's own crate name in a Rust path.
+    ///
+    /// `assert_starter_matches_example` cannot see this. It renders with the
+    /// starter's own name, where `{{crate_name}}` and a hardcoded `cms` produce
+    /// identical bytes — so a template variable that was never substituted
+    /// compares equal and ships. `autumn new my-blog --starter cms` then
+    /// scaffolds a crate named `my_blog` whose `main.rs` says `cms::bootstrap()`,
+    /// and it does not compile.
+    ///
+    /// Rendering under a different name is what separates the two, so that is
+    /// what this does: scaffold each built-in as `acme-site` and assert no
+    /// emitted Rust source names the starter itself.
+    fn assert_no_hardcoded_crate_name(starter: &'static Dir<'static>, starter_name: &str) {
+        let contents = load_from_embedded(starter).unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("acme-site");
+        let vars = TemplateVars {
+            project_name: "acme-site",
+            crate_name: "acme_site",
+            autumn_version: env!("CARGO_PKG_VERSION"),
+            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        };
+        scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
+
+        let needle = format!("{starter_name}::");
+        for file in &contents.files {
+            let emitted = emit_rel_path(&file.rel_path);
+            if std::path::Path::new(emitted).extension() != Some(std::ffi::OsStr::new("rs")) {
+                continue;
+            }
+            let rendered = fs::read_to_string(dest.join(emitted)).unwrap();
+            for (line_no, line) in rendered.lines().enumerate() {
+                // `crate::<name>::` and `some_<name>::` are ordinary paths; only
+                // the crate root spelled as the starter's own name is the bug.
+                let Some(at) = line.find(&needle) else {
+                    continue;
+                };
+                let preceded_by_ident = line[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':');
+                assert!(
+                    preceded_by_ident,
+                    "{emitted}:{} names the crate `{starter_name}` after rendering as \
+                     `acme-site`; template it as {{{{crate_name}}}}:: or the scaffolded \
+                     project will not compile:\n  {line}",
+                    line_no + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saas_starter_has_no_hardcoded_crate_name() {
+        assert_no_hardcoded_crate_name(&builtin::SAAS, "saas");
+    }
+
+    #[test]
+    fn cms_starter_has_no_hardcoded_crate_name() {
+        assert_no_hardcoded_crate_name(&builtin::CMS, "cms");
+    }
+
+    /// The embedded `saas` starter must reproduce `examples/saas/` exactly, so
+    /// the flagship starter and the drift-gated example cannot diverge.
+    #[test]
+    fn embedded_saas_matches_example_saas() {
+        assert_starter_matches_example(&builtin::SAAS, "saas");
+    }
+
+    /// The same contract for the `cms` starter and `examples/cms/`.
+    #[test]
+    fn embedded_cms_matches_example_cms() {
+        assert_starter_matches_example(&builtin::CMS, "cms");
     }
 }

@@ -42,6 +42,14 @@ pub fn route_macro(
         Err(err) => return err,
     };
 
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at when deciding whether this
+    // route keeps the standalone `IdempotencyReplayLayer` — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
+        return err;
+    }
+
     // Extract #[intercept(LayerType)] attributes from the handler.
     let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
 
@@ -609,12 +617,11 @@ fn build_handler_expr(
 }
 
 fn has_authorize_guard(input_fn: &syn::ItemFn) -> bool {
-    input_fn.attrs.iter().any(|attr| {
-        attr.path()
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "authorize")
-    }) || block_has_replay_guard(&input_fn.block)
+    input_fn
+        .attrs
+        .iter()
+        .any(|attr| crate::authorize::attr_is_authorize_shaped(attr, input_fn))
+        || block_has_replay_guard(&input_fn.block)
         || crate::api_doc::has_policy_check_in_stmts(&input_fn.block.stmts)
 }
 

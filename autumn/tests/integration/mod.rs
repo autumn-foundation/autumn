@@ -65,6 +65,9 @@ mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
 mod constela;
+#[cfg(feature = "acme")]
+mod custom_domain_issuance;
+mod custom_domains;
 mod custom_layer;
 #[cfg(feature = "db")]
 mod data_classification;
@@ -88,6 +91,7 @@ mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
 mod error_reporting;
+mod error_validation_details;
 mod events_integration;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
@@ -221,6 +225,8 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(feature = "openapi")]
+mod openapi_export;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
@@ -261,6 +267,7 @@ mod rate_limit_pipeline;
 mod rate_limit_principal;
 #[cfg(feature = "redis")]
 mod rate_limit_redis_integration;
+mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
@@ -284,6 +291,11 @@ mod repository_bulk_operations;
 mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
+// Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
+// cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
+// (after the fix) the batched `dependent_delete_all` replacement.
+#[cfg(feature = "db")]
+mod repository_dependent_destroy_leaf_batch_profile;
 #[cfg(feature = "db")]
 mod repository_find_in_batches;
 #[cfg(feature = "db")]
@@ -342,6 +354,7 @@ mod sim_rate_limit_clock;
 mod sim_retry_storm;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+mod sqlite_ci_coverage;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]
@@ -381,6 +394,8 @@ mod translatable_request;
 mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;
+#[cfg(feature = "db")]
+mod validate_on_insert;
 #[cfg(feature = "db")]
 mod validate_on_update_blind;
 mod validate_patch_option_ip;

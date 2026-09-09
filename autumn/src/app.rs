@@ -3314,6 +3314,30 @@ impl AppBuilder {
             return;
         }
 
+        // ── OpenAPI spec dump mode ─────────────────────────────────────
+        // When AUTUMN_DUMP_OPENAPI=1, print the generated OpenAPI document
+        // and exit. Triggered by `autumn openapi export`, which needs the
+        // contract without booting the server or connecting to a database.
+        // The guard is deliberately outside the feature gate: a binary built
+        // without `openapi` must report that on the dump protocol rather than
+        // ignore the request and start serving.
+        if is_dump_openapi_mode() {
+            #[cfg(feature = "openapi")]
+            {
+                self.run_dump_openapi_mode().await;
+                return;
+            }
+            #[cfg(not(feature = "openapi"))]
+            {
+                eprintln!(
+                    "{marker}{reason}",
+                    marker = crate::openapi::OPENAPI_UNAVAILABLE_MARKER,
+                    reason = crate::openapi::OPENAPI_UNAVAILABLE_FEATURE,
+                );
+                std::process::exit(2);
+            }
+        }
+
         // ── Cache-coherence manifest dump mode ─────────────────────────
         // When AUTUMN_DUMP_CACHE_COHERENCE=1, print the cache-coherence
         // manifest (#1716) and exit. Triggered by `autumn cache audit`, which
@@ -3609,16 +3633,34 @@ impl AppBuilder {
         // rather than in `validate()`, so the doctor can still load the config.
         // A combined role is always fine.
         let role = config.role;
-        if crate::config::split_role_requires_durable_backend(role, &config.jobs.backend) {
+        // Both config-only preconditions, through the same helper the no-boot
+        // export calls — the split-role/durable-backend rule and the merged
+        // scheduled-task-name check. The helper returns the message rather than
+        // exiting, because this path has a database pool to stop on the way out
+        // and the export has none.
+        if let Err(message) = validate_config_preconditions(&config, &tasks) {
+            tracing::error!("{message}");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
+        // The sqlite queue backs a split role only because both processes open
+        // the same file. Against an in-memory target each gets its own private
+        // database, so the web replica would enqueue where no worker can ever
+        // look — the same silent stranding, one step further in (issue #1907).
+        if crate::config::split_role_requires_file_backed_sqlite(
+            role,
+            &config.jobs.backend,
+            config.database.effective_primary_url(),
+        ) {
             tracing::error!(
                 role = role.as_str(),
-                jobs_backend = %config.jobs.backend,
-                "process role '{}' requires a durable jobs backend: backend '{}' is not \
-                 a recognized durable backend and falls through to the in-process 'local' \
-                 runtime, which cannot be shared across a split web/worker topology. \
-                 Set jobs.backend = \"postgres\" or \"redis\", or run the combined role.",
+                "process role '{}' with jobs.backend = \"sqlite\" requires a FILE-backed \
+                 database: an in-memory SQLite target is private to each process, so the web \
+                 replica would enqueue into a queue no worker process can see. Point \
+                 database.url at a sqlite:// file, or run the combined role.",
                 role.as_str(),
-                config.jobs.backend,
             );
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
@@ -3626,9 +3668,7 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "mail")]
-        if mount_unsubscribe_endpoint {
-            config.mail.mount_unsubscribe_endpoint = true;
-        }
+        apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
 
         // Apply builder-level flag: `.idempotent()` enables the middleware when
         // neither `autumn.toml` nor the environment explicitly disable it.
@@ -3659,11 +3699,18 @@ impl AppBuilder {
         let i18n_bundle =
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
-        // 3. Validate routes
-        assert!(
-            !all_routes.is_empty(),
-            "No routes registered. Did you forget to call .routes()?"
-        );
+        // 3. Validate routes.
+        //
+        // Both of this function's own pre-router checks now run here, through
+        // the same helper the no-boot export calls. The repository-policy audit
+        // used to sit ~140 lines further down; running it here only moves it
+        // ahead of the startup banner, and a refusal is better reported before
+        // announcing a start than after.
+        if let Err(message) =
+            validate_pre_router_preconditions(&all_routes, &scoped_groups, &config)
+        {
+            panic!("{message}");
+        }
 
         // 4. Log banner with profile info
         let profile_display = config.profile.as_deref().unwrap_or("none");
@@ -3804,7 +3851,9 @@ impl AppBuilder {
         // "a developer who flips the `api =` switch on a
         // `#[repository]` exposes mutate endpoints that any
         // authenticated user can call against any record."
-        validate_repository_api_policies(&all_routes, &scoped_groups, &config);
+        // (The audit itself now runs above, with the other pre-router
+        // precondition, so the exporter shares both — see
+        // `validate_pre_router_preconditions`.)
 
         // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
@@ -4142,7 +4191,12 @@ impl AppBuilder {
         // an X actually registered on the live registry. Catches
         // the "wired the macro arg, forgot the `.policy(...)`
         // builder call" footgun before any 500 lands.
-        validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        validate_repository_policies_registered(
+            &all_routes,
+            &scoped_groups,
+            state.policy_registry(),
+            &config,
+        );
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
             state.insert_extension(handle);
@@ -4666,6 +4720,7 @@ impl AppBuilder {
                             listener,
                             tls_cfg,
                             acme_cfg,
+                            config.tenancy.base_domain.as_deref(),
                             &config.credentials,
                             https_port,
                             acme_status.clone(),
@@ -4949,7 +5004,10 @@ impl AppBuilder {
                 http_challenge_port,
                 https_port,
                 dns01,
+                custom_domains,
             } = bind_state;
+            // Read before `custom_domains` is moved into the spawn below.
+            let custom_domains_enabled = custom_domains.is_some();
 
             // The `:80` challenge/redirect listener, bound dual-stack so the CA
             // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
@@ -4968,7 +5026,13 @@ impl AppBuilder {
             let challenge_listeners =
                 match crate::acme::challenge::bind_challenge_listeners(http_challenge_port).await {
                     Ok(listeners) => listeners,
-                    Err(e) if dns01 => {
+                    // Only DNS-01 WITHOUT custom domains can live without this
+                    // listener. Tenant certificates are always ordered over
+                    // HTTP-01 — the record lives in the tenant's zone, where
+                    // this deployment holds no DNS credential — so continuing
+                    // here would verify every tenant domain and then burn its
+                    // issuance budget into permanent backoff, never activating.
+                    Err(e) if dns01 && !custom_domains_enabled => {
                         tracing::warn!(
                             port = http_challenge_port,
                             error = %e,
@@ -4981,6 +5045,21 @@ impl AppBuilder {
                         Vec::new()
                     }
                     Err(e) => {
+                        if dns01 {
+                            tracing::error!(
+                                port = http_challenge_port,
+                                "Failed to bind the ACME HTTP-01 challenge listener: {e}. This \
+                                 deployment issues its own certificate over DNS-01, which does \
+                                 not need the listener — but [server.tls.acme.custom_domains] is \
+                                 enabled, and a tenant's domain can only be validated over \
+                                 HTTP-01. Grant CAP_NET_BIND_SERVICE, set [server.tls.acme] \
+                                 http_challenge_port to a port a front-end forwards :80 to, or \
+                                 disable custom domains"
+                            );
+                            #[cfg(feature = "managed-pg")]
+                            crate::managed_pg::emergency_stop_async().await;
+                            std::process::exit(1);
+                        }
                         tracing::error!(
                             port = http_challenge_port,
                             "Failed to bind the ACME HTTP-01 challenge listener: {e}. Port \
@@ -4993,7 +5072,8 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                 };
-            let challenge_router = crate::acme::challenge::challenge_router(tokens, https_port);
+            let challenge_router =
+                crate::acme::challenge::challenge_router(tokens.clone(), https_port);
             // Serve every bound listener (one for dual-stack, two for the split
             // fallback), each a child of `server_shutdown` so they tear down with
             // the main server. The router is cheap to clone (shared Arc state).
@@ -5043,10 +5123,12 @@ impl AppBuilder {
                 };
             renewal_task.leadership_degraded = leadership_degraded;
 
-            // A distributed scheduler backend means a multi-replica deployment,
-            // where ACME is not fleet-safe: see `acme_fleet_warning` for the two
-            // hazards and why DNS-01 only retires one of them. Warn loudly
-            // rather than silently mis-serving (#1620).
+            // A distributed scheduler backend means several processes serve
+            // this app — a fleet on `postgres`, or processes on one host on
+            // `sqlite`. ACME is not safe across either without care: see
+            // `acme_fleet_warning` for the two hazards, which of them each
+            // backend actually carries, and why DNS-01 retires only one of them
+            // on a fleet. Warn loudly rather than silently mis-serving (#1620).
             if let Some(message) = acme_fleet_warning(config.scheduler.backend, dns01) {
                 tracing::warn!(scheduler_backend = coordinator.backend(), "{message}");
             }
@@ -5064,11 +5146,26 @@ impl AppBuilder {
             let reporter = compose_acme_alert_reporter(reporter, &state);
             renewal_task.recovery = Some(make_acme_alert_recovery(&state));
             let renewal_shutdown = server_shutdown.child_token();
+            let renewal_coordinator = std::sync::Arc::clone(&coordinator);
             tokio::spawn(async move {
                 renewal_task
-                    .run(coordinator, reporter, renewal_shutdown)
+                    .run(renewal_coordinator, reporter, renewal_shutdown)
                     .await;
             });
+
+            // Tenant custom domains (#1635): publish the registry so tenancy
+            // resolution can route a connected `Host`, register the health
+            // indicator and the retention pruner, and spawn the orchestrator.
+            if let Some(cd) = custom_domains {
+                spawn_custom_domain_task(
+                    cd,
+                    tokens,
+                    std::sync::Arc::clone(&coordinator),
+                    leadership_degraded,
+                    &state,
+                    server_shutdown.child_token(),
+                );
+            }
         }
 
         tracing::info!(bound = %bound_desc, "Listening");
@@ -5681,9 +5778,7 @@ impl AppBuilder {
         .await;
 
         #[cfg(feature = "mail")]
-        if mount_unsubscribe_endpoint {
-            config.mail.mount_unsubscribe_endpoint = true;
-        }
+        apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
@@ -6315,6 +6410,157 @@ impl AppBuilder {
 
         let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
             eprintln!("Failed to serialize route listing: {e}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
+
+    /// Dump the generated `OpenAPI` document as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_OPENAPI=1` is set (by
+    /// `autumn openapi export`). Does not connect to a database or bind a TCP
+    /// port.
+    ///
+    /// The document is built through the exact same pair the `/openapi.json`
+    /// route uses — [`crate::router::collect_openapi_docs`] then the spec
+    /// generator — so an exported spec and a served one cannot drift. Config is
+    /// loaded the same way a normal boot loads it, because the session cookie
+    /// name feeds the `SessionAuth` security scheme.
+    ///
+    /// Like the served route this evaluates deprecation/sunset state against
+    /// the current instant ([`crate::openapi::generate_spec`] passes
+    /// `Utc::now()`), so an export is reproducible except across a declared
+    /// deprecation or sunset date — which is a real contract change a `--check`
+    /// diff should surface, not noise to suppress.
+    ///
+    /// Exits 0 on success, 1 on serialization failure, and 2 when the app has
+    /// no spec to emit (reported on the
+    /// [`OPENAPI_UNAVAILABLE_MARKER`](crate::openapi::OPENAPI_UNAVAILABLE_MARKER)
+    /// protocol).
+    #[cfg(feature = "openapi")]
+    async fn run_dump_openapi_mode(self) {
+        let Self {
+            routes,
+            scoped_groups,
+            api_versions,
+            openapi,
+            config_loader_factory,
+            plugin_config_roots,
+            merge_routers,
+            nest_routers,
+            declared_routes,
+            #[cfg(feature = "mcp")]
+            mcp,
+            #[cfg(feature = "mail")]
+            mount_unsubscribe_endpoint,
+            policy_registrations,
+            tasks,
+            ..
+        } = self;
+
+        let Some(openapi_config) = openapi else {
+            eprintln!(
+                "{marker}{reason}",
+                marker = crate::openapi::OPENAPI_UNAVAILABLE_MARKER,
+                reason = crate::openapi::OPENAPI_UNAVAILABLE_UNCONFIGURED,
+            );
+            std::process::exit(2);
+        };
+
+        // Config only: `TelemetryProvider::init` can reach a collector or read
+        // production credentials, and telemetry cannot affect the document, so
+        // an export advertised as touching nothing must not run it.
+        #[cfg_attr(
+            not(feature = "mail"),
+            expect(unused_mut, reason = "only `mail` mutates it")
+        )]
+        let mut config = load_config_only(config_loader_factory, plugin_config_roots).await;
+
+        // The builder flag must land BEFORE the collision checks below, exactly
+        // as it does on the serving path: it is what decides whether
+        // `/_autumn/unsubscribe` is claimed, and a check run against the
+        // unmodified config would approve a mount that startup rejects.
+        #[cfg(feature = "mail")]
+        apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
+
+        // Run the SERVING PATH'S OWN preflight before emitting anything. An
+        // export that skips a check the router enforces lets `--check` pass for
+        // an application that cannot start — and worse, does so QUIETLY:
+        // `generate_spec` keys operations by (path, method), so a duplicate
+        // silently DROPS the earlier one and the document describes a subset of
+        // the API as though it were the whole of it.
+        //
+        // Every one of these calls the router's own function rather than
+        // re-deriving its rule. A second copy would drift, and a preflight that
+        // disagreed with the router about what it rejects would be worse than
+        // none. The two that used to be inline in `build_router_pre_state` and
+        // `build_openapi_router` were extracted for exactly this, so there is
+        // still one definition per rule.
+        //
+        // Ordered as the serving path orders them, so an app with more than one
+        // problem reports the same first error either way.
+        // The config-only preconditions first, in `run()`'s order: a split role
+        // on a non-durable jobs backend, or a duplicate scheduled task name,
+        // stops startup before anything route-shaped is even looked at.
+        let tasks = merge_framework_scheduled_tasks(tasks, &config);
+        if let Err(message) = validate_config_preconditions(&config, &tasks) {
+            eprintln!("\u{2717} Cannot export a spec for an app that cannot start: {message}");
+            std::process::exit(1);
+        }
+
+        // `.policy::<R, _>(...)` / `.scope::<R, _>(...)` are DEFERRED closures the
+        // serving path replays onto live state before checking that every
+        // `#[repository(policy = X)]` route actually has an X registered. The
+        // export dropped them and checked only that the macro argument existed,
+        // so an app that declares a policy but forgets the builder call — which
+        // refuses to start under a production profile — still exported a
+        // contract `--check` would approve.
+        //
+        // A throwaway `PolicyRegistry` is enough: the check only ever reads the
+        // registry, and building real `AppState` would open the database this
+        // command promises not to touch.
+        let export_registry = crate::authorization::PolicyRegistry::default();
+        for register in policy_registrations {
+            register(&export_registry);
+        }
+        validate_repository_policies_registered(&routes, &scoped_groups, &export_registry, &config);
+
+        let mcp_mount_path: Option<&str> = {
+            #[cfg(feature = "mcp")]
+            {
+                mcp.as_ref().map(|rt| rt.mount_path.as_str())
+            }
+            #[cfg(not(feature = "mcp"))]
+            {
+                None
+            }
+        };
+        if let Err(error) = export_preflight(&ExportPreflight {
+            routes: &routes,
+            scoped_groups: &scoped_groups,
+            api_versions: &api_versions,
+            openapi_config: &openapi_config,
+            merge_routers: &merge_routers,
+            nest_routers: &nest_routers,
+            declared_routes: &declared_routes,
+            config: &config,
+            mcp_mount_path,
+        }) {
+            eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {error}");
+            std::process::exit(1);
+        }
+
+        let mut openapi_config = openapi_config;
+        openapi_config.api_versions = api_versions;
+        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name);
+
+        let docs = crate::router::collect_openapi_docs(&routes, &scoped_groups);
+        let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
+        let spec = crate::openapi::generate_spec(&openapi_config, &refs);
+
+        let json = serde_json::to_string_pretty(&spec).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize OpenAPI spec: {e}");
             std::process::exit(1);
         });
         println!("{json}");
@@ -7580,6 +7826,15 @@ pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
 }
 
+/// Whether the process should dump the generated `OpenAPI` document and exit.
+///
+/// Set by `autumn openapi export`. Unlike the routes dump this is checked even
+/// when the `openapi` feature is off, so the CLI gets an explicit "no spec here"
+/// answer instead of a booted server.
+pub(crate) fn is_dump_openapi_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_OPENAPI").as_deref() == Ok("1")
+}
+
 /// Whether the dump should also emit the declared plugin contracts
 /// ([`PLUGIN_CONTRACT_MARKER`](crate::plugin_contract::PLUGIN_CONTRACT_MARKER)).
 ///
@@ -8280,7 +8535,9 @@ async fn execute_task_result(
 
     match result {
         Ok(Ok(())) => Ok(duration_ms),
-        Ok(Err(e)) => Err((duration_ms, e.to_string())),
+        // `message`, not `Display`: this string is stored as the task's
+        // `last_error`, sent in alerts, and broadcast on `sys:tasks`.
+        Ok(Err(e)) => Err((duration_ms, e.message())),
         Err(panic) => Err((duration_ms, format_scheduled_task_panic(panic.as_ref()))),
     }
 }
@@ -8980,6 +9237,23 @@ struct AcmeBindState {
     /// challenge/redirect port is fatal (HTTP-01) or a warning (DNS-01, where
     /// the CA never connects to this host).
     dns01: bool,
+    /// The tenant custom-domain wiring (#1635), present exactly when
+    /// `[server.tls.acme.custom_domains] enabled = true`.
+    custom_domains: Option<CustomDomainBindState>,
+}
+
+/// Everything the custom-domain orchestrator needs, built at bind time so the
+/// SNI resolver and the loop share one registry and one certificate cache.
+#[cfg(feature = "acme")]
+struct CustomDomainBindState {
+    registry: std::sync::Arc<crate::custom_domain::CustomDomainRegistry>,
+    cache: std::sync::Arc<crate::custom_domain::CustomDomainCertCache>,
+    store: std::sync::Arc<crate::acme::store::FsAcmeStore>,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    config: crate::config::CustomDomainsConfig,
+    /// The enclosing `[server.tls.acme]`, so the per-domain issuer orders on
+    /// the SAME account and directory as the deployment's own certificate.
+    acme: crate::config::AcmeConfig,
 }
 
 /// Build a TLS listener for ACME mode: serve a stored certificate if one is
@@ -8987,10 +9261,18 @@ struct AcmeBindState {
 /// returned [`AcmeBindState`] carries everything the renewal task and challenge
 /// listener need.
 #[cfg(feature = "acme")]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one bind-time assembly of the ACME listener, its store, its \
+              placeholder and the custom-domain registry; splitting it would \
+              only scatter the ordering these steps depend on"
+)]
 async fn build_acme_tls_listener(
     tcp: tokio::net::TcpListener,
     tls_cfg: &crate::config::TlsConfig,
     acme_cfg: &crate::config::AcmeConfig,
+    tenancy_base_domain: Option<&str>,
     credentials: &crate::credentials::CredentialsStore,
     https_port: u16,
     status: Option<crate::acme::renewal::AcmeStatus>,
@@ -9042,9 +9324,100 @@ async fn build_acme_tls_listener(
     };
 
     let resolver = std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(initial));
-    let server_config = crate::tls::build_server_config(
+
+    // Tenant custom domains (#1635): the registry is hydrated from disk before
+    // the listener binds, so a restart routes and serves every connected domain
+    // on the first request rather than after the first orchestrator tick. The
+    // SNI resolver wraps — rather than replaces — the operator's own resolver,
+    // so the deployment's certificate keeps serving its own names unchanged.
+    let custom_domains = match acme_cfg.custom_domains.as_ref() {
+        Some(cd_cfg) if cd_cfg.enabled => {
+            // Reserve everything this deployment already serves. Without it a
+            // tenant registers another tenant's subdomain — which the
+            // operator's own wildcard already points here, so it verifies and
+            // issues — and every request for that host then resolves to
+            // whoever registered it.
+            let mut reserved = acme_cfg.domains.clone();
+            reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
+            // The ingress hostname is the sharpest of the three. It ALREADY
+            // resolves to the ingress addresses, so a tenant who registers it
+            // needs no DNS change at all: verification passes on the first
+            // tick, HTTP-01 validates, and from then on every request to the
+            // deployment's own infrastructure hostname routes to that tenant.
+            // It is not necessarily covered by `domains` — an operator may run
+            // ingress under a separate infrastructure zone — so it is reserved
+            // explicitly rather than by assuming overlap.
+            reserved.extend(cd_cfg.ingress_hostname.clone());
+            let registry = std::sync::Arc::new(
+                crate::custom_domain::CustomDomainRegistry::new(
+                    std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
+                        cd_cfg.store_dir.clone(),
+                    )),
+                    cd_cfg.max_domains,
+                )
+                .with_reserved(reserved),
+            );
+            match registry.load().await {
+                Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
+                // A registry that cannot be read is not fatal to the
+                // deployment: its own certificate still serves. It IS fatal to
+                // custom domains, though — an index that hydrated nothing
+                // cannot tell whether a hostname is already owned, so
+                // `register` refuses until a load succeeds rather than
+                // overwriting the durable record of whoever holds it.
+                Err(e) => tracing::error!(
+                    "failed to load the tenant custom-domain registry: {e}; connected domains will \
+                     not route and no new domain can be connected until this is fixed and the \
+                     process restarted"
+                ),
+            }
+            Some(CustomDomainBindState {
+                registry,
+                cache: std::sync::Arc::new(crate::custom_domain::CustomDomainCertCache::new(
+                    cd_cfg.cert_cache_size,
+                )),
+                store: std::sync::Arc::new(FsAcmeStore::new(
+                    acme_cfg.cache_dir.clone(),
+                    crate::acme::directory_label(&acme_cfg.directory),
+                )),
+                provider: std::sync::Arc::clone(&provider),
+                config: cd_cfg.clone(),
+                acme: acme_cfg.clone(),
+            })
+        }
+        _ => None,
+    };
+
+    let cert_resolver: std::sync::Arc<dyn rustls::server::ResolvesServerCert> =
+        custom_domains.as_ref().map_or_else(
+            || {
+                std::sync::Arc::clone(&resolver)
+                    as std::sync::Arc<dyn rustls::server::ResolvesServerCert>
+            },
+            |cd| {
+                std::sync::Arc::new(
+                    crate::custom_domain::SniCertResolver::new(
+                        std::sync::Arc::clone(&resolver),
+                        acme_cfg.domains.clone(),
+                        std::sync::Arc::clone(&cd.registry),
+                        std::sync::Arc::clone(&cd.cache),
+                    )
+                    // A domain evicted from the bounded cache (or never warmed,
+                    // in a deployment with more domains than the cache holds)
+                    // loads its certificate here rather than stopping being
+                    // served.
+                    .with_source(std::sync::Arc::new(
+                        crate::acme::tenant_domains::FsSniCertSource::new(
+                            std::sync::Arc::clone(&cd.store),
+                            std::sync::Arc::clone(&provider),
+                        ),
+                    )),
+                )
+            },
+        );
+    let server_config = crate::tls::build_server_config_with_resolver(
         std::sync::Arc::clone(&provider),
-        std::sync::Arc::clone(&resolver),
+        cert_resolver,
     )
     .map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
@@ -9082,6 +9455,7 @@ async fn build_acme_tls_listener(
             http_challenge_port: acme_cfg.http_challenge_port,
             https_port,
             dns01: acme_cfg.dns.is_some(),
+            custom_domains,
         },
     ))
 }
@@ -9102,11 +9476,15 @@ async fn build_acme_tls_listener(
 /// not distribute certificates, so (2) still mis-serves TLS on every replica
 /// but the leader. Warn either way; only the text differs (issue #1620).
 ///
+/// The `sqlite` backend coordinates processes on **one** host (issue #1907), so
+/// hazard (2) does not apply: every process reads the same `cache_dir` on the
+/// same disk. Hazard (1) still does, because the token map is per-process — so
+/// it gets its own, narrower message, and DNS-01 clears it entirely.
+///
 /// Keyed off the *configured* backend (operator intent) rather than the built
 /// coordinator, so the warning still fires when `coordinator_from_config` fell
 /// back to in-process after a Postgres error — exactly the case where the fleet
-/// is multi-replica but this process degraded. The exhaustive `matches!` is
-/// compiler-enforced if a new distributed backend variant is added.
+/// is multi-replica but this process degraded.
 #[cfg(feature = "acme")]
 const fn acme_fleet_warning(
     backend: crate::config::SchedulerBackend,
@@ -9114,6 +9492,20 @@ const fn acme_fleet_warning(
 ) -> Option<&'static str> {
     if !backend.is_fleet_distributed() {
         return None;
+    }
+    if matches!(backend, crate::config::SchedulerBackend::Sqlite) {
+        if dns01 {
+            // DNS-01 needs no :80 challenge, and the store is already shared.
+            return None;
+        }
+        return Some(
+            "ACME HTTP-01 validation is not safe across the processes scheduler.backend = \
+             \"sqlite\" coordinates: the token store is per-process, so a proxy may route the \
+             CA's :80 challenge to a process without the token (404). The certificate store is \
+             not at risk — every process on the host reads the same [server.tls.acme] \
+             cache_dir. Serve ACME from one process, terminate TLS at the proxy, or use DNS-01 \
+             (#1620)",
+        );
     }
     Some(if dns01 {
         "ACME DNS-01 issuance is fleet-safe, but the on-disk certificate store is not: only \
@@ -9236,6 +9628,110 @@ fn compose_acme_alert_reporter(
         inner(message);
     })
 }
+
+/// Publish the custom-domain registry and spawn its orchestrator (#1635).
+///
+/// The registry goes into `AppState` so tenancy resolution can route a
+/// connected `Host`; the health indicator and the retention pruner are
+/// registered from the same handles the loop mutates, so the three can never
+/// disagree about a domain's state.
+#[cfg(feature = "acme")]
+fn spawn_custom_domain_task(
+    bind_state: CustomDomainBindState,
+    tokens: crate::acme::challenge::Http01Tokens,
+    coordinator: std::sync::Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    leadership_degraded: bool,
+    state: &AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let CustomDomainBindState {
+        registry,
+        cache,
+        store,
+        provider,
+        config,
+        acme,
+    } = bind_state;
+
+    state.insert_extension(std::sync::Arc::clone(&registry));
+    if let Err(e) = state.health_indicator_registry.register(
+        "custom_domains",
+        crate::actuator::IndicatorGroup::HealthOnly,
+        std::sync::Arc::new(crate::custom_domain::CustomDomainHealthIndicator::new(
+            std::sync::Arc::clone(&registry),
+        )),
+    ) {
+        tracing::warn!("{e}");
+    }
+
+    let issuer = std::sync::Arc::new(crate::acme::tenant_domains::AcmeDomainIssuer::new(
+        acme.clone(),
+        std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
+        tokens,
+    ));
+    let task = std::sync::Arc::new(crate::acme::tenant_domains::CustomDomainTask {
+        registry,
+        cache,
+        certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
+        provider,
+        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier),
+        issuer,
+        limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
+            config.issuance_per_domain_per_day,
+            config.issuance_global_per_hour,
+            config.failure_backoff_secs,
+            config.max_failure_backoff_secs,
+        )),
+        ingress: config.ingress(),
+        renew_before_days: acme.renew_before_days,
+        // A per-domain failure is a framework-scheduled operation failing, so
+        // it raises #1610's alert naming the domain and its tenant.
+        reporter: make_custom_domain_reporter(state),
+        recovery: Some(make_custom_domain_recovery(state)),
+        coordinator,
+        leadership_degraded,
+        cert_store_paths: Some(store),
+        // The deployment's own certificate shares this store and has no
+        // registry record; naming it keeps the retention prune from deleting
+        // the certificate the listener is serving.
+        retained_cert_ids: std::iter::once(
+            crate::acme::store::CertId::from_domains(&acme.domains)
+                .as_str()
+                .to_owned(),
+        )
+        .collect(),
+    });
+
+    state.insert_extension(std::sync::Arc::clone(&task)
+        as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
+
+    let interval = std::time::Duration::from_secs(config.poll_interval_secs.max(1));
+    tokio::spawn(async move {
+        task.run(interval, shutdown).await;
+    });
+}
+
+/// The reporter a custom-domain failure is dispatched through.
+#[cfg(feature = "acme")]
+fn make_custom_domain_reporter(state: &AppState) -> crate::acme::tenant_domains::ReporterFn {
+    let state = state.clone();
+    std::sync::Arc::new(move |message: String| {
+        crate::alerts::notify_scheduled_task_failure(&state, CUSTOM_DOMAIN_TASK_NAME, &message);
+    })
+}
+
+/// The callback that clears an outstanding custom-domain alert.
+#[cfg(feature = "acme")]
+fn make_custom_domain_recovery(state: &AppState) -> crate::acme::tenant_domains::RecoveryFn {
+    let state = state.clone();
+    std::sync::Arc::new(move || {
+        crate::alerts::notify_scheduled_task_recovered(&state, CUSTOM_DOMAIN_TASK_NAME);
+    })
+}
+
+/// The scheduled-task name a custom-domain failure alert is keyed on.
+#[cfg(feature = "acme")]
+const CUSTOM_DOMAIN_TASK_NAME: &str = "custom_domain_certificates";
 
 /// The callback that clears an outstanding ACME renewal alert once issuance
 /// succeeds again.
@@ -9842,6 +10338,38 @@ async fn load_config_and_telemetry(
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
     plugin_config_roots: BTreeSet<String>,
 ) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    let config = load_config_only(config_loader, plugin_config_roots).await;
+
+    // 2. Initialize logging/telemetry via the installed provider, falling
+    //    back to the default `tracing-subscriber + OTLP` initializer.
+    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
+        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
+    let telemetry_guard = provider
+        .init(&config.log, &config.telemetry, config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize telemetry: {error}");
+            std::process::exit(1);
+        });
+
+    (config, telemetry_guard)
+}
+
+/// Resolve the effective configuration WITHOUT initializing telemetry.
+///
+/// Split out of [`load_config_and_telemetry`] for the one-shot dump modes that
+/// need config but must not touch the outside world. A custom
+/// `TelemetryProvider::init` may open a collector connection, read credentials
+/// or otherwise reach production resources, and telemetry cannot influence what
+/// those modes emit — so `autumn openapi export`, advertised as binding no port
+/// and opening no database, must not trigger it either (issue #802).
+///
+/// Everything up to and including [`AutumnConfig::apply_retention_caps`] is
+/// shared with the telemetry-initializing path, so the config the two resolve is
+/// identical.
+async fn load_config_only(
+    config_loader: Option<ConfigLoaderFactory>,
+    plugin_config_roots: BTreeSet<String>,
+) -> AutumnConfig {
     // 1. Load configuration via the installed loader, falling back to the
     //    five-layer TOML + env default.
     //
@@ -9886,18 +10414,22 @@ async fn load_config_and_telemetry(
     // `[retention]` section is untouched.
     config.apply_retention_caps();
 
-    // 2. Initialize logging/telemetry via the installed provider, falling
-    //    back to the default `tracing-subscriber + OTLP` initializer.
-    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
-        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
-    let telemetry_guard = provider
-        .init(&config.log, &config.telemetry, config.profile.as_deref())
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize telemetry: {error}");
-            std::process::exit(1);
-        });
+    // Install the `[metrics]` cardinality caps before anything can record
+    // through the call-site facade. The registry is process-global and its
+    // caps are read at each decision rather than baked in at registration, so
+    // this must land before the first `metrics::counter(...)` call — otherwise
+    // an early instrument would be admitted (or refused) under the defaults
+    // and, for `max_labels_per_series`, would canonicalize its label set to a
+    // different series key than every later sample.
+    //
+    // It lives in `load_config_only`, the prefix EVERY mode shares — the
+    // telemetry-initializing path calls it too — so trunk's invariant ("no
+    // path boots with the defaults silently in force") is unchanged, and the
+    // one-shot dump modes gain it as well. Setting caps touches no collector
+    // and opens nothing, so it does not violate what those modes promise.
+    crate::metrics::set_limits(config.metrics.limits());
 
-    (config, telemetry_guard)
+    config
 }
 
 /// Register the embedded `static/` tree (if any) as the process-wide asset
@@ -11373,6 +11905,268 @@ fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String
     s
 }
 
+/// Fold `.mount_unsubscribe_endpoint()` into the loaded config.
+///
+/// The builder flag lives outside the config, so a config that leaves the
+/// endpoint disabled still mounts it when the app asked for it. That mount
+/// claims `/_autumn/unsubscribe`, which the `OpenAPI` and MCP collision checks
+/// must see — an export that ran them against the unmodified config approved a
+/// mount that startup rejects.
+///
+/// Shared because it was already copied at two `run_*` sites before the export
+/// became the third.
+#[cfg(feature = "mail")]
+const fn apply_mail_builder_overrides(config: &mut AutumnConfig, mount_unsubscribe_endpoint: bool) {
+    if mount_unsubscribe_endpoint {
+        config.mail.mount_unsubscribe_endpoint = true;
+    }
+}
+
+/// Run the serving path's whole preflight for a no-boot export.
+///
+/// Split out of `run_dump_openapi_mode` for length once it reached nine checks.
+/// Every one of them calls the router's (or `run()`'s) own function rather than
+/// re-deriving its rule: a second copy would drift, and a preflight that
+/// disagreed with the router about what it rejects — in EITHER direction — would
+/// be worse than none.
+///
+/// `mcp_mount_path` is `None` when MCP is not configured, and unused when the
+/// `mcp` feature is off.
+/// Everything [`export_preflight`] needs, borrowed from the builder.
+///
+/// A context struct rather than nine parameters, following `RouterContext` —
+/// which exists for the same reason on the serving side.
+#[cfg(feature = "openapi")]
+struct ExportPreflight<'a> {
+    routes: &'a [Route],
+    scoped_groups: &'a [ScopedGroup],
+    api_versions: &'a [ApiVersion],
+    openapi_config: &'a crate::openapi::OpenApiConfig,
+    merge_routers: &'a [axum::Router<AppState>],
+    nest_routers: &'a [(String, axum::Router<AppState>)],
+    declared_routes: &'a [crate::route_listing::RouteInfo],
+    config: &'a AutumnConfig,
+    /// `None` when MCP is not configured; unused when the `mcp` feature is off.
+    mcp_mount_path: Option<&'a str>,
+}
+
+#[cfg(feature = "openapi")]
+fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
+    let &ExportPreflight {
+        routes,
+        scoped_groups,
+        api_versions,
+        openapi_config,
+        merge_routers,
+        nest_routers,
+        declared_routes,
+        config,
+        // Read only by the `mcp` block below; binding it unconditionally keeps
+        // one destructuring rather than two cfg'd copies of the same pattern.
+        #[cfg_attr(
+            not(feature = "mcp"),
+            expect(unused_variables, reason = "only the `mcp` block reads it")
+        )]
+        mcp_mount_path,
+    } = ctx;
+
+    // `run()`'s OWN pre-router checks first, in its order: an app with no
+    // routes, or with an unguarded mutating repository API under a
+    // production profile, never reaches router construction at all. These hold
+    // for EVERY role — `run()` performs them before it branches on one.
+    validate_pre_router_preconditions(routes, scoped_groups, config)?;
+
+    // Everything below describes the application router, and a `worker` (or any
+    // other non-HTTP) role never builds one: `run()` takes the probe-only branch
+    // and none of these six rules execute. Enforcing them here would REJECT a
+    // deployment that starts perfectly well — a route legitimately owning
+    // `/openapi.json` under a worker profile, say — which is the same
+    // disagreement with the serving path as being too lax, pointing the other
+    // way, and the more expensive of the two because it blocks correct work.
+    //
+    // The document itself is still exported: it is built from the routes and the
+    // `OpenApiConfig`, neither of which depends on the role, so the contract a
+    // worker-profile export writes down is the same one the web role serves.
+    if !config.role.serves_http() {
+        return Ok(());
+    }
+
+    // What the ROUTER would see for OpenAPI, resolved once and used by every
+    // mount-sensitive check below, so the three cannot disagree about
+    // whether the endpoint is mounted.
+    let mounted_openapi = config.openapi_runtime.enabled.then_some(openapi_config);
+
+    let registered_versions: std::collections::HashSet<&str> =
+        api_versions.iter().map(|av| av.version.as_str()).collect();
+    let preflight = crate::router::reject_unregistered_api_versions(
+        routes,
+        scoped_groups,
+        &registered_versions,
+    )
+    .and_then(|()| {
+        crate::router::reject_duplicate_user_routes(
+            routes,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            declared_routes,
+            config,
+        )
+    })
+    .and_then(|()| {
+        // The `[openapi]` profile gate decides whether the endpoint is
+        // MOUNTED. `run()` hands `None` to the router when it is off, so
+        // neither the path validation nor the collision check runs and an
+        // application route may legitimately occupy `/openapi.json`.
+        // Validating unconditionally made the exporter STRICTER than
+        // startup — rejecting an app that boots fine — which is the same
+        // class of disagreement as being laxer, just pointing the other
+        // way. The document itself is still exported: the gate governs
+        // serving, not whether the contract can be written down.
+        mounted_openapi.map_or(Ok(()), crate::router::validate_openapi_mount_paths)
+    })
+    .and_then(|()| {
+        crate::router::reject_openapi_path_collisions(
+            mounted_openapi,
+            routes,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            config,
+        )
+    });
+
+    // MCP is part of the same preflight, not a separate concern: an app that
+    // mounts MCP at a malformed path, or at one a user/OpenAPI route already
+    // owns, is rejected by `build_router_pre_state` at startup. An export
+    // that skipped these would certify a router that cannot be built — the
+    // exact failure the four rules above exist to prevent, one subsystem
+    // over. Both call the router's own function, so there is still one
+    // definition per rule.
+    #[cfg(feature = "mcp")]
+    let preflight = preflight.and_then(|()| {
+        let Some(path) = mcp_mount_path else {
+            return Ok(());
+        };
+        crate::router::validate_mcp_mount_path(path).and_then(|()| {
+            // The SAME gated value: `reject_mcp_path_collisions` reserves
+            // the OpenAPI paths as claimed GETs, which they are not when the
+            // endpoint is not mounted.
+            crate::router::reject_mcp_path_collisions(
+                path,
+                routes,
+                scoped_groups,
+                config,
+                mounted_openapi,
+                merge_routers,
+                nest_routers,
+            )
+        })
+    });
+
+    preflight.map_err(|error| error.to_string())
+}
+
+/// Append every framework-owned scheduled task to the declared list.
+///
+/// Two sources, both of which `run()` merges before validating names: the
+/// `#[repository(..., retention(...))]` sweeps collected from `inventory`, and
+/// the config-driven `[retention]` sweep. A no-boot export that validated only
+/// the DECLARED list would miss the collision this check most often catches —
+/// between a hand-declared `#[scheduled]` fn and one of these generated names.
+///
+/// `run()` performs these same two merges inline, at two different points in its
+/// prologue — the repository sweeps before the config load, the framework one
+/// after — so it cannot call this without a reordering. What is shared is the
+/// RULE: each merge here is a single call to the same
+/// `collect_retention_tasks` / `framework_retention_task` the serving path
+/// calls, so only the sequencing is restated, not the logic.
+#[cfg(feature = "openapi")]
+fn merge_framework_scheduled_tasks(
+    mut tasks: Vec<crate::task::TaskInfo>,
+    config: &AutumnConfig,
+) -> Vec<crate::task::TaskInfo> {
+    #[cfg(feature = "db")]
+    tasks.extend(crate::retention::collect_retention_tasks());
+    if let Some(retention_task) = crate::data_retention::framework_retention_task(&config.retention)
+    {
+        tasks.push(retention_task);
+    }
+    tasks
+}
+
+/// Every CONFIG-only precondition the serving path enforces before it boots.
+///
+/// Sibling of [`validate_pre_router_preconditions`], which covers the
+/// route-shaped ones. Both are things `run()` does that
+/// `build_router_pre_state` does not, so an export that mirrored the router
+/// faithfully still approved a spec for an app that refuses to start (issue
+/// #802):
+///
+/// * a `web`/`worker` process role on a non-durable jobs backend — the web
+///   replica would enqueue into an in-memory queue no worker can drain;
+/// * a duplicate `#[scheduled]` task name, which spawns two loops competing for
+///   one coordination lock.
+///
+/// `tasks` must ALREADY be the fully merged list — hand-declared entries plus
+/// the `#[repository(..., retention(...))]` sweeps plus the framework's
+/// `[retention]` sweep — because that is the list whose names actually collide.
+/// Merging here instead double-counts against the caller's own merge: `run()`
+/// pushes the framework sweep before reaching this, so synthesising it again
+/// reported its fixed `autumn-retention-sweep` name as a duplicate and refused
+/// to start every app with a `[retention]` window. Build the list once, with
+/// [`merge_framework_scheduled_tasks`].
+///
+/// Returns the message to report; the caller decides how to fail, because the
+/// serving path also has a database pool to stop on the way out and the export
+/// has none.
+fn validate_config_preconditions(
+    config: &AutumnConfig,
+    tasks: &[crate::task::TaskInfo],
+) -> Result<(), String> {
+    if crate::config::split_role_requires_durable_backend(config.role, &config.jobs.backend) {
+        return Err(format!(
+            "process role '{role}' requires a durable jobs backend: backend '{backend}' is not \
+             a recognized durable backend and falls through to the in-process 'local' runtime, \
+             which cannot be shared across a split web/worker topology. Set jobs.backend = \
+             \"postgres\" or \"redis\", or run the combined role.",
+            role = config.role.as_str(),
+            backend = config.jobs.backend,
+        ));
+    }
+
+    crate::task::validate_unique_task_names(tasks.iter().map(|task| task.name.as_str()))?;
+
+    Ok(())
+}
+
+/// Every route/config precondition the serving path enforces BEFORE it hands
+/// off to [`crate::router::build_router_pre_state`].
+///
+/// That function's own six rules are already shared with the no-boot dump modes
+/// (issue #802). These are the ones `run()` performed itself, inline and in two
+/// separate places, so the export preflight did not have them: an app with no
+/// routes at all, or with a mutating `#[repository(api = ...)]` carrying no
+/// paired `policy`, could not start yet exported a document `--check` would
+/// approve. Collecting them here means a rule added to the serving path is in
+/// the exporter by construction rather than by remembering — which is what the
+/// one-at-a-time additions of the last three rounds kept failing to be.
+///
+/// `Err` carries the message the caller should report; `validate_repository_api_policies`
+/// exits the process itself when it is fatal, exactly as it does at startup, so
+/// an export refuses on the same condition a boot would.
+fn validate_pre_router_preconditions(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> Result<(), String> {
+    if routes.is_empty() {
+        return Err("No routes registered. Did you forget to call .routes()?".to_owned());
+    }
+    validate_repository_api_policies(routes, scoped_groups, config);
+    Ok(())
+}
+
 fn validate_repository_api_policies(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],
@@ -11504,17 +12298,23 @@ fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
 }
 
 #[allow(clippy::cognitive_complexity)]
+/// Takes the `PolicyRegistry` rather than the whole `AppState` — which is all
+/// `collect_unregistered_repository_handlers` ever needed — so the no-boot
+/// export can run this rule too, against a throwaway registry the deferred
+/// registrations are replayed onto. Requiring `AppState` would have meant
+/// building state, which is exactly what an export advertised as opening no
+/// database must not do (issue #802).
 fn validate_repository_policies_registered(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],
-    state: &AppState,
+    registry: &crate::authorization::PolicyRegistry,
     config: &AutumnConfig,
 ) {
     let profile = config.profile.as_deref().unwrap_or("default");
     let strict = is_production_profile(profile);
 
     let (missing_policies, missing_scopes) =
-        collect_unregistered_repository_handlers(routes, scoped_groups, state.policy_registry());
+        collect_unregistered_repository_handlers(routes, scoped_groups, registry);
 
     if missing_policies.is_empty() && missing_scopes.is_empty() {
         return;
@@ -12602,6 +13402,37 @@ mod tests {
         assert!(
             !dns01.contains("token") && !dns01.contains("404"),
             "DNS-01 warning must not blame the HTTP-01 token map: {dns01}"
+        );
+    }
+
+    /// Issue #1907: `scheduler.backend = "sqlite"` coordinates processes on one
+    /// host, so it carries the HTTP-01 token hazard but not the certificate
+    /// store one — every process reads the same `cache_dir`.
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_fleet_warning_for_sqlite_names_only_the_token_hazard() {
+        use crate::config::SchedulerBackend;
+
+        let http01 = super::acme_fleet_warning(SchedulerBackend::Sqlite, false)
+            .expect("multi-process HTTP-01 must warn about the per-process token store");
+        assert!(
+            http01.contains("token"),
+            "the warning must name the token store: {http01}"
+        );
+        assert!(
+            !http01.contains("Run ACME on a single host"),
+            "a single-host deployment must not be told to move to a single host: {http01}"
+        );
+        assert!(
+            http01.contains("cache_dir"),
+            "the warning must say the certificate store is already shared: {http01}"
+        );
+
+        // DNS-01 needs no :80 challenge, and the store is already shared, so
+        // there is nothing left to warn about.
+        assert!(
+            super::acme_fleet_warning(SchedulerBackend::Sqlite, true).is_none(),
+            "DNS-01 on one host clears both hazards"
         );
     }
 
@@ -15111,7 +15942,27 @@ mod tests {
 
     #[cfg(feature = "i18n")]
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard must span the `load_config_and_telemetry` await — that \
+                  await is what mutates the limits, so dropping the lock before it \
+                  would serialize nothing. Same shape, and the same reason, as \
+                  `config_runtime_drift_actuator_prefix_is_mounted`'s circuit-breaker \
+                  guard: the contending holders are sibling libtest threads, not \
+                  tasks on this runtime, so blocking here cannot starve the future \
+                  that would release it."
+    )]
     async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
+        // `load_config_and_telemetry` installs the `[metrics]` section, so
+        // calling it here resets the process-global metric limits as a side
+        // effect. Take the same lock the metrics tests use, or this can land
+        // between a limits test raising a cap and the loop that depends on it
+        // — dropping samples at the default while that test expects the
+        // raised value. See `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let project = tempfile::tempdir().expect("project dir");
         let i18n_dir = project.path().join("custom-i18n");
         std::fs::create_dir_all(&i18n_dir).expect("i18n dir");
