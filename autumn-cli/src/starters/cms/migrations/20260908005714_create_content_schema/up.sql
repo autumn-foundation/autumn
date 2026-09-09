@@ -110,19 +110,38 @@ CREATE TABLE posts (
     created_at        TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMP NOT NULL DEFAULT NOW()
 );
+-- Uniqueness follows the URL a row actually mints, which for a page depends on
+-- where it sits in the hierarchy.
+--
 -- A slug is unique within its post type, so a page `/about` and a post
--- `/2026/about` can coexist — the same guarantee WordPress gives.
-CREATE UNIQUE INDEX idx_posts_type_slug ON posts (post_type, slug);
+-- `/2026/about` can coexist — the same guarantee WordPress gives. Nested pages
+-- are excluded here and covered by `idx_pages_parent_slug` below: they are
+-- addressed by their full ancestry, so `/about/team` and `/company/team` are
+-- different URLs and both are legitimate. A global `(post_type, slug)` forced
+-- the second to become `team-2`, which is a rename WordPress does not make and
+-- which `resolve_page_path` — it disambiguates by `parent_id` — never needed.
+CREATE UNIQUE INDEX idx_posts_type_slug
+    ON posts (post_type, slug)
+    WHERE post_type <> 'page' OR parent_id IS NULL;
 
--- ...but `post` and `page` both mint a BARE path (`/about`), and only one row
--- can be served there. `(post_type, slug)` does not stop them colliding, so
--- the application de-duplicates on write — and this index is what makes that
--- hold under concurrency, where two inserts can each check first and each find
--- the slug free. A custom type is addressed under its own prefix
--- (`/product/widget`) and so is deliberately excluded.
+-- A nested page competes only with its siblings: they are the rows that would
+-- mint the same path under the same parent.
+CREATE UNIQUE INDEX idx_pages_parent_slug
+    ON posts (parent_id, slug)
+    WHERE post_type = 'page' AND parent_id IS NOT NULL;
+
+-- ...and `post` and top-level `page` both mint a BARE path (`/about`), where
+-- only one row can be served. `(post_type, slug)` does not stop them colliding
+-- with each other, so the application de-duplicates on write — and this index
+-- is what makes that hold under concurrency, where two inserts can each check
+-- first and each find the slug free.
+--
+-- A custom type is addressed under its own prefix (`/product/widget`) and a
+-- nested page under its ancestry, so neither mints a bare path and neither
+-- belongs here.
 CREATE UNIQUE INDEX idx_posts_bare_path_slug
     ON posts (slug)
-    WHERE post_type IN ('post', 'page');
+    WHERE post_type = 'post' OR (post_type = 'page' AND parent_id IS NULL);
 CREATE INDEX idx_posts_status_published ON posts (status, published_at DESC);
 CREATE INDEX idx_posts_author ON posts (author_id);
 CREATE INDEX idx_posts_parent ON posts (parent_id);

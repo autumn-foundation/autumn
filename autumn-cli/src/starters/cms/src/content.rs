@@ -1881,30 +1881,35 @@ pub fn segment_claim(segment: &str, exclude: Option<Registration<'_>>) -> Option
     None
 }
 
-/// A slug that is free across every post type sharing the bare URL path.
+/// A slug that is free among the rows minting the same shape of URL.
 ///
-/// `posts` is unique on `(post_type, slug)`, so a post and a page may both be
-/// slugged `about` — but both mint `/about`, and the front controller can only
-/// serve one of them, leaving the other unreachable at its own canonical URL.
-/// WordPress solves this by making the slug unique across the types that share
-/// the root, appending `-2`, `-3`, … ; this does the same.
+/// What a slug has to be unique against depends on the URL the row actually
+/// mints, which is not the same question as its post type:
 ///
-/// Only `post` and `page` compete: a custom type is addressed under its own
-/// prefix (`/product/widget`), so it cannot collide with them.
+/// * A **nested page** is addressed by its full ancestry, so it competes only
+///   with its siblings. `/about/team` and `/company/team` are different URLs
+///   and both are legitimate — WordPress allows exactly this, and
+///   `resolve_page_path` disambiguates by `parent_id`. Treating every page as
+///   globally unique renamed the second one to `team-2` for no reason.
+/// * A **post or a top-level page** mints a bare path (`/about`), where only
+///   one row can be served — so those two types compete with each other,
+///   appending `-2`, `-3`, … as WordPress does.
+/// * A **custom type** is addressed under its own prefix (`/product/widget`)
+///   and competes only with itself, but it still has to compete, because
+///   `idx_posts_type_slug` requires uniqueness within a type.
 pub async fn ensure_unique_slug(
     conn: &mut AsyncPgConnection,
     post_type: &str,
     desired: &str,
+    parent_id: Option<i64>,
     exclude_id: Option<i64>,
 ) -> AutumnResult<String> {
-    // Which rows this slug must be unique against. `post` and `page` share the
-    // bare URL path, so they compete with each other; a custom type is
-    // addressed under its own prefix (`/product/widget`) and competes only with
-    // itself — but it still has to compete, because `idx_posts_type_slug`
-    // requires uniqueness within a type. Returning early for custom types made
-    // a second item with the same title fail with a constraint error instead of
-    // getting the usual `-2`.
-    let competing_types: Vec<&str> = if BARE_PATH_TYPES.contains(&post_type) {
+    // A page with a parent is not in the bare-path namespace at all; it is in
+    // its parent's.
+    let nested_page = post_type == "page" && parent_id.is_some();
+    let competing_types: Vec<&str> = if nested_page {
+        vec!["page"]
+    } else if BARE_PATH_TYPES.contains(&post_type) {
         BARE_PATH_TYPES.to_vec()
     } else {
         vec![post_type]
@@ -1920,8 +1925,14 @@ pub async fn ensure_unique_slug(
     // Reserving is what keeps both features working. Falling back to content
     // when the archive or route "has nothing" would instead make `/2026` or
     // `/search` mean different things depending on what happens to exist.
-    let shadowed_by_a_route =
-        BARE_PATH_TYPES.contains(&post_type) && segment_claim(desired, None).is_some();
+    //
+    // A nested page is exempt: nothing claims `/about/team` by claiming
+    // `/team`, and reserving on its account would rename a page for a collision
+    // that cannot happen. `guard_page_path` covers the nested paths that *are*
+    // claimed.
+    let shadowed_by_a_route = !nested_page
+        && BARE_PATH_TYPES.contains(&post_type)
+        && segment_claim(desired, None).is_some();
     let mut candidate = if shadowed_by_a_route {
         format!("{desired}-2")
     } else {
@@ -1932,6 +1943,15 @@ pub async fn ensure_unique_slug(
             .filter(posts::slug.eq(candidate.clone()))
             .filter(posts::post_type.eq_any(&competing_types))
             .into_boxed();
+        // Siblings only, for a nested page — and for a top-level page or a
+        // post, the bare-path namespace, which nested pages are not in.
+        query = match parent_id {
+            Some(parent) if nested_page => query.filter(posts::parent_id.eq(parent)),
+            _ if BARE_PATH_TYPES.contains(&post_type) => {
+                query.filter(posts::post_type.eq("post").or(posts::parent_id.is_null()))
+            }
+            _ => query,
+        };
         if let Some(id) = exclude_id {
             query = query.filter(posts::id.ne(id));
         }
@@ -2862,7 +2882,9 @@ pub async fn insert_post_with_unique_slug(
         let desired = desired.clone();
         let outcome = conn
             .transaction(async move |conn| {
-                let slug = ensure_unique_slug(conn, &attempt.post_type, &desired, None).await?;
+                let slug =
+                    ensure_unique_slug(conn, &attempt.post_type, &desired, attempt.parent_id, None)
+                        .await?;
                 let row = crate::models::NewPost { slug, ..attempt };
                 let saved: Post = diesel::insert_into(posts::table)
                     .values(&row)

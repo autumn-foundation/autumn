@@ -1243,9 +1243,19 @@ pub async fn update(
     }
 
     let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
+    // The parent this save is *moving the page to*, not the one it has: a page
+    // being re-filed competes with its new siblings, and allocating against the
+    // old ones would let it land on a slug already taken where it is going.
     let slug = repos
         .with_conn(async |conn| {
-            content::ensure_unique_slug(conn, &post_type, &desired, Some(id)).await
+            content::ensure_unique_slug(
+                conn,
+                &post_type,
+                &desired,
+                optional_id(form.parent_id.as_ref()),
+                Some(id),
+            )
+            .await
         })
         .await?;
 

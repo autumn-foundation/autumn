@@ -8751,3 +8751,100 @@ async fn a_thread_by_many_accounts_renders_every_name() {
         "and a guest under the name they gave"
     );
 }
+
+/// Two pages under different parents may share a slug.
+///
+/// `/about/team` and `/company/team` are different URLs, and
+/// `resolve_page_path` has always disambiguated pages by `parent_id` — but a
+/// global `(post_type, slug)` uniqueness, plus a bare-path index that covered
+/// every page rather than only the top-level ones, renamed the second to
+/// `team-2`. WordPress makes no such rename.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn pages_under_different_parents_may_share_a_slug() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let page = async |title: &str, slug: &str, parent: Option<&str>| -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ];
+        if let Some(parent) = parent {
+            fields.push(("parent_id", parent));
+        }
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating {title}: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+
+    let about = page("About", "about", None).await;
+    let company = page("Company", "company", None).await;
+    let first = page("Team", "team", Some(&about)).await;
+    let second = page("Team", "team", Some(&company)).await;
+
+    let slug_of = async |id: &str| -> String {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::slug)
+            .first(&mut conn)
+            .await
+            .expect("the page")
+    };
+    assert_eq!(slug_of(&first).await, "team");
+    assert_eq!(
+        slug_of(&second).await,
+        "team",
+        "a sibling of a different parent is not a collision"
+    );
+
+    // Both resolve, at their own paths.
+    sign_out(&client);
+    client
+        .get("/about/team")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+    client
+        .get("/company/team")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+
+    // Siblings still collide — the scope narrowed, it did not disappear.
+    let third = page("Team", "team", Some(&about)).await;
+    assert_eq!(
+        slug_of(&third).await,
+        "team-2",
+        "two children of the same parent would mint the same URL"
+    );
+
+    // And a top-level page still competes with posts for the bare path.
+    create_post(&client, &cookie, "Careers", "Body.", "publish").await;
+    let bare = page("Careers", "careers", None).await;
+    assert_eq!(
+        slug_of(&bare).await,
+        "careers-2",
+        "a top-level page and a post both mint /careers"
+    );
+}

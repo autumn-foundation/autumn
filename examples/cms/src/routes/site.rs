@@ -353,8 +353,14 @@ impl Repos {
         for _ in 0..5 {
             let slug = {
                 let mut conn = self.conn().await?;
-                crate::content::ensure_unique_slug(&mut conn, &new.post_type, &desired, None)
-                    .await?
+                crate::content::ensure_unique_slug(
+                    &mut conn,
+                    &new.post_type,
+                    &desired,
+                    new.parent_id,
+                    None,
+                )
+                .await?
             };
             let attempt = crate::models::NewPost {
                 slug,
