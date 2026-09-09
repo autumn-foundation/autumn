@@ -760,8 +760,12 @@ apply-time error.
   copy the pre-scrub row into another table as the rewrite runs. The scrub names
   the tables carrying user triggers; check or disable them on the copy.
 - **Materialized views are refreshed** (in dependency order — traced through
-  ordinary views too, since a materialized view that reads another through one
-  must still be rebuilt after it — inside the scrub's own transaction) since they hold their own copy of whatever they selected — so
+  ordinary views, and through the function dependencies PostgreSQL records, since
+  a materialized view that reads another through one must still be rebuilt after
+  it — inside the scrub's own transaction). A view read through a function whose
+  body PostgreSQL does *not* track, such as a SQL function written as a string
+  literal, is **refused**: nothing records what it reads, so the order cannot be
+  derived. Rewrite the function with `BEGIN ATOMIC`, which is tracked. since they hold their own copy of whatever they selected — so
   a refresh the role is not allowed to run rolls the rewrites back rather than
   committing base tables a stale view contradicts. A view left `WITH NO DATA` is
   the one exception: it holds no rows to scrub, so it is skipped rather than

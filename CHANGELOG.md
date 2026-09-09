@@ -598,7 +598,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tables and in `z_source`, and all 200 still in `a_report`. Rule dependencies
   are now read between relations of any kind and walked through anything that is
   not a materialized view, so the edge is recovered however many ordinary views
-  sit in between.
+  sit in between. The walk also follows the one function hop PostgreSQL records,
+  `rewrite -> pg_proc -> pg_class`, which a `BEGIN ATOMIC` body produces — and
+  REFUSES a view read through a function whose body it does not track. Measured
+  on `a_report -> bridge_fn() -> z_source` with a string-literal body:
+  `pg_depend` holds `a_report -> pg_proc(bridge_fn)` and the function holds no
+  relation dependency at all, so no path exists to walk; the views sorted by
+  name, `a_report` refreshed FIRST from a stale `z_source`, and the run reported
+  success with `users` at 2 rows, both base tables clean, and all 200 original
+  addresses still in `a_report`. The same shape with a `BEGIN ATOMIC` body is
+  ordered correctly instead — measured, `z_source` refreshed first despite
+  sorting later, both views ending clean.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the

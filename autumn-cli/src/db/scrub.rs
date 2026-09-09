@@ -304,6 +304,13 @@ pub enum ScrubError {
         /// The target labels, sorted.
         targets: Vec<String>,
     },
+    /// A materialized view's definition calls a function whose body `PostgreSQL`
+    /// does not track, so the run cannot know which views it reads and cannot
+    /// order the refresh around it.
+    UntraceableViewFunction {
+        /// `view via function`, sorted.
+        views: Vec<String>,
+    },
     /// `--dry-run` cannot prove the reconnect for a target whose connection
     /// string leaves the port to libpq: psql resolves it from `PGPORT` (or the
     /// 5432 default) at PASTE time, which need not be what it resolved when the
@@ -579,6 +586,24 @@ impl std::fmt::Display for ScrubError {
                  target as a URI (`postgres://user@host/db`), or run without `--dry-run`.",
                 targets.len(),
                 bullet_list(targets),
+            ),
+            Self::UntraceableViewFunction { views } => write!(
+                f,
+                "{} materialized view(s) read through a function this run cannot \
+                 follow:\n{}\n  \
+                 Refresh order is taken from the dependency graph `PostgreSQL` records, \
+                 and it records nothing about what a function whose body is a string \
+                 literal reads. Measured on `a_report -> bridge_fn() -> z_source`: \
+                 `pg_depend` holds `a_report -> pg_proc(bridge_fn)` and the function \
+                 holds NO relation dependency at all, so the two views sorted by name, \
+                 `a_report` refreshed FIRST from a `z_source` still holding pre-scrub \
+                 rows, and the run reported success with `users` at 2 rows, 0 original \
+                 addresses in the base tables and in `z_source`, and all 200 still in \
+                 `a_report`. A `BEGIN ATOMIC` body IS tracked and is followed normally. \
+                 Rewrite the function with `BEGIN ATOMIC`, inline its query into the \
+                 view, or drop the view and rebuild it after the run.",
+                views.len(),
+                bullet_list(views),
             ),
             Self::UnprintablePortlessTarget { targets } => write!(
                 f,
@@ -2565,6 +2590,15 @@ fn classify_and_apply(
                 tables: facts.legacy_inheritance,
             });
         }
+        // A view whose order cannot be DERIVED at all, because its definition
+        // calls a function whose body PostgreSQL does not track. Refused before
+        // the reachability check below, which can only compare two lists built
+        // from a graph this shape is missing from entirely.
+        if !facts.untraceable_view_functions.is_empty() {
+            return Err(ScrubError::UntraceableViewFunction {
+                views: facts.untraceable_view_functions,
+            });
+        }
         // A view the dependency walk never reached is one the run cannot
         // refresh, and an unrefreshed view keeps its pre-scrub rows. Detected by
         // comparing the ordered list against the flat enumeration rather than by
@@ -3431,9 +3465,13 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
 /// still holding pre-scrub rows, and refreshing `z_source` afterwards does not
 /// touch it — `users` scrubbed to 2 rows with 0 original addresses, `z_source`
 /// clean, and `a_report` holding all 200, under a reported success. So
-/// `rel_edge` takes every rewrite-rule dependency between relations, `reach`
-/// walks it from each materialized view through anything that is not one, and
-/// `edge` keeps the pairs that land on one. `reach` recurses with `UNION` over a
+/// `rel_edge` takes every rewrite-rule dependency between relations — and the
+/// one function hop `PostgreSQL` records, `rewrite -> pg_proc -> pg_class`,
+/// which a `BEGIN ATOMIC` body produces. `reach` walks that from each
+/// materialized view through anything that is not one, and `edge` keeps the
+/// pairs that land on one. A function whose body is a string literal records no
+/// such dependency at all and cannot be walked; `untraceable_view_functions`
+/// refuses those rather than ordering around a gap. `reach` recurses with `UNION` over a
 /// finite set of pairs, so it terminates whatever the view graph looks like.
 ///
 /// `needed` is every POPULATED view, plus every view one of those reads, however
@@ -3469,6 +3507,15 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
      WHERE d.classid = 'pg_rewrite'::regclass \
        AND d.refclassid = 'pg_class'::regclass \
        AND d.refobjid <> r.ev_class \
+     UNION \
+     SELECT DISTINCT r.ev_class AS dependent, fd.refobjid AS source \
+     FROM pg_depend d \
+     JOIN pg_rewrite r ON r.oid = d.objid \
+     JOIN pg_depend fd ON fd.classid = 'pg_proc'::regclass \
+       AND fd.objid = d.refobjid AND fd.refclassid = 'pg_class'::regclass \
+     WHERE d.classid = 'pg_rewrite'::regclass \
+       AND d.refclassid = 'pg_proc'::regclass \
+       AND fd.refobjid <> r.ev_class \
  ), reach AS ( \
      SELECT m.oid AS dependent, e.source FROM mv m \
      JOIN rel_edge e ON e.dependent = m.oid \
@@ -3694,6 +3741,14 @@ pub struct DatabaseFacts {
     /// run the view's query. Measured on a view defined as `SELECT 1/0`, it
     /// succeeds where a plain `REFRESH` raises `division by zero`.
     pub unpopulated_views: Vec<String>,
+    /// `view via function` for every materialized view whose definition calls a
+    /// non-system function that records no relation dependency of its own.
+    ///
+    /// Such a function's body is opaque to `pg_depend` — a string literal, or
+    /// `plpgsql` — so the run cannot know whether it reads another materialized
+    /// view, and cannot order the refresh around it. A `BEGIN ATOMIC` body does
+    /// record its reads and is followed by `MV_REFRESH_CLOSURE` instead.
+    pub untraceable_view_functions: Vec<String>,
     /// Non-system schemas other than `public` that hold base tables. The whole
     /// classification universe is `public`-only, so these are refused.
     pub other_schemas: BTreeSet<String>,
@@ -4254,6 +4309,26 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
+    // The views whose order cannot be derived at all. Deliberately not part of
+    // the closure query: this is a refusal, not an edge.
+    let untraceable_view_functions = names(
+        "SELECT DISTINCT rel.relname || ' via ' || p.proname AS name \
+         FROM pg_depend d \
+         JOIN pg_rewrite r ON r.oid = d.objid \
+         JOIN pg_class rel ON rel.oid = r.ev_class AND rel.relkind = 'm' \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         JOIN pg_proc p ON p.oid = d.refobjid \
+         JOIN pg_namespace pn ON pn.oid = p.pronamespace \
+         WHERE d.classid = 'pg_rewrite'::regclass \
+           AND d.refclassid = 'pg_proc'::regclass \
+           AND pn.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND NOT EXISTS (SELECT 1 FROM pg_depend fd \
+                           WHERE fd.classid = 'pg_proc'::regclass AND fd.objid = p.oid \
+                             AND fd.refclassid = 'pg_class'::regclass) \
+         ORDER BY name",
+        &mut conn,
+    )?;
+
     // EVERY unpopulated view, not only the closure members among them, because
     // this list closes a race as well as restoring a state. See
     // `DatabaseFacts::unpopulated_views`.
@@ -4321,6 +4396,7 @@ fn probe_database_facts(
         materialized_views,
         all_materialized_views,
         unpopulated_views,
+        untraceable_view_functions,
         other_schemas,
         framework_tables,
         public_columns,

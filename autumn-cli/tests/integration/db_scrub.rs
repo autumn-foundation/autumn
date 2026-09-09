@@ -2427,6 +2427,87 @@ async fn a_view_reached_through_an_ordinary_view_is_refreshed_in_dependency_orde
     }
 }
 
+/// A view read through a function `PostgreSQL` does not track is refused; one
+/// read through a `BEGIN ATOMIC` function is ordered normally.
+///
+/// Refresh order comes from the dependency graph the catalog records, and it
+/// records nothing about what a function whose body is a string literal reads.
+/// Measured on `a_report -> bridge_fn() -> z_source`: `pg_depend` holds
+/// `a_report -> pg_proc(bridge_fn)`, the function holds NO relation dependency
+/// at all, the two views sorted by name, `a_report` refreshed FIRST from a
+/// stale `z_source`, and the run reported success with `users` at 2 rows, both
+/// base tables clean, and all 200 original addresses still in `a_report`.
+///
+/// A `BEGIN ATOMIC` body does record its reads, so that chain is followed
+/// rather than refused — the distinction this test exists to hold.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_read_through_an_untracked_function_is_refused() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let opaque = seed_sample_fixture(&admin, &base, "fn_opaque").await;
+    opaque
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION bridge_fn() RETURNS TABLE(id int, email text) \
+                 AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM bridge_fn();",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/fn_opaque");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("a_report via bridge_fn"),
+        "the refusal must name the view and the function it cannot follow: {refusal}"
+    );
+    assert_eq!(
+        seeded_rows(&opaque, "users", "email").await,
+        200,
+        "and it must refuse BEFORE writing anything: {refusal}"
+    );
+
+    // The same shape through a tracked body is followed, not refused. `z_source`
+    // sorts AFTER `a_report`, so refreshing it first can only come from the
+    // function hop being traversed.
+    let atomic = seed_sample_fixture(&admin, &base, "fn_atomic").await;
+    atomic
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION atomic_fn() RETURNS TABLE(id int, email text) LANGUAGE sql \
+                 BEGIN ATOMIC SELECT id, email FROM z_source; END; \
+             CREATE MATERIALIZED VIEW a_report AS SELECT * FROM atomic_fn();",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_atomic");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "a tracked function body must still order the refresh: {stderr}"
+    );
+    for view in ["z_source", "a_report"] {
+        assert_eq!(
+            seeded_rows(&atomic, view, "email").await,
+            0,
+            "{view} must be rebuilt from the scrubbed rows: {stderr}"
+        );
+    }
+}
+
 /// A purged framework table is compacted and measured like any other.
 ///
 /// `[framework] purge` empties its tables, and `DELETE` frees no file space, so
