@@ -1525,6 +1525,59 @@ async fn a_self_referential_derivation_survives_crossing_reparents() {
     }
 }
 
+/// The same crossing through `upsert_many`, which row-locks the existing
+/// child rows `FOR UPDATE` before it applies the deltas: the serialization lock
+/// must come before that load, or two upserts hold each other's node and
+/// deadlock the same way two updates would.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_self_referential_derivation_survives_crossing_upserts() {
+    let (_guard, _pg, pool) = setup().await;
+    let repo = PgDvNodeRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    mark_all_complete(&mut conn).await;
+
+    let a = seed_node(&repo, None).await;
+    let b = seed_node(&repo, None).await;
+    let workers: Vec<_> = [(a, b), (b, a)]
+        .into_iter()
+        .map(|(mine, other)| {
+            let repo = PgDvNodeRepository::with_pool_untracked(pool.clone());
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    // `child_count` is `#[default]`, so the upsert never writes
+                    // it: the derivation alone maintains it.
+                    for parent in [Some(other), None] {
+                        repo.upsert_many(&[DvNode {
+                            id: mine,
+                            parent_id: parent,
+                            child_count: 0,
+                        }])
+                        .await?;
+                    }
+                }
+                Ok::<(), autumn_web::AutumnError>(())
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker
+            .await
+            .expect("join")
+            .expect("a crossing upsert must wait, not deadlock");
+    }
+    for node in [a, b] {
+        let count: i64 =
+            diesel::sql_query("SELECT child_count AS count FROM dv_nodes WHERE id = $1")
+                .bind::<BigInt, _>(node)
+                .get_result::<CountRow>(&mut conn)
+                .await
+                .expect("read the count")
+                .count;
+        assert_eq!(count, 0, "node {node} counts no children");
+    }
+}
+
 // ── AC6: resumable backfill ────────────────────────────────────────────────
 
 /// AC6: a backfill stopped mid-sweep keeps its checkpoint, and resuming

@@ -78,8 +78,12 @@ fn all_targets_sqlite(targets: &[(String, String)]) -> bool {
 
 /// Apply pending user migrations against a `SQLite` database through the unlocked
 /// diesel harness (no advisory lock, no `diesel` subprocess — issue #1999/#2036
-/// precedent). Real only under the `sqlite` feature; the default build returns
-/// the [`SQLITE_FEATURE_MSG`] seam.
+/// precedent), then the `SQLite` variants of the framework tables every
+/// database needs, with the two enumerated together first so an app migration
+/// sharing a framework version cannot mask it (see
+/// [`autumn_web::migrate::run_pending_sqlite_with_framework_migrations`]).
+/// Real only under the `sqlite` feature; the default build returns the
+/// [`SQLITE_FEATURE_MSG`] seam.
 #[cfg(feature = "sqlite")]
 fn apply_pending_sqlite_cli(
     database_url: &str,
@@ -92,7 +96,7 @@ fn apply_pending_sqlite_cli(
                 migrations_dir.display()
             ))
         })?;
-    autumn_web::migrate::run_pending_sqlite(database_url, migrations)
+    autumn_web::migrate::run_pending_sqlite_with_framework_migrations(database_url, &migrations)
 }
 
 /// `SQLite` apply seam in the default (Postgres-only) build — references no
@@ -707,60 +711,31 @@ fn run_single_target(
 /// applied (its DDL has no `SQLite` variant); the three shard-required sets
 /// that do have one (version history, commit-hook queue, derivation state) are,
 /// so a deployment with startup auto-migration off still gets them (#1769).
+/// The app set and those three are version-disambiguated together before
+/// either is applied, as at boot, so an app migration that shares a version
+/// with a framework one masks nothing.
 fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
     let dir = std::path::Path::new(migrations_dir);
-    eprintln!("  Running pending migrations (SQLite, unlocked harness)...\n");
+    eprintln!(
+        "  Running pending migrations (SQLite, unlocked harness; app set, then framework sets)...\n"
+    );
     match apply_pending_sqlite_cli(database_url, dir) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\u{2713} Migrations are already up to date.");
+            true
         }
         Ok(result) => {
             for migration in &result.applied {
                 eprintln!("  Applied {migration}");
             }
             eprintln!("\n\u{2713} Migrations applied successfully.");
+            true
         }
         Err(e) => {
             eprintln!("\u{2717} {e}");
-            return false;
-        }
-    }
-    eprintln!("\n  Running framework migrations (SQLite)...\n");
-    match apply_pending_sqlite_framework_cli(database_url) {
-        Ok(result) if result.applied.is_empty() => {
-            eprintln!("\u{2713} Framework migrations are already up to date.");
-            true
-        }
-        Ok(result) => {
-            for migration in &result.applied {
-                eprintln!("  Applied {migration}");
-            }
-            eprintln!("\n\u{2713} Framework migrations applied successfully.");
-            true
-        }
-        Err(e) => {
-            eprintln!("\u{2717} Framework migration failed: {e}");
             false
         }
     }
-}
-
-/// Apply the `SQLite` framework sets (see
-/// [`autumn_web::migrate::run_pending_sqlite_framework_migrations`]). Real only
-/// under the `sqlite` feature; the default build returns the
-/// [`SQLITE_FEATURE_MSG`] seam like every other `SQLite` step.
-#[cfg(feature = "sqlite")]
-fn apply_pending_sqlite_framework_cli(
-    database_url: &str,
-) -> Result<MigrationResult, MigrationError> {
-    autumn_web::migrate::run_pending_sqlite_framework_migrations(database_url)
-}
-
-#[cfg(not(feature = "sqlite"))]
-fn apply_pending_sqlite_framework_cli(
-    _database_url: &str,
-) -> Result<MigrationResult, MigrationError> {
-    Err(MigrationError::Migration(SQLITE_FEATURE_MSG.to_owned()))
 }
 
 /// Fail-fast validation of every applied migration's checksum against its

@@ -2664,6 +2664,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let __autumn_cc_before_many =
             ::autumn_web::repository::counter_cache_capture_fks_many(conn, #cc_specs, ids).await?;
     };
+    // `upsert_many` row-locks the existing rows of each chunk (`FOR UPDATE`)
+    // before it can diff them, so on a table with a leg onto itself the lock
+    // that serializes such mutations has to be taken before that load, not by
+    // the post-upsert hook: two upserts that each hold the other's parent row
+    // would otherwise deadlock on the way to it.
+    let cc_before_upsert = quote! {
+        ::autumn_web::repository::counter_cache_serialize_self_referential(
+            conn, #cc_specs,
+        ).await?;
+    };
     let cc_after_upsert_chunk = quote! {
         ::autumn_web::repository::counter_cache_after_upsert_many(
             conn, #cc_specs, &existing_rows, &chunk_upserted,
@@ -10993,6 +11003,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let mut upserted = Vec::new();
                         let cols = (&records[0]).__autumn_column_count() + #tenant_extra;
                         let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
+                        #cc_before_upsert
                         #vh_upsert_lock_keys
                         for chunk in records.chunks(chunk_size) {
                             let chunk_ids: Vec<_> = chunk.iter().map(|r| r.id).collect();

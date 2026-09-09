@@ -795,12 +795,12 @@ where
 /// Returns [`MigrationError::Migration`] if the embedded set's metadata
 /// cannot be enumerated (not expected in practice for a `const` produced by
 /// `embed_migrations!`, but the underlying Diesel API is fallible).
-pub(crate) fn migration_versions_and_names<DB>(
-    source: &EmbeddedMigrations,
+pub(crate) fn migration_versions_and_names<DB, S>(
+    source: &S,
 ) -> Result<Vec<(String, String)>, MigrationError>
 where
     DB: diesel::backend::Backend,
-    EmbeddedMigrations: diesel::migration::MigrationSource<DB>,
+    S: diesel::migration::MigrationSource<DB> + ?Sized,
 {
     let migrations = MigrationSource::<DB>::migrations(source)
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
@@ -877,6 +877,23 @@ where
 pub(crate) fn compute_migration_disambiguation(
     named_sets: &[(&str, &EmbeddedMigrations)],
 ) -> HashMap<String, String> {
+    compute_migration_disambiguation_from_names(
+        named_sets
+            .iter()
+            .filter_map(|(_, set)| migration_versions_and_names::<Pg, _>(*set).ok()),
+    )
+}
+
+/// [`compute_migration_disambiguation`] over already-enumerated sets, each a
+/// list of `(version, full name)` pairs. This is the whole algorithm; the
+/// embedded-set form above only enumerates. A caller holding a set that is
+/// not embedded (the `autumn migrate` CLI reads the app's `migrations/`
+/// directory from disk) enumerates it with [`migration_versions_and_names`]
+/// and comes in here, so it reaches the same decision the boot path reaches
+/// for the same migration names.
+pub(crate) fn compute_migration_disambiguation_from_names(
+    sets: impl IntoIterator<Item = Vec<(String, String)>>,
+) -> HashMap<String, String> {
     // version -> distinct full names claiming it. Only the DISTINCT full
     // names matter for collision detection: the same migration folded into
     // two bundles under different source names (the intentional, harmless
@@ -884,10 +901,7 @@ pub(crate) fn compute_migration_disambiguation(
     // register it or in what order.
     let mut by_version: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    for (_, set) in named_sets {
-        let Ok(pairs) = migration_versions_and_names::<Pg>(set) else {
-            continue;
-        };
+    for pairs in sets {
         for (version, full_name) in pairs {
             let entries = by_version.entry(version).or_default();
             if !entries.contains(&full_name) {
@@ -1029,22 +1043,21 @@ impl<DB: diesel::backend::Backend + 'static> Migration<DB> for RenamedMigration<
     }
 }
 
-/// Wraps an [`EmbeddedMigrations`] set, transparently substituting the
-/// tracked version of any migration named in `disambiguated` (full name ->
-/// substitute version — see [`compute_migration_disambiguation`]). Every
-/// other migration in the set passes through completely unchanged — this is
-/// a no-op wrapper when `disambiguated` is empty, the overwhelmingly common
-/// case (no collision was ever detected).
-pub(crate) struct DisambiguatedMigrations<'a> {
-    inner: &'a EmbeddedMigrations,
+/// Wraps a migration set (an [`EmbeddedMigrations`] by default; any
+/// [`MigrationSource`], the CLI's on-disk app directory included),
+/// transparently substituting the tracked version of any migration named in
+/// `disambiguated` (full name -> substitute version — see
+/// [`compute_migration_disambiguation`]). Every other migration in the set
+/// passes through completely unchanged — this is a no-op wrapper when
+/// `disambiguated` is empty, the overwhelmingly common case (no collision was
+/// ever detected).
+pub(crate) struct DisambiguatedMigrations<'a, S = EmbeddedMigrations> {
+    inner: &'a S,
     disambiguated: &'a HashMap<String, String>,
 }
 
-impl<'a> DisambiguatedMigrations<'a> {
-    pub(crate) const fn new(
-        inner: &'a EmbeddedMigrations,
-        disambiguated: &'a HashMap<String, String>,
-    ) -> Self {
+impl<'a, S> DisambiguatedMigrations<'a, S> {
+    pub(crate) const fn new(inner: &'a S, disambiguated: &'a HashMap<String, String>) -> Self {
         Self {
             inner,
             disambiguated,
@@ -1052,10 +1065,10 @@ impl<'a> DisambiguatedMigrations<'a> {
     }
 }
 
-impl<DB> MigrationSource<DB> for DisambiguatedMigrations<'_>
+impl<DB, S> MigrationSource<DB> for DisambiguatedMigrations<'_, S>
 where
     DB: diesel::backend::Backend + 'static,
-    EmbeddedMigrations: MigrationSource<DB>,
+    S: MigrationSource<DB>,
 {
     fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<DB>>>> {
         let migrations = MigrationSource::<DB>::migrations(self.inner)?;
@@ -2727,10 +2740,11 @@ pub fn run_pending_shard_framework_migrations(
     }
 }
 
-/// Apply the framework migration sets a `SQLite` database requires.
+/// Apply an app's own migrations and then the framework sets a `SQLite`
+/// database requires, under one version-collision map.
 ///
-/// These are the `SQLite` variants of the version-history, commit-hook queue
-/// and derivation-state tables, the same three
+/// The framework sets are the `SQLite` variants of the version-history,
+/// commit-hook queue and derivation-state tables, the same three
 /// [`run_pending_shard_framework_migrations`] applies to a Postgres shard.
 /// The Postgres control-plane schema (`FRAMEWORK_MIGRATIONS`) has no `SQLite`
 /// variant and is never applied here. This is what gives `autumn migrate` an
@@ -2738,17 +2752,48 @@ pub fn run_pending_shard_framework_migrations(
 /// auto-migration is off; without it the boot only reports them pending and
 /// a `#[derivation]` reconciliation fails on the missing state table.
 ///
+/// Diesel tracks applied migrations by version alone, so an app migration
+/// that happens to share a version with one of these framework migrations
+/// would, applied on its own first, mask the framework one for good: the
+/// framework set would then report nothing pending while its table was never
+/// created. The two are therefore enumerated together and every collision
+/// resolved (by the same rule the boot path applies to the sets an app
+/// registers: the lexicographically first full name keeps the plain version,
+/// every other one is tracked under a substitute) before either is applied,
+/// the app set first, so the tracked versions here are the ones the boot path
+/// records for the same migration names.
+///
 /// # Errors
 ///
-/// Returns an error if the connection cannot be established or a migration
-/// fails; the same errors as [`run_pending_sqlite`].
+/// Returns an error if a set cannot be enumerated, the connection cannot be
+/// established or a migration fails; the same errors as
+/// [`run_pending_sqlite`].
 #[cfg(feature = "sqlite")]
-pub fn run_pending_sqlite_framework_migrations(
+pub fn run_pending_sqlite_with_framework_migrations<S>(
     database_url: &str,
-) -> Result<MigrationResult, MigrationError> {
-    let mut applied: Vec<String> = Vec::new();
+    app_migrations: &S,
+) -> Result<MigrationResult, MigrationError>
+where
+    S: diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+{
+    use diesel::sqlite::Sqlite;
+
+    let mut sets: Vec<Vec<(String, String)>> =
+        vec![migration_versions_and_names::<Sqlite, S>(app_migrations)?];
     for set in shard_framework_migration_sets() {
-        let result = run_pending_sqlite(database_url, EmbeddedMigrationsRef(set))?;
+        sets.push(migration_versions_and_names::<Sqlite, _>(set)?);
+    }
+    let disambiguated = compute_migration_disambiguation_from_names(sets);
+    let mut applied = run_pending_sqlite(
+        database_url,
+        DisambiguatedMigrations::new(app_migrations, &disambiguated),
+    )?
+    .applied;
+    for set in shard_framework_migration_sets() {
+        let result = run_pending_sqlite(
+            database_url,
+            DisambiguatedMigrations::new(set, &disambiguated),
+        )?;
         applied.extend(result.applied);
     }
     Ok(MigrationResult { applied })
@@ -3087,7 +3132,7 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn every_shard_required_framework_table_is_in_the_control_set_too() {
-        let names: Vec<String> = migration_versions_and_names::<Pg>(&FRAMEWORK_MIGRATIONS)
+        let names: Vec<String> = migration_versions_and_names::<Pg, _>(&FRAMEWORK_MIGRATIONS)
             .expect("enumerate the control set")
             .into_iter()
             .map(|(_, name)| name)
@@ -3104,21 +3149,32 @@ mod tests {
         }
     }
 
+    /// A fresh `sqlite://` file plus an empty `migrations/` directory beside
+    /// it, unique per call.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_scratch(tag: &str) -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "autumn-sqlite-framework-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let migrations_dir = root.join("migrations");
+        std::fs::create_dir_all(&migrations_dir).expect("scratch migrations dir");
+        let url = format!("sqlite://{}", root.join("app.sqlite").display());
+        (migrations_dir, url)
+    }
+
     /// `autumn migrate` on a `sqlite://` target applies the `SQLite` variants
     /// of the shard-required sets, the derivation state table included, and
     /// a second run applies nothing.
     #[cfg(feature = "sqlite")]
     #[test]
     fn the_sqlite_framework_sets_apply_through_the_cli_path() {
-        let path = std::env::temp_dir().join(format!(
-            "autumn-sqlite-framework-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        let url = format!("sqlite://{}", path.display());
-        let first = run_pending_sqlite_framework_migrations(&url).expect("first apply");
+        let (migrations_dir, url) = sqlite_scratch("plain");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("empty app set");
+        let first = run_pending_sqlite_with_framework_migrations(&url, &app).expect("first apply");
         assert!(
             first
                 .applied
@@ -3135,13 +3191,68 @@ mod tests {
             "the other shard-required tables come along: {:?}",
             first.applied
         );
-        let second = run_pending_sqlite_framework_migrations(&url).expect("second apply");
+        let second =
+            run_pending_sqlite_with_framework_migrations(&url, &app).expect("second apply");
         assert!(
             second.applied.is_empty(),
-            "idempotent: {:?}",
+            "nothing is applied twice: {:?}",
             second.applied
         );
-        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An app migration that shares its version with the derivation
+    /// migration does not mask it: both apply, the app one under the plain
+    /// version (its name sorts first) and the framework one under the
+    /// substitute the boot path would record too.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn a_sqlite_app_migration_sharing_a_framework_version_masks_nothing() {
+        use diesel::RunQueryDsl as _;
+
+        let (migrations_dir, url) = sqlite_scratch("collide");
+        let colliding = migrations_dir.join("20260907101530_aaa_collides");
+        std::fs::create_dir_all(&colliding).expect("colliding migration dir");
+        std::fs::write(
+            colliding.join("up.sql"),
+            "CREATE TABLE aaa (id INTEGER PRIMARY KEY);\n",
+        )
+        .expect("up.sql");
+        std::fs::write(colliding.join("down.sql"), "DROP TABLE aaa;\n").expect("down.sql");
+        let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
+
+        let first = run_pending_sqlite_with_framework_migrations(&url, &app).expect("first apply");
+        assert!(
+            first
+                .applied
+                .iter()
+                .any(|version| version == "20260907101530"),
+            "the app migration keeps the plain version: {:?}",
+            first.applied
+        );
+        assert!(
+            first
+                .applied
+                .iter()
+                .any(|version| version.starts_with("20260907101530+")),
+            "the derivation migration is applied under a substitute version: {:?}",
+            first.applied
+        );
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
+        diesel::sql_query("SELECT 1 FROM aaa LIMIT 1")
+            .execute(&mut conn)
+            .expect("the app table exists");
+        diesel::sql_query("SELECT 1 FROM _autumn_derivations LIMIT 1")
+            .execute(&mut conn)
+            .expect("the derivation state table exists");
+
+        let second =
+            run_pending_sqlite_with_framework_migrations(&url, &app).expect("second apply");
+        assert!(
+            second.applied.is_empty(),
+            "nothing is applied twice: {:?}",
+            second.applied
+        );
     }
 
     #[cfg(feature = "db")]
@@ -3150,7 +3261,7 @@ mod tests {
         let names: Vec<String> = shard_framework_migration_sets()
             .into_iter()
             .flat_map(|set| {
-                migration_versions_and_names::<Pg>(set).expect("enumerate an embedded set")
+                migration_versions_and_names::<Pg, _>(set).expect("enumerate an embedded set")
             })
             .map(|(_, name)| name)
             .collect();
@@ -3318,12 +3429,12 @@ mod tests {
         const COLLIDING: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_collision");
         let raw_versions: std::collections::HashSet<String> =
-            migration_versions_and_names::<Pg>(&APP)
+            migration_versions_and_names::<Pg, _>(&APP)
                 .unwrap()
                 .into_iter()
                 .map(|(v, _)| v)
                 .chain(
-                    migration_versions_and_names::<Pg>(&COLLIDING)
+                    migration_versions_and_names::<Pg, _>(&COLLIDING)
                         .unwrap()
                         .into_iter()
                         .map(|(v, _)| v),
@@ -3399,7 +3510,7 @@ mod tests {
     fn migration_versions_and_names_enumerates_todo_app_fixture() {
         const MIGRATIONS: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
-        let pairs = migration_versions_and_names::<Pg>(&MIGRATIONS).unwrap();
+        let pairs = migration_versions_and_names::<Pg, _>(&MIGRATIONS).unwrap();
         assert!(
             pairs
                 .iter()

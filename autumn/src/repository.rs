@@ -38,7 +38,7 @@ pub use crate::counter_cache::{
     counter_cache_apply_delta_by_child_id, counter_cache_before_delete_by_id,
     counter_cache_before_delete_many, counter_cache_before_detach_many,
     counter_cache_before_restore_by_id, counter_cache_capture_fks, counter_cache_capture_fks_many,
-    counter_cache_recompute,
+    counter_cache_recompute, counter_cache_serialize_self_referential,
 };
 #[doc(inline)]
 pub use crate::counter_cache::{Captured, CapturedContribution, CapturedContributions};

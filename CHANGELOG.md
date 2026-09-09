@@ -391,7 +391,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_autumn_derivations` state table ships in the framework migration set (so
   `autumn migrate` creates it on the control database, and on a `sqlite://`
   target applies the SQLite variants of the shard-required sets, which it had
-  skipped) and as a standalone set the runtime applies when a derivation is
+  skipped, version-disambiguated together with the app's own set so a shared
+  version masks nothing) and as a standalone set the runtime applies when a
+  derivation is
   registered (on every shard primary too).
   Each batch locks its state row, so replicas take turns on one sweep.
   `GET /actuator/derivations` (sensitive-gated) reports each derivation's
@@ -406,8 +408,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NOCASE` column cannot make the SQL and Rust lowerings disagree. A
   derivation onto its own table sweeps one parent per batch, a batch the
   database aborts to break a deadlock is retried from its checkpoint, every
-  mutation on such a table takes a per-table advisory lock first so crossing
-  re-parents wait rather than deadlock, and
+  mutation on such a table takes a per-table advisory lock before its first
+  row lock (`upsert_many` before the `FOR UPDATE` load it diffs against) so
+  crossing re-parents and upserts wait rather than deadlock, and
   `derivation::resweep` re-enqueues one derivation for the settling pass a
   rolling deployment that changed a definition needs (see the guide). The
   collision check also covers the column a `#[commentable(counter_cache)]`
