@@ -1,0 +1,12 @@
+   Compiling autumn-web v0.7.0 (/home/user/autumn/autumn)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6m 43s
+     Running tests/integration_tests.rs (target/debug/deps/integration_tests-a899cbc1cdfece2d)
+
+running 2 tests
+test integration::rate_limit_tenant_scope::global_limiter_principal_bucket_isolated_by_tenant ... ok
+test integration::rate_limit_tenant_scope::per_route_throttle_principal_bucket_isolated_by_tenant ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1949 filtered out; finished in 0.01s
+
+
+[exited with code 0]
