@@ -647,13 +647,17 @@ impl Limiter {
 
         let raw_key = self.extract_key(req)?;
 
+        // Fold the ambient tenant into the *bucket* key only — `raw_key` stays
+        // unqualified below for the tier hook. See `tenant_qualify_bucket_key`.
+        let tenant_qualified_key = tenant_qualify_bucket_key(self.key_strategy, &raw_key);
+
         // Namespace the bucket key by the active path prefix so that different
         // path overrides get independent token buckets (avoids burst-value
         // collision when /strict and /normal share the same client IP).
         let key = if key_ns.is_empty() {
-            raw_key.clone()
+            tenant_qualified_key
         } else {
-            format!("{key_ns}\0{raw_key}")
+            format!("{key_ns}\0{tenant_qualified_key}")
         };
 
         let mut burst = opt_burst.unwrap_or(self.burst);
@@ -724,6 +728,42 @@ fn strip_key_prefix(key: &str) -> &str {
     key.strip_prefix("token:")
         .or_else(|| key.strip_prefix("principal:"))
         .unwrap_or(key)
+}
+
+/// Fold the ambient tenant into a `principal:`-keyed bucket key before it is
+/// used to look up a token bucket.
+///
+/// `AuthenticatedPrincipal` keys on whatever identity value the app stored at
+/// login (`session.get(auth_session_key)`, see `RequireAuth`/`RequireApiToken`
+/// and the `populate_rate_limit_principal`/`__check_throttle` fallbacks) — and
+/// that value is not guaranteed unique across tenants. Autumn's own sharding
+/// guide documents that per-tenant primary keys are shard-local `BIGSERIAL`s
+/// (docs/guide/sharding.md), so the first user provisioned on two different
+/// tenants' shards both land on `id = 1`. Every `tenant_scoped` repository
+/// operation resolves `CURRENT_TENANT` ambiently to avoid exactly this; the
+/// bucket key must too, or one tenant's user can exhaust another tenant's
+/// bucket purely by sharing a principal id.
+///
+/// Deliberately returns the *bucket* key only — the tier-hook-visible value
+/// (`strip_key_prefix`'s output, passed to `with_tier_hook`) must stay the
+/// bare principal id the documented hook signature promises, so callers must
+/// keep using the original, unqualified `raw_key` for that. The `"principal:"`
+/// prefix is preserved (rather than replaced) so `key_class_label` still
+/// recognizes the key as an authenticated principal in logs/responses.
+///
+/// A no-op for `Ip`/`ApiToken` keys and for the IP fallback (no principal
+/// resolved): those either have no tenant-collision-prone identity or are
+/// already inherently un-shared across tenants (a bearer token is a random
+/// unique string; falling back to IP is an existing, accepted limitation).
+fn tenant_qualify_bucket_key(key_strategy: KeyStrategy, raw_key: &str) -> String {
+    if key_strategy == KeyStrategy::AuthenticatedPrincipal
+        && let Some(id) = raw_key.strip_prefix("principal:")
+        && let Ok(Some(tenant)) = crate::tenancy::CURRENT_TENANT.try_with(Clone::clone)
+    {
+        format!("principal:tenant={tenant}:{id}")
+    } else {
+        raw_key.to_owned()
+    }
 }
 
 /// Extract the key string from the `Authorization: Bearer <token>` header.
@@ -1615,6 +1655,10 @@ pub async fn __check_throttle(
         // ConnectInfo). Bypass — matches how the tower layer handles this.
         return Ok(());
     };
+    // Same tenant fold-in the global tower layer applies (see
+    // `tenant_qualify_bucket_key`) — `#[throttle(key = "principal")]` shares
+    // the same `extract_key` derivation and the same cross-tenant collision.
+    let bucket_key = tenant_qualify_bucket_key(key_strategy, &bucket_key);
 
     let burst = f64::from(limit.max(1));
     let rps = throttle_rps(limit.max(1), per_secs);
