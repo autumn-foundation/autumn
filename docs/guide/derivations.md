@@ -187,7 +187,8 @@ corruption: two derivations sharing a name, two maintaining one parent column,
 or a derivation maintaining a column that something else already maintains: a
 plain `counter_cache` on another model, a `#[votable]` model's aggregate
 column, a `#[repository(..., position(...))]` ordering column, a model's
-`#[lock_version]` token, or a `#[commentable(counter_cache = ...)]` parent's
+`#[lock_version]` token or `tenant_id` discriminator, or a
+`#[commentable(counter_cache = ...)]` parent's
 count (each registers the column it claims for exactly this check). A database failure does not: it is logged, the sweep for that target
 is skipped, and a derivation whose backfill has not run yet is stale rather than
 broken, which the actuator reports exactly.
@@ -344,8 +345,10 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   `tenant` field renamed with `#[diesel(column_name = "...")]` is rejected. A
   foreign-key field renamed that way is not detected, so keep `fk` fields
   unrenamed.
-- **The parent primary key is not a maintainable column**: `column = "id"`
-  is a compile error.
+- **The parent primary key and tenant discriminator are not maintainable
+  columns**: `column = "id"` and `column = "tenant_id"` are compile errors, and
+  a model's `tenant_id` field also claims its column in the registry, so a
+  derivation reaching it by another spelling stops the boot.
 - **A self-referential derivation cannot read the column it maintains.** Onto
   its own table, `sum(<the maintained column>)` or a filter naming it is a
   compile error: the parent-side update runs no repository hook, so a row's

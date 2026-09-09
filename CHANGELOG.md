@@ -407,8 +407,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rolling deployment that changed a definition needs (see the guide). The
   collision check also covers the column a `#[commentable(counter_cache)]`
   parent keeps, a `#[votable]` model's aggregate column, a repository's
-  `position(...)` ordering column and a model's `#[lock_version]` token (under
-  its `#[diesel(column_name)]` when it has one),
+  `position(...)` ordering column, a model's `#[lock_version]` token and its
+  `tenant_id` discriminator (each under its `#[diesel(column_name)]` when it
+  has one; `column = "tenant_id"` is also a compile error),
   string filters cast to `TEXT` so Postgres `citext` compares bytewise too,
   `column = "id"` and a self-referential derivation reading the column it
   maintains (its `fk` and `tenant` columns included) are compile errors,

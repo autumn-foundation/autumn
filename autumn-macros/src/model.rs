@@ -2115,10 +2115,14 @@ fn emit_counter_caches_impl(
     // would erase it. Its claim is emitted whether or not this model keeps a
     // counter cache of its own, since the usual shape is a parent that keeps
     // none while a child's derivation names one of its columns (#1769).
-    let lock_version_claim = all_fields
+    // So is the `tenant_id` field, the framework's tenant discriminator
+    // (`#[repository(tenant_scoped)]` filters on it, and every read scope
+    // keys off it): a derivation maintaining it would move the parent to
+    // another tenant, and on a sharded deployment leave it on the wrong shard.
+    let implicit_claims: Vec<TokenStream> = all_fields
         .iter()
-        .find(|f| has_attr(f, "lock_version"))
-        .and_then(|field| Some((field, field.ident.as_ref()?)))
+        .filter(|f| has_attr(f, "lock_version") || is_tenant_id_field(f))
+        .filter_map(|field| Some((field, field.ident.as_ref()?)))
         .map(|(field, ident)| {
             // The claim names the *database* column: a field Diesel renames
             // with `#[diesel(column_name = ...)]` stores the token under the
@@ -2135,9 +2139,10 @@ fn emit_counter_caches_impl(
                     }
                 }
             }
-        });
+        })
+        .collect();
     if cached.is_empty() && derivations.is_empty() {
-        return Ok(lock_version_claim.unwrap_or_default());
+        return Ok(quote! { #(#implicit_claims)* });
     }
 
     // Both declaration kinds share every validation below, so the diagnostics
@@ -2237,8 +2242,7 @@ fn emit_counter_caches_impl(
     // can refuse a `#[derivation]` on another model that maintains the same
     // parent column (#1769): the two would double count, and the backfill
     // would then overwrite the counter cache's rows.
-    let mut claim_items: Vec<TokenStream> = Vec::new();
-    claim_items.extend(lock_version_claim);
+    let mut claim_items: Vec<TokenStream> = implicit_claims;
     for (index, assoc) in cached.iter().enumerate() {
         let decl = assoc
             .counter_cache
@@ -2349,6 +2353,20 @@ fn emit_counter_caches_impl(
                     "`#[derivation]` cannot maintain `{parent_table}.id`: that is the \
                      parent's primary key, and a maintained value would rewrite the \
                      parent's identity. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        // `tenant_id` is the framework's tenant discriminator on every model
+        // that has it (see `is_tenant_id_field`), so a maintained value would
+        // move the parent to another tenant. The parent's own claim catches
+        // this at boot as well; this is the earlier, clearer diagnostic.
+        if column == "tenant_id" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.tenant_id`: that is the \
+                     parent's tenant discriminator, and a maintained value would move the \
+                     parent to another tenant. Name a dedicated aggregate column"
                 ),
             ));
         }
@@ -4866,6 +4884,12 @@ fn validate_translatable_field(field: &syn::Field) -> syn::Result<()> {
 fn unraw_ident(ident: &syn::Ident) -> String {
     let raw = ident.to_string();
     raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
+}
+
+/// Whether a field is the framework's tenant discriminator: the model macro
+/// keys tenant scoping off a field named `tenant_id`, wherever it appears.
+fn is_tenant_id_field(field: &syn::Field) -> bool {
+    field.ident.as_ref().is_some_and(|i| i == "tenant_id")
 }
 
 /// Whether a field carries `#[diesel(column_name = ...)]`, which renames the
@@ -10989,6 +11013,64 @@ mod tests {
         assert!(
             generated.contains("cannot maintain `posts.id`"),
             "the parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_tenant_id_field_claims_its_column() {
+        // The tenant discriminator is a maintained column in the registry's
+        // sense: a derivation onto it would move the parent between tenants,
+        // so a model carrying one claims it whether or not it keeps a counter
+        // cache of its own.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub tenant_id: Option<String>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("CounterCacheClaim") && generated.contains("column : \"tenant_id\""),
+            "a `tenant_id` field must claim its column: {generated}"
+        );
+        let without = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !without.contains("CounterCacheClaim"),
+            "a model with neither token nor tenant claims nothing: {without}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_maintain_the_parent_tenant_id() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "tenant_id", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.tenant_id`"),
+            "the tenant discriminator is not a maintainable column: {generated}"
         );
     }
 
