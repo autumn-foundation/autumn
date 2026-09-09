@@ -1302,7 +1302,15 @@ impl CustomDomainRegistry {
             .collect();
         let mut removed = 0;
         for hostname in hostnames {
-            if self.remove(&hostname).await? {
+            // Re-assert the tenant per hostname: the list is a snapshot and
+            // each removal awaits, so a hostname freed early can be
+            // re-registered by ANOTHER tenant before a later one runs. An
+            // unconditional removal would delete that tenant's record and stop
+            // routing a domain that was never part of this teardown.
+            if self
+                .remove_if(&hostname, |current| current.tenant == tenant)
+                .await?
+            {
                 removed += 1;
             }
         }

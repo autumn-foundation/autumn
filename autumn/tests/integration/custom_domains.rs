@@ -1137,3 +1137,49 @@ async fn a_state_change_that_fails_to_persist_is_not_left_in_the_index() {
         registry.get("app.clientco.com").unwrap()
     );
 }
+
+// ── Codex round 11 ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_registry_tenant_teardown_leaves_a_hostname_another_tenant_took_over() {
+    // `remove_tenant` walks a snapshot and each removal awaits, so a hostname
+    // freed early can be re-registered by ANOTHER tenant before a later one
+    // runs. Removing it unconditionally stops routing a domain that was never
+    // part of this teardown.
+    let store = Arc::new(PausingDeleteStore::new());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    ));
+    // `list_for_tenant` sorts by hostname, so `a-` is removed first and holds
+    // the teardown inside its store delete.
+    for host in ["a-first.clientco.com", "b-second.clientco.com"] {
+        registry.register(host, "tenant-a", NOW).await.unwrap();
+    }
+
+    store.pause_next_delete();
+    let teardown = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move { registry.remove_tenant("tenant-a").await.unwrap() }
+    });
+    store.reached_pause().await;
+
+    // The second hostname changes hands while the teardown is suspended.
+    assert!(registry.remove("b-second.clientco.com").await.unwrap());
+    registry
+        .register("b-second.clientco.com", "tenant-b", NOW + 1)
+        .await
+        .unwrap();
+    store.release();
+
+    assert_eq!(
+        teardown.await.unwrap(),
+        1,
+        "only the hostname still belonging to tenant-a is torn down"
+    );
+    assert!(registry.get("a-first.clientco.com").is_none());
+    let survivor = registry
+        .get("b-second.clientco.com")
+        .expect("the new tenant's domain must survive the old tenant's teardown");
+    assert_eq!(survivor.tenant, "tenant-b");
+}

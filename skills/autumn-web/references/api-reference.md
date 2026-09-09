@@ -1621,10 +1621,17 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 The app drives the journey through
 `autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
 `register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
-renders the exact record to show the tenant, `list_for_tenant` renders status,
-and `remove` / `remove_tenant` offboard. States are `pending_dns` → `verified` →
-`issuing` → `active`; a stuck domain carries `failure_reason`, and an `active`
-domain that fails renewal STAYS active and serving.
+renders the exact record to show the tenant, and `list_for_tenant` renders
+status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
+active and serving.
+
+**Offboard through `<dyn CustomDomainPruner>::from_state(&state)`** —
+`offboard_domain(hostname)` and `offboard_tenant_domains(tenant)`. The
+registry's own `remove` / `remove_tenant` only drop the record: they stop
+routing, but the certificate and its private key stay in the ACME store until a
+`[retention] custom_domains` window prunes them, which is unset by default.
+`CustomDomainPruner` does both.
 
 Three gates stand between a tenant-supplied hostname and an ACME order: the app
 registered it, DNS independently resolves to this deployment, and the budget has
