@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Confidential fields: explicit slice-one threat model and coverage
+  contract.** The guide now distinguishes protected plaintext and client root
+  keys from permitted metadata leakage and excluded active attacks. A
+  machine-readable manifest inventories every protected at-rest sink, and a
+  repository-hygiene gate requires each sink to remain represented in the
+  end-to-end leak-sentinel test.
+
 - **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
   management system.** `autumn new <name> --starter cms` now scaffolds a
   complete CMS, joining `saas` as the second curated built-in. The rendered

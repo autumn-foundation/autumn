@@ -61,6 +61,7 @@ mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
+mod confidential_fields_leak_sentinel;
 mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "acme")]
