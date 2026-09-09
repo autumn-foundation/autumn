@@ -81,10 +81,25 @@ pub struct ExportPost {
     /// The author's **username**, not their id: ids are meaningless across
     /// installations, and a username is what an importer can actually resolve.
     pub author: String,
+    /// A page's **full path** (`about/team`), which is what identifies it.
+    ///
+    /// A slug alone stopped being an identity when nested page slugs became
+    /// unique per parent rather than globally: `/about/team` and
+    /// `/company/team` are both legitimate and both carry the slug `team`, so
+    /// an importer keyed on `(post_type, slug)` restored the first and skipped
+    /// the second as already present — losing a page out of the site's own
+    /// backup. Added in version 4; absent from a version-2 or -3 file, where
+    /// the slug was the identity because the schema made it one.
+    #[serde(default)]
+    pub path: Option<String>,
     /// The parent page's **slug**, for hierarchical types — same reasoning as
     /// `author`. Without it a restore flattens the tree: a page reachable at
     /// `/about/team` comes back as `/team`, so every inbound link and
     /// canonical URL to it starts 404ing after a backup restore.
+    ///
+    /// Retained alongside `path` for version-2 and -3 files, which have no
+    /// `path`; for a version-4 page the parent is the path's own prefix, which
+    /// is what `parent_identity` reads.
     #[serde(default)]
     pub parent: Option<String>,
     #[serde(default)]
@@ -192,10 +207,10 @@ fn default_comment_status() -> String {
 /// missing password would have silently unprotected content, whereas a missing
 /// media list only means there is none to restore. Refusing version 2 outright
 /// would strand backups for no safety gain.
-pub const EXPORT_VERSION: u32 = 3;
+pub const EXPORT_VERSION: u32 = 4;
 
 /// The versions this site can read.
-const READABLE_EXPORT_VERSIONS: &[u32] = &[2, 3];
+const READABLE_EXPORT_VERSIONS: &[u32] = &[2, 3, 4];
 
 /// How much of the request budget multipart framing and the CSRF field may use.
 ///
@@ -333,6 +348,18 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 Some(parent_id) => repos.posts.find_by_id(parent_id).await?.map(|p| p.slug),
                 None => None,
             };
+            // The full path, which is what identifies a page now that a nested
+            // slug is only unique among its siblings.
+            let path = if post.post_type == "page" {
+                let ancestry = repos.page_ancestry(&post).await?;
+                Some(if ancestry.is_empty() {
+                    post.slug.clone()
+                } else {
+                    format!("{}/{}", ancestry.join("/"), post.slug)
+                })
+            } else {
+                None
+            };
             let assigned = repos.post_terms(post.id).await?;
             // The featured image by slug, resolved now while the ids still mean
             // something in this database.
@@ -355,6 +382,7 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 comment_status: post.comment_status.clone(),
                 password: post.password.clone(),
                 author,
+                path,
                 parent: parent_slug,
                 published_at: post.published_at,
                 sticky: post.sticky,
@@ -407,6 +435,65 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
             autumn_web::slugify(&settings.site_title)
         ))
         .into_response())
+}
+
+/// What identifies a post inside an export file.
+///
+/// A page's full path, when the file carries one; its slug otherwise. The slug
+/// alone stopped being an identity when nested page slugs became unique per
+/// parent — `/about/team` and `/company/team` both carry `team`.
+fn identity(post: &ExportPost) -> String {
+    post.path.clone().unwrap_or_else(|| post.slug.clone())
+}
+
+/// The identity of a post's parent, as the file describes it.
+///
+/// For a version-4 page this is the path's own prefix, which is unambiguous.
+/// For an older file it is the bare parent slug, which is the best that file
+/// can say — and was unambiguous under the schema that wrote it.
+fn parent_identity(post: &ExportPost) -> Option<String> {
+    if let Some(path) = &post.path {
+        let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        segments.pop();
+        return (!segments.is_empty()).then(|| segments.join("/"));
+    }
+    post.parent.clone()
+}
+
+/// The full path a stored post is addressed at, for comparing against a file's
+/// identity.
+async fn local_identity(repos: &Repos, post: &crate::models::Post) -> AutumnResult<String> {
+    if post.post_type != "page" {
+        return Ok(post.slug.clone());
+    }
+    let ancestry = repos.page_ancestry(post).await?;
+    Ok(if ancestry.is_empty() {
+        post.slug.clone()
+    } else {
+        format!("{}/{}", ancestry.join("/"), post.slug)
+    })
+}
+
+/// A stored post of `post_type` whose own identity matches, if there is one.
+async fn find_local(
+    repos: &Repos,
+    post_type: &str,
+    identity: &str,
+) -> AutumnResult<Option<crate::models::Post>> {
+    // The last segment is the slug, which is what the index can find.
+    let slug = identity.rsplit('/').next().unwrap_or(identity).to_owned();
+    for candidate in repos
+        .posts
+        .find_by_slug(slug)
+        .await?
+        .into_iter()
+        .filter(|candidate| candidate.post_type == post_type)
+    {
+        if local_identity(repos, &candidate).await? == identity {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// The status an imported post should land in.
@@ -575,15 +662,28 @@ pub async fn import(
     let mut restored = 0_usize;
     let mut skipped = 0_usize;
     let mut orphaned = 0_i64;
-    // (created id, post type, the slug AS WRITTEN IN THE FILE, parent slug).
-    // The written slug is the key the file's `parent` references use; the row
-    // may have been given a different one to avoid colliding with content
-    // already on this site.
+    // (created id, post type, the identity AS WRITTEN IN THE FILE, parent
+    // identity). The written identity is the key the file's parent references
+    // use; the row may have been given a different slug to avoid colliding with
+    // content already on this site.
     let mut created_ids: Vec<(i64, String, String, Option<String>)> = Vec::new();
     // Posts whose status was moved out of `draft`, so their transition action
     // can fire once the ancestry pass has finished — see the dispatch below.
     let mut transitioned_ids: Vec<i64> = Vec::new();
-    for post in &payload.posts {
+
+    // Shallowest first, so a parent is created before its children.
+    //
+    // The order is not cosmetic. Every page used to be inserted at the top
+    // level and re-parented in the pass below, which meant a nested page
+    // transiently occupied the *bare-path* namespace — so restoring both
+    // `/about/team` and `/company/team` gave the second the slug `team-2`, and
+    // it stayed that way after re-parenting. Creating the parent first lets the
+    // child be inserted where it belongs, where its slug only has to be unique
+    // among its siblings.
+    let mut ordered: Vec<&ExportPost> = payload.posts.iter().collect();
+    ordered.sort_by_key(|post| identity(post).matches('/').count());
+
+    for post in ordered {
         // Idempotent on the slug *the file names*, not only on the slug the
         // row ended up with. Those differ whenever the allocator had to add a
         // suffix — an imported `about` landing as `about-2` because a post
@@ -597,17 +697,34 @@ pub async fn import(
         // marker rather than by the slug. That distinction is the whole point:
         // a marker says "this row is ours, finish it", while a bare slug match
         // says only "something local is already called that".
+        let file_identity = identity(post);
+        // The parent, if this run has already created it or the site already
+        // had it. `None` leaves the row at the top level for the pass below to
+        // re-link — which is still needed for a parent the file names but does
+        // not contain.
+        let parent_now = match parent_identity(post) {
+            Some(parent) => match created_ids
+                .iter()
+                .find(|(_, post_type, id, _)| post_type == &post.post_type && id == &parent)
+            {
+                Some((id, _, _, _)) => Some(*id),
+                None => find_local(&repos, &post.post_type, &parent)
+                    .await?
+                    .map(|found| found.id),
+            },
+            None => None,
+        };
         let marker_owned =
-            match imported_source_slugs.get(&(post.post_type.clone(), post.slug.clone())) {
+            match imported_source_slugs.get(&(post.post_type.clone(), file_identity.clone())) {
                 Some(id) => repos.posts.find_by_id(*id).await?,
                 None => None,
             };
-        let slug_taken = repos
-            .posts
-            .find_by_slug(post.slug.clone())
+        // Matched on the *path*, not the bare slug: a local `/about/team` does
+        // not make the file's `/company/team` already present, and treating it
+        // as such dropped a page out of the site's own backup.
+        let slug_taken = find_local(&repos, &post.post_type, &file_identity)
             .await?
-            .into_iter()
-            .any(|p| p.post_type == post.post_type);
+            .is_some();
 
         if let Some(ours) = marker_owned {
             skipped += 1;
@@ -658,8 +775,8 @@ pub async fn import(
             created_ids.push((
                 ours.id,
                 post.post_type.clone(),
-                post.slug.clone(),
-                post.parent.clone(),
+                file_identity.clone(),
+                parent_identity(post),
             ));
             continue;
         }
@@ -702,7 +819,7 @@ pub async fn import(
             body: post.body.clone(),
             status: "draft".to_owned(),
             author_id,
-            parent_id: None,
+            parent_id: parent_now,
             menu_order: post.menu_order,
             // Resolved against the media restored above, falling back to a
             // row already on this site with that slug — importing into a
@@ -743,7 +860,7 @@ pub async fn import(
         // Not the file's status verbatim: an elapsed schedule becomes a
         // publication. See `import_status`.
         let wanted_status = import_status(&post.status, post.published_at).to_owned();
-        let source_slug = post.slug.clone();
+        let source_slug = file_identity.clone();
         // The insert, the marker, the terms and the status are one transaction.
         //
         // The insert used to sit outside it, because the `Repos` allocator
@@ -760,6 +877,21 @@ pub async fn import(
             .with_conn(async |conn| {
                 use diesel_async::AsyncConnection as _;
                 conn.transaction(async move |conn| {
+                    // The parent resolved above is only *used* if it is one the
+                    // editor would accept — a live row of the same type, no
+                    // cycle, within `MAX_PAGE_DEPTH`. Pre-setting it without
+                    // asking let an import file a page under a trashed parent,
+                    // whose canonical URL then resolves nowhere; declining here
+                    // leaves the row at the top level and hands it to the
+                    // ancestry pass, which declines too and reports the count.
+                    let mut draft = draft;
+                    if let Some(parent_id) = draft.parent_id
+                        && content::validate_parent(conn, None, &draft.post_type, parent_id)
+                            .await
+                            .is_err()
+                    {
+                        draft.parent_id = None;
+                    }
                     let created = content::insert_post_with_unique_slug(conn, draft).await?;
                     content::record_import_source(conn, created.id, &source_slug).await?;
                     content::set_post_terms(conn, created.id, term_ids).await?;
@@ -790,22 +922,22 @@ pub async fn import(
         created_ids.push((
             created_id,
             post.post_type.clone(),
-            post.slug.clone(),
-            post.parent.clone(),
+            file_identity.clone(),
+            parent_identity(post),
         ));
         restored += 1;
     }
 
     // Re-link ancestry in a second pass: a child can appear in the file before
     // its parent, so the parent's row may not exist during the first. Resolve
-    // through the file's own slugs rather than by re-querying, because a row
-    // may have been given a different slug on the way in.
-    let by_file_slug: std::collections::HashMap<(&str, &str), i64> = created_ids
+    // through the file's own identities rather than by re-querying, because a
+    // row may have been given a different slug on the way in.
+    let by_file_identity: std::collections::HashMap<(&str, &str), i64> = created_ids
         .iter()
-        .map(|(id, post_type, file_slug, _)| ((post_type.as_str(), file_slug.as_str()), *id))
+        .map(|(id, post_type, identity, _)| ((post_type.as_str(), identity.as_str()), *id))
         .collect();
-    for (child_id, post_type, _, parent_slug) in &created_ids {
-        let Some(parent_slug) = parent_slug else {
+    for (child_id, post_type, _, parent_identity) in &created_ids {
+        let Some(parent_identity) = parent_identity else {
             continue;
         };
         // Prefer a row created by this run; fall back to one already on the
@@ -813,17 +945,23 @@ pub async fn import(
         // shape, and there the parent is *skipped* as already-present — so it
         // is absent from the map, and consulting only the map would drop the
         // child to the top level and change its canonical path.
-        let parent_id = match by_file_slug.get(&(post_type.as_str(), parent_slug.as_str())) {
+        let parent_id = match by_file_identity.get(&(post_type.as_str(), parent_identity.as_str()))
+        {
             Some(id) => Some(*id),
-            None => repos
-                .posts
-                .find_by_slug(parent_slug.clone())
+            None => find_local(&repos, post_type, parent_identity)
                 .await?
-                .into_iter()
-                .find(|candidate| candidate.post_type == *post_type)
                 .map(|parent| parent.id),
         };
+        // Already correct when the creation pass could resolve the parent; the
+        // second pass exists for the ones it could not.
+        let already_linked = repos
+            .posts
+            .find_by_id(*child_id)
+            .await?
+            .and_then(|child| child.parent_id)
+            == parent_id;
         if let Some(parent_id) = parent_id
+            && !already_linked
             && parent_id != *child_id
             && !repos
                 .with_conn(async |conn| content::set_post_parent(conn, *child_id, parent_id).await)

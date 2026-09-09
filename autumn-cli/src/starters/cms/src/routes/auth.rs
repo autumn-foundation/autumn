@@ -264,7 +264,12 @@ pub async fn register(
         .await?;
         return Ok(page.into_response());
     }
-    if !email.contains('@') || email.len() > 254 {
+    // A cheap pre-check so the form can redisplay with its own message;
+    // `normalize_new_user` applies the model's declared validator, which is
+    // what actually decides. Approximating it here *instead* accepted `user@`.
+    if !autumn_web::reexports::validator::ValidateEmail::validate_email(&email)
+        || email.len() > crate::hooks::MAX_EMAIL_BYTES
+    {
         let page = auth_page(
             &repos,
             &session,

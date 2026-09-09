@@ -64,6 +64,9 @@ pub const MAX_COMMENT_NAME_BYTES: usize = 80;
 /// the form's `maxlength`.
 pub const MAX_COMMENT_EMAIL_BYTES: usize = 254;
 
+/// The longest account email accepted — the same RFC 5321 bound.
+pub const MAX_EMAIL_BYTES: usize = 254;
+
 /// The largest commenter website accepted.
 ///
 /// There is no input for it on the form at all, which is exactly why it needs a
@@ -435,6 +438,21 @@ impl MutationHooks for CommentHooks {
 pub fn normalize_new_user(new: &mut NewUser) -> AutumnResult<()> {
     new.username = new.username.trim().to_lowercase();
     new.email = new.email.trim().to_lowercase();
+    // The model declares `#[validate(email)]`, and `register_user` inserts
+    // through direct Diesel — so the derived validator never runs and this is
+    // the only place the rule is applied. The registration form approximated it
+    // with `contains('@')`, which accepts `user@`; this is the same crate the
+    // derive uses, so the two answers cannot diverge.
+    if !autumn_web::reexports::validator::ValidateEmail::validate_email(&new.email) {
+        return Err(AutumnError::unprocessable_msg(
+            "That email address is not valid",
+        ));
+    }
+    if new.email.len() > MAX_EMAIL_BYTES {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "Email must be at most {MAX_EMAIL_BYTES} characters"
+        )));
+    }
     if new.username.is_empty() {
         return Err(AutumnError::unprocessable_msg("Username is required"));
     }

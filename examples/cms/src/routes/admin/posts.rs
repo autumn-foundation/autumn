@@ -1041,135 +1041,97 @@ pub async fn create(
             .await?;
     }
 
-    // Slug allocation and the retry it needs live on `Repos` so the importer
-    // uses exactly the same path — `idx_posts_bare_path_slug` makes the
-    // invariant the database's, so every insert path has to allocate through
-    // one place.
-    let created = repos
-        .save_post_with_unique_slug(NewPost {
-            post_type: registered.slug.to_owned(),
-            title: form.title.trim().to_owned(),
-            slug: form.slug.trim().to_owned(),
-            excerpt: form.excerpt.trim().to_owned(),
-            body: form.body.clone(),
-            status: if status == "future" || status == "private" {
-                // Both are only reachable by transition, so create as a draft
-                // and move it immediately below — the state machine stays the
-                // single authority on which statuses are reachable how.
-                "draft".to_owned()
-            } else {
-                status.clone()
-            },
-            author_id: user.id,
-            parent_id: optional_id(form.parent_id.as_ref()),
-            featured_media_id: optional_id(form.featured_media_id.as_ref()),
-            menu_order: optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
-            comment_status: form
-                .comment_status
-                .as_deref()
-                .map_or("closed", |_| "open")
-                .to_owned(),
-            password: form.password.trim().to_owned(),
-            sticky: form.sticky.is_some(),
-            published_at: scheduled_for,
-        })
-        .await?;
+    // Resolved before the row exists, so the insert and the filings can share
+    // one transaction. A post being created carries nothing forward, so this
+    // needs only the type and the form.
+    let term_ids = resolve_term_ids(&repos, registered.slug, None, &form).await?;
 
-    // Everything after the insert, with the row removed if any of it fails.
+    let draft = NewPost {
+        post_type: registered.slug.to_owned(),
+        title: form.title.trim().to_owned(),
+        slug: form.slug.trim().to_owned(),
+        excerpt: form.excerpt.trim().to_owned(),
+        body: form.body.clone(),
+        status: if status == "future" || status == "private" {
+            // Both are only reachable by transition, so create as a draft
+            // and move it immediately below — the state machine stays the
+            // single authority on which statuses are reachable how.
+            "draft".to_owned()
+        } else {
+            status.clone()
+        },
+        author_id: user.id,
+        parent_id: optional_id(form.parent_id.as_ref()),
+        featured_media_id: optional_id(form.featured_media_id.as_ref()),
+        menu_order: optional_id(form.menu_order.as_ref()).unwrap_or(0) as i32,
+        comment_status: form
+            .comment_status
+            .as_deref()
+            .map_or("closed", |_| "open")
+            .to_owned(),
+        password: form.password.trim().to_owned(),
+        sticky: form.sticky.is_some(),
+        published_at: scheduled_for,
+    };
+
+    // The insert and every write that completes it are one transaction.
     //
-    // The insert has to be its own transaction: it goes through
-    // `save_post_with_unique_slug`, whose retry-on-collision needs a fresh
-    // connection each attempt. So the row is already committed when the
-    // revision, the term resolution and the deferred transition run — and a
-    // failure in any of them returned an error while leaving a draft behind,
-    // which a retry then duplicated under a suffixed slug. Unwinding is the
-    // honest outcome: the caller asked for a post and did not get one.
-    let follow_up = async {
-        // Re-checked *after* the insert, under the hierarchy lock. The
-        // pre-flight check above runs on a released connection, so another
-        // editor can deepen the chosen parent in between and leave this child
-        // past `MAX_PAGE_DEPTH` — `page_ancestry` then truncates its path and
-        // the page is unreachable at the URL it advertises.
-        //
-        // Checked afterwards rather than held across the insert because the
-        // insert cannot join that transaction: it goes through the pool-backed
-        // repository so `PostHooks` runs, and the allocator retries on its own
-        // connection. So the window is closed by unwinding instead — the
-        // failure path below removes the row, which is why this belongs here
-        // rather than before the insert.
-        if let Some(parent_id) = optional_id(form.parent_id.as_ref()) {
-            repos
-                .with_conn(async |conn| {
-                    use diesel_async::AsyncConnection as _;
-                    conn.transaction(async move |conn| {
-                        content::lock_page_hierarchy(conn).await?;
-                        content::validate_parent(
-                            conn,
-                            Some(created.id),
-                            registered.slug,
-                            parent_id,
-                        )
+    // They were not: the insert went through the pool-backed allocator, so the
+    // row committed and then the revision, the filings and any deferred
+    // transition ran as later statements with an unwind behind them. An unwind
+    // covers a failed statement; it does not cover a cancelled request or a
+    // process that stops existing, and either left an immediately-public post
+    // with no taxonomy or revision history, or a requested private/scheduled
+    // post stuck as a draft, with no marker a retry could resume from.
+    // `content::insert_post_with_unique_slug` allocates on this connection with
+    // a savepoint per attempt, which is what makes one transaction possible —
+    // the same change the importer took two rounds ago.
+    let (created, transitioned) = repos
+        .with_conn(async |conn| {
+            use diesel_async::AsyncConnection as _;
+            conn.transaction(async move |conn| {
+                // Under the hierarchy lock, taken before the insert now that
+                // the insert is in here: the pre-flight check above runs on a
+                // released connection, so another editor can deepen the chosen
+                // parent in between and leave this child past
+                // `MAX_PAGE_DEPTH`, whose path `page_ancestry` then truncates.
+                if optional_id(form.parent_id.as_ref()).is_some() {
+                    content::lock_page_hierarchy(conn).await?;
+                }
+                let created = content::insert_post_with_unique_slug(conn, draft).await?;
+                if let Some(parent_id) = created.parent_id {
+                    content::validate_parent(conn, Some(created.id), registered.slug, parent_id)
                         .await?;
-                        // The path is only settled now: the slug the allocator
-                        // chose plus the parent this insert carried. A refusal
-                        // takes the unwind below, like every other check here.
-                        content::guard_page_path(conn, created.id).await
-                    })
-                    .await
-                })
-                .await?;
-        }
+                }
 
-        if registered.supports_revisions {
-            repos
-                .with_conn(async |conn| content::record_initial_revision(conn, &created).await)
-                .await?;
-        }
+                if registered.supports_revisions {
+                    content::record_initial_revision(conn, &created).await?;
+                }
 
-        // Unconditionally, even for an empty set: `set_post_terms` *replaces*
-        // the filings, so skipping it when the selection is empty means "remove
-        // every category" quietly does nothing and the post stays in archives
-        // it was taken out of. (A guard here was a regression I introduced when
-        // this split out of `apply_terms`.)
-        let term_ids = resolve_term_ids(&repos, &created, &form).await?;
-        repos
-            .with_conn(async |conn| content::set_post_terms(conn, created.id, term_ids).await)
-            .await?;
-        if status == "future" || status == "private" {
-            repos
-                .with_conn(async |conn| {
-                    content::transition_status(
+                // Unconditionally, even for an empty set: `set_post_terms`
+                // *replaces* the filings, so skipping it when the selection is
+                // empty means "remove every category" quietly does nothing and
+                // the post stays in archives it was taken out of. (A guard here
+                // was a regression I introduced when this split out of
+                // `apply_terms`.)
+                content::set_post_terms(conn, created.id, term_ids).await?;
+
+                if status == "future" || status == "private" {
+                    let moved = content::transition_status(
                         conn,
                         created.id,
                         &status,
                         Some(user.id),
                         Some(&user),
                     )
-                    .await
-                })
-                .await?;
-            return Ok::<_, AutumnError>(true);
-        }
-        Ok::<_, AutumnError>(false)
-    }
-    .await;
-
-    let transitioned = match follow_up {
-        Ok(transitioned) => transitioned,
-        Err(error) => {
-            // Best effort, and never in place of the real error: a failed
-            // cleanup is logged so the row can be found, while the caller hears
-            // why their save failed.
-            if let Err(cleanup) = repos.posts.delete_by_id(created.id).await {
-                autumn_web::reexports::tracing::warn!(
-                    %cleanup,
-                    post_id = created.id,
-                    "failed to remove a post whose creation could not be completed"
-                );
-            }
-            return Err(error);
-        }
-    };
+                    .await?;
+                    return Ok::<_, AutumnError>((moved, true));
+                }
+                Ok::<_, AutumnError>((created, false))
+            })
+            .await
+        })
+        .await?;
 
     // Actions fire only once the post is actually complete.
     if transitioned {
@@ -1311,7 +1273,7 @@ pub async fn update(
     // The tag find-or-create stays outside: it is repository work on its own
     // connection, and a tag that survives a failed save is harmless — an
     // orphaned tag is visible and removable, unlike a half-applied post.
-    let term_ids = resolve_term_ids(&repos, &existing, &form).await?;
+    let term_ids = resolve_term_ids(&repos, &post_type, Some(existing.id), &form).await?;
     let updated = repos
         .with_conn(async |conn| {
             use diesel_async::AsyncConnection as _;
@@ -1427,8 +1389,18 @@ fn requested_status(form: &PostForm, user: &User) -> String {
 /// taxonomy is attachable through the same code that handles categories and
 /// tags. Special-casing `category` and `post_tag` is what left a custom
 /// taxonomy creatable through the term screens and unattachable from anywhere.
-async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResult<Vec<i64>> {
-    let taxonomies = content_types::taxonomies_for(&post.post_type);
+/// Takes the type and an *optional* id rather than a `Post`, so the creation
+/// path can resolve the selection before the row exists — which is what lets
+/// the insert and the filings share one transaction. A post being created has
+/// no filings to carry forward, so `None` is the honest input rather than a
+/// stand-in row.
+async fn resolve_term_ids(
+    repos: &Repos,
+    post_type: &str,
+    post_id: Option<i64>,
+    form: &PostForm,
+) -> AutumnResult<Vec<i64>> {
+    let taxonomies = content_types::taxonomies_for(post_type);
     if taxonomies.is_empty() {
         return Ok(Vec::new());
     }
@@ -1443,9 +1415,11 @@ async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> Autumn
     // what an import or a direct write can leave behind.
     let rendered: std::collections::HashSet<&str> =
         taxonomies.iter().map(|taxonomy| taxonomy.slug).collect();
-    for term in repos.post_terms(post.id).await? {
-        if !rendered.contains(term.taxonomy.as_str()) {
-            term_ids.push(term.id);
+    if let Some(post_id) = post_id {
+        for term in repos.post_terms(post_id).await? {
+            if !rendered.contains(term.taxonomy.as_str()) {
+                term_ids.push(term.id);
+            }
         }
     }
 

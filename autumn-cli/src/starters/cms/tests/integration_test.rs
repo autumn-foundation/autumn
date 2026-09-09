@@ -3780,7 +3780,7 @@ async fn an_export_round_trip_keeps_featured_media() {
         .assert_ok()
         .text();
     let payload: serde_json::Value = serde_json::from_str(&exported).expect("valid export JSON");
-    assert_eq!(payload["version"], serde_json::json!(3));
+    assert_eq!(payload["version"], serde_json::json!(4));
     assert_eq!(
         payload["attachments"][0]["slug"],
         serde_json::json!("cover-image")
@@ -5192,12 +5192,19 @@ async fn an_import_does_not_reparent_a_local_post_that_shares_a_slug() {
     })
     .to_string();
 
+    // Both pages in the file are restored. The file's `install` sits under
+    // `manuals` and the local one under `guides`: different paths, so they are
+    // different pages, and skipping the second would drop a page out of the
+    // backup. (This assertion read "1 imported" while a nested page's slug was
+    // globally unique — the file's page was silently discarded then, which is
+    // the defect the identity change fixes.)
     import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok()
-        .assert_body_contains("1 imported");
+        .assert_body_contains("2 imported");
 
-    // The local page is where it was, with its own content and URL.
+    // The local page is where it was, with its own content and URL — which is
+    // what this test is actually about.
     sign_out(&client);
     client
         .get("/guides/install")
@@ -5205,11 +5212,15 @@ async fn an_import_does_not_reparent_a_local_post_that_shares_a_slug() {
         .await
         .assert_ok()
         .assert_body_contains("Local content.");
-    assert_eq!(
-        client.get("/manuals/install").send().await.status,
-        404,
-        "the import must not have moved the local page under its own parent"
-    );
+
+    // And the imported one is at its own path, carrying the file's content
+    // rather than having displaced anything.
+    client
+        .get("/manuals/install")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Imported child.");
 }
 
 /// The one-click status control cannot schedule without a date.
@@ -8847,4 +8858,260 @@ async fn pages_under_different_parents_may_share_a_slug() {
         "careers-2",
         "a top-level page and a post both mint /careers"
     );
+}
+
+/// A backup carrying two pages with the same final segment restores both.
+///
+/// Scoping nested page slugs to their parent made `/about/team` and
+/// `/company/team` both legitimate — and left the export/import identity, which
+/// was `(post_type, slug)`, unable to tell them apart. The second was skipped
+/// as already present, into an empty database, so the CMS silently lost a page
+/// out of its own backup.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_backup_with_duplicate_page_slugs_restores_every_page() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let page = async |title: &str, slug: &str, parent: Option<&str>| -> String {
+        let body = format!("Body of {slug}.");
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            ("body", body.as_str()),
+            ("status", "publish"),
+            ("password", ""),
+        ];
+        if let Some(parent) = parent {
+            fields.push(("parent_id", parent));
+        }
+        let created = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(created.status, 303, "creating {title}: {}", created.text());
+        created
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+
+    let about = page("About", "about", None).await;
+    let company = page("Company", "company", None).await;
+    page("Team", "team", Some(&about)).await;
+    page("Team", "team", Some(&company)).await;
+
+    let exported = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let payload: serde_json::Value = serde_json::from_str(&exported).expect("valid export JSON");
+    let paths: Vec<&str> = payload["posts"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|post| post["path"].as_str())
+        .collect();
+    assert!(
+        paths.contains(&"about/team") && paths.contains(&"company/team"),
+        "the export has to say which page each one is: {paths:?}"
+    );
+
+    // Restore into an empty site. Both pages must come back, at their own
+    // paths.
+    let fresh = db_client().await;
+    let cookie = register(&fresh, "owner").await;
+    import_export(&fresh, &cookie, exported.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 imported");
+
+    sign_out(&fresh);
+    fresh
+        .get("/about/team")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body of team.");
+    fresh
+        .get("/company/team")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body of team.");
+
+    // And re-importing the same file changes nothing — the identity has to
+    // stay idempotent, not merely become unique.
+    import_export(&fresh, &cookie, exported.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("4 already present");
+}
+
+/// A malformed email is refused at registration.
+///
+/// `register_user` inserts through direct Diesel, so the model's
+/// `#[validate(email)]` never runs — and the form approximated it with
+/// `contains('@')`, which accepts `user@`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_malformed_email_cannot_register() {
+    let client = db_client().await;
+
+    for address in ["user@", "@example.com", "no-at-sign", "a@b@c.com"] {
+        let refused = client
+            .post("/register")
+            .form(&form(&[
+                ("username", "someone"),
+                ("email", address),
+                ("password", "correct horse battery staple"),
+            ]))
+            .send()
+            .await;
+        assert_ne!(
+            refused.status,
+            303,
+            "`{address}` is not a valid address: {}",
+            refused.text()
+        );
+    }
+
+    let accounts: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::users::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(accounts, 0, "no malformed address may have been stored");
+
+    // A real one still registers.
+    client
+        .post("/register")
+        .form(&form(&[
+            ("username", "someone"),
+            ("email", "someone@example.com"),
+            ("password", "correct horse battery staple"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// A creation that fails part-way leaves no post behind.
+///
+/// The insert used to commit on its own, with the revision, the filings and any
+/// deferred transition following as separate transactions behind an unwind. An
+/// unwind covers a failed statement; it does not cover a cancelled request or a
+/// process that stops existing, either of which left an immediately-public post
+/// with no taxonomy or revision history, or a requested private post stuck as a
+/// draft, with no marker a retry could resume from.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_interrupted_creation_leaves_no_post() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Fail the run after the row is written but before the work that completes
+    // it, which is the window the transaction closes. A trigger on `revisions`
+    // stands in for the process death that would do it in practice.
+    let db = TestDb::shared().await;
+    try_execute(
+        db,
+        "CREATE OR REPLACE FUNCTION refuse_revision() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.summary = 'Created' THEN RAISE EXCEPTION 'boom'; END IF;
+             RETURN NEW;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .await
+    .expect("create the trigger function");
+    try_execute(db, "DROP TRIGGER IF EXISTS refuse_revision ON revisions")
+        .await
+        .expect("clear any previous trigger");
+    try_execute(
+        db,
+        "CREATE TRIGGER refuse_revision BEFORE INSERT ON revisions
+         FOR EACH ROW EXECUTE FUNCTION refuse_revision()",
+    )
+    .await
+    .expect("install the trigger");
+
+    let failed = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Half Made"),
+            ("slug", "half-made"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_ne!(failed.status, 303, "the creation must not report success");
+
+    let rows: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("half-made"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(
+        rows, 0,
+        "the insert has to roll back with the work that completes it"
+    );
+
+    try_execute(db, "DROP TRIGGER refuse_revision ON revisions")
+        .await
+        .expect("remove the trigger");
+
+    // And the same submission succeeds once the failure is gone, with its
+    // revision in place.
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Half Made"),
+            ("slug", "half-made"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "body: {}", created.text());
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+    client
+        .get(&format!("/admin/content/post/{id}/revisions"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Created");
 }
