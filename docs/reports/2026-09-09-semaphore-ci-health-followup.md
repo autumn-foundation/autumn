@@ -9,7 +9,13 @@ confirms the rerun harness fixed roughly a day ago has still never been run.
 ## 🎯 Verdict path
 
 `trunk-dev`'s tip (`c456bcd`) is green; the last completed push-triggered
-`ci.yml` run succeeded. No branch-protection or merge-queue regressions found.
+`ci.yml` run succeeded. No new escape (a merge landing against a stale base,
+in the shape #2527 found for #2488) was observed in this pass's sample —
+but that is a narrower claim than "resolved": this pass only sampled Actions
+run outcomes, not the branch-protection configuration itself, so whether
+"require branches up to date before merging" (or an equivalent) is actually
+enabled remains unverified, exactly as the 2026-09-05 and 2026-09-08 reports
+left it. Do not read this pass as having cleared that item.
 
 `manual-macos-contention-check.yml` — fixed and `actionlint`-clean since #2627
 (merged 2026-09-08T15:07:44Z) — still has **zero `workflow_dispatch` runs**
@@ -121,9 +127,11 @@ points, not a campaign. What ships instead:
   about a day (the *workflow file* has existed, mostly broken, for four days
   since 2026-09-05 — but the working version has only been available since
   #2627 merged) while the organic sample keeps accumulating one data point
-  at a time (now 4 hits across the tracked corpus: 3 macOS + 1 Linux, plus a
-  second `cache_stampede` repeat) — the exact scenario the harness exists to
-  short-circuit. Given the new Linux hit, the campaign should not stay
+  at a time — now 4 cumulative `live_upgrade` hits (3 macOS connection-error
+  + 1 Linux line-567) plus 2 `cache_stampede` hits and 1 `sim_fault_plan`
+  hit, 7 organic hits total across the tracked corpus (see the Measurement
+  table below for the full per-signature breakdown) — the exact scenario
+  the harness exists to short-circuit. Given the new Linux hit, the campaign should not stay
   macOS-only forever even though the two signatures aren't yet shown to
   share a mechanism: a companion rerun of the `Coverage (workspace)` job
   shape (or several samples of the plain `cargo test --workspace` under
