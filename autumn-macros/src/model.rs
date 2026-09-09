@@ -2148,9 +2148,13 @@ fn emit_counter_caches_impl(
     // (`#[repository(tenant_scoped)]` filters on it, and every read scope
     // keys off it): a derivation maintaining it would move the parent to
     // another tenant, and on a sharded deployment leave it on the wrong shard.
+    // And so is `deleted_at`, the soft-delete marker: a maintained value
+    // would hide the parent from every `deleted_at IS NULL` read (on SQLite an
+    // integer aggregate simply lands in it; on Postgres the type mismatch
+    // fails the write).
     let implicit_claims: Vec<TokenStream> = all_fields
         .iter()
-        .filter(|f| has_attr(f, "lock_version") || is_tenant_id_field(f))
+        .filter(|f| has_attr(f, "lock_version") || is_tenant_id_field(f) || is_deleted_at_field(f))
         .filter_map(|field| Some((field, field.ident.as_ref()?)))
         .map(|(field, ident)| {
             // The claim names the *database* column: a field Diesel renames
@@ -2462,6 +2466,19 @@ fn emit_counter_caches_impl(
                     "`#[derivation]` cannot maintain `{parent_table}.tenant_id`: that is the \
                      parent's tenant discriminator, and a maintained value would move the \
                      parent to another tenant. Name a dedicated aggregate column"
+                ),
+            ));
+        }
+        // `deleted_at` is the soft-delete marker wherever it appears: any
+        // non-NULL value hides the row from every soft-deleting read.
+        if column == "deleted_at" {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`#[derivation]` cannot maintain `{parent_table}.deleted_at`: that is the \
+                     parent's soft-delete marker, and any maintained value (a zero \
+                     included) would hide the parent from every `deleted_at IS NULL` \
+                     read. Name a dedicated aggregate column"
                 ),
             ));
         }
@@ -5043,6 +5060,11 @@ fn unraw_ident(ident: &syn::Ident) -> String {
 /// keys tenant scoping off a field named `tenant_id`, wherever it appears.
 fn is_tenant_id_field(field: &syn::Field) -> bool {
     field.ident.as_ref().is_some_and(|i| i == "tenant_id")
+}
+
+/// Whether a field is the framework's soft-delete marker, `deleted_at`.
+fn is_deleted_at_field(field: &syn::Field) -> bool {
+    field.ident.as_ref().is_some_and(|i| i == "deleted_at")
 }
 
 /// Whether a field carries `#[diesel(column_name = ...)]`, which renames the
@@ -11204,6 +11226,45 @@ mod tests {
         assert!(
             !without.contains("CounterCacheClaim"),
             "a model with neither token nor tenant claims nothing: {without}"
+        );
+    }
+
+    #[test]
+    fn model_deleted_at_field_claims_its_column_and_is_not_a_derivation_target() {
+        // The soft-delete marker is a maintained column in the registry's
+        // sense: a value written into it hides the parent from every
+        // soft-deleting read.
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Doc {
+                    #[id]
+                    pub id: i64,
+                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("CounterCacheClaim")
+                && generated.contains("column : \"deleted_at\""),
+            "a `deleted_at` field must claim its column: {generated}"
+        );
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "deleted_at", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.deleted_at`"),
+            "the soft-delete marker is not a maintainable column: {generated}"
         );
     }
 

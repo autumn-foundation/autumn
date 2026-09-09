@@ -189,7 +189,7 @@ corruption: two derivations sharing a name, two maintaining one parent column,
 or a derivation maintaining a column that something else already maintains: a
 plain `counter_cache` on another model, a `#[votable]` model's aggregate
 column, a `#[repository(..., position(...))]` ordering column, a model's
-`#[lock_version]` token or `tenant_id` discriminator, or a
+`#[lock_version]` token, `tenant_id` discriminator or `deleted_at` marker, or a
 `#[commentable(counter_cache = ...)]` parent's
 count (each registers the column it claims for exactly this check). Column and
 table names are compared as the database compares quoted identifiers: exactly on
@@ -361,10 +361,11 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   discriminator move only under the repository's own hooked paths, so reading
   one is fine. Maintain a multi-level aggregate one level at a time, from the
   leaves up, each as its own derivation over source data.
-- **The parent primary key and tenant discriminator are not maintainable
-  columns**: `column = "id"` and `column = "tenant_id"` are compile errors, and
-  a model's `tenant_id` field also claims its column in the registry, so a
-  derivation reaching it by another spelling stops the boot.
+- **The parent primary key, tenant discriminator and soft-delete marker are
+  not maintainable columns**: `column = "id"`, `column = "tenant_id"` and
+  `column = "deleted_at"` are compile errors, and a model's `tenant_id` and
+  `deleted_at` fields also claim their columns in the registry, so a
+  derivation reaching one by another spelling stops the boot.
 - **A self-referential derivation cannot read the column it maintains.** Onto
   its own table, `sum(<the maintained column>)` or a filter naming it is a
   compile error: the parent-side update runs no repository hook, so a row's
