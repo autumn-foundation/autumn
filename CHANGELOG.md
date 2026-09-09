@@ -707,6 +707,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🛣️ Onramp: corrected the "Local development" guidance in
+  `docs/guide/getting-started.md` about what `autumn doctor`'s
+  `version_compat` check can actually catch (docs overclaim → accurate):**
+  the guide said a source-built CLI "may scaffold projects pinning an
+  `autumn-web` version that is not on crates.io yet" and that
+  `version_compat` "reports the two versions side by side; if they
+  disagree" — implying a green check rules out version skew. In reality
+  `autumn new` always pins the CLI's own frozen-until-release
+  `CARGO_PKG_VERSION` (CLAUDE.md: never bump the workspace version outside a
+  release), which is normally already published; it is the *code* behind
+  that version number that has moved on between releases. `version_compat`
+  compares version strings, so it prints `✅ version_compat — autumn-cli
+  0.7.0 matches autumn-web 0.7.0` regardless — confirmed live on
+  `quickstart-gate.yml`'s `local-dev-quickstart` job (red since #2459
+  landed, still red as of this fix, always on this exact version-strings-
+  match-but-code-diverged path). The guide now says so plainly: don't trust
+  a green `version_compat` to rule out version skew, watch for a `cargo
+  build` failure referencing `autumn_web::` right after `autumn new`
+  instead, and apply the `[patch.crates-io]` workaround proactively when
+  building from a checkout that's ahead of the last release tag. No code
+  changes — `version_compat` still cannot see this drift (a version bump is
+  the only real fix, out of scope here), so nothing to re-measure on the
+  quickstart-gate harness; this closes the gap between what the docs
+  promised and what the check actually does.
 - **macros:** the `#[model]` association preloader named `diesel::pg::Pg`
   directly, so a `--belongs-to … --counter-cache` scaffold did not compile on a
   SQLite app. It now names `autumn_web::RuntimeBackend`, the alias that already

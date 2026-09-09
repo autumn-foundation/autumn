@@ -97,12 +97,24 @@ just built:
 cargo install --path autumn-cli
 ```
 
-Between releases the workspace can be ahead of the published crates, so a
-source-built CLI may scaffold projects pinning an `autumn-web` version that is
-not on crates.io yet. `autumn doctor`'s `version_compat` check reports the two
-versions side by side; if they disagree, either point the generated
-`Cargo.toml` at your checkout with a `[patch.crates-io]` override or install
-the published CLI instead.
+Between releases the workspace can be ahead of the published crates while the
+version number stays put — this project never bumps the version for feature
+work, only for a release. So `autumn new` pins whatever `autumn-web` version
+your source-built CLI was compiled with, and that number is normally already
+on crates.io; it is the *code* behind it that has moved on. That means
+`autumn doctor`'s `version_compat` check, which compares version strings, will
+print a reassuring `✅ version_compat — autumn-cli 0.7.0 matches autumn-web
+0.7.0` even when your checkout and the published crate have diverged — it has
+no way to see API drift that the version number doesn't carry.
+
+The real symptom is a `cargo build` failure right after `autumn new`, usually
+a plain type-mismatch error inside generated code that calls into
+`autumn_web::`. If you hit that, don't trust a green `version_compat` to rule
+out the version-skew explanation — either point the generated `Cargo.toml` at
+your checkout with a `[patch.crates-io]` override, or install the published
+CLI instead. If you're building from a checkout that's more than a few commits
+past the last release tag, applying the `[patch.crates-io]` override up front
+avoids the failure entirely.
 
 Either way you get the `autumn` binary. These are the commands you will touch in
 your first hour:
