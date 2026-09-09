@@ -234,6 +234,14 @@ pub struct ExportAttachment {
     pub alt_text: String,
     #[serde(default)]
     pub caption: String,
+    /// The uploader's **username**, for the reason a post's author is one.
+    ///
+    /// Media deletion lets an Author remove only files whose `uploader_id` is
+    /// theirs, so a restore that dropped this handed every file to whoever ran
+    /// the import — the original uploader losing control of their own uploads,
+    /// silently, in a workflow that is supposed to put the site back.
+    #[serde(default)]
+    pub uploader: Option<String>,
     /// The stored blob handle: provider id, key, content type, size, etag.
     /// Absent only for a row whose file was already missing.
     #[serde(default)]
@@ -503,6 +511,9 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
     let mut attachments = Vec::new();
     for attachment in &rows.attachments {
         attachments.push(ExportAttachment {
+            uploader: attachment
+                .uploader_id
+                .and_then(|id| rows.usernames.get(&id).cloned()),
             slug: attachment.slug.clone(),
             title: attachment.title.clone(),
             mime_type: attachment.mime_type.clone(),
@@ -840,7 +851,22 @@ pub async fn import(
                         height: attachment.height,
                         alt_text: attachment.alt_text.clone(),
                         caption: attachment.caption.clone(),
-                        uploader_id: Some(user.id),
+                        // The file's own uploader when this site has that
+                        // account, falling back to the importer only when it
+                        // does not. Attributing every restored file to whoever
+                        // ran the import takes each Author's uploads out of
+                        // their control — `delete_attachment` lets an Author
+                        // remove only files whose `uploader_id` is theirs.
+                        uploader_id: Some(match attachment.uploader.as_ref() {
+                            Some(username) => repos
+                                .users
+                                .find_by_username(username.clone())
+                                .await?
+                                .into_iter()
+                                .next()
+                                .map_or(user.id, |owner| owner.id),
+                            None => user.id,
+                        }),
                     })
                     .await?
                     .id

@@ -3249,15 +3249,39 @@ pub async fn export_snapshot(conn: &mut AsyncPgConnection) -> AutumnResult<Expor
 /// The reads themselves. Separate from [`export_snapshot`] so the transaction
 /// is one line and cannot accidentally gain a statement outside itself.
 async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
+    // Every taxonomy the *rows* mention, not only the registered ones. A plugin
+    // that is disabled when the backup is taken leaves its terms in the table
+    // and its registration absent, so a file built from the registry would omit
+    // them — and re-enabling the plugin after a restore could not recover the
+    // taxonomy it defined. A backup is of the database, not of the process.
+    //
+    // Registered first, in registry order, then the rest alphabetically, so the
+    // file's shape stays deterministic either way.
+    let mut taxonomies: Vec<String> = crate::content_types::all_taxonomies()
+        .iter()
+        .map(|taxonomy| taxonomy.slug.to_owned())
+        .collect();
+    let mut stored_taxonomies: Vec<String> = terms::table
+        .select(terms::taxonomy)
+        .distinct()
+        .order(terms::taxonomy.asc())
+        .load(conn)
+        .await?;
+    stored_taxonomies.retain(|slug| !taxonomies.contains(slug));
+    taxonomies.extend(stored_taxonomies);
+
     let mut terms_by_taxonomy = Vec::new();
-    for taxonomy in crate::content_types::all_taxonomies() {
+    for taxonomy in taxonomies {
         let rows: Vec<Term> = terms::table
-            .filter(terms::taxonomy.eq(taxonomy.slug))
+            .filter(terms::taxonomy.eq(&taxonomy))
             .order(terms::id.asc())
             .select(Term::as_select())
             .load(conn)
             .await?;
-        terms_by_taxonomy.push((taxonomy.slug.to_owned(), rows));
+        if rows.is_empty() {
+            continue;
+        }
+        terms_by_taxonomy.push((taxonomy, rows));
     }
 
     // Every post in one query, trash and unregistered types included, because
@@ -3276,12 +3300,29 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
     // insertion order. Trash is deliberately excluded: an export is a backup of
     // the site's content, and restoring somebody's deleted drafts into a fresh
     // install is a surprise, not a feature.
+    // Every type the rows mention, for the reason the taxonomies are: a disabled
+    // plugin's content is still the site's content, and a backup that omits it
+    // cannot be restored into a site that re-enables the plugin.
+    let mut post_types: Vec<String> = crate::content_types::all_post_types()
+        .iter()
+        .map(|post_type| post_type.slug.to_owned())
+        .collect();
+    let mut stored_types: Vec<String> = all_posts
+        .iter()
+        .filter(|post| post.status != "trash")
+        .map(|post| post.post_type.clone())
+        .collect();
+    stored_types.sort_unstable();
+    stored_types.dedup();
+    stored_types.retain(|slug| !post_types.contains(slug));
+    post_types.extend(stored_types);
+
     let mut posts = Vec::new();
-    for post_type in crate::content_types::all_post_types() {
+    for post_type in post_types {
         posts.extend(
             all_posts
                 .iter()
-                .filter(|post| post.post_type == post_type.slug && post.status != "trash")
+                .filter(|post| post.post_type == post_type && post.status != "trash")
                 .cloned(),
         );
     }
@@ -3355,15 +3396,31 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
         meta_by_post.entry(post_id).or_default().push((key, value));
     }
 
-    // Post authors *and* comment authors. Resolving only the former left every
-    // registered commenter exported as a guest, so a restore would strip their
-    // account from their own comments.
+    let attachments: Vec<crate::models::Attachment> = attachments::table
+        .order(attachments::id.asc())
+        .select(crate::models::Attachment::as_select())
+        .load(conn)
+        .await?;
+    let attachments_by_id = attachments
+        .iter()
+        .map(|attachment| (attachment.id, attachment.clone()))
+        .collect();
+
+    // Post authors, comment authors, revision editors *and* media uploaders.
+    // Resolving only the first left every registered commenter exported as a
+    // guest, and every uploader unnamed — so a restore handed each Author's
+    // files to whoever ran the import.
     let mut author_ids: Vec<i64> = posts.iter().map(|post| post.author_id).collect();
     author_ids.extend(comment_rows.iter().filter_map(|comment| comment.author_id));
     author_ids.extend(
         revision_rows
             .iter()
             .filter_map(|revision| revision.author_id),
+    );
+    author_ids.extend(
+        attachments
+            .iter()
+            .filter_map(|attachment| attachment.uploader_id),
     );
     author_ids.sort_unstable();
     author_ids.dedup();
@@ -3393,16 +3450,6 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
             terms_by_post.entry(post_id).or_default().push(term.clone());
         }
     }
-
-    let attachments: Vec<crate::models::Attachment> = attachments::table
-        .order(attachments::id.asc())
-        .select(crate::models::Attachment::as_select())
-        .load(conn)
-        .await?;
-    let attachments_by_id = attachments
-        .iter()
-        .map(|attachment| (attachment.id, attachment.clone()))
-        .collect();
 
     Ok(ExportRows {
         terms_by_taxonomy,

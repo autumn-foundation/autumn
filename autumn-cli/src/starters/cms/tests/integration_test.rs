@@ -542,6 +542,30 @@ fn sign_out(client: &TestClient) {
 }
 
 /// Register an account. The first one created owns the site.
+/// Sign an existing account in, returning its fresh session cookie.
+///
+/// `register` rotates the session, so a cookie captured before a second account
+/// registers is stale — the request lands signed out and the admin screens
+/// redirect to the login form. Tests that need two accounts and then act as the
+/// first one come back through here.
+async fn sign_in(client: &TestClient, username: &str) -> String {
+    let resp = client
+        .post("/login")
+        .form(&form(&[
+            ("username", username),
+            ("password", "correct-horse-battery-staple"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        resp.status,
+        303,
+        "sign-in should redirect; body was: {}",
+        resp.text()
+    );
+    session_cookie(&resp)
+}
+
 async fn register(client: &TestClient, username: &str) -> String {
     let email = format!("{username}@example.com");
     let resp = client
@@ -3689,6 +3713,194 @@ async fn a_stale_plain_permalink_is_a_404() {
 
     // The front page itself is untouched.
     client.get("/").send().await.assert_ok();
+}
+
+/// A post created through the API gets the same history as one created in the
+/// admin.
+///
+/// The admin's create transaction records an initial revision and the API's did
+/// not, so "restore this revision" meant something different depending on which
+/// supported write surface made the content — and the first edit would snapshot
+/// a body whose predecessor was nowhere.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_api_created_post_gets_an_initial_revision() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/api/v1/posts")
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "title": "Through the API",
+            "body": "Body.",
+            "status": "draft"
+        }))
+        .send()
+        .await;
+    assert!(
+        created.status.is_success(),
+        "create: {} {}",
+        created.status,
+        created.text()
+    );
+
+    let revisions: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::get_result({{crate_name}}::schema::revisions::table.count(), &mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(
+        revisions, 1,
+        "a post created through the API starts with the same history as one \
+         created in the admin"
+    );
+}
+
+/// A restore keeps each file with its uploader.
+///
+/// The export carried no uploader identity, so every restored attachment
+/// belonged to whoever ran the import — and `delete_attachment` lets an Author
+/// remove only files whose `uploader_id` is theirs, so each Author lost control
+/// of their own uploads in the workflow that is supposed to put the site back.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_restore_keeps_each_file_with_its_uploader() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Illustrated", "Body.", "publish").await;
+    let _second = register(&client, "photographer").await;
+
+    let uploader_id: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::users::table
+                .filter({{crate_name}}::schema::users::username.eq("photographer"))
+                .select({{crate_name}}::schema::users::id),
+            &mut conn,
+        )
+        .await
+        .expect("the account")
+    };
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO attachments (title, slug, mime_type, byte_size, alt_text, caption,
+                                      uploader_id)
+             VALUES ('Their Photo', 'their-photo', 'image/png', 1, '', '', {uploader_id})"
+        ),
+    )
+    .await
+    .expect("seed the upload");
+
+    // Back as the administrator: registering the second account rotated the
+    // session, so the cookie captured before it is signed out.
+    let cookie = sign_in(&client, "owner").await;
+    let payload = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        payload.contains("photographer"),
+        "the uploader travels:\n{payload}"
+    );
+
+    // Restore into a site where both accounts exist, the importer being the
+    // administrator.
+    let fresh = db_client().await;
+    let _admin = register(&fresh, "owner").await;
+    let _second = register(&fresh, "photographer").await;
+    let cookie = sign_in(&fresh, "owner").await;
+    import_export(&fresh, &cookie, &payload).await.assert_ok();
+
+    let (owner_of_file, photographer): (Option<i64>, i64) = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let owner_of_file = RunQueryDsl::first(
+            {{crate_name}}::schema::attachments::table
+                .filter({{crate_name}}::schema::attachments::slug.eq("their-photo"))
+                .select({{crate_name}}::schema::attachments::uploader_id),
+            &mut conn,
+        )
+        .await
+        .expect("the attachment");
+        let photographer = RunQueryDsl::first(
+            {{crate_name}}::schema::users::table
+                .filter({{crate_name}}::schema::users::username.eq("photographer"))
+                .select({{crate_name}}::schema::users::id),
+            &mut conn,
+        )
+        .await
+        .expect("the account");
+        (owner_of_file, photographer)
+    };
+    assert_eq!(
+        owner_of_file,
+        Some(photographer),
+        "the file comes back belonging to the account that uploaded it, not to \
+         whoever ran the import"
+    );
+}
+
+/// A backup carries content whose plugin is not registered right now.
+///
+/// A plugin that is disabled when the backup is taken leaves its posts and
+/// terms in the database and its registration absent, and a file built from the
+/// registry omitted both — so re-enabling the plugin after a restore could
+/// recover neither the content nor the taxonomy that described it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_backup_carries_content_of_an_unregistered_type() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Ordinary", "Body.", "publish").await;
+
+    // Rows of a type and a taxonomy nothing registers — the state a disabled
+    // plugin leaves. Slugs no other test registers; the registry is
+    // process-global.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO posts (post_type, title, slug, excerpt, body, status, author_id,
+                            comment_status, password, sticky, published_at)
+         VALUES ('dormant-plugin', 'Dormant', 'dormant', '', 'Still here.', 'publish', 1,
+                 'closed', '', false, NOW())",
+    )
+    .await
+    .expect("seed the post");
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         VALUES ('dormant-taxonomy', 'Dormant term', 'dormant-term', '', 0)",
+    )
+    .await
+    .expect("seed the term");
+
+    let payload = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        payload.contains("dormant-plugin") && payload.contains("Still here."),
+        "the disabled plugin's content is in the backup:\n{payload}"
+    );
+    assert!(
+        payload.contains("dormant-taxonomy") && payload.contains("dormant-term"),
+        "and so is the taxonomy that described it"
+    );
+    // The registered content is still there too.
+    assert!(payload.contains("Ordinary"));
 }
 
 /// A term whose taxonomy is no longer registered is not linked.

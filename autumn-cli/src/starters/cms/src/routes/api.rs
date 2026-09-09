@@ -302,6 +302,15 @@ pub async fn create_post(
             use autumn_web::reexports::diesel_async::AsyncConnection as _;
             conn.transaction(async move |conn| {
                 let created = crate::content::insert_post_with_unique_slug(conn, draft).await?;
+                // The same snapshot the admin's create path records, inside the
+                // same transaction. Without it a post created through the API
+                // started with no history at all, so "restore this revision"
+                // meant something different depending on which supported write
+                // surface made the content — and the first *edit* would then
+                // snapshot a body nobody could see the predecessor of.
+                if crate::content::type_supports_revisions(&created.post_type) {
+                    crate::content::record_initial_revision(conn, &created).await?;
+                }
                 match deferred_transition {
                     Some(target) => {
                         crate::content::transition_status(
