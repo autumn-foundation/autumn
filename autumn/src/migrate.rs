@@ -778,6 +778,97 @@ where
     Ok(versions)
 }
 
+/// A version an app migration shares with a framework migration of another
+/// name: see [`app_framework_version_collisions`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameworkVersionCollision {
+    /// The shared version, what `__diesel_schema_migrations` keys on.
+    pub version: String,
+    /// The app migration's full name (its directory).
+    pub app_migration: String,
+    /// The framework migration's full name.
+    pub framework_migration: String,
+}
+
+impl FrameworkVersionCollision {
+    /// What an operator does about it: give the app migration a fresh
+    /// version, and move its tracking record along if it is already applied.
+    #[must_use]
+    pub fn remedy(&self) -> String {
+        format!(
+            "app migration `{app}` and framework migration `{framework}` share version \
+             `{version}`, and `__diesel_schema_migrations` tracks by version alone, so \
+             whichever ran first would mask the other. Rename `{app}` to a fresh version \
+             (its directory prefix); if it is already applied to this database, move its \
+             record too: UPDATE __diesel_schema_migrations SET version = '<new version>' \
+             WHERE version = '{version}';",
+            app = self.app_migration,
+            framework = self.framework_migration,
+            version = self.version,
+        )
+    }
+}
+
+/// The versions the app's `migrations_dir` shares with a framework migration
+/// of another name, over every framework set (the control set and the three
+/// shard-required sets).
+///
+/// `autumn migrate` on a Postgres target applies the app set through the
+/// `diesel` CLI, which tracks a migration under its directory's version only,
+/// so unlike the `SQLite` path it cannot carry a colliding app migration
+/// under a substitute version; a collision there means whichever side runs
+/// first masks the other for good. The CLI therefore asks here before it
+/// applies or rolls back anything, and stops with [`FrameworkVersionCollision::remedy`]
+/// when the answer is not empty. A framework migration that the control set
+/// carries under the very same name as its standalone set is the intended
+/// duplicate and is not a collision. An absent `migrations_dir` has nothing
+/// to collide.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if the directory or an embedded set
+/// cannot be enumerated.
+pub fn app_framework_version_collisions(
+    migrations_dir: &Path,
+) -> Result<Vec<FrameworkVersionCollision>, MigrationError> {
+    if !migrations_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let app = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
+        MigrationError::Migration(format!(
+            "failed to read migrations directory {}: {e}",
+            migrations_dir.display()
+        ))
+    })?;
+    let app_pairs = migration_versions_and_names::<Pg, _>(&app)?;
+    let mut framework_pairs: Vec<(String, String)> = Vec::new();
+    for set in [
+        &FRAMEWORK_MIGRATIONS,
+        &crate::version_history::VERSION_HISTORY_MIGRATIONS,
+        &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+        &crate::derivation::DERIVATION_MIGRATIONS,
+    ] {
+        framework_pairs.extend(migration_versions_and_names::<Pg, _>(set)?);
+    }
+    let mut collisions: Vec<FrameworkVersionCollision> = Vec::new();
+    for (version, app_name) in &app_pairs {
+        for (framework_version, framework_name) in &framework_pairs {
+            if framework_version != version || framework_name == app_name {
+                continue;
+            }
+            let collision = FrameworkVersionCollision {
+                version: version.clone(),
+                app_migration: app_name.clone(),
+                framework_migration: framework_name.clone(),
+            };
+            if !collisions.contains(&collision) {
+                collisions.push(collision);
+            }
+        }
+    }
+    Ok(collisions)
+}
+
 /// Enumerate `(version, full_name)` for every migration in an embedded set —
 /// `version` is what `__diesel_schema_migrations` actually keys on (e.g.
 /// `"20260101000000"`); `full_name` also carries the description (e.g.
@@ -3309,6 +3400,78 @@ mod tests {
                 "`{required}` must reach the control target through `autumn migrate`: {names:?}"
             );
         }
+    }
+
+    /// A scratch `migrations/` directory, unique per call.
+    fn scratch_migrations_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "autumn-collision-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch migrations dir");
+        dir
+    }
+
+    /// An app migration on the derivation migration's version is reported
+    /// against it by name, with the remedy naming both and the version.
+    #[test]
+    fn an_app_migration_sharing_a_framework_version_is_reported() {
+        let dir = scratch_migrations_dir("collide");
+        let colliding = dir.join("20260907101530_zzz_app");
+        std::fs::create_dir_all(&colliding).expect("migration dir");
+        std::fs::write(colliding.join("up.sql"), "SELECT 1;\n").expect("up.sql");
+        std::fs::write(colliding.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        let collisions = app_framework_version_collisions(&dir).expect("enumerate");
+        assert_eq!(
+            collisions,
+            vec![FrameworkVersionCollision {
+                version: "20260907101530".to_owned(),
+                app_migration: "20260907101530_zzz_app".to_owned(),
+                framework_migration: "20260907101530_create_derivations".to_owned(),
+            }]
+        );
+        let remedy = collisions[0].remedy();
+        assert!(remedy.contains("20260907101530_zzz_app"), "{remedy}");
+        assert!(
+            remedy.contains("20260907101530_create_derivations"),
+            "{remedy}"
+        );
+        assert!(
+            remedy.contains("WHERE version = '20260907101530'"),
+            "{remedy}"
+        );
+    }
+
+    /// An app set with its own versions, an empty directory and an absent
+    /// directory collide with nothing; the control set's copy of a shard
+    /// migration, carried under the same name, is not a collision either.
+    #[test]
+    fn only_a_differently_named_migration_on_a_framework_version_collides() {
+        let dir = scratch_migrations_dir("clean");
+        let own = dir.join("20260101000000_create_widgets");
+        std::fs::create_dir_all(&own).expect("migration dir");
+        std::fs::write(own.join("up.sql"), "SELECT 1;\n").expect("up.sql");
+        std::fs::write(own.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        assert!(
+            app_framework_version_collisions(&dir)
+                .expect("own")
+                .is_empty()
+        );
+        let empty = scratch_migrations_dir("empty");
+        assert!(
+            app_framework_version_collisions(&empty)
+                .expect("empty")
+                .is_empty()
+        );
+        let absent = empty.join("nowhere");
+        assert!(
+            app_framework_version_collisions(&absent)
+                .expect("absent")
+                .is_empty()
+        );
     }
 
     /// A fresh `sqlite://` file plus an empty `migrations/` directory beside

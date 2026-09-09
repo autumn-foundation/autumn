@@ -614,6 +614,16 @@ fn run_single_target(
         }
     }
 
+    // A version an app migration shares with a framework migration lets
+    // whichever side runs first mask the other, and the `diesel` CLI below
+    // tracks a migration under its directory's version only, so unlike the
+    // SQLite path this one cannot carry the app migration under a substitute.
+    // Stop before anything runs, with the rename to make.
+    if let Some(message) = framework_version_collision_error(std::path::Path::new(migrations_dir)) {
+        eprintln!("\u{274C} Migration version collision: {message}");
+        return false;
+    }
+
     // Acquire this target database's Postgres advisory lock before reading
     // the pending-migration list. This serializes concurrent callers
     // (rolling-deploy replicas or parallel `autumn migrate run`
@@ -2013,6 +2023,14 @@ fn run_down_target(
     if is_sqlite_target(database_url) {
         revert_user_migrations_sqlite_cli(database_url, dir, plan, on_reverted)
     } else {
+        // Rollback plans by version too and excludes framework versions from
+        // the plan, so a colliding app migration would be skipped as
+        // framework-owned: the same refusal as the apply path.
+        if let Some(message) = framework_version_collision_error(dir) {
+            return Err(MigrationError::Migration(format!(
+                "migration version collision: {message}"
+            )));
+        }
         autumn_web::migrate::revert_user_migrations_locked(
             database_url,
             dir,
@@ -2020,6 +2038,28 @@ fn run_down_target(
             plan,
             on_reverted,
         )
+    }
+}
+
+/// The refusal for an app `migrations_dir` that shares a version with a
+/// framework migration on a Postgres target (see
+/// [`autumn_web::migrate::app_framework_version_collisions`]), one remedy per
+/// collision, or `None` when there is nothing to refuse. A directory that
+/// cannot be enumerated is refused too, since the check could not run.
+fn framework_version_collision_error(migrations_dir: &Path) -> Option<String> {
+    match autumn_web::migrate::app_framework_version_collisions(migrations_dir) {
+        Ok(collisions) if collisions.is_empty() => None,
+        Ok(collisions) => Some(
+            collisions
+                .iter()
+                .map(autumn_web::migrate::FrameworkVersionCollision::remedy)
+                .collect::<Vec<_>>()
+                .join("\n  "),
+        ),
+        Err(e) => Some(format!(
+            "could not check {} for version collisions: {e}",
+            migrations_dir.display()
+        )),
     }
 }
 
@@ -2871,6 +2911,41 @@ mod tests {
             name: format!("{version}_m"),
             dir: Some(std::path::PathBuf::from(format!("migrations/{version}_m"))),
         }
+    }
+
+    /// The Postgres apply and rollback paths refuse an app migration that
+    /// shares a version with a framework migration, naming both and the
+    /// rename; an app set with its own versions is not refused.
+    #[test]
+    fn framework_version_collision_error_names_both_sides_and_the_remedy() {
+        let dir = std::env::temp_dir().join(format!(
+            "autumn-cli-collision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let colliding = dir.join("20260907101530_zzz_app");
+        std::fs::create_dir_all(&colliding).expect("migration dir");
+        std::fs::write(colliding.join("up.sql"), "SELECT 1;\n").expect("up.sql");
+        std::fs::write(colliding.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        let message = framework_version_collision_error(&dir).expect("a collision is refused");
+        assert!(message.contains("20260907101530_zzz_app"), "{message}");
+        assert!(
+            message.contains("20260907101530_create_derivations"),
+            "{message}"
+        );
+        assert!(
+            message.contains("UPDATE __diesel_schema_migrations"),
+            "{message}"
+        );
+
+        let own = dir.join("20260101000000_create_widgets");
+        std::fs::remove_dir_all(&colliding).expect("drop the colliding migration");
+        std::fs::create_dir_all(&own).expect("migration dir");
+        std::fs::write(own.join("up.sql"), "SELECT 1;\n").expect("up.sql");
+        std::fs::write(own.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        assert!(framework_version_collision_error(&dir).is_none());
     }
 
     #[test]
