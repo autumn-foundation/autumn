@@ -243,11 +243,12 @@ pub fn validate_signing_secret(
 /// their own `sign`/`sign_upload` in `storage/local.rs`. `benches/csrf_verify.rs`
 /// (a `GET` that mints a token plus two `POST`s that verify it, through the
 /// real `CsrfLayer`) attributes `hmac_sha256_hex` 16.86% of the profile's
-/// instructions under `valgrind --tool=callgrind` (136,026,523 of
-/// 806,998,060 Ir, base-subtracted per the bench's own 0-vs-2000-iteration
-/// convention) — most of it the real HMAC-SHA256 compression
-/// (`sha2::sha256::compress256`, 10.42% of the whole profile), which is
-/// inherent crypto work, not a target.
+/// instructions under `valgrind --tool=callgrind --iterations 2000`
+/// (136,026,523 of that run's raw, un-base-subtracted 806,998,060 Ir total —
+/// `callgrind_annotate --inclusive=yes`'s own "% of PROGRAM TOTALS") — most
+/// of it the real HMAC-SHA256 compression (`sha2::sha256::compress256`,
+/// 10.42% of the same raw total), which is inherent crypto work, not a
+/// target.
 ///
 /// **Negative result (checked, not shipped):** the per-byte hex fold below
 /// routes every one of the 32 output bytes through `core::fmt::write` ->
@@ -256,19 +257,24 @@ pub fn validate_signing_secret(
 /// (7.43%) is *not* this fold's isolated cost — `write!`/`format!` run all
 /// over the request pipeline (tracing spans, header formatting, ...), so
 /// that figure also counts calls with nothing to do with this function.
-/// Swapping the fold for `hex::encode` (already used for identical
+/// Diffing `hmac_sha256_hex`'s own inclusive Ir directly against itself,
+/// with the fold swapped for `hex::encode` (already used for identical
 /// byte-to-hex encoding elsewhere in this crate: `ledger.rs`, `migrate.rs`,
-/// `sigv4.rs`, ...) and diffing `hmac_sha256_hex`'s own inclusive Ir
-/// before vs. after isolates it instead: 136,026,523 -> 99,533,081
-/// (-36,493,442 Ir, 4.52% of the whole profile — the fold's actual
-/// addressable share). Measured on the same bench/machine: instructions
-/// 806,998,060 -> 769,584,433 total (base-subtracted per-request
-/// 132,954.8 -> 126,764.3 Ir, -4.66%), DHAT allocation blocks and bytes
-/// unchanged (both approaches make exactly one `String` allocation).
-/// -4.66% clears neither the 5%-of-instructions nor the 10%-of-allocations
-/// impact floor — it is the ceiling of what this narrow, safe substitution
-/// can remove, since the untouchable SHA-256 compression dominates the
-/// rest of this function's cost — so no fix is shipped.
+/// `sigv4.rs`, ...), isolates it instead: 136,026,523 -> 99,533,081
+/// (-36,493,442 Ir, 4.52% of the same raw total) — the measured saving from
+/// *this* substitution specifically, not a proof that no encoding could do
+/// better (`hex::encode` still allocates, fills, and converts both nibbles
+/// of every byte; it isn't free either).
+///
+/// Measured end to end, base-subtracted (an `--iterations 0` run isolates
+/// process-startup/warm-up cost, subtracted from `--iterations 2000`'s
+/// total before dividing by its 6,000 marginal requests, per this bench's
+/// own convention): instructions/request 132,954.8 -> 126,764.3 (-4.66%);
+/// DHAT allocation blocks and bytes unchanged (both implementations make
+/// exactly one `String` allocation). -4.66% clears neither the
+/// 5%-of-instructions nor the 10%-of-allocations impact floor for *this*
+/// substitution — it doesn't rule out some other encoding approach clearing
+/// it, only that this one doesn't — so no fix is shipped.
 ///
 /// # Panics
 ///
