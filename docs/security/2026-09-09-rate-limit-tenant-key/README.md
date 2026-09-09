@@ -144,6 +144,33 @@ bug.
 - `cargo fmt --all` — clean, no diff.
 - `cargo clippy -p autumn-web --features test-support --all-targets -- -D
   warnings` — clean.
+- `cargo clippy --workspace --all-targets -- -D warnings` (reduced
+  `CARGO_BUILD_JOBS=2` to stay under this sandbox's memory ceiling) — clean,
+  0 errors.
+- `cargo clippy -p autumn-web --features
+  "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme"
+  --lib -- -D warnings` and `--features "plugin-sandbox,test-support" --lib`
+  (the two gated-feature lanes `scripts/pre-push-check.sh` mirrors from
+  `ci.yml`) — both clean.
+- `cargo check --workspace --all-targets` — 0 errors; every workspace
+  member (all 16 example apps, both plugins, `autumn-cli`,
+  `autumn-schema-core`, `autumn-edge`, `autumn-search`,
+  `autumn-storage-s3`, `autumn-cache-redis`) type-checks against the
+  change. Substituted for `scripts/pre-push-check.sh`'s `cargo test
+  --workspace --no-run` step, which ran this sandbox's fixed per-session
+  disk allowance to 0 bytes free while linking `reddit-clone`'s test
+  binaries (`rustc-LLVM ERROR: IO failure on output stream: No space left
+  on device`) — a sandbox resource limit hit while linking an unrelated
+  example's test binaries, not a compile error in this change; `cargo
+  check` gives the same cross-package type-correctness signal without the
+  disk-heavy link step. The change touches no public signature (the new
+  `tenant_qualify_bucket_key` helper is a private `fn`, and
+  `__check_throttle`'s signature is unchanged), so the blast radius `cargo
+  test --workspace --no-run` would additionally catch is already covered
+  by `cargo check --workspace` plus the full `autumn-web` test/clippy runs
+  above.
+- `cargo test --workspace --doc` — 0 failed across every workspace crate
+  including `autumn_web`.
 - Re-attack: confirmed a same-tenant repeat still shares its own bucket
   (the fix partitions by tenant; it does not disable per-principal
   throttling), and that two *different* tenants with *different* principal
