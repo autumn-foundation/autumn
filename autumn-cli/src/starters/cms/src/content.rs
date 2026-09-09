@@ -2727,28 +2727,67 @@ pub async fn set_post_parent(
     // could commit a cycle — and both pages then resolve nowhere, because page
     // resolution walks down from a root. Owning them here is what stops the
     // next caller forgetting, which is how this gap appeared.
-    conn.transaction(async move |conn| {
-        lock_page_hierarchy(conn).await?;
-        if validate_parent(conn, Some(post_id), &post.post_type, parent_id)
-            .await
-            .is_err()
-        {
-            return Ok(false);
-        }
-        diesel::update(posts::table.find(post_id))
-            .set(posts::parent_id.eq(parent_id))
-            .execute(conn)
-            .await?;
-        // Re-parenting is the other way a page's path changes. Declining
-        // rather than raising, like the checks above it: the importer treats an
-        // unusable link as "leave this page at the top level" and reports the
-        // count.
-        if guard_page_path(conn, post_id).await.is_err() {
-            return Ok(false);
-        }
-        Ok::<_, AutumnError>(true)
-    })
-    .await
+    // A refusal has to leave the transaction, not return from inside it. The
+    // path guard runs *after* the `UPDATE` — it cannot run before, because the
+    // path is only settled once the parent is stored — so returning `Ok(false)`
+    // there committed the re-parent and then reported that the page had been
+    // left where it was. On a restore that is a page moved onto a claimed path,
+    // shadowed by the probe, while the report says it stayed at the top level.
+    let outcome = conn
+        .transaction(async move |conn| {
+            lock_page_hierarchy(conn).await?;
+            if validate_parent(conn, Some(post_id), &post.post_type, parent_id)
+                .await
+                .is_err()
+            {
+                return Err(ParentRefused::Declined);
+            }
+            diesel::update(posts::table.find(post_id))
+                .set(posts::parent_id.eq(parent_id))
+                .execute(conn)
+                .await?;
+            // Re-parenting is the other way a page's path changes — and the
+            // descendants' paths with it, which is what `guard_page_path`
+            // walks.
+            if guard_page_path(conn, post_id).await.is_err() {
+                return Err(ParentRefused::Declined);
+            }
+            Ok::<_, ParentRefused>(true)
+        })
+        .await;
+
+    // Declining is not an error to the caller: the importer treats an unusable
+    // link as "leave this page at the top level" and reports the count. It is
+    // an error to the *transaction*, which is the point.
+    match outcome {
+        Ok(applied) => Ok(applied),
+        Err(ParentRefused::Declined) => Ok(false),
+        Err(ParentRefused::Failed(error)) => Err(error),
+    }
+}
+
+/// Why a re-parent did not happen.
+///
+/// A refusal travels as an error so the transaction rolls back, and is
+/// translated to `Ok(false)` outside it — see [`set_post_parent`].
+enum ParentRefused {
+    /// The link is not one the editor would accept, or it would put the page or
+    /// one of its descendants on a claimed path.
+    Declined,
+    /// Something actually went wrong.
+    Failed(AutumnError),
+}
+
+impl From<diesel::result::Error> for ParentRefused {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Failed(AutumnError::from(error))
+    }
+}
+
+impl From<AutumnError> for ParentRefused {
+    fn from(error: AutumnError) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// Delete a comment and rebuild the post's approved-comment counter — in one
