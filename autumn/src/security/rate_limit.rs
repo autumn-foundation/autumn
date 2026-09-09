@@ -2485,9 +2485,10 @@ mod tests {
         // what an id of "tenant[1]=abc" on a tenant-absent request would
         // also render. The `t`/`n` tag makes the two families disjoint
         // regardless of what either string contains.
-        let tenant_present = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a".to_owned()), || {
-            tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:bc")
-        });
+        let tenant_present = crate::tenancy::CURRENT_TENANT
+            .sync_scope(Some("a".to_owned()), || {
+                tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:bc")
+            });
         let tenant_absent =
             tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:t1:abc");
         assert_ne!(
