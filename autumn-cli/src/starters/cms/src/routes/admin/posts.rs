@@ -1313,8 +1313,26 @@ pub async fn update(
                         post.parent_id = parent;
                         post.featured_media_id = media;
                         post.menu_order = order;
-                        if let Some(when) = scheduled_for {
-                            post.published_at = Some(when);
+                        match scheduled_for {
+                            Some(when) => post.published_at = Some(when),
+                            // Blanking the date field on something that has
+                            // never actually been live clears the timestamp.
+                            // Leaving it made "unschedule this" keep the old
+                            // due time, so publishing the draft later dated and
+                            // ordered it at a moment that never happened — and
+                            // with a future date, gave it a dated permalink and
+                            // archive in the future. `validate_post_update`
+                            // stamps `now` when a post with no date goes live,
+                            // which is what the editor meant.
+                            //
+                            // Only for a row that is not live: for a published
+                            // or private post `published_at` is a publication
+                            // record, and an edit must never reorder the blog
+                            // index.
+                            None if !matches!(post.status.as_str(), "publish" | "private") => {
+                                post.published_at = None;
+                            }
+                            None => {}
                         }
                     },
                 )

@@ -593,6 +593,31 @@ fn settings_form(overrides: &[(&str, &str)]) -> String {
     form(&fields)
 }
 
+/// Upload an export file to the importer.
+///
+/// The endpoint takes a multipart file rather than a URL-encoded field: form
+/// encoding turned every quote and brace into a three-byte escape, so a backup
+/// roughly a third of the request limit already exceeded it and the CMS could
+/// not restore its own export.
+async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> TestResponse {
+    const BOUNDARY: &str = "----cmsimport";
+    let body = format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"payload\"; \
+         filename=\"export.json\"\r\nContent-Type: application/json\r\n\r\n\
+         {payload}\r\n--{BOUNDARY}--\r\n"
+    );
+    client
+        .post("/admin/tools/import")
+        .header("cookie", cookie)
+        .header(
+            "content-type",
+            &format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(body)
+        .send()
+        .await
+}
+
 /// Create a post through the admin editor and return its id.
 async fn create_post(
     client: &TestClient,
@@ -1311,12 +1336,7 @@ async fn importing_a_slug_an_existing_post_holds_does_not_abort_the_run() {
     // An existing post already holds `about`.
     create_post(&client, &cookie, "About", "Existing post.", "publish").await;
 
-    let result = client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
-        .await;
+    let result = import_export(&client, &cookie, payload.as_str()).await;
     result.assert_ok().assert_body_contains("2 imported");
 
     sign_out(&client);
@@ -1830,12 +1850,7 @@ async fn export_and_import_round_trip_the_site_content() {
 
     // Re-importing into the same site is a no-op: content is matched on
     // (post_type, slug), so a re-run duplicates nothing.
-    let reimport = client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
-        .await;
+    let reimport = import_export(&client, &cookie, payload.as_str()).await;
     reimport.assert_ok().assert_body_contains("already present");
 
     let posts: serde_json::Value = client.get("/api/v1/posts").send().await.assert_ok().json();
@@ -2364,12 +2379,7 @@ async fn importing_under_a_trashed_parent_keeps_the_child_reachable() {
     })
     .to_string();
 
-    let result = client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
-        .await;
+    let result = import_export(&client, &cookie, payload.as_str()).await;
     result
         .assert_ok()
         .assert_body_contains("1 imported")
@@ -2620,21 +2630,13 @@ async fn re_importing_a_reslugged_page_is_still_idempotent() {
     })
     .to_string();
 
-    client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
+    import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok()
         .assert_body_contains("1 imported");
 
     // The same file again: nothing new.
-    client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
+    import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok()
         .assert_body_contains("0 imported");
@@ -3748,11 +3750,7 @@ async fn an_export_round_trip_keeps_featured_media() {
     // Importing it into a site that has neither restores both and re-attaches.
     let fresh = db_client().await;
     let cookie = register(&fresh, "owner").await;
-    fresh
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", exported.as_str())]))
-        .send()
+    import_export(&fresh, &cookie, exported.as_str())
         .await
         .assert_ok()
         .assert_body_contains("1 imported");
@@ -4153,11 +4151,7 @@ async fn an_export_round_trip_keeps_the_sticky_flag() {
 
     let fresh = db_client().await;
     let cookie = register(&fresh, "owner").await;
-    fresh
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", exported.as_str())]))
-        .send()
+    import_export(&fresh, &cookie, exported.as_str())
         .await
         .assert_ok()
         .assert_body_contains("1 imported");
@@ -5120,11 +5114,7 @@ async fn an_import_does_not_reparent_a_local_post_that_shares_a_slug() {
     })
     .to_string();
 
-    client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
+    import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok()
         .assert_body_contains("1 imported");
@@ -5333,11 +5323,7 @@ async fn an_import_does_not_reparent_a_local_term() {
     })
     .to_string();
 
-    client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
+    import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok();
 
@@ -5442,12 +5428,7 @@ async fn an_import_cannot_introduce_an_inline_html_attachment() {
     })
     .to_string();
 
-    let refused = client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
-        .await;
+    let refused = import_export(&client, &cookie, payload.as_str()).await;
     assert_eq!(
         refused.status,
         422,
@@ -6115,12 +6096,7 @@ async fn a_failed_import_leaves_no_half_created_taxonomy() {
     })
     .to_string();
 
-    let failed = client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
-        .await;
+    let failed = import_export(&client, &cookie, payload.as_str()).await;
     assert_ne!(failed.status, 303, "the import must not report success");
 
     let categories = client
@@ -6153,11 +6129,7 @@ async fn a_failed_import_leaves_no_half_created_taxonomy() {
         ]
     })
     .to_string();
-    client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
+    import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok();
     client
@@ -6614,11 +6586,7 @@ async fn a_completed_import_is_left_alone_on_a_re_import() {
     })
     .to_string();
 
-    client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
+    import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok()
         .assert_body_contains("1 imported");
@@ -6645,11 +6613,7 @@ async fn a_completed_import_is_left_alone_on_a_re_import() {
 
     // The same backup again. It must report the post as already present and
     // change nothing.
-    client
-        .post("/admin/tools/import")
-        .header("cookie", &cookie)
-        .form(&form(&[("payload", payload.as_str())]))
-        .send()
+    import_export(&client, &cookie, payload.as_str())
         .await
         .assert_ok()
         .assert_body_contains("already present");
@@ -7383,4 +7347,317 @@ async fn the_appearance_category_selector_is_bounded() {
         "the selector must not render every category"
     );
     assert!(screen.contains("First 200 by name"));
+}
+
+/// Clearing the publish date on an unscheduled post clears the timestamp.
+///
+/// Leaving the old due time behind made "move this back to draft" keep a date
+/// the post was never published at: publishing it later dated and ordered it at
+/// that obsolete moment, and with a future date gave it a dated permalink and
+/// an archive slot in the future.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn unscheduling_a_post_clears_its_publish_date() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let when = (chrono::Utc::now() + chrono::Duration::days(30))
+        .naive_utc()
+        .format("%Y-%m-%dT09:00")
+        .to_string();
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Later"),
+            ("slug", "later"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", when.as_str()),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303, "body: {}", created.text());
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    // Back to draft with the date field cleared — the editor unscheduling it.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Later"),
+            ("slug", "later"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "draft"),
+            ("password", ""),
+            ("publish_at", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let stored: Option<chrono::NaiveDateTime> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select({{crate_name}}::schema::posts::published_at)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+    assert!(
+        stored.is_none(),
+        "an unscheduled post must not keep the due time it never reached: {stored:?}"
+    );
+
+    // Publishing it now dates it now, not at the abandoned schedule.
+    client
+        .post(&format!("/admin/content/post/{id}/status?to=publish"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+    let stored: chrono::NaiveDateTime = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select({{crate_name}}::schema::posts::published_at)
+            .first::<Option<chrono::NaiveDateTime>>(&mut conn)
+            .await
+            .expect("the post")
+            .expect("a published post is dated")
+    };
+    assert!(
+        stored <= chrono::Utc::now().naive_utc(),
+        "a post published now must not be dated in the future: {stored}"
+    );
+
+    // A post that really was published keeps its date across an edit.
+    let live = create_post(&client, &cookie, "Live", "Body.", "publish").await;
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET published_at = '2020-01-01 00:00:00' WHERE id = {live}"),
+    )
+    .await
+    .expect("backdate");
+    client
+        .post(&format!("/admin/content/post/{live}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Live"),
+            ("slug", "live"),
+            ("excerpt", ""),
+            ("body", "Edited."),
+            ("status", "publish"),
+            ("password", ""),
+            ("publish_at", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let kept: Option<chrono::NaiveDateTime> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .find(live)
+            .select({{crate_name}}::schema::posts::published_at)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+    assert!(
+        kept.is_some_and(|when| when.format("%Y").to_string() == "2020"),
+        "editing a published post must never reorder the blog index: {kept:?}"
+    );
+}
+
+/// A backup restores after its schedules have elapsed.
+///
+/// `transition_status` refuses `future` with a past date — correctly, since
+/// such a schedule either never fires or fires on the next sweep. But a backup
+/// restored after downtime routinely carries exactly that, and the importer
+/// unwound the post and aborted, so a valid backup could not be restored
+/// without hand-editing its JSON.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_import_publishes_a_schedule_that_has_already_passed() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "attachments": [],
+        "posts": [
+            {
+                "post_type": "post", "title": "Was Scheduled", "slug": "was-scheduled",
+                "excerpt": "", "body": "Imported body.", "status": "future",
+                "password": "", "comment_status": "open",
+                "author": "owner", "terms": [], "comments": [],
+                "published_at": "2020-01-01T00:00:00", "parent": null,
+                "sticky": false, "menu_order": 0
+            }
+        ]
+    })
+    .to_string();
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    // Published rather than stuck `future`, which the sweep would never claim
+    // for a date already in the past.
+    let status: String = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("was-scheduled"))
+            .select({{crate_name}}::schema::posts::status)
+            .first(&mut conn)
+            .await
+            .expect("the imported post")
+    };
+    assert_eq!(status, "publish");
+
+    sign_out(&client);
+    let listed: serde_json::Value = client.get("/api/v1/posts").send().await.assert_ok().json();
+    assert!(
+        listed
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|p| p["slug"] == "was-scheduled"),
+        "the restored post has to be readable, not stranded"
+    );
+
+    // A schedule still in the future is restored as a schedule.
+    let future = (chrono::Utc::now() + chrono::Duration::days(30))
+        .naive_utc()
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "attachments": [],
+        "posts": [
+            {
+                "post_type": "post", "title": "Still Scheduled", "slug": "still-scheduled",
+                "excerpt": "", "body": "Imported body.", "status": "future",
+                "password": "", "comment_status": "open",
+                "author": "owner", "terms": [], "comments": [],
+                "published_at": future, "parent": null,
+                "sticky": false, "menu_order": 0
+            }
+        ]
+    })
+    .to_string();
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+    let status: String = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("still-scheduled"))
+            .select({{crate_name}}::schema::posts::status)
+            .first(&mut conn)
+            .await
+            .expect("the imported post")
+    };
+    assert_eq!(
+        status, "future",
+        "a schedule that has not elapsed must stay a schedule"
+    );
+}
+
+/// The importer accepts an export the exporter can actually produce.
+///
+/// The old form posted the JSON as a URL-encoded field, where every quote and
+/// brace becomes a three-byte escape — so a backup roughly a third of the
+/// request limit already exceeded it, and the CMS could not restore its own
+/// export under the shipped configuration.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_importer_accepts_an_export_too_large_to_url_encode() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A body big enough that URL-encoding the JSON would have pushed the
+    // request past the 32 MiB limit, while the raw bytes stay inside the
+    // importer's own cap. Built from characters form encoding has to escape
+    // and JSON does not, so the encoded length is close to three times the
+    // raw one — which is exactly the inflation that made a real backup
+    // unrestorable.
+    let body = "{}&%<>,;".repeat(1_500_000);
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "attachments": [],
+        "posts": [
+            {
+                "post_type": "post", "title": "Bulky", "slug": "bulky",
+                "excerpt": "", "body": body, "status": "publish",
+                "password": "", "comment_status": "open",
+                "author": "owner", "terms": [], "comments": [],
+                "published_at": null, "parent": null, "sticky": false, "menu_order": 0
+            }
+        ]
+    })
+    .to_string();
+    assert!(
+        payload.len() < 24 * 1024 * 1024,
+        "the fixture has to fit the importer's own cap: {}",
+        payload.len()
+    );
+    // The premise, asserted rather than assumed: this payload could not have
+    // reached the old handler at all. `form()` percent-encodes every byte that
+    // is not unreserved, so the JSON's quotes, braces and spaces each become
+    // three bytes — and the encoded body exceeds the framework's 32 MiB request
+    // limit, which the extractor applies before any handler runs.
+    assert!(
+        form(&[("payload", payload.as_str())]).len() > 32 * 1024 * 1024,
+        "if this does not exceed the limit, the test is not testing the fix"
+    );
+
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+
+    let stored: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .filter({{crate_name}}::schema::posts::slug.eq("bulky"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the imported post")
+    };
+    assert_eq!(stored, 1);
 }

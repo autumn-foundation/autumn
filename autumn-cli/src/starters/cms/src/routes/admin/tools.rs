@@ -217,15 +217,20 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
             section class="bg-white rounded-lg shadow p-5" {
                 h2 class="font-semibold mb-2" { "Import" }
                 p class="text-sm text-gray-600 mb-4" {
-                    "Paste an export file. Content is matched on (type, slug): an existing item \
+                    "Upload an export file. Content is matched on (type, slug): an existing item \
                      is left alone rather than duplicated, so re-running an import is safe."
                 }
-                form action="/admin/tools/import" method="post" class="space-y-3" {
+                form action="/admin/tools/import" method="post"
+                     enctype="multipart/form-data" class="space-y-3" {
                     (csrf.input())
-                    label for="payload" class="sr-only" { "Export JSON" }
-                    textarea #payload name="payload" rows="8" required
-                             placeholder="{\"version\": 3, …}"
-                             class="w-full border rounded px-3 py-2 font-mono text-xs" {}
+                    label for="payload" class="sr-only" { "Export file" }
+                    input #payload type="file" name="payload" required accept="application/json"
+                          class="w-full border rounded px-3 py-2 text-sm";
+                    p class="text-xs text-gray-400" {
+                        "Up to " (MAX_IMPORT_BYTES / (1024 * 1024)) " MB. A larger backup needs \
+                         `security.upload.max_request_size_bytes` raised in autumn.toml, and \
+                         this constant with it."
+                    }
                     button type="submit"
                            class="px-4 py-2 border rounded bg-white hover:bg-gray-50" {
                         "Import"
@@ -376,21 +381,70 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
         .into_response())
 }
 
-#[derive(Deserialize)]
-pub struct ImportForm {
-    pub payload: String,
+/// The status an imported post should land in.
+///
+/// A backup restored after downtime routinely carries `future` posts whose time
+/// has already passed. `transition_status` refuses that edge — correctly, since
+/// a schedule in the past either never fires or fires on the next sweep — so
+/// the import aborted the post and unwound it, and an otherwise valid backup
+/// could not be restored without hand-editing its JSON. The scheduler would
+/// have published these within a minute of their due time, so publishing them
+/// now is what the file actually asked for.
+fn import_status(status: &str, published_at: Option<chrono::NaiveDateTime>) -> &str {
+    if status == "future" && published_at.is_none_or(|when| when <= chrono::Utc::now().naive_utc())
+    {
+        return "publish";
+    }
+    status
 }
+
+/// The largest export the importer accepts.
+///
+/// Has to stay below `security.upload.max_request_size_bytes` (32 MiB by
+/// default), because that limit is applied by the extractor before this handler
+/// runs — a body over it is a bare 413 the starter cannot turn into a sentence.
+/// Some headroom for multipart framing, hence 24 rather than 32.
+const MAX_IMPORT_BYTES: usize = 24 * 1024 * 1024;
 
 #[post("/admin/tools/import")]
 pub async fn import(
     repos: Repos,
     session: Session,
     csrf: Csrf,
-    Form(form): Form<ImportForm>,
+    mut form: autumn_web::extract::Multipart,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ImportContent);
 
-    let payload: Export = serde_json::from_str(&form.payload)
+    // A file upload rather than a textarea, which is what the export already
+    // hands the operator. The old form posted the JSON as a URL-encoded field:
+    // every quote and brace became a three-byte escape, so a backup roughly a
+    // third of the request limit already exceeded it — and the CMS could not
+    // restore its own export under the shipped configuration. Multipart carries
+    // the bytes as they are.
+    let mut raw: Option<Vec<u8>> = None;
+    while let Some(field) = form.next_field().await? {
+        if field.name() == Some("payload") {
+            if raw.is_some() {
+                return Err(AutumnError::unprocessable_msg("Upload one file at a time"));
+            }
+            // Bounded read: the part is attacker-controlled length, and the cap
+            // is what turns "too big" into a sentence rather than a truncated
+            // parse.
+            raw = Some(
+                field
+                    .with_max_bytes(MAX_IMPORT_BYTES)
+                    .bytes_limited()
+                    .await?,
+            );
+        }
+    }
+    let Some(raw) = raw else {
+        return Err(AutumnError::unprocessable_msg(
+            "Choose an export file to import",
+        ));
+    };
+
+    let payload: Export = serde_json::from_slice(&raw)
         .map_err(|err| AutumnError::unprocessable_msg(format!("Not a valid export file: {err}")))?;
     if !READABLE_EXPORT_VERSIONS.contains(&payload.version) {
         return Err(AutumnError::unprocessable_msg(format!(
@@ -550,7 +604,9 @@ pub async fn import(
             // a failure in between leaves exactly this state, and a retry that
             // only skipped would never repair it.
             let term_ids = resolve_import_terms(&repos, post).await?;
-            let wanted_status = post.status.clone();
+            // Same mapping the creation path uses: a retry of a backup whose
+            // schedules have since elapsed must not be refused either.
+            let wanted_status = import_status(&post.status, post.published_at).to_owned();
             let ours_id = ours.id;
             let current_status = ours.status.clone();
             let transitioned = repos
@@ -662,7 +718,9 @@ pub async fn import(
         // connection. A failure after it leaves a draft with no source marker,
         // which the next run treats as an ordinary slug collision and re-imports
         // beside — visible, rather than silently skipped.
-        let wanted_status = post.status.clone();
+        // Not the file's status verbatim: an elapsed schedule becomes a
+        // publication. See `import_status`.
+        let wanted_status = import_status(&post.status, post.published_at).to_owned();
         let source_slug = post.slug.clone();
         let transitioned = repos
             .with_conn(async |conn| {
