@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The rate-limit bucket key for `key_strategy = "authenticated_principal"`
+  (and `#[throttle(key = "principal")]`) now folds in the ambient resolved
+  tenant (🛡 Warden):** the key was built as `principal:<id>` from whatever
+  identity value an app's login handler stored in the session
+  (`session.insert("user_id", user.id.to_string())`, the pattern
+  `docs/guide/authentication.md` documents), with no tenant consulted —
+  unlike every `tenant_scoped` repository operation, which resolves
+  `CURRENT_TENANT` automatically. That identity value is not guaranteed
+  unique across tenants: Autumn's own sharding guide documents that
+  per-tenant primary keys are shard-local `BIGSERIAL`s
+  (`docs/guide/sharding.md`), so the first user provisioned on two different
+  tenants' shards both land on `id = 1`. An app that turned on Autumn's
+  multi-tenancy (`[tenancy] enabled = true`) together with either documented
+  rate-limiting feature shared one token bucket across any two tenants whose
+  users' principal ids happened to coincide: an ordinary authenticated user
+  of tenant A exhausting their own bucket denied service (`429`) to an
+  unrelated tenant B user who had made zero requests of their own.
+  `Limiter::extract_key` and `#[throttle]`'s per-route guard now fold
+  `CURRENT_TENANT` into the bucket key (not into the value handed to
+  `with_tier_hook`, which still receives the bare principal id its
+  documented signature promises). Apps without tenancy enabled compute the
+  same key as before. **Compatibility note:** upgrading resets any
+  in-flight bucket for a tenant-enabled `authenticated_principal`/`principal`
+  key — a one-time full-bucket refill, not a correctness change. See
+  `docs/security/2026-09-09-rate-limit-tenant-key/`.
+
 - **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
   layers in SSG/ISR (`dist`) mode, closing an authn-bypass gap (🛡 Warden):**
   the dispatch clone `tools/call` replays requests against is assembled
