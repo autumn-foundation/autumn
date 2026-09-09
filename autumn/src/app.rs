@@ -3650,9 +3650,7 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "mail")]
-        if mount_unsubscribe_endpoint {
-            config.mail.mount_unsubscribe_endpoint = true;
-        }
+        apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
 
         // Apply builder-level flag: `.idempotent()` enables the middleware when
         // neither `autumn.toml` nor the environment explicitly disable it.
@@ -3683,11 +3681,18 @@ impl AppBuilder {
         let i18n_bundle =
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
-        // 3. Validate routes
-        assert!(
-            !all_routes.is_empty(),
-            "No routes registered. Did you forget to call .routes()?"
-        );
+        // 3. Validate routes.
+        //
+        // Both of this function's own pre-router checks now run here, through
+        // the same helper the no-boot export calls. The repository-policy audit
+        // used to sit ~140 lines further down; running it here only moves it
+        // ahead of the startup banner, and a refusal is better reported before
+        // announcing a start than after.
+        if let Err(message) =
+            validate_pre_router_preconditions(&all_routes, &scoped_groups, &config)
+        {
+            panic!("{message}");
+        }
 
         // 4. Log banner with profile info
         let profile_display = config.profile.as_deref().unwrap_or("none");
@@ -3828,7 +3833,9 @@ impl AppBuilder {
         // "a developer who flips the `api =` switch on a
         // `#[repository]` exposes mutate endpoints that any
         // authenticated user can call against any record."
-        validate_repository_api_policies(&all_routes, &scoped_groups, &config);
+        // (The audit itself now runs above, with the other pre-router
+        // precondition, so the exporter shares both — see
+        // `validate_pre_router_preconditions`.)
 
         // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
@@ -5705,9 +5712,7 @@ impl AppBuilder {
         .await;
 
         #[cfg(feature = "mail")]
-        if mount_unsubscribe_endpoint {
-            config.mail.mount_unsubscribe_endpoint = true;
-        }
+        apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
@@ -6381,6 +6386,8 @@ impl AppBuilder {
             declared_routes,
             #[cfg(feature = "mcp")]
             mcp,
+            #[cfg(feature = "mail")]
+            mount_unsubscribe_endpoint,
             ..
         } = self;
 
@@ -6396,7 +6403,18 @@ impl AppBuilder {
         // Config only: `TelemetryProvider::init` can reach a collector or read
         // production credentials, and telemetry cannot affect the document, so
         // an export advertised as touching nothing must not run it.
-        let config = load_config_only(config_loader_factory, plugin_config_roots).await;
+        #[cfg_attr(
+            not(feature = "mail"),
+            expect(unused_mut, reason = "only `mail` mutates it")
+        )]
+        let mut config = load_config_only(config_loader_factory, plugin_config_roots).await;
+
+        // The builder flag must land BEFORE the collision checks below, exactly
+        // as it does on the serving path: it is what decides whether
+        // `/_autumn/unsubscribe` is claimed, and a check run against the
+        // unmodified config would approve a mount that startup rejects.
+        #[cfg(feature = "mail")]
+        apply_mail_builder_overrides(&mut config, mount_unsubscribe_endpoint);
 
         // Run the SERVING PATH'S OWN preflight before emitting anything. An
         // export that skips a check the router enforces lets `--check` pass for
@@ -6414,6 +6432,14 @@ impl AppBuilder {
         //
         // Ordered as the serving path orders them, so an app with more than one
         // problem reports the same first error either way.
+        // `run()`'s OWN pre-router checks first, in its order: an app with no
+        // routes, or with an unguarded mutating repository API under a
+        // production profile, never reaches router construction at all.
+        if let Err(message) = validate_pre_router_preconditions(&routes, &scoped_groups, &config) {
+            eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {message}");
+            std::process::exit(1);
+        }
+
         let registered_versions: std::collections::HashSet<&str> =
             api_versions.iter().map(|av| av.version.as_str()).collect();
         let preflight = crate::router::reject_unregistered_api_versions(
@@ -11585,6 +11611,50 @@ fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String
         write!(s, "  - #[repository({name}, api = \"{path}\")]").unwrap();
     }
     s
+}
+
+/// Fold `.mount_unsubscribe_endpoint()` into the loaded config.
+///
+/// The builder flag lives outside the config, so a config that leaves the
+/// endpoint disabled still mounts it when the app asked for it. That mount
+/// claims `/_autumn/unsubscribe`, which the `OpenAPI` and MCP collision checks
+/// must see — an export that ran them against the unmodified config approved a
+/// mount that startup rejects.
+///
+/// Shared because it was already copied at two `run_*` sites before the export
+/// became the third.
+#[cfg(feature = "mail")]
+const fn apply_mail_builder_overrides(config: &mut AutumnConfig, mount_unsubscribe_endpoint: bool) {
+    if mount_unsubscribe_endpoint {
+        config.mail.mount_unsubscribe_endpoint = true;
+    }
+}
+
+/// Every route/config precondition the serving path enforces BEFORE it hands
+/// off to [`crate::router::build_router_pre_state`].
+///
+/// That function's own six rules are already shared with the no-boot dump modes
+/// (issue #802). These are the ones `run()` performed itself, inline and in two
+/// separate places, so the export preflight did not have them: an app with no
+/// routes at all, or with a mutating `#[repository(api = ...)]` carrying no
+/// paired `policy`, could not start yet exported a document `--check` would
+/// approve. Collecting them here means a rule added to the serving path is in
+/// the exporter by construction rather than by remembering — which is what the
+/// one-at-a-time additions of the last three rounds kept failing to be.
+///
+/// `Err` carries the message the caller should report; `validate_repository_api_policies`
+/// exits the process itself when it is fatal, exactly as it does at startup, so
+/// an export refuses on the same condition a boot would.
+fn validate_pre_router_preconditions(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> Result<(), String> {
+    if routes.is_empty() {
+        return Err("No routes registered. Did you forget to call .routes()?".to_owned());
+    }
+    validate_repository_api_policies(routes, scoped_groups, config);
+    Ok(())
 }
 
 fn validate_repository_api_policies(

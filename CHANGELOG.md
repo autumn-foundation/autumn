@@ -159,6 +159,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mount-path rule is extracted from that function rather than copied, joining
   the others, so there is still exactly one definition per rule.
 
+- **openapi:** `autumn openapi export` also runs the two preconditions `run()`
+  enforced itself, and applies the same builder overrides, before generating
+  (issue #802). The preflight mirrored `build_router_pre_state` faithfully, but
+  `run()` checks two more things outside it: an app with **no routes at all**
+  panics at startup, and a mutating `#[repository(api = "…")]` with no paired
+  `policy` refuses to start under a production profile. Either could export a
+  document `--check` would approve for an application that never reaches router
+  construction. Both now live in one `validate_pre_router_preconditions` the two
+  paths share, so a precondition added to the serving path is in the exporter by
+  construction rather than by remembering. Separately, the
+  `.mount_unsubscribe_endpoint()` builder flag — which decides whether
+  `/_autumn/unsubscribe` is claimed, and so what the collision checks see — is
+  now folded into the config before those checks on the export path too; it was
+  already copied at two `run_*` sites, and is now shared by all three.
+
 
 ### Changed
 
