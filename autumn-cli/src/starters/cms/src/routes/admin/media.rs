@@ -376,7 +376,7 @@ pub async fn serve(
     let mut download = Download::from_blob(blobs.store(), blob.key.clone())
         .await?
         .content_type(attachment.mime_type.clone())
-        .filename(attachment.title.clone());
+        .filename(download_filename(&attachment));
     if may_render_inline(&attachment.mime_type) {
         download = download.inline();
     }
@@ -386,8 +386,22 @@ pub async fn serve(
 /// A URL-safe, collision-resistant key for an upload.
 fn unique_slug(filename: &str, rng: &autumn_web::entropy::Rng) -> String {
     let stem = filename.rsplit('/').next().unwrap_or(filename);
+    // ASCII alphanumeric, not merely short. `slugify` never returns an empty
+    // string — it falls back to a hash token derived from its input (see its
+    // docs, and #2424) — so `photo.画像` and `logo.` were stored as
+    // `photo-<suffix>.n3f2a9c…`, a manufactured extension that is worse than
+    // none: it names a type nothing has, and it is what the reader sees when
+    // they save the file. Nothing here is a filesystem hazard, so the answer is
+    // to decide whether the suffix *is* an extension rather than to normalize
+    // whatever follows the dot.
     let (name, ext) = match stem.rsplit_once('.') {
-        Some((name, ext)) if ext.len() <= 8 => (name, Some(ext)),
+        Some((name, ext))
+            if !ext.is_empty()
+                && ext.len() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            (name, Some(ext))
+        }
         _ => (stem, None),
     };
     let base = autumn_web::slugify(name);
@@ -410,10 +424,43 @@ fn unique_slug(filename: &str, rng: &autumn_web::entropy::Rng) -> String {
     // against the table and still races.
     let uuid = rng.uuid_v4().simple().to_string();
     let suffix = &uuid[..12];
+    // Already ASCII alphanumeric by the match above, so lowercasing is the whole
+    // normalization — `slugify` would only reintroduce the fallback token.
     match ext {
-        Some(ext) => format!("{base}-{suffix}.{}", autumn_web::slugify(ext)),
+        Some(ext) => format!("{base}-{suffix}.{}", ext.to_ascii_lowercase()),
         None => format!("{base}-{suffix}"),
     }
+}
+
+/// The name a download is saved under.
+///
+/// `display_title` strips the extension before it becomes `attachment.title` —
+/// deliberately, because the title is what the editor reads — so using the title
+/// alone saved `report.csv` as `report`, a file the operating system no longer
+/// knows what to open. The extension comes back from the slug, which is where
+/// the normalized one lives.
+///
+/// The title, not the slug, remains the base: the slug is machine-shaped
+/// (`my-report-8f21a0c4d5e6.csv`) and the file the reader saves should be named
+/// the way the library names it.
+fn download_filename(attachment: &crate::models::Attachment) -> String {
+    let title = attachment.title.trim();
+    if title.is_empty() {
+        return attachment.slug.clone();
+    }
+    let Some((_, ext)) = attachment.slug.rsplit_once('.') else {
+        return title.to_owned();
+    };
+    if ext.is_empty() {
+        return title.to_owned();
+    }
+    // An editor who renamed the file to include the extension already gets it
+    // right; appending a second one would produce `report.csv.csv`.
+    let suffix = format!(".{ext}");
+    if title.to_lowercase().ends_with(&suffix.to_lowercase()) {
+        return title.to_owned();
+    }
+    format!("{title}{suffix}")
 }
 
 /// Deletes an uploaded blob unless the upload completes.
@@ -492,3 +539,85 @@ fn display_title(filename: &str) -> String {
 
 #[allow(dead_code)]
 fn _type_uses(_: UpdateAttachment) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment(title: &str, slug: &str) -> crate::models::Attachment {
+        crate::models::Attachment {
+            id: 1,
+            title: title.to_owned(),
+            slug: slug.to_owned(),
+            file: None,
+            mime_type: "text/csv".to_owned(),
+            byte_size: 1,
+            width: None,
+            height: None,
+            alt_text: String::new(),
+            caption: String::new(),
+            uploader_id: None,
+            created_at: chrono::NaiveDateTime::default(),
+            updated_at: chrono::NaiveDateTime::default(),
+        }
+    }
+
+    /// A key carries a real extension or none — never a manufactured one.
+    ///
+    /// `slugify` never returns an empty string: it falls back to a hash token
+    /// derived from its input. So slugifying whatever follows the last dot
+    /// turned `logo.` and `photo.画像` into `….n3f2a9c…`, an extension naming a
+    /// type nothing has, which is then what the reader sees when they save it.
+    #[test]
+    fn a_key_carries_a_real_extension_or_none() {
+        let rng =
+            autumn_web::entropy::Rng::from_source(autumn_web::entropy::SeededEntropy::shared(7));
+        for filename in [
+            "logo.",
+            "photo.画像",
+            "notes",
+            "a.b.画像",
+            "x.toolongextension",
+        ] {
+            let slug = unique_slug(filename, &rng);
+            assert!(!slug.is_empty(), "{filename} produced an empty key");
+            if let Some((_, ext)) = slug.rsplit_once('.') {
+                panic!("{filename} manufactured the extension {ext:?} in {slug}");
+            }
+        }
+        // A real one survives, lowercased.
+        assert!(unique_slug("report.csv", &rng).ends_with(".csv"));
+        assert!(unique_slug("archive.TAR", &rng).ends_with(".tar"));
+        assert!(unique_slug("shot.PNG", &rng).ends_with(".png"));
+    }
+
+    /// `display_title` strips the extension, so the title alone saved
+    /// `report.csv` as `report` — a file the operating system no longer knows
+    /// what to open.
+    #[test]
+    fn a_download_keeps_the_uploaded_extension() {
+        assert_eq!(
+            download_filename(&attachment("Report", "report-8f21a0c4d5e6.csv")),
+            "Report.csv"
+        );
+        // No extension on the slug means none to restore.
+        assert_eq!(
+            download_filename(&attachment("Notes", "notes-8f21a0c4d5e6")),
+            "Notes"
+        );
+        // An editor who already typed it does not get it twice, whatever case.
+        assert_eq!(
+            download_filename(&attachment("Report.csv", "report-8f21a0c4d5e6.csv")),
+            "Report.csv"
+        );
+        assert_eq!(
+            download_filename(&attachment("Report.CSV", "report-8f21a0c4d5e6.csv")),
+            "Report.CSV"
+        );
+        // A dot in the title is not an extension.
+        assert_eq!(
+            download_filename(&attachment("Report v1.2", "report-8f21a0c4d5e6.csv")),
+            "Report v1.2.csv"
+        );
+    }
+}

@@ -2682,6 +2682,65 @@ pub async fn search_published(
     Ok((rows, usize::try_from(total).unwrap_or(0)))
 }
 
+/// The unique violations a menu insert can raise, and what each one means.
+///
+/// `menus.slug` is `UNIQUE` and `idx_menus_location` is a partial unique index,
+/// so both are `UniqueViolation` and only the constraint name tells them apart.
+const MENU_COLLISION_INDEXES: &[(&str, &str, &str)] = &[
+    (
+        "menus_slug_key",
+        "name",
+        "A menu with that name already exists",
+    ),
+    (
+        "idx_menus_location",
+        "location",
+        "Another menu was just assigned to that location; try again",
+    ),
+];
+
+/// A free slug for a new menu.
+///
+/// `slugify` alone was the whole allocator, and `menus.slug` is `NOT NULL
+/// UNIQUE`, so two menus named the same thing collided outright — an ordinary
+/// thing for an administrator to want, reported as somebody else winning a race
+/// for the location. Two names that differ only in punctuation do it too:
+/// `Main menu` and `Main-Menu` both slugify to `main-menu`.
+///
+/// A suffix rather than a refusal: the slug is not a URL here — the theme
+/// addresses a menu by `location` — so it only has to be unique, and making the
+/// administrator invent a second name for it would be asking them to work
+/// around a detail they cannot see.
+async fn unique_menu_slug(conn: &mut AsyncPgConnection, name: &str) -> AutumnResult<String> {
+    // `slugify` never returns an empty string — it falls back to a stable hash
+    // token — so there is no empty case to guard here.
+    let base = autumn_web::slugify(name);
+    // One query for the whole family, not one per candidate.
+    let taken: Vec<String> = menus::table
+        .filter(
+            menus::slug
+                .eq(&base)
+                .or(menus::slug.like(format!("{base}-%"))),
+        )
+        .select(menus::slug)
+        .load(conn)
+        .await?;
+    if !taken.iter().any(|slug| slug == &base) {
+        return Ok(base);
+    }
+    // Bounded: past this the name is being used as a counter, and the unique
+    // index is still there to catch the race either way.
+    for n in 2..=1000 {
+        let candidate = format!("{base}-{n}");
+        if !taken.iter().any(|slug| slug == &candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(AutumnError::unprocessable_msg(
+        "Too many menus share that name; give this one a different one",
+    ))
+}
+
 /// Assign a theme location to a new menu, clearing the previous holder — in one
 /// transaction.
 ///
@@ -2715,30 +2774,26 @@ pub async fn replace_menu_at_location(
                 .execute(conn)
                 .await?;
         }
+        let slug = unique_menu_slug(conn, &name).await?;
         diesel::insert_into(menus::table)
             .values((
                 menus::name.eq(&name),
-                menus::slug.eq(autumn_web::slugify(&name)),
+                menus::slug.eq(&slug),
                 menus::location.eq(&location),
             ))
             .execute(conn)
             .await
             .map_err(|error| {
-                // The constraint firing means another administrator won the
-                // race between the lock above and this insert — a real answer,
-                // not an internal error.
-                if matches!(
-                    error,
-                    diesel::result::Error::DatabaseError(
-                        diesel::result::DatabaseErrorKind::UniqueViolation,
-                        _
-                    )
-                ) {
-                    AutumnError::conflict_msg(
-                        "Another menu was just assigned to that location; try again",
-                    )
-                } else {
-                    AutumnError::from(error)
+                // Which constraint fired decides what to say. Both are unique
+                // violations, and reporting the location race for either of
+                // them told an administrator who had simply reused a menu name
+                // that somebody else was editing at the same moment — a message
+                // that is confidently wrong and sends them to look for a
+                // conflict that is not there.
+                let error = AutumnError::from(error);
+                match autumn_web::error::unique_violation_field(&error, MENU_COLLISION_INDEXES) {
+                    Some((_, message)) => AutumnError::conflict_msg(message),
+                    None => error,
                 }
             })?;
         Ok::<_, AutumnError>(())

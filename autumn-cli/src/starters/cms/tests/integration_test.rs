@@ -3643,6 +3643,153 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// Two menus may share a name.
+///
+/// `menus.slug` is `NOT NULL UNIQUE` and `slugify(name)` was the whole
+/// allocator, so a second menu called "Main" was refused — and refused with the
+/// location-race message, which told an administrator who had simply reused a
+/// name that somebody else was editing at the same moment. A message that is
+/// confidently wrong sends them looking for a conflict that is not there.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn two_menus_may_share_a_name() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for location in ["primary", "footer"] {
+        client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", "Main"), ("location", location)]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    let slugs: Vec<String> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::menus::table
+            .order({{crate_name}}::schema::menus::id.asc())
+            .select({{crate_name}}::schema::menus::slug)
+            .load(&mut conn)
+            .await
+            .expect("the menus")
+    };
+    assert_eq!(
+        slugs,
+        vec!["main".to_owned(), "main-2".to_owned()],
+        "the second menu takes a suffix rather than being refused"
+    );
+
+    // And the location index still says what it means when it is the one that
+    // fires: assigning a third menu to a location an existing one holds detaches
+    // the incumbent rather than erroring.
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Main"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// A download keeps the uploaded file's extension.
+///
+/// `display_title` strips it before it becomes `attachment.title`, and the
+/// `Content-Disposition` filename was that title — so clicking View on
+/// `report.csv` saved a file called `report`, which the operating system no
+/// longer knows what to open.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_download_is_named_with_its_extension() {
+    let db = TestDb::shared().await;
+    let _ = db_client().await;
+    let uploads = std::env::temp_dir().join(format!(
+        "cms-download-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&uploads).expect("create the blob store root");
+    let mut config = AutumnConfig::default();
+    config.security.csrf.enabled = false;
+    config.security.submit_token.enabled = false;
+    let store = autumn_web::storage::LocalBlobStore::new(
+        "default".to_owned(),
+        uploads.clone(),
+        "/_blobs".to_owned(),
+        std::time::Duration::from_secs(900),
+        autumn_web::storage::local::SigningKey::new(b"cms-download-test-key".to_vec()),
+        Vec::new(),
+    )
+    .expect("local blob store");
+    let client = TestApp::new()
+        .routes(app_routes())
+        .config(config)
+        .with_db(db.pool())
+        .state_initializer(move |state| {
+            state.insert_extension::<autumn_web::storage::BlobStoreState>(
+                autumn_web::storage::BlobStoreState::new(std::sync::Arc::new(store)),
+            );
+        })
+        .build();
+    let cookie = register(&client, "owner").await;
+
+    // `text/csv` is on the allow-list and never renders inline, so this is the
+    // forced-download path.
+    let boundary = "----cmsdownload";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+         filename=\"report.csv\"\r\nContent-Type: text/csv\r\n\r\nid,name\r\n\
+         --{boundary}--\r\n"
+    );
+    client
+        .post("/admin/media")
+        .header("cookie", &cookie)
+        .header(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(payload)
+        .send()
+        .await
+        .assert_status(303);
+
+    let slug: String = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = db.pool().get().await.expect("conn");
+        {{crate_name}}::schema::attachments::table
+            .select({{crate_name}}::schema::attachments::slug)
+            .first(&mut conn)
+            .await
+            .expect("the attachment")
+    };
+    assert!(
+        slug.ends_with(".csv"),
+        "the key keeps the extension: {slug}"
+    );
+
+    let served = client.get(&format!("/media/{slug}")).send().await;
+    let disposition = served
+        .assert_ok()
+        .header("content-disposition")
+        .expect("a disposition header");
+    assert!(
+        disposition.contains("attachment"),
+        "a csv is a download, not an inline render: {disposition}"
+    );
+    assert!(
+        disposition.contains("report.csv"),
+        "the saved file must keep its extension: {disposition}"
+    );
+
+    std::fs::remove_dir_all(&uploads).ok();
+}
+
 /// A second `file` part is refused rather than orphaning a blob.
 ///
 /// Every `file` field was written to the blob store but only the last got an
