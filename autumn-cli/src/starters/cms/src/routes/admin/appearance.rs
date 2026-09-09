@@ -7,9 +7,7 @@ use serde::Deserialize;
 
 use crate::capabilities::Capability;
 use crate::models::{NewMenuItem, NewWidget, UpdateWidget};
-use crate::repositories::{
-    MenuItemRepository as _, MenuRepository as _, TermRepository as _, WidgetRepository as _,
-};
+use crate::repositories::{MenuItemRepository as _, MenuRepository as _, WidgetRepository as _};
 use crate::require_capability;
 use crate::theme::WidgetKind;
 
@@ -57,6 +55,10 @@ pub struct WidgetForm {
     pub position: String,
 }
 
+/// How many categories the menu-item builder offers, matching the bound on the
+/// page selector beside it.
+const MENU_TERM_LIMIT: i64 = 200;
+
 #[get("/admin/appearance")]
 pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
@@ -73,7 +75,16 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
     widgets.sort_by_key(|w| (w.position, w.id));
 
     let pages = repos.published_posts("page", 200).await?;
-    let categories = repos.terms.find_by_taxonomy("category".to_owned()).await?;
+    // Bounded like `pages` above, and for the same reason: this is a
+    // *create* control — every menu on the screen renders the whole set as
+    // `<option>`s, so an unbounded finder here made the Appearance screen the
+    // one that broke on a large taxonomy while the taxonomy and authoring
+    // screens stayed responsive. There is no current selection to retain: the
+    // control always starts at "No category".
+    let (categories, category_count) = {
+        let mut conn = repos.conn().await?;
+        crate::content::terms_page_with_total(&mut conn, "category", 0, MENU_TERM_LIMIT).await?
+    };
 
     let body = html! {
         section class="mb-10" {
@@ -150,6 +161,11 @@ pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                                         option value="" { "No category" }
                                         @for term in &categories {
                                             option value=(term.id) { (term.name) }
+                                        }
+                                    }
+                                    @if category_count > MENU_TERM_LIMIT {
+                                        p class="text-xs text-gray-400 mt-1" {
+                                            "First " (MENU_TERM_LIMIT) " by name."
                                         }
                                     }
                                 }

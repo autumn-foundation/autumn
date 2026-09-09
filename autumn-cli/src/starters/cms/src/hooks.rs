@@ -221,6 +221,10 @@ impl MutationHooks for PostHooks {
     }
 }
 
+/// The longest post title accepted, matching the `#[validate]` cap declared on
+/// the `Post` model — and the editor's `maxlength`.
+pub const MAX_POST_TITLE: usize = 300;
+
 /// The invariants every edit to an existing post has to satisfy, whichever path
 /// makes it.
 ///
@@ -260,6 +264,19 @@ pub fn validate_post_update(before: &Post, after: &mut Post) -> AutumnResult<()>
         return Err(AutumnError::unprocessable_msg(
             "A published post must have a title",
         ));
+    }
+
+    // And the model's declared cap, which the direct-Diesel path never runs.
+    // Checked for every status, not just the live ones: the form's `maxlength`
+    // is a browser convenience a crafted edit ignores, so an author could park
+    // a request-sized title on a draft and publish it afterwards — at which
+    // point every listing, feed and API response carries it. The lower bound is
+    // deliberately not enforced here: an untitled *draft* is legitimate, which
+    // is what the live-status check above is for.
+    if after.title.chars().count() > MAX_POST_TITLE {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A title must be at most {MAX_POST_TITLE} characters"
+        )));
     }
 
     // `published_at` is the timestamp the front end orders and dates by. Stamp

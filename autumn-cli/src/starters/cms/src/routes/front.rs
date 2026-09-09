@@ -893,29 +893,38 @@ fn archive_bounds(
     // the same reason the editor uses it: the earlier instant keeps consecutive
     // days adjacent rather than overlapping.
     //
-    // A *skipped* midnight is the harder case and cannot be answered by falling
-    // back to the naive value. Africa/Cairo has no 00:00 on 2026-04-24: the day
-    // begins locally at 01:00, which is 22:00 UTC on the 23rd. Reading the
-    // naive value as UTC started that archive two hours late, so posts from the
-    // first local hours of the day carried `/2026/04/24/` permalinks and
-    // appeared in neither day's archive. The first local time that exists on
-    // the date is the answer, so the walk steps forward until one resolves —
-    // one lookup on every ordinary day, and no real transition has ever skipped
-    // more than a couple of hours.
-    let to_utc = |date: NaiveDate| -> Option<chrono::NaiveDateTime> {
-        let midnight = date.and_hms_opt(0, 0, 0)?;
-        let mut local = midnight;
-        while local.date() == date {
-            if let Some(resolved) = zone.from_local_datetime(&local).earliest() {
-                return Some(resolved.naive_utc());
-            }
-            local += chrono::Duration::minutes(1);
-        }
-        // A local date with no valid time at all — the whole day skipped, which
-        // no zone has ever done. Better than no archive.
-        Some(midnight)
-    };
-    Some((to_utc(start)?, to_utc(end)?))
+    // The two bounds then differ, and the difference is the whole subtlety.
+    //
+    // The *start* is the first local time that exists on that date, and nothing
+    // later. Africa/Cairo has no 00:00 on 2026-04-24: the day begins locally at
+    // 01:00, which is 22:00 UTC on the 23rd. And a date with no local time at
+    // all has no archive — `None`, which the caller renders as a 404. That is
+    // not hypothetical: Pacific/Apia crossed the international date line at the
+    // end of 2011, so 2011-12-30 never happened there.
+    //
+    // The *end* is the first local time that exists at or after the following
+    // midnight, and it is allowed to cross into a later date. Without that, a
+    // real day whose successor never happened lost its own archive: December
+    // 29 in Apia ends when December 31 begins, and requiring the 30th to exist
+    // made the 29th return `None` too. (Which is how this was found — the first
+    // version of the Apia test failed on the *neighbour*, not on the missing
+    // day.)
+    let first_local_instant =
+        |from: chrono::NaiveDateTime, limit: i64| -> Option<chrono::NaiveDateTime> {
+            (0..limit).find_map(|minutes| {
+                let local = from.checked_add_signed(chrono::Duration::minutes(minutes))?;
+                zone.from_local_datetime(&local)
+                    .earliest()
+                    .map(|resolved| resolved.naive_utc())
+            })
+        };
+
+    const MINUTES_IN_A_DAY: i64 = 24 * 60;
+    let from = first_local_instant(start.and_hms_opt(0, 0, 0)?, MINUTES_IN_A_DAY)?;
+    // Three days of slack: the longest gap any zone has ever had is Apia's one
+    // day, and a bound keeps a corrupt zone database from spinning.
+    let until = first_local_instant(end.and_hms_opt(0, 0, 0)?, 3 * MINUTES_IN_A_DAY)?;
+    Some((from, until))
 }
 
 /// A listing's page link. Page 1 drops the parameter so the canonical URL of a
@@ -1045,6 +1054,30 @@ mod tests {
                 .expect("a real date")
         );
         assert!(from < until);
+    }
+
+    /// A local date that never happened has no archive at all.
+    ///
+    /// Pacific/Apia crossed the international date line at the end of 2011, so
+    /// 2011-12-30 does not exist there. The previous fallback read its naive
+    /// midnight as UTC and produced a range covering the last hours of local
+    /// December 29 — an archive listing posts whose permalinks name the day
+    /// before it.
+    #[test]
+    fn a_date_that_never_happened_locally_has_no_archive() {
+        let apia: chrono_tz::Tz = "Pacific/Apia".parse().expect("a known zone");
+        assert!(archive_bounds(2011, Some(12), Some(30), apia).is_none());
+        // Its neighbours keep theirs. December 29 is the one that matters:
+        // its range ends when the 31st begins, because the 30th never did.
+        let (from, until) =
+            archive_bounds(2011, Some(12), Some(29), apia).expect("a day that happened");
+        assert!(from < until);
+        let (next_from, _) =
+            archive_bounds(2011, Some(12), Some(31), apia).expect("a day that happened");
+        assert_eq!(
+            until, next_from,
+            "consecutive real days have to tile the timeline, missing day or not"
+        );
     }
 
     /// The ordinary case, and the one every other day of the year takes.

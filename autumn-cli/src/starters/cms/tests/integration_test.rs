@@ -7169,3 +7169,218 @@ async fn a_save_cannot_apply_an_unbounded_number_of_terms() {
     };
     assert_eq!(filed, 50, "the cap bounds the save, it does not break it");
 }
+
+/// A reply cannot be approved while an ancestor is hidden.
+///
+/// Hiding a parent cascades over its *approved* descendants, but a reply that
+/// was already pending when its parent was spammed stays pending — and this is
+/// where a moderator would then approve it. `assemble_thread` builds from the
+/// roots down, so that reply can never be attached, while
+/// `recount_post_comments` counts it: the post advertises a comment no reader
+/// can reach.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_reply_cannot_be_approved_under_a_hidden_ancestor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Thread", "Body.", "publish").await;
+
+    // A signed-in comment lands approved; a guest reply is held for moderation.
+    client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "Root comment.")]))
+        .send()
+        .await
+        .assert_status(303);
+    let root_id: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::comments::table
+            .filter({{crate_name}}::schema::comments::body.eq("Root comment."))
+            .select({{crate_name}}::schema::comments::id)
+            .first(&mut conn)
+            .await
+            .expect("the root comment")
+    };
+
+    sign_out(&client);
+    client
+        .post(&format!("/comments/{post_id}"))
+        .form(&form(&[
+            ("body", "Pending reply."),
+            ("author_name", "Guest"),
+            ("author_email", "guest@example.com"),
+            ("reply_to", root_id.to_string().as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let reply_id: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::comments::table
+            .filter({{crate_name}}::schema::comments::body.eq("Pending reply."))
+            .select({{crate_name}}::schema::comments::id)
+            .first(&mut conn)
+            .await
+            .expect("the reply")
+    };
+
+    // Spam the root. The reply was already pending, so the cascade leaves it.
+    client
+        .post(&format!("/admin/comments/{root_id}/status?to=spam"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+
+    let refused = client
+        .post(&format!("/admin/comments/{reply_id}/status?to=approved"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "approving under a hidden ancestor must be refused: {}",
+        refused.text()
+    );
+
+    // Nothing was counted, and nothing is claimed on the page.
+    let count: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::posts::table
+            .find(post_id)
+            .select({{crate_name}}::schema::posts::comment_count)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+    assert_eq!(count, 0, "a comment nobody can see must not be counted");
+
+    // Restore the root, and the reply can be approved — the rule is an
+    // ordering constraint, not a dead end.
+    client
+        .post(&format!("/admin/comments/{root_id}/status?to=approved"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post(&format!("/admin/comments/{reply_id}/status?to=approved"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_status(303);
+    sign_out(&client);
+    client
+        .get("/thread")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Pending reply.");
+}
+
+/// The model's title cap is enforced on the direct-Diesel edit path.
+///
+/// `update_post_with_revision` writes the fields back with plain Diesel — which
+/// is what makes the edit and its revision one transaction, and what bypasses
+/// the derived validator. The form's `maxlength` is a browser convenience: an
+/// author could park a request-sized title on a draft and publish it
+/// afterwards, at which point every listing, feed and API response carries it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_oversized_title_is_refused_on_the_edit_path() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Modest", "Body.", "draft").await;
+
+    let huge = "t".repeat(301);
+    let refused = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", huge.as_str()),
+            ("slug", "modest"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "draft"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "a title past the model's cap must be refused even on a draft: {}",
+        refused.text()
+    );
+
+    // A title at the cap still saves — the bound is the model's, not tighter.
+    let ok = "t".repeat(300);
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", ok.as_str()),
+            ("slug", "modest"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "draft"),
+            ("password", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+}
+
+/// The Appearance screen's category selector is bounded.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_appearance_category_selector_is_bounded() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A menu, so the screen renders the item builder at all.
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Primary"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         SELECT 'category',
+                'cat-' || lpad(g::text, 3, '0'),
+                'cat-' || lpad(g::text, 3, '0'),
+                '', 0
+         FROM generate_series(1, 250) AS g",
+    )
+    .await
+    .expect("seed the terms");
+
+    let screen = client
+        .get("/admin/appearance")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    screen.assert_ok();
+    let screen = screen.text();
+    assert!(
+        screen.contains("cat-001"),
+        "the first categories are offered"
+    );
+    assert!(
+        !screen.contains("cat-250"),
+        "the selector must not render every category"
+    );
+    assert!(screen.contains("First 200 by name"));
+}

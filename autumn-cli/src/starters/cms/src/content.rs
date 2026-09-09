@@ -636,6 +636,42 @@ pub async fn moderate_comment(
             return Ok::<_, AutumnError>((comment, false));
         }
 
+        // Approving a reply is only meaningful if its ancestors are approved
+        // too. `assemble_thread` builds from the roots down, so a reply under a
+        // hidden parent can never be attached — while `recount_post_comments`
+        // would count it, leaving the post advertising a comment no reader can
+        // reach. The hiding cascade below does not create this state (it moves
+        // the approved descendants with the parent), but it does not prevent
+        // it: a reply that was already *pending* when its parent was spammed
+        // stays pending, and this is where a moderator would then approve it.
+        //
+        // Walked up rather than asserted about the immediate parent alone: an
+        // ancestor two levels up can be the hidden one. Bounded by the same
+        // depth cap the write path enforces.
+        if target == "approved"
+            && let Some(parent_id) = comment.parent_id
+        {
+            let mut cursor = Some(parent_id);
+            for _ in 0..=MAX_COMMENT_DEPTH {
+                let Some(current) = cursor else {
+                    break;
+                };
+                let ancestor: Comment = comments::table
+                    .find(current)
+                    .select(Comment::as_select())
+                    .first(conn)
+                    .await
+                    .map_err(AutumnError::not_found)?;
+                if ancestor.status != "approved" {
+                    return Err(AutumnError::unprocessable_msg(
+                        "Approve the comment this replies to first — a reply under a \
+                         hidden comment cannot be shown",
+                    ));
+                }
+                cursor = ancestor.parent_id;
+            }
+        }
+
         let saved: Comment = diesel::update(comments::table.find(comment_id))
             .set(comments::status.eq(&target))
             .returning(Comment::as_returning())
