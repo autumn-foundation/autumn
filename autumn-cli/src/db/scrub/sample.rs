@@ -421,12 +421,14 @@ impl std::fmt::Display for SampleError {
                 f,
                 "{} table(s) the run promised would be empty still hold rows after \
                  every write:\n{}\n  \
-                 A trigger fired by one of the emptying statements has inserted into a \
-                 table an earlier one already emptied — an `ON DELETE` archive trigger \
-                 between two of them will do it — so the rows are back, carrying whatever \
-                 they carried before. Nothing is committed. Disable the triggers on the \
-                 copy before scrubbing, or stop promising a table is emptied when \
-                 something refills it.",
+                 Something wrote to them after they were emptied, so the rows are back, \
+                 carrying whatever they carried before. Two things can: a trigger fired by \
+                 one of the emptying statements, inserting into a table an earlier one \
+                 already emptied — an `ON DELETE` archive trigger between two of them will \
+                 do it — or a materialized view whose query calls a function that INSERTs, \
+                 since `REFRESH` runs that query. Nothing is committed. Disable the \
+                 triggers on the copy before scrubbing, drop the write from the view's \
+                 function, or stop promising a table is emptied when something refills it.",
                 tables.len(),
                 bullets(tables),
             ),

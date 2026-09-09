@@ -797,6 +797,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing runnable is printed at all when any target cannot be sized (measured:
   zero `BEGIN`, `COMMIT`, `DELETE FROM` and `ON_ERROR_STOP` lines), and a
   healthy two-target run still prints both blocks in full.
+- **cli:** `autumn db scrub` proves its promised-empty tables are empty AFTER
+  the materialized-view refreshes, not before them. `REFRESH` runs the view's
+  query, and that query can call a function whose body INSERTs — measured on a
+  tracked `BEGIN ATOMIC` function writing into a `never_include` table, the run
+  reported `audit_logs: 503 -> 0 row(s)` and `✓ Scrub complete` while the table
+  held three rows carrying real addresses. Volatility does not identify such a
+  function: measured, `CREATE FUNCTION ... STABLE BEGIN ATOMIC INSERT ...` is
+  accepted, so a `provolatile` test would miss exactly this one. Checking after
+  every write covers both this and the emptying-trigger case the check was
+  written for, and needs no guess about which functions can write. The run now
+  refuses and rolls back, naming the table.
+- **cli:** `autumn db scrub` no longer refuses a materialized view that uses a
+  fully tracked user-defined **aggregate**. An aggregate's `pg_proc` row is a
+  shell with no body of any kind, so `prosqlbody` is NULL for a traceable one
+  and the opacity check reported the aggregate itself as untraceable — measured,
+  an aggregate whose transition function is a tracked `BEGIN ATOMIC` body was
+  refused as `a_report via gather`, blocking a valid scrub. Only `prokind = 'a'`
+  is exempt, and only the shell: everything an aggregate runs is a separate
+  `pg_proc` the closure already reaches, so an opaque transition or final
+  function is still named (measured on both). A window function is not exempt —
+  it has no body because it is written in C, which is opacity rather than a
+  shell.
 - **web:** `AutumnError` now reads back its own validation details (issue
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem

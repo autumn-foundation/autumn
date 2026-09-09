@@ -2272,6 +2272,136 @@ async fn a_target_that_cannot_be_sized_prints_no_script_for_the_others() {
     );
 }
 
+/// A view function that writes into a promised-empty table is caught.
+///
+/// `REFRESH` runs the view's query, and that query can call a function whose
+/// body INSERTs. The refreshes are the last writes in the transaction, so a
+/// check that ran before them reported success over a table that had been
+/// refilled — measured, `audit_logs: 503 -> 0 row(s)` and `Scrub complete`
+/// while the table held three rows carrying real addresses. Volatility does not
+/// identify such a function either: `CREATE FUNCTION ... STABLE BEGIN ATOMIC
+/// INSERT ...` is accepted, so the proof is a check after every write rather
+/// than a guess about which functions can write.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_function_that_refills_an_emptied_table_is_refused() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "mv_refill").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    client
+        .batch_execute(
+            "CREATE FUNCTION refill(bigint) RETURNS bigint LANGUAGE sql VOLATILE \
+             BEGIN ATOMIC \
+                 INSERT INTO audit_logs (actor_email, action) \
+                 VALUES ('leaked' || $1 || '@real-corp.example', 'refilled') \
+                 RETURNING id; \
+             END; \
+             CREATE MATERIALIZED VIEW a_refill AS SELECT refill(c.id) AS v FROM countries c;",
+        )
+        .await
+        .unwrap();
+    let before = count(&client, "SELECT count(*)::bigint FROM users").await;
+    let url = format!("{base}/mv_refill");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, refusal) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    assert!(
+        refusal.contains("promised would be empty still hold rows"),
+        "a refill by a view's function must be caught: {refusal}"
+    );
+    assert!(
+        refusal.contains("audit_logs"),
+        "the refusal must name the table: {refusal}"
+    );
+    assert_eq!(
+        count(&client, "SELECT count(*)::bigint FROM users").await,
+        before,
+        "and nothing may be committed: {refusal}"
+    );
+}
+
+/// A fully tracked aggregate is not mistaken for an opaque function.
+///
+/// An aggregate's `pg_proc` row is a shell with no body of any kind, so
+/// `prosqlbody` is NULL for a perfectly traceable one. Measured before the
+/// exemption: an aggregate whose transition function is a tracked `BEGIN
+/// ATOMIC` body was refused as `a_report via gather`, blocking a valid scrub.
+/// Exempting the shell loses nothing, because everything the aggregate runs is
+/// a separate `pg_proc` the closure already reaches.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_tracked_aggregate_is_not_refused_but_an_opaque_one_is() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+
+    // Tracked transition function: the chain is followable, so it must scrub,
+    // and the source view must still be refreshed before the dependent.
+    let ok = seed_sample_fixture(&admin, &base, "agg_tracked").await;
+    ok.batch_execute(
+        "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+         CREATE FUNCTION agg_step(text, bigint) RETURNS text LANGUAGE sql STABLE \
+             BEGIN ATOMIC \
+                 SELECT coalesce($1, '') \
+                 || coalesce((SELECT email FROM z_source WHERE id = $2), ''); \
+             END; \
+         CREATE AGGREGATE gather(bigint) (SFUNC = agg_step, STYPE = text); \
+         CREATE MATERIALIZED VIEW a_report AS \
+             SELECT gather(id) AS harvested FROM countries;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/agg_tracked");
+    let (_o, stderr) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "the aggregate's reads must still order the refresh: {stderr}"
+    );
+
+    // Opaque transition function: still refused, and named — the exemption
+    // covers the shell only, never the implementation reached through it.
+    // Dollar-quoted rather than `BEGIN ATOMIC`, so the body stays a string
+    // literal and `prosqlbody` stays NULL (measured).
+    let bad = seed_sample_fixture(&admin, &base, "agg_opaque").await;
+    bad.batch_execute(
+        "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+         CREATE FUNCTION agg_step(text, bigint) RETURNS text LANGUAGE sql STABLE \
+             AS $body$ SELECT coalesce($1, '') \
+                 || coalesce((SELECT email FROM z_source WHERE id = $2), '') $body$; \
+         CREATE AGGREGATE gather(bigint) (SFUNC = agg_step, STYPE = text); \
+         CREATE MATERIALIZED VIEW a_report AS \
+             SELECT gather(id) AS harvested FROM countries;",
+    )
+    .await
+    .unwrap();
+    let url = format!("{base}/agg_opaque");
+    let (_o, refusal) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--sample", "users=1%"],
+        &[("AUTUMN_DATABASE__URL", url.as_str())],
+    );
+    assert!(
+        refusal.contains("a_report via agg_step"),
+        "the opaque implementation must be named, not the aggregate shell: {refusal}"
+    );
+}
+
 /// A target whose connection string cannot name ONE endpoint is not printed.
 ///
 /// Two shapes, both measured on `PostgreSQL` 16.13. `hostaddr` selects the

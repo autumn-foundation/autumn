@@ -3070,9 +3070,6 @@ fn classify_and_apply(
             // table an earlier one emptied. `execute` counts them all and rolls
             // back; the printed sequence has to do the same, or an operator who
             // runs it commits exactly the rows the real command refuses.
-            for (table, _) in &phases.final_pass {
-                eprintln!("  {};", emptiness_assertion(table));
-            }
             // Last inside the transaction, exactly where `execute` runs them: a
             // materialized view keeps its own physical copy of whatever it
             // selected, so a script that skips this leaves the view's heap
@@ -3093,6 +3090,15 @@ fn classify_and_apply(
                     "  REFRESH MATERIALIZED VIEW {} WITH NO DATA;",
                     qualified_ident(view)
                 );
+            }
+            // And the emptiness proof, after every write in the block — the
+            // refreshes included, because a view's query can call a function
+            // that INSERTs into a table this run promised would be empty.
+            // `execute` checks in exactly this position and rolls back; the
+            // printed sequence has to, or an operator who runs it commits
+            // exactly the rows the real command refuses.
+            for (table, _) in &phases.final_pass {
+                eprintln!("  {};", emptiness_assertion(table));
             }
             // The last statement inside the transaction, and the whole reason
             // the compaction below can tell a scrubbed target from an aborted
@@ -4515,10 +4521,22 @@ fn probe_database_facts(
     // "unknown", it is "every one of them": before 14 no SQL body is parsed
     // into the catalog at all, so no function reached from a view can be
     // followed, and each one is untraceable by construction.
+    //
+    // An AGGREGATE is exempt, and only an aggregate. Its `pg_proc` row is a
+    // shell with no body of any kind, so `prosqlbody` is NULL for a perfectly
+    // traceable one and the predicate refused it — measured, an aggregate whose
+    // transition function is a tracked `BEGIN ATOMIC` body was refused as
+    // `a_report via gather`, a valid scrub blocked. Exempting it loses nothing,
+    // because everything an aggregate actually runs is a separate `pg_proc` the
+    // closure already reaches: measured on one with both a transition and a
+    // final function, the shell records `pg_proc -> s_step` AND
+    // `pg_proc -> s_final`, and the opaque final function is still named. A
+    // window function (`prokind = 'w'`) is NOT exempt — it has no body because
+    // it is written in C, which is opacity rather than a shell.
     let opaque_body = if has_catalog_column(&mut conn, "pg_proc", "prosqlbody")? {
-        "p.prosqlbody IS NULL"
+        "p.prokind <> 'a' AND p.prosqlbody IS NULL"
     } else {
-        "true"
+        "p.prokind <> 'a'"
     };
     let untraceable_view_functions = names(
         &format!(
@@ -5637,24 +5655,6 @@ fn execute(
         // the trigger graph decides, and it can be cyclic. So the guarantee is
         // checked rather than arranged, in the same transaction, the same way
         // the sample re-counts its foreign keys rather than trusting the walk.
-        let mut refilled = Vec::new();
-        for (table, _) in &phases.final_pass {
-            let row: RowCount = sql_query(format!(
-                "SELECT count(*) AS n FROM {}",
-                qualified_ident(table)
-            ))
-            .get_result(conn)?;
-            if row.n > 0 {
-                refilled.push(format!("{table} ({} row(s))", row.n));
-            }
-        }
-        if !refilled.is_empty() {
-            refilled.sort();
-            refilled.dedup();
-            return Err(sample::SampleFailure::Refused(
-                sample::SampleError::NotEmptied { tables: refilled },
-            ));
-        }
         // Inside the transaction, so a refresh the role is not allowed to run
         // rolls the rewrites back rather than committing base tables that a
         // stale materialized view still contradicts.
@@ -5681,6 +5681,43 @@ fn execute(
             ))
             .execute(conn)?;
             counts.push((format!("{view} (materialized view left unpopulated)"), 0));
+        }
+
+        // Prove the promise instead of ordering for it — AFTER the refreshes,
+        // which are the last writes in the transaction.
+        //
+        // Each statement in the emptying pass can fire triggers, and one of
+        // those can insert into a table an EARLIER statement already emptied —
+        // an `ON DELETE` archive trigger between two promised-empty tables does
+        // exactly that. No ordering of the deletes rules that out in general:
+        // the trigger graph decides, and it can be cyclic.
+        //
+        // A refresh writes too. A materialized view's query can call a function
+        // whose body INSERTs, and `REFRESH` runs that query — measured on a
+        // tracked `BEGIN ATOMIC` function writing into a `never_include` table,
+        // the run reported `audit_logs: 503 -> 0 row(s)` and `✓ Scrub complete`
+        // while leaving three rows carrying real addresses. Volatility does not
+        // separate those functions out: measured, `CREATE FUNCTION ... STABLE
+        // BEGIN ATOMIC INSERT ...` is accepted, so a `provolatile` test would
+        // miss exactly this one. Checking after every write covers both causes
+        // and needs no guess about which functions can write.
+        let mut refilled = Vec::new();
+        for (table, _) in &phases.final_pass {
+            let row: RowCount = sql_query(format!(
+                "SELECT count(*) AS n FROM {}",
+                qualified_ident(table)
+            ))
+            .get_result(conn)?;
+            if row.n > 0 {
+                refilled.push(format!("{table} ({} row(s))", row.n));
+            }
+        }
+        if !refilled.is_empty() {
+            refilled.sort();
+            refilled.dedup();
+            return Err(sample::SampleFailure::Refused(
+                sample::SampleError::NotEmptied { tables: refilled },
+            ));
         }
         Ok(())
     })
