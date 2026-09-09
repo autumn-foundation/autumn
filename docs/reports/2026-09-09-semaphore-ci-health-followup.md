@@ -4,8 +4,8 @@ Follow-up to `docs/reports/2026-09-08-semaphore-macos-contention-harness-fix.md`
 (#2627, merged) and the running investigation in
 `docs/ci-health/quarantine-ledger.md`. No fix PR — the hard gate for one still
 isn't cleared — but this pass finds two new organic hits that materially change
-the working diagnosis, and confirms the rerun harness fixed four days ago has
-still never been run.
+the working diagnosis, and confirms the rerun harness fixed roughly a day ago
+has still never been run.
 
 ## 🎯 Verdict path
 
@@ -13,9 +13,12 @@ still never been run.
 `ci.yml` run succeeded. No branch-protection or merge-queue regressions found.
 
 `manual-macos-contention-check.yml` — fixed and `actionlint`-clean since #2627
-(2026-09-08) — still has **zero `workflow_dispatch` runs** (`total_count: 0`
-against its own run history via the Actions API, checked 2026-09-09). It has
-been dispatchable for four days and nobody has run it.
+(merged 2026-09-08T15:07:44Z) — still has **zero `workflow_dispatch` runs**
+(`total_count: 0` against its own run history via the Actions API, checked
+2026-09-09T10:20Z, roughly 19 hours after the fix landed). It has been
+dispatchable for about a day and nobody has run it; the workflow file itself
+has existed, broken, since 2026-09-05 — four days describes the file's total
+age, not how long the working version has sat idle.
 
 ## 🌡️ Symptom
 
@@ -48,8 +51,10 @@ than trusting the run-level conclusion:
      34317587464 (PR #2645), job `Coverage (workspace)`, on a plain hosted
      `ubuntu-latest` runner (confirmed via the job's own `labels`, not the
      `heavy_runs_on`-routed `test` job). This job runs `cargo llvm-cov`,
-     which instruments and roughly doubles the cost of the wrapped test
-     binary. Failure: `tests/live_upgrade.rs:567` — `"the new build should
+     which instruments the wrapped test binary — `ci.yml`'s own comment
+     notes this roughly doubles `target/`'s on-disk *size*; no wall-clock
+     runtime measurement was taken here, so the execution-time overhead is
+     unquantified, not assumed to be the same 2x. Failure: `tests/live_upgrade.rs:567` — `"the new build should
      have served part of the load"` — a *different* assertion than the
      3 macOS hits in the 2026-09-04 census (those failed the connection-error
      check, ~line 551). The new build's version string never showed up in the
@@ -68,20 +73,24 @@ than trusting the run-level conclusion:
 **Verdict not rendered — but the working hypothesis needs revision.** Since
 2026-09-04 this cluster has been framed as "macOS runner contention,"
 justifying a macOS-only rerun harness. Finding 1 above is a hit on a
-completely different, non-contended, plain hosted Linux runner — the one
-thing the two hits share isn't the OS, it's that the runner was doing
-meaningfully more work per wall-clock second than a bare `cargo test`
-(coverage instrumentation on Linux; whatever `macos-latest`'s baseline
-contention is on the other three). That points at a mechanism in the *test's*
-design — a fixed-duration load-generation window racing a real process
-cutover — that any sufficiently slow or loaded execution can lose, not a
-macOS-specific scheduling quirk. This is still a hypothesis, not a
-confirmed root cause: distinguishing "test's window is too tight under load"
-from "a genuine narrow race in the hot-upgrade handoff that slow execution
-exposes more reliably" is exactly what the still-undispatched rerun campaign
-exists to do, and per Semaphore's law 3 (product/test verdict rendered first)
-neither test's tolerance nor the product code should change until that
-campaign renders it.
+completely different, non-contended, plain hosted Linux runner running under
+`cargo llvm-cov` instrumentation — instrumentation known to add overhead
+(confirmed for disk size; execution-time overhead not measured here) —
+against a `macos-latest` baseline whose own contention level is likewise
+unmeasured. The two hits no longer share "macOS" as their common factor,
+which is enough to say the macOS-only framing doesn't fit the evidence, but
+not enough to name what the actual shared factor is (slower/instrumented
+execution generically is a plausible candidate, not a confirmed one). That
+in turn points at a candidate mechanism in the *test's* design — a
+fixed-duration load-generation window racing a real process cutover — that
+sufficiently slow or loaded execution of *some* kind can lose, rather than a
+macOS-specific scheduling quirk. This remains a hypothesis, not a confirmed
+root cause: distinguishing "test's window is too tight under load" from "a
+genuine narrow race in the hot-upgrade handoff that slow execution exposes
+more reliably" — and actually quantifying what "slow" means here — is
+exactly what the still-undispatched rerun campaign exists to do, and per
+Semaphore's law 3 (product/test verdict rendered first) neither the test's
+tolerance nor the product code should change until that campaign renders it.
 
 `cache_stampede`'s second hit doesn't change its diagnosis (still open, still
 undiagnosed), but it does change its priority: two hits of the identical
@@ -99,16 +108,19 @@ points, not a campaign. What ships instead:
   `live_upgrade`.
 - **Recommendation for a human**: dispatch
   `manual-macos-contention-check.yml` now. It has been fixed and idle for
-  four days while the organic sample keeps accumulating one data point at a
-  time (now 4 hits across the tracked corpus: 3 macOS + 1 Linux, plus a
+  about a day (the *workflow file* has existed, mostly broken, for four days
+  since 2026-09-05 — but the working version has only been available since
+  #2627 merged) while the organic sample keeps accumulating one data point
+  at a time (now 4 hits across the tracked corpus: 3 macOS + 1 Linux, plus a
   second `cache_stampede` repeat) — the exact scenario the harness exists to
   short-circuit. Given finding 1 above, the campaign should not stay
   macOS-only forever: a companion rerun of the `Coverage (workspace)` job
   shape (or several samples of the plain `cargo test --workspace` under
-  `cargo llvm-cov` wrapping) would test the "slow execution, not the OS"
-  hypothesis directly. That is a second harness, not this one — flagged for
-  a future pass, not built here, since this session found the evidence for
-  it but building an untested second harness on top of an already-undispatched
+  `cargo llvm-cov` wrapping, with wall-clock timing actually measured this
+  time) would test the "slow execution, not the OS" hypothesis directly.
+  That is a second harness, not this one — flagged for a future pass, not
+  built here, since this session found the evidence for it but building an
+  untested second harness on top of an already-undispatched
   first one would compound the same problem rather than fix it.
 
 **Noted, not actioned** (cosmetic, no fix warranted): `manual-macos-contention-check.yml`

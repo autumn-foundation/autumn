@@ -95,27 +95,30 @@ without also filling in the intake form above.
   `heavy_runs_on` only overrides the `test` job's `ubuntu-latest` matrix
   leg, and this run drew a standard hosted runner, not a contended
   self-hosted one), step "Generate coverage (workspace catch-all)" — this
-  is `cargo llvm-cov`, which instruments and roughly doubles the cost of
-  every test binary it wraps (per this job's own inline comment). Failure
-  is at `tests/live_upgrade.rs:567`: `"the new build should have served
-  part of the load"` — the v2 binary never appeared in the observed read
-  set — not the connection-error assertion (line ~551) the 3 macOS hits
-  above were classified against. Full run: 5 passed, 1 failed in the
+  is `cargo llvm-cov`, which instruments every test binary it wraps. This
+  job's own inline comment notes that roughly doubles `target/`'s on-disk
+  *size*; no wall-clock runtime measurement was taken here, so treat the
+  execution-time overhead as real but unquantified, not as a confirmed 2x.
+  Failure is at `tests/live_upgrade.rs:567`: `"the new build should have
+  served part of the load"` — the v2 binary never appeared in the observed
+  read set — not the connection-error assertion (line ~551) the 3 macOS
+  hits above were classified against. Full run: 5 passed, 1 failed in the
   `hot-upgrade` package.
   - **Why this matters**: the working hypothesis driving the (still
     undispatched, see below) macOS-only rerun campaign was "macOS runner
     contention" specifically. A hit on a plain Linux hosted runner, on a
-    different assertion, under a job that is inherently 2x+ slower than a
-    normal test run, points instead at a more general mechanism: *any*
-    sufficiently slow/contended execution can shrink the effective window
-    the test's fixed-duration load generator has to observe the new build
-    actually taking over traffic, before the test's own timeout fires and
-    it asserts on what it saw. That is a hypothesis about the *test's*
-    design (a wall-clock load window racing a real cutover, at the mercy of
+    different assertion, under a job running instrumented (and therefore
+    at least somewhat slower, though not measured here) binaries, points
+    instead at a candidate more general mechanism: *some* sufficiently
+    slow/contended execution can shrink the effective window the test's
+    fixed-duration load generator has to observe the new build actually
+    taking over traffic, before the test's own timeout fires and it
+    asserts on what it saw. That is a hypothesis about the *test's* design
+    (a wall-clock load window racing a real cutover, at the mercy of
     whatever the host's actual perf happens to be for that run), not
-    proof either way — still not confirmed, but the "macOS-specific"
-    framing this entry has carried since 2026-09-04 no longer fits the
-    evidence.
+    proof either way, and "slow execution" itself is not yet quantified —
+    still not confirmed, but the "macOS-specific" framing this entry has
+    carried since 2026-09-04 no longer fits the evidence.
 - **Verdict not yet rendered**: whether this is runner-class/contention
   timing dependence in the test's load-window design (now: on *any* slow or
   loaded runner, not only macOS) or a genuine narrow race in the hot-upgrade
@@ -129,11 +132,16 @@ without also filling in the intake form above.
   `matrix` context, which isn't available there — GitHub rejected every
   dispatch attempt with zero jobs run, caught by #2548 but not fixed before
   #2527 merged); fixed in
-  `docs/reports/2026-09-08-semaphore-macos-contention-harness-fix.md` (#2627)
-  and verified `actionlint`-clean. **Four days later, it still has zero
-  `workflow_dispatch` runs** (`total_count: 0` against the workflow's own
-  run history, checked 2026-09-09) — nobody has dispatched it yet, and that
-  gap is now more urgent given the new Linux hit above widens what the
+  `docs/reports/2026-09-08-semaphore-macos-contention-harness-fix.md` (#2627,
+  merged 2026-09-08T15:07:44Z) and verified `actionlint`-clean. **About 19
+  hours later, it still has zero `workflow_dispatch` runs** (`total_count: 0`
+  against the workflow's own run history, checked 2026-09-09T10:20Z) —
+  nobody has dispatched it yet. (The workflow *file* has existed since
+  2026-09-05, so it is four days old, but it only became dispatchable —
+  i.e. actually able to run — when #2627 fixed its parse error; don't
+  conflate the file's total age with how long the working version has been
+  available.) That gap is now more urgent given the new Linux hit above
+  widens what the
   campaign needs to test (not macOS-only; ideally a Linux `Coverage
   (workspace)`-shaped rerun too, not just `cargo test --workspace` on a
   plain runner). #2548 separately banked 13/13 clean organic macOS samples
