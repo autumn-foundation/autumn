@@ -784,6 +784,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   times and `LIMIT 0` four times — and `LIMIT 0` selects no root rows, so the
   delete pass empties the table instead of sampling it. Both still scrub without
   `--dry-run`, where the command sizes and writes on the one connection it holds.
+- **cli:** `autumn db scrub --dry-run` sizes every target before printing a
+  line. Sizing opens its own connection and reads live counts, so it was the one
+  fallible step left inside the emission loop, and a failure on a LATER target
+  landed after an EARLIER one's complete transaction had been printed, `COMMIT`
+  included. Measured on a control plus one shard where the role could read the
+  catalogs but not `SELECT` the shard's `users`: the run exited 1 with
+  `permission denied for table users`, having already printed the control's
+  whole block — one `COMMIT`, seven `DELETE FROM` — so saving that output and
+  running it would scrub the control and leave the shard untouched, the
+  half-anonymized topology the classify-then-apply split exists to prevent. Now
+  nothing runnable is printed at all when any target cannot be sized (measured:
+  zero `BEGIN`, `COMMIT`, `DELETE FROM` and `ON_ERROR_STOP` lines), and a
+  healthy two-target run still prints both blocks in full.
 - **web:** `AutumnError` now reads back its own validation details (issue
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem

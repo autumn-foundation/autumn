@@ -2191,6 +2191,87 @@ async fn scrub_refuses_to_print_a_target_with_no_stated_port() {
     );
 }
 
+/// A later target that cannot be sized prints nothing for the earlier ones.
+///
+/// Sizing opens its own connection and reads live counts, so it is fallible and
+/// it used to run inside the emission loop — a failure on the SECOND target
+/// landed after the FIRST target's complete transaction had been printed,
+/// `COMMIT` included. Saving that output and running it scrubs the first
+/// database and leaves the second untouched, which is exactly the
+/// half-anonymized topology the classify-then-apply split exists to prevent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_target_that_cannot_be_sized_prints_no_script_for_the_others() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let control = seed_sample_fixture(&admin, &base, "mt_control").await;
+    let shard = seed_sample_fixture(&admin, &base, "mt_shard").await;
+
+    // A role that reads the catalogs on both, but cannot count the shard's
+    // rows. Classification passes; only the sizing read fails.
+    admin
+        .batch_execute("CREATE ROLE scrubber LOGIN PASSWORD 'pw'")
+        .await
+        .unwrap();
+    for db in [&control, &shard] {
+        db.batch_execute(
+            "GRANT ALL ON SCHEMA public TO scrubber;              GRANT ALL ON ALL TABLES IN SCHEMA public TO scrubber;              GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO scrubber;",
+        )
+        .await
+        .unwrap();
+    }
+    shard
+        .batch_execute("REVOKE SELECT ON users FROM scrubber")
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    std::fs::write(
+        dir.join("autumn.toml"),
+        format!(
+            "[app]\nname = \"mt\"\n\n\
+             [database]\nprimary_url = \"postgres://scrubber:pw@{host}:{port}/mt_control\"\n\n\
+             [[database.shards]]\nname = \"one\"\n\
+             primary_url = \"postgres://scrubber:pw@{host}:{port}/mt_shard\"\n"
+        ),
+    )
+    .unwrap();
+
+    let (stdout, stderr) = run_autumn_fail(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &[],
+    );
+    for output in [&stdout, &stderr] {
+        for runnable in ["BEGIN;", "COMMIT;", "DELETE FROM", "ON_ERROR_STOP"] {
+            assert!(
+                !output.contains(runnable),
+                "no target's script may be printed when another cannot be sized \
+                 (found {runnable}): {output}"
+            );
+        }
+    }
+
+    // And once it CAN be sized, both targets print in full.
+    shard
+        .batch_execute("GRANT SELECT ON users TO scrubber")
+        .await
+        .unwrap();
+    let (_o, ok) = run_autumn_ok(
+        dir,
+        &["db", "scrub", "--dry-run", "--sample", "users=1%"],
+        &[],
+    );
+    assert_eq!(
+        ok.matches("COMMIT;").count(),
+        2,
+        "both targets must print a complete transaction: {ok}"
+    );
+}
+
 /// A target whose connection string cannot name ONE endpoint is not printed.
 ///
 /// Two shapes, both measured on `PostgreSQL` 16.13. `hostaddr` selects the

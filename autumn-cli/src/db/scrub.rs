@@ -2951,6 +2951,31 @@ fn classify_and_apply(
         // it too, which a stream of destructive blocks wants. It does nothing for
         // an interactive paste — measured, psql ignores it there — which is what
         // the per-target guard below is for.
+        // Size every sampled target BEFORE printing a line. Sizing opens its own
+        // connection and reads live counts, so it is the one fallible step left
+        // in the emission loop — and a failure on a LATER target used to land
+        // after an EARLIER one's complete block, `COMMIT` included. Measured on
+        // a control plus one shard where the role could read the catalogs but
+        // not `SELECT` the shard's `users`: the run exited 1 with `permission
+        // denied for table users`, having already printed the control's whole
+        // transaction (one `COMMIT`, seven `DELETE FROM`). Saving that output
+        // and running it scrubs the control and leaves the shard untouched —
+        // the half-anonymized topology this function's two passes exist to
+        // prevent, reached through the one fallible call that had not moved
+        // into pass 1.
+        let mut sized: Vec<Option<BTreeMap<String, i64>>> = Vec::with_capacity(plans.len());
+        for (label, url, _, _, sampling) in &plans {
+            sized.push(match sampling {
+                Some(plan) => {
+                    let mut conn = probe_connection(url, label, "size the sample")?;
+                    Some(
+                        sample::source_counts(&mut conn, plan)
+                            .map_err(|e| ScrubError::Sql(e.to_string()))?,
+                    )
+                }
+                None => None,
+            });
+        }
         eprintln!("  \\set ON_ERROR_STOP on");
         // One flag for the whole stream: "everything so far succeeded, and the
         // last block was on the target it named". `execute` returns on the first
@@ -2962,7 +2987,7 @@ fn classify_and_apply(
         // never reaches the `\gset` that would set the flag true again, so one
         // failure skips every target after it.
         eprintln!("  \\set autumn_ok true");
-        for (label, url, plan, facts, sampling) in &plans {
+        for (index, (label, url, plan, facts, sampling)) in plans.iter().enumerate() {
             let no_deferral = BTreeSet::new();
             let deferred: &BTreeSet<String> =
                 sampling.as_ref().map_or(&no_deferral, |s| &s.purge_after);
@@ -3024,7 +3049,7 @@ fn classify_and_apply(
                 eprintln!("  {statement};");
             }
             if let Some(sampling) = sampling {
-                report_sample_sql(url, label, sampling)?;
+                report_sample_sql(sampling, sized[index].as_ref());
             }
             for (_, statement) in &phases.after_sample {
                 eprintln!("  {statement};");
@@ -3318,18 +3343,18 @@ fn report_sample_plan(label: &str, plan: &sample::SamplePlan) {
 /// The selection walk repeats until it stops finding related rows, so its
 /// statements are shown once with that noted rather than unrolled: how many
 /// passes a schema needs is a property of the data, not of the plan.
-fn report_sample_sql(url: &str, label: &str, plan: &sample::SamplePlan) -> Result<(), ScrubError> {
-    // Read the live row counts rather than printing a placeholder: a root's
-    // `LIMIT` is the one number a reader checks. Read outside the scrub's own
-    // transaction, so a concurrent write can move it between this print and a
+fn report_sample_sql(plan: &sample::SamplePlan, counts: Option<&BTreeMap<String, i64>>) {
+    // The counts are read for EVERY target before this prints anything, so a
+    // target that cannot be sized takes the whole script down before a line of
+    // it exists. They are still live counts read outside the scrub's own
+    // transaction, so a concurrent write can move one between this print and a
     // later real run — as it can for any dry run against a live database.
-    let mut conn = probe_connection(url, label, "size the sample")?;
-    let counts =
-        sample::source_counts(&mut conn, plan).map_err(|e| ScrubError::Sql(e.to_string()))?;
+    let empty = BTreeMap::new();
+    let counts = counts.unwrap_or(&empty);
     for statement in plan.setup_statements() {
         eprintln!("  {statement};");
     }
-    for statement in plan.seed_statements(&counts) {
+    for statement in plan.seed_statements(counts) {
         eprintln!("  {statement};");
     }
     for statement in plan.index_statements() {
@@ -3351,7 +3376,6 @@ fn report_sample_sql(url: &str, label: &str, plan: &sample::SamplePlan) -> Resul
             integrity_assertion(&statement)
         );
     }
-    Ok(())
 }
 
 /// Report what the sample kept, per table and in total (AC #6).
