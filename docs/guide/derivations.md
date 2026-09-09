@@ -370,7 +370,10 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   that parent being maintained. The same holds for the two columns every
   aggregate reads implicitly: onto its own table a derivation cannot maintain
   its `fk` or its `tenant` column, since a maintained value would re-parent
-  the row without carrying its contribution off the old parent.
+  the row without carrying its contribution off the old parent. The registry
+  repeats both rules at boot under the database's identifier semantics, so on
+  SQLite a `parent_table` or `column` that differs from the child's only in
+  case is caught there.
 - **Self-referential derivations sweep one parent per batch.** A child that
   derives onto its own table (a comment's `reply_count`) has rows that are
   children and parents at once, so a batch locking several parents in id order

@@ -427,6 +427,20 @@ fn check_source_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -
         let sources: Vec<String> = source_columns(def).into_iter().map(ident_key).collect();
         // The table whose columns are this derivation's sources: the child's.
         let source_table = ident_key(def.child_table);
+        // Onto its own table, the column a derivation maintains is a column of
+        // its source rows. The macro refuses the spelled-out case; this is the
+        // same rule under the backend's identifier semantics, where `Nodes`
+        // and `nodes` (or `Score` and `score`) are one name on `SQLite`.
+        if ident_key(def.parent_table) == source_table && sources.contains(&ident_key(def.column)) {
+            return Err(AutumnError::from(std::io::Error::other(format!(
+                "derivation `{}` on {}::{} onto its own table reads the column it maintains, \
+                 `{}.{}` (as its sum, in its filter, as its grouping key or as its tenant \
+                 column). The parent-side update runs no repository hook, so a row's new \
+                 value would change what it contributes to its own parent without that \
+                 parent being maintained. Read another column, or maintain another one",
+                def.name, def.module_path, def.model, def.parent_table, def.column,
+            ))));
+        }
         if let Some(other) = defs.iter().find(|other| {
             other.name != def.name
                 && ident_key(other.parent_table) == source_table
@@ -1741,6 +1755,68 @@ mod tests {
         // case-sensitive on Postgres: `"Score"` and `"score"` are two columns.
         let (lower, upper) = case_variant_pair();
         check_unique_columns(&[&lower, &upper], &[]).expect("two columns coexist");
+    }
+
+    #[test]
+    fn a_self_referential_derivation_cannot_read_its_own_column_at_boot_either() {
+        // The macro refuses the spelled-out case; the registry repeats it so a
+        // binary the macro did not see (or a backend whose identifiers fold
+        // case) cannot get one past the boot.
+        let self_read = DerivationDef {
+            name: "dv_comments.score",
+            parent_table: "dv_comments",
+            column: "score",
+            transform: "sum(score)",
+            filter: "",
+            filter_sql: "",
+            contrib_sql: "{c}.\"score\"",
+            ..count_def()
+        };
+        let message = check_source_columns(&[&self_read], &[])
+            .expect_err("a derivation onto its own table cannot read its column")
+            .to_string();
+        assert!(
+            message.contains("reads the column it maintains"),
+            "{message}"
+        );
+        // The grouping key and the tenant column are read implicitly too.
+        let own_fk = DerivationDef {
+            column: "post_id",
+            transform: "count",
+            contrib_sql: "1",
+            ..self_read
+        };
+        check_source_columns(&[&own_fk], &[]).expect_err("the grouping key is a source");
+        // Reading another column of its own table is the documented shape.
+        let reply_count = DerivationDef {
+            column: "reply_count",
+            transform: "count",
+            contrib_sql: "1",
+            filter: "published",
+            filter_sql: " AND ({c}.\"published\" = TRUE)",
+            ..self_read
+        };
+        check_source_columns(&[&reply_count], &[]).expect("a self-referential count is fine");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_folds_identifier_case_in_the_self_reference_check() {
+        // `Nodes`/`nodes` and `Score`/`score` are one table and one column on
+        // SQLite, so a definition the macro saw as targeting another table
+        // reads its own maintained column after all.
+        let folded = DerivationDef {
+            name: "Nodes.Score",
+            child_table: "nodes",
+            parent_table: "Nodes",
+            column: "Score",
+            transform: "sum(score)",
+            filter: "",
+            filter_sql: "",
+            contrib_sql: "{c}.\"score\"",
+            ..count_def()
+        };
+        check_source_columns(&[&folded], &[]).expect_err("case variants are one column on SQLite");
     }
 
     #[test]
