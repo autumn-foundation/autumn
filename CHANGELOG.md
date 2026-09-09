@@ -443,6 +443,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sides compare NULL, and an ordinary role loses the discriminator rather than
   the run — verified with a plain `LOGIN` role, which still refuses the clone on
   the port alone.
+  A positive `--sample` percentage of a nonempty table now always selects at
+  least one row. `ceil` alone did not guarantee the documented round-up: a
+  denormal percentage (`5e-324` parses as finite and greater than zero) makes
+  `total * pct / 100.0` UNDERFLOW to `0.0`, measured for a table of 1 and of 10
+  rows, and `ceil(0.0)` is `0` — a zero-row seed, whose root
+  `DELETE ... WHERE NOT EXISTS (keep)` then matches every row and empties the
+  table it was asked to sample.
   The compaction that runs AFTER the transaction — `VACUUM (FULL)` cannot run
   inside one — is fenced by psql rather than by the guard, because the guard
   cannot reach it: the printed `COMMIT` turns its abort into a `ROLLBACK` and

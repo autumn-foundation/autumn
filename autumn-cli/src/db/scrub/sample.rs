@@ -586,7 +586,26 @@ impl SampleAmount {
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             Self::Percent(pct) => {
                 let wanted = (total as f64 * pct / 100.0).ceil();
-                (wanted as i64).clamp(0, total)
+                let rows = (wanted as i64).clamp(0, total);
+                // A positive percentage of a nonempty table is at least one
+                // row, and `ceil` is not enough to guarantee that: the product
+                // UNDERFLOWS for a denormal percentage, and `ceil(0.0)` is 0.
+                // Measured, `pct = 5e-324` (the smallest positive f64, which
+                // parses as finite and > 0 and so is accepted):
+                //
+                //   total=1   -> product 0.0     -> 0 rows
+                //   total=10  -> product 0.0     -> 0 rows
+                //   total=200 -> product 1e-323  -> 1 row
+                //
+                // A zero-row seed does not select nothing harmlessly: the
+                // root's `DELETE ... WHERE NOT EXISTS (keep)` then matches
+                // every row, which is exactly the silently-empty database this
+                // round-up exists to prevent.
+                if total > 0 && pct > 0.0 {
+                    rows.max(1)
+                } else {
+                    rows
+                }
             }
         }
     }
@@ -2245,6 +2264,16 @@ mod tests {
         assert_eq!(SampleAmount::Percent(100.0).rows(1000), 1000);
         // An empty source table stays empty.
         assert_eq!(SampleAmount::Percent(50.0).rows(0), 0);
+        // `ceil` alone does not deliver the round-up: the product underflows
+        // for a denormal percentage, and `parse_spec` accepts one because it is
+        // finite and greater than zero. Measured before the clamp: 0 rows for a
+        // table of 1 and of 10 — and a zero-row seed makes the root's DELETE
+        // match every row, emptying the table it was asked to sample.
+        assert_eq!(SampleAmount::Percent(5e-324).rows(1), 1);
+        assert_eq!(SampleAmount::Percent(5e-324).rows(10), 1);
+        assert_eq!(SampleAmount::Percent(5e-324).rows(200), 1);
+        // An empty table still selects nothing: there is no row to round up to.
+        assert_eq!(SampleAmount::Percent(5e-324).rows(0), 0);
     }
 
     #[test]
