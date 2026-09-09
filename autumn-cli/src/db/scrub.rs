@@ -2879,10 +2879,10 @@ fn classify_and_apply(
             for view in &facts.materialized_views {
                 eprintln!("  REFRESH MATERIALIZED VIEW {};", qualified_ident(view));
             }
-            // And the same restore `execute` runs, in the same position: a view
-            // the database left `WITH NO DATA` is populated only so a dependent
-            // can be rebuilt from it, and emptied again once it has been.
-            for view in &facts.transient_views {
+            // And the same closing pass `execute` runs, in the same position:
+            // every view that had no data when the run probed ends with none,
+            // whether it was populated for a dependent or skipped entirely.
+            for view in &facts.unpopulated_views {
                 eprintln!(
                     "  REFRESH MATERIALIZED VIEW {} WITH NO DATA;",
                     qualified_ident(view)
@@ -2894,34 +2894,68 @@ fn classify_and_apply(
             // other, so `\gset` assigns nothing and the `false` above stands.
             eprintln!("  SELECT true AS autumn_scrubbed \\gset");
             eprintln!("  COMMIT;");
-            // Deliberately outside the envelope, as in `execute`: VACUUM (FULL)
-            // cannot run inside a transaction block. Printed as the real
-            // statements rather than described: a sample that is not compacted
-            // still occupies the source's disk, so an operator running the
-            // printed sequence without them does not get the laptop-sized copy
-            // the command promises.
-            //
-            // Being outside the envelope also puts them outside the target
-            // guard, and that gap was reachable: the `COMMIT` just printed turns
-            // the guard's abort into a ROLLBACK and clears the aborted state, so
-            // on a clone pasted at its origin every DELETE was refused and six
-            // VACUUM (FULL, ANALYZE) statements still ran on the ORIGIN, each
-            // taking an ACCESS EXCLUSIVE lock. psql fences them instead.
-            //
-            // The fence is emitted for EVERY target, not only a sampled one: it
-            // is what carries the failure forward, and a target with nothing to
-            // compact still has to say whether it succeeded.
+            // Whether this target actually scrubbed, recorded for the
+            // compaction pass that follows every target's block. Emitted for
+            // EVERY target, not only a sampled one: the flag is also what
+            // carries a failure forward, and a target with nothing to compact
+            // still has to say whether it succeeded.
             for line in post_commit_fence(&facts.endpoint) {
                 eprintln!("  {line}");
             }
-            if let Some(sampling) = sampling {
+            // Closes the `\if :autumn_ok` this target opened.
+            eprintln!("  \\endif");
+        }
+        // Compaction comes after EVERY target's transaction, never between two
+        // of them, because that is where `classify_and_apply` runs it: it
+        // commits each target in one loop and then compacts in a second, where
+        // a failure is a warning and the next target is compacted anyway.
+        //
+        // Printed inside the per-target block it was neither. Measured on two
+        // TCP targets with `ON_ERROR_STOP on` — the supported non-interactive
+        // way to run this — a `VACUUM (FULL, ANALYZE)` on the first target that
+        // timed out against a concurrent reader ended the script at rc=3: the
+        // first database was scrubbed and sampled (2 users, 0 original
+        // addresses) and the SECOND still held all 200 of its own, from a
+        // failure the command itself only warns about.
+        //
+        // Guarded as a whole on `:autumn_ok`, which matches the executor again:
+        // it propagates the first `execute` failure with `?`, so a later
+        // target's failure means no earlier target is compacted either.
+        let sampled: Vec<_> = plans
+            .iter()
+            .filter_map(|(label, url, _, facts, sampling)| {
+                sampling.as_ref().map(|s| (label, url, facts, s))
+            })
+            .collect();
+        if !sampled.is_empty() {
+            eprintln!("  \\if :autumn_ok");
+            // Warning-only from here, as in the executor: with `ON_ERROR_STOP`
+            // still on, one target's failed VACUUM would skip every later
+            // target's. Nothing destructive follows — these statements are
+            // outside every transaction and rewrite no rows — and the per-target
+            // guard below is what a failed `\connect` runs into, exactly as it
+            // does above.
+            eprintln!("  \\set ON_ERROR_STOP off");
+            for (label, url, facts, sampling) in sampled {
+                let purges = purge_statements(&facts.framework_tables, &sources.config);
+                for line in psql_connect(label, url) {
+                    eprintln!("  {line}");
+                }
+                // The same fail-closed shape the fence uses: false first, so a
+                // `\gset` whose query fails cannot carry the previous target's
+                // answer into this one's VACUUM statements.
+                eprintln!("  \\set autumn_here false");
+                eprintln!(
+                    "  SELECT NOT ({}) AS autumn_here \\gset",
+                    endpoint_mismatch(&facts.endpoint)
+                );
+                eprintln!("  \\if :autumn_here");
                 eprintln!("  SET lock_timeout = '{COMPACT_LOCK_TIMEOUT}';");
                 for table in compacted_tables(sampling, &purged_tables(&purges)) {
                     eprintln!("  VACUUM (FULL, ANALYZE) {};", qualified_ident(table));
                 }
+                eprintln!("  \\endif");
             }
-            eprintln!("  \\endif");
-            // Closes the `\if :autumn_ok` this target opened.
             eprintln!("  \\endif");
         }
         eprintln!("\n\u{2713} Dry run only \u{2014} nothing was written.");
@@ -2967,7 +3001,7 @@ fn classify_and_apply(
             &ViewRefresh {
                 ordered: &facts.materialized_views,
                 all: &facts.all_materialized_views,
-                transient: &facts.transient_views,
+                unpopulated: &facts.unpopulated_views,
             },
             sampling.as_ref(),
             label,
@@ -3331,7 +3365,7 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
 ///   on the dependent fails outright while its source is unpopulated (measured:
 ///   `materialized view "mv_a" has not been populated`), and an unrefreshed
 ///   populated view keeps its pre-scrub rows. So the source is refreshed after
-///   all — and `transient_views` puts it back afterwards, which is safe because
+///   all — and `unpopulated_views` puts it back after, which is safe because
 ///   emptying a source does not un-populate the dependent already rebuilt from
 ///   it (measured: the dependent kept `relispopulated` and all 200 rows).
 ///
@@ -3544,13 +3578,27 @@ pub struct DatabaseFacts {
     /// list is, though: the unreachable-view refusal compares the two, so a view
     /// present in only one of them reads as one the walk could not reach.
     pub all_materialized_views: Vec<String>,
-    /// The closure members that were UNPOPULATED when the run found them.
+    /// EVERY materialized view in `public` that was unpopulated when the run
+    /// probed it — not only the closure members among them.
     ///
-    /// Each is refreshed only because a populated view reads it, and emptied
-    /// again with `REFRESH ... WITH NO DATA` once that dependent has been
-    /// rebuilt — so a view the database deliberately left unpopulated is one the
-    /// scrub leaves unpopulated too.
-    pub transient_views: Vec<String>,
+    /// Each gets a `REFRESH ... WITH NO DATA` as the transaction's last view
+    /// statement, which does two jobs. A closure member was populated only so a
+    /// dependent could be rebuilt from it, and this puts it back. A view outside
+    /// the closure was skipped, and this closes the race that skipping opened:
+    /// probing runs on its own connection before the apply transaction, the
+    /// locks that transaction takes are `SHARE ROW EXCLUSIVE` on base tables and
+    /// none at all on a view, and `REFRESH MATERIALIZED VIEW` needs only
+    /// `ACCESS SHARE` on the tables it reads. Measured on `PostgreSQL` 16.13: a
+    /// concurrent session refreshed a skipped view mid-scrub without waiting,
+    /// and the run committed with `users` scrubbed to 2 rows and the view
+    /// holding all 200 original addresses. Emptying it under the `ACCESS
+    /// EXCLUSIVE` this statement takes serialises that session behind the
+    /// commit, after which it can only re-derive from scrubbed rows.
+    ///
+    /// It costs nothing that skipping saved: `REFRESH ... WITH NO DATA` does not
+    /// run the view's query. Measured on a view defined as `SELECT 1/0`, it
+    /// succeeds where a plain `REFRESH` raises `division by zero`.
+    pub unpopulated_views: Vec<String>,
     /// Non-system schemas other than `public` that hold base tables. The whole
     /// classification universe is `public`-only, so these are refused.
     pub other_schemas: BTreeSet<String>,
@@ -4111,16 +4159,13 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
-    // The members of that closure that were unpopulated when the run found
-    // them: refreshed only because a populated view reads them, and emptied
-    // again once it has been.
-    let transient_views = names(
-        &format!(
-            "{MV_REFRESH_CLOSURE} \
-             SELECT rel.relname AS name FROM needed n \
-             JOIN pg_class rel ON rel.oid = n.oid \
-             WHERE NOT rel.relispopulated ORDER BY rel.relname"
-        ),
+    // EVERY unpopulated view, not only the closure members among them, because
+    // this list closes a race as well as restoring a state. See
+    // `DatabaseFacts::unpopulated_views`.
+    let unpopulated_views = names(
+        "SELECT rel.relname AS name FROM pg_class rel \
+         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+         WHERE rel.relkind = 'm' AND NOT rel.relispopulated ORDER BY rel.relname",
         &mut conn,
     )?;
 
@@ -4180,7 +4225,7 @@ fn probe_database_facts(
         delete_triggered_tables,
         materialized_views,
         all_materialized_views,
-        transient_views,
+        unpopulated_views,
         other_schemas,
         framework_tables,
         public_columns,
@@ -4527,8 +4572,8 @@ fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
     terms.join(" OR ")
 }
 
-/// The psql conditional that fences everything a target block does AFTER its
-/// `COMMIT`.
+/// The psql predicate that decides whether this target really scrubbed, read by
+/// the compaction pass that runs after every target's `COMMIT`.
 ///
 /// `VACUUM (FULL)` cannot run inside a transaction block, so the compaction is
 /// the one part of a target's plan the in-transaction guard cannot cover — and
@@ -4541,10 +4586,14 @@ fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
 /// `ACCESS EXCLUSIVE` lock and rewriting the table.
 ///
 /// So psql decides instead of the server. `\gset` reads the same predicate the
-/// guard uses, and `\if` skips the block when it is false. Both failure modes
-/// are closed, measured on psql 16.13: a false value prints `query ignored`, and
-/// a `\gset` whose query ERRORED leaves the variable unset, which `\if` reports
-/// as `Boolean expected` and still skips.
+/// guard uses into `autumn_ok`, and the compaction pass `\if`s on it. Both
+/// failure modes are closed, measured on psql 16.13: a false value prints
+/// `query ignored`, and a `\gset` whose query ERRORED leaves the variable
+/// unset, which `\if` reports as `Boolean expected` and still skips.
+///
+/// The `\if` itself is NOT emitted here. Compaction is printed after every
+/// target's transaction rather than inside one, because that is where the
+/// executor runs it; this leaves the flag for that pass to read.
 ///
 /// The `search_path` pin is re-applied first because the run's own pins are
 /// `SET LOCAL` — they belong to the transaction that just rolled back, so the
@@ -4565,7 +4614,6 @@ fn post_commit_fence(endpoint: &ServerEndpoint) -> Vec<String> {
              AND NOT ({})) AS autumn_ok \\gset",
             endpoint_mismatch(endpoint),
         ),
-        "\\if :autumn_ok".to_owned(),
     ]
 }
 
@@ -4899,11 +4947,11 @@ type Applied = (Vec<(String, usize)>, Option<sample::SampleOutcome>);
 
 /// The materialized-view work one target's transaction owes: which views to
 /// refresh and in what order, the flat closure the size report measures over,
-/// and the members to return to `WITH NO DATA` once their dependents are built.
+/// and every view to leave `WITH NO DATA` once those refreshes are done.
 struct ViewRefresh<'a> {
     ordered: &'a [String],
     all: &'a [String],
-    transient: &'a [String],
+    unpopulated: &'a [String],
 }
 
 /// Run every statement for one database inside a single transaction, so a
@@ -5045,12 +5093,15 @@ fn execute(
             .execute(conn)?;
             counts.push((format!("{view} (materialized view refreshed)"), 0));
         }
-        // And back to `WITH NO DATA` for the ones that only had to be populated
-        // so a dependent could be rebuilt from them. Last, after every refresh,
+        // And `WITH NO DATA` for every view that had none when the run probed:
+        // the ones populated only so a dependent could be rebuilt from them, and
+        // the ones skipped entirely — which a concurrent session could have
+        // populated from pre-scrub rows in the meantime, since nothing here
+        // locks a view the run does not refresh. Last, after every refresh,
         // because emptying a source before its dependent is rebuilt makes that
         // refresh fail — and safe here, because emptying it afterwards does not
         // un-populate the dependent already rebuilt from it.
-        for view in views.transient {
+        for view in views.unpopulated {
             sql_query(format!(
                 "REFRESH MATERIALIZED VIEW {} WITH NO DATA",
                 qualified_ident(view)
@@ -5155,9 +5206,21 @@ mod tests {
             "the fence must re-pin the path it needs: {fence:?}"
         );
         assert!(
-            fence.iter().any(|line| line.contains("\\gset"))
-                && fence.iter().any(|line| line == "\\if :autumn_ok"),
+            fence
+                .iter()
+                .any(|line| line.contains("\\gset") && line.contains("AS autumn_ok")),
             "psql, not the server, has to decide this one: {fence:?}"
+        );
+        // The `\if` belongs to the compaction pass, which runs after EVERY
+        // target's transaction rather than inside one. Emitting it here put the
+        // VACUUM statements between two targets: measured on two TCP targets
+        // under `ON_ERROR_STOP on`, a first-target VACUUM that timed out ended
+        // the script at rc=3 with that database scrubbed and the SECOND still
+        // holding all 200 of its original addresses — from a failure the
+        // executor only warns about.
+        assert!(
+            !fence.iter().any(|line| line == "\\if :autumn_ok"),
+            "the fence sets the flag; the compaction pass reads it: {fence:?}"
         );
         // One flag for the whole stream, not one per target: `execute` returns
         // on the first target that fails and never touches the rest, and the

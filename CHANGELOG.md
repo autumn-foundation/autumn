@@ -512,6 +512,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then emptied again with `REFRESH ... WITH NO DATA` once the dependent has been
   rebuilt. Measured: the dependent keeps its rows and its populated state when
   its source is emptied afterwards, so both relations end as the run found them.
+  That closing `REFRESH ... WITH NO DATA` covers EVERY view that had no data,
+  not only the one populated for a dependent, because skipping one outright left
+  a race: probing runs on its own connection before the apply transaction, which
+  locks base tables and no views at all, and `REFRESH` needs only `ACCESS SHARE`
+  on the tables it reads. Measured — a concurrent `REFRESH` of a skipped view
+  fired while the scrub held `SHARE ROW EXCLUSIVE` on `users` did not wait, and
+  the run committed with `users` at 2 rows and the view holding all 200 original
+  addresses. It costs nothing that skipping saved: `REFRESH ... WITH NO DATA`
+  does not run the view's query, measured on a view defined as `SELECT 1/0`,
+  where it succeeds and a plain `REFRESH` raises `division by zero`.
+  `--dry-run` now prints the compaction after EVERY target's transaction rather
+  than inside each one, and turns `ON_ERROR_STOP` off first, matching the
+  executor: it commits every target in one loop and compacts in a second, where
+  a failed `VACUUM` is a warning and the next target is compacted anyway.
+  Measured on two TCP targets — a first-target `VACUUM (FULL, ANALYZE)` that
+  timed out against a concurrent reader ended the script at rc=3 with that
+  database scrubbed and sampled and the SECOND still holding all 200 of its
+  original addresses. Each target's compaction reconnects and re-checks the
+  endpoint before running, so a failed `\connect` in that pass cannot compact
+  the previous target's database.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the

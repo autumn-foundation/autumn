@@ -2202,6 +2202,11 @@ async fn the_size_report_counts_a_refreshed_materialized_view() {
 /// view keeps its pre-scrub rows. So the source is refreshed after all — and
 /// emptied again once the dependent has been rebuilt from it, which leaves both
 /// exactly as the run found them.
+///
+/// Every unpopulated view gets that closing `REFRESH ... WITH NO DATA`, not only
+/// the one populated for a dependent, because skipping one outright left a race:
+/// probing runs before the apply transaction, and nothing that transaction locks
+/// stops another session populating a view this run does not refresh.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn an_unpopulated_materialized_view_is_left_unpopulated() {
@@ -2258,11 +2263,26 @@ async fn an_unpopulated_materialized_view_is_left_unpopulated() {
         "a populated view must still be refreshed: {stderr}"
     );
     assert!(
-        !stderr.contains("deferred_report"),
-        "the standalone unpopulated view must not be touched at all: {stderr}"
+        !stderr.contains("deferred_report (materialized view refreshed)"),
+        "the standalone unpopulated view must not be REFRESHED — that would run \
+         the query it was left unpopulated to avoid: {stderr}"
+    );
+    // It is still emptied, though. Probing runs on its own connection before the
+    // apply transaction, and nothing that transaction locks stops another
+    // session refreshing a view this run skipped: measured on PostgreSQL 16.13,
+    // a concurrent `REFRESH` fired while the scrub held `SHARE ROW EXCLUSIVE` on
+    // `users` did not wait, and the run committed with `users` at 2 rows and the
+    // view holding all 200 original addresses. A closing `REFRESH ... WITH NO
+    // DATA` takes `ACCESS EXCLUSIVE` and costs nothing — it does not run the
+    // view's query (measured: it succeeds on a view defined as `SELECT 1/0`,
+    // where a plain `REFRESH` raises `division by zero`).
+    assert!(
+        stderr.contains("deferred_report (materialized view left unpopulated)"),
+        "the standalone unpopulated view must still be emptied under lock: {stderr}"
     );
     assert!(
-        stderr.contains("source_report (materialized view left unpopulated)"),
+        stderr.contains("source_report (materialized view refreshed)")
+            && stderr.contains("source_report (materialized view left unpopulated)"),
         "the source a populated view reads must be refreshed and then emptied \
          again: {stderr}"
     );
@@ -2344,6 +2364,24 @@ async fn sampling_compacts_and_measures_the_purged_framework_table() {
     assert!(
         dry_err.contains(r#"VACUUM (FULL, ANALYZE) "public"."autumn_jobs""#),
         "the printed compaction must cover the purged table: {dry_err}"
+    );
+    // And it must come after EVERY target's transaction, warning-only, because
+    // that is where the executor runs it. Printed inside the per-target block it
+    // was neither: measured on two TCP targets under `ON_ERROR_STOP on`, a
+    // first-target `VACUUM` that timed out against a concurrent reader ended the
+    // script at rc=3 with that database scrubbed and the SECOND still holding
+    // all 200 of its own original addresses.
+    let vacuum_at = dry_err.find("VACUUM (FULL, ANALYZE)").unwrap();
+    assert!(
+        dry_err.rfind("COMMIT;").unwrap() < vacuum_at,
+        "compaction must follow the last target's COMMIT: {dry_err}"
+    );
+    assert!(
+        dry_err
+            .find("\\set ON_ERROR_STOP off")
+            .is_some_and(|off| off < vacuum_at),
+        "a failed compaction must not stop the script, as it does not stop the \
+         command: {dry_err}"
     );
 
     let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);

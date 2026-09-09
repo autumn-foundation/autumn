@@ -419,6 +419,14 @@ and quoted values with escapes), the run **refuses** rather than print a
 destructive block with no boundary above it. Configure such a target as a URI to
 use `--dry-run` on it; scrubbing it without `--dry-run` is unaffected.
 
+Compaction is printed after **every** target's transaction, never between two of
+them, and with `ON_ERROR_STOP` turned off first — because that is what the
+command itself does: it commits each target and then compacts in a second pass
+where a failed `VACUUM` is a warning. Printed inside a target's block it was
+neither, and a `VACUUM` on the first target that timed out against a concurrent
+reader ended the script with that database scrubbed and the second still holding
+its production rows.
+
 That boundary is checked rather than trusted. `\connect` does **not** close the
 existing connection when the new one fails: psql prints `Previous connection
 kept` and the session carries on, so the block below it would run against the
@@ -729,7 +737,10 @@ apply-time error.
   populated, and the scrub does not spend the query time and disk it was left
   unpopulated to save. If a populated view reads it, it is refreshed after all —
   the dependent cannot be rebuilt otherwise — and emptied again once that
-  dependent has been, so both end as the run found them.
+  dependent has been, so both end as the run found them. Every view that had no
+  data gets that closing `REFRESH ... WITH NO DATA`, which also settles a race:
+  the scrub locks base tables, not views, so another session can populate a
+  skipped view from pre-scrub rows while the run is open.
 - **A key column holding PII can only be declared `safe`.** A natural key
   (`patients(ssn PRIMARY KEY)`) cannot be anonymized in place without rewriting
   every row that references it, which this command does not do — so it is kept
