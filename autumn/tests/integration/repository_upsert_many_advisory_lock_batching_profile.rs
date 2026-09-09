@@ -34,6 +34,7 @@
 #![cfg(feature = "db")]
 #![allow(clippy::cast_possible_wrap)] // fixture indices are bounded well under i64::MAX
 
+use autumn_web::hooks::MutationHooks;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
@@ -61,9 +62,23 @@ pub struct LedgerUpsertLockRecord {
     pub value: i32,
 }
 
+// A no-op hooks impl, matching `HookedVersionedRecord` in
+// `repository_bulk_operations.rs` — the proven-working
+// `hooks + versioned = true` combination this harness's model mirrors,
+// rather than the untested hooks-free + versioned=true corner.
+#[derive(Clone, Default)]
+pub struct LedgerUpsertLockRecordHooks;
+
+impl MutationHooks for LedgerUpsertLockRecordHooks {
+    type Model = LedgerUpsertLockRecord;
+    type NewModel = NewLedgerUpsertLockRecord;
+    type UpdateModel = UpdateLedgerUpsertLockRecord;
+}
+
 #[autumn_web::repository(
     LedgerUpsertLockRecord,
     table = "ledger_upsert_lock_records",
+    hooks = LedgerUpsertLockRecordHooks,
     versioned = true
 )]
 pub trait LedgerUpsertLockRecordRepository {}
@@ -139,6 +154,7 @@ async fn setup_pool() -> (
 const fn build_repo(pool: Pool<AsyncPgConnection>) -> PgLedgerUpsertLockRecordRepository {
     PgLedgerUpsertLockRecordRepository {
         pool,
+        hooks: LedgerUpsertLockRecordHooks,
         __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
