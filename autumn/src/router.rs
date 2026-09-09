@@ -566,27 +566,7 @@ fn build_router_pre_state(
         .map(|v| v.0.iter().map(|av| av.version.as_str()).collect())
         .unwrap_or_default();
 
-    let check_route_version = |route: &Route| -> Result<(), RouterBuildError> {
-        if let Some(version) = route
-            .api_version
-            .filter(|ver| !registered_versions.contains(*ver))
-        {
-            return Err(RouterBuildError::UnregisteredApiVersion {
-                route_name: route.name.to_string(),
-                version: version.to_string(),
-            });
-        }
-        Ok(())
-    };
-
-    for route in &route_list {
-        check_route_version(route)?;
-    }
-    for group in &ctx.scoped_groups {
-        for route in &group.routes {
-            check_route_version(route)?;
-        }
-    }
+    reject_unregistered_api_versions(&route_list, &ctx.scoped_groups, &registered_versions)?;
 
     // Fail fast when two user- or plugin-registered routes share a `(method,
     // path)`. `group_and_mount_routes` would hand the overlap to
@@ -635,23 +615,7 @@ fn build_router_pre_state(
     #[cfg(feature = "mcp")]
     let mcp_prepared: Option<McpPrepared> = if let Some(rt) = ctx.mcp.take() {
         let path = rt.mount_path.as_str();
-        // The mount path must be one static endpoint. Reject empty,
-        // non-absolute, doubled-slash, and dynamic (`{capture}` / `{*rest}`)
-        // paths so MCP cannot shadow a path class, and so the collision
-        // preflight reserves the exact URL it matches. Colon-prefixed segments
-        // (`/:mcp`, axum 0.7 syntax) panic in axum 0.8's `Router::route`;
-        // rejecting them here yields `InvalidMcpPath` instead of a crash.
-        if path.is_empty()
-            || !path.starts_with('/')
-            || path.contains("//")
-            || path.contains('{')
-            || path.contains('*')
-            || path.split('/').any(|segment| segment.starts_with(':'))
-        {
-            return Err(RouterBuildError::InvalidMcpPath {
-                value: rt.mount_path,
-            });
-        }
+        validate_mcp_mount_path(path)?;
         // The MCP endpoint mounts GET+POST at `mount_path`. If a user, framework,
         // or OpenAPI route already owns that exact path, the later `merge` would
         // panic on overlapping method routes; surface it as a recoverable error
@@ -1203,16 +1167,7 @@ fn build_openapi_router(
     // Validate user-provided paths up front so a typo like
     // `"openapi.json"` surfaces as a recoverable RouterBuildError
     // rather than an axum panic (`Paths must start with a '/'`).
-    validate_route_path("openapi_json_path", &config.openapi_json_path)?;
-    if let Some(path) = &config.swagger_ui_path {
-        validate_route_path("swagger_ui_path", path)?;
-        // Registering two GET handlers on the same path would cause an
-        // axum `Route::route` panic, so reject collisions as a
-        // configuration error instead.
-        if path == &config.openapi_json_path {
-            return Err(RouterBuildError::DuplicateOpenApiPath { path: path.clone() });
-        }
-    }
+    validate_openapi_mount_paths(&config)?;
 
     let docs = collect_openapi_docs(route_list, scoped_groups);
 
@@ -1560,7 +1515,7 @@ fn collect_claimed_get_paths(
 /// The configured `OpenAPI` JSON/UI/asset paths (which merge as `GET`s before
 /// the MCP router) are checked as well.
 #[cfg(feature = "mcp")]
-fn reject_mcp_path_collisions(
+pub fn reject_mcp_path_collisions(
     mount_path: &str,
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
@@ -1658,7 +1613,7 @@ fn reject_mcp_path_collisions(
 /// We emit a `tracing::warn!` so operators know the check is
 /// incomplete in that case.
 #[cfg(feature = "openapi")]
-fn reject_openapi_path_collisions(
+pub fn reject_openapi_path_collisions(
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
@@ -1875,7 +1830,106 @@ fn framework_route_clashes(
 /// The first pairwise collision wins: `existing` names the handler that
 /// registered the path first (in the iteration order used by the actual
 /// mount step), `incoming` names the duplicate that triggered the error.
-fn reject_duplicate_user_routes(
+/// Fail when a route declares an API version that was never registered.
+///
+/// Extracted from `build_router_pre_state`, which used to inline this as a
+/// closure, so the no-boot dump modes can run the SAME rule. `autumn openapi
+/// export` otherwise emitted a document for a versioned app that cannot start
+/// (issue #802). One definition, both callers — a second copy would drift.
+/// Validate the configured `OpenAPI` JSON and Swagger-UI mount paths.
+///
+/// Shared by `build_openapi_router` and the no-boot dump modes: a malformed
+/// path (`"openapi.json"` with no leading slash) or two endpoints on the same
+/// path make the serving router unbuildable, and an export that ignored that
+/// would let `--check` pass for an app that cannot start (issue #802).
+///
+/// Gated on `openapi` like every item it touches: `OpenApiConfig`,
+/// `validate_route_path` and `RouterBuildError::DuplicateOpenApiPath` are all
+/// behind that feature, and extracting this out of `build_openapi_router` (which
+/// sits inside the gated region) moved it out from under the gate.
+#[cfg(feature = "openapi")]
+pub fn validate_openapi_mount_paths(
+    config: &crate::openapi::OpenApiConfig,
+) -> Result<(), RouterBuildError> {
+    validate_route_path("openapi_json_path", &config.openapi_json_path)?;
+    if let Some(path) = &config.swagger_ui_path {
+        validate_route_path("swagger_ui_path", path)?;
+        // Registering two GET handlers on the same path would cause an
+        // axum `Route::route` panic, so reject collisions as a
+        // configuration error instead.
+        if path == &config.openapi_json_path {
+            return Err(RouterBuildError::DuplicateOpenApiPath { path: path.clone() });
+        }
+    }
+    Ok(())
+}
+
+/// Validate the MCP mount path.
+///
+/// It must be one static endpoint: reject empty, non-absolute, doubled-slash and
+/// dynamic (`{capture}` / `{*rest}`) paths, so MCP cannot shadow a path class and
+/// the collision preflight reserves the exact URL it matches. Colon-prefixed
+/// segments (`/:mcp`, axum 0.7 syntax) panic in axum 0.8's `Router::route`;
+/// rejecting them here yields `InvalidMcpPath` instead of a crash.
+///
+/// Extracted from `build_router_pre_state`, which used to inline it, so the
+/// no-boot dump modes can run the SAME rule rather than a second copy that would
+/// drift (issue #802).
+///
+/// Gated on `mcp` like `RouterBuildError::InvalidMcpPath` itself.
+#[cfg(feature = "mcp")]
+pub fn validate_mcp_mount_path(path: &str) -> Result<(), RouterBuildError> {
+    if path.is_empty()
+        || !path.starts_with('/')
+        || path.contains("//")
+        || path.contains('{')
+        || path.contains('*')
+        || path.split('/').any(|segment| segment.starts_with(':'))
+    {
+        return Err(RouterBuildError::InvalidMcpPath {
+            value: path.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub fn reject_unregistered_api_versions(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    registered_versions: &std::collections::HashSet<&str>,
+) -> Result<(), RouterBuildError> {
+    let check = |route: &Route| -> Result<(), RouterBuildError> {
+        if let Some(version) = route
+            .api_version
+            .filter(|ver| !registered_versions.contains(*ver))
+        {
+            return Err(RouterBuildError::UnregisteredApiVersion {
+                route_name: route.name.to_string(),
+                version: version.to_string(),
+            });
+        }
+        Ok(())
+    };
+
+    for route in route_list {
+        check(route)?;
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            check(route)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fail when two user- or plugin-registered routes share a `(method, path)`.
+///
+/// `pub` so the no-boot dump modes can run the SAME check the serving path
+/// runs. `autumn openapi export` otherwise emitted a document in which the
+/// later of two colliding operations silently overwrote the earlier — so
+/// `--check` could pass on a contract for an app that cannot start at all
+/// (issue #802). One function, both callers, no second copy to drift.
+pub fn reject_duplicate_user_routes(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
     merge_routers: &[axum::Router<AppState>],
@@ -6465,7 +6519,7 @@ pub async fn htmx_sse_handler() -> axum::response::Response {
 }
 
 #[cfg(feature = "openapi")]
-fn collect_openapi_docs(
+pub fn collect_openapi_docs(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
 ) -> Vec<crate::openapi::ApiDoc> {

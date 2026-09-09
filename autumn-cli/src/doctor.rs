@@ -3784,27 +3784,51 @@ fn check_database_topology_contract(
 ///
 /// A split web/worker role runs the HTTP tier and the job/scheduler tier in
 /// **separate processes**, so it needs a durable jobs backend the two processes
-/// can share. Only the recognized durable backends (`postgres`/`redis`) qualify;
-/// any other value — the in-process `local` queue, a typo like `postgresql`, or a
+/// can share. Only the recognized durable backends
+/// (`postgres`/`redis`/`sqlite`) qualify — `sqlite` because its queue is a table
+/// both processes on the host open (issue #1907). Any other value — the
+/// in-process `local` queue, a typo like `postgresql`, or a
 /// blank backend — falls through to the per-process local runtime, where a web
 /// replica's enqueue never reaches a worker replica's queue.
 /// [`autumn_web::config::split_role_requires_durable_backend`] flags that invalid
 /// combo; the app itself rejects it at startup, and doctor surfaces it up front.
-fn check_split_topology_on_local(role: ProcessRole, jobs_backend: &str) -> CheckResult {
+fn check_split_topology_on_local(
+    role: ProcessRole,
+    jobs_backend: &str,
+    database_url: Option<&str>,
+) -> CheckResult {
     let backend = jobs_backend.trim();
+    // The sqlite queue is shareable only because both processes open the same
+    // FILE. An in-memory target gives each its own database, so the web replica
+    // enqueues where no worker can look (issue #1907).
+    if autumn_web::config::split_role_requires_file_backed_sqlite(role, backend, database_url) {
+        return CheckResult {
+            name: "process_role_backend",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "role={} with jobs.backend=\"sqlite\" on an in-memory database: an in-memory \
+                 SQLite target is private to each process, so a split web/worker topology would \
+                 enqueue into a queue no worker process can see",
+                role.as_str(),
+            )),
+            hint: Some(
+                "Point database.url at a sqlite:// FILE for a split web/worker role, or run the combined role",
+            ),
+        };
+    }
     if autumn_web::config::split_role_requires_durable_backend(role, jobs_backend) {
         return CheckResult {
             name: "process_role_backend",
             status: CheckStatus::Fail,
             detail: Some(format!(
                 "role={} with jobs.backend=\"{backend}\": a split web/worker role needs a durable \
-                 (postgres/redis) jobs backend; \"{backend}\" is not a recognized durable backend \
-                 and falls through to the in-process `local` runtime, which cannot share a job \
-                 queue across the separate web and worker processes",
+                 (postgres/redis/sqlite) jobs backend; \"{backend}\" is not a recognized durable \
+                 backend and falls through to the in-process `local` runtime, which cannot share a \
+                 job queue across the separate web and worker processes",
                 role.as_str(),
             )),
             hint: Some(
-                "Set jobs.backend = \"postgres\" (or redis) for split web/worker roles, or run the combined role",
+                "Set jobs.backend = \"postgres\" (or redis, or sqlite on the single-host SQLite tier) for split web/worker roles, or run the combined role",
             ),
         };
     }
@@ -5620,12 +5644,15 @@ fn resolve_deploy_previous_signing_secrets(merged: &toml::Table) -> Result<Vec<S
     Ok(out)
 }
 
-/// Whether any enabled runtime feature requires a configured Postgres pool at
+/// Whether any enabled runtime feature requires a configured database pool at
 /// startup, resolved from the merged active-profile runtime table (env first).
 /// Mirrors the exact backend conditions the runtime enforces:
 /// - `jobs.backend = "postgres"` → `job::start_postgres_runtime` requires a pool.
 /// - `scheduler.backend = "postgres"` → `scheduler::coordinator_from_config`
 ///   requires a pool.
+/// - `jobs.backend = "sqlite"` / `scheduler.backend = "sqlite"` → the durable
+///   `SQLite` queue and lease table live in the app's own database, so both
+///   require a pool too (issue #1907).
 ///
 /// Cache, channels, and idempotency have only in-memory/Redis backends (no
 /// Postgres variant), so they never require a DB pool.
@@ -5636,20 +5663,28 @@ fn resolve_deploy_db_backed_runtime(
     let env_var = |key: &str| env.var(key).ok().filter(|value| !value.is_empty());
 
     let jobs = merged.get("jobs").and_then(toml::Value::as_table);
-    let jobs_postgres = first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
-        .or_else(|| first_toml_string(jobs, &["backend"]))
-        .as_deref()
-        .map(str::trim)
-        == Some("postgres");
+    let jobs_db_backed = matches!(
+        first_env(&env_var, &["AUTUMN_JOBS__BACKEND"])
+            .or_else(|| first_toml_string(jobs, &["backend"]))
+            .as_deref()
+            .map(str::trim),
+        Some("postgres" | "sqlite")
+    );
 
     let scheduler = merged.get("scheduler").and_then(toml::Value::as_table);
-    let scheduler_postgres = first_env(&env_var, &["AUTUMN_SCHEDULER__BACKEND"])
+    let scheduler_db_backed = first_env(&env_var, &["AUTUMN_SCHEDULER__BACKEND"])
         .or_else(|| first_toml_string(scheduler, &["backend"]))
         .as_deref()
         .and_then(autumn_web::config::SchedulerBackend::from_env_value)
-        .is_some_and(|backend| backend == autumn_web::config::SchedulerBackend::Postgres);
+        .is_some_and(|backend| {
+            matches!(
+                backend,
+                autumn_web::config::SchedulerBackend::Postgres
+                    | autumn_web::config::SchedulerBackend::Sqlite
+            )
+        });
 
-    jobs_postgres || scheduler_postgres
+    jobs_db_backed || scheduler_db_backed
 }
 
 fn resolve_trusted_hosts() -> Vec<String> {
@@ -7929,9 +7964,15 @@ pub fn run(opts: DoctorOptions) {
     }));
 
     // 4b. Process role vs. jobs backend: a split web/worker role can't share the
-    // in-process `local` job queue across separate processes.
+    // in-process `local` job queue across separate processes — nor an in-memory
+    // SQLite database, which is private to each of them.
+    let split_topology_db_url = db_topology.primary_url.clone();
     tasks.push(Box::new(move || {
-        check_split_topology_on_local(process_role, &jobs_backend)
+        check_split_topology_on_local(
+            process_role,
+            &jobs_backend,
+            split_topology_db_url.as_deref(),
+        )
     }));
 
     // 4c. Queue pinning zero-coverage guard (#1623): warn if jobs.pin leaves a
@@ -15557,7 +15598,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_fails_on_web_role_with_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Web, "local");
+        let result = check_split_topology_on_local(ProcessRole::Web, "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
         assert!(
@@ -15573,14 +15614,14 @@ foo = "bar"
 
     #[test]
     fn split_topology_fails_on_worker_role_with_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Worker, "local");
+        let result = check_split_topology_on_local(ProcessRole::Worker, "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("worker"));
     }
 
     #[test]
     fn split_topology_passes_for_combined_role_on_local_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Combined, "local");
+        let result = check_split_topology_on_local(ProcessRole::Combined, "local", None);
         assert_eq!(result.status, CheckStatus::Pass);
         // Combined never splits, so the detail need not mention the backend.
         assert_eq!(result.detail.as_deref(), Some("role=combined"));
@@ -15589,7 +15630,7 @@ foo = "bar"
 
     #[test]
     fn split_topology_passes_for_web_role_on_postgres_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Web, "postgres");
+        let result = check_split_topology_on_local(ProcessRole::Web, "postgres", None);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=web"), "got: {detail}");
@@ -15598,11 +15639,38 @@ foo = "bar"
 
     #[test]
     fn split_topology_passes_for_worker_role_on_redis_backend() {
-        let result = check_split_topology_on_local(ProcessRole::Worker, "redis");
+        let result = check_split_topology_on_local(ProcessRole::Worker, "redis", None);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("role=worker"), "got: {detail}");
         assert!(detail.contains("redis"), "got: {detail}");
+    }
+
+    /// Issue #1907: the durable `SQLite` queue is a table both processes on the
+    /// host open, so it backs a split role.
+    #[test]
+    fn split_topology_passes_for_worker_role_on_sqlite_backend() {
+        let result = check_split_topology_on_local(
+            ProcessRole::Worker,
+            "sqlite",
+            Some("sqlite:///var/lib/app.db"),
+        );
+        assert_eq!(result.status, CheckStatus::Pass);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("role=worker"), "got: {detail}");
+        assert!(detail.contains("sqlite"), "got: {detail}");
+    }
+
+    /// Issue #1907: the sqlite queue backs a split role only on a FILE.
+    #[test]
+    fn split_topology_fails_for_sqlite_on_an_in_memory_database() {
+        let result =
+            check_split_topology_on_local(ProcessRole::Web, "sqlite", Some("sqlite::memory:"));
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("in-memory"), "got: {detail}");
+        let hint = result.hint.unwrap_or_default();
+        assert!(hint.contains("FILE"), "the hint names the fix: {hint}");
     }
 
     #[test]
@@ -15610,7 +15678,7 @@ foo = "bar"
         // A typo like `postgresql` is not a recognized durable backend: it falls
         // through to the in-process local runtime, so a split role must be
         // rejected exactly as it is for the literal `local`.
-        let result = check_split_topology_on_local(ProcessRole::Web, "postgresql");
+        let result = check_split_topology_on_local(ProcessRole::Web, "postgresql", None);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
         assert!(
@@ -15627,7 +15695,7 @@ foo = "bar"
     #[test]
     fn split_topology_fails_on_web_role_with_blank_backend() {
         // A blank backend also falls through to the local runtime.
-        let result = check_split_topology_on_local(ProcessRole::Web, "");
+        let result = check_split_topology_on_local(ProcessRole::Web, "", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("web"));
     }
@@ -16767,7 +16835,7 @@ foo = "bar"
 
         // ...and doctor therefore flags the split-on-local misconfiguration the
         // runtime rejects at startup, instead of wrongly passing.
-        let result = check_split_topology_on_local(role, &backend);
+        let result = check_split_topology_on_local(role, &backend, None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("worker"));
     }

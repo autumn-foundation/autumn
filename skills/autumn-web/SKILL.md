@@ -880,7 +880,7 @@ raw Diesel:
 | `hooks = MyHooks` (attr) | `before_/after_create/update/delete` + `after_*_commit` lifecycle hooks with `MutationContext` |
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
 | `find_in_batches(batch_size)`, `find_each(batch_size)` | **(0.6.0)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
-| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware), else inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
+| `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware, canonicalizing a `#[normalize]` lookup column), else normalizes and validates the payload (#2586 — an existing row still wins over a rejected one, re-checked on the primary) and inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
 | `ledgered = true` / `ledgered(valid_time = "col")` (attr) | **(0.7.0, issue #1699)** Makes the entity bitemporal and tamper-evident: every insert, update and soft-delete appends an immutable, hash-chained revision carrying a **full row snapshot** to `_autumn_ledger_revisions`. Adds `ledger_as_of(id, at)`, `ledger_as_of_at(id, LedgerAsOf)`, `ledger_diff(id, from, to)`, `ledger_revisions(id)`, `ledger_verify(id)`, `ledger_head(id)`, `ledger_high_water(id)` and `ledger_pin(id)` (both at once, from one snapshot — what an audit posture pins outside the database). Implies `versioned = true` and **requires `soft_delete`** (a hard DELETE would erase the row the ledger reconstructs); `purge` is not generated, and `#[version_history(sensitive = [...])]` / `no_versioned_record_impl` are compile errors. See "Ledgered entities" below |
 | `retention(after = "30d", basis = created_at)` / `retention(purge_deleted_after = "90d")` (attr) | **(0.7.0)** Declarative data-retention: reach for this instead of hand-writing a `#[scheduled]` cleanup fn for expiring sessions, drafts, one-time codes, or other transient rows. Compiles to a batched (`batch_size`, default 500), cursor-paginated sweep auto-registered with fleet coordination — no `tasks![...]` entry needed. On a `soft_delete` repository, `after` soft-deletes (never re-touching an already-deleted row) and `purge_deleted_after` hard-purges (re-checking `deleted_at` at delete time so a concurrent `restore()` survives); without `soft_delete`, `after` hard-deletes. Sweeps run across **all** tenants on a `tenant_scoped` repository (no per-tenant opt-out) and are not supported on `sharded` repositories (compile error). `autumn retention --dry-run [--model NAME]` reports rows-that-would-be-swept without deleting. Emits `retention_sweep_rows_total` / `retention_sweep_duration_seconds` metrics + a structured log line per run. See `docs/guide/retention-sweeps.md` |
 
@@ -965,6 +965,16 @@ create/update handlers validate the decoded payload before touching the DB:
   `Validate` derive compile to a no-op via the autoref `MaybeValidate`
   specialization (no migration burden), and this applies to plain and
   policy-backed handlers (#1237, #1253). See `docs/guide/pagination.md`.
+- **The repository enforces the same rules itself (#2586)**, so this is no
+  longer an `api = "..."` feature: `save`, `save_many`,
+  `save_many_skip_invalid` and the create half of `find_or_create_by_*` run
+  them after `#[normalize]` and before `before_create`. A GraphQL resolver, a
+  `#[task]` or an admin action gets the same 422. **Not** covered:
+  `Model::factory().create()` (and so `autumn seed`), a hand-written
+  repository, raw `diesel::insert_into`, and `upsert_many`. Update paths are
+  unchanged — see "Partial-update validation" below. A `#[validate]` rule on a
+  column that `before_create` *populates* now rejects every insert, because the
+  rules run first.
 
 ### Partial-update validation — the effective merged model (0.6.0, issue #1778)
 
@@ -2039,8 +2049,9 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
 | `worker` | no (probe-only router) | yes |
 
 - Run a specific tier: `autumn serve --role web|worker|combined`.
-- A split (non-`combined`) role **requires a `postgres`/`redis` jobs backend** —
-  an in-memory queue can't cross processes.
+- A split (non-`combined`) role **requires a `postgres`/`redis`/`sqlite` jobs
+  backend** — an in-memory queue can't cross processes. `sqlite` qualifies only
+  within one host, since its queue is a table in one file (#1907).
 - `release init --split-workers` splices a dedicated `worker:` service into the
   generated **docker-compose** output and sets the web-tier role on the `app`
   service (#1613). See `docs/guide/cloud-native.md`.
@@ -2808,7 +2819,19 @@ autumn graph touches posts       # which routes and jobs reach a model, table, o
 autumn graph impact Post         # what a change to a model would affect: the repositories over it, and every route and job reaching it directly or through one
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
+autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
+autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
+autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
 ```
+
+`autumn openapi export` is the way to get the contract out of an app — prefer
+it to booting the server and curling `/openapi.json`, and to `autumn build`
+(which writes `dist/openapi.json` only as a side effect of static generation,
+and bails out entirely on an app with no `#[static_get]` routes). Every run also
+reports the component schemas that degraded to the opaque placeholder, naming
+the operations reaching them; those are the types a generated client can only
+see as `unknown` / `serde_json::Value`. Fix each with
+`#[derive(OpenApiSchema)]` on the type. See `docs/guide/openapi.md`.
 
 Reach for `autumn graph` before reading a codebase to answer a structural
 question. It is derived from the macros at compile time and embedded in the
@@ -3245,6 +3268,45 @@ on `/actuator/health` under the `sqlite-replication` indicator; the indicator go
 `[alerts]` pipeline escalates (see `AlertCondition::HealthIndicatorDown`).
 Verification is a **real restore** on an interval, not a checksum. See
 `docs/guide/sqlite-in-production.md`.
+
+### Durable jobs and a single-host scheduler on SQLite (0.7.0, issue #1907)
+
+On the **SQLite** tier, `#[job]` work is durable with no Redis and no Postgres.
+`jobs.backend = "sqlite"` puts the queue in an `autumn_jobs` table in the app's
+own file; a worker claims a row with one
+`UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …`, the single-host analog of
+`FOR UPDATE SKIP LOCKED`, because SQLite serializes writers. A claim a crashed
+worker left behind is re-enqueued once it outlives
+`jobs.sqlite.visibility_timeout_ms`. The runtime creates the table and its
+indexes itself — framework migrations are Postgres SQL.
+
+```toml
+[jobs]
+backend = "sqlite"
+
+[jobs.sqlite]
+visibility_timeout_ms = 30000   # reclaim a dead worker's claim after this
+poll_interval_ms = 250          # no LISTEN/NOTIFY, so an idle worker polls
+
+[scheduler]
+backend = "sqlite"              # or "in_process" (default) for one process
+```
+
+Semantics match Postgres: attempts, backoff, dead-lettering,
+`#[job(unique)]` windows, `#[job(concurrency = N)]`, named queues, `[jobs] pin`,
+tracked-job status, the actuator gauges, and the `/admin/jobs` dashboard, which
+reads the table so every process on the host sees one queue.
+
+`scheduler.backend = "sqlite"` leases each `(task, tick)` in
+`autumn_scheduler_leases`, so several processes on one host elect exactly one
+leader per tick; the lease expires after `scheduler.lease_ttl_secs` rather than
+wedging the task when a leader dies. `autumn_web::lock::Lock` works on the tier
+too, over a lease row rather than a `pg_advisory_lock` session.
+
+Because the queue is a table both processes open, a **split web/worker role is
+valid on SQLite** — but only within one host. Both backends need the non-default
+`sqlite` cargo feature and are refused with an actionable message without it. See
+`docs/guide/sqlite-in-production.md` and `docs/guide/jobs.md`.
 
 ### SQLite migration dialect and `migrate check` (issue #1906)
 

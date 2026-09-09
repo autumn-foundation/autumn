@@ -2223,6 +2223,32 @@ fn ledger_append_ts(
     }
 }
 
+/// `#[validate(...)]` on the repository insert path (#2586).
+///
+/// `payload` is a `&New*` expression. Expands to a no-op for a payload type
+/// that does not implement `validator::Validate` — a model with no
+/// `#[validate]` columns, or a hand-written insert struct — so no repository
+/// needs migrating.
+///
+/// Pass the borrow the caller already holds rather than adding one: `validator`
+/// supplies a blanket `impl<T: Validate> Validate for &T`, so an extra `&` does
+/// still validate, but only through that impl. The direct form does not depend
+/// on it.
+fn maybe_validate_insert(payload: &TokenStream) -> TokenStream {
+    quote! {
+        {
+            // Both traits must be in scope for autoref resolution to choose
+            // between them; exactly one applies to any concrete payload type,
+            // so the other is (correctly) unused.
+            #[allow(unused_imports)]
+            use ::autumn_web::validation::{
+                MaybeValidateFallback as _, MaybeValidateViaValidator as _,
+            };
+            (&::autumn_web::validation::MaybeValidate(#payload)).autumn_maybe_validate()
+        }
+    }
+}
+
 /// Generate the `move_to`/`move_before`/`move_after`/`move_up`/`move_down`
 /// inherent methods for a `position(...)`-declaring repository (issue #1358).
 /// Empty `TokenStream` when `config.position` is `None`, so every existing
@@ -3020,6 +3046,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // id) already on the destroy path, and an already-seen row is skipped (see
         // the per-row guard in the loop), so cyclic graphs terminate.
         let has_dependents = !config.dependents.is_empty();
+        // Ledger: when this child has none of the per-row machinery the Destroy
+        // cascade exists for — no repository-attribute grandchildren, no
+        // `before_delete`/etc. hooks, no version history/commit-hook/broadcast
+        // bookkeeping, and it is never soft-deleted — the per-row reload-then-
+        // delete loop below does no work a single batched statement couldn't:
+        // `#destroy_mutation`'s plain-hard-delete arm never reads `__record`, and
+        // nothing else in Phase 2 needs it either. Route that case through the
+        // same `dependent_delete_all` runtime helper already used for the
+        // `DeleteAll` action (which already batches its optional counter-cache
+        // decrement via `counter_cache_before_delete_many`), guarded by an
+        // additional RUNTIME check that this model has no *model-attribute*
+        // `#[has_many(dependent = ...)]` grandchildren either — `has_dependents`
+        // only rules out the repository-attribute route, and the two routes are
+        // resolved independently (see `dep_autumn_dependents_use` below). A model
+        // with runtime grandchildren still needs the per-row loop to cascade into
+        // them, so it falls through to the unchanged path at runtime.
+        // Codex review, PR #2647: `position(...)` is excluded too. A bulk
+        // multi-row DELETE removes several same-scope siblings in one
+        // statement, but the row-level compaction triggers `position(...)`
+        // installs only ever see one departing row at a time (see
+        // `delete_chunk_size`'s `config.position.is_some()` guard elsewhere in
+        // this file, which forces single-row chunks for the exact same
+        // reason) — removing several ranked siblings at once leaves the
+        // survivors' ranks gapped or duplicated instead of compacted.
+        let destroy_fast_path_eligible = !has_dependents
+            && config.hooks_type.is_none()
+            && !dep_needs_post
+            && !config.soft_delete
+            && config.position.is_none();
         // The grandchildren follow this child's delete kind: a soft-delete child
         // is only soft-deleted when its parent is (`__parent_soft`), so its own
         // children inherit `__parent_soft`; a non-soft-delete child is always hard
@@ -3245,6 +3300,203 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
 
+        // Ledger: the unmodified per-row Destroy body — one bulk `FOR UPDATE` id
+        // select, a restrict pre-scan pass, then a reload-then-mutate pass per
+        // child id. Emitted verbatim regardless of `destroy_fast_path_eligible` so
+        // a model with runtime (`#[has_many(dependent = ...)]`) grandchildren —
+        // invisible to `has_dependents`, which only sees the repository-attribute
+        // route — still gets the recursive cascade it needs; see
+        // `destroy_fast_path` below.
+        let destroy_per_row_loop = quote! {
+            #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+            struct __AutumnDepId {
+                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                id: i64,
+            }
+            // Codex P2, "lock children before the restrict pre-scan": this id
+            // selection takes `FOR UPDATE` on every selected child row before the
+            // read-only restrict pre-scan below. Under READ COMMITTED an FK insert
+            // of a `restrict` grandchild takes `FOR KEY SHARE` on the referenced
+            // child row, so holding `FOR UPDATE` here blocks that insert until this
+            // transaction ends. A concurrent grandchild therefore cannot slip in
+            // between the pre-scan `EXISTS` probe and either the Phase-2 reload /
+            // `before_delete` hook or the child delete. The Phase-2 reload still
+            // calls `.for_update()`, but that is now a no-op re-lock rather than
+            // the first lock. The lock is hoisted from Phase 2 to here, over the
+            // same rows in the same parent→child order, so it adds no new deadlock
+            // class, and `ORDER BY id` makes acquisition order deterministic
+            // across concurrent cascades. This covers `delete_by_id` and both
+            // `delete_many` bulk paths, and both soft and hard child deletes:
+            // `#destroy_live_filter` is applied before `FOR UPDATE`, so the locked
+            // rows match the rows the later passes operate on.
+            //
+            // The `FOR UPDATE` clause is emitted only on Postgres. SQLite rejects
+            // `SELECT … FOR UPDATE` and needs no such clause: its single-writer
+            // database-level lock already serializes concurrent cascades — the
+            // rationale that also degrades the DSL `maybe_for_update!` seam to a
+            // plain read. `backend_select!` picks the suffix in autumn-web's own
+            // compilation, so the Postgres SQL is byte-identical to before and the
+            // SQLite form drops the clause.
+            let __for_update: &str = ::autumn_web::backend_select! {
+                pg => { " FOR UPDATE" },
+                sqlite => { "" },
+            };
+            let __q = format!(
+                "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
+                __table, __fk_column, #destroy_live_filter, __for_update
+            );
+            let __ids: ::std::vec::Vec<__AutumnDepId> =
+                ::autumn_web::reexports::diesel::sql_query(__q)
+                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
+                    .load::<__AutumnDepId>(conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+            // #1800 case 2, pre-scan pass: probe the `restrict` grandchildren of
+            // every selected child id before any child `before_delete` hook fires.
+            // Codex round-5-A already ordered a child's own grandchild restrict
+            // ahead of that child's hook, but the probe sat inside the per-child
+            // mutating loop, so with several siblings an earlier sibling's
+            // `before_delete` fired and only then did a later sibling's restrict
+            // grandchild return the 409. The transaction rolls back; a
+            // non-transactional hook side effect does not. Hoisting the read-only
+            // probe into its own pass closes that window. The probe mutates
+            // neither `__path` nor `__deleted` — a `restrict` action is a pure
+            // `SELECT EXISTS` — so it is safe ahead of, and need not re-run in, the
+            // mutating pass.
+            for __row in &__ids {
+                let __cid = __row.id;
+                // #1800, "re-probe restricts on hard revisits": skip a row already
+                // physically removed elsewhere, whose restrict grandchildren were
+                // probed on that path. This consults `__physical`, not the
+                // all-handled `__deleted`, to match the Phase-2 diamond
+                // revisit-skip below: a row merely soft-deleted on an earlier path
+                // is in `__deleted` but not in `__physical`, so a later
+                // hard-delete revisit still re-runs this pre-scan. Keyed on
+                // `__deleted` it would skip the probe while Phase 2, keyed on
+                // `__physical`, still hard-deletes the row — firing the child hook
+                // and falling through to a raw FK failure instead of the typed 409
+                // when the row has a soft-deleted restrict dependent. The
+                // hard-path probe drops the live filter, since `__parent_soft` is
+                // false there, so it includes the soft-deleted dependent and
+                // returns the 409 before any hook. The probe body may be empty, so
+                // this is a positive guard rather than an early `continue`, which
+                // clippy flags as redundant when it is the loop's last statement.
+                if !__physical.contains(&(#table_name, __cid)) {
+                    #grandchild_restrict_cascade
+                }
+            }
+            // Phase 2: now that every sibling's restrict grandchildren have
+            // passed, fire hooks and mutate.
+            for __row in __ids {
+                let __cid = __row.id;
+                // The diamond traversal revisit-skip (Codex round-5-B, #1800 case
+                // 1). Skip a row already physically removed, which dedups across
+                // independent batch roots and branches. It consults `__physical`,
+                // not the all-handled `__deleted`: a row soft-deleted on an
+                // earlier path is not physically gone, so a later hard path in a
+                // mixed diamond must still remove it. A redundant soft re-visit is
+                // caught by the `__record.deleted_at` guard below once reloaded,
+                // so a soft-handled row is not re-hooked either.
+                if __physical.contains(&(#table_name, __cid)) {
+                    continue;
+                }
+                // #1739 cycle guard (now the ACTIVE-path stack): skip a (table,
+                // id) already on the current destroy path. `insert` returns false
+                // when the row is already present, so a self- or mutual-reference
+                // (e.g. a grandchild pointing back at an ancestor) is not
+                // re-entered and the traversal terminates. Pushed here before
+                // descending; popped after this row's subtree completes (see the
+                // `__path.remove` below), so a completed sibling/root never
+                // suppresses a later cascade.
+                if !__path.insert((#table_name, __cid)) {
+                    continue;
+                }
+                // #1369: reload the exact id the parent-soft-gated selection
+                // returned. Do not re-apply `#sd_filter` (`deleted_at IS NULL`)
+                // here: on a hard parent delete the selection deliberately
+                // includes already soft-deleted children, whose FK still
+                // references the parent, so a live-only reload would return
+                // `None`, skip the hard delete, and leave the row to FK-fail the
+                // parent DELETE. The id set is authoritative for the parent kind,
+                // and the row is locked with `for_update`.
+                let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
+                    .first::<#model_name>(conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?;
+                if let ::core::option::Option::Some(__record) = __record {
+                    // #1800 case 1: skip a redundant SOFT re-visit of an already-
+                    // soft-deleted row (it is not in `__deleted`).
+                    #destroy_soft_revisit_skip
+                    #destroy_ctx_decl
+                    // #1800 case 2: this child's own `restrict` grandchildren were
+                    // already probed in the pre-scan pass above (read-only 409),
+                    // so the child `before_delete` hook only ever fires once every
+                    // reachable sibling restrict has passed.
+                    #destroy_before_delete
+                    // #1739: mutate this child's OWN dependents (grandchildren)
+                    // before removing the child row, so a hard delete never
+                    // leaves an FK-dangling grandchild and never FK-fails the
+                    // child delete.
+                    #grandchild_mutating_cascade
+                    // #1325: this child's OWN counter caches move as it is
+                    // destroyed, in the cascade's transaction. Without it a
+                    // `dependent = destroy` parent silently leaves every
+                    // surviving grandparent's count inflated.
+                    #cc_before_delete_cascade
+                    #destroy_mutation
+                    // #1800 case 1: record the row as gone ONLY when it was
+                    // physically deleted (a soft-deleted row stays reachable for a
+                    // later hard-delete path).
+                    #destroy_deleted_mark
+                    #destroy_post_mutation
+                }
+                // Codex round-5-B: pop this row off the ACTIVE path once its
+                // whole subtree is processed, so it only ever blocks re-entry
+                // WHILE on the recursion stack (cycle-break), never afterwards.
+                // Runs whether or not the row was still present.
+                __path.remove(&(#table_name, __cid));
+            }
+            ::core::result::Result::Ok(#destroy_ret_value)
+        };
+
+        // Ledger: when `destroy_fast_path_eligible` (no repository-attribute
+        // grandchildren, no hooks, no version-history/commit-hook/broadcast
+        // bookkeeping, never soft-deleted, no `position(...)` — see where it's
+        // computed above), route through the SAME bulk helper the `DeleteAll`
+        // action already uses
+        // (`dependent_delete_all`, which already batches its optional
+        // counter-cache decrement via `counter_cache_before_delete_many` instead
+        // of one decrement per row) rather than the per-row reload-then-delete
+        // loop, which for this exact configuration reloads a record nothing reads
+        // (`#destroy_mutation`'s plain-hard-delete arm deletes by id alone) and
+        // deletes it one row at a time. `has_dependents` only rules out
+        // repository-attribute grandchildren; a model can still declare runtime
+        // grandchildren via `#[has_many(dependent = ...)]`, invisible to this
+        // macro invocation, so this checks `#model_name::dependents()` — cheap,
+        // no DB round trip — and falls back to the untouched per-row loop when it
+        // is non-empty.
+        let destroy_body = if destroy_fast_path_eligible {
+            quote! {
+                if #model_name::dependents().is_empty() {
+                    ::autumn_web::repository::dependent_delete_all(
+                        conn,
+                        __table,
+                        #cc_specs,
+                        #cc_has,
+                        __fk_column,
+                        __parent_id,
+                    )
+                    .await?;
+                    ::core::result::Result::Ok(#destroy_ret_value)
+                } else {
+                    #destroy_per_row_loop
+                }
+            }
+        } else {
+            destroy_per_row_loop
+        };
+
         quote! {
             /// Apply a [`DependentAction`](::autumn_web::repository::DependentAction)
             /// to this model's rows whose `__fk_column` equals `__parent_id`,
@@ -3380,169 +3632,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         // set breaks self-/mutual-referential cycles.
                         #destroy_register
                         #destroy_ret_decl
-                        #[derive(::autumn_web::reexports::diesel::QueryableByName)]
-                        struct __AutumnDepId {
-                            #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
-                            id: i64,
-                        }
-                        // Codex P2, "lock children before the restrict pre-scan":
-                        // this id selection takes `FOR UPDATE` on every selected
-                        // child row before the read-only restrict pre-scan below.
-                        // Under READ COMMITTED an FK insert of a `restrict`
-                        // grandchild takes `FOR KEY SHARE` on the referenced child
-                        // row, so holding `FOR UPDATE` here blocks that insert until
-                        // this transaction ends. A concurrent grandchild therefore
-                        // cannot slip in between the pre-scan `EXISTS` probe and
-                        // either the Phase-2 reload / `before_delete` hook or the
-                        // child delete. The Phase-2 reload still calls
-                        // `.for_update()`, but that is now a no-op re-lock rather
-                        // than the first lock. The lock is hoisted from Phase 2 to
-                        // here, over the same rows in the same parent→child order,
-                        // so it adds no new deadlock class, and `ORDER BY id` makes
-                        // acquisition order deterministic across concurrent cascades.
-                        // This covers `delete_by_id` and both `delete_many` bulk
-                        // paths, and both soft and hard child deletes:
-                        // `#destroy_live_filter` is applied before `FOR UPDATE`, so
-                        // the locked rows match the rows the later passes operate on.
-                        //
-                        // The `FOR UPDATE` clause is emitted only on Postgres.
-                        // SQLite rejects `SELECT … FOR UPDATE` and needs no such
-                        // clause: its single-writer database-level lock already
-                        // serializes concurrent cascades — the rationale that also
-                        // degrades the DSL `maybe_for_update!` seam to a plain read.
-                        // `backend_select!` picks the suffix in autumn-web's own
-                        // compilation, so the Postgres SQL is byte-identical to
-                        // before and the SQLite form drops the clause.
-                        let __for_update: &str = ::autumn_web::backend_select! {
-                            pg => { " FOR UPDATE" },
-                            sqlite => { "" },
-                        };
-                        let __q = format!(
-                            "SELECT id FROM \"{}\" WHERE \"{}\" = $1{} ORDER BY id{}",
-                            __table, __fk_column, #destroy_live_filter, __for_update
-                        );
-                        let __ids: ::std::vec::Vec<__AutumnDepId> =
-                            ::autumn_web::reexports::diesel::sql_query(__q)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__parent_id)
-                                .load::<__AutumnDepId>(conn)
-                                .await
-                                .map_err(::autumn_web::AutumnError::from)?;
-                        // #1800 case 2, pre-scan pass: probe the `restrict`
-                        // grandchildren of every selected child id before any child
-                        // `before_delete` hook fires. Codex round-5-A already ordered
-                        // a child's own grandchild restrict ahead of that child's
-                        // hook, but the probe sat inside the per-child mutating loop,
-                        // so with several siblings an earlier sibling's
-                        // `before_delete` fired and only then did a later sibling's
-                        // restrict grandchild return the 409. The transaction rolls
-                        // back; a non-transactional hook side effect does not.
-                        // Hoisting the read-only probe into its own pass closes that
-                        // window. The probe mutates neither `__path` nor `__deleted`
-                        // — a `restrict` action is a pure `SELECT EXISTS` — so it is
-                        // safe ahead of, and need not re-run in, the mutating pass.
-                        for __row in &__ids {
-                            let __cid = __row.id;
-                            // #1800, "re-probe restricts on hard revisits": skip a
-                            // row already physically removed elsewhere, whose
-                            // restrict grandchildren were probed on that path. This
-                            // consults `__physical`, not the all-handled
-                            // `__deleted`, to match the Phase-2 diamond revisit-skip
-                            // below: a row merely soft-deleted on an earlier path is
-                            // in `__deleted` but not in `__physical`, so a later
-                            // hard-delete revisit still re-runs this pre-scan. Keyed
-                            // on `__deleted` it would skip the probe while Phase 2,
-                            // keyed on `__physical`, still hard-deletes the row —
-                            // firing the child hook and falling through to a raw FK
-                            // failure instead of the typed 409 when the row has a
-                            // soft-deleted restrict dependent. The hard-path probe
-                            // drops the live filter, since `__parent_soft` is false
-                            // there, so it includes the soft-deleted dependent and
-                            // returns the 409 before any hook. The probe body may be
-                            // empty, so this is a positive guard rather than an early
-                            // `continue`, which clippy flags as redundant when it is
-                            // the loop's last statement.
-                            if !__physical.contains(&(#table_name, __cid)) {
-                                #grandchild_restrict_cascade
-                            }
-                        }
-                        // Phase 2: now that every sibling's restrict grandchildren
-                        // have passed, fire hooks and mutate.
-                        for __row in __ids {
-                            let __cid = __row.id;
-                            // The diamond traversal revisit-skip (Codex round-5-B,
-                            // #1800 case 1). Skip a row already physically removed,
-                            // which dedups across independent batch roots and
-                            // branches. It consults `__physical`, not the all-handled
-                            // `__deleted`: a row soft-deleted on an earlier path is
-                            // not physically gone, so a later hard path in a mixed
-                            // diamond must still remove it. A redundant soft re-visit
-                            // is caught by the `__record.deleted_at` guard below once
-                            // reloaded, so a soft-handled row is not re-hooked either.
-                            if __physical.contains(&(#table_name, __cid)) {
-                                continue;
-                            }
-                            // #1739 cycle guard (now the ACTIVE-path stack): skip a
-                            // (table, id) already on the current destroy path. `insert`
-                            // returns false when the row is already present, so a self-
-                            // or mutual-reference (e.g. a grandchild pointing back at an
-                            // ancestor) is not re-entered and the traversal terminates.
-                            // Pushed here before descending; popped after this row's
-                            // subtree completes (see the `__path.remove` below), so a
-                            // completed sibling/root never suppresses a later cascade.
-                            if !__path.insert((#table_name, __cid)) {
-                                continue;
-                            }
-                            // #1369: reload the exact id the parent-soft-gated
-                            // selection returned. Do not re-apply `#sd_filter`
-                            // (`deleted_at IS NULL`) here: on a hard parent delete
-                            // the selection deliberately includes already
-                            // soft-deleted children, whose FK still references the
-                            // parent, so a live-only reload would return `None`, skip
-                            // the hard delete, and leave the row to FK-fail the parent
-                            // DELETE. The id set is authoritative for the parent kind,
-                            // and the row is locked with `for_update`.
-                            let __record = ::autumn_web::maybe_for_update!(#table_ident::table.find(__cid))
-
-                                .first::<#model_name>(conn)
-                                .await
-                                .optional()
-                                .map_err(::autumn_web::AutumnError::from)?;
-                            if let ::core::option::Option::Some(__record) = __record {
-                                // #1800 case 1: skip a redundant SOFT re-visit of an
-                                // already-soft-deleted row (it is not in `__deleted`).
-                                #destroy_soft_revisit_skip
-                                #destroy_ctx_decl
-                                // #1800 case 2: this child's own `restrict`
-                                // grandchildren were already probed in the pre-scan
-                                // pass above (read-only 409), so the child
-                                // `before_delete` hook only ever fires once every
-                                // reachable sibling restrict has passed.
-                                #destroy_before_delete
-                                // #1739: mutate this child's OWN dependents
-                                // (grandchildren) before removing the child row, so
-                                // a hard delete never leaves an FK-dangling
-                                // grandchild and never FK-fails the child delete.
-                                #grandchild_mutating_cascade
-                                // #1325: this child's OWN counter caches move
-                                // as it is destroyed, in the cascade's
-                                // transaction. Without it a `dependent =
-                                // destroy` parent silently leaves every
-                                // surviving grandparent's count inflated.
-                                #cc_before_delete_cascade
-                                #destroy_mutation
-                                // #1800 case 1: record the row as gone ONLY when it
-                                // was physically deleted (a soft-deleted row stays
-                                // reachable for a later hard-delete path).
-                                #destroy_deleted_mark
-                                #destroy_post_mutation
-                            }
-                            // Codex round-5-B: pop this row off the ACTIVE path once
-                            // its whole subtree is processed, so it only ever blocks
-                            // re-entry WHILE on the recursion stack (cycle-break), never
-                            // afterwards. Runs whether or not the row was still present.
-                            __path.remove(&(#table_name, __cid));
-                        }
-                        ::core::result::Result::Ok(#destroy_ret_value)
+                        #destroy_body
                     }
                 }
                 })
@@ -4833,6 +4923,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             let __autumn_read_route =
                 ::autumn_web::repository::ReadRoute::from_state(state);
+        }
+    };
+
+    // #2586: `docs/guide/forms.md` promises the model's `#[validate]` rules
+    // hold on every write path — a form, an API endpoint, a seed, a job, a CSV
+    // import. Only the generated REST handlers ran them, so a caller reaching
+    // the repository directly bypassed the model entirely. These fragments put
+    // them on the insert path itself, after `#[normalize]` canonicalizes the
+    // payload and before the `before_create` hook, exactly as the guide states.
+    //
+    // Update paths are deliberately untouched: they keep the documented
+    // hooked / `validate_on_update = fetch` / blind table.
+    let validate_insert_new = {
+        let call = maybe_validate_insert(&quote! { new });
+        quote! { #call?; }
+    };
+    let validate_row_result = maybe_validate_insert(&quote! { __autumn_row });
+    let validate_item_result = maybe_validate_insert(&quote! { &item });
+    let validate_insert_each_row = {
+        let call = maybe_validate_insert(&quote! { __autumn_row });
+        quote! {
+            // Every row is checked before any row is written, so a rejected
+            // batch leaves nothing behind.
+            for __autumn_row in new {
+                #call?;
+            }
         }
     };
 
@@ -7747,10 +7863,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut successes = Vec::new();
                 let mut failures = Vec::new();
 
-                // 1. Run before_create hooks sequentially
+                // 1. Run the model's `#[validate]` rules, then before_create,
+                //    sequentially. A row either side rejects is reported by
+                //    index and skipped — the method's partial-success contract.
                 let mut valid_items = Vec::new();
                 for (idx, original_item) in new.iter().enumerate() {
                     let mut item = original_item.clone();
+                    // #2586: model rules first, so a hook never sees a row the
+                    // model would refuse.
+                    if let ::core::result::Result::Err(err) = #validate_item_result {
+                        failures.push((idx, err));
+                        continue;
+                    }
                     let mut ctx = MutationContext::new(MutationOp::Create);
                     #idempotency_setup
                     match self.hooks.before_create(&mut ctx, &mut item).await {
@@ -10099,6 +10223,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let mut successes = Vec::new();
                 let mut failures = Vec::new();
 
+                // #2586: run the model's `#[validate]` rules first and report a
+                // rejected row by index, keeping the partial-success contract.
+                // Only the surviving indices are recorded here; the rows are
+                // re-collected below solely when something was dropped, so a
+                // model with no rules still writes from the caller's slice with
+                // no extra clone.
+                let mut __autumn_kept: ::std::vec::Vec<usize> =
+                    ::std::vec::Vec::with_capacity(new.len());
+                for (idx, __autumn_row) in new.iter().enumerate() {
+                    match #validate_row_result {
+                        ::core::result::Result::Ok(()) => __autumn_kept.push(idx),
+                        ::core::result::Result::Err(err) => failures.push((idx, err)),
+                    }
+                }
+                let __autumn_retained: ::std::vec::Vec<#new_name>;
+                let new: &[#new_name] = if __autumn_kept.len() == new.len() {
+                    new
+                } else {
+                    __autumn_retained =
+                        __autumn_kept.iter().map(|&i| new[i].clone()).collect();
+                    &__autumn_retained
+                };
+                if new.is_empty() {
+                    return Ok((successes, failures));
+                }
+
                 let mut offset = 0;
                 let cols = (&new[0]).__autumn_column_count() + #tenant_extra;
                 let chunk_size = if cols == 0 { 1000 } else { (::autumn_web::repository::MAX_BIND_PARAMS / cols).min(1000).max(1) };
@@ -10145,9 +10295,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 return ::core::result::Result::Err(batch_err);
                             }
 
-                            // Fallback to row-by-row insertion for this chunk
+                            // Fallback to row-by-row insertion for this chunk.
+                            // #2586: chunks index into the retained rows, so map
+                            // back to the caller's index before reporting.
                             for (idx, item) in chunk.iter().enumerate() {
-                                let global_idx = offset + idx;
+                                let global_idx = __autumn_kept[offset + idx];
                                 let res = ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                                     async move {
                                         let model = (#row_insert_expr_conn)
@@ -11634,20 +11786,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     ) = if config.sharded && config.tenant_scoped {
         let write_guard = &cross_shard_write_guard;
         (
-            quote! { #write_guard #save_body },
+            quote! { #write_guard #validate_insert_new #save_body },
             quote! { #write_guard #update_body },
             quote! { #write_guard #delete_body },
-            quote! { #write_guard #save_many_body },
+            quote! { #write_guard #validate_insert_each_row #save_many_body },
             quote! { #write_guard #save_many_skip_invalid_body },
             quote! { #write_guard #update_many_body },
             quote! { #write_guard #delete_many_body },
         )
     } else {
         (
-            save_body,
+            quote! { #validate_insert_new #save_body },
             update_body,
             delete_body,
-            save_many_body,
+            quote! { #validate_insert_each_row #save_many_body },
             save_many_skip_invalid_body,
             update_many_body,
             delete_many_body,
@@ -14223,9 +14375,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let fname = name.to_string();
                 if spec.string_fields.contains(&fname) {
                     let enc_ident = format_ident!("__autumn_foc_{name}");
+                    let norm_ident = format_ident!("__autumn_focn_{name}");
+                    // #2586: canonicalize the lookup argument on a `#[normalize]`
+                    // column, the same probe the derived `find_by_*` finders use.
+                    // The insert normalizes its payload, so a raw lookup would
+                    // miss the row it just wrote: the next identical call would
+                    // conflict on insert and then miss the re-lookup too, which
+                    // surfaces as the "no matching row on re-lookup" 500 rather
+                    // than the existing row. Runs before the encrypted-column
+                    // encoder, matching the finder order.
                     encode_lets.push(quote! {
+                        let #norm_ident = {
+                            #[allow(unused_imports)]
+                            use ::autumn_web::normalize::{SpezLookupNo as _, SpezLookupYes as _};
+                            ::autumn_web::normalize::SpezLookup::<#model_name>(
+                                ::core::marker::PhantomData, #fname, &#name,
+                            )
+                            .spez_lookup()
+                        };
                         let #enc_ident = ::autumn_web::encryption::encode_derived_query_param(
-                            #table_name_str, #fname, &#name,
+                            #table_name_str, #fname, &#norm_ident,
                         )
                         .map_err(|__e| ::autumn_web::AutumnError::internal_server_error_msg(
                             __e.to_string(),
@@ -14263,6 +14432,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let step1_lookup = make_lookup(quote! { &mut __rconn });
             let relookup = make_lookup(quote! { &mut conn });
+            // #2586: the create half runs the model's `#[validate]` rules, but a
+            // refusal must not overtake the found path. Step 1 is
+            // replica-eligible, so it can miss a row the primary already has
+            // (and a concurrent caller can insert one after it ran); this call
+            // would then insert nothing, which is exactly the case the rules do
+            // not govern. Confirm on the primary before refusing, so the answer
+            // does not depend on replication lag.
+            let validate_or_found = {
+                let primary_lookup = make_lookup(quote! { &mut __autumn_vconn });
+                let call = maybe_validate_insert(&quote! { new });
+                quote! {
+                    if let ::core::result::Result::Err(__autumn_invalid) = #call {
+                        let mut __autumn_vconn = self.__autumn_acquire_conn().await?;
+                        let __autumn_existing: ::core::option::Option<#model_name> =
+                            #primary_lookup;
+                        if let ::core::option::Option::Some(__autumn_row) = __autumn_existing {
+                            return ::core::result::Result::Ok((__autumn_row, false));
+                        }
+                        return ::core::result::Result::Err(__autumn_invalid);
+                    }
+                }
+            };
             let none_branch_msg = if config.soft_delete {
                 "find_or_create_by: the insert hit a unique conflict but no matching \
                  row was found on re-lookup. Two causes are possible: (1) the lookup \
@@ -14471,6 +14662,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             return ::core::result::Result::Ok((__row, false));
                         }
                     }
+                    // #2586: the row is about to be created, so normalize and
+                    // then run the model's `#[validate]` rules — the same
+                    // insert-path contract `save` has. Deliberately after the
+                    // lookup: a found row is returned unchanged, because this
+                    // call inserts nothing.
+                    #[allow(unused_imports)]
+                    use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                    #[allow(unused_imports)]
+                    use ::std::borrow::Borrow as _;
+                    let __autumn_normalized =
+                        ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                    let new: &#new_name = __autumn_normalized.borrow();
+                    #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
                     #step2
                 }
@@ -19576,6 +19780,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
+                // #2586: normalize before the per-row `#[validate]` pass inside
+                // the body, so a skip-invalid import judges — and stores — the
+                // same canonical value `save_many` does.
+                //
+                // Costs one clone of the batch, as `save_many` already does:
+                // `#[model]` emits `impl Normalize` for every `New*` (empty-bodied
+                // when nothing is normalized), so the probe's `Yes` arm always
+                // wins here and the borrowed `No` arm is reachable only for a
+                // hand-written `New*`. Making that fallback real means gating the
+                // impl on the model actually having `#[normalize]` columns — see
+                // the follow-up issue; it is not specific to this path.
+                #[allow(unused_imports)]
+                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                #[allow(unused_imports)]
+                use ::std::borrow::Borrow as _;
+                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_skip_invalid_body
             }
 
@@ -21349,6 +21570,243 @@ mod tests {
         );
     }
 
+    /// Slice `generated` from `start` up to `end` (or the end of the string).
+    fn section_between<'a>(generated: &'a str, start: &str, end: &str) -> &'a str {
+        let from = generated
+            .find(start)
+            .unwrap_or_else(|| panic!("missing `{start}` in generated code"));
+        let rest = &generated[from..];
+        let to = rest.find(end).unwrap_or(rest.len());
+        &rest[..to]
+    }
+
+    #[test]
+    fn repository_macro_save_validates_after_normalize_before_insert() {
+        // #2586: `save` runs the model's `#[validate]` rules on every caller —
+        // a job, a seed, a resolver — not only the generated REST handlers.
+        // Order: normalize, then validate, then insert.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(&generated, "async fn save (", "async fn update (");
+
+        let normalize_at = section
+            .find("spez_normalize ()")
+            .expect("save must normalize the payload");
+        // Pinned to the exact emitted form: `new` is already a `&New*`, so an
+        // extra borrow would validate only via `validator`'s blanket
+        // `impl Validate for &T`. Assert the shape that does not rely on it.
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("save must validate the payload");
+        let insert_at = section.find("insert_into").expect("save must insert");
+        assert!(
+            normalize_at < validate_at && validate_at < insert_at,
+            "save must normalize, then validate, then insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_validates_on_every_config_branch() {
+        // #2586 names four `save` bodies — blind, hooked, tenant-scoped and
+        // versioned. The splice sits at the one point they are composed, so
+        // prove that rather than trusting it.
+        for attr in [
+            quote! { Post },
+            quote! { Post, hooks = PostHooks },
+            quote! { Post, tenant_scoped },
+            quote! { Post, versioned = true },
+            quote! { Post, tenant_scoped, sharded },
+        ] {
+            let label = attr.to_string();
+            let generated =
+                repository_macro(attr, quote! { pub trait PostRepository {} }).to_string();
+            let section = section_between(&generated, "async fn save (", "async fn update (");
+            assert!(
+                section.contains("MaybeValidate (new)"),
+                "`{label}` must validate on the insert path: {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_hooked_save_validates_before_before_create() {
+        // #2586: on a hooked repository the rules run before `before_create`,
+        // as `docs/guide/forms.md` states.
+        let generated = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = section_between(&generated, "async fn save (", "async fn update (");
+
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("hooked save must validate the payload");
+        let hook_at = section
+            .find("before_create")
+            .expect("hooked save must run before_create");
+        assert!(
+            validate_at < hook_at,
+            "validation must run before the before_create hook: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_many_validates_each_row_before_insert() {
+        // #2586: the bulk insert path validates every row before writing any.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many (",
+            "async fn save_many_skip_invalid (",
+        );
+
+        let validate_at = section
+            .find("MaybeValidate (__autumn_row)")
+            .expect("save_many must validate each row");
+        let insert_at = section.find("insert_into").expect("save_many must insert");
+        assert!(
+            validate_at < insert_at,
+            "every row must be validated before the batch insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_save_many_skip_invalid_normalizes_and_reports_rows() {
+        // #2586: skip-invalid keeps its partial-success contract — a row the
+        // model rejects is reported by index, not raised. It also normalizes
+        // first, so validators see the same canonical value `save` gives them.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many_skip_invalid (",
+            "async fn update_many (",
+        );
+
+        let normalize_at = section
+            .find("spez_normalize_many ()")
+            .expect("skip-invalid must normalize rows");
+        let validate_at = section
+            .find("MaybeValidate (__autumn_row)")
+            .expect("skip-invalid must validate rows");
+        assert!(
+            normalize_at < validate_at,
+            "rows must be normalized before validation: {section}"
+        );
+        // Reported, not raised: the rejected index is pushed onto `failures`
+        // rather than `?`-propagated. `failures . push` alone would pass on the
+        // unchanged code (hook and constraint failures already use it), so pin
+        // the arm the validation pass writes.
+        assert!(
+            section.contains("::core::result::Result::Err (err) => failures . push ((idx , err))")
+                || section.contains(
+                    ":: core :: result :: Result :: Err (err) => failures . push ((idx , err))"
+                ),
+            "an invalid row must be reported by index, not raised: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_hooked_save_many_skip_invalid_validates_before_hook() {
+        // #2586: same contract on the hooked skip-invalid path.
+        let generated = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = section_between(
+            &generated,
+            "async fn save_many_skip_invalid (",
+            "async fn update_many (",
+        );
+
+        let validate_at = section
+            .find("MaybeValidate (& item)")
+            .expect("hooked skip-invalid must validate rows");
+        let hook_at = section
+            .find("before_create")
+            .expect("hooked skip-invalid must run before_create");
+        assert!(
+            validate_at < hook_at,
+            "validation must run before before_create: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_find_or_create_by_validates_before_insert() {
+        // #2586: the get-or-insert path validates only when it is about to
+        // insert, so an existing row is still returned for a payload the model
+        // would reject.
+        let generated = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_slug(&self, slug: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        // Bound on the next generated item. `HasTenantIdColumn` is emitted only
+        // for a tenant_scoped repository, so it would never match here and the
+        // "section" would run to the end of the output.
+        let section = section_between(
+            &generated,
+            "pub async fn find_or_create_by_slug",
+            "pub async fn preload",
+        );
+
+        let lookup_at = section
+            .find("__autumn_acquire_read_conn")
+            .expect("get-or-insert must look up first");
+        let validate_at = section
+            .find("MaybeValidate (new)")
+            .expect("get-or-insert must validate the payload");
+        let insert_at = section
+            .find("insert_into")
+            .expect("get-or-insert must insert");
+        assert!(
+            lookup_at < validate_at && validate_at < insert_at,
+            "validation must sit between the lookup and the insert: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_upsert_many_stays_unvalidated() {
+        // #2586 guard rail: `upsert_many` takes whole models and Postgres
+        // decides per row whether the statement inserts or updates, so there is
+        // no insert to hang the rule on. `docs/guide/forms.md` documents the
+        // carve-out; pin it so it cannot drift silently.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        // Bounded on the inherent impl that follows the trait impl. Note
+        // `impl PostRepository for PgPostRepository` does not match this needle.
+        let section = section_between(
+            &generated,
+            "async fn upsert_many (",
+            "impl PgPostRepository",
+        );
+        assert!(
+            !section.contains("MaybeValidate"),
+            "upsert_many is a documented carve-out: {section}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_blind_update_still_validates_nothing() {
+        // #2586 guard rail: the fix is insert-only. A no-hooks, no-knob
+        // repository keeps the documented blind update path.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        let section = section_between(&generated, "async fn update (", "async fn delete_by_id (");
+
+        assert!(
+            !section.contains("MaybeValidate"),
+            "the blind update path must stay unvalidated: {section}"
+        );
+    }
+
     #[test]
     fn repository_macro_api_create_validates_before_save() {
         // #1253: create runs `#[validate]` rules (via autoref `MaybeValidate`)
@@ -22785,6 +23243,116 @@ mod tests {
         assert!(
             generated.contains("dependent_delete_all"),
             "delete_all must issue a bulk DELETE"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_leaf_takes_batched_fast_path() {
+        // Ledger: a plain leaf child (no hooks, not soft-delete, no
+        // dependent(...) of its own) routes the Destroy arm through the same
+        // dependent_delete_all() helper on_delete = delete_all already uses,
+        // guarded by a runtime check that the model has no *model-attribute*
+        // (#[has_many(dependent = ...)]) grandchildren either. This checks
+        // Comment's OWN generated `__autumn_apply_dependent_on_conn` (used
+        // when something ELSE destroys Comment as its child), so Comment must
+        // declare no `dependent(...)` of its own here -- a repository that
+        // itself has `dependent(...)` is the "has grandchildren" case tested
+        // separately below and must NOT take this fast path.
+        let generated = repository_macro(
+            quote! { Comment },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("dependent_delete_all"),
+            "a hookless, non-soft-delete, dependent-free leaf must take the \
+             batched dependent_delete_all fast path: {destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains("dependents") && destroy_arm.contains("is_empty"),
+            "the fast path must still guard on the model's own runtime \
+             dependents() being empty: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_own_dependents_skips_fast_path() {
+        // A child that itself declares dependent(...) (repo-attribute
+        // grandchildren) must keep the per-row loop -- dependent_delete_all()
+        // has no way to recurse into a grandchild cascade.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with its own repository-attribute dependent(...) \
+             grandchildren must never take the batched fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_with_hooks_skips_fast_path() {
+        // A child with hooks must keep the exact per-row loop -- the fast
+        // path's dependent_delete_all() call never fires before_delete.
+        let generated = repository_macro(
+            quote! { Comment, hooks = CommentHooks, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a child with before_delete hooks must never take the batched \
+             fast path (it would skip the hook): {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_soft_delete_skips_fast_path() {
+        // A soft-delete child must keep the per-row loop too --
+        // dependent_delete_all() only ever hard-deletes.
+        let generated = repository_macro(
+            quote! { Comment, soft_delete, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a soft-delete child must never take the hard-delete-only batched \
+             fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_positioned_skips_fast_path() {
+        // Codex review, PR #2647: a `position(...)` child must keep the
+        // per-row loop even though it has none of the other disqualifiers --
+        // dependent_delete_all()'s bulk multi-row DELETE removes several
+        // same-scope siblings in one statement, but the row-level compaction
+        // triggers position(...) installs only ever see one departing row at
+        // a time (see this file's `delete_chunk_size` guard, which forces
+        // single-row chunks for the identical reason), so a batched delete
+        // here would leave the survivors' ranks gapped or duplicated.
+        // `position(...)` does not yet support a repo's OWN `dependent(...)`
+        // (an unrelated, pre-existing restriction), so this checks the
+        // unconditionally-generated Destroy arm on a bare `position` leaf
+        // instead of pairing it with grandchildren like the sibling tests
+        // above do.
+        let generated = repository_macro(
+            quote! { Comment, position },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a position(...) child must never take the batched fast path \
+             (it would corrupt the ordering): {destroy_arm}"
         );
     }
 

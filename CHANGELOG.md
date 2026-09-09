@@ -83,6 +83,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **🗃️ Ledger: batch the `dependent(on_delete = destroy)` leaf cascade
+  (statements 10002→3, buffers -77.6%):** the generated `Destroy` cascade
+  (`autumn-macros/src/repository.rs`) selected child ids in bulk but then
+  reloaded and deleted each one individually — two statements per row,
+  even when the child has no `hooks`, isn't `soft_delete`/`versioned`/
+  `position(...)`, and declares no `dependent(...)`/`#[has_many(dependent =
+  ...)]` of its own, so nothing in that configuration ever read the
+  reload. That exact configuration now routes through the same
+  `dependent_delete_all` runtime helper `on_delete = delete_all` already
+  uses (which already batches its optional counter-cache decrement),
+  guarded by a cheap runtime check for model-attribute grandchildren
+  invisible to the macro's own attributes. Every other configuration
+  (hooks, soft-delete, versioned, broadcasting, positioned, or any
+  grandchildren) is unaffected and keeps the exact prior per-row loop.
+  `dependent_delete_all` itself now always takes a locked, ascending-id
+  pre-lock before its bulk `DELETE` — closing a stale-reparent counter-cache
+  race and a cross-cascade deadlock window the original per-row loop never
+  had, wrapped in an outer `count(*)` so locking a huge fan-out costs O(1)
+  memory and network, not one row per child — which applies equally to the
+  pre-existing `delete_all` caller. Profiled against a 500-post/~23k-comment
+  fixture cascading a 5,000-comment delete: `pg_stat_statements` calls
+  10,002 → 3, buffers 45,583 → 10,192. Full existing `dependent`/`has_many`
+  suite (29 tests, including diamond-cascade and hook/soft-delete cases)
+  passes unchanged. See
+  `docs/reports/2026-09-08-ledger-dependent-destroy-leaf-batch/`.
+
 - **⚡ Bolt: `feed::escape` ASCII fast path (instructions -38.4%):** a new
   `autumn/benches/feed_render.rs` profiling harness — rendering a realistic
   30-entry Atom feed, the same `Feed::atom(...).entries(...)` shape
@@ -103,6 +129,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   620,067 → 381,893 per render (-38.4%); `escape`'s own share of the profile
   72% → 54%; allocation bytes/blocks per render unchanged (both paths make
   exactly one `String` allocation).
+
+### Fixed
+
+- **openapi:** `#[model]` types no longer export as untyped blobs (issue #802).
+  The macro has always emitted `OpenApiSchema` impls for a model and its `New*` /
+  `Update*` companions, but never submitted the compile-time inventory
+  descriptor the spec and MCP back-fills actually resolve types through — so
+  nothing could *find* those impls, and every `#[repository(api = "…")]`
+  endpoint documented its own model as the generic
+  `{"type": "object", "title": "X"}` placeholder unless the app repeated each
+  one by hand through `OpenApiConfig::register_schema`. The `bookmarks`
+  example's entire REST surface was in that state. All three companions now
+  register themselves, so a model on the API boundary carries real fields with
+  no wiring, and a generated client sees a typed struct instead of `unknown` /
+  `serde_json::Value`. Apps that were registering models explicitly are
+  unaffected: an explicit `register_schema` is still seeded first and still wins.
+
+- **openapi:** an application type whose last path segment is `Option` or `Vec`
+  is no longer described as nullable or as an array (issue #802). Both macros
+  match those two wrappers on the type's **last path segment**, because a proc
+  macro sees only the tokens as written — so an app's own `domain::Option<T>` or
+  `domain::Vec<T>` (ordinary structs that merely spell that name) took the
+  nullable / array branch. A `#[model]` field of such a type was published as
+  `oneOf [T, null]` or `type: array` and, worse, dropped from `required`, so a
+  generated client could omit a field the server demands; an `#[api]` handler
+  returning `Json<domain::Option<T>>` documented the *inner* type it never
+  wraps. Nothing flagged it: no opaque component was emitted, so
+  `autumn openapi export --strict` passed while it happened. Both paths now
+  check the type's full runtime `type_name` before treating it as a `std`
+  wrapper — the same escape the scalar table already uses for its own
+  last-segment collisions — so a colliding type resolves to its registered
+  schema, or to an honest `$ref` that `--strict` reports as opaque. Genuine
+  `Option` / `Vec` are unchanged, requiredness included.
+
+- **openapi:** a handler that takes or returns `Json<serde_json::Value>` is
+  documented as arbitrary JSON rather than as an empty object (issue #802). The
+  route macro emitted an ordinary named `$ref` for it; nothing registers a
+  schema for that external type, so the back-fill resolved it to the opaque
+  `{"type":"object"}` placeholder — which misdescribes every array, scalar and
+  `null` such a handler legitimately carries, and made
+  `autumn openapi export --strict` fail on a handler that is behaving
+  correctly. The `#[model]` field path already special-cased this; the
+  route-level builder now does too, keyed on the same full `type_name`, so an
+  application's own type named `Value` still gets its ordinary `$ref`. The
+  optional form is deliberately *not* wrapped in `oneOf [.., null]`: the
+  unconstrained schema already admits `null`, and `oneOf` requires exactly one
+  branch to match, so wrapping it would reject the very `null` it permits.
+
+- **openapi:** `autumn openapi export` now runs the router's MCP checks too, so
+  it cannot certify a spec for an app that will not start (issue #802). The
+  preflight already ran four of the serving path's rules; an app mounting MCP at
+  a malformed path, or at one a user or `OpenAPI` route already owns, is
+  rejected by `build_router_pre_state` at startup but passed `--check`. The
+  mount-path rule is extracted from that function rather than copied, joining
+  the others, so there is still exactly one definition per rule.
+
+- **openapi:** `autumn openapi export` also runs the two preconditions `run()`
+  enforced itself, and applies the same builder overrides, before generating
+  (issue #802). The preflight mirrored `build_router_pre_state` faithfully, but
+  `run()` checks two more things outside it: an app with **no routes at all**
+  panics at startup, and a mutating `#[repository(api = "…")]` with no paired
+  `policy` refuses to start under a production profile. Either could export a
+  document `--check` would approve for an application that never reaches router
+  construction. Both now live in one `validate_pre_router_preconditions` the two
+  paths share, so a precondition added to the serving path is in the exporter by
+  construction rather than by remembering. Separately, the
+  `.mount_unsubscribe_endpoint()` builder flag — which decides whether
+  `/_autumn/unsubscribe` is claimed, and so what the collision checks see — is
+  now folded into the config before those checks on the export path too; it was
+  already copied at two `run_*` sites, and is now shared by all three.
+
+- **openapi:** `autumn openapi export` honors the `[openapi] enabled` profile
+  gate when checking mount paths (issue #802). With the endpoint disabled,
+  `run()` hands the router `None`, so it neither validates the `OpenAPI` mount
+  paths nor treats them as claimed `GET`s — an application route may
+  legitimately own `/openapi.json` under that profile. The exporter validated
+  them unconditionally and so *rejected* an application that starts perfectly
+  well: the same class of disagreement with the serving path as being too lax,
+  pointing the other way. All three mount-sensitive checks (path validation,
+  the `OpenAPI` collision scan, and the MCP one, which reserves those same
+  paths) now read one resolved value, so they cannot disagree about whether the
+  endpoint is mounted. The document itself is still exported either way — the
+  gate governs serving, not whether the contract can be written down.
+
+- **openapi:** the external-scalar identity check compares the real type path,
+  not a crate-name prefix (issue #802). `chrono`'s date/time types and
+  `uuid::Uuid` are matched by the macro on their last path segment, and a
+  runtime check then confirmed the identity really was external — but that check
+  was `starts_with("chrono::")`, which accepts *every* type in a crate that
+  happens to be named `chrono`. A downstream crate of that name defining its own
+  `DateTime` was inlined as a string even when serde writes an object, and no
+  opaque component was emitted, so `--strict` could not see it. Each scalar now
+  compares against `type_name` of the genuine type, reached through
+  `autumn_web::reexports` — so the check cannot drift if `chrono` moves a type
+  between internal modules, and cannot be satisfied by a namespace collision.
+  `DateTime<Tz>` compares the path before the `<`, so every zone still
+  qualifies. `uuid` joins the `reexports` module for this.
+
+- **openapi:** a field carrying `#[serde(skip_serializing_if = "…")]` is no
+  longer advertised as `required` (issue #802). That attribute means a response
+  may omit the field, so `required` is wrong for it whatever its type. The
+  standalone derive's audit already refuses the attribute on anything neither
+  `Option`-named nor defaulted — precisely because the survivors are
+  describable as optional — but it judged `Option`-ness by the last path
+  segment, so an application's own `domain::Option<T>` passed the audit and
+  then landed in `required` anyway once the emitter's identity guard recognised
+  the impostor, leaving a schema its own responses could violate. The decision
+  now keys on the attribute rather than the type, which is exactly what a proc
+  macro can see.
+
+- **openapi:** `autumn openapi export` verifies deferred `.policy::<R, _>(…)` /
+  `.scope::<R, _>(…)` registrations (issue #802). Those builder calls are
+  closures the serving path replays onto live state before checking that every
+  `#[repository(policy = X)]` route really has an `X` registered — a check that
+  refuses to start under a production profile. The export dropped the closures
+  and confirmed only that the macro argument existed, so an app declaring a
+  policy but missing the builder call exported a contract `--check` would
+  approve. It now replays them onto a throwaway `PolicyRegistry` and runs the
+  same rule; `validate_repository_policies_registered` takes that registry
+  rather than the whole `AppState`, which is all it ever read, so the export
+  still opens no database.
+
+- **openapi:** `autumn openapi export` runs the two config-only guards that stop
+  a boot before anything route-shaped is looked at (issue #802): a `web`/`worker`
+  process role on a non-durable jobs backend — where the web replica enqueues
+  into an in-memory queue no worker can drain — and a duplicate `#[scheduled]`
+  task name, which spawns two loops competing for one coordination lock. Either
+  refuses to start, and neither was reachable from the router, so an export that
+  mirrored the router faithfully still approved the contract. Both now live in a
+  `validate_config_preconditions` the two paths share. The task check validates
+  the list with the framework's `[retention]` sweep merged in, exactly as the
+  serving path does — the collision it most often catches is between a
+  hand-declared task and that generated one, so validating the unmerged list
+  would miss the very case it exists for. The merge happens in exactly one
+  place, `merge_framework_scheduled_tasks`, covering both the
+  `#[repository(..., retention(...))]` sweeps and the config-driven one.
+
+- **Breaking:** `#[derive(OpenApiSchema)]` now refuses
+  `#[serde(skip_serializing_if = "…")]` on a field with no `#[serde(default)]`,
+  including on `Option<T>`, which previously compiled. `skip_serializing_if`
+  governs serialization only, so a response may omit the field while serde still
+  rejects a request that omits it; being spelled `Option<T>` used to be accepted
+  as proof that omission is valid on the way in, but a proc macro sees only the
+  tokens, and an application's own type named `Option` reads identically while
+  serde does require it. For such a type neither answer is right — `required`
+  lets a response omit what the schema demands, optional lets a client omit what
+  serde rejects — so the shape is refused rather than guessed. Add
+  `#[serde(default)]`, which is a no-op on a real `Option<T>` (serde already
+  fills a missing one with `None`) and makes omission genuinely valid in both
+  directions. `#[model]` is unaffected: its read schema describes a response
+  only. See the [migration guide](docs/migrations/next.md).
+
+- **openapi:** `autumn openapi export` no longer applies the application-router
+  checks under a non-HTTP process role (issue #802). With `role = "worker"`,
+  `run()` takes the probe-only branch and never builds the application router,
+  so none of those six rules execute — a route may legitimately own
+  `/openapi.json` under that profile. Enforcing them anyway *rejected* a
+  deployment that starts perfectly well. The config-only preconditions still
+  apply to every role, because `run()` performs those before it branches, and
+  the document is still exported either way: it is built from the routes and the
+  `OpenApiConfig`, neither of which depends on the role, so a worker-profile
+  export writes down the same contract the web role serves.
+
 
 ### Changed
 
@@ -346,7 +535,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COMMENT ON`, `GRANT`/`REVOKE`, `MERGE`, a writing CTE and the Postgres-only
   `CREATE INDEX`/`CREATE TABLE` clauses — and fails the `up.sql` gate, since they
   cannot apply. Postgres classification is unchanged.
-
+- **openapi:** `#[derive(OpenApiSchema)]` now covers enums whose variants are
+  all unit variants, emitting the closed string set serde puts on the wire
+  (`{"type": "string", "enum": [...]}`) and honoring `#[serde(rename)]`,
+  `#[serde(rename_all)]` and `#[serde(skip)]`. Previously the derive rejected
+  every enum outright, so an enum on the API boundary had no opt-in short of a
+  hand-written impl and fell back to the opaque object placeholder. Enums with
+  data-carrying variants are still a compile error rather than a guess: serde's
+  representation for those depends on `#[serde(tag/content/untagged)]`, so an
+  inferred shape could confidently advertise a contract the handler will not
+  accept.
+- **openapi:** the opaque-schema predicate MCP used to warn on degraded tool
+  input schemas is now `openapi::is_opaque_object_schema`, paired with a new
+  `openapi::opaque_component_schemas` that reports every placeholder component in
+  a built spec along with the operations reaching it. `autumn openapi export`
+  prints that report on every run, so a half-untyped contract is a visible
+  condition rather than a silent one. Behaviour of the existing MCP warnings is
+  unchanged — they now call the shared predicate instead of a private copy.
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
   a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
@@ -441,6 +646,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `./scripts/check-docs-routes.sh` (`--list` for the mounted surface,
   `--self-test` for the matcher's own cases).
 
+- **sqlite:** durable background jobs and a single-host scheduler on the SQLite
+  tier (issue #1907). `jobs.backend = "sqlite"` puts the queue in an
+  `autumn_jobs` table in the app's own database file, so `#[job]` work is
+  durable and restart-safe with **no Redis and no Postgres**. SQLite serializes
+  writers, so a worker claims a row with one
+  `UPDATE … WHERE id = (SELECT … LIMIT 1) RETURNING …` — the single-host analog
+  of `FOR UPDATE SKIP LOCKED` — and a claim left behind by a crashed worker is
+  re-enqueued once it outlives `jobs.sqlite.visibility_timeout_ms`. Attempt
+  counting, exponential backoff, dead-lettering, `#[job(unique)]` windows,
+  `#[job(concurrency = N)]` limits, named queues and `[jobs] pin` all behave as
+  they do on Postgres, and the `/admin/jobs` dashboard reads the table, so every
+  process on the host sees one queue. Workers poll (`jobs.sqlite.poll_interval_ms`,
+  default 250ms) because SQLite has no `LISTEN`/`NOTIFY`. The runtime creates
+  the table and its indexes itself — framework migrations are Postgres SQL — so
+  there is nothing to run by hand. Alongside it, `scheduler.backend = "sqlite"`
+  leases each `(task, tick)` in an `autumn_scheduler_leases` table, so several
+  processes on one host elect exactly one leader per tick; the lease expires
+  after `scheduler.lease_ttl_secs` rather than wedging the task when a leader
+  dies. A durable SQLite queue is shared by both processes of a web/worker
+  split, so that topology is now valid on the tier. Both backends need the
+  non-default `sqlite` cargo feature, and both are refused with an actionable
+  message on a build without it. Nothing on the Postgres path changes.
+  `autumn_web::lock::Lock` works on the tier too: the same API takes a lease row
+  in an `autumn_locks` table instead of a `pg_advisory_lock` session, so the
+  processes sharing the file contend, a live holder renews in the background,
+  and a dead one's lock frees at the lease expiry rather than wedging. It is
+  single-host in scope and not re-entrant; both are documented.
+  **Breaking:** `JobConfig` gains a public `sqlite` field and `SchedulerBackend`
+  gains a `Sqlite` variant, so a struct literal over `JobConfig` or an
+  exhaustive `match` on `SchedulerBackend` needs one line — see the
+  [migration guide](docs/migrations/next.md).
+
+- **sqlite:** connections opened at the same instant against a brand-new
+  database file no longer fail with "database is locked". `PRAGMA journal_mode
+  = WAL` takes an exclusive lock and SQLite does not run the busy handler for
+  it, so the `busy_timeout` set one pragma earlier never covered it: whichever
+  connection lost that race failed setup, and the request behind it got a 500.
+  The journal mode is a persistent property of the file, so the setup now
+  retries briefly and every retry after the winner is a no-op. Reachable
+  whenever several subsystems open the database at boot, which the durable
+  SQLite job runtime above does.
 - **web:** `AutumnError` now reads back its own validation details (issue
   #2587). `details()` returns the per-field message map for a validation
   failure and `None` for anything else, `code()` returns the stable problem
@@ -779,6 +1025,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🛣️ Onramp: corrected the "Local development" guidance in
+  `docs/guide/getting-started.md` about what `autumn doctor`'s
+  `version_compat` check can actually catch (docs overclaim → accurate):**
+  the guide said a source-built CLI "may scaffold projects pinning an
+  `autumn-web` version that is not on crates.io yet" and that
+  `version_compat` "reports the two versions side by side; if they
+  disagree" — implying a green check rules out version skew. In reality
+  `autumn new` always pins the CLI's own frozen-until-release
+  `CARGO_PKG_VERSION` (CLAUDE.md: never bump the workspace version outside a
+  release), which is normally already published; it is the *code* behind
+  that version number that has moved on between releases. `version_compat`
+  compares version strings, so it prints `✅ version_compat — autumn-cli
+  0.7.0 matches autumn-web 0.7.0` regardless — confirmed live on
+  `quickstart-gate.yml`'s `local-dev-quickstart` job (red since #2459
+  landed, still red as of this fix, always on this exact version-strings-
+  match-but-code-diverged path). The guide now says so plainly: don't trust
+  a green `version_compat` to rule out version skew, watch for a `cargo
+  build` failure referencing `autumn_web::` right after `autumn new`
+  instead, and apply the `[patch.crates-io]` workaround proactively when
+  building from a checkout that's ahead of the last release tag. No code
+  changes — `version_compat` still cannot see this drift (a version bump is
+  the only real fix, out of scope here), so nothing to re-measure on the
+  quickstart-gate harness; this closes the gap between what the docs
+  promised and what the check actually does.
 - **macros:** the `#[model]` association preloader named `diesel::pg::Pg`
   directly, so a `--belongs-to … --counter-cache` scaffold did not compile on a
   SQLite app. It now names `autumn_web::RuntimeBackend`, the alias that already
@@ -807,6 +1077,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SQLite app needs it to compile at all (#1924).
 
 ### Added
+
+- **openapi:** `autumn openapi export` gets the spec out of the app without
+  running it (issue #802). It compiles the target binary and runs it in a dump
+  mode that binds no port and opens no database connection — the same no-boot
+  child-process protocol `autumn routes` uses — then writes the same OpenAPI 3.1
+  document `/openapi.json` serves, built through the very same
+  `collect_openapi_docs` + `generate_spec` pair so an exported spec and a served
+  one cannot drift. Until now the only ways to obtain the contract were to boot
+  the server and curl it, or to run a full static build (`autumn build` emits
+  `dist/openapi.json` as a side effect, and bails out entirely on an app with no
+  `#[static_get]` routes). `--out <path>` writes a file, `--check <path>`
+  re-exports and fails on drift against a committed copy — comparing parsed JSON
+  rather than bytes, and printing the operations that were added, removed or
+  changed — and `--strict` additionally fails on any opaque component schema.
+  An app built without the `openapi` feature, or one that never called
+  `.openapi(...)`, reports which of the two it is instead of emitting nothing.
+  The point of the command is to hand the standard generators
+  (`openapi-typescript`, `progenitor`, `openapi-generator`) a spec worth
+  generating from; Autumn does not ship its own client emitters.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,
@@ -2911,6 +3200,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defect and the regression test pinning it
   (`form_and_search_input_focus_keeps_a_visible_outline`) are in
   `autumn-admin-plugin/src/templates.rs`.
+
+- **`#[validate]` on a `#[model]` was ignored by every repository write that did
+  not go through a generated REST handler (issue #2586):** `docs/guide/forms.md`
+  promises a rule put on the model covers every write path — a form, an API
+  endpoint, a seed, a job, a CSV import — but `#[repository]` spliced the check
+  into the `api = "..."` `create`/`update` handlers only. A GraphQL resolver, a
+  `#[task]`, a seed or an admin action calling `save` wrote a row the model
+  forbids, and `#[normalize]` running on that same path made the gap easy to
+  miss: a `#[normalize(trim)] #[validate(length(min = 1))]` title submitted as
+  `"   "` was trimmed to `""` and then inserted.
+  The rules now run on every generated insert path — `save`, `save_many`,
+  `save_many_skip_invalid`, and the create half of `find_or_create_by_*` — after
+  normalization and before the `before_create` hook, exactly where the guide
+  says they run. `save` and `save_many` raise a 422 with the per-field map and
+  write nothing; `save_many_skip_invalid` keeps its partial-success contract and
+  reports a rejected row as `(index, error)` against the caller's own index; and
+  `find_or_create_by_*` validates only when it is about to insert, so a row that
+  already exists is still returned. `save_many_skip_invalid` also normalizes its
+  rows now, which it did not before, so it judges and stores the same canonical
+  value `save_many` does.
+  A payload type without `#[validate]` columns still compiles to a no-op, so no
+  repository needs migrating — but a caller that has been writing rows its own
+  model forbids will now get a 422 where it used to get a row. Update paths are
+  unchanged: they keep the documented hooked / `validate_on_update = fetch` /
+  blind table.
+  Three consequences worth knowing before you upgrade. A `#[validate]` rule on a
+  column that `before_create` **populates** now rejects every insert, because
+  the rules run first — put rules on what the caller supplies, and derive the
+  value before building the `New*`. On a `tenant_scoped` repository, `save` with
+  an invalid payload and no tenant context now returns the 422 rather than the
+  "no tenant context was established" 500; both are still errors, but the
+  precedence changed. And `Model::factory().create()` — so `autumn seed` — still
+  inserts through Diesel directly and is deliberately **not** covered, along
+  with hand-written repositories, raw `diesel::insert_into`, and `upsert_many`;
+  `docs/guide/forms.md` now says so rather than implying otherwise.
+  `find_or_create_by_*` additionally canonicalizes a `#[normalize]` lookup
+  column, the same probe the derived `find_by_*` finders already used. Without
+  it the create half would insert the canonical value while the lookup searched
+  for the raw one, so a repeated identical call would miss the row it had just
+  written and surface the "no matching row on re-lookup" 500.
+
 - **examples/reddit-clone: concurrent identical `/submit`s could duplicate a
   post's slug and make its permalink silently serve a different post (issue
   #2544):** `unique_slug()`/`unique_slug_excluding()` proved uniqueness with a

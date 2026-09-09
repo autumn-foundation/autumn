@@ -77,7 +77,15 @@ autumn-web = { version = "0.7.0", path = "../autumn", default-features = false, 
     # and purely additive (it adds the pure-Rust `wasmi` interpreter and nothing
     # else), so it is enabled unconditionally rather than behind a CLI feature —
     # the sqlite CLI build gets the same commands as the Postgres one.
-    "plugin-sandbox"
+    "plugin-sandbox",
+    # `autumn openapi export` parses the spec its child dump emitted and reports
+    # the components that degraded to the opaque `{"type":"object"}` placeholder.
+    # It reuses the framework's own `OpenApiSpec` types and
+    # `openapi::opaque_component_schemas` rather than re-deriving the predicate,
+    # so the exporter and the runtime cannot disagree about what counts as
+    # opaque. Additive and small: the feature's only extra dependency is
+    # `serde_yaml`.
+    "openapi"
 ] }
 autumn-schema-core = { version = "0.7.0", path = "../autumn-schema-core" }
 base64 = "0.23"
