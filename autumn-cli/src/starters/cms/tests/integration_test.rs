@@ -3643,6 +3643,274 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// A capacity check serializes on something that exists even when the
+/// container is empty.
+///
+/// `FOR UPDATE` over a container's existing children locks nothing while there
+/// are none, so concurrent transactions each lock zero rows, each count zero,
+/// and each insert — carrying an empty menu or sidebar straight past its bound,
+/// which is the one case the check exists for. The menu row and an advisory
+/// lock on the sidebar's name are the stable things to serialize on.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_capacity_check_serializes_on_an_empty_container() {
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Main"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The menu is empty and the sidebar is empty — the state in which locking
+    // the children locks nothing at all.
+    let mut holder = TestDb::shared().await.pool().get().await.expect("conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    // `FOR NO KEY UPDATE`, not `FOR UPDATE`. The insert's foreign key takes
+    // `FOR KEY SHARE` on the menu row, which conflicts with `FOR UPDATE` — so
+    // holding that would block the insert whether or not it takes the row lock
+    // deliberately, and the test would pass against the bug. `NO KEY UPDATE` is
+    // compatible with key share and conflicts only with the explicit
+    // `FOR UPDATE` the capacity check now takes.
+    diesel::sql_query("SELECT id FROM menus WHERE id = 1 FOR NO KEY UPDATE")
+        .execute(&mut holder)
+        .await
+        .expect("hold the menu row");
+
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(750), async {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::insert_menu_item(
+            &mut conn,
+            {{crate_name}}::models::NewMenuItem {
+                menu_id: 1,
+                parent_id: None,
+                label: "Home".to_owned(),
+                url: "/".to_owned(),
+                post_id: None,
+                term_id: None,
+                position: 0,
+            },
+            100,
+        )
+        .await
+    })
+    .await;
+    assert!(
+        blocked.is_err(),
+        "the insert must wait on the menu row, not race past an empty menu"
+    );
+    diesel::sql_query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("release the menu row");
+
+    // The sidebar's advisory lock, held from a session so an `xact` lock waits
+    // on it — the same trick the hierarchy-lock test uses.
+    let mut holder = TestDb::shared().await.pool().get().await.expect("conn");
+    diesel::sql_query("SELECT pg_advisory_lock(7717260, hashtext('primary'))")
+        .execute(&mut holder)
+        .await
+        .expect("hold the sidebar");
+    let blocked = tokio::time::timeout(std::time::Duration::from_millis(750), async {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::insert_widget(
+            &mut conn,
+            {{crate_name}}::models::NewWidget {
+                sidebar: "primary".to_owned(),
+                kind: "search".to_owned(),
+                title: "Search".to_owned(),
+                settings: serde_json::json!({}),
+                position: 0,
+            },
+            30,
+        )
+        .await
+    })
+    .await;
+    assert!(
+        blocked.is_err(),
+        "the insert must wait on the sidebar's lock, not race past an empty sidebar"
+    );
+    diesel::sql_query("SELECT pg_advisory_unlock(7717260, hashtext('primary'))")
+        .execute(&mut holder)
+        .await
+        .expect("release the sidebar");
+
+    // Released, both go through.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::insert_widget(
+            &mut conn,
+            {{crate_name}}::models::NewWidget {
+                sidebar: "primary".to_owned(),
+                kind: "search".to_owned(),
+                title: "Search".to_owned(),
+                settings: serde_json::json!({}),
+                position: 0,
+            },
+            30,
+        )
+        .await
+        .expect("the insert proceeds once the lock is free");
+    }
+}
+
+/// The seed leaves an occupied primary location alone.
+///
+/// The check asked for a menu whose *slug* was `primary`, but
+/// `idx_menus_location` constrains the *location* — so a site whose primary
+/// menu is named anything else read as having none, and the insert violated the
+/// index. The settings, terms and posts are already committed by then, so the
+/// task reported failure over a half-seeded site and failed the same way on
+/// every retry.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_seed_leaves_an_occupied_menu_location_alone() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A menu at `primary` whose slug is anything but `primary`.
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Main"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::seed::seed_site(&mut conn)
+            .await
+            .expect("the seed must not fail over a menu that is already there");
+    }
+
+    let at_primary: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::get_result(
+            {{crate_name}}::schema::menus::table
+                .filter({{crate_name}}::schema::menus::location.eq("primary"))
+                .count(),
+            &mut conn,
+        )
+        .await
+        .expect("the count")
+    };
+    assert_eq!(at_primary, 1, "and does not add a second one");
+}
+
+/// Changing and deleting accounts are authorized against the actor's current
+/// row too, not only creation.
+///
+/// `with_administrator_guard` locked and reloaded the *target* and never the
+/// actor, so an administrator demoted or deleted while their request was in
+/// flight could still promote an account they control and keep privileged
+/// access through it. Fixing only `create_user_as` last round left the two
+/// paths that already had a guard still deciding on the session's stale copy.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn managing_accounts_is_authorized_against_the_actors_current_row() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let _owner = register(&client, "owner").await;
+    let _second = register(&client, "second").await;
+    let _third = register(&client, "third").await;
+    try_execute(
+        TestDb::shared().await,
+        "UPDATE users SET role = 'administrator' WHERE username IN ('second', 'third')",
+    )
+    .await
+    .expect("promote");
+
+    let id_of = async |username: &'static str| -> i64 {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::users::table
+                .filter({{crate_name}}::schema::users::username.eq(username))
+                .select({{crate_name}}::schema::users::id),
+            &mut conn,
+        )
+        .await
+        .expect("the account")
+    };
+    let actor_id = id_of("second").await;
+    let target_id = id_of("third").await;
+
+    // Revoked while the request was in flight.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE users SET role = 'subscriber' WHERE id = {actor_id}"),
+    )
+    .await
+    .expect("demote the actor");
+
+    // A role change: the promotion the finding describes.
+    let updated = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::update_user(
+            &mut conn,
+            actor_id,
+            target_id,
+            {{crate_name}}::content::UserEdit {
+                role: {{crate_name}}::capabilities::Role::Administrator,
+                email: "third@example.com".to_owned(),
+                display_name: "Third".to_owned(),
+                bio: String::new(),
+                website: String::new(),
+            },
+        )
+        .await
+    };
+    assert_eq!(
+        updated
+            .expect_err("a revoked actor may not change roles")
+            .status(),
+        autumn_web::prelude::StatusCode::FORBIDDEN
+    );
+
+    // And a deletion, which is a demotion to no role at all.
+    let deleted = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::delete_user(&mut conn, actor_id, target_id).await
+    };
+    assert_eq!(
+        deleted
+            .expect_err("a revoked actor may not delete accounts")
+            .status(),
+        autumn_web::prelude::StatusCode::FORBIDDEN
+    );
+
+    let (role, present): (String, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let role: String = RunQueryDsl::first(
+            {{crate_name}}::schema::users::table
+                .find(target_id)
+                .select({{crate_name}}::schema::users::role),
+            &mut conn,
+        )
+        .await
+        .expect("the target");
+        let present: i64 =
+            RunQueryDsl::get_result({{crate_name}}::schema::users::table.find(target_id).count(), &mut conn)
+                .await
+                .expect("the count");
+        (role, present)
+    };
+    assert_eq!(role, "administrator", "the target is unchanged");
+    assert_eq!(present, 1, "and still there");
+}
+
 /// Creating an account is authorized against the actor's current row.
 ///
 /// The handler's capability check runs at the start of a request that then
@@ -9110,7 +9378,7 @@ async fn deleting_an_author_takes_the_hierarchy_lock() {
         let mut worker = TestDb::shared().await.pool().get().await.expect("conn");
         let blocked = tokio::time::timeout(
             std::time::Duration::from_millis(750),
-            {{crate_name}}::content::delete_user(&mut worker, 2),
+            {{crate_name}}::content::delete_user(&mut worker, 1, 2),
         )
         .await;
         assert!(
@@ -9129,7 +9397,7 @@ async fn deleting_an_author_takes_the_hierarchy_lock() {
 
     // With the lock released it completes.
     let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-    {{crate_name}}::content::delete_user(&mut conn, 2)
+    {{crate_name}}::content::delete_user(&mut conn, 1, 2)
         .await
         .expect("the deletion proceeds once the lock is free");
 }

@@ -20,9 +20,26 @@ use crate::settings::Settings;
 /// so running it twice changes nothing the second time. A seed that cannot be
 /// re-run is a seed nobody dares run.
 #[autumn_web::task(name = "seed-demo")]
-pub async fn seed_demo_content(mut db: Db) -> AutumnResult<()> {
-    let conn = &mut *db;
+pub async fn seed_demo_content(
+    mut db: Db,
+    config: autumn_web::config::AutumnConfig,
+) -> AutumnResult<()> {
+    // The probe paths, observed here because a task does not go through the
+    // `Repos` extractor that normally records them on the first request.
+    // Without this the seeder's guard has nothing to check against, and a site
+    // configured with `health.path = "/about"` seeds a page the probe shadows.
+    crate::content::observe_probe_paths(&config);
+    seed_site(&mut db).await
+}
 
+/// The seed itself, on a plain connection.
+///
+/// Extracted from the task for the same reason [`seed_posts`] was: a test has
+/// no way to build a `Db` extractor, and the parts worth covering — the skip
+/// rules and the idempotence — are all in here.
+pub async fn seed_site(
+    conn: &mut autumn_web::reexports::diesel_async::AsyncPgConnection,
+) -> AutumnResult<()> {
     // The default settings, written out so the Settings screen shows real rows
     // rather than implicit fallbacks.
     for (name, value) in Settings::default().to_rows() {
@@ -91,8 +108,15 @@ pub async fn seed_demo_content(mut db: Db) -> AutumnResult<()> {
     seed_posts(conn, author_id, now).await?;
 
     // A primary menu pointing at the About page.
+    //
+    // Asked of the *location*, which is what `idx_menus_location` constrains.
+    // Asking for the slug meant a site whose primary menu was named anything
+    // else — "Main", say — read as having none, and the insert below then
+    // violated that index. The settings, terms and posts above are already
+    // committed by then, so the task reported failure over a half-seeded site
+    // and failed the same way on every retry.
     let menu_exists: i64 = menus::table
-        .filter(menus::slug.eq("primary"))
+        .filter(menus::location.eq("primary"))
         .count()
         .get_result(conn)
         .await?;
@@ -223,6 +247,17 @@ pub async fn seed_posts(
         } else {
             vec![post_type]
         };
+        // The health probe's path is a literal route the framework mounts, so
+        // content there is shadowed however correct the row is. The editor's
+        // create path has refused this since round thirty-six; the seeder went
+        // around it with a direct insert, so a site configured with
+        // `health.path = "/about"` published an About page it then served the
+        // probe for. Skipping rather than erroring, for the same reason the
+        // collision above skips: a demo page is not worth failing a startup.
+        if crate::content::guard_claimed_path(&[slug.to_owned()], post_type).is_err() {
+            continue;
+        }
+
         let exists: i64 = posts::table
             .filter(posts::slug.eq(slug))
             .filter(posts::post_type.eq_any(competing))

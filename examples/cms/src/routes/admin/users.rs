@@ -289,12 +289,15 @@ pub async fn update(
         .with_conn(async |conn| {
             crate::content::update_user(
                 conn,
+                actor.id,
                 id,
-                Role::parse(&form.role),
-                form.email.clone(),
-                form.display_name.trim().to_owned(),
-                form.bio.clone(),
-                form.website.trim().to_owned(),
+                crate::content::UserEdit {
+                    role: Role::parse(&form.role),
+                    email: form.email.clone(),
+                    display_name: form.display_name.trim().to_owned(),
+                    bio: form.bio.clone(),
+                    website: form.website.trim().to_owned(),
+                },
             )
             .await
         })
@@ -332,7 +335,7 @@ pub async fn delete(
     // gone with the counts stale — and a retry finds no user to delete, so
     // nothing ever repairs them.
     repos
-        .with_conn(async |conn| crate::content::delete_user(conn, id).await)
+        .with_conn(async |conn| crate::content::delete_user(conn, actor.id, id).await)
         .await?;
 
     Ok(Redirect::to("/admin/users").into_response())

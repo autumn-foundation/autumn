@@ -1508,6 +1508,7 @@ pub async fn register_user(
 /// a spare administrator and both proceed.
 async fn with_administrator_guard<F>(
     conn: &mut AsyncPgConnection,
+    actor_id: i64,
     target_id: i64,
     new_role: crate::capabilities::Role,
     mutate: F,
@@ -1525,6 +1526,29 @@ where
         ))
         .execute(conn)
         .await?;
+
+        // The actor, re-read under the same lock as the target. The handler's
+        // capability check ran on a released connection, and this guard used to
+        // reload only the *target* — so an administrator demoted or deleted
+        // while their request was in flight could still promote an account they
+        // control and keep privileged access through it. Every write to the
+        // administrator set now decides on the actor's current row, which is
+        // what `create_user_as` does and what this guard should always have
+        // done. A deleted actor has no authority at all, so a missing row is a
+        // refusal rather than a fall-through.
+        let actor: Option<User> = users::table
+            .find(actor_id)
+            .select(User::as_select())
+            .first(conn)
+            .await
+            .optional()?;
+        let permitted =
+            actor.is_some_and(|actor| actor.role().can(crate::capabilities::Capability::EditUsers));
+        if !permitted {
+            return Err(AutumnError::forbidden_msg(
+                "Your account can no longer manage users",
+            ));
+        }
 
         let target: User = users::table
             .find(target_id)
@@ -1556,15 +1580,32 @@ where
 
 /// Change an account's role and profile fields, guarding the last
 /// administrator.
+/// The profile fields an administrator may change on another account.
+///
+/// A struct rather than five more parameters, for the reason `EditContext` is
+/// one: at the call site four adjacent `String`s are four chances to swap two
+/// of them silently.
+pub struct UserEdit {
+    pub role: crate::capabilities::Role,
+    pub email: String,
+    pub display_name: String,
+    pub bio: String,
+    pub website: String,
+}
+
 pub async fn update_user(
     conn: &mut AsyncPgConnection,
+    actor_id: i64,
     target_id: i64,
-    role: crate::capabilities::Role,
-    email: String,
-    display_name: String,
-    bio: String,
-    website: String,
+    edit: UserEdit,
 ) -> AutumnResult<()> {
+    let UserEdit {
+        role,
+        email,
+        display_name,
+        bio,
+        website,
+    } = edit;
     // The same rule the registration path applies, for the same reason: this is
     // a direct Diesel update, so the model's `#[validate(email)]` never runs.
     // Fixing only the create path left an administrator able to store `user@`
@@ -1582,7 +1623,7 @@ pub async fn update_user(
         )));
     }
 
-    with_administrator_guard(conn, target_id, role, move |conn| {
+    with_administrator_guard(conn, actor_id, target_id, role, move |conn| {
         async move {
             diesel::update(users::table.find(target_id))
                 .set((
@@ -1607,7 +1648,11 @@ pub async fn update_user(
 /// Returns the terms its cascaded posts were filed under, so the caller can
 /// rebuild their counts — the cascade reaches `post_terms` and nothing in it
 /// maintains `terms.post_count`.
-pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> AutumnResult<()> {
+pub async fn delete_user(
+    conn: &mut AsyncPgConnection,
+    actor_id: i64,
+    target_id: i64,
+) -> AutumnResult<()> {
     // Deleting is a demotion to "no role at all", so it takes the same guard.
     // The recounts run inside the same transaction as the cascade: doing them
     // afterwards means a transient failure leaves the account and its posts
@@ -1615,6 +1660,7 @@ pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> Autumn
     // delete, so nothing ever repairs them.
     with_administrator_guard(
         conn,
+        actor_id,
         target_id,
         crate::capabilities::Role::Subscriber,
         move |conn| {
@@ -2789,12 +2835,19 @@ pub async fn insert_menu_item(
     // The model's declared rules, which this direct insert never runs.
     crate::hooks::validate_new_menu_item(&new)?;
     conn.transaction(async move |conn| {
-        let _locked: Vec<i64> = menu_items::table
-            .filter(menu_items::menu_id.eq(new.menu_id))
-            .select(menu_items::id)
+        // The *menu* row, not its items. Locking the children serializes
+        // nothing when there are none: concurrent transactions each lock zero
+        // rows, each count zero, and each insert — so a burst of simultaneous
+        // submissions can carry an empty menu straight past the bound, which is
+        // the one case a capacity check exists for. The container row is always
+        // there, so it is the thing to serialize on.
+        let _locked: Option<i64> = menus::table
+            .find(new.menu_id)
+            .select(menus::id)
             .for_update()
-            .load(conn)
-            .await?;
+            .first(conn)
+            .await
+            .optional()?;
         let existing: i64 = menu_items::table
             .filter(menu_items::menu_id.eq(new.menu_id))
             .count()
@@ -2815,6 +2868,13 @@ pub async fn insert_menu_item(
     .await
 }
 
+/// The advisory-lock class the sidebar capacity check uses.
+///
+/// Two-int advisory locks live in a different space from the single-`bigint`
+/// ones (`ADMIN_SET_LOCK_KEY`, `PAGE_HIERARCHY_LOCK_KEY`), so this cannot
+/// collide with them however the second half hashes.
+const WIDGET_SET_LOCK_CLASS: i32 = 7_717_260;
+
 /// Add a sidebar widget, refusing one the sidebar could never show.
 ///
 /// Same shape as [`insert_menu_item`]: the Appearance screen and every public
@@ -2827,11 +2887,18 @@ pub async fn insert_widget(
     limit: i64,
 ) -> AutumnResult<()> {
     conn.transaction(async move |conn| {
-        let _locked: Vec<i64> = widgets::table
-            .filter(widgets::sidebar.eq(&new.sidebar))
-            .select(widgets::id)
-            .for_update()
-            .load(conn)
+        // A sidebar has no row of its own to lock, and locking the widgets
+        // already in it serializes nothing while it is empty — see
+        // `insert_menu_item`. An advisory lock keyed on the sidebar's name is
+        // the stable thing here: it exists whether or not any widget does.
+        //
+        // Its own key space, so it orders against nothing else. Widgets are a
+        // leaf: no path holds a widget lock and then reaches for a post, a term
+        // or the hierarchy.
+        diesel::sql_query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+            .bind::<diesel::sql_types::Integer, _>(WIDGET_SET_LOCK_CLASS)
+            .bind::<diesel::sql_types::Text, _>(new.sidebar.clone())
+            .execute(conn)
             .await?;
         let existing: i64 = widgets::table
             .filter(widgets::sidebar.eq(&new.sidebar))
@@ -4580,6 +4647,19 @@ mod slug_shape_tests {
             let mut config = autumn_web::config::AutumnConfig::default();
             "/category/status".clone_into(&mut config.health.path);
             "/tag/status".clone_into(&mut config.health.live_path);
+            // A bare single-segment path too, which is the shape the seeder
+            // mints. The store is a `OnceLock`, so this is the one place a
+            // configuration can be observed in a test — an integration test
+            // cannot set it deterministically, which is why the seeder's guard
+            // is asserted here rather than through a seeded site.
+            //
+            // Deliberately not `/about`, even though that is the page the
+            // seeder creates: every test in this process shares this one
+            // observation, and `segment_claim_names_every_kind_of_owner`
+            // asserts `about` is unclaimed. The property under test is that a
+            // bare path a probe holds is refused, not that it is spelled
+            // `about`.
+            "/probe-only".clone_into(&mut config.health.ready_path);
             config
         });
 
@@ -4609,6 +4689,19 @@ mod slug_shape_tests {
         assert!(
             super::guard_term_path("not_a_taxonomy", "status").is_ok(),
             "an unregistered taxonomy has no base to collide on"
+        );
+
+        // The bare single-segment shape the seeder mints. It went around this
+        // guard with a direct insert, so a site configured with
+        // `health.path = "/about"` published an About page the probe then
+        // shadowed — the CMS advertising a URL it does not serve.
+        assert!(
+            claimed(&["probe-only"]),
+            "a seeded page under a claimed bare path is unreachable too"
+        );
+        assert!(
+            !claimed(&["about"]) && !claimed(&["hello-world"]),
+            "and the seeded content beside it is untouched"
         );
     }
 }
