@@ -144,6 +144,50 @@ let account: Account = accounts::table
     .await?;
 ```
 
+### Blind indexes (preferred for equality lookup)
+
+`#[encrypted(blind_index)]` declares migration metadata for three distinct
+columns: the original column continues to contain randomized ciphertext,
+`<field>_blind_index` contains a 32-byte token, and
+`<field>_blind_index_key_version` contains the token-key generation. Migration
+and PostgreSQL index names contain a SHA-256-derived suffix over the table,
+model, and field, so long or similarly truncated identifiers do not collide.
+PostgreSQL equality is used **only** on the token and key-version columns; it is
+never used on plaintext or randomized ciphertext.
+
+The application client computes the token with
+`autumn_web::blind_index::compute`. Its versioned HMAC-SHA256 domain includes
+the application identifier, model, field, owner (tenant/user/global) scope,
+normalization version, and token-key generation. Every component is
+length-prefixed. Normalization version 1 is exactly NFKC, Unicode lowercase,
+then leading/trailing-whitespace trimming, in that order. Unknown versions are
+rejected; do not substitute locale-, database-, browser-, or client-specific
+normalization.
+
+Blind indexes reveal **equality and frequency** to anyone who can observe the
+database. Do not use them for low-entropy values (status flags, small enums,
+country codes, or easily enumerated identifiers), and never expose an endpoint
+that acts as a chosen-input token oracle. Scope the token as narrowly as the
+query permits.
+
+A token match is only a candidate, not cryptographic proof that plaintexts are
+equal: PRF outputs can collide and database data can be corrupt. Fetch every
+matching row, decrypt its ciphertext, and call `verify_candidate` before using
+it as an equality result. Rust-side token comparisons must use `tokens_equal`,
+which compares both key generation and token in constant time.
+
+#### Rotating a blind-index key
+
+1. Add the new token key with a fresh generation number while retaining the old
+   key, and start dual-reading `(old_generation, old_token)` and
+   `(new_generation, new_token)`.
+2. New writes store the new generation and token. In batches, decrypt each old
+   row, recompute its token with the new key and the row's original owner scope,
+   and atomically update only the token and key-version columns. Do not copy a
+   token across owners or applications.
+3. Verify no rows carry the old generation, stop dual-reading, and only then
+   remove the old token key. Ciphertext-key rotation remains independent.
+
 ## On-disk format
 
 Each encrypted value is a base64 string wrapping a self-describing binary

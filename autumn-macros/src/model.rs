@@ -14,6 +14,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens as _, format_ident, quote};
+use sha2::{Digest as _, Sha256};
 use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
@@ -4568,6 +4569,8 @@ struct EncryptedSpec {
     /// `versioned_ciphertext` — store encrypted before/after ciphertext in record
     /// version history instead of the default "changed (encrypted)" marker.
     versioned_ciphertext: bool,
+    /// Generate a separate blind-index token and key-version column descriptor.
+    blind_index: bool,
 }
 
 impl EncryptedSpec {
@@ -4575,6 +4578,7 @@ impl EncryptedSpec {
         mode: EncryptedMode::None,
         admin_visible: false,
         versioned_ciphertext: false,
+        blind_index: false,
     };
     fn is_encrypted(self) -> bool {
         self.mode != EncryptedMode::None
@@ -4612,10 +4616,13 @@ fn parse_field_encrypted(field: &syn::Field) -> syn::Result<EncryptedSpec> {
             } else if meta.path.is_ident("versioned_ciphertext") {
                 spec.versioned_ciphertext = true;
                 Ok(())
+            } else if meta.path.is_ident("blind_index") {
+                spec.blind_index = true;
+                Ok(())
             } else {
                 Err(meta.error(
                     "unsupported `#[encrypted]` option; expected one of \
-                     `deterministic`, `randomized`, `admin_visible`, `versioned_ciphertext`",
+                     `deterministic`, `randomized`, `admin_visible`, `versioned_ciphertext`, `blind_index`",
                 ))
             }
         })?;
@@ -7486,8 +7493,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Collect `#[encrypted]` columns (validated to be non-null `String`).
-    // Each entry: (column, deterministic, admin_visible, versioned_ciphertext).
-    let mut encrypted_columns: Vec<(String, bool, bool, bool)> = Vec::new();
+    // Each entry: (column, deterministic, admin_visible, versioned_ciphertext, blind_index).
+    let mut encrypted_columns: Vec<(String, bool, bool, bool, bool)> = Vec::new();
     for f in &all_fields {
         if let Err(err) = validate_encrypted_field(f) {
             return err.to_compile_error();
@@ -7500,6 +7507,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     spec.mode == EncryptedMode::Deterministic,
                     spec.admin_visible,
                     spec.versioned_ciphertext,
+                    spec.blind_index,
                 ));
             }
             Ok(_) => {}
@@ -7805,10 +7813,37 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // Blind-index storage is deliberately distinct from the ciphertext column.
+    // Names include a SHA-256 prefix of the fully-qualified logical column, making
+    // them stable, PostgreSQL-length-safe, and collision-resistant.
+    let blind_index_inventory: Vec<TokenStream> = encrypted_columns
+        .iter()
+        .filter_map(|(col, _, _, _, blind)| {
+            if !*blind {
+                return None;
+            }
+            let digest = Sha256::digest(format!("{table_name}\0{name}\0{col}").as_bytes());
+            let tag = hex::encode(&digest[..10]);
+            let token_column = format!("{col}_blind_index");
+            let key_version_column = format!("{col}_blind_index_key_version");
+            let migration_name = format!("add_blind_index_{tag}");
+            let index_name = format!("idx_bidx_{tag}");
+            Some(quote! {
+                ::autumn_web::reexports::inventory::submit! {
+                    ::autumn_web::blind_index::BlindIndexColumnDescriptor {
+                        model: stringify!(#name), table: #table_name, ciphertext_column: #col,
+                        token_column: #token_column, key_version_column: #key_version_column,
+                        migration_name: #migration_name, index_name: #index_name,
+                    }
+                }
+            })
+        })
+        .collect();
+
     let encrypted_inventory: Vec<TokenStream> = encrypted_columns
         .iter()
         .map(
-            |(col, deterministic, admin_visible, versioned_ciphertext)| {
+            |(col, deterministic, admin_visible, versioned_ciphertext, _)| {
                 quote! {
                     ::autumn_web::reexports::inventory::submit! {
                         ::autumn_web::encryption::EncryptedColumnDescriptor {
@@ -9837,6 +9872,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #(#encrypted_inventory)*
+        #(#blind_index_inventory)*
 
         #translatable_items
         #(#translatable_inventory)*
@@ -13981,6 +14017,27 @@ mod tests {
             pub token: String
         };
         assert!(validate_encrypted_field(&field).is_ok());
+    }
+
+    #[test]
+    fn blind_index_emits_separate_collision_resistant_storage_names() {
+        let generated = model_macro(
+            quote! { table = "customer_records" },
+            quote! {
+                pub struct Customer {
+                    #[id]
+                    pub id: i64,
+                    #[encrypted(blind_index)]
+                    pub email: String,
+                }
+            },
+        )
+        .to_string();
+        assert!(generated.contains("email_blind_index"));
+        assert!(generated.contains("email_blind_index_key_version"));
+        assert!(generated.contains("add_blind_index_"));
+        assert!(generated.contains("idx_bidx_"));
+        assert!(generated.contains("ciphertext_column : \"email\""));
     }
 
     #[test]

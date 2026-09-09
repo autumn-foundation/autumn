@@ -87,6 +87,8 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+/// Versioned, domain-separated blind indexes for encrypted equality lookup.
+pub mod blind_index;
 // The build-time agent authority envelope (issue #1691): what an MCP-exposed,
 // agent-operable handler is allowed to do -- which models it writes, whether it
 // leaves the tenant, which hosts it calls, which jobs it enqueues, how

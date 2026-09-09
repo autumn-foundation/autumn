@@ -647,9 +647,11 @@ dependencies = [
 name = "autumn-macros"
 version = "0.7.0"
 dependencies = [
+ "hex",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
+ "sha2 0.10.9",
  "syn 2.0.119",
  "temp-env",
 ]
