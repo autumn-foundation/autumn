@@ -327,7 +327,7 @@ async fn start_postgres() -> (
 /// The module default above is `postgres:11-alpine`, and it stays that way on
 /// purpose: it is the oldest server the scrub claims to run on, so every test
 /// that does not need a newer feature keeps proving that claim. `BEGIN ATOMIC`
-/// and the `pg_proc.prosqlbody` column that records it are both PostgreSQL 14,
+/// and the `pg_proc.prosqlbody` column that records it are both `PostgreSQL` 14,
 /// so the two tests about following a tracked function through the catalog
 /// cannot be written against 11 — the fixture itself is a syntax error there.
 async fn start_postgres_with_atomic_bodies() -> (
@@ -335,6 +335,7 @@ async fn start_postgres_with_atomic_bodies() -> (
     String,
     u16,
 ) {
+    use testcontainers::ImageExt as _;
     use testcontainers::runners::AsyncRunner as _;
     use testcontainers_modules::postgres::Postgres;
 
@@ -2615,6 +2616,134 @@ async fn a_view_read_through_a_tracked_function_is_refreshed_in_order() {
             seeded_rows(&atomic, view, "email").await,
             0,
             "{view} must be rebuilt from the scrubbed rows: {stderr}"
+        );
+    }
+}
+
+/// A view reaching another only through a user-defined OPERATOR is ordered.
+///
+/// The rewrite rule records `pg_operator`, and no `pg_proc` row at all, so
+/// seeding the function closure from the rule's `pg_proc` dependencies alone
+/// found nothing. Measured before this was followed: `a_report` reads
+/// `z_source` only through `1 ==> 200`, whose implementation is a tracked
+/// `BEGIN ATOMIC` function, and the run reported `Scrub complete` with `users`
+/// at 2 rows, `z_source` clean, and all 200 original addresses still sitting in
+/// `a_report`. `z_source` sorts AFTER `a_report`, so refreshing it first can
+/// only come from the operator hop being traversed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_view_read_through_a_custom_operator_is_refreshed_in_order() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "fn_operator").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    // The operator's implementation returns the addresses themselves, so a
+    // stale `z_source` is not a subtle ordering wrinkle — it is the PII,
+    // copied verbatim into the dependent view.
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
+             CREATE FUNCTION op_impl(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 BEGIN ATOMIC \
+                     SELECT string_agg(s.email, ',' ORDER BY s.id) FROM z_source s \
+                     WHERE s.id BETWEEN $1 AND $2; \
+                 END; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = op_impl); \
+             CREATE MATERIALIZED VIEW a_report AS \
+                 SELECT (1::bigint ==> 200::bigint) AS harvested;",
+        )
+        .await
+        .unwrap();
+    let url = format!("{base}/fn_operator");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+    let source_at = stderr
+        .find("z_source (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the source must be refreshed: {stderr}"));
+    let dependent_at = stderr
+        .find("a_report (materialized view refreshed)")
+        .unwrap_or_else(|| panic!("the dependent must be refreshed: {stderr}"));
+    assert!(
+        source_at < dependent_at,
+        "an operator's implementation must order the refresh: {stderr}"
+    );
+    assert_eq!(
+        seeded_rows(&client, "z_source", "email").await,
+        0,
+        "the source view must be rebuilt from the scrubbed rows: {stderr}"
+    );
+    let leaked = count(
+        &client,
+        &format!(
+            "SELECT count(*)::bigint FROM a_report \
+             WHERE harvested LIKE '%{SEEDED_DOMAIN}%'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        leaked, 0,
+        "the dependent must not keep addresses harvested from a stale source: {stderr}"
+    );
+}
+
+/// An opaque body behind an operator or a domain CHECK is refused, not ordered.
+///
+/// Same blind spot as the ordering above, on the refusal side: the opacity
+/// check joined the rule straight to `pg_proc`, so a function a rule reaches
+/// through `pg_operator` or `pg_type` was never inspected at all. Measured
+/// before the seed covered them, both cases returned nothing to refuse.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_opaque_body_behind_an_operator_or_domain_is_refused() {
+    let (_pg, host, port) = start_postgres_with_atomic_bodies().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+
+    for (db, fixture) in [
+        (
+            "fn_op_opaque",
+            "CREATE FUNCTION opaque_op(bigint, bigint) RETURNS text LANGUAGE sql STABLE \
+                 AS 'SELECT string_agg(email, '','') FROM z_source WHERE id BETWEEN $1 AND $2'; \
+             CREATE OPERATOR ==> (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = opaque_op); \
+             CREATE MATERIALIZED VIEW a_report AS \
+                 SELECT (1::bigint ==> 200::bigint) AS harvested;",
+        ),
+        (
+            "fn_dom_opaque",
+            "CREATE FUNCTION opaque_dom(text) RETURNS boolean LANGUAGE plpgsql STABLE \
+                 AS $$ BEGIN RETURN EXISTS (SELECT 1 FROM z_source WHERE email = $1); END; $$; \
+             CREATE DOMAIN known_email AS text CHECK (opaque_dom(VALUE)); \
+             CREATE MATERIALIZED VIEW a_report AS \
+                 SELECT (u.email::known_email)::text AS addr FROM users u;",
+        ),
+    ] {
+        let client = seed_sample_fixture(&admin, &base, db).await;
+        client
+            .batch_execute(&format!(
+                "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; {fixture}"
+            ))
+            .await
+            .unwrap();
+        let before = seeded_rows(&client, "users", "email").await;
+        assert!(before > 0, "{db} must start with seeded addresses");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        sample_project(dir);
+        let url = format!("{base}/{db}");
+        let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+        let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+        assert!(
+            stderr.contains("read through a function this run cannot follow"),
+            "{db} must be refused rather than ordered around the gap: {stderr}"
+        );
+        assert_eq!(
+            seeded_rows(&client, "users", "email").await,
+            before,
+            "{db} must be refused before anything is written: {stderr}"
         );
     }
 }

@@ -631,8 +631,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function records no relation of its own and was refused although the closure
   can follow it to the table: measured on `a_report -> wrap_fn() -> inner_fn() ->
   z_source`, refused as `via wrap_fn`, and now scrubbing with `z_source`
-  refreshed first and both views clean. (`prosqlbody` is PostgreSQL 14; the
-  probe already reads `indnullsnotdistinct`, which is 15.)
+  refreshed first and both views clean. `prosqlbody` is PostgreSQL 14 and is
+  probed for with `has_catalog_column`, like every other version-specific
+  catalog column this file reads; on an older server every function reached from
+  a view is treated as opaque, which is what it is, since no SQL body is parsed
+  into the catalog before 14. The function closure is seeded from every catalog
+  path a rewrite rule can record, not only `pg_proc`. Measured over the four
+  indirections: a direct call, a cast and an aggregate all record `pg_proc`, but
+  a user-defined OPERATOR records `pg_operator` and a DOMAIN's `CHECK` records
+  `pg_type`, each with no `pg_proc` row at all. The operator case was a silent
+  leak — `a_report` reading `z_source` only through `1 ==> 200`, whose
+  implementation is a tracked `BEGIN ATOMIC` function, produced no edge, the two
+  views sorted by name, and the run reported success with `users` at 2 rows,
+  `z_source` clean, and all 200 original addresses still in `a_report`. Both are
+  now followed: measured, `z_source` refreshes first against alphabetical order
+  and `a_report` ends with 0 original addresses, and an opaque body behind
+  either an operator or a domain check is refused rather than ordered around.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the

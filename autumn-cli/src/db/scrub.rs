@@ -3479,6 +3479,33 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
 /// refuses those rather than ordering around a gap. `reach` recurses with `UNION` over a
 /// finite set of pairs, so it terminates whatever the view graph looks like.
 ///
+/// `fn_seed` is keyed by the RULE, not by the object the rule references,
+/// because a rule can name a function by more than one catalog path and the
+/// earlier shape could only follow one of them. Measured on `PostgreSQL`
+/// 16.13, over the four indirections a rule can record:
+///
+/// | how the view reaches the function | the rule's `pg_depend` row |
+/// | --- | --- |
+/// | calls it directly                | `pg_proc` |
+/// | through a cast                   | `pg_proc` (the cast function) |
+/// | through an aggregate             | `pg_proc` (then `pg_proc -> pg_proc` to the sfunc) |
+/// | through a user-defined operator  | `pg_operator` — and NO `pg_proc` row |
+/// | through a domain's CHECK         | `pg_type` — and NO `pg_proc` row |
+///
+/// The first three were already followed; the last two were not, and the
+/// operator case is a silent leak rather than a missed refinement. Measured:
+/// `a_report` reading `z_source` only through `1 ==> 200`, whose implementation
+/// is a tracked `BEGIN ATOMIC` function, produced no edge at all, so the two
+/// views sorted by name, `a_report` refreshed FIRST from a stale `z_source`,
+/// and the run reported `Scrub complete` with `users` at 2 rows, `z_source`
+/// clean, and all 200 original addresses still in `a_report`. The domain case
+/// is the same blind spot and fails closed instead — the check fires against
+/// the stale view during the rewrite and aborts the transaction — but it is the
+/// same missing edge, so it is seeded the same way rather than left to luck.
+///
+/// `oprcode` and `pg_constraint.contypid` are both older than every server this
+/// command supports, so neither needs a `has_catalog_column` probe.
+///
 /// `needed` is every POPULATED view, plus every view one of those reads, however
 /// deep. Both halves matter:
 ///
@@ -3505,12 +3532,30 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
      SELECT rel.oid, rel.relispopulated FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind = 'm' \
- ), fn_reach AS ( \
-     SELECT d.refobjid AS root, d.refobjid AS fn \
+ ), fn_seed AS ( \
+     SELECT r.oid AS rule, d.refobjid AS fn \
      FROM pg_depend d \
+     JOIN pg_rewrite r ON r.oid = d.objid \
      WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_proc'::regclass \
      UNION \
-     SELECT r.root, fd.refobjid FROM fn_reach r \
+     SELECT r.oid, o.oprcode \
+     FROM pg_depend d \
+     JOIN pg_rewrite r ON r.oid = d.objid \
+     JOIN pg_operator o ON o.oid = d.refobjid \
+     WHERE d.classid = 'pg_rewrite'::regclass \
+       AND d.refclassid = 'pg_operator'::regclass AND o.oprcode <> 0 \
+     UNION \
+     SELECT r.oid, cd.refobjid \
+     FROM pg_depend d \
+     JOIN pg_rewrite r ON r.oid = d.objid \
+     JOIN pg_constraint con ON con.contypid = d.refobjid \
+     JOIN pg_depend cd ON cd.classid = 'pg_constraint'::regclass \
+       AND cd.objid = con.oid AND cd.refclassid = 'pg_proc'::regclass \
+     WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_type'::regclass \
+ ), fn_reach AS ( \
+     SELECT rule, fn FROM fn_seed \
+     UNION \
+     SELECT r.rule, fd.refobjid FROM fn_reach r \
      JOIN pg_depend fd ON fd.classid = 'pg_proc'::regclass AND fd.objid = r.fn \
        AND fd.refclassid = 'pg_proc'::regclass \
  ), rel_edge AS ( \
@@ -3522,14 +3567,11 @@ const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
        AND d.refobjid <> r.ev_class \
      UNION \
      SELECT DISTINCT r.ev_class AS dependent, fd.refobjid AS source \
-     FROM pg_depend d \
-     JOIN pg_rewrite r ON r.oid = d.objid \
-     JOIN fn_reach fr ON fr.root = d.refobjid \
+     FROM pg_rewrite r \
+     JOIN fn_reach fr ON fr.rule = r.oid \
      JOIN pg_depend fd ON fd.classid = 'pg_proc'::regclass \
        AND fd.objid = fr.fn AND fd.refclassid = 'pg_class'::regclass \
-     WHERE d.classid = 'pg_rewrite'::regclass \
-       AND d.refclassid = 'pg_proc'::regclass \
-       AND fd.refobjid <> r.ev_class \
+     WHERE fd.refobjid <> r.ev_class \
  ), reach AS ( \
      SELECT m.oid AS dependent, e.source FROM mv m \
      JOIN rel_edge e ON e.dependent = m.oid \
@@ -4378,9 +4420,7 @@ fn probe_database_facts(
              FROM node n \
              JOIN pg_class root ON root.oid = n.root \
              JOIN pg_rewrite rw ON rw.ev_class = n.relation \
-             JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid \
-               AND d.refclassid = 'pg_proc'::regclass \
-             JOIN fn_reach fr ON fr.root = d.refobjid \
+             JOIN fn_reach fr ON fr.rule = rw.oid \
              JOIN pg_proc p ON p.oid = fr.fn \
              JOIN pg_namespace pn ON pn.oid = p.pronamespace \
              WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema') \

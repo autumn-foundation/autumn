@@ -762,12 +762,17 @@ apply-time error.
 - **Materialized views are refreshed** (in dependency order — traced through
   ordinary views, and through the function dependencies PostgreSQL records, since
   a materialized view that reads another through one must still be rebuilt after
-  it — inside the scrub's own transaction). A view read through a function whose
-  body PostgreSQL does *not* track, such as a SQL function written as a string
-  literal, is **refused**: nothing records what it reads, so the order cannot be
-  derived. Rewrite the function with `BEGIN ATOMIC`, which is tracked. since they hold their own copy of whatever they selected — so
-  a refresh the role is not allowed to run rolls the rewrites back rather than
-  committing base tables a stale view contradicts. A view left `WITH NO DATA` is
+  it — inside the scrub's own transaction) since they hold their own copy of
+  whatever they selected — so a refresh the role is not allowed to run rolls the
+  rewrites back rather than committing base tables a stale view contradicts.
+  The function hop is followed however the view reaches it: a direct call, a
+  cast, an aggregate, a user-defined operator, or a domain's `CHECK`
+  constraint. A view read through a function whose body PostgreSQL does *not*
+  track, such as a SQL function written as a string literal or one in
+  `plpgsql`, is **refused**: nothing records what it reads, so the order cannot
+  be derived. Rewrite the function with `BEGIN ATOMIC`, which is tracked. On
+  PostgreSQL 13 and older no SQL body is tracked at all, so a view reached
+  through any function is refused there. A view left `WITH NO DATA` is
   the one exception: it holds no rows to scrub, so it is skipped rather than
   populated, and the scrub does not spend the query time and disk it was left
   unpopulated to save. If a populated view reads it, it is refreshed after all —
