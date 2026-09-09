@@ -187,6 +187,53 @@ pub async fn dependent_nullify<M: 'static>(
     Ok(())
 }
 
+/// [`dependent_child_ids`], but takes `FOR UPDATE` on the selected rows
+/// (Postgres only — a no-op clause on `SQLite`, whose single-writer lock
+/// already serializes this).
+///
+/// Codex review, PR #2647: the snapshot this feeds a subsequent bulk DELETE,
+/// so it must be safe to act on. Under READ COMMITTED, `SELECT ... FOR UPDATE`
+/// blocks on a row a concurrent transaction is mid-write to, and once that
+/// transaction commits, re-checks `fk_column = parent_id` against the *new*
+/// row version before including it — so a row reparented away in that window
+/// is correctly excluded, matching the locked `SELECT ... FOR UPDATE` the
+/// per-row Destroy loop has always taken over the same predicate. A plain
+/// unlocked read has no such re-check: it can return a row that is reparented
+/// and committed away before the caller's later DELETE/decrement run,
+/// decrementing the wrong parent's counter cache for a row that was never
+/// actually removed.
+#[cfg(feature = "db")]
+async fn dependent_child_ids_for_update(
+    conn: &mut crate::db::RuntimeConnection,
+    table: &str,
+    fk_column: &str,
+    parent_id: i64,
+) -> crate::AutumnResult<Vec<i64>> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct ChildId {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        id: i64,
+    }
+
+    let for_update: &str = crate::backend_select! {
+        pg => { " FOR UPDATE" },
+        sqlite => { "" },
+    };
+
+    Ok(diesel::sql_query(format!(
+        "SELECT id FROM \"{table}\" WHERE \"{fk_column}\" = $1 ORDER BY id{for_update}"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(parent_id)
+    .load::<ChildId>(conn)
+    .await
+    .map_err(crate::AutumnError::from)?
+    .into_iter()
+    .map(|row| row.id)
+    .collect())
+}
+
 /// Bulk-delete every child row pointing at `parent_id`.
 ///
 /// #1325: same shape as [`dependent_nullify`] — the rows are about to go, so
@@ -212,7 +259,7 @@ pub async fn dependent_delete_all<M: 'static>(
     use diesel_async::RunQueryDsl;
 
     if has_counter_caches {
-        let ids = dependent_child_ids(conn, table, fk_column, parent_id).await?;
+        let ids = dependent_child_ids_for_update(conn, table, fk_column, parent_id).await?;
         counter_cache_before_delete_many(conn, specs, &ids).await?;
     }
 

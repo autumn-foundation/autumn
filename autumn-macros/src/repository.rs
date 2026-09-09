@@ -3036,10 +3036,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // resolved independently (see `dep_autumn_dependents_use` below). A model
         // with runtime grandchildren still needs the per-row loop to cascade into
         // them, so it falls through to the unchanged path at runtime.
+        // Codex review, PR #2647: `position(...)` is excluded too. A bulk
+        // multi-row DELETE removes several same-scope siblings in one
+        // statement, but the row-level compaction triggers `position(...)`
+        // installs only ever see one departing row at a time (see
+        // `delete_chunk_size`'s `config.position.is_some()` guard elsewhere in
+        // this file, which forces single-row chunks for the exact same
+        // reason) — removing several ranked siblings at once leaves the
+        // survivors' ranks gapped or duplicated instead of compacted.
         let destroy_fast_path_eligible = !has_dependents
             && config.hooks_type.is_none()
             && !dep_needs_post
-            && !config.soft_delete;
+            && !config.soft_delete
+            && config.position.is_none();
         // The grandchildren follow this child's delete kind: a soft-delete child
         // is only soft-deleted when its parent is (`__parent_soft`), so its own
         // children inherit `__parent_soft`; a non-soft-delete child is always hard
@@ -3427,8 +3436,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Ledger: when `destroy_fast_path_eligible` (no repository-attribute
         // grandchildren, no hooks, no version-history/commit-hook/broadcast
-        // bookkeeping, never soft-deleted — see where it's computed above), route
-        // through the SAME bulk helper the `DeleteAll` action already uses
+        // bookkeeping, never soft-deleted, no `position(...)` — see where it's
+        // computed above), route through the SAME bulk helper the `DeleteAll`
+        // action already uses
         // (`dependent_delete_all`, which already batches its optional
         // counter-cache decrement via `counter_cache_before_delete_many` instead
         // of one decrement per row) rather than the per-row reload-then-delete
@@ -22921,6 +22931,34 @@ mod tests {
             !destroy_arm.contains("dependent_delete_all"),
             "a soft-delete child must never take the hard-delete-only batched \
              fast path: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_dependent_destroy_positioned_skips_fast_path() {
+        // Codex review, PR #2647: a `position(...)` child must keep the
+        // per-row loop even though it has none of the other disqualifiers --
+        // dependent_delete_all()'s bulk multi-row DELETE removes several
+        // same-scope siblings in one statement, but the row-level compaction
+        // triggers position(...) installs only ever see one departing row at
+        // a time (see this file's `delete_chunk_size` guard, which forces
+        // single-row chunks for the identical reason), so a batched delete
+        // here would leave the survivors' ranks gapped or duplicated.
+        // `position(...)` does not yet support a repo's OWN `dependent(...)`
+        // (an unrelated, pre-existing restriction), so this checks the
+        // unconditionally-generated Destroy arm on a bare `position` leaf
+        // instead of pairing it with grandchildren like the sibling tests
+        // above do.
+        let generated = repository_macro(
+            quote! { Comment, position },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            !destroy_arm.contains("dependent_delete_all"),
+            "a position(...) child must never take the batched fast path \
+             (it would corrupt the ordering): {destroy_arm}"
         );
     }
 
