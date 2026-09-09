@@ -7071,3 +7071,101 @@ async fn the_authors_endpoint_pages_in_sql() {
         ]
     );
 }
+
+/// A save can only apply so many terms, whichever control they came from.
+///
+/// The cap was on the flat taxonomy's free-text box and not on the hierarchical
+/// id list, so a crafted submission could enumerate every term in a large
+/// taxonomy: one database lookup per id on the way in, and a permanent set of
+/// filings big enough to make that post's editor unbounded again, since the
+/// picker adds every selected term back.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_save_cannot_apply_an_unbounded_number_of_terms() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Filed", "Body.", "draft").await;
+
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         SELECT 'category',
+                'cat-' || lpad(g::text, 3, '0'),
+                'cat-' || lpad(g::text, 3, '0'),
+                '', 0
+         FROM generate_series(1, 80) AS g",
+    )
+    .await
+    .expect("seed the terms");
+
+    let ids: Vec<i64> = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::terms::table
+            .filter({{crate_name}}::schema::terms::taxonomy.eq("category"))
+            .order({{crate_name}}::schema::terms::slug.asc())
+            .select({{crate_name}}::schema::terms::id)
+            .load(&mut conn)
+            .await
+            .expect("the seeded terms")
+    };
+
+    let save = async |count: usize| {
+        let strings: Vec<String> = ids.iter().take(count).map(i64::to_string).collect();
+        let mut fields = vec![
+            ("title", "Filed"),
+            ("slug", "filed"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "draft"),
+            ("password", ""),
+        ];
+        for value in &strings {
+            fields.push(("taxonomies[category]", value.as_str()));
+        }
+        client
+            .post(&format!("/admin/content/post/{id}"))
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await
+    };
+
+    let refused = save(80).await;
+    assert_eq!(
+        refused.status,
+        422,
+        "a submission past the cap must be refused: {}",
+        refused.text()
+    );
+
+    // Nothing was filed — the cap is checked before any database work.
+    let filed: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::post_terms::table
+            .filter({{crate_name}}::schema::post_terms::post_id.eq(id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the filings")
+    };
+    assert_eq!(filed, 0, "a refused save must file nothing");
+
+    // A save within the cap still works, and still files exactly what it named.
+    assert_eq!(save(50).await.status, 303);
+    let filed: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::post_terms::table
+            .filter({{crate_name}}::schema::post_terms::post_id.eq(id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the filings")
+    };
+    assert_eq!(filed, 50, "the cap bounds the save, it does not break it");
+}

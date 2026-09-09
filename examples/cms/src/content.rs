@@ -2442,6 +2442,28 @@ pub async fn terms_page_with_total(
     Ok((rows, total))
 }
 
+/// Which of `ids` are terms in `taxonomy`, in one query.
+///
+/// The editor resolved a submitted id set one lookup at a time, so a crafted
+/// save could turn a single bounded request into a query per id.
+pub async fn term_ids_in_taxonomy(
+    conn: &mut AsyncPgConnection,
+    taxonomy: &str,
+    ids: &[i64],
+) -> AutumnResult<std::collections::HashSet<i64>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    Ok(terms::table
+        .filter(terms::taxonomy.eq(taxonomy))
+        .filter(terms::id.eq_any(ids))
+        .select(terms::id)
+        .load::<i64>(conn)
+        .await?
+        .into_iter()
+        .collect())
+}
+
 /// The terms named by a set of ids, for resolving the parent names a page of
 /// the term list refers to.
 ///

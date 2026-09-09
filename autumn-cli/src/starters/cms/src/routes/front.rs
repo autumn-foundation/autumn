@@ -889,18 +889,31 @@ fn archive_bounds(
     // so a post the permalink builder had placed on the ninth fell into the
     // tenth's archive.
     //
-    // `.earliest()` for the same reason the editor uses it: a daylight-saving
-    // change can make local midnight ambiguous or skip it, and the earlier
-    // instant keeps the ranges of consecutive days adjacent rather than
-    // overlapping. A skipped midnight falls back to the raw value, which is at
-    // most an hour out on one day a year and never leaves a post unreachable.
+    // `.earliest()` for an ambiguous midnight — the hour a clock repeats — for
+    // the same reason the editor uses it: the earlier instant keeps consecutive
+    // days adjacent rather than overlapping.
+    //
+    // A *skipped* midnight is the harder case and cannot be answered by falling
+    // back to the naive value. Africa/Cairo has no 00:00 on 2026-04-24: the day
+    // begins locally at 01:00, which is 22:00 UTC on the 23rd. Reading the
+    // naive value as UTC started that archive two hours late, so posts from the
+    // first local hours of the day carried `/2026/04/24/` permalinks and
+    // appeared in neither day's archive. The first local time that exists on
+    // the date is the answer, so the walk steps forward until one resolves —
+    // one lookup on every ordinary day, and no real transition has ever skipped
+    // more than a couple of hours.
     let to_utc = |date: NaiveDate| -> Option<chrono::NaiveDateTime> {
-        let local = date.and_hms_opt(0, 0, 0)?;
-        Some(
-            zone.from_local_datetime(&local)
-                .earliest()
-                .map_or(local, |resolved| resolved.naive_utc()),
-        )
+        let midnight = date.and_hms_opt(0, 0, 0)?;
+        let mut local = midnight;
+        while local.date() == date {
+            if let Some(resolved) = zone.from_local_datetime(&local).earliest() {
+                return Some(resolved.naive_utc());
+            }
+            local += chrono::Duration::minutes(1);
+        }
+        // A local date with no valid time at all — the whole day skipped, which
+        // no zone has ever done. Better than no archive.
+        Some(midnight)
     };
     Some((to_utc(start)?, to_utc(end)?))
 }
@@ -989,4 +1002,68 @@ async fn not_found(repos: &Repos, session: &Session, csrf: &Csrf) -> AutumnResul
     };
     let page = render(repos, session, csrf, "Not found", body).await?;
     Ok((StatusCode::NOT_FOUND, page).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::archive_bounds;
+
+    /// A day whose local midnight does not exist still starts when it starts.
+    ///
+    /// Africa/Cairo advances its clock at midnight on 2026-04-24: there is no
+    /// 00:00 that day, and the date begins locally at 01:00 — 22:00 UTC on the
+    /// 23rd. Reading the naive midnight as UTC started the archive two hours
+    /// late, so posts published in the first local hours carried
+    /// `/2026/04/24/` permalinks and appeared in neither day's archive.
+    #[test]
+    fn a_skipped_local_midnight_starts_the_archive_at_the_transition() {
+        let cairo: chrono_tz::Tz = "Africa/Cairo".parse().expect("a known zone");
+        let (from, until) = archive_bounds(2026, Some(4), Some(24), cairo).expect("a real date");
+
+        // The naive-midnight reading; the value this must not be.
+        let naive = chrono::NaiveDate::from_ymd_opt(2026, 4, 24)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .expect("a real date");
+        assert_ne!(
+            from, naive,
+            "the day does not begin at 00:00 UTC — it begins when the local date does"
+        );
+
+        // 01:00 Cairo on the 24th is 22:00 UTC on the 23rd.
+        assert_eq!(
+            from,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 23)
+                .and_then(|d| d.and_hms_opt(22, 0, 0))
+                .expect("a real date")
+        );
+        // The range is half-open and the following midnight is ordinary:
+        // 00:00 on the 25th at UTC+3 is 21:00 UTC on the 24th.
+        assert_eq!(
+            until,
+            chrono::NaiveDate::from_ymd_opt(2026, 4, 24)
+                .and_then(|d| d.and_hms_opt(21, 0, 0))
+                .expect("a real date")
+        );
+        assert!(from < until);
+    }
+
+    /// The ordinary case, and the one every other day of the year takes.
+    #[test]
+    fn a_normal_day_is_local_midnight_to_local_midnight() {
+        let la: chrono_tz::Tz = "America/Los_Angeles".parse().expect("a known zone");
+        let (from, until) = archive_bounds(2026, Some(9), Some(9), la).expect("a real date");
+        assert_eq!(
+            from,
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 9)
+                .and_then(|d| d.and_hms_opt(7, 0, 0))
+                .expect("a real date"),
+            "midnight at UTC-7"
+        );
+        assert_eq!(
+            until,
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 10)
+                .and_then(|d| d.and_hms_opt(7, 0, 0))
+                .expect("a real date")
+        );
+    }
 }

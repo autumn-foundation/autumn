@@ -546,6 +546,18 @@ const PARENT_PICKER_LIMIT: i64 = 100;
 /// term missing from the form would be silently unfiled.
 const TERM_PICKER_LIMIT: i64 = 100;
 
+/// The most terms one save may apply, per taxonomy.
+///
+/// Both halves of `resolve_term_ids` need it, and for the same reason: the
+/// submission is a form body, not a rendering of the bounded controls the
+/// editor drew. A flat taxonomy's box is free text that could carry millions of
+/// comma-separated names; a hierarchical taxonomy's checkbox list is a set of
+/// ids a crafted request can enumerate over the whole taxonomy. Either way the
+/// cost is per entry and the result is permanent — and enough filings on one
+/// post would make that post's editor unbounded again, since the picker adds
+/// every selected term back. An editor filing a post picks a handful.
+const MAX_TERMS_PER_SAVE: usize = 50;
+
 impl EditorContext {
     async fn load(repos: &Repos, registered: &PostType, post: Option<&Post>) -> AutumnResult<Self> {
         // One control per taxonomy this type registers, whatever they are.
@@ -1396,30 +1408,45 @@ async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> Autumn
             let Some(submitted) = form.taxonomies.get(taxonomy.slug) else {
                 continue;
             };
-            for id in submitted.iter().copied() {
-                let belongs = repos
-                    .terms
-                    .find_by_id(id)
-                    .await?
-                    .is_some_and(|term| term.taxonomy == taxonomy.slug);
-                if belongs {
-                    term_ids.push(id);
-                }
+            // Deduplicated first, so a form repeating one id cannot spend the
+            // budget, and bounded before any database work.
+            let mut seen = std::collections::HashSet::new();
+            let requested: Vec<i64> = submitted
+                .iter()
+                .copied()
+                .filter(|id| seen.insert(*id))
+                .collect();
+            if requested.len() > MAX_TERMS_PER_SAVE {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "At most {MAX_TERMS_PER_SAVE} {} can be applied in one save",
+                    taxonomy.plural.to_lowercase()
+                )));
             }
+            // One query for the whole set rather than one per id. The filter is
+            // still the point — `set_post_terms` checks neither the term's
+            // taxonomy nor whether that taxonomy applies to this post type, so
+            // a crafted submission could otherwise file a post under a taxonomy
+            // registered for something else, after which that taxonomy's public
+            // archive listed it.
+            let slug = taxonomy.slug;
+            let lookup = requested.clone();
+            let accepted = repos
+                .with_conn(async move |conn| {
+                    content::term_ids_in_taxonomy(conn, slug, &lookup).await
+                })
+                .await?;
+            // From the deduplicated set, not the raw submission: a form
+            // repeating an id would otherwise file the post under it twice.
+            term_ids.extend(requested.into_iter().filter(|id| accepted.contains(id)));
         } else {
             // Names, find-or-create — a flat taxonomy's box creates what it
             // does not find, matching WordPress's tag box.
             let Some(submitted) = form.taxonomy_names.get(taxonomy.slug) else {
                 continue;
             };
-            // Bounded *before* any database work. Find-or-create means one
-            // lookup and possibly one insert per name, and the field is free
-            // text: a crafted save could carry millions of comma-separated
-            // names inside the framework's default request limit, holding the
-            // request open for that many sequential queries and leaving a
-            // permanent term set behind. An editor tagging a post types a
-            // handful.
-            const MAX_TERMS_PER_SAVE: usize = 50;
+            // Bounded *before* any database work: find-or-create means one
+            // lookup and possibly one insert per name. See
+            // `MAX_TERMS_PER_SAVE`.
             if submitted
                 .split(',')
                 .filter(|n| !n.trim().is_empty())
