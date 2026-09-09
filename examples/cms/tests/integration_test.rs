@@ -5546,3 +5546,307 @@ async fn create_comment_rechecks_the_post_under_its_lock() {
     page.assert_ok();
     assert!(!page.text().contains("Late comment"));
 }
+
+/// A crafted comment submission is validated on the server.
+///
+/// The form declares `required` and `maxlength`; a POST that never went through
+/// a browser declares nothing. `create_comment` inserts through direct Diesel —
+/// it has to, so the row and the counter move together — which means it never
+/// runs `CommentHooks::before_create`, and for a while it did not run
+/// `validate_comment` either. A signed-in commenter's empty body would have
+/// been stored *approved*.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_crafted_comment_submission_is_validated_server_side() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Rules", "Body.", "publish").await;
+
+    // Signed in, so the comment would land `approved` and be immediately
+    // public — the case where skipping validation costs the most.
+    let empty = client
+        .post(&format!("/comments/{post_id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[("body", "   ")]))
+        .send()
+        .await;
+    assert_ne!(
+        empty.status,
+        303,
+        "an empty comment body must be refused: {}",
+        empty.text()
+    );
+
+    // A guest with no name is unattributable.
+    sign_out(&client);
+    let nameless = client
+        .post(&format!("/comments/{post_id}"))
+        .form(&form(&[("body", "Anonymous"), ("author_name", "  ")]))
+        .send()
+        .await;
+    assert_ne!(
+        nameless.status,
+        303,
+        "a guest comment with no name must be refused: {}",
+        nameless.text()
+    );
+
+    // And the declared 10,000-byte cap is the cap, not the global request-body
+    // limit.
+    let huge = "x".repeat(10_001);
+    let oversized = client
+        .post(&format!("/comments/{post_id}"))
+        .form(&form(&[
+            ("body", huge.as_str()),
+            ("author_name", "Guest"),
+            ("author_email", "guest@example.com"),
+        ]))
+        .send()
+        .await;
+    assert_ne!(
+        oversized.status, 303,
+        "a body past the declared cap must be refused"
+    );
+
+    // None of the three reached the queue.
+    let queue = client
+        .get("/admin/comments?status=approved")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    queue.assert_ok();
+    assert!(
+        !queue.text().contains("Anonymous"),
+        "no rejected submission may have been stored"
+    );
+}
+
+/// Restoring a revision is authorized against the row as locked.
+///
+/// A Contributor may edit their own draft but not a published post. If an
+/// Editor publishes it between the handler's check and the transaction, the
+/// stale `draft` would keep the request authorized and the restore would
+/// rewrite the body of live content the Contributor can no longer touch. The
+/// re-check lives inside the transaction, so the call is made directly here —
+/// through the route the handler's own pre-check would refuse first, and the
+/// test would pass with the inner check deleted.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restoring_a_revision_is_authorized_against_the_locked_row() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+
+    sign_out(&client);
+    let contributor = register(&client, "contributor").await;
+    client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "contributor"),
+            ("email", "contributor@example.com"),
+            ("display_name", "Contributor"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let id = create_post(&client, &contributor, "Their Draft", "Original.", "draft").await;
+
+    // The owner publishes it. The Contributor's capability over it is gone.
+    client
+        .post(&format!("/admin/content/post/{id}/status?to=publish"))
+        .header("cookie", &owner)
+        .send()
+        .await
+        .assert_status(303);
+
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let actor: cms::models::User = cms::schema::users::table
+        .filter(cms::schema::users::username.eq("contributor"))
+        .select(cms::models::User::as_select())
+        .first(&mut conn)
+        .await
+        .expect("the contributor account");
+    let revision_id: i64 = cms::schema::revisions::table
+        .filter(cms::schema::revisions::post_id.eq(id))
+        .select(cms::schema::revisions::id)
+        .order(cms::schema::revisions::id.asc())
+        .first(&mut conn)
+        .await
+        .expect("the initial revision");
+
+    let refused =
+        cms::content::restore_revision(&mut conn, id, revision_id, Some(actor.id), Some(&actor))
+            .await;
+    assert!(
+        refused.is_err(),
+        "the restore must re-check the capability against the locked row"
+    );
+
+    // The process's own paths — the importer, the seeder — still have no actor
+    // and are still allowed.
+    cms::content::restore_revision(&mut conn, id, revision_id, None, None)
+        .await
+        .expect("an actorless restore is the scheduler's, not a user's");
+}
+
+/// A term's parent has to be in the term's own taxonomy.
+///
+/// The `<select>` offers only this taxonomy's terms, but the id is a number in
+/// a form body: the foreign key accepts any term, and `TermHooks` has no
+/// database to resolve the candidate in. A category filed under a tag renders
+/// nowhere and the exporter drops it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_terms_parent_must_belong_to_the_same_taxonomy() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/terms/post_tag")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Rust"),
+            ("slug", ""),
+            ("description", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let tags = client
+        .get("/admin/terms/post_tag")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    tags.assert_ok();
+    assert!(tags.text().contains("Rust"));
+
+    // The tag is the only term, so it is id 1. Offer it as a category's parent.
+    let refused = client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Grafted"),
+            ("slug", ""),
+            ("description", ""),
+            ("parent_id", "1"),
+        ]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "a cross-taxonomy parent must be refused: {}",
+        refused.text()
+    );
+
+    let categories = client
+        .get("/admin/terms/category")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    categories.assert_ok();
+    assert!(
+        !categories.text().contains("Grafted"),
+        "the refused term must not have been stored"
+    );
+
+    // A parent from the same taxonomy still works — the check bounds the input,
+    // it does not remove hierarchy.
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Guides"),
+            ("slug", ""),
+            ("description", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Beginner"),
+            ("slug", ""),
+            ("description", ""),
+            ("parent_id", "2"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    client
+        .get("/admin/terms/category")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Guides — ");
+}
+
+/// The media library is paginated in SQL, not loaded whole and sorted in Rust.
+///
+/// Every Author holds `UploadFiles`, so this table grows without any single
+/// upload being invalid; the screen used to manage uploads was the one that
+/// became unusable first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_media_library_is_paginated() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // 50 rows, newest first by `created_at`: `File 001` is the most recent.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO attachments (title, slug, mime_type, byte_size, created_at)
+         SELECT 'File ' || lpad(g::text, 3, '0'),
+                'file-' || lpad(g::text, 3, '0'),
+                'application/pdf',
+                1024,
+                NOW() - (g || ' minutes')::interval
+         FROM generate_series(1, 50) AS g",
+    )
+    .await
+    .expect("seed the library");
+
+    let first = client
+        .get("/admin/media")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    first.assert_ok();
+    let first = first.text();
+    assert!(first.contains("File 001"), "the newest row leads page one");
+    assert!(first.contains("File 048"), "page one holds a full page");
+    assert!(
+        !first.contains("File 049"),
+        "page one must stop at the page size rather than render the whole table"
+    );
+    assert!(
+        first.contains("Page 1 of 2"),
+        "the pager states where it is"
+    );
+
+    let second = client
+        .get("/admin/media?page=2")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    second.assert_ok();
+    let second = second.text();
+    assert!(
+        second.contains("File 049") && second.contains("File 050"),
+        "the tail is reachable"
+    );
+    assert!(
+        !second.contains("File 001"),
+        "page two must not repeat page one"
+    );
+}

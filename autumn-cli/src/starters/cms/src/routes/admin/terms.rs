@@ -159,6 +159,36 @@ pub async fn create(
     let _user = require_capability!(repos, session, csrf, Capability::ManageCategories);
     resolve(&taxonomy)?;
 
+    let parent_id = form
+        .parent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<i64>().ok());
+
+    // The `<select>` only ever offers this taxonomy's own terms, but the id is
+    // a number in a form body and nothing downstream re-derives it: the foreign
+    // key accepts any `terms.id`, and `TermHooks::before_create` can only clear
+    // the parent for a *flat* taxonomy because a hook has no database of its
+    // own to look the candidate up in. So a crafted submission could file a
+    // category under a tag. The result is a row no screen can render — the list
+    // resolves parent names only within the taxonomy it loaded — and one the
+    // exporter drops on the floor for the same reason, silently flattening the
+    // tree on the next restore. Resolve it here, where there is a connection,
+    // and require the match.
+    if let Some(parent_id) = parent_id {
+        let parent = repos
+            .terms
+            .find_by_id(parent_id)
+            .await?
+            .ok_or_else(|| AutumnError::unprocessable_msg("No such parent"))?;
+        if parent.taxonomy != taxonomy {
+            return Err(AutumnError::unprocessable_msg(
+                "A term's parent must belong to the same taxonomy",
+            ));
+        }
+    }
+
     // Slugging, taxonomy validation and the flat-taxonomy parent rule all live
     // in `TermHooks`, so the importer and the REST API get them too.
     repos
@@ -168,12 +198,7 @@ pub async fn create(
             name: form.name.trim().to_owned(),
             slug: form.slug.trim().to_owned(),
             description: form.description.trim().to_owned(),
-            parent_id: form
-                .parent_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .and_then(|v| v.parse::<i64>().ok()),
+            parent_id,
         })
         .await?;
 

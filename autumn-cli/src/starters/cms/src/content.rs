@@ -13,7 +13,9 @@ use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
 
 use crate::models::{Comment, NewRevision, Post, Revision, Term, User};
-use crate::schema::{comments, menus, post_meta, post_terms, posts, revisions, terms, users};
+use crate::schema::{
+    attachments, comments, menus, post_meta, post_terms, posts, revisions, terms, users,
+};
 
 /// The maximum reply nesting a comment thread accepts.
 ///
@@ -295,6 +297,7 @@ pub async fn restore_revision(
     post_id: i64,
     revision_id: i64,
     editor_id: Option<i64>,
+    actor: Option<&crate::models::User>,
 ) -> AutumnResult<Post> {
     conn.transaction(async move |conn| {
         let revision: Revision = revisions::table
@@ -312,6 +315,28 @@ pub async fn restore_revision(
             .first(conn)
             .await
             .map_err(AutumnError::not_found)?;
+
+        // Re-checked against the row *as locked*, for the same reason
+        // `transition_status` does it: a restore is an edit, and the handler's
+        // check ran against the status it read before this lock existed. A
+        // Contributor who opens the revision screen on their own draft, and
+        // whose draft an Editor publishes in the meantime, would otherwise
+        // rewrite the body of a live post they can no longer edit.
+        //
+        // `None` is a path with no acting user — the importer and the seeder,
+        // whose authority is the process's rather than a session's.
+        if let Some(actor) = actor
+            && !crate::capabilities::can_edit_post(
+                actor.role(),
+                actor.id,
+                post.author_id,
+                &post.status,
+            )
+        {
+            return Err(AutumnError::forbidden_msg(
+                "You do not have permission to edit this content",
+            ));
+        }
 
         let summary = format!("Restored revision #{}", revision.id);
         match editor_id {
@@ -650,8 +675,23 @@ pub async fn moderate_comment(
 /// Insert a comment, bumping the approved counter when it lands approved.
 pub async fn create_comment(
     conn: &mut AsyncPgConnection,
-    new: crate::models::NewComment,
+    mut new: crate::models::NewComment,
 ) -> AutumnResult<Comment> {
+    // The direct insert below is the reason this call exists: the row and the
+    // post's approved-comment counter have to move in one transaction, which
+    // the repository's generated `save` cannot do. But going around the
+    // repository also goes around `CommentHooks::before_create`, so the *only*
+    // server-side validation a comment ever gets is this line. Without it the
+    // form's `required` and `maxlength` attributes are the whole defence, and
+    // they are a browser convenience a crafted POST ignores: a signed-in
+    // commenter's empty body would be inserted pre-approved and increment the
+    // counter, a guest could post unattributed, and bodies would grow to the
+    // global request-body limit rather than the declared 10,000-byte cap —
+    // making the moderation queue and every thread render arbitrarily
+    // expensive. Run before the transaction opens: nothing here touches the
+    // database, and a rejected submission should not have taken a row lock.
+    crate::hooks::validate_comment(&mut new)?;
+
     conn.transaction(async move |conn| {
         // The post is locked and re-read before anything is inserted. The
         // handler's eligibility check runs on a released connection, so an
@@ -2193,6 +2233,32 @@ pub async fn approved_comment_count(
         .count()
         .get_result(conn)
         .await?)
+}
+
+/// One page of the media library, newest first, ordered and bounded in SQL.
+///
+/// The generated `find_all` loads every attachment row and the screen sorted
+/// the whole collection in memory. Every account with `UploadFiles` — which is
+/// every Author — can grow that table indefinitely, so the screen an editor
+/// uses to *manage* their uploads is the one that stops working first, without
+/// a single invalid upload having happened.
+pub async fn attachments_page(
+    conn: &mut AsyncPgConnection,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<crate::models::Attachment>> {
+    Ok(attachments::table
+        .order((attachments::created_at.desc(), attachments::id.desc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(crate::models::Attachment::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// How many rows the media library holds, for its pager.
+pub async fn attachment_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
+    Ok(attachments::table.count().get_result(conn).await?)
 }
 
 /// Publish one due scheduled post and rebuild its terms' counts — atomically.

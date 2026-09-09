@@ -1513,7 +1513,7 @@ pub async fn restore(
 
     repos
         .with_conn(async |conn| {
-            content::restore_revision(conn, id, revision_id, Some(user.id)).await
+            content::restore_revision(conn, id, revision_id, Some(user.id), Some(&user)).await
         })
         .await?;
     do_action(Action::PostSaved, id);

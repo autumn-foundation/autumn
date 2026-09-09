@@ -11,6 +11,7 @@ use autumn_web::reexports::axum::response::Response;
 use autumn_web::storage::BlobStoreState;
 
 use crate::capabilities::Capability;
+use crate::content;
 use crate::models::{NewAttachment, UpdateAttachment};
 use crate::plugins::{Action, do_action};
 use crate::repositories::AttachmentRepository as _;
@@ -18,6 +19,15 @@ use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
 use super::layout;
+
+/// How many attachments one library page shows.
+const MEDIA_PER_PAGE: i64 = 48;
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LibraryFilter {
+    #[serde(default)]
+    pub page: Option<usize>,
+}
 
 /// The upload cap. WordPress defers to PHP's `upload_max_filesize`, which is
 /// how a 2 MB default surprises people; stating it here means the form text and
@@ -73,10 +83,28 @@ pub fn may_render_inline(mime_type: &str) -> bool {
 }
 
 #[get("/admin/media")]
-pub async fn list(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
+pub async fn list(
+    repos: Repos,
+    session: Session,
+    csrf: Csrf,
+    Query(filter): Query<LibraryFilter>,
+) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::UploadFiles);
-    let mut items = repos.attachments.find_all().await?;
-    items.sort_by_key(|item| std::cmp::Reverse(item.created_at));
+
+    // Ordered and bounded in SQL. `find_all` loaded every attachment row and
+    // this screen then sorted the whole collection in memory and rendered all
+    // of it into one response — so the library grew itself out of usability,
+    // one legitimate upload at a time.
+    let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
+    let (items, total) = {
+        let mut conn = repos.conn().await?;
+        let rows =
+            content::attachments_page(&mut conn, (page - 1) * MEDIA_PER_PAGE, MEDIA_PER_PAGE)
+                .await?;
+        let total = content::attachment_count(&mut conn).await?;
+        (rows, total)
+    };
+    let last_page = ((total + MEDIA_PER_PAGE - 1) / MEDIA_PER_PAGE).max(1);
 
     let body = html! {
         form action="/admin/media" method="post" enctype="multipart/form-data"
@@ -145,7 +173,25 @@ pub async fn list(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
             }
             @if items.is_empty() {
                 p class="col-span-full text-center text-gray-400 py-10" {
-                    "Nothing in the library yet."
+                    @if page > 1 { "Nothing on this page." } @else { "Nothing in the library yet." }
+                }
+            }
+        }
+
+        @if last_page > 1 {
+            nav aria-label="Media pages" class="flex items-center justify-between mt-6 text-sm" {
+                @if page > 1 {
+                    a href=(format!("/admin/media?page={}", page - 1))
+                      class="text-indigo-700 hover:underline" { "← Newer" }
+                } @else {
+                    span {}
+                }
+                span class="text-gray-500" { "Page " (page) " of " (last_page) }
+                @if page < last_page {
+                    a href=(format!("/admin/media?page={}", page + 1))
+                      class="text-indigo-700 hover:underline" { "Older →" }
+                } @else {
+                    span {}
                 }
             }
         }
