@@ -302,9 +302,11 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
   (`trim`/`downcase`/`upcase`/`squish`/`strip_nul`); `with = path` calls a user
-  `fn(&str) -> String`. Runs on the **write** path (`save`/`save_many` insert;
-  `update` via `UpdateDraft::from_patch`) *before* the `before_create` /
-  `before_update` hooks and the DB write, and on derived `#[repository]`
+  `fn(&str) -> String`. Runs on the **write** path (`save`, `save_many`,
+  `save_many_skip_invalid` and the create half of `find_or_create_by_*` on
+  insert; `update` via `UpdateDraft::from_patch`) *before* the model's
+  `#[validate]` rules, the `before_create` / `before_update` hooks and the DB
+  write, and on derived `#[repository]`
   `find_by_`/`count_by_` lookups (so `find_by_email("  FOO@X.com ")` matches the
   stored `foo@x.com` row). Built-ins are idempotent; composing
   `#[normalize(downcase)]` with a `unique` column yields case-insensitive
