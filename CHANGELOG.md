@@ -253,7 +253,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[serde(default)]`, which is a no-op on a real `Option<T>` (serde already
   fills a missing one with `None`) and makes omission genuinely valid in both
   directions. `#[model]` is unaffected: its read schema describes a response
-  only.
+  only. See the [migration guide](docs/migrations/next.md).
 
 
 ### Changed
