@@ -615,23 +615,7 @@ fn build_router_pre_state(
     #[cfg(feature = "mcp")]
     let mcp_prepared: Option<McpPrepared> = if let Some(rt) = ctx.mcp.take() {
         let path = rt.mount_path.as_str();
-        // The mount path must be one static endpoint. Reject empty,
-        // non-absolute, doubled-slash, and dynamic (`{capture}` / `{*rest}`)
-        // paths so MCP cannot shadow a path class, and so the collision
-        // preflight reserves the exact URL it matches. Colon-prefixed segments
-        // (`/:mcp`, axum 0.7 syntax) panic in axum 0.8's `Router::route`;
-        // rejecting them here yields `InvalidMcpPath` instead of a crash.
-        if path.is_empty()
-            || !path.starts_with('/')
-            || path.contains("//")
-            || path.contains('{')
-            || path.contains('*')
-            || path.split('/').any(|segment| segment.starts_with(':'))
-        {
-            return Err(RouterBuildError::InvalidMcpPath {
-                value: rt.mount_path,
-            });
-        }
+        validate_mcp_mount_path(path)?;
         // The MCP endpoint mounts GET+POST at `mount_path`. If a user, framework,
         // or OpenAPI route already owns that exact path, the later `merge` would
         // panic on overlapping method routes; surface it as a recoverable error
@@ -1531,7 +1515,7 @@ fn collect_claimed_get_paths(
 /// The configured `OpenAPI` JSON/UI/asset paths (which merge as `GET`s before
 /// the MCP router) are checked as well.
 #[cfg(feature = "mcp")]
-fn reject_mcp_path_collisions(
+pub fn reject_mcp_path_collisions(
     mount_path: &str,
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
@@ -1876,6 +1860,35 @@ pub fn validate_openapi_mount_paths(
         if path == &config.openapi_json_path {
             return Err(RouterBuildError::DuplicateOpenApiPath { path: path.clone() });
         }
+    }
+    Ok(())
+}
+
+/// Validate the MCP mount path.
+///
+/// It must be one static endpoint: reject empty, non-absolute, doubled-slash and
+/// dynamic (`{capture}` / `{*rest}`) paths, so MCP cannot shadow a path class and
+/// the collision preflight reserves the exact URL it matches. Colon-prefixed
+/// segments (`/:mcp`, axum 0.7 syntax) panic in axum 0.8's `Router::route`;
+/// rejecting them here yields `InvalidMcpPath` instead of a crash.
+///
+/// Extracted from `build_router_pre_state`, which used to inline it, so the
+/// no-boot dump modes can run the SAME rule rather than a second copy that would
+/// drift (issue #802).
+///
+/// Gated on `mcp` like `RouterBuildError::InvalidMcpPath` itself.
+#[cfg(feature = "mcp")]
+pub fn validate_mcp_mount_path(path: &str) -> Result<(), RouterBuildError> {
+    if path.is_empty()
+        || !path.starts_with('/')
+        || path.contains("//")
+        || path.contains('{')
+        || path.contains('*')
+        || path.split('/').any(|segment| segment.starts_with(':'))
+    {
+        return Err(RouterBuildError::InvalidMcpPath {
+            value: path.to_owned(),
+        });
     }
     Ok(())
 }

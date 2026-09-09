@@ -6379,6 +6379,8 @@ impl AppBuilder {
             merge_routers,
             nest_routers,
             declared_routes,
+            #[cfg(feature = "mcp")]
+            mcp,
             ..
         } = self;
 
@@ -6440,6 +6442,33 @@ impl AppBuilder {
                 &config,
             )
         });
+
+        // MCP is part of the same preflight, not a separate concern: an app that
+        // mounts MCP at a malformed path, or at one a user/OpenAPI route already
+        // owns, is rejected by `build_router_pre_state` at startup. An export
+        // that skipped these would certify a router that cannot be built — the
+        // exact failure the four rules above exist to prevent, one subsystem
+        // over. Both call the router's own function, so there is still one
+        // definition per rule.
+        #[cfg(feature = "mcp")]
+        let preflight = preflight.and_then(|()| {
+            let Some(runtime) = mcp.as_ref() else {
+                return Ok(());
+            };
+            let path = runtime.mount_path.as_str();
+            crate::router::validate_mcp_mount_path(path).and_then(|()| {
+                crate::router::reject_mcp_path_collisions(
+                    path,
+                    &routes,
+                    &scoped_groups,
+                    &config,
+                    Some(&openapi_config),
+                    &merge_routers,
+                    &nest_routers,
+                )
+            })
+        });
+
         if let Err(error) = preflight {
             eprintln!("\u{2717} Cannot export a spec for a router that cannot be built: {error}");
             std::process::exit(1);

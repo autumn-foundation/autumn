@@ -1104,6 +1104,42 @@ fn wrapper_is_impostor(entry: &SchemaEntry) -> bool {
     })
 }
 
+/// The `type_name` of `serde_json::Value`.
+#[cfg(feature = "openapi")]
+const SERDE_JSON_VALUE_IDENTITY: &str = "serde_json::value::Value";
+
+/// The schema for arbitrary JSON: no constraint at all.
+///
+/// Deliberately identical to what `#[derive(OpenApiSchema)]` emits for a
+/// `serde_json::Value` FIELD, so a route-level `Json<Value>` and a model field
+/// of the same type describe the same contract.
+#[cfg(feature = "openapi")]
+fn arbitrary_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "description": "Arbitrary JSON: an object, array, string, number, boolean or null.",
+    })
+}
+
+/// Does this entry describe a genuine `serde_json::Value`?
+///
+/// A handler taking or returning `Json<serde_json::Value>` produced an ordinary
+/// named `Ref`. Nothing registers a schema for that external type, so the
+/// back-fill gave it the opaque `{"type":"object"}` placeholder — which
+/// misdescribes every array, scalar and null it legitimately carries, and made
+/// `--strict` fail on a handler that is behaving correctly. The model-field path
+/// already special-cases this; the route-level builder is the same rule one step
+/// out.
+///
+/// Checked by full `type_name`, never by the last path segment: an application's
+/// own `Value` is an ordinary type and keeps its `$ref`.
+#[cfg(feature = "openapi")]
+fn entry_is_arbitrary_json(entry: &SchemaEntry) -> bool {
+    matches!(entry.kind, SchemaKind::Ref)
+        && entry
+            .identity
+            .is_some_and(|resolve| resolve() == SERDE_JSON_VALUE_IDENTITY)
+}
+
 /// Flatten an entry, yielding each leaf `Ref` entry reached through
 /// `Array` / `Nullable` wrappers (so a `Json<Vec<User>>` contributes `User`).
 #[cfg(feature = "openapi")]
@@ -1112,6 +1148,11 @@ fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
     // component, rather than contributing the inner type it never wraps.
     if wrapper_is_impostor(entry) {
         return vec![entry];
+    }
+    // Arbitrary JSON is described inline, so it must NOT earn a component —
+    // registering one is exactly how it became an opaque placeholder.
+    if entry_is_arbitrary_json(entry) {
+        return Vec::new();
     }
     match entry.kind {
         SchemaKind::Ref => vec![entry],
@@ -1451,6 +1492,9 @@ fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_
             "$ref": format!("#/components/schemas/{}", index.display_key(entry))
         });
     }
+    if entry_is_arbitrary_json(entry) {
+        return arbitrary_json_schema();
+    }
     match entry.kind {
         SchemaKind::Primitive(json_type) => serde_json::json!({ "type": json_type }),
         SchemaKind::Ref => {
@@ -1468,6 +1512,13 @@ fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_
             //   * For primitives, use the compact type-array form: `type: ["T", "null"]`.
             //   * For all other schemas (arrays, nested nullable, etc.), use `oneOf`
             //     so the full inner schema (e.g. `items`) is preserved.
+            // `Option<serde_json::Value>` must NOT be wrapped: the
+            // unconstrained schema already admits null, and `oneOf` demands that
+            // EXACTLY ONE branch match — so `oneOf [{unconstrained}, {null}]`
+            // would reject the very null it is meant to permit.
+            if entry_is_arbitrary_json(inner) {
+                return arbitrary_json_schema();
+            }
             match inner.kind {
                 SchemaKind::Ref | SchemaKind::Array(_) | SchemaKind::Nullable(_) => {
                     serde_json::json!({
