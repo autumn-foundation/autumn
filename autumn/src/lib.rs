@@ -2006,6 +2006,11 @@ pub mod reexports {
     pub use tokio;
     pub use tokio_util;
     pub use tracing;
+    /// Re-exported so `#[model]`'s generated schema can name the GENUINE
+    /// `uuid::Uuid` when checking a field's runtime type identity, instead of
+    /// matching a hand-written path prefix that any crate named `uuid` would
+    /// satisfy (issue #802).
+    pub use uuid;
     pub use validator;
 }
 

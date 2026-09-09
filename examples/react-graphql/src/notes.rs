@@ -85,6 +85,17 @@ fn to_gql(err: AutumnError) -> async_graphql::Error {
     let message = if status.is_server_error() {
         tracing::error!(status = %status, error = %err, "GraphQL resolver failed");
         "internal server error".to_owned()
+    } else if let Some(fields) = err.details() {
+        // A validation error's `Display` is the summary "Validation failed";
+        // the per-field map is what a client can act on, and `errors[].message`
+        // is the only channel GraphQL gives us to put it in. Sorted so the text
+        // is stable when several fields fail.
+        let mut messages: Vec<String> = fields
+            .iter()
+            .flat_map(|(field, reasons)| reasons.iter().map(move |r| format!("{field}: {r}")))
+            .collect();
+        messages.sort();
+        messages.join("; ")
     } else {
         err.to_string()
     };

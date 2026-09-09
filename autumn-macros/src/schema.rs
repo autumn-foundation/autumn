@@ -54,9 +54,8 @@ pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<Strin
                         Ok(())
                     });
                 }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });
@@ -91,9 +90,8 @@ pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
                         Ok(())
                     });
                 }
-            } else if let Ok(value) = meta.value() {
-                // Consume any `= value` so sibling metas keep parsing.
-                let _: syn::Result<syn::Lit> = value.parse();
+            } else {
+                consume_unrecognized_meta(&meta)?;
             }
             Ok(())
         });
@@ -134,6 +132,372 @@ pub fn apply_serde_rename_all_rule(rule: &str, field: &str) -> Option<String> {
         "SCREAMING-KEBAB-CASE" => Some(field.to_ascii_uppercase().replace('_', "-")),
         _ => None,
     }
+}
+
+/// Whether a `#[serde(...)]` attribute list carries a bare word from `words`.
+///
+/// For the marker attributes that take no value — `transparent`, `flatten`,
+/// `skip`, `skip_serializing`, `skip_deserializing`, `untagged`, `default` in
+/// its bare form. Returns the first match, so callers can name it in a
+/// diagnostic.
+pub fn serde_bare_word(attrs: &[syn::Attribute], words: &[&'static str]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(word) = words.iter().find(|w| meta.path.is_ident(w)) {
+                found = Some(*word);
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a `#[serde(...)]` attribute list carries `key = "..."` for any key in
+/// `keys`, returning the first match.
+///
+/// For the value-taking attributes that change the wire shape: `into`, `from`,
+/// `try_from`, `tag`, `content`, and the field-level `default = "path"`.
+pub fn serde_valued_key(attrs: &[syn::Attribute], keys: &[&'static str]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(key) = keys.iter().find(|k| meta.path.is_ident(k)) {
+                found = Some(*key);
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Whether a field carries `#[serde(skip_serializing_if = "...")]`, so a
+/// response omits it whenever the predicate matches.
+///
+/// Distinct from an unconditional `skip` / `skip_serializing`: the field DOES
+/// appear in some responses, so its property belongs in the schema — it simply
+/// cannot be `required`, because a legitimate response may leave it out.
+/// Does this attribute list carry `#[serde(default)]`, bare or `= "path"`?
+///
+/// Shared by the derive's emitter (which marks a defaulted field not-`required`)
+/// and its audit (which must NOT refuse `skip_serializing_if` on a field serde
+/// can fill in). Those two have to agree on what "defaulted" means, so they ask
+/// the same function rather than each spelling the check out (issue #802).
+pub fn has_serde_default(attrs: &[syn::Attribute]) -> bool {
+    serde_bare_word(attrs, &["default"]).is_some()
+        || serde_valued_key(attrs, &["default"]).is_some()
+}
+
+pub fn field_has_skip_serializing_if(field: &syn::Field) -> bool {
+    let mut conditional = false;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing_if") {
+                conditional = true;
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    conditional
+}
+
+/// Apply an enum-level `#[serde(rename_all = "...")]` casing rule to a
+/// (`PascalCase`) variant identifier, mirroring `serde_derive`'s
+/// `RenameRule::apply_to_variant`.
+///
+/// Deliberately NOT routed through [`apply_serde_rename_all_rule`]: that helper
+/// takes an already-`snake_case` *field* name, so its `lowercase`/`snake_case`
+/// arms are identity. A variant arrives in `PascalCase`, so each rule needs the
+/// serde variant algorithm instead — `InProgress` must become `in_progress`
+/// under `snake_case` and `inprogress` (not `in_progress`) under `lowercase`.
+///
+/// Returns `None` for a rule string serde itself would reject; the `Serialize`
+/// derive on the same enum then reports the error, so this does not duplicate it.
+pub fn apply_serde_rename_all_rule_to_variant(rule: &str, variant: &str) -> Option<String> {
+    // serde's own variant→snake_case: insert `_` before every uppercase char
+    // after the first, then lowercase. (`XMLHttpRequest` → `x_m_l_http_request`,
+    // matching serde exactly rather than guessing at acronym runs.)
+    fn snake(variant: &str) -> String {
+        let mut out = String::with_capacity(variant.len() + 4);
+        for (i, ch) in variant.char_indices() {
+            if i > 0 && ch.is_uppercase() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        }
+        out
+    }
+    match rule {
+        "lowercase" => Some(variant.to_ascii_lowercase()),
+        "UPPERCASE" => Some(variant.to_ascii_uppercase()),
+        "PascalCase" => Some(variant.to_owned()),
+        "camelCase" => {
+            let mut chars = variant.chars();
+            chars
+                .next()
+                .map(|first| first.to_lowercase().collect::<String>() + chars.as_str())
+        }
+        "snake_case" => Some(snake(variant)),
+        "SCREAMING_SNAKE_CASE" => Some(snake(variant).to_ascii_uppercase()),
+        "kebab-case" => Some(snake(variant).replace('_', "-")),
+        "SCREAMING-KEBAB-CASE" => Some(snake(variant).to_ascii_uppercase().replace('_', "-")),
+        _ => None,
+    }
+}
+
+/// A container-level `#[serde(...)]` enum representation other than serde's
+/// default (externally tagged), as the attribute word that selected it.
+///
+/// Each of these changes what a *unit* variant serializes to, so a schema
+/// generator that ignores them advertises the wrong wire shape:
+///
+/// | Attribute | A unit variant serializes as |
+/// |---|---|
+/// | *(default, externally tagged)* | `"Variant"` — a JSON string |
+/// | `#[serde(tag = "t")]` | `{"t": "Variant"}` — an object |
+/// | `#[serde(tag = "t", content = "c")]` | `{"t": "Variant"}` — an object |
+/// | `#[serde(untagged)]` | `null` |
+/// | `#[serde(into = "u8")]` / `from` / `try_from` | whatever the conversion type serializes as |
+///
+/// The conversion attributes belong here for the same reason: serde routes the
+/// value through another type entirely, so the variant names never reach the
+/// wire and a string-enum schema would describe a payload the handler does not
+/// accept.
+///
+/// Returns `None` for the default representation.
+pub fn serde_enum_representation(attrs: &[syn::Attribute]) -> Option<&'static str> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            // `tag` wins the report when both `tag` and `content` are present:
+            // it is the one that changes a unit variant's shape, and naming it
+            // keeps the diagnostic pointing at the cause.
+            if meta.path.is_ident("tag") {
+                found = Some("tag");
+            } else if meta.path.is_ident("untagged") {
+                found = Some("untagged");
+            } else if meta.path.is_ident("into") {
+                found = Some("into");
+            } else if meta.path.is_ident("from") {
+                found = Some("from");
+            } else if meta.path.is_ident("try_from") {
+                found = Some("try_from");
+            } else if meta.path.is_ident("content") && found.is_none() {
+                found = Some("content");
+            }
+            consume_unrecognized_meta(&meta)?;
+            Ok(())
+        });
+    }
+    found
+}
+
+/// Consume whatever follows an unrecognized `#[serde(...)]` key so
+/// `parse_nested_meta` can reach the keys that come after it.
+///
+/// Two shapes have to be swallowed, not one. `key = "value"` is the obvious
+/// case. The other is a **list**, `key(a = "x", b = "y")` — and missing it is
+/// not cosmetic: `meta.value()` fails on a list (there is no `=`), so the
+/// parenthesized group stays unread, `parse_nested_meta` aborts on it, and
+/// every later key goes unvisited. A caller that swallows the resulting error
+/// then sees a clean "nothing found".
+///
+/// That is exactly how `#[serde(rename_all(serialize = "snake_case"), tag =
+/// "kind")]` slipped past [`serde_enum_representation`]: `tag` was never
+/// reached, so an internally tagged enum was advertised as a plain string enum.
+/// Anything that gates on absence must therefore consume both shapes.
+fn consume_unrecognized_meta(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<()> {
+    if let Ok(value) = meta.value() {
+        let _: syn::Result<syn::Lit> = value.parse();
+    } else if meta.input.peek(syn::token::Paren) {
+        let content;
+        syn::parenthesized!(content in meta.input);
+        let _: proc_macro2::TokenStream = content.parse()?;
+    }
+    Ok(())
+}
+
+/// The serde attributes on an enum variant, read for `rename` / `skip`.
+///
+/// Mirrors [`field_serde_serialize_rename`] but over a
+/// [`syn::Variant`](syn::Variant)'s attribute list.
+/// Does this variant carry a `#[serde(alias = "…")]`?
+///
+/// `alias` is deserialize-only: it adds an accepted input spelling without
+/// changing what serialization writes. That asymmetry has no correct rendering
+/// in a single schema serving both directions, so the derive refuses it
+/// (issue #802).
+///
+/// Routed through [`consume_unrecognized_meta`] like every other scanner here,
+/// so a sibling list-valued attribute — `#[serde(bound(deserialize = "…"),
+/// alias = "legacy")]` — cannot abort the walk before `alias` is reached.
+pub fn variant_has_serde_alias(variant: &syn::Variant) -> bool {
+    has_serde_alias(&variant.attrs)
+}
+
+/// Does this attribute list carry `#[serde(alias = "…")]`?
+///
+/// serde accepts `alias` on a FIELD and on a VARIANT, and it means the same
+/// deserialize-only widening in both places. One predicate serves both, so the
+/// two callers cannot drift the way the audit and the emitter drifted over
+/// `default` (issue #802).
+pub fn has_serde_alias(attrs: &[syn::Attribute]) -> bool {
+    let mut found = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("alias") {
+                // Consume the value so the walk continues cleanly.
+                if let Ok(value) = meta.value() {
+                    let _ = value.parse::<syn::Lit>();
+                }
+                found = true;
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+pub fn variant_serde_serialize_rename(variant: &syn::Variant) -> Option<String> {
+    let mut renamed = None;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                if let Ok(value) = meta.value() {
+                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
+                        renamed = Some(s.value());
+                    }
+                } else {
+                    let _ = meta.parse_nested_meta(|inner| {
+                        if let Ok(value) = inner.value()
+                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
+                            && inner.path.is_ident("serialize")
+                        {
+                            renamed = Some(s.value());
+                        }
+                        Ok(())
+                    });
+                }
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    renamed
+}
+
+/// Whether a `#[serde(...)]` attribute list carries a **split** `rename_all` or
+/// `rename` — the `name(serialize = "...", deserialize = "...")` form — where
+/// the two sides disagree.
+///
+/// A symmetric `rename_all = "snake_case"` applies to both directions and is
+/// exact. The split form is not: the schema can only advertise one string, so a
+/// generated client sends the serialize spelling while the handler's
+/// `Deserialize` accepts the other. Same asymmetry as a directional skip, same
+/// answer — refuse rather than publish a value that only works one way.
+///
+/// Returns the attribute word (`rename_all` / `rename`) when the two sides are
+/// present and differ.
+pub fn serde_split_rename(attrs: &[syn::Attribute], key: &'static str) -> Option<&'static str> {
+    let mut split = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident(key)
+                && meta.value().is_err()
+                && meta.input.peek(syn::token::Paren)
+            {
+                let (mut ser, mut de) = (None::<String>, None::<String>);
+                meta.parse_nested_meta(|inner| {
+                    if let Ok(value) = inner.value()
+                        && let Ok(syn::Lit::Str(lit)) = value.parse::<syn::Lit>()
+                    {
+                        if inner.path.is_ident("serialize") {
+                            ser = Some(lit.value());
+                        } else if inner.path.is_ident("deserialize") {
+                            de = Some(lit.value());
+                        }
+                    }
+                    Ok(())
+                })?;
+                // Asymmetric in either shape. Both sides present and
+                // disagreeing is the obvious one. ONE side present is equally
+                // asymmetric and easier to miss: `rename_all(serialize =
+                // "snake_case")` renames only the output, so serde still
+                // DESERIALIZES the original spelling — advertising the
+                // serialize side would have a client send a value the handler
+                // rejects. Only a split whose two sides are spelled the same
+                // round-trips, and that is the sole accepted case.
+                match (ser, de) {
+                    (Some(ser), Some(de)) if ser == de => {}
+                    (None, None) => {}
+                    _ => split = Some(key),
+                }
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    split
+}
+
+/// A **directional** skip on a variant — `skip_serializing` or
+/// `skip_deserializing` — returned as the attribute word.
+///
+/// One schema describes both directions, so a variant present in only one of
+/// them has no correct rendering. `skip_deserializing` is the dangerous
+/// direction: the variant IS serialized, so a serialize-side schema advertises
+/// it, and a client that sends it back gets an unknown-variant error from
+/// serde. `skip_serializing` is the mirror — dropping it would deny an input
+/// the handler accepts. Neither can be inferred away, so the derive refuses the
+/// enum instead of publishing a half-true set. Plain `#[serde(skip)]` is
+/// unambiguous (gone from both directions) and stays supported.
+pub fn variant_directional_skip(variant: &syn::Variant) -> Option<&'static str> {
+    let mut found = None;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip_serializing") {
+                found = Some("skip_serializing");
+            } else if meta.path.is_ident("skip_deserializing") {
+                found = Some("skip_deserializing");
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    found
+}
+
+/// The field-level twin of [`variant_directional_skip`], with the same reasoning:
+/// a field present in only one serde direction has no correct rendering in a
+/// schema that describes both.
+pub fn variant_directional_skip_on_field(field: &syn::Field) -> Option<&'static str> {
+    serde_bare_word(&field.attrs, &["skip_serializing", "skip_deserializing"])
+}
+
+/// Whether a variant carries `#[serde(skip)]`, in which case it never appears
+/// on the wire in either direction and must not be advertised.
+pub fn variant_is_serde_skipped(variant: &syn::Variant) -> bool {
+    let mut skipped = false;
+    for attr in variant.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("skip") {
+                skipped = true;
+            } else {
+                consume_unrecognized_meta(&meta)?;
+            }
+            Ok(())
+        });
+    }
+    skipped
 }
 
 /// The JSON-schema property name a field serializes to, honoring serde attrs.
@@ -206,6 +570,96 @@ pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
     emit_json_schema_tokens(&field.ty)
 }
 
+/// Emit the schema for a type whose last path segment is `Option`.
+///
+/// Split out of [`emit_json_schema_tokens`] only for length: the nullable case
+/// carries two runtime guards (the wrapper's own identity, and — for
+/// `Option<Value>` — the inner type's) and their reasoning does not compress.
+fn emit_option_schema_tokens(ty: &syn::Type, inner: &syn::Type) -> TokenStream {
+    // Everything below describes `ty` as NULLABLE, which is only true if
+    // `ty` is `std`'s `Option`. `unwrap_single_generic` matched the last
+    // path segment, so an application's own `domain::Option<T>` reaches
+    // here too — and it is an ordinary struct, not a nullable anything.
+    // The whole nullable body is therefore emitted as the MATCHED arm of
+    // the runtime identity guard: a registered `domain::Option<T>` gets its
+    // real schema, an unregistered one gets the honest `$ref` (which
+    // `--strict` then reports as opaque), and only genuine `Option` is
+    // described as nullable.
+
+    // `Option<serde_json::Value>` must NOT be wrapped. The unconstrained
+    // schema already admits null, and `oneOf` demands that EXACTLY ONE
+    // branch match — so `oneOf [{unconstrained}, {"type":"null"}]` would
+    // reject the very null it is meant to permit, because null matches both.
+    //
+    // But `is_serde_json_value` matches the LAST PATH SEGMENT, so it also
+    // fires for an application type of one's own called `Value`. That type
+    // is ordinary: if it carries `#[derive(OpenApiSchema)]` its schema is a
+    // normal non-null object and it NEEDS the null branch, or serializing
+    // `None` emits a null the schema forbids. A proc macro cannot tell the
+    // two apart, so the choice is deferred to runtime — the same escape the
+    // scalar table uses for its own last-segment collisions.
+    if is_serde_json_value(&type_name_str(inner)) {
+        // THREE outcomes, not two. The inventory check alone cannot tell the
+        // genuine `serde_json::Value` from an application `Value` that
+        // derives nothing — it answers `None` for both — so the identity is
+        // checked as well, exactly as `emit_identity_guarded` does for the
+        // non-optional path. Without it an underived colliding `Value` was
+        // published as arbitrary JSON: `--strict` passed while a client
+        // still received `unknown` for a field with a fixed wire shape.
+        let inner_ty = inner;
+        let matched = quote! {{
+            match ::autumn_web::openapi::registered_derived_schema(
+                ::core::any::type_name::<#inner_ty>()
+            ) {
+                // A colliding application `Value` with a real schema: wrap
+                // it like any other optional type.
+                ::core::option::Option::Some(__derived) => {
+                    ::autumn_web::reexports::serde_json::json!({
+                        "oneOf": [__derived, { "type": "null" }]
+                    })
+                }
+                ::core::option::Option::None => {
+                    let __identity = ::core::any::type_name::<#inner_ty>();
+                    if __identity == "serde_json::value::Value" {
+                        // Genuine `serde_json::Value`: unconstrained already
+                        // admits null, and wrapping it in `oneOf` would
+                        // REJECT that null (it matches both branches).
+                        ::autumn_web::reexports::serde_json::json!({
+                            "description": "Arbitrary JSON: an object, array, string, \
+                                            number, boolean or null.",
+                        })
+                    } else {
+                        // An underived application `Value`: an ordinary
+                        // type, so it gets the ordinary nullable `$ref`.
+                        let __ref_path = ::std::format!(
+                            "#/components/schemas/{}",
+                            __identity
+                        );
+                        ::autumn_web::reexports::serde_json::json!({
+                            "oneOf": [{ "$ref": __ref_path }, { "type": "null" }]
+                        })
+                    }
+                }
+            }
+        }};
+        return emit_identity_guarded(
+            ty,
+            &std_wrapper_predicate(&OPTION_IDENTITY_PREFIXES),
+            &matched,
+        );
+    }
+    let inner_tokens = emit_json_schema_tokens(inner);
+    let matched = quote! {{
+        let __inner = #inner_tokens;
+        ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
+    }};
+    emit_identity_guarded(
+        ty,
+        &std_wrapper_predicate(&OPTION_IDENTITY_PREFIXES),
+        &matched,
+    )
+}
+
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
@@ -214,23 +668,86 @@ pub fn emit_json_schema_tokens_for_field(field: &Field) -> TokenStream {
 pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
     if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
-        let inner_tokens = emit_json_schema_tokens(&inner);
-        return quote! {{
-            let __inner = #inner_tokens;
-            ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
-        }};
+        return emit_option_schema_tokens(ty, &inner);
     }
 
     // Vec<T> → {"type": "array", "items": <T-schema>}
+    //
+    // Guarded exactly like `Option` above: `domain::Vec<T>` is matched by the
+    // last path segment but is not an array, so the array body is the MATCHED
+    // arm and anything else falls through to its registered schema or an
+    // honest `$ref`.
     if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Vec") {
         let inner_tokens = emit_json_schema_tokens(&inner);
-        return quote! {{
+        let matched = quote! {{
             let __items = #inner_tokens;
             ::autumn_web::reexports::serde_json::json!({ "type": "array", "items": __items })
         }};
+        return emit_identity_guarded(ty, &std_wrapper_predicate(&VEC_IDENTITY_PREFIXES), &matched);
     }
 
     let name = type_name_str(ty);
+
+    // Types that serialize as a JSON scalar despite not being Rust primitives.
+    // Without this they fall through to the `$ref` branch below and the spec
+    // carries a dangling component nothing registers — which the back-fill then
+    // resolves to the opaque object placeholder. `created_at` / `updated_at`
+    // columns make `NaiveDateTime` near-universal across `#[model]` types, so
+    // this was one untyped field on almost every model on an API boundary
+    // (issue #802). Each maps to the standard OpenAPI `format` for what serde
+    // actually writes.
+    if is_serde_json_value(&name) {
+        return unconstrained_json_tokens(ty);
+    }
+
+    if let Some((json_type, format, description)) = scalar_json_schema(&name) {
+        let format_insert = format.map(|f| {
+            quote! { __scalar.insert("format".to_owned(), #f.into()); }
+        });
+        let description_insert = description.map(|d| {
+            quote! { __scalar.insert("description".to_owned(), #d.into()); }
+        });
+        // Matching is on the type's LAST PATH SEGMENT, because a proc macro sees
+        // only the tokens as written and `use chrono::NaiveDateTime;` is the
+        // normal spelling. Two runtime checks then establish that the type
+        // really IS the external scalar before it is described as one:
+        //
+        //   1. The derived-schema inventory. A colliding application type
+        //      carrying `#[derive(OpenApiSchema)]` resolves to its own schema.
+        //   2. Its FULL runtime path. An application `Uuid` or `DateTime` that
+        //      derives NOTHING used to fall through to the scalar and be
+        //      advertised as a uuid/date-time string even though it serializes
+        //      as an object — check (1) alone could not see it, because there
+        //      was nothing registered to find. `type_name` gives the
+        //      fully-qualified path, so only the genuine `chrono::`/`uuid::`
+        //      types take this branch; anything else falls through to the same
+        //      `$ref` the fallback below emits, where it is either resolved or
+        //      honestly reported as opaque.
+        //
+        // (The same last-segment limitation still governs `primitive_json_type`
+        // for `String`, `bool` and the numerics, where the stakes are lower: a
+        // colliding `String` would have to be a non-string-serializing type of
+        // that exact name.)
+        // The predicate is derived from the REAL type through `autumn_web`'s
+        // re-export (see `scalar_identity_predicate`), not from a hand-written
+        // prefix: `starts_with("chrono::")` accepted every type in a crate of
+        // that name, and a downstream crate named `chrono` with its own
+        // `DateTime` was inlined as a string even when serde writes an object.
+        let identity_predicate = scalar_identity_predicate(&name)
+            .expect("scalar_json_schema and scalar_identity_predicate cover the same names");
+        return emit_identity_guarded(
+            ty,
+            &identity_predicate,
+            &quote! {{
+                let mut __scalar = ::autumn_web::reexports::serde_json::Map::new();
+                __scalar.insert("type".to_owned(), #json_type.into());
+                #format_insert
+                #description_insert
+                ::autumn_web::reexports::serde_json::Value::Object(__scalar)
+            }},
+        );
+    }
+
     crate::api_doc::primitive_json_type(&name).map_or_else(
         || {
             // Emit the `$ref` against the field type's FULL `type_name` identity
@@ -247,68 +764,391 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
             }}
         },
         |json_type| {
-            quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }
+            // Guarded like every other last-segment table. `String` is the
+            // realistic collision — it is a std type, not a language primitive,
+            // so `struct String { .. }` in an application is ordinary code and
+            // used to be advertised as a JSON string however it serialized. The
+            // language primitives are listed too so the rule has no exceptions
+            // to remember; their `type_name` is just the bare name.
+            let expected: &[&str] = match json_type {
+                "string" => &["alloc::string::String", "str", "&str"],
+                "boolean" => &["bool"],
+                "number" => &["f32", "f64"],
+                _ => &[
+                    "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize",
+                ],
+            };
+            emit_identity_guarded(
+                ty,
+                &quote! { [#(#expected),*].contains(&__identity) },
+                &quote! {
+                    ::autumn_web::reexports::serde_json::json!({ "type": #json_type })
+                },
+            )
         },
     )
 }
 
-/// Emit the body of `OpenApiSchema::schema()` for a list of fields.
+/// JSON-Schema `type`, optional `format`, and optional `description` for a
+/// non-primitive type that nevertheless serializes as a single scalar.
 ///
-/// `all_optional` is `true` for `UpdateX` structs where every field is
-/// conceptually optional (backed by `Patch<T>`).
-pub fn emit_schema_fn_body(
-    fields: &[&&Field],
-    all_optional: bool,
-    rename_all_rule: Option<&str>,
+/// Deliberately narrow: only types whose serde output is unambiguous.
+/// Numeric-adjacent wrappers (`Decimal`, `BigDecimal`) are left out on purpose —
+/// whether they serialize as a JSON number or a string depends on which serde
+/// feature the app enabled, and an opaque placeholder beats a confidently wrong
+/// scalar.
+///
+/// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
+/// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
+/// but `NaiveDateTime` / `NaiveTime` serialize without one
+/// (`2026-09-06T18:00:00`). Claiming the standard format would make a strict
+/// validator reject the server's real payload, and lead a generator to emit a
+/// timezone-aware client type that cannot parse it. A bare `string` plus a
+/// description is less specific but true. `NaiveDate` keeps `date`, whose RFC
+/// 3339 production (`full-date`) has no offset to begin with, and `DateTime<Tz>`
+/// keeps `date-time` because chrono does write an offset for it.
+/// Emit a runtime-guarded mapping for a type matched by its LAST PATH SEGMENT.
+///
+/// Every table in this module matches on the last segment, because a proc macro
+/// sees only the tokens as written and `use serde_json::Value;` is the ordinary
+/// spelling. A name match is therefore a HYPOTHESIS, not a fact: an application
+/// type of the same name is indistinguishable at expansion time.
+///
+/// So the emitted code checks two things at runtime before committing to the
+/// mapping, and falls back to the full-identity `$ref` otherwise:
+///
+///   1. The derived-schema inventory — a colliding type carrying
+///      `#[derive(OpenApiSchema)]` resolves to its own real schema.
+///   2. `type_name`, against the genuine type's fully-qualified path — which
+///      catches the colliding type that derives NOTHING, where check (1) has
+///      nothing to find and silently says "not a collision".
+///
+/// Both checks are needed: (1) alone let an underived `domain::Uuid` be
+/// advertised as a uuid string, and (2) alone would ignore an application type
+/// that had correctly registered itself. Written once here so a new table
+/// cannot be added with only half the guard (issue #802).
+fn emit_identity_guarded(
+    ty: &syn::Type,
+    identity_predicate: &TokenStream,
+    matched: &TokenStream,
 ) -> TokenStream {
-    emit_schema_fn_body_ext(fields, all_optional, &[], rename_all_rule)
+    quote! {{
+        match ::autumn_web::openapi::registered_derived_schema(
+            ::core::any::type_name::<#ty>()
+        ) {
+            ::core::option::Option::Some(__derived) => __derived,
+            ::core::option::Option::None => {
+                let __identity = ::core::any::type_name::<#ty>();
+                if #identity_predicate {
+                    #matched
+                } else {
+                    // Same full-identity `$ref` the general fallback emits, so
+                    // the finalize collision index can rewrite it.
+                    let __ref_path = ::std::format!(
+                        "#/components/schemas/{}",
+                        __identity
+                    );
+                    ::autumn_web::reexports::serde_json::json!({ "$ref": __ref_path })
+                }
+            }
+        }
+    }}
 }
 
-pub fn emit_schema_fn_body_ext(
+/// The `type_name` prefixes that identify `std`'s own `Option` / `Vec`.
+///
+/// Both spellings are listed for each because `core::option::Option` /
+/// `alloc::vec::Vec` are what today's rustc renders, while `std::option::` /
+/// `std::vec::` are the re-export paths a future rustc could plausibly print.
+/// Accepting both costs one string comparison and removes a silent-wrong-spec
+/// failure mode from a toolchain upgrade.
+const OPTION_IDENTITY_PREFIXES: [&str; 2] = ["core::option::Option<", "std::option::Option<"];
+const VEC_IDENTITY_PREFIXES: [&str; 2] = ["alloc::vec::Vec<", "std::vec::Vec<"];
+
+/// Emit an expression that is `true` at runtime iff `__identity` (the enclosing
+/// scope's `type_name::<T>()`) names one of `prefixes`.
+///
+/// `Option` and `Vec` are matched by the macro on their LAST PATH SEGMENT, for
+/// the same reason every other type here is: a proc macro sees only the tokens
+/// as written. But an application's own `domain::Option<T>` — an ordinary
+/// struct that happens to spell that segment — is not nullable, and a
+/// `domain::Vec<T>` is not an array. Describing them as such advertised a wire
+/// shape those types do not serialize, and (because no opaque component was
+/// emitted) `autumn openapi export --strict` passed while doing it. Deferring
+/// the decision to `type_name` is the same escape the scalar table uses for its
+/// own last-segment collisions.
+fn std_wrapper_predicate(prefixes: &[&str]) -> TokenStream {
+    let checks = prefixes
+        .iter()
+        .map(|p| quote! { __identity.starts_with(#p) });
+    quote! { #(#checks)||* }
+}
+
+/// Emit an expression that is `true` at runtime iff `ty` really is `std`'s
+/// wrapper named by `prefixes`, for use OUTSIDE [`emit_identity_guarded`]
+/// (which binds `__identity` itself).
+fn emit_is_std_wrapper(ty: &syn::Type, prefixes: &[&str]) -> TokenStream {
+    let predicate = std_wrapper_predicate(prefixes);
+    quote! {{
+        let __identity = ::core::any::type_name::<#ty>();
+        #predicate
+    }}
+}
+
+/// Is this type spelled `serde_json::Value` (or a `Value` alias of it)?
+///
+/// Matched on the LAST PATH SEGMENT for the same reason the scalar table is: a
+/// proc macro sees only the tokens as written, and `use serde_json::Value;` is
+/// the normal spelling. A colliding application type is handled the same way
+/// too — the runtime check consults the derived-schema inventory first, so a
+/// `Value` of one's own carrying `#[derive(OpenApiSchema)]` wins.
+fn is_serde_json_value(name: &str) -> bool {
+    name == "Value"
+}
+
+/// The schema for arbitrary JSON: no constraint at all.
+///
+/// A `json` / `jsonb` column may legitimately hold an object, an array, a
+/// string, a number, a boolean or null, so any `"type"` here would be a lie for
+/// some rows. Emitting only a description leaves the schema unconstrained,
+/// which is the honest answer and is true of BOTH directions (issue #802).
+fn unconstrained_json_tokens(ty: &syn::Type) -> TokenStream {
+    emit_identity_guarded(
+        ty,
+        &quote! { __identity == "serde_json::value::Value" },
+        &quote! {
+            ::autumn_web::reexports::serde_json::json!({
+                "description": "Arbitrary JSON: an object, array, string, number, boolean or null.",
+            })
+        },
+    )
+}
+
+fn scalar_json_schema(
+    name: &str,
+) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
+    Some(match name {
+        // `DateTime<Utc>` reaches here as its last path segment, `DateTime`.
+        "DateTime" => ("string", Some("date-time"), None),
+        "NaiveDate" => ("string", Some("date"), None),
+        "NaiveDateTime" => (
+            "string",
+            None,
+            Some("ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00"),
+        ),
+        "NaiveTime" => (
+            "string",
+            None,
+            Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
+        ),
+        "Uuid" => ("string", Some("uuid"), None),
+        _ => return None,
+    })
+}
+
+/// A runtime predicate that is `true` only for the GENUINE external scalar this
+/// table entry describes.
+///
+/// The identity is compared against `type_name` of the real type, reached
+/// through `autumn_web`'s own re-export — never against a hand-written string.
+/// Two things follow. It cannot drift from the dependency: if `chrono` moves
+/// `NaiveDateTime` between internal modules, both sides move together. And it
+/// is exact rather than namespace-wide: the previous `starts_with("chrono::")`
+/// accepted ANY type in a crate that happens to be named `chrono` — including a
+/// downstream crate of that name defining its own `DateTime` — and inlined it as
+/// a string even when serde writes an object, with no opaque component for
+/// `--strict` to catch.
+///
+/// `DateTime<Tz>` is compared on the part before `<`, because the zone is a
+/// parameter: `DateTime<Utc>`, `DateTime<Local>` and `DateTime<Tz>` are all
+/// genuinely chrono's. Everything else is compared whole.
+fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
+    let chrono = quote! { ::autumn_web::reexports::chrono };
+    let real: TokenStream = match name {
+        "DateTime" => {
+            // Generic: match the path up to the `<`, so any zone qualifies while
+            // an unrelated `DateTime` still does not.
+            return Some(quote! {{
+                let __real = ::core::any::type_name::<#chrono::DateTime<#chrono::Utc>>();
+                let __head = |__s: &'static str| __s.split('<').next().unwrap_or(__s);
+                __head(__identity) == __head(__real)
+            }});
+        }
+        "NaiveDate" => quote! { #chrono::NaiveDate },
+        "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
+        "NaiveTime" => quote! { #chrono::NaiveTime },
+        "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
+        _ => return None,
+    };
+    Some(quote! { __identity == ::core::any::type_name::<#real>() })
+}
+
+/// Emit the body of `OpenApiSchema::schema()` for a list of fields.
+///
+/// `all_optional` is `true` for `Update*` structs where every field is
+/// conceptually optional (backed by `Patch<T>`); `extra_required` names fields
+/// to force into the `required` set; and `treat_as_optional` names fields that
+/// must NOT be `required` even though their type is not `Option<T>`.
+///
+/// Requiredness has to follow what the generated `Deserialize` accepts, not what
+/// the Rust type looks like. `#[model]` puts `#[serde(default)]` on a
+/// non-`Option` `bool` in the `New*` struct, so a POST body may omit it and get
+/// `false` — advertising it as required would force a generated client to send a
+/// value the server does not need (issue #802).
+pub fn emit_schema_fn_body_full(
     fields: &[&&Field],
     all_optional: bool,
     extra_required: &[&&Field],
     rename_all_rule: Option<&str>,
+    treat_as_optional: &dyn Fn(&Field) -> bool,
 ) -> TokenStream {
+    emit_schema_fn_body_named(
+        fields,
+        all_optional,
+        extra_required,
+        rename_all_rule,
+        treat_as_optional,
+        false,
+        false,
+    )
+}
+
+/// As [`emit_schema_fn_body_full`], plus `raw_field_names`: advertise each
+/// property under its bare Rust identifier, ignoring every serde rename.
+///
+/// Needed for the `New*` / `Update*` companions. Those structs deliberately do
+/// NOT inherit the model's `#[serde(rename_all)]` or field-level
+/// `#[serde(rename)]` — a behaviour pinned by
+/// `autumn/tests/integration/form_for_derive.rs` — so a schema built with the
+/// model's rename metadata would advertise `authorName` for a body serde only
+/// accepts as `author_name`, and every generated client's POST would fail with
+/// a missing-field error (issue #802).
+pub fn emit_schema_fn_body_named(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+    rename_all_rule: Option<&str>,
+    treat_as_optional: &dyn Fn(&Field) -> bool,
+    raw_field_names: bool,
+    patch_nullable: bool,
+) -> TokenStream {
+    let resolve_name = |f: &Field| -> Option<String> {
+        if raw_field_names {
+            let raw = f.ident.as_ref()?.to_string();
+            Some(raw.strip_prefix("r#").unwrap_or(&raw).to_owned())
+        } else {
+            schema_property_name(f, rename_all_rule)
+        }
+    };
     // Resolve each field's advertised property name once — through the shared
     // serde helpers so the schema honors `#[serde(rename)]` /
     // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
     // same resolved name for BOTH the property key and the `required` entry, so
     // the two can never drift.
+    // `patch_nullable` applies to `fields` ONLY, never to `extra_required`.
+    // On an `UpdateModel` every entry of `fields` is declared `Patch<T>` while
+    // the `extra_required` lock-version column stays a plain `T` (issue #802).
     let insertions: Vec<TokenStream> = fields
         .iter()
-        .chain(extra_required.iter())
-        .map(|f| {
-            let field_name = schema_property_name(f, rename_all_rule)
-                .unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
-            let schema_expr = emit_json_schema_tokens_for_field(f);
+        .map(|f| (f, patch_nullable))
+        .chain(extra_required.iter().map(|f| (f, false)))
+        .map(|(f, nullable)| {
+            let field_name =
+                resolve_name(f).unwrap_or_else(|| f.ident.as_ref().unwrap().to_string());
+            let base = emit_json_schema_tokens_for_field(f);
+            // `Option<T>` already emits `oneOf [T, null]`, so wrapping it again
+            // would only nest a second, redundant null branch.
+            //
+            // `is_option_type` matches the LAST PATH SEGMENT, though, so an
+            // application's own `domain::Option<T>` answers `true` here while
+            // `emit_json_schema_tokens` (identity-guarded above) correctly
+            // emits a NON-nullable schema for it. Skipping the wrap on that
+            // answer alone would leave a `Patch` field whose `null` — the wire
+            // form of `Clear` — is forbidden by its own schema. So when the
+            // compile-time answer is `true` the choice is deferred to the same
+            // runtime identity the emitter uses, and the two agree by
+            // construction.
+            let schema_expr = if !nullable {
+                base
+            } else if is_option_type(&f.ty) {
+                let is_std_option = emit_is_std_wrapper(&f.ty, &OPTION_IDENTITY_PREFIXES);
+                quote! {{
+                    let __inner = #base;
+                    if #is_std_option {
+                        __inner
+                    } else {
+                        ::autumn_web::reexports::serde_json::json!({
+                            "oneOf": [__inner, { "type": "null" }]
+                        })
+                    }
+                }}
+            } else {
+                quote! {{
+                    let __inner = #base;
+                    ::autumn_web::reexports::serde_json::json!({
+                        "oneOf": [__inner, { "type": "null" }]
+                    })
+                }}
+            };
             quote! {
                 __props.insert(#field_name.to_owned(), #schema_expr);
             }
         })
         .collect();
 
-    let mut required_names: Vec<String> = if all_optional {
-        Vec::new()
-    } else {
-        fields
-            .iter()
-            .filter(|f| !is_option_type(&f.ty))
-            .filter_map(|f| schema_property_name(f, rename_all_rule))
-            .collect()
-    };
-    for f in extra_required {
-        if let Some(name) = schema_property_name(f, rename_all_rule) {
-            required_names.push(name);
+    // A field is required unless it is genuinely optional.
+    //
+    // `treat_as_optional` reads serde attributes, which a proc macro sees
+    // exactly and completely — that answer is final. `is_option_type` does not:
+    // it matches the LAST PATH SEGMENT, so an application's own
+    // `domain::Option<T>` — an ordinary struct the client must actually send —
+    // answered `true` and was silently dropped from `required`, while its
+    // property schema (identity-guarded in `emit_json_schema_tokens`) correctly
+    // described a non-nullable object. Requiredness is therefore emitted as a
+    // runtime-conditional push for exactly the fields that answer `true`,
+    // keyed on the same `type_name` identity the emitter uses, so a property's
+    // shape and its requiredness cannot disagree.
+    //
+    // The pushes are emitted in the original order — model fields first, then
+    // `extra_required` — so `required` keeps the ordering it has always had.
+    let mut required_pushes: Vec<TokenStream> = Vec::new();
+    if !all_optional {
+        for f in fields {
+            // `skip_serializing_if` means a RESPONSE may omit the field, so
+            // `required` is wrong for it whatever its type. The standalone
+            // derive's audit already refuses this attribute on anything that is
+            // neither `Option`-named nor defaulted — precisely because the
+            // survivors are describable as optional — but it makes that
+            // judgement from the last path segment, so an application's own
+            // `domain::Option<T>` passed the audit and then landed in `required`
+            // anyway once the emitter's identity guard recognised the impostor.
+            // Deciding it here, on the attribute rather than on the type, makes
+            // the audit's stated premise actually true and needs no runtime
+            // identity: the attribute is exactly what a proc macro can see.
+            if treat_as_optional(f) || field_has_skip_serializing_if(f) {
+                continue;
+            }
+            let Some(name) = resolve_name(f) else {
+                continue;
+            };
+            let push = quote! {
+                __required.push(::autumn_web::reexports::serde_json::json!(#name));
+            };
+            required_pushes.push(if is_option_type(&f.ty) {
+                let is_std_option = emit_is_std_wrapper(&f.ty, &OPTION_IDENTITY_PREFIXES);
+                quote! { if !(#is_std_option) { #push } }
+            } else {
+                push
+            });
         }
     }
-
-    let required_tokens: Vec<TokenStream> = required_names
-        .iter()
-        .map(|name| {
-            quote! { ::autumn_web::reexports::serde_json::json!(#name) }
-        })
-        .collect();
+    for f in extra_required {
+        if let Some(name) = resolve_name(f) {
+            required_pushes.push(quote! {
+                __required.push(::autumn_web::reexports::serde_json::json!(#name));
+            });
+        }
+    }
 
     quote! {
         let mut __props = ::autumn_web::reexports::serde_json::Map::new();
@@ -322,8 +1162,10 @@ pub fn emit_schema_fn_body_ext(
             "properties".to_owned(),
             ::autumn_web::reexports::serde_json::Value::Object(__props),
         );
-        let __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
-            ::std::vec![#(#required_tokens),*];
+        #[allow(unused_mut)]
+        let mut __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
+            ::std::vec::Vec::new();
+        #(#required_pushes)*
         if !__required.is_empty() {
             __schema.insert(
                 "required".to_owned(),
