@@ -361,11 +361,24 @@ pub(crate) fn has_derivation_descriptors() -> bool {
         .is_some()
 }
 
-/// The registered derivation named `name`.
-fn find(name: &str) -> Option<&'static DerivationDef> {
-    registered_derivations()
-        .into_iter()
+/// The definition `name` selects from `defs`, after the whole set has passed
+/// the registry check.
+///
+/// The repair and resweep entry points take a name, but they act on a column
+/// the rest of the registry may also claim: a `recompute` that skipped the
+/// check would assign a shared parent column from one definition's source
+/// alone and overwrite what the colliding one maintains. So they refuse the
+/// same registries boot refuses, before touching the database.
+fn select_checked<'a>(defs: &[&'a DerivationDef], name: &str) -> AutumnResult<&'a DerivationDef> {
+    check_registry(defs)?;
+    defs.iter()
+        .copied()
         .find(|def| def.name == name)
+        .ok_or_else(|| {
+            AutumnError::from(std::io::Error::other(format!(
+                "`{name}` is not a derivation registered in this binary"
+            )))
+        })
 }
 
 /// Reject a registry that cannot be reconciled.
@@ -1338,15 +1351,12 @@ fn is_missing_state_table(error: &AutumnError) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error when `name` is not a registered derivation or when the
-/// state row cannot be written. A derivation with no state row yet (a first
-/// boot has not run) is enqueued.
+/// Returns an error when `name` is not a registered derivation, when the
+/// registered set cannot be reconciled (the check boot runs, so a colliding
+/// registry is refused here too) or when the state row cannot be written. A
+/// derivation with no state row yet (a first boot has not run) is enqueued.
 pub async fn resweep(conn: &mut RuntimeConnection, name: &str) -> AutumnResult<()> {
-    let def = find(name).ok_or_else(|| {
-        AutumnError::from(std::io::Error::other(format!(
-            "`{name}` is not a registered derivation"
-        )))
-    })?;
+    let def = select_checked(&registered_derivations(), name)?;
     enqueue(conn, def).await
 }
 
@@ -1360,14 +1370,12 @@ pub async fn resweep(conn: &mut RuntimeConnection, name: &str) -> AutumnResult<(
 ///
 /// # Errors
 ///
-/// Returns an error when `name` is not a registered derivation, and propagates
+/// Returns an error when `name` is not a registered derivation or when the
+/// registered set cannot be reconciled (the check boot runs, so a colliding
+/// registry is refused here rather than swept from one side), and propagates
 /// any database error from the sweep.
 pub async fn recompute(conn: &mut RuntimeConnection, name: &str) -> AutumnResult<usize> {
-    let Some(def) = find(name) else {
-        return Err(AutumnError::from(std::io::Error::other(format!(
-            "`{name}` is not a derivation registered in this binary"
-        ))));
-    };
+    let def = select_checked(&registered_derivations(), name)?;
     crate::counter_cache::recompute_view(conn, &def.sql_view(), None).await
 }
 
@@ -1758,6 +1766,33 @@ mod tests {
         } else {
             folded.expect("`\"ID\"` is its own quoted column on Postgres");
         }
+    }
+
+    /// `recompute` and `resweep` select their definition through the same
+    /// registry check boot runs, so a registry with a column collision is
+    /// refused before any sweep, and a clean one selects by name.
+    #[test]
+    fn a_repair_selects_its_definition_only_from_a_checked_registry() {
+        let first = DerivationDef {
+            name: "dv_posts.count_a",
+            ..count_def()
+        };
+        let second = DerivationDef {
+            name: "dv_posts.count_b",
+            ..count_def()
+        };
+        let message = select_checked(&[&first, &second], "dv_posts.count_a")
+            .expect_err("two derivations on one column are refused before the sweep")
+            .to_string();
+        assert!(message.contains("count twice"), "{message}");
+
+        let only = count_def();
+        let selected = select_checked(&[&only], only.name).expect("a clean registry selects");
+        assert_eq!(selected.name, only.name);
+        let missing = select_checked(&[&only], "dv_posts.nowhere")
+            .expect_err("an unknown name is refused")
+            .to_string();
+        assert!(missing.contains("not a derivation registered"), "{missing}");
     }
 
     #[cfg(feature = "sqlite")]

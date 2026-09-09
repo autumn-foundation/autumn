@@ -382,6 +382,9 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   primary key under the backend's identifier rules (`"ID"` on SQLite, where
   quoted identifiers fold case), so a boot fails rather than a mutation
   renumbering a parent.
+- **`recompute` and `resweep` run the same registry check as boot.** A
+  binary whose registry has a column collision is refused by them too, before
+  any sweep, rather than repairing a shared column from one side.
 - **A self-referential derivation cannot read the column it maintains.** Onto
   its own table, `sum(<the maintained column>)` or a filter naming it is a
   compile error: the parent-side update runs no repository hook, so a row's
