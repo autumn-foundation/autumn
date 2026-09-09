@@ -4,7 +4,10 @@
 //! repository-generated CRUD, `CsrfToken` for forms, Maud templates.
 
 use autumn_web::extract::Path;
+use autumn_web::form::ChangesetForm;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
+use autumn_web::reexports::http;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -85,59 +88,106 @@ pub async fn list(
 
 #[secured]
 #[get("/r/create")]
-pub async fn create_form(session: Session, csrf: CsrfToken) -> AutumnResult<Markup> {
+pub async fn create_form(
+    session: Session,
+    csrf: CsrfToken,
+    csrf_field: CsrfFormField,
+) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
+    let blank = ChangesetForm::blank(CreateSubredditForm::default(), csrf.token())
+        .with_csrf_field(csrf_field.0.clone());
     Ok(layout(
         "Create Community",
         current_user.as_deref(),
         Some(csrf.token()),
-        html! {
-            div class="max-w-lg mx-auto" {
-                h1 class="text-2xl font-bold mb-6" { "Create a Community" }
-                form action=(paths::create()) method="post"
-                     class="space-y-4 bg-white rounded-lg shadow p-6" {
-                    input type="hidden" name="_csrf" value=(csrf.token());
-                    div {
-                        label for="name" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Community Name"
-                        }
-                        div class="flex items-center" {
-                            span class="text-gray-400 mr-1" { "r/" }
-                            input type="text" id="name" name="name" required
-                                  minlength="2" maxlength="32"
-                                  placeholder="rustlang"
-                                  pattern="[a-zA-Z0-9_]+"
-                                  class="flex-1 border border-gray-300 rounded px-3 py-2 text-sm \
-                                         focus:outline-none focus:ring-2 focus:ring-orange-400";
-                        }
-                        p class="text-xs text-gray-400 mt-1" {
-                            "Letters, numbers, and underscores only"
-                        }
-                    }
-                    div {
-                        label for="description" class="block text-sm font-medium text-gray-700 mb-1" {
-                            "Description"
-                        }
-                        textarea id="description" name="description" rows="3"
-                                 placeholder="What is this community about?"
-                                 class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
-                                        focus:outline-none focus:ring-2 focus:ring-orange-400" {}
-                    }
-                    button type="submit"
-                           class="w-full bg-orange-500 text-white py-2 rounded font-medium \
-                                  hover:bg-orange-600 transition-colors" {
-                        "Create Community"
-                    }
-                }
-            }
-        },
+        create_form_markup(&blank),
     ))
 }
 
-#[derive(serde::Deserialize)]
+/// The create-community form's shape.
+///
+/// Mirrors `posts::SubmitPostForm`: this is a *form*, so both fields round-trip
+/// whatever the browser sent, and the content/length rules live in
+/// `validate_community_name` rather than the type.
+#[derive(serde::Deserialize, serde::Serialize, validator::Validate, Clone, Default)]
 pub struct CreateSubredditForm {
+    #[validate(custom(function = "validate_community_name"))]
     pub name: String,
+    #[serde(default)]
     pub description: String,
+}
+
+/// Render one field's validation messages, in the element its control points
+/// at with `aria-describedby`. Same shape as `posts::field_errors`.
+fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
+    let errors = form.errors_for(field);
+    html! {
+        div id=(format!("{field}-error")) {
+            @for message in errors {
+                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
+            }
+        }
+    }
+}
+
+/// The create-community form's markup — rendered by the GET route and
+/// re-rendered verbatim by the POST route when validation, or a duplicate
+/// name, rejects the submission. Mirrors `posts::submit_form_markup`'s
+/// changeset round-trip: the author's typed name and description come back in
+/// the fields alongside a message per field, instead of the framework's
+/// generic 422 page silently discarding the draft.
+///
+/// The name input stays hand-written rather than `autumn_web::a11y::TextField`
+/// so it can keep its `pattern` attribute, which that widget does not support.
+fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
+    let input_class = "flex-1 border border-gray-300 rounded px-3 py-2 text-sm \
+                       focus:outline-none focus:ring-2 focus:ring-orange-400";
+    let textarea_class = "w-full border border-gray-300 rounded px-3 py-2 text-sm \
+                          focus:outline-none focus:ring-2 focus:ring-orange-400";
+    let name_invalid = !form.errors_for("name").is_empty();
+
+    html! {
+        div class="max-w-lg mx-auto" {
+            h1 class="text-2xl font-bold mb-6" { "Create a Community" }
+            (form.form_tag(&paths::create(), "post", html! {
+                div {
+                    label for="name" class="block text-sm font-medium text-gray-700 mb-1" {
+                        "Community Name"
+                    }
+                    div class="flex items-center" {
+                        span class="text-gray-400 mr-1" { "r/" }
+                        input type="text" id="name" name="name" required
+                              minlength="2" maxlength="32"
+                              placeholder="rustlang"
+                              pattern="[a-zA-Z0-9_]+"
+                              value=(form.field_value("name").unwrap_or_default())
+                              aria-describedby="name-error"
+                              aria-invalid=[name_invalid.then(|| "true")]
+                              class=(input_class);
+                    }
+                    (field_errors("name", form))
+                    p class="text-xs text-gray-400 mt-1" {
+                        "Letters, numbers, and underscores only"
+                    }
+                }
+                div {
+                    label for="description" class="block text-sm font-medium text-gray-700 mb-1" {
+                        "Description"
+                    }
+                    textarea id="description" name="description" rows="3"
+                             placeholder="What is this community about?"
+                             class=(textarea_class) {
+                        (form.field_value("description").unwrap_or_default())
+                    }
+                }
+                button type="submit"
+                       class="w-full bg-orange-500 text-white py-2 rounded font-medium \
+                              hover:bg-orange-600 transition-colors" {
+                    "Create Community"
+                }
+            }))
+        }
+    }
 }
 
 /// The community-name rules, factored out of the handler so they can be
@@ -147,33 +197,47 @@ pub struct CreateSubredditForm {
 /// .is_empty()`: `slugify` never returns an empty string, so the check this
 /// replaces was unreachable and a community called `"***"` was created with a
 /// hash slug (the same bug as the post title, issue #2424).
-fn validate_community_name(name: &str) -> Result<(), AutumnError> {
+fn validate_community_name(name: &str) -> Result<(), validator::ValidationError> {
     // Characters, not bytes: `str::len()` counts UTF-8 bytes, so it told an
     // 11-character Japanese name it was over 32 "characters" and let a
     // 1-character one past a rule that exists to require 2. The post title's
     // `length(min = 1, max = 300)` already counts characters, so this also
     // makes the app's two length rules mean the same thing.
-    let length = name.chars().count();
+    let length = name.trim().chars().count();
     if !(2..=32).contains(&length) {
-        return Err(AutumnError::unprocessable_msg(
-            "Community name must be 2-32 characters",
-        ));
+        return Err(validator::ValidationError::new("name")
+            .with_message("Community name must be 2-32 characters".into()));
     }
     if !contains_letter_or_number(name) {
-        return Err(AutumnError::unprocessable_msg(
-            "Community name must contain at least one letter or number",
-        ));
+        return Err(validator::ValidationError::new("name")
+            .with_message("Community name must contain at least one letter or number".into()));
     }
     Ok(())
 }
 
+/// Create a community.
+///
+/// The changeset round-trip, same shape as `posts::submit`: `into_valid()`
+/// either hands back the validated form or the form itself, still carrying the
+/// author's name and description alongside the field error. The failure arm
+/// re-renders `create_form_markup` with a 422 — which is exactly what the old
+/// `AutumnError::unprocessable_msg("Community name must be 2-32 characters")`
+/// did NOT do: it sent the framework's generic error page instead, discarding
+/// both fields and requiring the author to retype everything.
+///
+/// The duplicate-name check happens after validation, once the database has
+/// been asked, so it re-renders the same way: a field error on `name`, with
+/// the description preserved, rather than the generic page.
 #[secured]
 #[post("/r/create")]
 pub async fn create(
     session: Session,
+    csrf_field: CsrfFormField,
     repo: PgSubredditRepository,
-    form: Form<CreateSubredditForm>,
-) -> AutumnResult<Redirect> {
+    // The body extractor is last, because it consumes the request body. See
+    // docs/guide/extractors.md.
+    form: ChangesetForm<CreateSubredditForm>,
+) -> AutumnResult<Response> {
     let user_id: i64 = session
         .get("user_id")
         .await
@@ -181,14 +245,33 @@ pub async fn create(
         .parse()
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
-    let name = form.0.name.trim().to_string();
-    validate_community_name(&name)?;
+    let csrf_token = form.csrf_token().map(str::to_owned).unwrap_or_default();
+
+    let valid = match form.into_valid() {
+        Ok(valid) => valid,
+        Err(rejected) => {
+            let current_user = session.get("username").await;
+            return Ok((
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+                layout(
+                    "Create Community",
+                    current_user.as_deref(),
+                    Some(csrf_token.as_str()),
+                    create_form_markup(&rejected),
+                ),
+            )
+                .into_response());
+        }
+    };
+
+    let name = valid.name.trim().to_string();
+    let description = valid.description.trim().to_string();
     let slug = slugify(&name);
 
     let new_sub = NewSubreddit {
         name: name.clone(),
         slug: slug.clone(),
-        description: form.0.description.trim().to_string(),
+        description: description.clone(),
         creator_id: user_id,
     };
 
@@ -199,15 +282,30 @@ pub async fn create(
     // a unique-violation, and both land on the same community.
     let (subreddit, created) = repo.find_or_create_by_slug(slug.clone(), &new_sub).await?;
     if !created {
-        // The slug is already owned by an existing community; preserve the prior
-        // UX of rejecting the duplicate rather than redirecting into someone
-        // else's community as if the create had succeeded.
-        return Err(AutumnError::unprocessable_msg(
-            "Community name already taken",
-        ));
+        // The slug is already owned by an existing community; preserve the
+        // prior UX of rejecting the duplicate rather than redirecting into
+        // someone else's community as if the create had succeeded — now an
+        // inline field error with the draft intact, not the generic 422 page.
+        let current_user = session.get("username").await;
+        let mut rejected =
+            ChangesetForm::blank(CreateSubredditForm { name, description }, &csrf_token)
+                .with_csrf_field(csrf_field.0.clone());
+        rejected
+            .changeset
+            .add_error("name", "Community name already taken");
+        return Ok((
+            http::StatusCode::UNPROCESSABLE_ENTITY,
+            layout(
+                "Create Community",
+                current_user.as_deref(),
+                Some(csrf_token.as_str()),
+                create_form_markup(&rejected),
+            ),
+        )
+            .into_response());
     }
 
-    Ok(Redirect::to(&paths::show(&subreddit.slug)))
+    Ok(Redirect::to(&paths::show(&subreddit.slug)).into_response())
 }
 
 // ── Show subreddit with posts ──────────────────────────────────
@@ -500,9 +598,10 @@ mod tests {
             let Err(error) = validate_community_name(name) else {
                 panic!("{name:?} must be rejected")
             };
-            assert!(
-                error.to_string().contains("at least one letter or number"),
-                "{name:?} must explain itself; got: {error}"
+            assert_eq!(
+                error.message.as_deref(),
+                Some("Community name must contain at least one letter or number"),
+                "{name:?} must explain itself"
             );
         }
     }
@@ -528,24 +627,84 @@ mod tests {
             let Err(error) = validate_community_name(name) else {
                 panic!("{name:?} is too short")
             };
-            assert!(
-                error.to_string().contains("2-32 characters"),
-                "got: {error}"
+            assert_eq!(
+                error.message.as_deref(),
+                Some("Community name must be 2-32 characters")
             );
         }
         let long = "r".repeat(33);
         let Err(error) = validate_community_name(&long) else {
             panic!("a 33-character name is too long")
         };
-        assert!(
-            error.to_string().contains("2-32 characters"),
-            "got: {error}"
+        assert_eq!(
+            error.message.as_deref(),
+            Some("Community name must be 2-32 characters")
         );
 
         // 11 characters, 33 bytes: a byte-counting rule called this too long.
         assert!(
             validate_community_name(&"日".repeat(11)).is_ok(),
             "an 11-character name is within a 32-character limit"
+        );
+    }
+
+    // ── The changeset round-trip (error-path inventory) ────────────
+
+    /// `ChangesetForm::without_csrf` wraps data in a fresh, error-free
+    /// changeset — going through `into_changeset` is what actually runs
+    /// `validate_community_name`. Same rule as `posts::validated` (#2424).
+    fn validated(form: CreateSubredditForm) -> ChangesetForm<CreateSubredditForm> {
+        ChangesetForm::from_changeset(form.into_changeset())
+    }
+
+    #[test]
+    fn a_rejected_submission_keeps_the_authors_input_and_wires_its_error() {
+        let rejected = validated(CreateSubredditForm {
+            name: "**".to_owned(),
+            description: "kept".to_owned(),
+        });
+        let rendered = create_form_markup(&rejected).into_string();
+
+        assert!(
+            rendered.contains("kept"),
+            "the description the author typed must come back; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#"aria-invalid="true""#)
+                && rendered.contains(r#"aria-describedby="name-error""#),
+            "the invalid name field must be wired to its message; rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("at least one letter or number"),
+            "the message must render next to the field; rendered: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_name_keeps_the_authors_input_and_wires_its_error() {
+        // Mirrors what `create` builds after `find_or_create_by_slug` reports
+        // the slug was already taken: a field error added to an otherwise
+        // valid changeset, not a fresh validation failure.
+        let mut rejected = ChangesetForm::blank(
+            CreateSubredditForm {
+                name: "rust".to_owned(),
+                description: "kept".to_owned(),
+            },
+            "tok-123",
+        );
+        rejected
+            .changeset
+            .add_error("name", "Community name already taken");
+        let rendered = create_form_markup(&rejected).into_string();
+
+        assert!(
+            rendered.contains("kept"),
+            "the description the author typed must come back; rendered: {rendered}"
+        );
+        assert!(rendered.contains("Community name already taken"));
+        assert!(
+            rendered.contains("tok-123"),
+            "the CSRF token must survive the round trip so the retry can submit"
         );
     }
 }
