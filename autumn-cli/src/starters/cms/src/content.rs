@@ -469,13 +469,36 @@ pub async fn set_post_terms(
             .load(conn)
             .await?;
 
+        let mut wanted = term_ids.clone();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        // Both sides of the change need recounting, so the union is computed
+        // before the join rows move.
+        let mut affected = previous;
+        affected.extend(wanted.iter().copied());
+        affected.sort_unstable();
+        affected.dedup();
+
+        // Locked *before* the writes below, not after. Inserting a `post_terms`
+        // row makes PostgreSQL take a `FOR KEY SHARE` lock on the referenced
+        // term to enforce the foreign key, and `recount_term` then asks the
+        // same row for `FOR UPDATE`. Two editors filing different posts under
+        // the same term therefore both hold a key-share lock and both try to
+        // upgrade it: neither can, and PostgreSQL breaks the cycle by aborting
+        // one editor's save as a deadlock. Taking the stronger lock first means
+        // there is never an upgrade to deadlock over — the second editor simply
+        // waits for the first.
+        //
+        // Ascending id order, and every fan-out over terms uses the same order,
+        // so two transactions touching overlapping sets can never hold the
+        // halves of each other's cycle.
+        lock_terms(conn, &affected).await?;
+
         diesel::delete(post_terms::table.filter(post_terms::post_id.eq(post_id)))
             .execute(conn)
             .await?;
 
-        let mut wanted = term_ids.clone();
-        wanted.sort_unstable();
-        wanted.dedup();
         if !wanted.is_empty() {
             let rows: Vec<_> = wanted
                 .iter()
@@ -494,16 +517,34 @@ pub async fn set_post_terms(
                 .await?;
         }
 
-        let mut affected = previous;
-        affected.extend(wanted);
-        affected.sort_unstable();
-        affected.dedup();
-        for term_id in affected {
-            recount_term(conn, term_id).await?;
-        }
+        recount_terms(conn, &affected).await?;
         Ok::<_, AutumnError>(())
     })
     .await
+}
+
+/// Take `FOR UPDATE` on the given term rows, in ascending id order.
+///
+/// Called before any write that will need to recount them — see
+/// [`set_post_terms`] for why the order and the timing both matter. The ids are
+/// sorted here rather than trusted from the caller, because a caller that
+/// forgets is exactly the bug this prevents.
+async fn lock_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
+    let mut ordered = term_ids.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    for term_id in ordered {
+        // A term deleted underneath us has no row to lock and nothing to
+        // recount; `recount_term` reaches the same conclusion.
+        let _locked: Option<i64> = terms::table
+            .find(term_id)
+            .select(terms::id)
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?;
+    }
+    Ok(())
 }
 
 /// Rebuild the counts of every term a post is filed under.
@@ -565,10 +606,7 @@ async fn recount_terms_for_post(conn: &mut AsyncPgConnection, post_id: i64) -> A
         .select(post_terms::term_id)
         .load(conn)
         .await?;
-    for term_id in term_ids {
-        recount_term(conn, term_id).await?;
-    }
-    Ok(())
+    recount_terms(conn, &term_ids).await
 }
 
 /// The ids of the terms a post is filed under, within one taxonomy.
@@ -996,9 +1034,18 @@ pub async fn revisions_for(
 }
 
 /// Rebuild the published-post counts of the given terms.
+///
+/// The single fan-out: every path that recounts more than one term goes through
+/// here, so the `FOR UPDATE` each `recount_term` takes is always acquired in
+/// ascending id order. Four separate loops in id-of-arrival order is four
+/// chances for two transactions with overlapping term sets to hold the halves
+/// of each other's cycle and deadlock.
 pub async fn recount_terms(conn: &mut AsyncPgConnection, term_ids: &[i64]) -> AutumnResult<()> {
-    for term_id in term_ids {
-        recount_term(conn, *term_id).await?;
+    let mut ordered = term_ids.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    for term_id in ordered {
+        recount_term(conn, term_id).await?;
     }
     Ok(())
 }
@@ -1388,9 +1435,7 @@ pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> Autumn
                 diesel::delete(users::table.find(target_id))
                     .execute(conn)
                     .await?;
-                for term_id in affected_terms {
-                    recount_term(conn, term_id).await?;
-                }
+                recount_terms(conn, &affected_terms).await?;
                 Ok(())
             }
             .scope_boxed()

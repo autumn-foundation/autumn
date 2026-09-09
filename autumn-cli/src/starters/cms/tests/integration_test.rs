@@ -9959,6 +9959,139 @@ async fn seeding_skips_a_slug_the_other_bare_type_already_holds() {
     assert_eq!(taken, 1, "the seed must not duplicate a taken bare path");
 }
 
+/// Filing a post under a term takes the term's lock before writing the join
+/// rows, not after.
+///
+/// Inserting a `post_terms` row makes PostgreSQL take `FOR KEY SHARE` on the
+/// referenced term to enforce the foreign key, and `recount_term` then asks the
+/// same row for `FOR UPDATE`. Two editors filing different posts under one term
+/// both hold a key-share lock and both try to upgrade: PostgreSQL breaks the
+/// cycle by aborting one editor's save as a deadlock.
+///
+/// The race itself is timing-dependent, so this asserts the property that makes
+/// it impossible instead: while the save is blocked on the term, it must hold
+/// no lock on `post_terms` — i.e. it stopped at the term before writing
+/// anything. That is observable from a third connection, and it is exactly the
+/// ordering a deadlock needs violated.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_term_is_locked_before_its_relationships_are_written() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Filed", "Body.", "publish").await;
+
+    client
+        .post("/admin/terms/category")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Contended"), ("slug", "contended")]))
+        .send()
+        .await
+        .assert_status(303);
+    let term_id: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::terms::table
+            .filter({{crate_name}}::schema::terms::slug.eq("contended"))
+            .select({{crate_name}}::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the term")
+    };
+
+    // A held `FOR UPDATE` on the term, from a session that keeps its
+    // transaction open. Anything the save does to that term now blocks.
+    let mut holder = TestDb::shared().await.pool().get().await.expect("conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    diesel::sql_query(format!(
+        "SELECT id FROM terms WHERE id = {term_id} FOR UPDATE"
+    ))
+    .execute(&mut holder)
+    .await
+    .expect("hold the term");
+
+    let save = tokio::spawn(async move {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::content::set_post_terms(&mut conn, post_id, vec![term_id]).await
+    });
+
+    // Wait for the save to be blocked on a lock rather than merely slow.
+    let mut blocked_pid: Option<i32> = None;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut probe = TestDb::shared().await.pool().get().await.expect("conn");
+        #[derive(diesel::QueryableByName)]
+        struct Pid {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            pid: i32,
+        }
+        // A row-level wait shows up as an ungranted lock on the *transaction*
+        // holding the row, not on the relation — filtering to relation locks
+        // finds nothing however long you poll.
+        let waiting: Vec<Pid> = diesel::sql_query(
+            "SELECT pid FROM pg_locks WHERE NOT granted AND pid <> pg_backend_pid()",
+        )
+        .load(&mut probe)
+        .await
+        .expect("pg_locks");
+        if let Some(found) = waiting.into_iter().next() {
+            blocked_pid = Some(found.pid);
+            break;
+        }
+    }
+    let blocked_pid = blocked_pid.expect("the save must block on the held term lock");
+
+    // The discriminating question: has the blocked transaction already written
+    // to `post_terms`? A write there takes a `RowExclusiveLock` on the table,
+    // which is granted and visible for as long as the transaction lives.
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let held: i64 = {
+        let mut probe = TestDb::shared().await.pool().get().await.expect("conn");
+        let rows: Vec<Count> = diesel::sql_query(format!(
+            "SELECT count(*) AS n
+             FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+             WHERE l.pid = {blocked_pid} AND l.granted
+               AND c.relname = 'post_terms' AND l.mode = 'RowExclusiveLock'"
+        ))
+        .load(&mut probe)
+        .await
+        .expect("pg_locks");
+        rows.into_iter().next().map_or(0, |row| row.n)
+    };
+    assert_eq!(
+        held, 0,
+        "the save must take the term's lock before writing any post_terms row; \
+         holding one while waiting to upgrade is the deadlock"
+    );
+
+    // Releasing the holder lets the save finish, and it finishes correctly.
+    diesel::sql_query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("commit");
+    save.await.expect("the task").expect("the save succeeds");
+
+    let filed: i64 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        {{crate_name}}::schema::post_terms::table
+            .filter({{crate_name}}::schema::post_terms::post_id.eq(post_id))
+            .filter({{crate_name}}::schema::post_terms::term_id.eq(term_id))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(filed, 1, "the post is filed under the term");
+}
+
 /// A comment URL survives the one permalink structure that is already a query.
 ///
 /// `Plain` renders `/?p=123`, so appending `?comments=2` produced
