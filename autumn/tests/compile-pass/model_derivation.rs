@@ -64,7 +64,7 @@ diesel::table! {
     reactions (id) {
         id -> BigInt,
         article_id -> BigInt,
-        tenant_id -> BigInt,
+        org_id -> BigInt,
         weight -> BigInt,
     }
 }
@@ -153,7 +153,7 @@ pub struct Membership {
 }
 
 #[model]
-#[derivation(Post, column = "reaction_count", fk = article_id, tenant = "tenant_id")]
+#[derivation(Post, column = "reaction_count", fk = article_id, tenant = "org_id")]
 #[derivation(
     Post,
     column = "origin_weight",
@@ -165,7 +165,7 @@ pub struct Reaction {
     #[id]
     pub id: i64,
     pub article_id: i64,
-    pub tenant_id: i64,
+    pub org_id: i64,
     pub weight: i64,
 }
 
@@ -256,9 +256,14 @@ fn main() {
     assert_eq!((draft.contrib_of)(&counted), 0);
     assert_eq!((draft.contrib_of)(&skipped), 1);
 
-    // String equality: the literal is single-quoted in SQL.
+    // String equality: the literal is single-quoted, the column is cast to
+    // `TEXT` and the comparison carries the bytewise-collation placeholder, so
+    // a `citext` or `NOCASE` column cannot make SQL disagree with Rust.
     let featured = &specs[3];
-    assert_eq!(featured.filter_sql, " AND ({c}.\"status\" = 'featured')");
+    assert_eq!(
+        featured.filter_sql,
+        " AND (CAST({c}.\"status\" AS TEXT) = 'featured' {bin})"
+    );
     assert_eq!((featured.contrib_of)(&counted), 1);
     assert_eq!((featured.contrib_of)(&skipped), 0);
 
@@ -308,7 +313,7 @@ fn main() {
     let reaction = Reaction {
         id: 1,
         article_id: 9,
-        tenant_id: 3,
+        org_id: 3,
         weight: 4,
     };
     let specs = Reaction::counter_caches();
@@ -318,12 +323,12 @@ fn main() {
     // have picked, and the tenant column reaches the spec and the definition.
     let reactions = &specs[0];
     assert_eq!(reactions.fk_column, "article_id");
-    assert_eq!(reactions.tenant_column, Some("tenant_id"));
+    assert_eq!(reactions.tenant_column, Some("org_id"));
     assert_eq!(reactions.contrib_sql, "1");
     assert_eq!((reactions.contrib_of)(&reaction), 1);
     let def = reactions.derivation.expect("registered definition");
     assert_eq!(def.name, "posts.reaction_count");
-    assert_eq!(def.tenant_column, Some("tenant_id"));
+    assert_eq!(def.tenant_column, Some("org_id"));
 
     // An `i64` sum contributes the field itself, with no widening.
     let origins = &specs[1];
