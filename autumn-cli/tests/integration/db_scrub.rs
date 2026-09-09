@@ -2477,7 +2477,7 @@ async fn a_view_read_through_an_untracked_function_is_refused() {
     opaque
         .batch_execute(
             "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
-             CREATE FUNCTION bridge_fn() RETURNS TABLE(id int, email text) \
+             CREATE FUNCTION bridge_fn() RETURNS TABLE(id bigint, email text) \
                  AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
              CREATE MATERIALIZED VIEW a_report AS SELECT * FROM bridge_fn();",
         )
@@ -2509,7 +2509,7 @@ async fn a_view_read_through_an_untracked_function_is_refused() {
     indirect
         .batch_execute(
             "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
-             CREATE FUNCTION bridge_fn() RETURNS TABLE(id int, email text) \
+             CREATE FUNCTION bridge_fn() RETURNS TABLE(id bigint, email text) \
                  AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
              CREATE VIEW bridge_view AS SELECT * FROM bridge_fn(); \
              CREATE MATERIALIZED VIEW a_report AS SELECT * FROM bridge_view;",
@@ -2537,9 +2537,9 @@ async fn a_view_read_through_an_untracked_function_is_refused() {
     nested
         .batch_execute(
             "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
-             CREATE FUNCTION opaque_inner() RETURNS TABLE(id int, email text) \
+             CREATE FUNCTION opaque_inner() RETURNS TABLE(id bigint, email text) \
                  AS $$ SELECT id, email FROM z_source $$ LANGUAGE sql; \
-             CREATE FUNCTION outer_fn() RETURNS TABLE(id int, email text) LANGUAGE sql \
+             CREATE FUNCTION outer_fn() RETURNS TABLE(id bigint, email text) LANGUAGE sql \
                  BEGIN ATOMIC SELECT f.id, f.email FROM opaque_inner() f \
                      WHERE EXISTS (SELECT 1 FROM countries); END; \
              CREATE MATERIALIZED VIEW a_report AS SELECT * FROM outer_fn();",
@@ -2590,9 +2590,9 @@ async fn a_view_read_through_a_tracked_function_is_refreshed_in_order() {
     atomic
         .batch_execute(
             "CREATE MATERIALIZED VIEW z_source AS SELECT id, email FROM users; \
-             CREATE FUNCTION atomic_fn() RETURNS TABLE(id int, email text) LANGUAGE sql \
+             CREATE FUNCTION atomic_fn() RETURNS TABLE(id bigint, email text) LANGUAGE sql \
                  BEGIN ATOMIC SELECT id, email FROM z_source; END; \
-             CREATE FUNCTION atomic_outer() RETURNS TABLE(id int, email text) LANGUAGE sql \
+             CREATE FUNCTION atomic_outer() RETURNS TABLE(id bigint, email text) LANGUAGE sql \
                  BEGIN ATOMIC SELECT id, email FROM atomic_fn(); END; \
              CREATE MATERIALIZED VIEW a_report AS SELECT * FROM atomic_outer();",
         )
