@@ -290,23 +290,46 @@ pub async fn create_post(
         .await?;
 
     let deferred_transition_fired = deferred_transition.is_some();
+    // Unwound on failure, like the admin editor and the importer. The insert is
+    // its own transaction — `save_post_with_unique_slug` retries on its own
+    // connection — so a deferred transition that fails afterwards would return
+    // an error over an already-committed draft the caller never asked for, and
+    // each retry would consume another suffixed slug. Third path with this
+    // shape; the API was the one left.
     let created = match deferred_transition {
         Some(target) => {
-            repos
+            let transitioned = repos
                 .with_conn(async |conn| {
-                    crate::content::transition_status(conn, created.id, &target, Some(user.id))
-                        .await
+                    crate::content::transition_status(
+                        conn,
+                        created.id,
+                        &target,
+                        Some(user.id),
+                        Some(&user),
+                    )
+                    .await
                 })
-                .await?
+                .await;
+            match transitioned {
+                Ok(post) => post,
+                Err(error) => {
+                    if let Err(cleanup) = repos.posts.delete_by_id(created.id).await {
+                        autumn_web::reexports::tracing::warn!(
+                            %cleanup,
+                            post_id = created.id,
+                            "failed to remove a post whose API creation could not be completed"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
         }
         None => created,
     };
 
-    // The same actions the admin editor and the scheduler fire. Without them a
-    // plugin listening for content changes — a search index, a cache purge, a
-    // webhook — silently missed everything created through the API, which is a
-    // supported way to create content and therefore has to be a supported way
-    // to observe it.
+    // The same actions the admin, import and scheduler paths fire, and only
+    // once the post is actually complete — a listener that reads it back must
+    // not see a state that is about to be unwound.
     do_action(Action::PostSaved, created.id);
     if deferred_transition_fired {
         do_action(Action::PostTransitioned, created.id);

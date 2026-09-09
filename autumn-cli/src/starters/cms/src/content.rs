@@ -154,6 +154,7 @@ pub async fn transition_status(
     post_id: i64,
     target: &str,
     editor_id: Option<i64>,
+    actor: Option<&crate::models::User>,
 ) -> AutumnResult<Post> {
     let target = target.to_owned();
     conn.transaction(async move |conn| {
@@ -164,6 +165,47 @@ pub async fn transition_status(
             .first(conn)
             .await
             .map_err(AutumnError::not_found)?;
+
+        // Authorization is re-checked against the row *as locked*, not against
+        // the status the handler read a moment earlier. A Contributor whose
+        // draft an Editor publishes in between would otherwise still be
+        // authorized by the stale `draft` — and go on to trash content they no
+        // longer have the capability to touch.
+        //
+        // `None` is a path with no acting user: the scheduler and the seeder,
+        // whose authority is the process's rather than a session's.
+        if let Some(actor) = actor {
+            let permitted = if target == "trash" {
+                crate::capabilities::can_delete_post(
+                    actor.role(),
+                    actor.id,
+                    post.author_id,
+                    &post.status,
+                )
+            } else if matches!(target.as_str(), "publish" | "private" | "future") {
+                actor
+                    .role()
+                    .can(crate::capabilities::Capability::PublishPosts)
+                    && crate::capabilities::can_edit_post(
+                        actor.role(),
+                        actor.id,
+                        post.author_id,
+                        &post.status,
+                    )
+            } else {
+                crate::capabilities::can_edit_post(
+                    actor.role(),
+                    actor.id,
+                    post.author_id,
+                    &post.status,
+                )
+            };
+            if !permitted {
+                return Err(AutumnError::forbidden_msg(
+                    "You do not have permission to change this content's status",
+                ));
+            }
+        }
 
         // The macro-generated enforcing transition: an undeclared edge or a
         // failed guard is a 400 and nothing is written.
@@ -611,6 +653,29 @@ pub async fn create_comment(
     new: crate::models::NewComment,
 ) -> AutumnResult<Comment> {
     conn.transaction(async move |conn| {
+        // The post is locked and re-read before anything is inserted. The
+        // handler's eligibility check runs on a released connection, so an
+        // editor closing comments, unpublishing or trashing the post in between
+        // would otherwise have a signed-in submission land *approved* on
+        // content that no longer accepts comments — and become publicly visible
+        // the moment the post is restored.
+        let post: Post = posts::table
+            .find(new.post_id)
+            .select(Post::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .map_err(AutumnError::not_found)?;
+        if !post.is_public()
+            || !is_public_type(&post.post_type)
+            || !type_supports_comments(&post.post_type)
+            || post.comment_status != "open"
+        {
+            return Err(AutumnError::forbidden_msg(
+                "Comments are closed on this post",
+            ));
+        }
+
         // A reply's parent has to still be approved, checked under a lock so a
         // concurrent moderation cannot slip between the check and the insert.
         //

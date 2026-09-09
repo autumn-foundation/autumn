@@ -5397,3 +5397,152 @@ async fn the_moderation_queue_paginates() {
         "the queue names the post being discussed"
     );
 }
+
+/// An imported attachment cannot smuggle an inline-rendered media type.
+///
+/// The upload path enforces `ALLOWED_MIME`; an import did not, so a tampered
+/// export could label bytes already in the store `text/html` and `/media/{slug}`
+/// would serve them inline — stored script execution on the site's own origin.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_import_cannot_introduce_an_inline_html_attachment() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Tampered",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "posts": [],
+        "attachments": [{
+            "slug": "payload", "title": "Payload", "mime_type": "text/html",
+            "byte_size": 10, "width": null, "height": null,
+            "alt_text": "", "caption": "",
+            "file": {"provider_id": "default", "key": "media/payload",
+                     "content_type": "text/html", "byte_size": 10}
+        }]
+    })
+    .to_string();
+
+    let refused = client
+        .post("/admin/tools/import")
+        .header("cookie", &cookie)
+        .form(&form(&[("payload", payload.as_str())]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "an unsupported media type must stop the restore: {}",
+        refused.text()
+    );
+
+    // And the serving policy is allowlist-shaped, so a row written by any other
+    // route is still not rendered inline.
+    assert!(!{{crate_name}}::routes::admin::media::may_render_inline("text/html"));
+    assert!(!{{crate_name}}::routes::admin::media::may_render_inline(
+        "image/svg+xml"
+    ));
+    assert!({{crate_name}}::routes::admin::media::may_render_inline("image/png"));
+}
+
+/// A transition is authorized against the row as it is, not as it was read.
+///
+/// A Contributor may edit their own draft but not a published post. If an
+/// Editor publishes it between the handler's check and the write, the stale
+/// `draft` kept the request authorized — so the Contributor could trash content
+/// they no longer had the capability to touch.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_transition_is_authorized_against_the_locked_row() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+
+    sign_out(&client);
+    let contributor = register(&client, "contributor").await;
+    client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "contributor"),
+            ("email", "contributor@example.com"),
+            ("display_name", "Contributor"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The Contributor's own draft.
+    let id = create_post(&client, &contributor, "Their Draft", "Body.", "draft").await;
+
+    // The owner publishes it — the Contributor no longer has any capability
+    // over it.
+    client
+        .post(&format!("/admin/content/post/{id}/status?to=publish"))
+        .header("cookie", &owner)
+        .send()
+        .await
+        .assert_status(303);
+
+    // Trashing is refused, and would have been refused even if the handler's
+    // pre-check had been made on a stale read.
+    let refused = client
+        .post(&format!("/admin/content/post/{id}/status?to=trash"))
+        .header("cookie", &contributor)
+        .send()
+        .await;
+    assert_eq!(refused.status, 403, "body: {}", refused.text());
+
+    sign_out(&client);
+    client
+        .get("/their-draft")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Body.");
+}
+
+/// A comment cannot land on a post whose comments were just closed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_comment_rechecks_the_post_under_its_lock() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Closing", "Body.", "publish").await;
+
+    // Close comments behind the handler's back, the way a concurrent edit
+    // would — then the insert must refuse regardless of what a caller checked.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET comment_status = 'closed' WHERE id = {post_id}"),
+    )
+    .await
+    .expect("close comments");
+
+    let refused = {{crate_name}}::content::create_comment(
+        &mut TestDb::shared().await.pool().get().await.expect("conn"),
+        {{crate_name}}::models::NewComment {
+            post_id,
+            parent_id: None,
+            author_id: None,
+            author_name: "Guest".to_owned(),
+            author_email: "guest@example.com".to_owned(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: "Late comment".to_owned(),
+            status: "approved".to_owned(),
+        },
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "the insert must re-read the post rather than trusting the caller"
+    );
+
+    let page = client.get("/closing").send().await;
+    page.assert_ok();
+    assert!(!page.text().contains("Late comment"));
+}

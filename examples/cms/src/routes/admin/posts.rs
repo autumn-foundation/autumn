@@ -927,7 +927,14 @@ pub async fn create(
         if status == "future" || status == "private" {
             repos
                 .with_conn(async |conn| {
-                    content::transition_status(conn, created.id, &status, Some(user.id)).await
+                    content::transition_status(
+                        conn,
+                        created.id,
+                        &status,
+                        Some(user.id),
+                        Some(&user),
+                    )
+                    .await
                 })
                 .await?;
             return Ok::<_, AutumnError>(true);
@@ -1120,7 +1127,8 @@ pub async fn update(
                 // than persisted, and now it is refused before anything commits.
                 let transitioned = status != updated.status;
                 if transitioned {
-                    content::transition_status(conn, id, &status, Some(user.id)).await?;
+                    content::transition_status(conn, id, &status, Some(user.id), Some(&user))
+                        .await?;
                 }
                 Ok::<_, AutumnError>((updated, transitioned))
             })
@@ -1358,7 +1366,7 @@ pub async fn transition(
 
     repos
         .with_conn(async |conn| {
-            content::transition_status(conn, id, &query.to, Some(user.id)).await
+            content::transition_status(conn, id, &query.to, Some(user.id), Some(&user)).await
         })
         .await?;
     do_action(Action::PostTransitioned, id);

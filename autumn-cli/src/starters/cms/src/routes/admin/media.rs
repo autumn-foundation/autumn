@@ -46,6 +46,32 @@ const ALLOWED_MIME: &[&str] = &[
 // inline (see `serve` below), which is what stops it executing on this origin.
 const NEVER_INLINE: &[&str] = &["image/svg+xml", "text/plain", "text/csv"];
 
+/// Whether an attachment row may claim this type at all.
+///
+/// The same allowlist the upload path enforces, exposed so the importer can
+/// apply it to rows arriving from a file rather than from a browser.
+#[must_use]
+pub fn is_allowed_mime(mime_type: &str) -> bool {
+    ALLOWED_MIME.contains(&mime_type)
+}
+
+/// Whether `/media/{slug}` may serve this type inline.
+///
+/// Allowlist-shaped rather than denylist-shaped, deliberately. The upload path
+/// enforces `ALLOWED_MIME`, but an attachment row can arrive by other routes —
+/// an import of a tampered export, a hand-written `INSERT` — and a row claiming
+/// `text/html` was previously served inline, because `NEVER_INLINE` named only
+/// SVG and a couple of text types. That is stored script execution on the
+/// site's own origin, from bytes an administrator was told they were merely
+/// restoring.
+///
+/// Deciding it here rather than only at the door means every row is covered
+/// whatever created it, and an unrecognised type downloads instead of running.
+#[must_use]
+pub fn may_render_inline(mime_type: &str) -> bool {
+    ALLOWED_MIME.contains(&mime_type) && !NEVER_INLINE.contains(&mime_type)
+}
+
 #[get("/admin/media")]
 pub async fn list(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::UploadFiles);
@@ -305,7 +331,7 @@ pub async fn serve(
         .await?
         .content_type(attachment.mime_type.clone())
         .filename(attachment.title.clone());
-    if !NEVER_INLINE.contains(&attachment.mime_type.as_str()) {
+    if may_render_inline(&attachment.mime_type) {
         download = download.inline();
     }
     Ok(download.into_response())

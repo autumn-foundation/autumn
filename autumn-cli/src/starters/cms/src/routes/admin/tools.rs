@@ -493,6 +493,19 @@ pub async fn import(
     // image, because nothing in the database could point at it.
     let mut media_ids: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for attachment in &payload.attachments {
+        // The same media policy the upload path applies. An export is a file,
+        // and a tampered one can label bytes already in the store as
+        // `text/html`. Serving is defended separately (`may_render_inline`
+        // refuses to inline anything off the allowlist), but a restore should
+        // also *say* it found something it will not accept rather than quietly
+        // storing a row nobody can use.
+        if !crate::routes::admin::media::is_allowed_mime(&attachment.mime_type) {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "`{}` claims the unsupported media type {:?}; this export cannot be \
+                 restored as it stands",
+                attachment.slug, attachment.mime_type
+            )));
+        }
         let existing = repos
             .attachments
             .find_by_slug(attachment.slug.clone())
@@ -589,6 +602,7 @@ pub async fn import(
                                 ours_id,
                                 &wanted_status,
                                 Some(user.id),
+                                None,
                             )
                             .await?;
                             return Ok::<_, AutumnError>(true);
@@ -701,8 +715,14 @@ pub async fn import(
                     content::record_import_source(conn, created.id, &source_slug).await?;
                     content::set_post_terms(conn, created.id, term_ids).await?;
                     if wanted_status != "draft" {
-                        content::transition_status(conn, created.id, &wanted_status, Some(user.id))
-                            .await?;
+                        content::transition_status(
+                            conn,
+                            created.id,
+                            &wanted_status,
+                            Some(user.id),
+                            None,
+                        )
+                        .await?;
                         return Ok::<_, AutumnError>(true);
                     }
                     Ok::<_, AutumnError>(false)
