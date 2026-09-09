@@ -23,31 +23,12 @@ use crate::require_capability;
 use super::super::site::{Csrf, Repos};
 use super::layout;
 
-/// A scheduled post needs a date that is actually in the future.
+/// Re-exported so the three call sites below read as they did.
 ///
-/// "Has a date" was not enough on the update path: a published post moved back
-/// to draft keeps its original `published_at`, the editor pre-fills that past
-/// timestamp, and choosing "Scheduled" without touching the field produced a
-/// row that was already due — the next sweep republished it within the minute
-/// instead of scheduling it. Nothing about that reads as scheduling to the
-/// person who did it.
-fn require_future_publish_date(
-    status: &str,
-    scheduled_for: Option<chrono::NaiveDateTime>,
-) -> AutumnResult<()> {
-    if status != "future" {
-        return Ok(());
-    }
-    match scheduled_for {
-        Some(when) if when > chrono::Utc::now().naive_utc() => Ok(()),
-        Some(_) => Err(AutumnError::unprocessable_msg(
-            "A scheduled post needs a publish date in the future",
-        )),
-        None => Err(AutumnError::unprocessable_msg(
-            "Pick a publish date for a scheduled post",
-        )),
-    }
-}
+/// The definition moved to `content` when `transition_status` started applying
+/// it to the locked row: the check that matters is the one inside the
+/// transaction, and two copies of a rule like this is how they drift.
+use content::require_future_publish_date;
 
 /// The statuses the editor's dropdown offers, in workflow order.
 const STATUS_CHOICES: &[(&str, &str)] = &[

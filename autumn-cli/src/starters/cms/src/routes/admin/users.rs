@@ -7,12 +7,22 @@ use autumn_web::reexports::axum::response::Response;
 use serde::Deserialize;
 
 use crate::capabilities::{Capability, Role};
+use crate::content;
 use crate::models::NewUser;
 use crate::repositories::UserRepository as _;
 use crate::require_capability;
 
 use super::super::site::{Csrf, Repos};
 use super::{layout, role_options};
+
+/// How many accounts one page of the users screen shows.
+const USERS_PER_PAGE: i64 = 50;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UsersFilter {
+    #[serde(default)]
+    pub page: Option<usize>,
+}
 
 #[derive(Deserialize)]
 pub struct NewUserForm {
@@ -38,11 +48,28 @@ pub struct UpdateUserForm {
 }
 
 #[get("/admin/users")]
-pub async fn list(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
+pub async fn list(
+    repos: Repos,
+    session: Session,
+    csrf: Csrf,
+    Query(filter): Query<UsersFilter>,
+) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::ListUsers);
     let may_edit = user.role().can(Capability::EditUsers);
-    let mut users = repos.users.find_all().await?;
-    users.sort_by(|a, b| a.username.cmp(&b.username));
+
+    // Ordered and bounded in SQL. `find_all` loaded every account and this
+    // screen sorted the whole set in memory and rendered one or two forms per
+    // row — so on a site with open registration, the screen an administrator
+    // would use to clear a signup flood was the one the flood broke first.
+    let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
+    let (users, total) = {
+        let mut conn = repos.conn().await?;
+        let rows =
+            content::users_page(&mut conn, (page - 1) * USERS_PER_PAGE, USERS_PER_PAGE).await?;
+        let total = content::user_count(&mut conn).await?;
+        (rows, total)
+    };
+    let last_page = ((total + USERS_PER_PAGE - 1) / USERS_PER_PAGE).max(1);
 
     let body = html! {
         div class="grid grid-cols-1 lg:grid-cols-3 gap-6" {
@@ -111,6 +138,26 @@ pub async fn list(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Re
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                @if last_page > 1 {
+                    nav aria-label="User pages"
+                        class="flex items-center justify-between p-4 border-t \
+                               border-gray-100 text-sm" {
+                        @if page > 1 {
+                            a href=(format!("/admin/users?page={}", page - 1))
+                              class="text-indigo-700 hover:underline" { "← Previous" }
+                        } @else {
+                            span {}
+                        }
+                        span class="text-gray-500" { "Page " (page) " of " (last_page) }
+                        @if page < last_page {
+                            a href=(format!("/admin/users?page={}", page + 1))
+                              class="text-indigo-700 hover:underline" { "Next →" }
+                        } @else {
+                            span {}
                         }
                     }
                 }

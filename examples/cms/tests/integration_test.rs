@@ -6329,3 +6329,154 @@ async fn the_featured_media_picker_is_bounded_and_keeps_its_selection() {
          saving the form unchanged silently clears it"
     );
 }
+
+/// The admin menu lists every registered taxonomy, not two hardcoded slugs.
+///
+/// A plugin's taxonomy already had a working screen at `/admin/terms/<slug>`
+/// and no way to reach it: the post editor renders a checkbox list that is
+/// empty until the taxonomy has a term, and the only place to create that first
+/// term was a URL an administrator had to guess. A registry-driven workflow
+/// that is undiscoverable is not one.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_admin_menu_lists_every_registered_taxonomy() {
+    // For `page` rather than `post`, and with its own slug: the registry is
+    // process-global, so this must not change what any other test's post
+    // editor renders.
+    cms::content_types::register_taxonomy(cms::content_types::Taxonomy {
+        slug: "aisle",
+        singular: "Aisle",
+        plural: "Aisles",
+        hierarchical: true,
+        post_types: &["page"],
+        rewrite_base: "aisle",
+    })
+    .expect("aisle registers cleanly");
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let dashboard = client.get("/admin").header("cookie", &cookie).send().await;
+    dashboard.assert_ok();
+    let dashboard = dashboard.text();
+    assert!(
+        dashboard.contains("/admin/terms/aisle"),
+        "a registered taxonomy must be reachable from the menu"
+    );
+    assert!(dashboard.contains("Aisles"), "under its own plural name");
+    // The built-ins still come from the same loop rather than a second list.
+    assert!(dashboard.contains("/admin/terms/category"));
+    assert!(dashboard.contains("/admin/terms/post_tag"));
+}
+
+/// Scheduling is validated against the row as locked.
+///
+/// The status endpoint carries no date — it can only move a post to `future`
+/// when the row already holds a future one — so its check is a read that can go
+/// stale. An editor who clears or rewinds `published_at` in between would
+/// otherwise have the request schedule a post that either never publishes
+/// (`NULL` never matches the sweep's `published_at <= now`) or publishes on the
+/// very next sweep.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_is_validated_against_the_locked_row() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Someday", "Body.", "draft").await;
+
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    // No date at all: the sweep would never see it, so it would sit `future`
+    // forever. Called directly, because the handler's own pre-check refuses
+    // first and the point is that the check inside the transaction refuses too.
+    let refused = cms::content::transition_status(&mut conn, id, "future", None, None).await;
+    assert!(
+        refused.is_err(),
+        "a schedule with no date must be refused under the lock"
+    );
+
+    // A date already in the past: the next sweep would publish it within the
+    // minute, which is not what scheduling means.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET published_at = NOW() - interval '1 day' WHERE id = {id}"),
+    )
+    .await
+    .expect("rewind the date");
+    let refused = cms::content::transition_status(&mut conn, id, "future", None, None).await;
+    assert!(
+        refused.is_err(),
+        "a schedule with a past date must be refused under the lock"
+    );
+
+    // A real future date still schedules.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET published_at = NOW() + interval '1 day' WHERE id = {id}"),
+    )
+    .await
+    .expect("set a future date");
+    let scheduled = cms::content::transition_status(&mut conn, id, "future", None, None)
+        .await
+        .expect("a real future date schedules");
+    assert_eq!(scheduled.status, "future");
+}
+
+/// The users screen is paginated in SQL.
+///
+/// Open registration is the shipped default and the per-IP throttle bounds the
+/// rate rather than the total, so the screen an administrator would use to
+/// clear a signup flood is the one the flood breaks first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_users_admin_list_is_paginated() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // 60 accounts, ordered by username: `user-01` … `user-60`. `owner` sorts
+    // before all of them, so page one is `owner` plus `user-01` … `user-49`.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO users (username, email, password_hash, display_name, role, bio, website)
+         SELECT 'user-' || lpad(g::text, 2, '0'),
+                'user-' || lpad(g::text, 2, '0') || '@example.com',
+                'x', '', 'subscriber', '', ''
+         FROM generate_series(1, 60) AS g",
+    )
+    .await
+    .expect("seed the accounts");
+
+    let first = client
+        .get("/admin/users")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    first.assert_ok();
+    let first = first.text();
+    assert!(
+        first.contains("user-01"),
+        "the first account leads page one"
+    );
+    assert!(first.contains("user-49"), "page one holds a full page");
+    assert!(
+        !first.contains("user-50"),
+        "page one must stop at the page size rather than render every account"
+    );
+    assert!(first.contains("Page 1 of 2"));
+
+    let second = client
+        .get("/admin/users?page=2")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    second.assert_ok();
+    let second = second.text();
+    assert!(
+        second.contains("user-50") && second.contains("user-60"),
+        "the tail is reachable"
+    );
+    assert!(
+        !second.contains("user-01"),
+        "page two must not repeat page one"
+    );
+}

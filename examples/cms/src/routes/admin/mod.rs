@@ -181,16 +181,21 @@ fn menu_items() -> Vec<(String, String, Capability)> {
             "Comments".to_owned(),
             Capability::ModerateComments,
         ),
-        (
-            "/admin/terms/category".to_owned(),
-            "Categories".to_owned(),
+    ]);
+    // From the registry, exactly as the post types above are. Hard-coding
+    // `category` and `post_tag` meant a plugin's taxonomy had a working screen
+    // at `/admin/terms/<slug>` and no way to reach it: the post editor renders
+    // a checkbox list that is empty until the taxonomy has a term, and the only
+    // place to create that first term was a URL an administrator had to guess.
+    // A registry-driven workflow that is undiscoverable is not one.
+    for taxonomy in content_types::all_taxonomies() {
+        items.push((
+            format!("/admin/terms/{}", taxonomy.slug),
+            taxonomy.plural.to_owned(),
             Capability::ManageCategories,
-        ),
-        (
-            "/admin/terms/post_tag".to_owned(),
-            "Tags".to_owned(),
-            Capability::ManageCategories,
-        ),
+        ));
+    }
+    items.extend([
         (
             "/admin/appearance".to_owned(),
             "Appearance".to_owned(),

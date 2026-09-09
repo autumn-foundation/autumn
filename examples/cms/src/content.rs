@@ -209,6 +209,19 @@ pub async fn transition_status(
             }
         }
 
+        // Scheduling is checked against the locked row's date, not against the
+        // one a handler read a moment earlier. The status endpoint carries no
+        // date at all — it can only move a post to `future` when the row
+        // already holds a future one — so an editor who clears or rewinds
+        // `published_at` in between would otherwise have that request schedule
+        // a post that either never publishes (`NULL` never matches the sweep's
+        // `published_at <= now`) or publishes on the very next sweep.
+        //
+        // The editor's own paths write `published_at` earlier in this same
+        // transaction, so the locked read sees what they are about to commit
+        // rather than what was there before.
+        require_future_publish_date(&target, post.published_at)?;
+
         // The macro-generated enforcing transition: an undeclared edge or a
         // failed guard is a 400 and nothing is written.
         let new_status = post.transition_status_to(&target)?;
@@ -1543,6 +1556,37 @@ pub fn is_reserved_path(slug: &str) -> bool {
     RESERVED_PATHS.contains(&slug)
 }
 
+/// A scheduled post needs a date that is actually in the future.
+///
+/// "Has a date" was not enough: a published post moved back to draft keeps its
+/// original `published_at`, the editor pre-fills that past timestamp, and
+/// choosing "Scheduled" without touching the field produced a row that was
+/// already due — the next sweep republished it within the minute instead of
+/// scheduling it. Nothing about that reads as scheduling to the person who did
+/// it. A missing date is the other half: the sweep selects `published_at <=
+/// now`, which `NULL` never matches, so the post is stuck `future` forever.
+///
+/// Lives here rather than in the editor because [`transition_status`] applies
+/// it to the row *as locked* — a handler's copy is a read that can go stale
+/// between the check and the write.
+pub fn require_future_publish_date(
+    status: &str,
+    scheduled_for: Option<chrono::NaiveDateTime>,
+) -> AutumnResult<()> {
+    if status != "future" {
+        return Ok(());
+    }
+    match scheduled_for {
+        Some(when) if when > chrono::Utc::now().naive_utc() => Ok(()),
+        Some(_) => Err(AutumnError::unprocessable_msg(
+            "A scheduled post needs a publish date in the future",
+        )),
+        None => Err(AutumnError::unprocessable_msg(
+            "Pick a publish date for a scheduled post",
+        )),
+    }
+}
+
 /// Refuse a creation whose deferred transition would fail after the insert.
 ///
 /// `private` and `future` are only reachable by transitioning a draft, so a
@@ -2226,6 +2270,32 @@ pub async fn admin_posts_page(
     });
 
     Ok((rows, total))
+}
+
+/// One page of the accounts list, ordered by username, bounded in SQL.
+///
+/// Open registration is the shipped default and the per-IP throttle bounds the
+/// rate rather than the total, so this table grows without any single signup
+/// being invalid — and the screen an administrator would use to clear a signup
+/// flood renders one or two forms per row, which made it the first one to stop
+/// working.
+pub async fn users_page(
+    conn: &mut AsyncPgConnection,
+    offset: i64,
+    limit: i64,
+) -> AutumnResult<Vec<User>> {
+    Ok(users::table
+        .order((users::username.asc(), users::id.asc()))
+        .offset(offset.max(0))
+        .limit(limit.max(0))
+        .select(User::as_select())
+        .load(conn)
+        .await?)
+}
+
+/// How many accounts the site holds, for the pager.
+pub async fn user_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
+    Ok(users::table.count().get_result(conn).await?)
 }
 
 /// The accounts that authored a page of posts, in one query.
