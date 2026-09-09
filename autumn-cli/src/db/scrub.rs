@@ -289,6 +289,21 @@ pub enum ScrubError {
         /// The refused profile.
         profile: String,
     },
+    /// The materialized-view dependency walk did not reach every view, so the
+    /// run cannot refresh them all — and an unrefreshed view keeps the rows it
+    /// selected before the scrub.
+    UnrefreshableViews {
+        /// The views the walk never reached, sorted.
+        views: Vec<String>,
+    },
+    /// `--dry-run` cannot print a guard that distinguishes this target from a
+    /// physical clone of it: the connection is over a Unix socket (so the
+    /// address and port are NULL) and the role cannot read `data_directory`,
+    /// which is the only value a clone does not share.
+    UnprintableAmbiguousTarget {
+        /// The target labels, sorted.
+        targets: Vec<String>,
+    },
     /// A table this run promises to empty carries a user-defined trigger or
     /// rewrite rule that fires on `DELETE`. That emptying pass is the run's LAST
     /// write, so anything it writes lands after every rewrite and is never
@@ -584,6 +599,39 @@ impl std::fmt::Display for ScrubError {
                  the run the profile guard exists to stop. The plan above is complete and \
                  accurate; add `--force` to print the script too, or point `--profile` at a \
                  staging target.",
+            ),
+            Self::UnrefreshableViews { views } => write!(
+                f,
+                "{} materialized view(s) cannot be refreshed in dependency order:\n{}\n  \
+                 The run refreshes views so each is rebuilt from scrubbed data, and it \
+                 orders them by walking `pg_depend`. That walk stops at a fixed depth, so \
+                 a chain longer than it leaves these views unreached — and a view that is \
+                 not refreshed keeps the rows it selected BEFORE the scrub, including the \
+                 values the run just removed from the tables it reads. Measured on a \
+                 36-deep chain: 33 views refreshed, `users` left with 0 original \
+                 addresses, and the deepest view still holding all 200. Refusing is the \
+                 only honest answer until the walk covers the whole graph — shorten the \
+                 chain, or drop the views this run cannot reach and rebuild them after \
+                 it.",
+                views.len(),
+                bullet_list(views),
+            ),
+            Self::UnprintableAmbiguousTarget { targets } => write!(
+                f,
+                "`--dry-run` cannot print a runnable script for {} target(s):\n{}\n  \
+                 Over a Unix socket the server reports no address and no port, and a \
+                 physical copy of a cluster — a replica, or a promoted clone — carries \
+                 its origin's `system_identifier`. That leaves `data_directory` as the \
+                 only value the two do not share, and this role cannot read it (it needs \
+                 `pg_read_all_settings`). The guard would then compare a database name, a \
+                 cluster id and a port that a same-port clone matches exactly. Measured: \
+                 two clusters on port 5433 with different socket directories, the clone's \
+                 script pasted at its origin after a failed `\\connect` — the guard \
+                 passed, the transaction committed, and the ORIGIN went from 200 users to \
+                 25. Connect over TCP so the address and port identify the endpoint, or \
+                 grant `pg_read_all_settings`, or run without --dry-run.",
+                targets.len(),
+                bullet_list(targets),
             ),
             Self::ReplicaSessionRole { role } => write!(
                 f,
@@ -2487,6 +2535,26 @@ fn classify_and_apply(
                 tables: facts.legacy_inheritance,
             });
         }
+        // A view the dependency walk never reached is one the run cannot
+        // refresh, and an unrefreshed view keeps its pre-scrub rows. Detected by
+        // comparing the ordered list against the flat enumeration rather than by
+        // knowing the walk's depth limit, so it stays true if that limit moves.
+        //
+        // Measured on a 36-deep chain: the run refreshed 33 views, reported
+        // success, left `users` with 0 original addresses — and the deepest view
+        // still held all 200. That is a silent leak, so it is refused instead.
+        let mut unreachable_views: Vec<String> = facts
+            .all_materialized_views
+            .iter()
+            .filter(|view| !facts.materialized_views.contains(view))
+            .cloned()
+            .collect();
+        if !unreachable_views.is_empty() {
+            unreachable_views.sort();
+            return Err(ScrubError::UnrefreshableViews {
+                views: unreachable_views,
+            });
+        }
         let plan = build_plan(&ClassificationInputs {
             tables: &tables,
             config: &sources.config,
@@ -2652,6 +2720,26 @@ fn classify_and_apply(
                 profile: profile.to_owned(),
             }
         })?;
+        // And refuse a target whose guard could not tell it from a clone. Over a
+        // socket the address and port are NULL, and a physical copy shares its
+        // origin's `system_identifier`, so `data_directory` is the only
+        // discriminator left — and dropping it when unreadable (which is right,
+        // because comparing against a value never learned refuses CORRECT
+        // pastes) leaves nothing. Measured before this: two clusters on port
+        // 5433 with different socket directories, the clone's script pasted at
+        // its origin, guard passed, COMMIT, origin 200 users -> 25.
+        let mut ambiguous: Vec<String> = plans
+            .iter()
+            .filter(|(_, _, _, facts, _)| {
+                let e = &facts.endpoint;
+                e.address.is_none() && e.port.is_none() && e.data_directory.is_none()
+            })
+            .map(|(label, _, _, _, _)| (*label).clone())
+            .collect();
+        ambiguous.sort();
+        if !ambiguous.is_empty() {
+            return Err(ScrubError::UnprintableAmbiguousTarget { targets: ambiguous });
+        }
         let mut encrypted_rewrites: Vec<String> = plans
             .iter()
             .flat_map(|(label, _, plan, _, _)| {

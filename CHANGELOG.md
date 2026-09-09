@@ -508,6 +508,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself refused with "framework-owned rows are emptied with `[framework]
   purge`". The purge-order deferral the excluded-leaf path already computes is
   applied unchanged.
+  Two refusals close paths that were silently wrong. A materialized-view chain
+  the dependency walk cannot reach the end of is refused rather than partly
+  refreshed: measured on a 36-deep chain, the run refreshed 33 views, reported
+  success, left `users` with 0 original addresses and the deepest view holding
+  all 200. And `--dry-run` refuses to print a script for a Unix-socket target
+  whose role cannot read `data_directory`: over a socket the address and port
+  are NULL and a physical copy shares its origin's `system_identifier`, so
+  nothing distinguishes the two. Measured with two clusters on port 5433 under
+  different socket directories, the clone's script pasted at its origin after a
+  failed `\connect` — the guard passed, the transaction committed, and the
+  ORIGIN went from 200 users to 25. A privileged socket role and any TCP target
+  still print.
   Its values are asked of the
   target connection rather than parsed out of its URL — libpq defaults an omitted database name to the user name, so deriving it
   meant reimplementing those rules — and every call is `pg_catalog`-qualified and
