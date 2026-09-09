@@ -220,6 +220,8 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(feature = "openapi")]
+mod openapi_export;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
@@ -381,6 +383,8 @@ mod translatable_request;
 mod tx_isolation_retry_integration;
 #[cfg(feature = "db")]
 mod validate_merged_model;
+#[cfg(feature = "db")]
+mod validate_on_insert;
 #[cfg(feature = "db")]
 mod validate_on_update_blind;
 mod validate_patch_option_ip;

@@ -69,6 +69,31 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 // ──────────────────────────────────────────────────────────────────
+// `autumn openapi export` dump protocol
+// ──────────────────────────────────────────────────────────────────
+
+/// Machine-readable stderr marker saying this binary cannot produce a spec.
+///
+/// Emitted by the `AUTUMN_DUMP_OPENAPI` dump instead of a spec document, with a
+/// human-readable reason following on the same line. `autumn openapi export`
+/// scans stderr for it so it can turn "this app has no OpenAPI surface" into an
+/// actionable message rather than a JSON parse failure on empty stdout.
+///
+/// Two things produce it: the binary was built without the `openapi` feature,
+/// or it was built with the feature but never called
+/// [`AppBuilder::openapi`](crate::app::AppBuilder::openapi).
+pub const OPENAPI_UNAVAILABLE_MARKER: &str = "[autumn:openapi-unavailable] ";
+
+/// Reason text following [`OPENAPI_UNAVAILABLE_MARKER`] when the binary was
+/// compiled without the `openapi` feature.
+pub const OPENAPI_UNAVAILABLE_FEATURE: &str = "this binary was built without the `openapi` feature";
+
+/// Reason text following [`OPENAPI_UNAVAILABLE_MARKER`] when the app never
+/// configured a spec.
+pub const OPENAPI_UNAVAILABLE_UNCONFIGURED: &str =
+    "this app never called `.openapi(OpenApiConfig::new(..))`";
+
+// ──────────────────────────────────────────────────────────────────
 // Public metadata attached to each Route
 // ──────────────────────────────────────────────────────────────────
 
@@ -242,10 +267,17 @@ pub struct SchemaEntry {
     /// `SchemaEntry` const-promotable to `&'static` in `Array` / `Nullable`
     /// wrappers, since `type_name` is not yet a stably-const fn.
     ///
-    /// `None` for primitives and for the `Array` / `Nullable` wrapper entries
-    /// (whose `name` is the sentinel `"array"` / `"nullable"`), and for legacy
-    /// short-name refs (e.g. the repository macro's model refs) which keep their
-    /// last-segment display key.
+    /// Set on the `Array` / `Nullable` wrapper entries too, where it names the
+    /// WRAPPER (`core::option::Option<T>`, `alloc::vec::Vec<T>`). The route
+    /// macros match those two on the last path segment, so an application's own
+    /// `domain::Option<T>` reaches the same arm; `wrapper_is_impostor` reads
+    /// this identity to tell the two apart and renders an impostor as an
+    /// ordinary `$ref` rather than as something nullable or array-shaped.
+    ///
+    /// `None` for primitives, and for legacy short-name refs (e.g. the
+    /// repository macro's model refs) which keep their last-segment display
+    /// key. A `None` wrapper is treated as genuine, so hand-built entries keep
+    /// their previous behaviour.
     pub identity: Option<fn() -> &'static str>,
 }
 
@@ -1038,10 +1070,90 @@ fn rewrite_identity_refs(value: &mut serde_json::Value, index: &SchemaComponentI
     }
 }
 
+/// `type_name` prefixes that identify `std`'s own `Option` / `Vec`.
+///
+/// Both spellings are accepted for each: `core::option::Option` /
+/// `alloc::vec::Vec` are what today's rustc renders, while `std::option::` /
+/// `std::vec::` are re-export paths a future rustc could plausibly print.
+#[cfg(feature = "openapi")]
+const OPTION_TYPE_NAME_PREFIXES: [&str; 2] = ["core::option::Option<", "std::option::Option<"];
+#[cfg(feature = "openapi")]
+const VEC_TYPE_NAME_PREFIXES: [&str; 2] = ["alloc::vec::Vec<", "std::vec::Vec<"];
+
+/// Does this `Array` / `Nullable` entry describe an application type that merely
+/// SPELLS `Vec` / `Option` in its last path segment?
+///
+/// The route macros can only match a type by the tokens as written, so
+/// `domain::Option<T>` — an ordinary struct — produces a `Nullable` entry just
+/// as `std`'s `Option<T>` does. Rendering it as nullable (or as an array, for a
+/// `domain::Vec<T>`) advertises a wire shape that type does not serialize.
+/// The wrapper entry carries its own `type_name`, which settles it.
+///
+/// An entry with no identity is treated as genuine: hand-built entries and
+/// anything emitted before wrapper identities existed keep their old shape.
+#[cfg(feature = "openapi")]
+fn wrapper_is_impostor(entry: &SchemaEntry) -> bool {
+    let prefixes: &[&str] = match entry.kind {
+        SchemaKind::Array(_) => &VEC_TYPE_NAME_PREFIXES,
+        SchemaKind::Nullable(_) => &OPTION_TYPE_NAME_PREFIXES,
+        SchemaKind::Ref | SchemaKind::Primitive(_) => return false,
+    };
+    entry.identity.is_some_and(|resolve| {
+        let identity = resolve();
+        !prefixes.iter().any(|prefix| identity.starts_with(prefix))
+    })
+}
+
+/// The `type_name` of `serde_json::Value`.
+#[cfg(feature = "openapi")]
+const SERDE_JSON_VALUE_IDENTITY: &str = "serde_json::value::Value";
+
+/// The schema for arbitrary JSON: no constraint at all.
+///
+/// Deliberately identical to what `#[derive(OpenApiSchema)]` emits for a
+/// `serde_json::Value` FIELD, so a route-level `Json<Value>` and a model field
+/// of the same type describe the same contract.
+#[cfg(feature = "openapi")]
+fn arbitrary_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "description": "Arbitrary JSON: an object, array, string, number, boolean or null.",
+    })
+}
+
+/// Does this entry describe a genuine `serde_json::Value`?
+///
+/// A handler taking or returning `Json<serde_json::Value>` produced an ordinary
+/// named `Ref`. Nothing registers a schema for that external type, so the
+/// back-fill gave it the opaque `{"type":"object"}` placeholder — which
+/// misdescribes every array, scalar and null it legitimately carries, and made
+/// `--strict` fail on a handler that is behaving correctly. The model-field path
+/// already special-cases this; the route-level builder is the same rule one step
+/// out.
+///
+/// Checked by full `type_name`, never by the last path segment: an application's
+/// own `Value` is an ordinary type and keeps its `$ref`.
+#[cfg(feature = "openapi")]
+fn entry_is_arbitrary_json(entry: &SchemaEntry) -> bool {
+    matches!(entry.kind, SchemaKind::Ref)
+        && entry
+            .identity
+            .is_some_and(|resolve| resolve() == SERDE_JSON_VALUE_IDENTITY)
+}
+
 /// Flatten an entry, yielding each leaf `Ref` entry reached through
 /// `Array` / `Nullable` wrappers (so a `Json<Vec<User>>` contributes `User`).
 #[cfg(feature = "openapi")]
 fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
+    // An impostor wrapper is a named type in its own right: it earns its own
+    // component, rather than contributing the inner type it never wraps.
+    if wrapper_is_impostor(entry) {
+        return vec![entry];
+    }
+    // Arbitrary JSON is described inline, so it must NOT earn a component —
+    // registering one is exactly how it became an opaque placeholder.
+    if entry_is_arbitrary_json(entry) {
+        return Vec::new();
+    }
     match entry.kind {
         SchemaKind::Ref => vec![entry],
         SchemaKind::Array(inner) | SchemaKind::Nullable(inner) => flatten_ref_entries(inner),
@@ -1373,6 +1485,16 @@ pub fn schema_entry_to_value(
 
 #[cfg(feature = "openapi")]
 fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_json::Value {
+    // `domain::Option<T>` / `domain::Vec<T>` reach the wrapper arms by last-path
+    // -segment match but are ordinary named types: describe them as such.
+    if wrapper_is_impostor(entry) {
+        return serde_json::json!({
+            "$ref": format!("#/components/schemas/{}", index.display_key(entry))
+        });
+    }
+    if entry_is_arbitrary_json(entry) {
+        return arbitrary_json_schema();
+    }
     match entry.kind {
         SchemaKind::Primitive(json_type) => serde_json::json!({ "type": json_type }),
         SchemaKind::Ref => {
@@ -1390,6 +1512,13 @@ fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_
             //   * For primitives, use the compact type-array form: `type: ["T", "null"]`.
             //   * For all other schemas (arrays, nested nullable, etc.), use `oneOf`
             //     so the full inner schema (e.g. `items`) is preserved.
+            // `Option<serde_json::Value>` must NOT be wrapped: the
+            // unconstrained schema already admits null, and `oneOf` demands that
+            // EXACTLY ONE branch match — so `oneOf [{unconstrained}, {null}]`
+            // would reject the very null it is meant to permit.
+            if entry_is_arbitrary_json(inner) {
+                return arbitrary_json_schema();
+            }
             match inner.kind {
                 SchemaKind::Ref | SchemaKind::Array(_) | SchemaKind::Nullable(_) => {
                     serde_json::json!({
@@ -1626,6 +1755,162 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Opaque-schema (placeholder) detection
+// ──────────────────────────────────────────────────────────────────
+
+/// Keys the generated placeholder may carry. Anything else means the schema
+/// says something real about its instances, so it is not a placeholder.
+#[cfg(feature = "openapi")]
+const PLACEHOLDER_KEYS: [&str; 3] = ["type", "title", "description"];
+
+/// True when `schema` is exactly the opaque object placeholder
+/// [`generate_spec`] emits for a referenced type that has no `OpenApiSchema`:
+/// `{"type":"object","title":…}` and nothing else.
+///
+/// Matched by *shape*, not by the absence of `properties` alone. An object can
+/// describe its instances without that key — `additionalProperties` (a map),
+/// `oneOf`/`allOf`/`anyOf`, `patternProperties`, a bare `$ref` — and a schema
+/// somebody registered deliberately through
+/// [`OpenApiConfig::register_schema`] in one of those forms is a real contract
+/// a client generator can render. Flagging it would make
+/// `autumn openapi export --strict` fail CI over a fully typed map. So a
+/// placeholder is recognised as an object carrying no key beyond `title` /
+/// `description`, which is precisely what the back-fill emits.
+///
+/// This is the single canonical predicate: the MCP tool-catalog builder
+/// ([`crate::mcp`]) applies it to a tool's `inputSchema`, and
+/// [`opaque_component_schemas`] applies it to a built spec's components.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn is_opaque_object_schema(schema: &serde_json::Value) -> bool {
+    if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+        return false;
+    }
+    schema.as_object().is_none_or(|map| {
+        map.keys()
+            .all(|key| PLACEHOLDER_KEYS.contains(&key.as_str()))
+    })
+}
+
+/// One component schema that degraded to the opaque object placeholder, with
+/// the operations that reference it.
+///
+/// Produced by [`opaque_component_schemas`]. A consumer of the spec (a client
+/// generator, Swagger UI, the MCP projection) can only render such a schema as
+/// an untyped blob — `unknown` in TypeScript, `serde_json::Value` in Rust — so
+/// `autumn openapi export` reports these rather than letting the contract
+/// degrade silently.
+#[cfg(feature = "openapi")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpaqueSchema {
+    /// Component key under `#/components/schemas/`.
+    pub schema: String,
+    /// `"METHOD /path"` for every operation referencing it, sorted and deduped.
+    /// Empty when the component is registered but unreferenced.
+    pub referenced_by: Vec<String>,
+}
+
+/// Report every component schema in `spec` that degraded to the opaque
+/// placeholder, sorted by component name.
+///
+/// The fix for each entry is to add `#[derive(OpenApiSchema)]` to the offending
+/// type (or register a hand-written schema via
+/// [`OpenApiConfig::register_schema`]), which makes the back-fill resolve the
+/// real field-accurate schema instead of the placeholder.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn opaque_component_schemas(spec: &OpenApiSpec) -> Vec<OpaqueSchema> {
+    let Some(components) = spec.components.as_ref() else {
+        return Vec::new();
+    };
+
+    let opaque: std::collections::BTreeSet<&str> = components
+        .schemas
+        .iter()
+        .filter(|(_, schema)| is_opaque_object_schema(schema))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if opaque.is_empty() {
+        return Vec::new();
+    }
+
+    // Pre-compute each component's own outgoing refs, so attribution can follow
+    // the component graph rather than stopping at an operation's direct refs.
+    // An operation usually reaches an opaque type *indirectly* — `POST /orders`
+    // takes a derived `Order` whose `address` field `$ref`s an underived
+    // `Address` — and reporting `Address` with an empty `referenced_by` would
+    // hide the very operation whose contract is degraded.
+    let component_refs: BTreeMap<&str, Vec<String>> = components
+        .schemas
+        .iter()
+        .map(|(name, schema)| {
+            let mut out = Vec::new();
+            collect_body_ref_identities(schema, &mut out);
+            (name.as_str(), out)
+        })
+        .collect();
+
+    // Map each opaque component to the operations that reach it. A reference
+    // can sit anywhere in an operation (body, response, parameter schema, or
+    // nested inside an array/nullable wrapper), so walk the serialized
+    // operation wholesale rather than probing known slots, then close over the
+    // component graph from whatever that turns up.
+    let mut refs: BTreeMap<&str, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for (path, item) in &spec.paths {
+        for (method, operation) in path_item_operations(item) {
+            let Ok(value) = serde_json::to_value(operation) else {
+                continue;
+            };
+            let mut frontier = Vec::new();
+            collect_body_ref_identities(&value, &mut frontier);
+
+            // Breadth-first over components, `seen` guarding the cycles a
+            // self- or mutually-recursive schema creates.
+            let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            while let Some(identity) = frontier.pop() {
+                if !seen.insert(identity.clone()) {
+                    continue;
+                }
+                if let Some(name) = opaque.get(identity.as_str()) {
+                    refs.entry(name)
+                        .or_default()
+                        .insert(format!("{method} {path}"));
+                }
+                if let Some(nested) = component_refs.get(identity.as_str()) {
+                    frontier.extend(nested.iter().cloned());
+                }
+            }
+        }
+    }
+
+    opaque
+        .into_iter()
+        .map(|schema| OpaqueSchema {
+            schema: schema.to_owned(),
+            referenced_by: refs
+                .get(schema)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Yield each `(METHOD, operation)` pair present on a [`PathItem`].
+#[cfg(feature = "openapi")]
+fn path_item_operations(item: &PathItem) -> Vec<(&'static str, &Operation)> {
+    [
+        ("GET", item.get.as_ref()),
+        ("POST", item.post.as_ref()),
+        ("PUT", item.put.as_ref()),
+        ("PATCH", item.patch.as_ref()),
+        ("DELETE", item.delete.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(method, op)| op.map(|op| (method, op)))
+    .collect()
 }
 
 // ──────────────────────────────────────────────────────────────────

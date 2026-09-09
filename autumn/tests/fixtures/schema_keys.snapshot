@@ -196,6 +196,9 @@ jobs.redis
 jobs.redis.key_prefix
 jobs.redis.url
 jobs.redis.visibility_timeout_ms
+jobs.sqlite
+jobs.sqlite.poll_interval_ms
+jobs.sqlite.visibility_timeout_ms
 jobs.tracking
 jobs.tracking.route_enabled
 jobs.tracking.ttl_secs

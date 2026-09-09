@@ -1,5 +1,5 @@
-//! `#[derive(OpenApiSchema)]` — a standalone derive that gives a plain struct a
-//! field-accurate `OpenApiSchema` impl (issue #1972).
+//! `#[derive(OpenApiSchema)]` — a standalone derive that gives a plain struct or
+//! unit-variant enum a field-accurate `OpenApiSchema` impl (issue #1972).
 //!
 //! Before this derive, the only automatic `OpenApiSchema` impls came from
 //! `#[model]` codegen and the primitive macro impls, so any other handler-arg
@@ -8,12 +8,17 @@
 //! its `OpenAPI` / MCP `inputSchema` degraded to a generic
 //! `{"type":"object","title":"X"}` placeholder.
 //!
-//! This derive mirrors the schema `#[model]` already generates
-//! (`crate::schema::emit_schema_fn_body`): each field becomes a JSON-schema
-//! property and every non-`Option` field is `required`. It additionally submits
-//! the schema into the compile-time `DerivedSchemaDescriptor` inventory that the
-//! spec/MCP back-fill loops consult, so a referenced struct resolves to its real
-//! schema with no manual registration.
+//! For structs this mirrors the schema `#[model]` already generates
+//! (`crate::schema::emit_schema_fn_body_full`): each field becomes a JSON-schema
+//! property and every non-`Option` field is `required`. For enums it emits the
+//! closed-set form (`{"type":"string","enum":[…]}`) that serde's default
+//! externally-tagged representation produces for unit variants — the shape a
+//! client generator turns into a TypeScript string union or a Rust enum.
+//!
+//! Either way the derive submits the schema into the compile-time
+//! `DerivedSchemaDescriptor` inventory that the spec/MCP back-fill loops
+//! consult, so a referenced type resolves to its real schema with no manual
+//! registration.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -37,9 +42,69 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    let fields = match &input.data {
+    let schema_body = match &input.data {
         Data::Struct(data) => match &data.fields {
-            Fields::Named(named) => &named.named,
+            Fields::Named(named) => {
+                if let Err(e) = reject_undescribable_struct(&input, named) {
+                    return e.to_compile_error().into();
+                }
+                // The emitters expect `&[&&Field]` (they were written against
+                // the `Vec<&&Field>` the model macro collects); build that
+                // shape here, minus the fields serde never puts on the wire.
+                let field_refs: Vec<&syn::Field> = named
+                    .named
+                    .iter()
+                    .filter(|f| crate::schema::serde_bare_word(&f.attrs, &["skip"]).is_none())
+                    .collect();
+                let field_ref_refs: Vec<&&syn::Field> = field_refs.iter().collect();
+                // Honor a container `#[serde(rename_all = "...")]` — the split
+                // form is refused above, so this side is the only side.
+                let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+                // A container `#[serde(default)]` (bare or `= "path"`) lets
+                // EVERY field be absent from a request, filled from the struct
+                // default. Nothing is required then. Safe in both directions:
+                // a response still carries every field, so a client that does
+                // not demand them is not misled, while a request client is no
+                // longer forced to send what the handler does not need.
+                let container_default = crate::schema::has_serde_default(&input.attrs);
+                let body = crate::schema::emit_schema_fn_body_full(
+                    &field_ref_refs,
+                    container_default,
+                    &[],
+                    rename_all_rule.as_deref(),
+                    // A `#[serde(default)]` field may be omitted from a request
+                    // and is always present in a response, so "not required" is
+                    // true of both directions — no conflict, unlike the
+                    // directional attributes refused above.
+                    &|f: &syn::Field| crate::schema::has_serde_default(&f.attrs),
+                );
+                // `#[serde(deny_unknown_fields)]` makes deserialization REJECT
+                // any key not listed above. Without `additionalProperties:
+                // false` the schema invites a client to send extras that the
+                // handler then 400s on. Describable rather than refusable —
+                // JSON Schema says exactly this — so it is emitted, not
+                // rejected.
+                //
+                // Sound in both directions: the attribute constrains input, and
+                // a response built from this struct never carries a key outside
+                // the listed set either, so the closed object is true of the
+                // serialize side as well.
+                if crate::schema::serde_bare_word(&input.attrs, &["deny_unknown_fields"]).is_some()
+                {
+                    quote! {{
+                        let mut __autumn_closed = { #body };
+                        if let Some(__autumn_obj) = __autumn_closed.as_object_mut() {
+                            __autumn_obj.insert(
+                                "additionalProperties".to_owned(),
+                                ::autumn_web::reexports::serde_json::json!(false),
+                            );
+                        }
+                        __autumn_closed
+                    }}
+                } else {
+                    body
+                }
+            }
             _ => {
                 return syn::Error::new_spanned(
                     &input,
@@ -49,26 +114,19 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 .into();
             }
         },
-        _ => {
+        Data::Enum(data) => match enum_schema_body(&input, data) {
+            Ok(body) => body,
+            Err(e) => return e.to_compile_error().into(),
+        },
+        Data::Union(_) => {
             return syn::Error::new_spanned(
                 &input,
-                "#[derive(OpenApiSchema)] is only supported on structs",
+                "#[derive(OpenApiSchema)] is only supported on structs and enums",
             )
             .to_compile_error()
             .into();
         }
     };
-
-    // `emit_schema_fn_body` expects `&[&&Field]` (it was written against the
-    // `Vec<&&Field>` the model macro collects); build that shape here.
-    let field_refs: Vec<&syn::Field> = fields.iter().collect();
-    let field_ref_refs: Vec<&&syn::Field> = field_refs.iter().collect();
-    // Honor a container `#[serde(rename_all = "...")]` on the derived struct so
-    // the advertised property names + `required` entries match the serialized
-    // wire names — same helper/precedence `#[model]` and `FormModel` use.
-    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
-    let schema_body =
-        crate::schema::emit_schema_fn_body(&field_ref_refs, false, rename_all_rule.as_deref());
 
     quote! {
         impl ::autumn_web::openapi::OpenApiSchema for #name {
@@ -91,4 +149,754 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+/// Emit the `schema()` body for a unit-variant enum: the closed string set
+/// serde's default representation puts on the wire.
+///
+/// Data-carrying variants are rejected rather than approximated. Serde's
+/// externally-tagged form for those is a `oneOf` of single-key wrapper objects
+/// whose exact shape also depends on `#[serde(tag/content/untagged)]`, so
+/// guessing would advertise a contract the handler does not actually accept —
+/// worse than the placeholder, because it is confidently wrong. The error names
+/// the hand-written escape hatch instead.
+fn enum_schema_body(
+    input: &DeriveInput,
+    data: &syn::DataEnum,
+) -> syn::Result<proc_macro2::TokenStream> {
+    reject_undescribable_enum(input, data)?;
+
+    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+    let values: Vec<String> = data
+        .variants
+        .iter()
+        .filter(|v| !crate::schema::variant_is_serde_skipped(v))
+        .map(|v| {
+            let raw = v.ident.to_string();
+            let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
+            // Precedence mirrors serde: a variant-level `#[serde(rename)]` wins
+            // over the container `#[serde(rename_all)]`, which wins over the
+            // raw identifier.
+            crate::schema::variant_serde_serialize_rename(v)
+                .or_else(|| {
+                    rename_all_rule.as_deref().and_then(|rule| {
+                        crate::schema::apply_serde_rename_all_rule_to_variant(rule, &raw)
+                    })
+                })
+                .unwrap_or(raw)
+        })
+        .collect();
+
+    if values.is_empty() {
+        return Err(syn::Error::new_spanned(
+            input,
+            "#[derive(OpenApiSchema)] needs at least one non-skipped variant to advertise",
+        ));
+    }
+
+    Ok(quote! {
+        ::autumn_web::reexports::serde_json::json!({
+            "type": "string",
+            "enum": [#(#values),*],
+        })
+    })
+}
+
+/// Refuse every struct shape whose real wire form the derive cannot describe.
+///
+/// Written as one audit of serde's attribute surface rather than a rule per
+/// report. Seven review rounds on issue #802 landed fixes scoped to whichever
+/// attribute was named, and each time an adjacent one was still wrong; the
+/// generalisation is that an object schema is only the truth when every field
+/// appears under a single symmetric name and the container is not re-shaped.
+///
+/// | Attribute | What serde does | Why an object schema is wrong |
+/// |---|---|---|
+/// | `transparent` | writes the inner value | there is no object at all |
+/// | `into` / `from` / `try_from` | routes through another type | shape is that type's |
+/// | `tag` / `untagged` | re-tags the container | adds or removes an object level |
+/// | `flatten` (field) | merges the field's keys upward | the field is not a nested property |
+/// | `skip_serializing` / `skip_deserializing` (field) | one direction only | one schema serves both |
+/// | split `rename_all` / `rename` | two different names | one schema advertises one |
+///
+/// Accepted and handled by the caller rather than refused: `skip` (absent both
+/// ways, so the field is dropped), `default` (omissible on input, present on
+/// output — "not required" is true either way), and a symmetric `rename_all` /
+/// `rename`.
+///
+/// KNOWN RESIDUAL: `with` / `serialize_with` / `deserialize_with` can put an
+/// arbitrary shape on the wire, and the schema still describes the Rust type.
+/// Not refused, because the attribute is common and usually only reformats a
+/// value of the same JSON type — but a converter that changes the type is
+/// misdescribed. Register such a type's schema by hand.
+/// Refuse `#[serde(skip_serializing_if = "…")]` where omission is not valid in
+/// BOTH directions.
+///
+/// Split out of [`reject_undescribable_struct`] for length; the reasoning is
+/// inline below because it is the whole of the rule.
+fn reject_undescribable_conditional_skip(
+    field: &syn::Field,
+    container_attrs: &[syn::Attribute],
+) -> syn::Result<()> {
+    // Direction-dependent for the same reason, and describable only when
+    // something makes omission valid on the REQUEST side too. A field or
+    // container `#[serde(default)]` does: deserialization fills the field
+    // in, serialization may omit it, and a not-`required` property is then
+    // accurate in both directions.
+    //
+    // Being spelled `Option<T>` does NOT, and used to be accepted here.
+    // That premise is only true for `std`'s `Option`, which a proc macro
+    // cannot verify — it sees the tokens as written, so an application's own
+    // `domain::Option<T>` reads identically and serde requires it on the
+    // request side. The two possible guesses are both wrong for that type:
+    // marking it `required` lets a response omit what the schema demands,
+    // marking it optional lets a client omit what serde rejects. It is not
+    // describable by one schema, so it is refused rather than guessed.
+    //
+    // The cost falls on `Option<T>` + `skip_serializing_if` with no
+    // `#[serde(default)]`, which used to compile. The fix is that one
+    // attribute, and it is a NO-OP for a real `Option` — serde already
+    // fills a missing one with `None` — so the suggestion is correct
+    // whichever of the two the type turns out to be.
+    if crate::schema::field_has_skip_serializing_if(field)
+        && !crate::schema::has_serde_default(&field.attrs)
+        && !crate::schema::has_serde_default(container_attrs)
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "#[derive(OpenApiSchema)] cannot describe a field with \
+             `#[serde(skip_serializing_if = ...)]` and no `#[serde(default)]`: that \
+             attribute governs serialization only, so a response may omit the field \
+             while serde still rejects a request that does. Being spelled `Option<T>` \
+             is not enough — this macro sees only the tokens, and a type of your own \
+             named `Option` reads the same but is required on the way in. Add \
+             `#[serde(default)]` (a no-op for a real `Option<T>`, which serde already \
+             fills with `None`), or write the `OpenApiSchema` impl by hand and register \
+             it with `OpenApiConfig::register_schema`.",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) -> syn::Result<()> {
+    // ── Container ────────────────────────────────────────────────────
+    if let Some(word) = crate::schema::serde_bare_word(&input.attrs, &["transparent", "untagged"]) {
+        return Err(syn::Error::new_spanned(
+            input,
+            format!(
+                "#[derive(OpenApiSchema)] cannot describe `#[serde({word})]`: serde does not \
+                 put an object with these fields on the wire, so the derived schema would \
+                 advertise a shape the handler neither accepts nor returns. Write the \
+                 `OpenApiSchema` impl by hand and register it with \
+                 `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+    if let Some(key) =
+        crate::schema::serde_valued_key(&input.attrs, &["into", "from", "try_from", "tag"])
+    {
+        return Err(syn::Error::new_spanned(
+            input,
+            format!(
+                "#[derive(OpenApiSchema)] cannot describe `#[serde({key} = ...)]`: it re-shapes \
+                 what reaches the wire, so an object schema built from these fields would be \
+                 wrong. Write the `OpenApiSchema` impl by hand and register it with \
+                 `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+    if let Some(key) = crate::schema::serde_split_rename(&input.attrs, "rename_all") {
+        return Err(syn::Error::new_spanned(input, split_rename_message(key)));
+    }
+
+    // ── Fields ───────────────────────────────────────────────────────
+    for field in &named.named {
+        if let Some(word) = crate::schema::serde_bare_word(&field.attrs, &["flatten"]) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "#[derive(OpenApiSchema)] cannot describe `#[serde({word})]`: serde merges \
+                     this field's keys into the containing object, while the derived schema \
+                     would publish it as a nested property — a generated client would send a \
+                     nesting the handler does not accept and expect one the server never \
+                     emits. Write the `OpenApiSchema` impl by hand and register it with \
+                     `OpenApiConfig::register_schema`."
+                ),
+            ));
+        }
+        // A (de)serialization adapter can put ANY shape on the wire — an `i64`
+        // amount written as a string is the common one — so the field's Rust
+        // type stops describing it. All three spellings are rejected, not just
+        // the serialize half: this schema serves requests AND responses, so an
+        // adapter on either side can make it wrong for that side. `with` sets
+        // both at once.
+        if let Some(key) = crate::schema::serde_valued_key(
+            &field.attrs,
+            &["with", "serialize_with", "deserialize_with"],
+        ) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "#[derive(OpenApiSchema)] cannot describe a field with \
+                     `#[serde({key} = ...)]`: the adapter decides what actually reaches the \
+                     wire, so a schema built from the field's Rust type would advertise a \
+                     shape serde neither writes nor accepts. Write the `OpenApiSchema` impl \
+                     by hand and register it with `OpenApiConfig::register_schema`."
+                ),
+            ));
+        }
+        if let Some(word) = crate::schema::variant_directional_skip_on_field(field) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "#[derive(OpenApiSchema)] cannot describe a field skipped in only one serde \
+                     direction (`#[serde({word})]`): one schema covers both requests and \
+                     responses. Use `#[serde(skip)]` if the field should not appear at all, or \
+                     write the `OpenApiSchema` impl by hand and register it with \
+                     `OpenApiConfig::register_schema`."
+                ),
+            ));
+        }
+        reject_undescribable_conditional_skip(field, &input.attrs)?;
+        // Same deserialize-only widening as on a variant, one level down.
+        // serde accepts an object carrying ONLY the alias, while the emitted
+        // schema names the canonical property and marks it `required` — so a
+        // validator rejects input the handler takes. `#[serde(deny_unknown_fields)]`
+        // sharpens it into a contradiction: the alias key is then forbidden as
+        // an additional property AND the canonical one demanded, so no request
+        // satisfies the schema and the handler at once.
+        if crate::schema::has_serde_alias(&field.attrs) {
+            return Err(syn::Error::new_spanned(
+                field,
+                "#[derive(OpenApiSchema)] cannot describe a field with `#[serde(alias = \"…\")]`: \
+                 the alias is accepted when deserializing but never written when serializing, so \
+                 one property name cannot be right for both requests and responses — a validator \
+                 would reject a request the handler accepts. Use `#[serde(rename = \"…\")]` if the \
+                 wire name should change in both directions, or write the `OpenApiSchema` impl by \
+                 hand and register it with `OpenApiConfig::register_schema`.",
+            ));
+        }
+        if let Some(key) = crate::schema::serde_split_rename(&field.attrs, "rename") {
+            return Err(syn::Error::new_spanned(field, split_rename_message(key)));
+        }
+    }
+
+    Ok(())
+}
+
+/// The shared diagnostic for a split `rename_all` / `rename` whose sides differ.
+fn split_rename_message(key: &str) -> String {
+    format!(
+        "#[derive(OpenApiSchema)] cannot describe a split `#[serde({key}(serialize = ..., \
+         deserialize = ...))]` whose two sides differ: one schema is advertised for both \
+         requests and responses, so a client generated from the serialize spelling would send \
+         a value the handler's `Deserialize` rejects. Use a symmetric `{key} = \"...\"`, or \
+         write the `OpenApiSchema` impl by hand and register it with \
+         `OpenApiConfig::register_schema`."
+    )
+}
+
+/// Refuse every enum shape whose real wire form the derive cannot describe.
+///
+/// Split out of [`enum_schema_body`] to keep that function inside the
+/// line budget, and because these four checks are one idea: a JSON string enum
+/// is only the truth when serde's default representation applies to unit
+/// variants with a single, symmetric spelling. Anything else is refused rather
+/// than approximated — a confidently wrong contract is worse than no derive,
+/// since a generated client acts on it.
+/// Refuse a variant carrying `#[serde(untagged)]`.
+///
+/// serde accepts `untagged` at the VARIANT level as well as the container
+/// level, and it means the same thing for that one variant: a unit variant so
+/// marked serializes as `null`, not as its name. The container-level check
+/// above reads `input.attrs` only, so a mixed enum — ordinary variants plus one
+/// untagged catch-all — slipped through and published every variant as a
+/// string, including the one that is `null` on the wire (issue #802).
+fn reject_untagged_variants(data: &syn::DataEnum) -> syn::Result<()> {
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::serde_bare_word(&v.attrs, &["untagged"]).is_some())
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] cannot describe a variant marked `#[serde(untagged)]`: \
+             serde writes it as `null` rather than as its name, so the closed string set the \
+             derive would publish is wrong for this variant and a client decodes the wrong \
+             type. Write the `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a unit variant carrying `#[serde(alias = "…")]`.
+///
+/// Split out of [`reject_undescribable_enum`] to keep that function within the
+/// crate's line budget; it is one rule, checked in one place.
+fn reject_aliased_variants(data: &syn::DataEnum) -> syn::Result<()> {
+    // `#[serde(other)]` is the SAME deserialize-only widening as `alias`, one
+    // keyword over: the marked variant becomes the catch-all, so serde accepts
+    // ANY unrecognised spelling for it. A closed `enum` array listing only the
+    // catch-all's own name therefore rejects, on a request, every value the
+    // handler happily takes.
+    //
+    // Checked alongside `alias` rather than in its own pass because they are one
+    // rule — "the deserialize side accepts more than the serialize side writes"
+    // — and splitting it is how this crate keeps shipping half a guard.
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::serde_bare_word(&v.attrs, &["other"]).is_some())
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] cannot describe a variant marked \
+             `#[serde(other)]`: it is serde's catch-all, so deserialization accepts any \
+             unrecognised spelling while serialization only ever writes this variant's own \
+             name — a closed string set would reject requests the handler accepts. Write the \
+             `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+
+    // `#[serde(alias = "…")]` is a DESERIALIZE-only widening: the alias is
+    // accepted on input and never written on output. A closed string set built
+    // from the canonical spellings is therefore too narrow for a request (an
+    // OpenAPI validator rejects a value the handler happily takes) and listing
+    // the aliases would make it too wide for a response (advertising values the
+    // server never emits). Same asymmetry as a directional skip, same answer.
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::variant_has_serde_alias(v))
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] cannot describe a variant with `#[serde(alias = \"…\")]`: \
+             the alias is accepted when deserializing but never written when serializing, so one \
+             string set cannot be right for both requests and responses — listing it advertises \
+             a value the server never emits, omitting it rejects one the handler accepts. Use \
+             `#[serde(rename = \"…\")]` if the wire spelling should change in both directions, \
+             or write the `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::Result<()> {
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| !matches!(v.fields, Fields::Unit))
+    {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[derive(OpenApiSchema)] supports only enums whose variants are all unit variants \
+             (they map to a JSON string enum). For a data-carrying enum, write the \
+             `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`.",
+        ));
+    }
+
+    // All-unit is not sufficient: a non-default container representation
+    // changes what a unit variant serializes to, so the string-enum schema
+    // below would be confidently wrong. `#[serde(tag = "t")]` makes each
+    // variant the object `{"t":"Variant"}`, and `#[serde(untagged)]` makes it
+    // `null` — a generated client built from the string enum would send a bare
+    // string to a handler that accepts neither. Refuse rather than guess, on
+    // the same reasoning that refuses data-carrying variants.
+    if let Some(repr) = crate::schema::serde_enum_representation(&input.attrs) {
+        // `untagged` is a bare word; `tag` / `content` take a value. Render each
+        // the way it is actually written, so the diagnostic quotes real syntax.
+        let (written, becomes) = match repr {
+            "untagged" => ("#[serde(untagged)]", "`null`"),
+            "tag" => ("#[serde(tag = \"...\")]", "an object"),
+            "content" => ("#[serde(content = \"...\")]", "an object"),
+            // Conversion attributes route the value through another type
+            // entirely, so the variant names never reach the wire at all.
+            "into" => (
+                "#[serde(into = \"...\")]",
+                "whatever the conversion type serializes as",
+            ),
+            "from" => (
+                "#[serde(from = \"...\")]",
+                "whatever the conversion type serializes as",
+            ),
+            _ => (
+                "#[serde(try_from = \"...\")]",
+                "whatever the conversion type serializes as",
+            ),
+        };
+        return Err(syn::Error::new_spanned(
+            input,
+            format!(
+                "#[derive(OpenApiSchema)] supports only serde's default (externally tagged) \
+                 enum representation; `{written}` makes a unit variant serialize as {becomes}, \
+                 not the JSON string the derived schema would advertise — a generated client \
+                 would send a contract the handler does not accept. Write the `OpenApiSchema` \
+                 impl by hand and register it with `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+
+    // A variant present in only one serde direction has no correct rendering in
+    // a document that describes both. Refuse rather than publish a set that is
+    // right for responses and wrong for requests (or the reverse).
+    if let Some(variant) = data
+        .variants
+        .iter()
+        .find(|v| crate::schema::variant_directional_skip(v).is_some())
+    {
+        let attribute = crate::schema::variant_directional_skip(variant)
+            .expect("the find predicate just matched it");
+        let consequence = if attribute == "skip_deserializing" {
+            "it is still serialized, so advertising it would tell a client it may send a \
+             value serde rejects as an unknown variant"
+        } else {
+            "it is still accepted on input, so omitting it would deny a value the handler takes"
+        };
+        return Err(syn::Error::new_spanned(
+            variant,
+            format!(
+                "#[derive(OpenApiSchema)] cannot describe a variant skipped in only one serde \
+                 direction: one schema covers both requests and responses, and with \
+                 `#[serde({attribute})]` {consequence}. Use `#[serde(skip)]` if the variant \
+                 should not appear at all, or write the `OpenApiSchema` impl by hand and \
+                 register it with `OpenApiConfig::register_schema`."
+            ),
+        ));
+    }
+
+    reject_aliased_variants(data)?;
+    reject_untagged_variants(data)?;
+
+    // A split rename is the same asymmetry as a directional skip: one schema,
+    // two disagreeing wire spellings. Advertising the serialize side would have
+    // a generated client send `in_progress` to a handler whose `Deserialize`
+    // accepts `inProgress`.
+    let split = crate::schema::serde_split_rename(&input.attrs, "rename_all")
+        .map(|key| (key, None))
+        .or_else(|| {
+            data.variants.iter().find_map(|v| {
+                crate::schema::serde_split_rename(&v.attrs, "rename").map(|key| (key, Some(v)))
+            })
+        });
+    if let Some((key, variant)) = split {
+        let message = format!(
+            "#[derive(OpenApiSchema)] cannot describe a split `#[serde({key}(serialize = ..., \
+             deserialize = ...))]` whose two sides differ: one schema is advertised for both \
+             requests and responses, so a client generated from the serialize spelling would \
+             send a value the handler's `Deserialize` rejects. Use a symmetric \
+             `{key} = \"...\"`, or write the `OpenApiSchema` impl by hand and register it with \
+             `OpenApiConfig::register_schema`."
+        );
+        return Err(variant.map_or_else(
+            || syn::Error::new_spanned(input, message.clone()),
+            |v| syn::Error::new_spanned(v, message.clone()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    /// Run the struct audit over a fixture, returning the rejection message.
+    fn audit(input: &DeriveInput) -> Result<(), String> {
+        let Data::Struct(data) = &input.data else {
+            panic!("fixture must be a struct");
+        };
+        let Fields::Named(named) = &data.fields else {
+            panic!("fixture must have named fields");
+        };
+        reject_undescribable_struct(input, named).map_err(|e| e.to_string())
+    }
+
+    /// A serialization adapter decides what actually reaches the wire, so the
+    /// field's Rust type stops describing it. Rejected rather than guessed:
+    /// publishing the Rust shape would be confidently wrong.
+    #[test]
+    fn a_field_serialize_adapter_is_refused() {
+        let err = audit(&parse_quote! {
+            struct Money {
+                #[serde(serialize_with = "as_string")]
+                amount: i64,
+            }
+        })
+        .expect_err("a serialize adapter must be refused");
+        assert!(
+            err.contains("serialize_with"),
+            "the message must name the attribute it refused: {err}"
+        );
+    }
+
+    /// `with` sets both directions at once, so it is wrong for both.
+    #[test]
+    fn a_field_with_adapter_is_refused() {
+        let err = audit(&parse_quote! {
+            struct Money {
+                #[serde(with = "string_money")]
+                amount: i64,
+            }
+        })
+        .expect_err("a `with` adapter must be refused");
+        assert!(err.contains("with"), "{err}");
+    }
+
+    /// The deserialize half is refused too, and deliberately: this one schema
+    /// serves requests as well as responses, so an adapter on either side makes
+    /// it wrong for that side. (`#[model]`'s read schema, which describes only a
+    /// response, keeps `deserialize_with` for exactly that reason.)
+    #[test]
+    fn a_field_deserialize_adapter_is_refused_too() {
+        let err = audit(&parse_quote! {
+            struct Money {
+                #[serde(deserialize_with = "lenient")]
+                amount: i64,
+            }
+        })
+        .expect_err("a deserialize adapter must be refused");
+        assert!(err.contains("deserialize_with"), "{err}");
+    }
+
+    /// The guard must not fire on an ordinary struct — over-rejection would
+    /// break every existing derive.
+    #[test]
+    fn a_plain_struct_still_passes() {
+        audit(&parse_quote! {
+            struct Plain {
+                id: i64,
+                #[serde(rename = "displayName")]
+                name: String,
+                tags: Option<Vec<String>>,
+            }
+        })
+        .expect("a plain struct must still be describable");
+    }
+
+    /// `skip_serializing_if` alone IS direction-dependent: the response may
+    /// omit the field while serde still demands it on a request.
+    #[test]
+    fn skip_serializing_if_alone_is_still_refused() {
+        let err = audit(&parse_quote! {
+            struct Row {
+                #[serde(skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect_err("a bare skip_serializing_if on a non-Option field must be refused");
+        assert!(err.contains("skip_serializing_if"), "{err}");
+    }
+
+    /// Adding a field `#[serde(default)]` makes omission valid in BOTH
+    /// directions, so the type becomes describable and must not be refused.
+    #[test]
+    fn a_field_default_rescues_skip_serializing_if() {
+        audit(&parse_quote! {
+            struct Row {
+                #[serde(default, skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect("default + skip_serializing_if is describable");
+    }
+
+    /// The valued spelling counts too.
+    #[test]
+    fn a_valued_field_default_rescues_skip_serializing_if() {
+        audit(&parse_quote! {
+            struct Row {
+                #[serde(default = "empty_tags", skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect("default = \"path\" + skip_serializing_if is describable");
+    }
+
+    /// A CONTAINER default covers every field, so it rescues them too.
+    #[test]
+    fn a_container_default_rescues_skip_serializing_if() {
+        audit(&parse_quote! {
+            #[serde(default)]
+            struct Row {
+                #[serde(skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .expect("a container default makes every field omissible on input");
+    }
+
+    /// A FIELD alias is the same deserialize-only widening as a variant alias.
+    /// Missing this while catching the variant form was the fourth instance on
+    /// this branch of a rule applied at one level of the syntax tree and not
+    /// the other, so both now share one predicate.
+    #[test]
+    fn a_field_alias_is_refused() {
+        let err = audit(&parse_quote! {
+            struct Row {
+                #[serde(alias = "legacy_name")]
+                name: String,
+            }
+        })
+        .expect_err("an aliased field must be refused");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// Same parser-robustness guarantee the variant scan has.
+    #[test]
+    fn a_field_alias_after_a_list_valued_attribute_is_still_seen() {
+        let err = audit(&parse_quote! {
+            struct Row {
+                #[serde(bound(deserialize = "T: Clone"), alias = "legacy_name")]
+                name: String,
+            }
+        })
+        .expect_err("a field alias behind a list-valued sibling must still be found");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// A symmetric `rename` on a field must still be describable.
+    #[test]
+    fn a_renamed_field_is_still_describable() {
+        audit(&parse_quote! {
+            struct Row {
+                #[serde(rename = "displayName")]
+                name: String,
+            }
+        })
+        .expect("a symmetric field rename must stay describable");
+    }
+
+    fn audit_enum(input: &DeriveInput) -> Result<(), String> {
+        let Data::Enum(data) = &input.data else {
+            panic!("fixture must be an enum");
+        };
+        reject_undescribable_enum(input, data).map_err(|e| e.to_string())
+    }
+
+    /// `alias` widens what deserialization ACCEPTS without changing what
+    /// serialization writes, so no single string set is right for both
+    /// directions.
+    #[test]
+    fn a_variant_alias_is_refused() {
+        let err = audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                #[serde(alias = "legacy")]
+                Retired,
+            }
+        })
+        .expect_err("an aliased variant must be refused");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// The scan must survive a sibling list-valued attribute — the parser bug
+    /// class that has bitten this crate before, where an unconsumed `bound(..)`
+    /// aborts the walk and the attribute after it reads as absent.
+    #[test]
+    fn an_alias_after_a_list_valued_attribute_is_still_seen() {
+        let err = audit_enum(&parse_quote! {
+            #[serde(bound(deserialize = "T: Clone"))]
+            enum Status {
+                Active,
+                #[serde(bound(deserialize = "T: Clone"), alias = "legacy")]
+                Retired,
+            }
+        })
+        .expect_err("an alias behind a list-valued sibling must still be found");
+        assert!(err.contains("alias"), "{err}");
+    }
+
+    /// serde honours `untagged` at the VARIANT level too, where it makes that
+    /// one variant serialize as `null` instead of its name. The container-level
+    /// guard reads `input.attrs` and never saw it.
+    #[test]
+    fn a_variant_level_untagged_is_refused() {
+        let err = audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                Retired,
+                #[serde(untagged)]
+                Unknown,
+            }
+        })
+        .expect_err("a variant-level untagged must be refused");
+        assert!(err.contains("untagged"), "{err}");
+    }
+
+    /// `#[serde(other)]` is the catch-all: deserialization accepts ANY
+    /// unrecognised spelling for that variant, so a closed string set rejects
+    /// requests the handler takes. Same deserialize-only widening as `alias`.
+    #[test]
+    fn a_catch_all_variant_is_refused() {
+        let err = audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                Retired,
+                #[serde(other)]
+                Unknown,
+            }
+        })
+        .expect_err("a #[serde(other)] catch-all must be refused");
+        assert!(err.contains("other"), "{err}");
+    }
+
+    /// The container-level form must still be caught — the new variant scan is
+    /// an addition, not a replacement.
+    #[test]
+    fn a_container_level_untagged_is_still_refused() {
+        let err = audit_enum(&parse_quote! {
+            #[serde(untagged)]
+            enum Status {
+                Active,
+                Retired,
+            }
+        })
+        .expect_err("a container-level untagged must still be refused");
+        assert!(err.contains("untagged"), "{err}");
+    }
+
+    /// A plain unit enum is the whole point of the derive and must survive both
+    /// scans untouched.
+    #[test]
+    fn a_plain_unit_enum_is_still_describable() {
+        audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                Retired,
+            }
+        })
+        .expect("a plain unit enum must stay describable");
+    }
+
+    /// `rename` changes BOTH directions, so it stays describable — the guard
+    /// must not swallow the ordinary case.
+    #[test]
+    fn a_renamed_variant_is_still_describable() {
+        audit_enum(&parse_quote! {
+            enum Status {
+                Active,
+                #[serde(rename = "retired")]
+                Retired,
+            }
+        })
+        .expect("a symmetric rename must still be describable");
+    }
+
+    /// A neighbouring serde key that merely *contains* an adapter name is not
+    /// one: the scan matches whole keys.
+    #[test]
+    fn a_lookalike_key_is_not_an_adapter() {
+        audit(&parse_quote! {
+            struct Plain {
+                #[serde(default = "with_default")]
+                amount: i64,
+            }
+        })
+        .expect("`default = \"with_default\"` is not an adapter");
+    }
 }

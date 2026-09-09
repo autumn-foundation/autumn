@@ -418,6 +418,61 @@ that does not configure `[replication]` behaves differently.
 knowing which fields the caller meant to leave defaulted, which a codemod cannot
 infer; the fix is the one-line `..AutumnConfig::default()` above.
 
+### Config: `JobConfig` gains a `sqlite` field, and `SchedulerBackend` gains a `Sqlite` variant
+
+**Why:** Durable jobs and a single-host scheduler on SQLite (issue #1907) need
+their own configuration. `JobConfig` has all-public fields and `SchedulerBackend`
+is not `#[non_exhaustive]`, so both additions are breaking for anyone who
+constructs the struct literally or matches the enum exhaustively.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::{JobConfig, SchedulerBackend};
+
+let jobs = JobConfig {
+    backend: "postgres".to_owned(),
+    workers: 4,
+    // …every other field spelled out…
+};
+
+let label = match config.scheduler.backend {
+    SchedulerBackend::InProcess => "single process",
+    SchedulerBackend::Postgres => "fleet",
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::{JobConfig, SchedulerBackend};
+
+let jobs = JobConfig {
+    backend: "postgres".to_owned(),
+    workers: 4,
+    ..JobConfig::default()
+};
+
+let label = match config.scheduler.backend {
+    SchedulerBackend::InProcess => "single process",
+    SchedulerBackend::Postgres => "fleet",
+    SchedulerBackend::Sqlite => "processes on one host",
+    _ => "unknown",
+};
+```
+
+The new field is `pub sqlite: JobSqliteConfig`, whose `Default` is a 30-second
+visibility timeout and a 250ms poll interval, so `..Default::default()` needs no
+other change. `SchedulerBackend::Sqlite` reports `is_fleet_distributed() == true`
+— it coordinates several processes, on one host.
+
+Nothing changes for an app that keeps `jobs.backend` and `scheduler.backend` as
+they are.
+
+**Automation:** `manual` — a struct literal can only be rewritten by knowing
+which fields the caller meant to default, and a match arm needs a decision about
+what the new variant means for that call site.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →
@@ -728,6 +783,50 @@ async fn beta_page() -> &'static str {
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
 
+### OpenApiSchema: `#[serde(skip_serializing_if)]` now needs `#[serde(default)]`
+
+**Why:** `skip_serializing_if` governs serialization alone — a response may omit
+the field, while serde still rejects a *request* that omits it. The derive used
+to accept the attribute whenever the field was spelled `Option<T>`, treating
+that as proof omission is valid on the way in. It is only proof for `std`'s
+`Option`, and a proc macro cannot tell: it sees the tokens as written, so an
+application's own type named `Option` reads identically and *is* required on the
+way in. For such a type neither answer is right — marking the property
+`required` lets a response omit what the schema demands, marking it optional
+lets a client omit what serde rejects — so the shape is refused rather than
+guessed. `#[serde(default)]` is what actually makes omission valid in both
+directions, and it is a no-op on a real `Option<T>`, which serde already fills
+with `None` when the field is missing.
+
+**Before (`0.7`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+struct Profile {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
+}
+```
+
+**After (`0.8`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+struct Profile {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
+}
+```
+
+**Automation:** `manual` — the fix is one attribute, but deciding it is the
+right fix is not mechanical. On a genuine `Option<T>` adding `#[serde(default)]`
+changes nothing and is always correct; on any other type it changes what serde
+accepts, so a codemod that added it everywhere would silently widen a request
+contract. `#[model]` is unaffected: its read schema describes a response only,
+so a conditionally-skipped column there stays sound without the attribute.
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
@@ -866,6 +965,18 @@ When `[replication] enabled = true`, pooled SQLite connections are created with
 checkpoints. That is a deliberate behaviour change for replicating apps and is
 described in the guide; apps without the section keep SQLite's default
 auto-checkpointing.
+
+### New: `[jobs.sqlite]` (durable SQLite job queue)
+
+Read only when `jobs.backend = "sqlite"`; every other backend ignores it. Two
+keys, both with `AUTUMN_JOBS__SQLITE__*` environment overrides:
+`visibility_timeout_ms` (default 30 000) bounds how long a claim a crashed
+worker left behind stays unreclaimed, and `poll_interval_ms` (default 250) sets
+how fast an idle worker sees work another process enqueued. See
+[SQLite in production → Durable jobs without Redis](../guide/sqlite-in-production.md#durable-jobs-without-redis).
+
+`scheduler.backend = "sqlite"` needs no new section: it reuses
+`scheduler.lease_ttl_secs` and `scheduler.key_prefix`.
 
 ## Behavior changes
 
