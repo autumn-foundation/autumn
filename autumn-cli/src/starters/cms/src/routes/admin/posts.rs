@@ -1205,25 +1205,8 @@ pub async fn update(
     }
 
     let desired = crate::hooks::normalize_slug(&form.slug, &form.title);
-    // The parent this save is *moving the page to*, not the one it has: a page
-    // being re-filed competes with its new siblings, and allocating against the
-    // old ones would let it land on a slug already taken where it is going.
-    let slug = repos
-        .with_conn(async |conn| {
-            content::ensure_unique_slug(
-                conn,
-                &post_type,
-                &desired,
-                optional_id(form.parent_id.as_ref()),
-                Some(id),
-            )
-            .await
-        })
-        .await?;
-
     let form_snapshot = (
         form.title.trim().to_owned(),
-        slug,
         form.excerpt.trim().to_owned(),
         form.body.clone(),
         form.password.trim().to_owned(),
@@ -1274,83 +1257,132 @@ pub async fn update(
     // connection, and a tag that survives a failed save is harmless — an
     // orphaned tag is visible and removable, unlike a half-applied post.
     let term_ids = resolve_term_ids(&repos, &post_type, Some(existing.id), &form).await?;
-    let updated = repos
-        .with_conn(async |conn| {
-            use diesel_async::AsyncConnection as _;
-            conn.transaction(async move |conn| {
-                let updated = content::update_post_with_revision(
-                    conn,
-                    id,
-                    user.id,
-                    "Edited",
-                    expected_lock_version,
-                    registered.supports_revisions,
-                    move |post| {
-                        let (
-                            title,
-                            slug,
-                            excerpt,
-                            body,
-                            password,
-                            sticky,
-                            comments_open,
-                            parent,
-                            media,
-                            order,
-                        ) = form_snapshot;
-                        post.title = title;
-                        post.slug = slug;
-                        post.excerpt = excerpt;
-                        post.body = body;
-                        post.password = password;
-                        post.sticky = sticky;
-                        post.comment_status =
-                            if comments_open { "open" } else { "closed" }.to_owned();
-                        post.parent_id = parent;
-                        post.featured_media_id = media;
-                        post.menu_order = order;
-                        match scheduled_for {
-                            Some(when) => post.published_at = Some(when),
-                            // Blanking the date field on something that has
-                            // never actually been live clears the timestamp.
-                            // Leaving it made "unschedule this" keep the old
-                            // due time, so publishing the draft later dated and
-                            // ordered it at a moment that never happened — and
-                            // with a future date, gave it a dated permalink and
-                            // archive in the future. `validate_post_update`
-                            // stamps `now` when a post with no date goes live,
-                            // which is what the editor meant.
-                            //
-                            // Only for a row that is not live: for a published
-                            // or private post `published_at` is a publication
-                            // record, and an edit must never reorder the blog
-                            // index.
-                            None if !matches!(post.status.as_str(), "publish" | "private") => {
-                                post.published_at = None;
+
+    // Retried on a slug collision, like the insert allocators.
+    //
+    // The slug is allocated on a connection released before this transaction
+    // opens, so two edits racing for the same slug under the same parent can
+    // both see it free — and the loser hit `idx_pages_parent_slug` (or either
+    // of the others) with no retry, returning a raw constraint error where a
+    // create would have got the next suffix. Re-allocating inside each attempt
+    // is what makes the second pass find the slug taken.
+    let parent_id = optional_id(form.parent_id.as_ref());
+    let mut attempts = 0;
+    let updated = loop {
+        attempts += 1;
+        let term_ids = term_ids.clone();
+        let form_snapshot = form_snapshot.clone();
+        let post_type = post_type.clone();
+        let desired = desired.clone();
+        let status = status.clone();
+        let user = user.clone();
+        let outcome = repos
+            .with_conn(async |conn| {
+                use diesel_async::AsyncConnection as _;
+                conn.transaction(async move |conn| {
+                    // Allocated *inside* the transaction, against the parent
+                    // this save is moving the page to rather than the one it
+                    // has — a page being re-filed competes with its new
+                    // siblings, and allocating against the old ones would let
+                    // it land on a slug already taken where it is going.
+                    let slug = content::ensure_unique_slug(
+                        conn,
+                        &post_type,
+                        &desired,
+                        parent_id,
+                        Some(id),
+                    )
+                    .await?;
+                    let updated = content::update_post_with_revision(
+                        conn,
+                        id,
+                        user.id,
+                        "Edited",
+                        expected_lock_version,
+                        registered.supports_revisions,
+                        move |post| {
+                            let (
+                                title,
+                                excerpt,
+                                body,
+                                password,
+                                sticky,
+                                comments_open,
+                                parent,
+                                media,
+                                order,
+                            ) = form_snapshot;
+                            post.title = title;
+                            // The slug allocated by this attempt, not one
+                            // captured before the transaction opened.
+                            post.slug = slug;
+                            post.excerpt = excerpt;
+                            post.body = body;
+                            post.password = password;
+                            post.sticky = sticky;
+                            post.comment_status =
+                                if comments_open { "open" } else { "closed" }.to_owned();
+                            post.parent_id = parent;
+                            post.featured_media_id = media;
+                            post.menu_order = order;
+                            match scheduled_for {
+                                Some(when) => post.published_at = Some(when),
+                                // Blanking the date field on something that has
+                                // never actually been live clears the timestamp.
+                                // Leaving it made "unschedule this" keep the old
+                                // due time, so publishing the draft later dated and
+                                // ordered it at a moment that never happened — and
+                                // with a future date, gave it a dated permalink and
+                                // archive in the future. `validate_post_update`
+                                // stamps `now` when a post with no date goes live,
+                                // which is what the editor meant.
+                                //
+                                // Only for a row that is not live: for a published
+                                // or private post `published_at` is a publication
+                                // record, and an edit must never reorder the blog
+                                // index.
+                                None if !matches!(post.status.as_str(), "publish" | "private") => {
+                                    post.published_at = None;
+                                }
+                                None => {}
                             }
-                            None => {}
-                        }
-                    },
-                )
-                .await?;
+                        },
+                    )
+                    .await?;
 
-                // Unconditionally — see `create`. An empty selection is a
-                // deliberate "file this under nothing", not "leave it alone".
-                content::set_post_terms(conn, id, term_ids).await?;
+                    // Unconditionally — see `create`. An empty selection is a
+                    // deliberate "file this under nothing", not "leave it alone".
+                    content::set_post_terms(conn, id, term_ids).await?;
 
-                // A status change goes through the state machine, never through the
-                // plain field write above — so an illegal edge is refused rather
-                // than persisted, and now it is refused before anything commits.
-                let transitioned = status != updated.status;
-                if transitioned {
-                    content::transition_status(conn, id, &status, Some(user.id), Some(&user))
-                        .await?;
-                }
-                Ok::<_, AutumnError>((updated, transitioned))
+                    // A status change goes through the state machine, never through the
+                    // plain field write above — so an illegal edge is refused rather
+                    // than persisted, and now it is refused before anything commits.
+                    let transitioned = status != updated.status;
+                    if transitioned {
+                        content::transition_status(conn, id, &status, Some(user.id), Some(&user))
+                            .await?;
+                    }
+                    Ok::<_, AutumnError>((updated, transitioned))
+                })
+                .await
             })
-            .await
-        })
-        .await?;
+            .await;
+        match outcome {
+            Ok(value) => break value,
+            Err(error)
+                if attempts < 5
+                    && autumn_web::error::unique_violation_field(
+                        &error,
+                        content::SLUG_COLLISION_INDEXES,
+                    )
+                    .is_some() =>
+            {
+                // Re-allocate against the state the winner left behind.
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let (_updated, transitioned) = updated;
 
     // Actions fire only after the transaction has committed: a listener that
@@ -1515,6 +1547,12 @@ async fn resolve_term_ids(
                 let term = match existing {
                     Some(term) => term,
                     None => {
+                        // The tag box is a *third* term-creation path, after
+                        // the term screen and the importer — and the one an
+                        // author reaches without meaning to create anything.
+                        // A configured probe at `/tag/status` claims that
+                        // archive whichever door the term came through.
+                        content::guard_term_path(taxonomy.slug, &slug)?;
                         match repos
                             .terms
                             .save(&crate::models::NewTerm {

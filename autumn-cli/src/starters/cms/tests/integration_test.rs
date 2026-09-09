@@ -9958,3 +9958,74 @@ async fn seeding_skips_a_slug_the_other_bare_type_already_holds() {
     };
     assert_eq!(taken, 1, "the seed must not duplicate a taken bare path");
 }
+
+/// Every approved comment is reachable, however long the thread gets.
+///
+/// The thread loaded a flat window of the oldest 200, so once a post passed
+/// that, every later comment was permanently invisible: no page to turn to, and
+/// a signed-in commenter redirected to an anchor that was not on the page they
+/// landed on. Taking the newest 200 instead would have detached replies whose
+/// roots fell off the front, so the window is a page of *roots* and every reply
+/// travels with the root it belongs to.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn every_approved_comment_stays_reachable() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Busy Thread", "Body.", "publish").await;
+
+    // 60 roots, more than one page, plus a reply on the last one — which is the
+    // comment a flat oldest-first window loses first.
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             SELECT {post_id}, NULL, 1, 'Owner', 'owner@example.com', '', '',
+                    'Root ' || lpad(g::text, 3, '0'), 'approved',
+                    NOW() - ((100 - g) || ' minutes')::interval
+             FROM generate_series(1, 60) AS g"
+        ),
+    )
+    .await
+    .expect("seed the roots");
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             SELECT {post_id},
+                    (SELECT id FROM comments WHERE body = 'Root 060'),
+                    1, 'Owner', 'owner@example.com', '', '',
+                    'A late reply', 'approved', NOW()"
+        ),
+    )
+    .await
+    .expect("seed the reply");
+
+    sign_out(&client);
+    let first = client.get("/busy-thread").send().await;
+    first.assert_ok();
+    let first = first.text();
+    assert!(
+        first.contains("Root 001"),
+        "the first page starts at the top"
+    );
+    assert!(
+        !first.contains("Root 060"),
+        "and stops at the page size rather than the whole thread"
+    );
+    assert!(first.contains("Page 1 of 2"), "with a pager:\n{first}");
+
+    // The later roots are reachable, and the reply came with its root rather
+    // than being stranded.
+    let second = client.get("/busy-thread?comments=2").send().await;
+    second.assert_ok();
+    let second = second.text();
+    assert!(second.contains("Root 060"), "the tail is reachable");
+    assert!(
+        second.contains("A late reply"),
+        "and a reply renders on the page its root is on:\n{second}"
+    );
+    assert!(!second.contains("Root 001"), "page two is not page one");
+}

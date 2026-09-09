@@ -9,10 +9,10 @@ use autumn_web::security::{CsrfFormField, CsrfToken};
 
 use crate::models::{MenuItem, Post, Term, User};
 use crate::repositories::{
-    MenuItemRepository as _, MenuRepository as _, PgAttachmentRepository, PgCommentRepository,
-    PgMenuItemRepository, PgMenuRepository, PgPostMetaRepository, PgPostRepository,
-    PgSiteOptionRepository, PgTermRepository, PgUserRepository, PgWidgetRepository,
-    PostRepository as _, TermRepository as _, UserRepository as _,
+    MenuRepository as _, PgAttachmentRepository, PgCommentRepository, PgMenuItemRepository,
+    PgMenuRepository, PgPostMetaRepository, PgPostRepository, PgSiteOptionRepository,
+    PgTermRepository, PgUserRepository, PgWidgetRepository, PostRepository as _,
+    TermRepository as _, UserRepository as _,
 };
 use crate::settings::{SITE_SCOPE, Settings, cached_settings};
 use crate::taxonomy::{PgPostTermLinkRepository, PostTermLinkRepository as _};
@@ -224,7 +224,23 @@ impl Repos {
         else {
             return Ok(Vec::new());
         };
-        let items = self.menu_items.find_by_menu_id(menu.id).await?;
+        // Bounded with the same constant the Appearance screen renders, so the
+        // set an administrator can see and remove is the set visitors get. An
+        // unbounded read here made every public request pay for a large menu —
+        // and, since that screen shows only the first hundred, the excess could
+        // be neither seen nor deleted.
+        let items = self
+            .with_conn(async move |conn| {
+                Ok(crate::content::menu_items_for(
+                    conn,
+                    &[menu.id],
+                    crate::routes::admin::appearance::MENU_ITEMS_SHOWN,
+                )
+                .await?
+                .remove(&menu.id)
+                .unwrap_or_default())
+            })
+            .await?;
 
         // Every target loaded in two set queries — plus one per level of page
         // hierarchy — rather than one query per item and one more per ancestor.

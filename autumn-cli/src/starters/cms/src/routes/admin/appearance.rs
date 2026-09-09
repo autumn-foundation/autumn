@@ -79,7 +79,7 @@ const MENUS_PER_PAGE: i64 = 20;
 ///
 /// A menu is navigation: past a couple of dozen entries it has stopped being
 /// one, and the screen should not become unusable because a script filled it.
-const MENU_ITEMS_SHOWN: i64 = 100;
+pub const MENU_ITEMS_SHOWN: i64 = 100;
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct AppearanceFilter {

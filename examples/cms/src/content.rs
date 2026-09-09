@@ -145,6 +145,15 @@ pub async fn update_post_with_revision(
         // back: the page's full path is only settled once the slug and the
         // parent are both stored, and this statement is what stores them.
         guard_page_path(conn, post_id).await?;
+        // And the custom-type shape, which the insert allocator already checks.
+        // Renaming an existing item is the other way onto a claimed path, and
+        // guarding only creation left it open.
+        if !BARE_PATH_TYPES.contains(&saved.post_type.as_str()) {
+            guard_claimed_path(
+                &[saved.post_type.clone(), saved.slug.clone()],
+                &saved.post_type,
+            )?;
+        }
         Ok::<_, AutumnError>(saved)
     })
     .await
@@ -3362,13 +3371,13 @@ pub async fn posts_for_comments(
         .collect())
 }
 
-/// A post's approved comments, oldest first, bounded.
+/// A flat page of a post's approved comments, oldest first.
 ///
-/// Both the status filter and the bound are applied in SQL. Ordering oldest
-/// first is what makes truncation safe for threading: a reply is always created
-/// after the comment it replies to, so any comment inside the window has its
-/// parent inside the window too, and `assemble_thread` never drops a subtree
-/// because its root fell off the end.
+/// For the REST API, which pages explicitly and returns a list rather than a
+/// tree — so a flat window is the right shape there and the caller can reach
+/// every comment by asking for the next page. The HTML thread uses
+/// `approved_thread_page` instead, because it renders a tree and a flat window
+/// would detach replies from roots that fell outside it.
 pub async fn approved_comments_page(
     conn: &mut AsyncPgConnection,
     post_id: i64,
@@ -3384,6 +3393,72 @@ pub async fn approved_comments_page(
         .select(Comment::as_select())
         .load(conn)
         .await?)
+}
+
+/// How many *top-level* comments one page of a thread holds.
+///
+/// Threads paginate by root, not by row. Taking a flat window of the oldest N
+/// comments meant every comment past that window was unreachable for good:
+/// there was no page to turn to, and a signed-in commenter was redirected to an
+/// anchor that did not exist on the page they landed on. Taking the newest N
+/// instead would have detached replies whose parents fell off the front, since
+/// `assemble_thread` builds from roots down.
+///
+/// Paginating by root keeps both properties: every comment is on exactly one
+/// page, and every reply is on the page its root is.
+pub const THREAD_ROOTS_PER_PAGE: i64 = 50;
+
+/// One page of a post's approved thread: a window of roots, plus every approved
+/// descendant of those roots.
+///
+/// Returns the comments and the total number of roots, so the caller can page.
+/// The descendant walk is level by level and bounded by `MAX_COMMENT_DEPTH`,
+/// which the write path enforces — so it is a handful of queries whatever the
+/// thread looks like.
+pub async fn approved_thread_page(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    offset: i64,
+    roots_per_page: i64,
+) -> AutumnResult<(Vec<Comment>, i64)> {
+    let total_roots: i64 = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .filter(comments::parent_id.is_null())
+        .count()
+        .get_result(conn)
+        .await?;
+
+    let mut collected: Vec<Comment> = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .filter(comments::parent_id.is_null())
+        .order((comments::created_at.asc(), comments::id.asc()))
+        .offset(offset.max(0))
+        .limit(roots_per_page.max(0))
+        .select(Comment::as_select())
+        .load(conn)
+        .await?;
+
+    let mut frontier: Vec<i64> = collected.iter().map(|comment| comment.id).collect();
+    for _ in 0..=MAX_COMMENT_DEPTH {
+        if frontier.is_empty() {
+            break;
+        }
+        let children: Vec<Comment> = comments::table
+            .filter(comments::status.eq("approved"))
+            .filter(comments::parent_id.eq_any(&frontier))
+            .order((comments::created_at.asc(), comments::id.asc()))
+            .select(Comment::as_select())
+            .load(conn)
+            .await?;
+        frontier = children.iter().map(|comment| comment.id).collect();
+        collected.extend(children);
+    }
+
+    // `assemble_thread` expects the rows in creation order.
+    collected.sort_by_key(|comment| (comment.created_at, comment.id));
+    Ok((collected, total_roots))
 }
 
 /// Rebuild a post's approved-comment counter from ground truth, under its lock.
@@ -3713,9 +3788,13 @@ mod slug_shape_tests {
         // Nothing is claimed until a configuration has been observed, which is
         // the store's whole design — so this asserts the *function*, against a
         // path the defaults do claim once seeded.
+        // One observation per process — the store is a `OnceLock` by design, so
+        // every assertion below shares this configuration. Two probe paths, so
+        // both taxonomy rewrite bases are covered by the one seeding.
         super::observe_probe_paths(&{
             let mut config = autumn_web::config::AutumnConfig::default();
             "/category/status".clone_into(&mut config.health.path);
+            "/tag/status".clone_into(&mut config.health.live_path);
             config
         });
 
@@ -3730,6 +3809,21 @@ mod slug_shape_tests {
         assert!(
             !claimed(&["category"]),
             "the prefix alone serves nothing and is not claimed"
+        );
+
+        // Through `guard_term_path`, which is what the three term-creation
+        // paths call — the term screen, the importer, and the post editor's tag
+        // box. It resolves the taxonomy's *rewrite base*, so `post_tag` has to
+        // become `/tag` rather than `/post_tag`.
+        assert!(super::guard_term_path("category", "status").is_err());
+        assert!(super::guard_term_path("post_tag", "status").is_err());
+        assert!(
+            super::guard_term_path("post_tag", "rust").is_ok(),
+            "an ordinary tag is untouched"
+        );
+        assert!(
+            super::guard_term_path("not_a_taxonomy", "status").is_ok(),
+            "an unregistered taxonomy has no base to collide on"
         );
     }
 }

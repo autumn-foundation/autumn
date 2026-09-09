@@ -38,21 +38,34 @@ pub async fn render_thread(
     session: &Session,
     csrf: &Csrf,
     post: &Post,
+    page: i64,
 ) -> AutumnResult<Markup> {
     let settings = repos.settings().await?;
     let viewer = repos.current_user(session).await?;
 
-    // Status filter and bound both in SQL. The generated `find_by_post_id`
-    // returns every row of every status, so filtering afterwards made a public
-    // page view cost the whole moderation queue — which, with guest comments
-    // on, anyone can grow.
+    // The status filter and the bound are both in SQL. The generated
+    // `find_by_post_id` returns every row of every status, so filtering
+    // afterwards made a public page view cost the whole moderation queue —
+    // which, with guest comments on, anyone can grow.
+    //
+    // Paginated by *root*, so every comment is on exactly one page and every
+    // reply is on the page its root is. A flat window of the oldest N put every
+    // later comment permanently out of reach — no page to turn to, and a
+    // signed-in commenter redirected to an anchor that was not on the page.
+    // The post's own URL, so the pager links back to the page it is on.
+    let permalink = repos.permalink(post, &settings).await?;
     let mut conn = repos.conn().await?;
-    let total = content::approved_comment_count(&mut conn, post.id).await?;
-    let rows: Vec<Comment> =
-        content::approved_comments_page(&mut conn, post.id, 0, content::MAX_THREAD_COMMENTS)
-            .await?;
+    let (rows, total_roots) = content::approved_thread_page(
+        &mut conn,
+        post.id,
+        (page - 1) * content::THREAD_ROOTS_PER_PAGE,
+        content::THREAD_ROOTS_PER_PAGE,
+    )
+    .await?;
     drop(conn);
-    let truncated = total > i64::try_from(rows.len()).unwrap_or(i64::MAX);
+    let last_page = ((total_roots + content::THREAD_ROOTS_PER_PAGE - 1)
+        / content::THREAD_ROOTS_PER_PAGE)
+        .max(1);
 
     // Resolve account-backed display names once. A registered commenter renders
     // under their *current* public name; a guest renders under the name they
@@ -106,12 +119,22 @@ pub async fn render_thread(
                 (render_nodes(&views, 0, &thread_ctx))
             }
 
-            @if truncated {
-                p class="text-sm text-gray-500 mb-8" {
-                    "Showing the first "
-                    (autumn_web::format::pluralize(
-                        i64::try_from(sorted.len()).unwrap_or(0), "comment"))
-                    " of " (total) "."
+            @if last_page > 1 {
+                nav aria-label="Comment pages"
+                    class="flex items-center justify-between text-sm mb-8" {
+                    @if page > 1 {
+                        a href=(format!("{permalink}?comments={}#comments-heading", page - 1))
+                          class="text-indigo-700 hover:underline" { "← Earlier comments" }
+                    } @else {
+                        span {}
+                    }
+                    span class="text-gray-500" { "Page " (page) " of " (last_page) }
+                    @if page < last_page {
+                        a href=(format!("{permalink}?comments={}#comments-heading", page + 1))
+                          class="text-indigo-700 hover:underline" { "Later comments →" }
+                    } @else {
+                        span {}
+                    }
                 }
             }
 

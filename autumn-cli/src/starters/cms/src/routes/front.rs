@@ -131,6 +131,21 @@ pub struct ListQueryParams {
     /// The search term (`?s=…`), WordPress's own parameter name.
     #[serde(default)]
     pub s: Option<String>,
+    /// Which page of a post's comment thread to render (`?comments=2`).
+    ///
+    /// Separate from `page`, which paginates the *listing* — a single post can
+    /// carry both in principle, and conflating them would make turning the
+    /// comment page look like turning an archive page.
+    #[serde(default)]
+    pub comments: Option<usize>,
+}
+
+/// Which page of a post's comment thread the query asks for, clamped.
+///
+/// Same clamp as every other page number here: it arrives as an unbounded
+/// `usize` from the query string.
+fn comment_page_of(params: &ListQueryParams) -> i64 {
+    i64::try_from(params.comments.unwrap_or(1).clamp(1, MAX_PAGE)).unwrap_or(1)
 }
 
 /// The highest page number any paginated screen will honour.
@@ -170,6 +185,9 @@ pub async fn front_page(
     csrf: Csrf,
     Query(params): Query<ListQueryParams>,
 ) -> AutumnResult<Response> {
+    // Clamped like every other page number here — see `MAX_PAGE`.
+    let comment_page = comment_page_of(&params);
+
     // `/?p=123` is the `plain` permalink structure. It is honoured whatever the
     // configured structure is, so links minted before a settings change keep
     // working.
@@ -177,7 +195,7 @@ pub async fn front_page(
         && let Some(post) = repos.posts.find_by_id(post_id).await?
         && is_publicly_routable(&post)
     {
-        return single_post(&repos, &session, &csrf, post).await;
+        return single_post(&repos, &session, &csrf, post, comment_page).await;
     }
 
     let settings = repos.settings().await?;
@@ -192,7 +210,7 @@ pub async fn front_page(
         && page.is_public()
         && is_publicly_routable(&page)
     {
-        return single_post(&repos, &session, &csrf, page).await;
+        return single_post(&repos, &session, &csrf, page, comment_page).await;
     }
 
     blog_index(&repos, &session, &csrf, &settings, &params).await
@@ -326,6 +344,7 @@ pub async fn dispatch(
     Query(params): Query<ListQueryParams>,
 ) -> AutumnResult<Response> {
     let settings = repos.settings().await?;
+    let comment_page = comment_page_of(&params);
     match crate::permalinks::resolve(&path) {
         Resolved::FrontPage => blog_index(&repos, &session, &csrf, &settings, &params).await,
 
@@ -336,14 +355,14 @@ pub async fn dispatch(
                 .await?
                 .filter(is_publicly_routable)
             {
-                Some(post) => single_post(&repos, &session, &csrf, post).await,
+                Some(post) => single_post(&repos, &session, &csrf, post, comment_page).await,
                 None => not_found(&repos, &session, &csrf).await,
             }
         }
 
         Resolved::Single { post_type, slug } => {
             match find_visible(&repos, &post_type, &slug).await? {
-                Some(post) => single_post(&repos, &session, &csrf, post).await,
+                Some(post) => single_post(&repos, &session, &csrf, post, comment_page).await,
                 // A bare segment is ambiguous: it may be a top-level page
                 // rather than a post. Only a TOP-LEVEL page, though — a nested
                 // page is addressed by its full path, so `/team` must not
@@ -352,7 +371,7 @@ pub async fn dispatch(
                 // at `/team`, and which one you got would depend on row order.
                 None => match find_visible(&repos, "page", &slug).await? {
                     Some(page) if page.parent_id.is_none() => {
-                        single_post(&repos, &session, &csrf, page).await
+                        single_post(&repos, &session, &csrf, page, comment_page).await
                     }
                     _ => not_found(&repos, &session, &csrf).await,
                 },
@@ -364,7 +383,7 @@ pub async fn dispatch(
             // permalink. Resolve the page ancestry first — it is the more
             // specific claim — then fall back to the last segment as a post.
             if let Some(page) = resolve_page_path(&repos, &path).await? {
-                return single_post(&repos, &session, &csrf, page).await;
+                return single_post(&repos, &session, &csrf, page, comment_page).await;
             }
             // …but only at the post's *own* dated permalink. Taking the last
             // segment of any path served `/hello` as `/anything/hello`; taking
@@ -378,7 +397,7 @@ pub async fn dispatch(
             };
             match find_visible(&repos, "post", last).await? {
                 Some(post) if is_dated_permalink_for(&path, &post, settings.zone()) => {
-                    single_post(&repos, &session, &csrf, post).await
+                    single_post(&repos, &session, &csrf, post, comment_page).await
                 }
                 _ => not_found(&repos, &session, &csrf).await,
             }
@@ -628,6 +647,7 @@ async fn single_post(
     session: &Session,
     csrf: &Csrf,
     post: Post,
+    comment_page: i64,
 ) -> AutumnResult<Response> {
     let settings = repos.settings().await?;
     let viewer = repos.current_user(session).await?;
@@ -672,7 +692,7 @@ async fn single_post(
     // Rendering an existing thread on a *closed* post is still deliberate:
     // closing comments stops new ones, it does not retract the conversation.
     let thread = if unlocked && (comments_open || post.comment_count > 0) {
-        super::comments::render_thread(repos, session, csrf, &post).await?
+        super::comments::render_thread(repos, session, csrf, &post, comment_page).await?
     } else {
         html! {}
     };
