@@ -211,6 +211,28 @@ pub async fn save(
 ) -> AutumnResult<Response> {
     let _user = require_capability!(repos, session, csrf, Capability::ManageOptions);
 
+    // Two fields are checked *before* the round trip below rather than left to
+    // it. `from_rows` ignores a value it cannot use and keeps the default,
+    // which is exactly right for reading the options table — a bad row must
+    // never take the site down — but it is the wrong answer for a form: the
+    // default for `timezone` is UTC, so a typo would silently move a non-UTC
+    // site to UTC, shifting every displayed date and the meaning of every
+    // subsequent scheduled time, and a typo in `date_format` would silently
+    // reset the site's date style. Both are settings whose current value is
+    // more valuable than any guess at what was meant.
+    let timezone = form.timezone.trim();
+    if !crate::settings::is_known_timezone(timezone) {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "`{timezone}` is not a timezone this site knows — use an IANA name \
+             such as Europe/London"
+        )));
+    }
+    if !crate::settings::is_renderable_date_format(form.date_format.trim()) {
+        return Err(AutumnError::unprocessable_msg(
+            "That date format cannot be rendered — check the strftime directives",
+        ));
+    }
+
     // Round-trip through `Settings` rather than writing the form fields
     // straight to the options table: `from_rows` is where every value is
     // validated and clamped, so a hand-crafted POST cannot store a
@@ -237,7 +259,7 @@ pub async fn save(
         ),
         ("active_theme".to_owned(), form.active_theme.clone()),
         ("date_format".to_owned(), form.date_format.clone()),
-        ("timezone".to_owned(), form.timezone.trim().to_owned()),
+        ("timezone".to_owned(), timezone.to_owned()),
         ("front_page_id".to_owned(), form.front_page_id.clone()),
     ]);
 

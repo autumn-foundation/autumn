@@ -132,7 +132,9 @@ impl Repos {
         } else {
             Vec::new()
         };
-        Ok(settings.permalink_structure.permalink(post, &ancestry))
+        Ok(settings
+            .permalink_structure
+            .permalink(post, &ancestry, settings.zone()))
     }
 
     /// The slugs of a page's ancestors, outermost first.

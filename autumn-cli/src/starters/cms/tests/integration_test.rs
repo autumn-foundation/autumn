@@ -2971,11 +2971,17 @@ async fn the_posts_api_pages_through_the_corpus() {
     assert_eq!(authors.as_array().map(Vec::len), Some(1));
 }
 
-/// A malformed date format must not take the site down.
+/// A malformed date format is refused, and never reaches a rendered page.
 ///
 /// `format()` defers everything to `Display`, a bad directive makes `Display`
 /// return an error, and `to_string()` turns that into a panic — so `%` in the
 /// settings form would 500 every dated listing and every single-post page.
+///
+/// Two defences, deliberately different. The form refuses it outright: silently
+/// keeping the default would reset the site's date style from a typo, and the
+/// current value is worth more than a guess. `Settings::from_rows` still
+/// *ignores* it, because that funnel also reads an import and a direct write to
+/// `options`, where failing would take the site down rather than save it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_malformed_date_format_is_refused_rather_than_crashing_the_site() {
@@ -2985,18 +2991,15 @@ async fn a_malformed_date_format_is_refused_rather_than_crashing_the_site() {
 
     let settings = |date_format: &str| settings_form(&[("date_format", date_format)]);
 
-    // A pattern chrono cannot render.
+    // A working pattern first, so there is a value worth preserving.
     client
         .post("/admin/settings")
         .header("cookie", &cookie)
-        .form(&settings("%"))
+        .form(&settings("%Y/%m/%d"))
         .send()
         .await
         .assert_status(303);
-
-    // Every dated surface still renders.
     sign_out(&client);
-    client.get("/").send().await.assert_ok();
     let dated = client
         .get("/api/v1/posts")
         .send()
@@ -3007,17 +3010,30 @@ async fn a_malformed_date_format_is_refused_rather_than_crashing_the_site() {
         .as_str()
         .expect("url")
         .to_owned();
-    client.get(&url).send().await.assert_ok();
-
-    // A valid pattern is still accepted and applied.
     client
-        .post("/admin/settings")
-        .header("cookie", &cookie)
-        .form(&settings("%Y/%m/%d"))
+        .get(&url)
         .send()
         .await
-        .assert_status(303);
+        .assert_ok()
+        .assert_body_contains(&chrono::Utc::now().format("%Y/%m/%d").to_string());
+
+    // A pattern chrono cannot render is refused rather than accepted-and-dropped.
+    let refused = client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings("%"))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "a malformed pattern must be refused, not silently reset to the default: {}",
+        refused.text()
+    );
+
+    // The site is unharmed and still on the format the administrator chose.
     sign_out(&client);
+    client.get("/").send().await.assert_ok();
     client
         .get(&url)
         .send()
@@ -6787,5 +6803,271 @@ async fn the_taxonomy_admin_screen_is_paginated() {
         third.matches("/delete\"").count(),
         20,
         "the last page holds the remainder, not a repeat of the first"
+    );
+}
+
+/// A dated permalink names the day the site says the post was published.
+///
+/// `published_at` is stored in UTC; a dated URL names a *calendar day*, which
+/// is a local question. Formatting the stored value directly gave a post
+/// published at 23:30 on the 9th in Los Angeles a `/2026/09/10/` URL while
+/// every rendered date on the page said the 9th — and the archive route, whose
+/// bounds were raw UTC midnights, filed it under the 10th to match the URL
+/// rather than the content.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_dated_permalink_and_its_archive_use_the_site_timezone() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[
+            ("timezone", "America/Los_Angeles"),
+            ("permalink_structure", "day_and_name"),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    create_post(&client, &cookie, "Late", "Body.", "publish").await;
+
+    // 06:30 UTC on 2026-09-10 is 23:30 on the 9th in Los Angeles: the two zones
+    // disagree about which day this is, which is the whole point.
+    try_execute(
+        TestDb::shared().await,
+        "UPDATE posts SET published_at = '2026-09-10 06:30:00' WHERE slug = 'late'",
+    )
+    .await
+    .expect("straddle the date boundary");
+
+    sign_out(&client);
+    let listed = client
+        .get("/api/v1/posts")
+        .send()
+        .await
+        .assert_ok()
+        .json::<serde_json::Value>();
+    let url = listed.as_array().expect("array")[0]["url"]
+        .as_str()
+        .expect("url")
+        .to_owned();
+    assert!(
+        url.starts_with("/2026/09/09/"),
+        "the URL must name the local day, not the UTC one: {url}"
+    );
+    client.get(&url).send().await.assert_ok();
+
+    // And the archive agrees with the URL rather than with the stored value.
+    client
+        .get("/2026/09/09")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Late");
+    let wrong_day = client.get("/2026/09/10").send().await;
+    wrong_day.assert_ok();
+    assert!(
+        !wrong_day.text().contains("Late"),
+        "the post must not also appear in the following day's archive"
+    );
+}
+
+/// A mistyped timezone is refused, not stored as UTC.
+///
+/// `Settings::from_rows` ignores a value it cannot parse and keeps the default,
+/// which is right for reading the options table and wrong for a form: the
+/// default is UTC, so a typo would silently move a non-UTC site to UTC —
+/// shifting every displayed date and the meaning of every scheduled time.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_mistyped_timezone_is_refused_rather_than_resetting_the_site() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("timezone", "America/Los_Angeles")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let refused = client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[("timezone", "Amerca/Los_Angeles")]))
+        .send()
+        .await;
+    assert_eq!(
+        refused.status,
+        422,
+        "a name the site cannot resolve must be refused: {}",
+        refused.text()
+    );
+
+    // The setting the administrator chose is still in place.
+    let screen = client
+        .get("/admin/settings")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    screen.assert_ok();
+    assert!(
+        screen.text().contains("America/Los_Angeles"),
+        "a refused submission must leave the previous zone alone"
+    );
+}
+
+/// The editor's taxonomy checkboxes are bounded, and keep the post's own terms.
+///
+/// Saving *replaces* a post's filings, so a selected term missing from the form
+/// would be silently unfiled — which makes retaining them part of the bound
+/// rather than a nicety.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_editor_taxonomy_control_is_bounded_and_keeps_its_selection() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Filed", "Body.", "draft").await;
+
+    // 150 categories, `cat-001` … `cat-150` by name.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         SELECT 'category',
+                'cat-' || lpad(g::text, 3, '0'),
+                'cat-' || lpad(g::text, 3, '0'),
+                '', 0
+         FROM generate_series(1, 150) AS g",
+    )
+    .await
+    .expect("seed the terms");
+
+    let editor = client
+        .get(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    editor.assert_ok();
+    let editor = editor.text();
+    assert!(editor.contains("cat-001"), "the first terms are offered");
+    assert!(
+        !editor.contains("cat-150"),
+        "the control must not render the whole taxonomy"
+    );
+    assert!(editor.contains("Showing the first"));
+
+    // File the post under a term past the bound, behind the editor's back —
+    // the same state an import or a bulk edit would leave.
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO post_terms (post_id, term_id)
+             SELECT {id}, id FROM terms WHERE slug = 'cat-150'"
+        ),
+    )
+    .await
+    .expect("file the post");
+
+    let editor = client
+        .get(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    editor.assert_ok();
+    assert!(
+        editor.text().contains("cat-150"),
+        "a term the post carries must be in the form, or saving unfiles it"
+    );
+}
+
+/// A page of authors keeps its distinct, its order and its bound.
+///
+/// `/api/v1/authors` is unauthenticated, and loading every distinct author id
+/// before bounding the users query made even `?per_page=1` cost one row per
+/// author on the wire and in memory. That cost is not observable through the
+/// endpoint, so this is a correctness guard on the rewrite rather than a test
+/// that fails without it: the `EXISTS` form has to keep excluding accounts with
+/// no published content, keep the username ordering, and keep paging — three
+/// things the two-query version got for free and a single query can quietly
+/// lose.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_authors_endpoint_pages_in_sql() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    create_post(&client, &cookie, "Owned", "Body.", "publish").await;
+
+    // 60 more accounts, each with a published post, plus 20 with none.
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO users (username, email, password_hash, display_name, role, bio, website)
+         SELECT 'writer-' || lpad(g::text, 2, '0'),
+                'writer-' || lpad(g::text, 2, '0') || '@example.com',
+                'x', '', 'author', '', ''
+         FROM generate_series(1, 80) AS g",
+    )
+    .await
+    .expect("seed the accounts");
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO posts (post_type, title, slug, excerpt, body, status, author_id,
+                            password, comment_status, menu_order)
+         SELECT 'post',
+                'By ' || u.username,
+                'by-' || u.username,
+                '', 'Body.', 'publish', u.id, '', 'open', 0
+         FROM users u
+         WHERE u.username LIKE 'writer-%'
+           AND substring(u.username from 8)::int <= 60",
+    )
+    .await
+    .expect("seed the posts");
+
+    sign_out(&client);
+    let page: serde_json::Value = client
+        .get("/api/v1/authors?per_page=5")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let rows = page.as_array().expect("array");
+    assert_eq!(rows.len(), 5, "the bound is the request's, not the site's");
+
+    // Only accounts with published content, and ordered by username — the
+    // twenty writers with no posts must not appear at all.
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|row| row["username"].as_str().expect("username"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["owner", "writer-01", "writer-02", "writer-03", "writer-04"],
+        "the distinct, the order and the bound all have to survive the rewrite"
+    );
+
+    let later: serde_json::Value = client
+        .get("/api/v1/authors?per_page=5&page=2")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let names: Vec<&str> = later
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|row| row["username"].as_str().expect("username"))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "writer-05",
+            "writer-06",
+            "writer-07",
+            "writer-08",
+            "writer-09"
+        ]
     );
 }

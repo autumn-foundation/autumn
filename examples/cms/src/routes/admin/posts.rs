@@ -491,8 +491,11 @@ struct TaxonomyField {
     slug: &'static str,
     label: &'static str,
     hierarchical: bool,
-    /// Every term, for a hierarchical taxonomy's checkbox list.
+    /// The terms offered in a hierarchical taxonomy's checkbox list — a
+    /// bounded window, plus whatever this post already carries.
     terms: Vec<Term>,
+    /// Whether the taxonomy holds more terms than the window is showing.
+    truncated: bool,
     /// Which of them this post carries.
     selected: Vec<i64>,
     /// The comma-separated names, for a flat taxonomy's box.
@@ -533,6 +536,16 @@ const MEDIA_PICKER_LIMIT: i64 = 100;
 /// explicitly below, whatever its age.
 const PARENT_PICKER_LIMIT: i64 = 100;
 
+/// How many terms a hierarchical taxonomy's checkbox list offers.
+///
+/// Terms accumulate through ordinary category creation *and* this editor's own
+/// find-or-create box, so paginating the taxonomy screen left the authoring
+/// form loading the whole taxonomy — descriptions included — and rendering a
+/// checkbox per row. The post's own terms are added back explicitly below,
+/// which is not optional: saving *replaces* a post's filings, so a selected
+/// term missing from the form would be silently unfiled.
+const TERM_PICKER_LIMIT: i64 = 100;
+
 impl EditorContext {
     async fn load(repos: &Repos, registered: &PostType, post: Option<&Post>) -> AutumnResult<Self> {
         // One control per taxonomy this type registers, whatever they are.
@@ -546,21 +559,47 @@ impl EditorContext {
                 .iter()
                 .filter(|term| term.taxonomy == taxonomy.slug)
                 .collect();
+            let selected: Vec<i64> = mine.iter().map(|term| term.id).collect();
+            // A hierarchical taxonomy lists terms as checkboxes; a flat one
+            // takes names, so it needs no term list.
+            let (terms, truncated) = if taxonomy.hierarchical {
+                let slug = taxonomy.slug;
+                let selected = selected.clone();
+                repos
+                    .with_conn(async move |conn| {
+                        let (mut rows, total) =
+                            content::terms_page_with_total(conn, slug, 0, TERM_PICKER_LIMIT)
+                                .await?;
+                        // Whatever this post carries that the window missed,
+                        // put first. Without it, saving an unchanged form
+                        // would unfile the post from a term it is in.
+                        let present: std::collections::HashSet<i64> =
+                            rows.iter().map(|term| term.id).collect();
+                        let missing: Vec<i64> = selected
+                            .into_iter()
+                            .filter(|id| !present.contains(id))
+                            .collect();
+                        if !missing.is_empty() {
+                            let mut extra: Vec<Term> = content::terms_by_ids(conn, &missing)
+                                .await?
+                                .into_values()
+                                .collect();
+                            extra.sort_by(|a, b| a.name.cmp(&b.name));
+                            rows.splice(0..0, extra);
+                        }
+                        Ok((rows, total > TERM_PICKER_LIMIT))
+                    })
+                    .await?
+            } else {
+                (Vec::new(), false)
+            };
             taxonomies.push(TaxonomyField {
                 slug: taxonomy.slug,
                 label: taxonomy.plural,
                 hierarchical: taxonomy.hierarchical,
-                // A hierarchical taxonomy lists every term as a checkbox; a
-                // flat one takes names, so it needs no term list.
-                terms: if taxonomy.hierarchical {
-                    repos
-                        .terms
-                        .find_by_taxonomy(taxonomy.slug.to_owned())
-                        .await?
-                } else {
-                    Vec::new()
-                },
-                selected: mine.iter().map(|term| term.id).collect(),
+                terms,
+                truncated,
+                selected,
                 names: mine
                     .iter()
                     .map(|term| term.name.clone())
@@ -823,6 +862,16 @@ fn editor(
                                                   class="rounded border-gray-300";
                                             (term.name)
                                         }
+                                    }
+                                }
+                                @if field.truncated {
+                                    p class="text-xs text-gray-400 mt-2" {
+                                        "Showing the first " (TERM_PICKER_LIMIT) " by name. "
+                                        a href=(format!("/admin/terms/{}", field.slug))
+                                          class="text-indigo-700 hover:underline" {
+                                            "Manage " (field.label.to_lowercase())
+                                        }
+                                        "."
                                     }
                                 }
                             }

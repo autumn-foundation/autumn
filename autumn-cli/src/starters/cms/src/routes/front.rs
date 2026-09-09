@@ -49,13 +49,19 @@ use super::site::{Csrf, Repos, render};
 /// That leaves exactly the two aliases a site gets by switching structure —
 /// which is the point of the fallback, so that changing the permalink setting
 /// does not 404 every link anyone has already shared.
-fn is_dated_permalink_for(path: &[String], post: &Post) -> bool {
+fn is_dated_permalink_for(path: &[String], post: &Post, zone: chrono_tz::Tz) -> bool {
     let Some((_, prefix)) = path.split_last() else {
         return false;
     };
     // The generator falls back to `created_at` for a post that has never been
-    // published, so the matcher has to accept the same date it would mint.
-    let date = post.published_at.unwrap_or(post.created_at).date();
+    // published, so the matcher has to accept the same date it would mint —
+    // read in the same zone, for the same reason. A UTC reading here would
+    // 404 the very URL `post_permalink` had just published for a post whose
+    // local and UTC days differ.
+    use chrono::TimeZone as _;
+    let date = zone
+        .from_utc_datetime(&post.published_at.unwrap_or(post.created_at))
+        .date_naive();
     // Compared as the strings the generator writes — `%Y/%m/%d`, so a
     // four-digit year and zero-padded two-digit month and day. Parsing instead
     // would make `/2026/9/hello` and `/2026/009/hello` aliases of
@@ -373,7 +379,7 @@ pub async fn dispatch(
                 return not_found(&repos, &session, &csrf).await;
             };
             match find_visible(&repos, "post", last).await? {
-                Some(post) if is_dated_permalink_for(&path, &post) => {
+                Some(post) if is_dated_permalink_for(&path, &post, settings.zone()) => {
                     single_post(&repos, &session, &csrf, post).await
                 }
                 _ => not_found(&repos, &session, &csrf).await,
@@ -579,7 +585,7 @@ async fn date_archive(
 ) -> AutumnResult<Response> {
     // Half-open bounds, so the filter is a pair of index-usable comparisons on
     // `published_at` rather than a per-row date decomposition.
-    let Some((from, until)) = archive_bounds(year, month, day) else {
+    let Some((from, until)) = archive_bounds(year, month, day, settings.zone()) else {
         return not_found(repos, session, csrf).await;
     };
     let per_page = usize::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
@@ -867,8 +873,9 @@ fn archive_bounds(
     year: i32,
     month: Option<u32>,
     day: Option<u32>,
+    zone: chrono_tz::Tz,
 ) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
-    use chrono::{Days, Months, NaiveDate};
+    use chrono::{Days, Months, NaiveDate, TimeZone as _};
 
     let start = NaiveDate::from_ymd_opt(year, month.unwrap_or(1), day.unwrap_or(1))?;
     let end = match (month, day) {
@@ -876,7 +883,26 @@ fn archive_bounds(
         (Some(_), None) => start.checked_add_months(Months::new(1))?,
         _ => NaiveDate::from_ymd_opt(year.checked_add(1)?, 1, 1)?,
     };
-    Some((start.and_hms_opt(0, 0, 0)?, end.and_hms_opt(0, 0, 0)?))
+    // Local midnight, expressed as the UTC instant it names — `published_at` is
+    // stored in UTC, and a `/2026/09/09/` archive means the ninth *here*. Taken
+    // as raw UTC midnights, the range was the site's day shifted by its offset,
+    // so a post the permalink builder had placed on the ninth fell into the
+    // tenth's archive.
+    //
+    // `.earliest()` for the same reason the editor uses it: a daylight-saving
+    // change can make local midnight ambiguous or skip it, and the earlier
+    // instant keeps the ranges of consecutive days adjacent rather than
+    // overlapping. A skipped midnight falls back to the raw value, which is at
+    // most an hour out on one day a year and never leaves a post unreachable.
+    let to_utc = |date: NaiveDate| -> Option<chrono::NaiveDateTime> {
+        let local = date.and_hms_opt(0, 0, 0)?;
+        Some(
+            zone.from_local_datetime(&local)
+                .earliest()
+                .map_or(local, |resolved| resolved.naive_utc()),
+        )
+    };
+    Some((to_utc(start)?, to_utc(end)?))
 }
 
 /// A listing's page link. Page 1 drops the parameter so the canonical URL of a

@@ -1484,24 +1484,20 @@ pub async fn published_authors_page(
     offset: i64,
     limit: i64,
 ) -> AutumnResult<Vec<User>> {
-    // The bound is applied to the *users* query rather than after it. The
-    // distinct-author set is still computed in full — it is a projection of one
-    // indexed column, not a row load — but on a large multi-author site the
-    // page returned, and the rows materialized to build it, are bounded by the
-    // request instead of by the size of the author population.
-    let author_ids: Vec<i64> = posts::table
-        .filter(posts::status.eq("publish"))
-        .filter(posts::post_type.eq_any(public_type_slugs()))
-        .select(posts::author_id)
-        .distinct()
-        .load(conn)
-        .await?;
-
-    if author_ids.is_empty() {
-        return Ok(Vec::new());
-    }
+    // One query, with the distinct, the order and the bound all inside it.
+    //
+    // Loading the distinct author ids first and then bounding the *users* query
+    // still made an unauthenticated `?per_page=1` cost one row per author on
+    // the wire and in memory — a projection of an indexed column rather than a
+    // row load, but still proportional to the whole author population rather
+    // than to the request. `EXISTS` lets Postgres stop at the page.
     Ok(users::table
-        .filter(users::id.eq_any(&author_ids))
+        .filter(diesel::dsl::exists(
+            posts::table
+                .filter(posts::author_id.eq(users::id))
+                .filter(posts::status.eq("publish"))
+                .filter(posts::post_type.eq_any(public_type_slugs())),
+        ))
         .order((users::username.asc(), users::id.asc()))
         .offset(offset.max(0))
         .limit(limit.max(0))

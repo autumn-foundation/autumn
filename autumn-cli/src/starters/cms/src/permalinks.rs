@@ -84,8 +84,18 @@ impl PermalinkStructure {
     /// always addressed by its path (`/about/team`) and a custom type is always
     /// prefixed by its slug (`/product/widget`) — exactly as WordPress does,
     /// because a dated URL for an undated content type reads as a bug.
+    /// `zone` is the site's timezone: `published_at` is stored in UTC and a
+    /// dated URL names a *calendar day*, which is a local question. Formatting
+    /// the stored value directly gave a post published at 23:30 on the 9th in
+    /// Los Angeles a `/2026/09/10/` URL while every rendered date on the page
+    /// said the 9th.
     #[must_use]
-    pub fn permalink(self, post: &crate::models::Post, ancestry: &[String]) -> String {
+    pub fn permalink(
+        self,
+        post: &crate::models::Post,
+        ancestry: &[String],
+        zone: chrono_tz::Tz,
+    ) -> String {
         match post.post_type.as_str() {
             "page" => {
                 if ancestry.is_empty() {
@@ -94,16 +104,24 @@ impl PermalinkStructure {
                     format!("/{}/{}", ancestry.join("/"), post.slug)
                 }
             }
-            "post" => self.post_permalink(post),
+            "post" => self.post_permalink(post, zone),
             other => format!("/{other}/{}", post.slug),
         }
     }
 
-    fn post_permalink(self, post: &crate::models::Post) -> String {
+    fn post_permalink(self, post: &crate::models::Post, zone: chrono_tz::Tz) -> String {
         // Dated structures need a date. A post that has never been published
         // has no `published_at`, so fall back to its creation date rather than
         // rendering `//sample-post`.
-        let date = post.published_at.unwrap_or(post.created_at);
+        //
+        // Read in the site's zone, because the URL names the day the site says
+        // the post was published on — the same day `Settings::format_date`
+        // renders. `resolve` turns that URL back into a local-day range through
+        // the same zone, so the two halves stay each other's inverse.
+        use chrono::TimeZone as _;
+        let date = zone
+            .from_utc_datetime(&post.published_at.unwrap_or(post.created_at))
+            .naive_local();
         match self {
             Self::Plain => format!("/?p={}", post.id),
             Self::Numeric => format!("/archives/{}", post.id),
@@ -356,21 +374,24 @@ mod tests {
     #[test]
     fn every_structure_renders_wordpresss_example_url() {
         let post = sample_post();
-        assert_eq!(PermalinkStructure::Plain.permalink(&post, &[]), "/?p=123");
         assert_eq!(
-            PermalinkStructure::Numeric.permalink(&post, &[]),
+            PermalinkStructure::Plain.permalink(&post, &[], chrono_tz::UTC),
+            "/?p=123"
+        );
+        assert_eq!(
+            PermalinkStructure::Numeric.permalink(&post, &[], chrono_tz::UTC),
             "/archives/123"
         );
         assert_eq!(
-            PermalinkStructure::PostName.permalink(&post, &[]),
+            PermalinkStructure::PostName.permalink(&post, &[], chrono_tz::UTC),
             "/sample-post"
         );
         assert_eq!(
-            PermalinkStructure::MonthAndName.permalink(&post, &[]),
+            PermalinkStructure::MonthAndName.permalink(&post, &[], chrono_tz::UTC),
             "/2026/09/sample-post"
         );
         assert_eq!(
-            PermalinkStructure::DayAndName.permalink(&post, &[]),
+            PermalinkStructure::DayAndName.permalink(&post, &[], chrono_tz::UTC),
             "/2026/09/07/sample-post"
         );
     }
@@ -382,7 +403,7 @@ mod tests {
     fn every_generated_permalink_resolves_back_to_its_post() {
         let post = sample_post();
         for structure in PermalinkStructure::all() {
-            let url = structure.permalink(&post, &[]);
+            let url = structure.permalink(&post, &[], chrono_tz::UTC);
             // `Plain` is a query string, not a path — it is resolved by the
             // `?p=` handler, not the path router.
             if *structure == PermalinkStructure::Plain {
@@ -407,7 +428,7 @@ mod tests {
         page.slug = "team".to_owned();
         let ancestry = vec!["about".to_owned()];
         assert_eq!(
-            PermalinkStructure::DayAndName.permalink(&page, &ancestry),
+            PermalinkStructure::DayAndName.permalink(&page, &ancestry, chrono_tz::UTC),
             "/about/team",
             "a page must never take a dated URL"
         );

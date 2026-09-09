@@ -91,17 +91,36 @@ pub mod keys {
 
 /// Whether a strftime pattern can actually be rendered.
 ///
+/// Public so the settings form can *refuse* a bad pattern rather than let
+/// `from_rows` quietly drop it — see [`is_known_timezone`].
+///
 /// `NaiveDateTime::format` parses nothing eagerly — it hands back a
 /// `DelayedFormat` whose `Display` does the work and returns `Err` on a bad
 /// directive. `write!` surfaces that as a `Result`; `to_string()` panics on it.
 /// The probe date carries a value for every field a pattern might name.
-fn is_renderable_date_format(pattern: &str) -> bool {
+#[must_use]
+pub fn is_renderable_date_format(pattern: &str) -> bool {
     use std::fmt::Write as _;
     let probe = chrono::NaiveDate::from_ymd_opt(2026, 1, 31)
         .and_then(|date| date.and_hms_opt(13, 45, 6))
         .expect("the probe timestamp is a valid date and time");
     let mut out = String::new();
     write!(out, "{}", probe.format(pattern)).is_ok()
+}
+
+/// Whether a string names a timezone the database knows.
+///
+/// `from_rows` ignores a value it cannot parse, which is right for its job:
+/// that funnel must never fail, because a bad row in `options` cannot be
+/// allowed to take the site down. But "ignore" there means "fall back to the
+/// default", and the default is UTC — so a typo submitted through the settings
+/// form would have silently moved a non-UTC site to UTC, shifting every
+/// displayed date and the meaning of every subsequent scheduled time. The form
+/// checks first and refuses, so the two behaviours are deliberate rather than
+/// the same code path used for two different questions.
+#[must_use]
+pub fn is_known_timezone(name: &str) -> bool {
+    name.parse::<chrono_tz::Tz>().is_ok()
 }
 
 impl Settings {
