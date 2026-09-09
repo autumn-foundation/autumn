@@ -24,9 +24,10 @@ with `#[state_machine(transitions(...))]` on the field and enforce with the
 generated `transition_{field}_to` in `before_update` — never write your own
 `match (old, new)` validation in hooks or handlers. To reuse one transition
 graph across fields/models, define a `#[lifecycle]` enum and reference it with
-`#[state_machine(lifecycle = Enum)]` (trunk-dev, #1916); `autumn lifecycle
-check` statically verifies soundness and `autumn lifecycle diagram` emits a
-DOT/Mermaid state diagram. See `docs/guide/state-machines.md` and the worked
+`#[state_machine(lifecycle = Enum)]` (trunk-dev, #1916). The macro proves the
+graph sound at compile time — an unreachable state or a non-terminal dead-end
+does not compile (#1675); `autumn lifecycle check` re-proves it project-wide
+and `autumn lifecycle diagram` emits a DOT/Mermaid state diagram. See `docs/guide/state-machines.md` and the worked
 example in `skills/autumn-web/references/examples.md`.
 
 ## Testing with TestApp and TestClient

@@ -4,9 +4,11 @@ Autumn's `#[lifecycle]` attribute turns a plain enum into a **typestate machine*
 whose illegal transitions are a *compile* error. You declare the states, the
 initial state, the terminal states, and every legal edge once, on the enum; the
 macro generates a metadata surface plus a per-enum module of zero-cost marker
-types where the only methods that exist are the transitions you declared. A
-build-time CLI gate (`autumn lifecycle check`) then proves the graph is
-structurally sound and fails CI if it is not.
+types where the only methods that exist are the transitions you declared. The
+macro also walks the declared graph and refuses to compile a lifecycle that is
+structurally unsound — a state nothing reaches, or a non-terminal state with no
+path to a terminal. `autumn lifecycle check` re-proves the same properties
+across a whole project and emits a machine-readable artifact for CI.
 
 ```rust
 use autumn_web::lifecycle;
@@ -48,7 +50,7 @@ transition to be caught.
 | State representation | Runtime string (`"draft"`, `"published"`) | A distinct Rust type per state |
 | Illegal transition | Rejected at **runtime** (`transition_status_to` returns a `400`) | Fails to **compile** — the method does not exist |
 | Guards | Yes — `from -> to: "guard_method"` runs `&self -> bool` | No runtime guards (structural only) |
-| Reachability / dead-ends | Not checked — dead states compile fine | Proven by the `autumn lifecycle check` CI gate |
+| Reachability / dead-ends | Not checked — dead states compile fine | Proven at **compile time**; re-proven project-wide by `autumn lifecycle check` |
 | Persistence | Backed by a model column, versioned/audited with the record | In-memory typestate; no persisted instance |
 
 Use `#[state_machine]` when the state is a **column on a persisted row** and the
@@ -262,13 +264,106 @@ fn cancel_from_placed() -> OrderState {
 
 ---
 
-## The build-time soundness gate
+## The build-time soundness proof
 
-The typestate module makes *individual* transitions sound, but it cannot see the
-graph as a whole — a lifecycle can still be nonsense (a state nothing reaches, a
-non-terminal you can enter but never leave). `autumn lifecycle check` proves the
-structural properties the type system alone can't, and **exits non-zero** on any
-violation, naming the offending state(s).
+Each generated `to_*` method knows only its own edge, so the typestate cannot
+see the graph as a whole. The macro walks the declared graph as well: a
+structurally unsound lifecycle **does not compile**.
+
+It proves five properties:
+
+1. **Reachability** — every variant is reachable from the initial state (no
+   orphan states).
+2. **Liveness (no dead-ends)** — every reachable non-terminal variant can reach
+   at least one terminal state. A cycle that never leads to a terminal fails
+   this too, even though every state in it has an outgoing edge.
+3. **Endpoint existence** — the initial state, every terminal, and every
+   transition endpoint is a declared variant.
+4. **Terminal has no exit** — a declared terminal state is the source of no
+   transition. A "movable terminal" is not terminal.
+5. **No duplicate edge** — the same `From -> To` is declared at most once.
+
+Properties 1 and 2 report every offending variant, each as its own diagnostic
+spanned at the variant, so `cargo` underlines the state to fix. A state that is
+both unreachable and exit-less is reported once, as unreachable: reachability is
+the root cause. Properties 3 to 5 stop at the first violation and are spanned in
+the attribute, where the bad name is written.
+
+### An unreachable state
+
+`Refunded` is a variant no transition targets, so no order can ever be in it
+([`autumn/tests/compile-fail/lifecycle_unreachable_state.rs`](../../autumn/tests/compile-fail/lifecycle_unreachable_state.rs)):
+
+```rust
+#[lifecycle(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> Paid,
+        Paid -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    Paid,
+    Refunded,   // ❌ nothing transitions into it
+    Delivered,
+}
+```
+
+```text
+error: state `Refunded` is unreachable from initial state `Pending` of lifecycle `OrderState` — add a transition into it, or remove the variant
+  --> tests/compile-fail/lifecycle_unreachable_state.rs:19:5
+   |
+19 |     Refunded,
+   |     ^^^^^^^^
+```
+
+### A non-terminal dead-end
+
+`OnHold` can be entered but never left, so an order that reaches it is stuck
+([`autumn/tests/compile-fail/lifecycle_dead_end_state.rs`](../../autumn/tests/compile-fail/lifecycle_dead_end_state.rs)):
+
+```rust
+#[lifecycle(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> OnHold,
+        Pending -> Paid,
+        Paid -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    OnHold,     // ❌ no outgoing transition, and not terminal
+    Paid,
+    Delivered,
+}
+```
+
+```text
+error: state `OnHold` is a non-terminal dead-end of lifecycle `OrderState`: no declared transition path reaches a terminal state — add an outgoing transition, or declare it terminal
+  --> tests/compile-fail/lifecycle_dead_end_state.rs:19:5
+   |
+19 |     OnHold,
+   |     ^^^^^^
+```
+
+A sound lifecycle compiles clean — see
+[`autumn/tests/compile-pass/lifecycle_valid.rs`](../../autumn/tests/compile-pass/lifecycle_valid.rs),
+and [`examples/invoice`](../../examples/invoice) for the same thing in a
+runnable app: `InvoiceState` declares `Draft → Issued → Paid`, with `Void` as a
+second terminal, and drives it through the generated typestate.
+
+---
+
+## The project-wide gate: `autumn lifecycle check`
+
+The compile-time proof covers every lifecycle the compiler builds. `autumn
+lifecycle check` proves the same five properties by *scanning source*, which
+adds two things the macro cannot: one report over a whole workspace without a
+build, and a machine-readable artifact for CI.
 
 ```bash
 autumn lifecycle check                 # check lifecycles in the current crate
@@ -276,62 +371,105 @@ autumn lifecycle check ./crates/app    # explicit project path (a positional)
 autumn lifecycle check --format json   # machine-readable output for tooling
 ```
 
-It proves three properties over every `#[lifecycle]` enum:
-
-1. **Reachability** — every state is reachable from the initial state (no
-   orphan/unreachable states).
-2. **Liveness (no dead-ends)** — every reachable non-terminal state can reach at
-   least one terminal state (no state you can enter but never leave except by a
-   terminal).
-3. **Endpoint existence** — the initial state, every terminal, and every
-   transition endpoint is a declared variant of the enum.
+It exits non-zero on any violation or unparseable attribute, naming the
+offending state(s).
 
 ### As a CI gate
 
-Run it alongside `fmt`/`clippy` so a structurally broken lifecycle can never
-merge:
+Run it alongside `fmt`/`clippy` so a broken lifecycle is reported by name even
+in a job that does not build the crate:
 
 ```yaml
 # .github/workflows/ci.yml
 - name: Lifecycle soundness
-  run: autumn lifecycle check --format json
+  run: autumn lifecycle check
 ```
-
-Because it exits non-zero on the first violation class, a failing job blocks the
-PR and the log names exactly which state broke the proof.
 
 ### Sample failing output
 
-Given a broken variant of the order lifecycle — say a `Refunded` state that no
-edge ever targets, and a `Paid` state whose only outgoing edges were removed —
-`autumn lifecycle check` reports:
+Given a broken order lifecycle — a `Refunded` state no edge targets, and a `Paid`
+state whose only outgoing edge was removed — `autumn lifecycle check` reports:
 
 ```text
-$ autumn lifecycle check
-Checking lifecycle `OrderState` (src/models/order.rs)
+autumn lifecycle check
+  scanned 1 lifecycle(s) across 1 .rs file(s)
 
-  error: state 'Refunded' is unreachable from initial state 'Cart'
-  error: state 'Paid' is a dead-end: no path from it reaches any terminal state
+  lifecycle 'OrderState' (5 state(s))
+    initial:   Cart
+    terminals: Delivered
+    violations:
+      [reachability] state 'Refunded' is unreachable from initial state 'Cart'
+      [dead-end] state 'Paid' is a non-terminal dead-end (cannot reach any terminal state)
 
-lifecycle `OrderState`: 2 violation(s)
-FAILED — 1 lifecycle with soundness violations
+  summary: 1 lifecycle(s), 2 violation(s), 0 parse error(s)
+Result: FAIL — fix the lifecycle violations above.
 ```
 
-The `--format json` form emits the same findings as structured data for
-scripting:
+The `--format json` form emits the same findings as structured data, and doubles
+as the lifecycle-graph artifact — it carries the declared states, initial state,
+terminals and transitions alongside the violations:
 
 ```json
 {
-  "lifecycle": "OrderState",
-  "ok": false,
-  "violations": [
-    { "kind": "unreachable", "state": "Refunded", "from_initial": "Cart" },
-    { "kind": "dead_end", "state": "Paid" }
-  ]
+  "files_scanned": 1,
+  "lifecycles": [
+    {
+      "name": "OrderState",
+      "states": [
+        "Cart",
+        "Placed",
+        "Paid",
+        "Delivered",
+        "Refunded"
+      ],
+      "initial": "Cart",
+      "terminals": [
+        "Delivered"
+      ],
+      "transitions": [
+        [
+          "Cart",
+          "Placed"
+        ],
+        [
+          "Placed",
+          "Paid"
+        ],
+        [
+          "Placed",
+          "Delivered"
+        ]
+      ],
+      "violations": [
+        {
+          "kind": "reachability",
+          "states": [
+            "Refunded"
+          ],
+          "message": "state 'Refunded' is unreachable from initial state 'Cart'"
+        },
+        {
+          "kind": "dead-end",
+          "states": [
+            "Paid"
+          ],
+          "message": "state 'Paid' is a non-terminal dead-end (cannot reach any terminal state)"
+        }
+      ]
+    }
+  ],
+  "errors": []
 }
 ```
 
-A sound lifecycle prints an `ok`/passing line and exits `0`.
+A sound lifecycle prints `Result: PASS` and exits `0`.
+
+> **Scanner limits.** `lifecycle check` reads source rather than resolving it, so
+> it recognizes `#[lifecycle(...)]`, a qualified `#[autumn_web::lifecycle(...)]`,
+> and a *same-file* alias (`use autumn_web::lifecycle as lc; #[lc(...)]`) — but
+> not an alias introduced in another file or laundered through a glob re-export
+> (tracked in #1925). A lifecycle it skips is still proven by the compiler; only
+> its entry in the report and the artifact is missing.
 
 ---
 
@@ -371,12 +509,11 @@ terminals. The `--format dot` output is the same graph in Graphviz syntax for
 `#[lifecycle]` deliberately proves *structural* soundness only. Being honest about
 the edges of the current slice:
 
-- **No guard satisfiability or bounded model checking.** The gate reasons about
-  the transition *graph* — reachability, dead-ends, endpoint existence. It does
-  not model data-dependent conditions, so it cannot tell you whether a guarded
-  path is *actually* traversable at runtime. (Lifecycles have no runtime guards at
-  all; if you need data-dependent guards, use
-  [`#[state_machine]`](state-machines.md).)
+- **No guard satisfiability or bounded model checking.** The proof reasons about
+  the transition *graph*. It does not model data-dependent conditions, so it
+  cannot tell you whether a guarded path is *actually* traversable at runtime.
+  (Lifecycles have no runtime guards at all; if you need data-dependent guards,
+  use [`#[state_machine]`](state-machines.md).)
 - **No concurrency or hierarchical statecharts.** There are no parallel/AND
   regions, nested/composite states, or orthogonal regions — a lifecycle is a
   single flat state graph with one active state at a time.
@@ -385,18 +522,16 @@ the edges of the current slice:
   transition log, or track history. For a persisted, audited lifecycle on a
   stored row, use a `#[state_machine]` field together with
   [Version History](version-history.md) / the audit trail.
-- **Reachability is enforced via the CLI CI gate, not (yet) a compile error.**
-  The typestate blocks *illegal* transitions at compile time, but the whole-graph
-  properties (reachability, no dead-ends) are proven by `autumn lifecycle check`
-  in CI rather than by a `const`-eval compile error. A structurally unsound
-  lifecycle will still *compile* — you must run the gate to catch it. The gate is
-  a source scanner (like `autumn a11y verify`): it recognizes the macro under a
-  bare, qualified (`#[autumn_web::lifecycle(...)]`), or *same-file*-aliased
-  (`use autumn_web::lifecycle as lc; #[lc(...)]`) attribute, but cannot follow an
-  alias introduced in another file or through a glob re-export (tracked in #1925).
-  That is a gap only
-  for the scanner's report — the typestate still makes every undeclared transition
-  a compile error however the macro is spelled.
+- **Structural properties only.** The proof covers reachability, dead-ends,
+  endpoint existence and terminal exits over the declared graph — not whether a
+  path is *taken* in practice, and not the runtime data behind it.
+- **One entry point.** Reachability is measured from `initial`, the only state
+  `Machine::start()` exists on. A lifecycle bound to a persisted column with
+  `#[state_machine(lifecycle = <Enum>)]` can have a second entry point, because
+  a row can be *created* in any state — an `Imported` or `Migrated` value no
+  edge targets reads as unreachable and fails the build. Give it an edge from
+  `initial`, or declare that field's table inline with
+  `#[state_machine(transitions(...))]`, which applies no reachability rule.
 
 ---
 

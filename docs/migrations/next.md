@@ -783,6 +783,68 @@ async fn beta_page() -> &'static str {
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
 
+### Lifecycle: an unsound `#[lifecycle]` graph is now a compile error
+
+**Why:** `#[lifecycle]` proved its *endpoints* — every `initial`, `terminal` and
+transition endpoint is a real variant, and a terminal has no outgoing edge — but
+never the shape of the graph those edges form. Two structural faults still
+compiled: a state unreachable from `initial`, which no machine can ever enter,
+and a reachable non-terminal state with no path to a terminal, which traps a
+machine that enters it.
+
+`autumn lifecycle check` reported both, but it scans source rather than
+resolving it: a `#[lifecycle]` reached through a cross-file alias or a glob
+re-export is skipped (#1925), so an unsound lifecycle spelled that way passed
+the gate and shipped. The macro sees every declaration however it is spelled, so
+the proof belongs there.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[lifecycle(
+    initial = Pending,
+    terminal(Delivered),
+    transitions(
+        Pending -> OnHold,
+        Pending -> Paid,
+        Paid -> Delivered,
+    )
+)]
+pub enum OrderState {
+    Pending,
+    OnHold,     // reachable, non-terminal, no way out
+    Paid,
+    Delivered,
+    Refunded,   // no transition targets it
+}
+```
+
+This compiled. `autumn lifecycle check` failed on it — unless the attribute was
+spelled through a cross-file alias, in which case nothing caught it.
+
+**After (`{X.Z}`):**
+
+```text
+error: state `Refunded` is unreachable from initial state `Pending` of lifecycle `OrderState` — add a transition into it, or remove the variant
+error: state `OnHold` is a non-terminal dead-end of lifecycle `OrderState`: no declared transition path reaches a terminal state — add an outgoing transition, or declare it terminal
+```
+
+Fix each named state one of three ways: add the missing transition, drop the
+variant, or declare the state terminal.
+
+**One case needs a different fix.** An enum bound to a persisted column with
+`#[state_machine(lifecycle = <Enum>)]` may carry a state that exists only as an
+*entry* state for created rows — an `Imported` or `Migrated` value no edge
+targets. `#[lifecycle]` declares one entry point, `initial`, so such a state now
+reads as unreachable. Either give it an edge from `initial`, or drop
+`#[lifecycle]` for that field and declare the table inline with
+`#[state_machine(transitions(...))]`, which is runtime-checked and applies no
+reachability rule. See
+[Declarative State Machines](../guide/state-machines.md).
+
+**Automation:** `manual` — the fix depends on which state the author meant to be
+reachable, which no codemod can infer.
+
 ### OpenApiSchema: `#[serde(skip_serializing_if)]` now needs `#[serde(default)]`
 
 **Why:** `skip_serializing_if` governs serialization alone — a response may omit

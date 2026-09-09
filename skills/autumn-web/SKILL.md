@@ -880,11 +880,13 @@ async fn before_update(
 
 Instead of inline `transitions(...)`, a field can reference a reusable
 `#[lifecycle]` enum — `#[state_machine(lifecycle = OrderState)]` — whose typed
-edges become the field's transition table (#1911/#1916). The `autumn lifecycle
-check` CLI command statically verifies every `#[lifecycle]` state machine
-(referenced-state existence, reachability, that every non-terminal state can
-reach a terminal one; exits non-zero when unsound), and `autumn lifecycle
-diagram` emits a Graphviz DOT or Mermaid `stateDiagram-v2` per lifecycle.
+edges become the field's transition table (#1911/#1916). `#[lifecycle]` proves
+the graph sound at compile time (#1675): referenced-state existence, a terminal
+with no exit, reachability from the initial state, and that every reachable
+non-terminal state can reach a terminal one. `autumn lifecycle check` re-proves
+the same over a whole project without a build and exits non-zero when unsound;
+`autumn lifecycle diagram` emits a Graphviz DOT or Mermaid `stateDiagram-v2`
+per lifecycle.
 
 See `docs/guide/state-machines.md` and `examples/wiki` (`Page` model,
 `draft → published → archived`).
