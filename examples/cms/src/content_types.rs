@@ -281,6 +281,20 @@ pub fn register_taxonomy(taxonomy: Taxonomy) -> Result<(), RegistrationError> {
         crate::content::Registration::Taxonomy(taxonomy.slug),
     )?;
 
+    // The internal slug is a URL segment too, which `claim_on` above never
+    // looks at — it checks the *base*. `/admin/terms/{taxonomy}` takes one
+    // segment, so a slug like `product/type` registers cleanly and then names a
+    // path no route can match: the taxonomy has a working term screen it is
+    // impossible to reach, and the menu entry built from the registry links to
+    // a 404. Post-type slugs are shape-checked for the same reason.
+    if let Some(reason) = segment_shape_problem(taxonomy.slug) {
+        return Err(RegistrationError {
+            field: "slug",
+            value: taxonomy.slug.to_owned(),
+            reason,
+        });
+    }
+
     let mut taxes = taxonomies().write().expect("taxonomy registry poisoned");
     match taxes.iter_mut().find(|t| t.slug == taxonomy.slug) {
         Some(existing) => *existing = taxonomy,

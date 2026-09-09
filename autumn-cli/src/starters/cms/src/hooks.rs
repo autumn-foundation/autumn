@@ -148,6 +148,70 @@ pub fn validate_comment(new: &mut NewComment) -> AutumnResult<()> {
     Ok(())
 }
 
+/// Normalize and validate a new post.
+///
+/// Public for the same reason [`validate_comment`], [`normalize_new_user`] and
+/// [`normalize_new_term`] are: the importer inserts through direct Diesel so
+/// that the row and its `_import_source_slug` marker commit together, and
+/// therefore never reaches `PostHooks::before_create`. An unmarked row is the
+/// one shape a retry cannot recognise, so the marker has to be in the same
+/// transaction as the insert — which means this validation has to be reachable
+/// from outside the hook.
+pub fn normalize_new_post(new: &mut NewPost) -> AutumnResult<()> {
+    if new.post_type.trim().is_empty() {
+        new.post_type = "post".to_owned();
+    }
+    if crate::content_types::find_post_type(&new.post_type).is_none() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Unknown post type `{}`",
+            new.post_type
+        )));
+    }
+
+    new.slug = normalize_slug(&new.slug, &new.title);
+
+    if new.status.trim().is_empty() {
+        new.status = "draft".to_owned();
+    }
+    if !CREATABLE_STATUSES.contains(&new.status.as_str()) {
+        return Err(AutumnError::bad_request_msg(format!(
+            "Content cannot be created directly in `{}`; create it as a draft and transition it",
+            new.status
+        )));
+    }
+    // The same guard the state machine puts on every publishing edge, so a
+    // direct create cannot bypass what a transition would refuse.
+    if new.status == "publish" && new.title.trim().is_empty() {
+        return Err(AutumnError::unprocessable_msg(
+            "A published post must have a title",
+        ));
+    }
+
+    if !matches!(new.comment_status.as_str(), "open" | "closed") {
+        new.comment_status = "open".to_owned();
+    }
+
+    // A post created *directly* as published needs its publish date stamped
+    // here — `before_update` only ever sees a post that was already saved,
+    // so without this a post that never passed through the editor's
+    // draft→publish transition would carry no date at all: no byline date
+    // on the page, no ordering on the index, and no `<lastmod>` in the
+    // sitemap. A caller that supplied one (an importer preserving the
+    // original date) keeps it.
+    if new.published_at.is_none() && new.status == "publish" {
+        new.published_at = Some(chrono::Utc::now().naive_utc());
+    }
+    // The model's declared cap, which a direct insert never runs — the same
+    // check `validate_post_update` makes on the edit path.
+    if new.title.chars().count() > MAX_POST_TITLE {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "A title must be at most {MAX_POST_TITLE} characters"
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub struct PostHooks;
 
@@ -161,51 +225,7 @@ impl MutationHooks for PostHooks {
         _ctx: &mut MutationContext,
         new: &mut NewPost,
     ) -> AutumnResult<()> {
-        if new.post_type.trim().is_empty() {
-            new.post_type = "post".to_owned();
-        }
-        if crate::content_types::find_post_type(&new.post_type).is_none() {
-            return Err(AutumnError::bad_request_msg(format!(
-                "Unknown post type `{}`",
-                new.post_type
-            )));
-        }
-
-        new.slug = normalize_slug(&new.slug, &new.title);
-
-        if new.status.trim().is_empty() {
-            new.status = "draft".to_owned();
-        }
-        if !CREATABLE_STATUSES.contains(&new.status.as_str()) {
-            return Err(AutumnError::bad_request_msg(format!(
-                "Content cannot be created directly in `{}`; create it as a draft and transition it",
-                new.status
-            )));
-        }
-        // The same guard the state machine puts on every publishing edge, so a
-        // direct create cannot bypass what a transition would refuse.
-        if new.status == "publish" && new.title.trim().is_empty() {
-            return Err(AutumnError::unprocessable_msg(
-                "A published post must have a title",
-            ));
-        }
-
-        if !matches!(new.comment_status.as_str(), "open" | "closed") {
-            new.comment_status = "open".to_owned();
-        }
-
-        // A post created *directly* as published needs its publish date stamped
-        // here — `before_update` only ever sees a post that was already saved,
-        // so without this a post that never passed through the editor's
-        // draft→publish transition would carry no date at all: no byline date
-        // on the page, no ordering on the index, and no `<lastmod>` in the
-        // sitemap. A caller that supplied one (an importer preserving the
-        // original date) keeps it.
-        if new.published_at.is_none() && new.status == "publish" {
-            new.published_at = Some(chrono::Utc::now().naive_utc());
-        }
-
-        Ok(())
+        normalize_new_post(new)
     }
 
     async fn before_update(

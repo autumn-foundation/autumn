@@ -572,7 +572,7 @@ pub async fn import(
         .with_conn(async |conn| content::completed_import_ids(conn).await)
         .await?;
 
-    let mut imported = 0_usize;
+    let mut restored = 0_usize;
     let mut skipped = 0_usize;
     let mut orphaned = 0_i64;
     // (created id, post type, the slug AS WRITTEN IN THE FILE, parent slug).
@@ -688,44 +688,44 @@ pub async fn import(
         // Everything lands as a draft first and is transitioned afterwards, so
         // the state machine sees every move into a published status — an import
         // cannot write a status the UI could not reach.
-        // Through the shared allocator: the bare-path index is enforced by the
-        // database, so importing a page whose slug an existing post already
-        // holds would otherwise abort the restore part-way, after earlier rows
-        // had committed.
-        let created = repos
-            .save_post_with_unique_slug(NewPost {
-                post_type: post.post_type.clone(),
-                title: post.title.clone(),
-                slug: post.slug.clone(),
-                excerpt: post.excerpt.clone(),
-                body: post.body.clone(),
-                status: "draft".to_owned(),
-                author_id,
-                parent_id: None,
-                menu_order: post.menu_order,
-                // Resolved against the media restored above, falling back to a
-                // row already on this site with that slug — importing into a
-                // populated site should re-attach to the image that is already
-                // there rather than dropping the association.
-                featured_media_id: match &post.featured_media {
-                    Some(slug) => match media_ids.get(slug) {
-                        Some(id) => Some(*id),
-                        None => repos
-                            .attachments
-                            .find_by_slug(slug.clone())
-                            .await?
-                            .into_iter()
-                            .next()
-                            .map(|attachment| attachment.id),
-                    },
-                    None => None,
+        //
+        // Built here and inserted below, inside the transaction: the row and
+        // its source marker have to commit together. Through the shared
+        // allocator either way, because the bare-path index is enforced by the
+        // database and importing a page whose slug an existing post already
+        // holds would otherwise abort the restore part-way.
+        let draft = NewPost {
+            post_type: post.post_type.clone(),
+            title: post.title.clone(),
+            slug: post.slug.clone(),
+            excerpt: post.excerpt.clone(),
+            body: post.body.clone(),
+            status: "draft".to_owned(),
+            author_id,
+            parent_id: None,
+            menu_order: post.menu_order,
+            // Resolved against the media restored above, falling back to a
+            // row already on this site with that slug — importing into a
+            // populated site should re-attach to the image that is already
+            // there rather than dropping the association.
+            featured_media_id: match &post.featured_media {
+                Some(slug) => match media_ids.get(slug) {
+                    Some(id) => Some(*id),
+                    None => repos
+                        .attachments
+                        .find_by_slug(slug.clone())
+                        .await?
+                        .into_iter()
+                        .next()
+                        .map(|attachment| attachment.id),
                 },
-                comment_status: post.comment_status.clone(),
-                password: post.password.clone(),
-                sticky: post.sticky,
-                published_at: post.published_at,
-            })
-            .await?;
+                None => None,
+            },
+            comment_status: post.comment_status.clone(),
+            password: post.password.clone(),
+            sticky: post.sticky,
+            published_at: post.published_at,
+        };
 
         let term_ids = resolve_import_terms(&repos, post).await?;
         // The terms and the transition commit together. They were separate
@@ -744,16 +744,23 @@ pub async fn import(
         // publication. See `import_status`.
         let wanted_status = import_status(&post.status, post.published_at).to_owned();
         let source_slug = post.slug.clone();
-        let transitioned = repos
+        // The insert, the marker, the terms and the status are one transaction.
+        //
+        // The insert used to sit outside it, because the `Repos` allocator
+        // takes a connection of its own — which left a window a retry could not
+        // recover from. A process killed between the insert and the marker
+        // leaves an *unmarked* post; the next run sees an ordinary local row
+        // holding that slug, classifies it as somebody else's content and skips
+        // it forever, so its terms, status and ancestry are never restored. The
+        // unwind below covers a failed statement, but nothing covers a process
+        // that stops existing. `content::insert_post_with_unique_slug` does the
+        // same allocation on this connection, each attempt in a savepoint, so
+        // there is no window at all.
+        let outcome = repos
             .with_conn(async |conn| {
                 use diesel_async::AsyncConnection as _;
                 conn.transaction(async move |conn| {
-                    // The marker joins this transaction. Writing it first, on
-                    // its own, meant a failure left an *unmarked* draft — which
-                    // the next run reads as unrelated local content and skips
-                    // forever, so its terms, status and ancestry are never
-                    // restored. Marked-and-unfinished is recoverable;
-                    // unmarked-and-unfinished is not.
+                    let created = content::insert_post_with_unique_slug(conn, draft).await?;
                     content::record_import_source(conn, created.id, &source_slug).await?;
                     content::set_post_terms(conn, created.id, term_ids).await?;
                     if wanted_status != "draft" {
@@ -765,42 +772,28 @@ pub async fn import(
                             None,
                         )
                         .await?;
-                        return Ok::<_, AutumnError>(true);
+                        return Ok::<_, AutumnError>((created.id, true));
                     }
-                    Ok::<_, AutumnError>(false)
+                    Ok::<_, AutumnError>((created.id, false))
                 })
                 .await
             })
-            .await;
+            .await?;
+        let (created_id, transitioned) = outcome;
 
-        // The row is removed if any of that failed, so the file is never left
-        // with an unmarked half-import that the next run cannot recognise. The
-        // insert cannot join the transaction — `save_post_with_unique_slug`
-        // retries on its own connection — so unwinding is what makes each
-        // post's import all-or-nothing.
-        let transitioned = match transitioned {
-            Ok(transitioned) => transitioned,
-            Err(error) => {
-                if let Err(cleanup) = repos.posts.delete_by_id(created.id).await {
-                    autumn_web::reexports::tracing::warn!(
-                        %cleanup,
-                        post_id = created.id,
-                        "failed to remove a post whose import could not be completed"
-                    );
-                }
-                return Err(error);
-            }
-        };
+        // No unwind: the transaction above is the unwind. A failure anywhere in
+        // it rolls the insert back with everything else, so there is no row to
+        // remove and no half-import for the next run to misread.
         if transitioned {
-            transitioned_ids.push(created.id);
+            transitioned_ids.push(created_id);
         }
         created_ids.push((
-            created.id,
+            created_id,
             post.post_type.clone(),
             post.slug.clone(),
             post.parent.clone(),
         ));
-        imported += 1;
+        restored += 1;
     }
 
     // Re-link ancestry in a second pass: a child can appear in the file before
@@ -876,7 +869,7 @@ pub async fn import(
         div class="bg-white rounded-lg shadow p-5 max-w-lg" {
             h2 class="font-semibold mb-2" { "Import complete" }
             p class="text-sm text-gray-700" {
-                (imported) " imported, " (skipped) " already present."
+                (restored) " imported, " (skipped) " already present."
             }
             @if orphaned > 0 {
                 p class="text-sm text-amber-700 mt-2" {

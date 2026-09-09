@@ -8372,3 +8372,214 @@ async fn a_batched_menu_resolves_every_link_kind() {
         "a raw URL passes through"
     );
 }
+
+/// A taxonomy whose slug is not a single URL segment is refused.
+///
+/// `claim_on` checks the `rewrite_base`, never the internal slug — so
+/// `product/type` registered cleanly and then named `/admin/terms/product/type`,
+/// a path the one-segment route cannot match. The taxonomy had a working term
+/// screen it was impossible to reach, and the menu entry built from the
+/// registry linked to a 404.
+#[test]
+fn a_taxonomy_slug_must_be_one_url_segment() {
+    let refused = cms::content_types::register_taxonomy(cms::content_types::Taxonomy {
+        slug: "product/type",
+        singular: "Product type",
+        plural: "Product types",
+        hierarchical: true,
+        post_types: &["post"],
+        rewrite_base: "product-type",
+    });
+    let error = refused.expect_err("a slug with a path separator is not a segment");
+    assert_eq!(error.field, "slug");
+
+    // A well-shaped one still registers — the check bounds the input rather
+    // than closing the door.
+    cms::content_types::register_taxonomy(cms::content_types::Taxonomy {
+        slug: "product-type",
+        singular: "Product type",
+        plural: "Product types",
+        hierarchical: true,
+        post_types: &["post"],
+        rewrite_base: "product-type",
+    })
+    .expect("a single-segment slug registers");
+}
+
+/// An import that dies between the insert and its marker leaves nothing behind.
+///
+/// The insert used to sit outside the transaction, because the `Repos`
+/// allocator takes a connection of its own. A failure between it and
+/// `record_import_source` left an unmarked post, which the next run reads as
+/// unrelated local content holding that slug and skips forever — its terms,
+/// status and ancestry never restored. The handler's unwind covered a failed
+/// statement; nothing covered a process that stops existing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_interrupted_import_leaves_no_unmarked_post() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // Fail the run *after* the post row is written, which is the window the
+    // transaction now closes. A trigger on `post_meta` fires between the insert
+    // and the marker's commit, standing in for the process death that would do
+    // it in practice.
+    let db = TestDb::shared().await;
+    try_execute(
+        db,
+        "CREATE OR REPLACE FUNCTION refuse_marker() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.meta_key = '_import_source_slug' THEN RAISE EXCEPTION 'boom'; END IF;
+             RETURN NEW;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .await
+    .expect("create the trigger function");
+    try_execute(db, "DROP TRIGGER IF EXISTS refuse_marker ON post_meta")
+        .await
+        .expect("clear any previous trigger");
+    try_execute(
+        db,
+        "CREATE TRIGGER refuse_marker BEFORE INSERT ON post_meta
+         FOR EACH ROW EXECUTE FUNCTION refuse_marker()",
+    )
+    .await
+    .expect("install the trigger");
+
+    let payload = serde_json::json!({
+        "version": 3,
+        "site_title": "Elsewhere",
+        "exported_at": "2026-01-01T00:00:00Z",
+        "terms": [],
+        "attachments": [],
+        "posts": [
+            {
+                "post_type": "post", "title": "Restored", "slug": "restored",
+                "excerpt": "", "body": "Imported body.", "status": "publish",
+                "password": "", "comment_status": "open",
+                "author": "owner", "terms": [], "comments": [],
+                "published_at": null, "parent": null, "sticky": false, "menu_order": 0
+            }
+        ]
+    })
+    .to_string();
+
+    let failed = import_export(&client, &cookie, payload.as_str()).await;
+    assert_ne!(failed.status, 200, "the import must not report success");
+
+    let rows: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .filter(cms::schema::posts::slug.eq("restored"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(
+        rows, 0,
+        "an unmarked post is the one state a retry cannot recognise, so the \
+         insert has to roll back with the marker"
+    );
+
+    try_execute(db, "DROP TRIGGER refuse_marker ON post_meta")
+        .await
+        .expect("remove the trigger");
+
+    // And the same file imports cleanly once the failure is gone.
+    import_export(&client, &cookie, payload.as_str())
+        .await
+        .assert_ok()
+        .assert_body_contains("1 imported");
+}
+
+/// Deleting an author is serialized with re-parenting.
+///
+/// The orphan check reads rows the deletion does not lock, so being in one
+/// transaction is not enough on its own: an editor filing their live page under
+/// this author's page in between would commit first, and the deletion would
+/// then re-root it having asked the question before the answer changed. Both
+/// paths take `PAGE_HIERARCHY_LOCK_KEY`, so one waits for the other.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn deleting_an_author_takes_the_hierarchy_lock() {
+    let client = db_client().await;
+    let owner = register(&client, "owner").await;
+
+    sign_out(&client);
+    let author = register(&client, "author").await;
+    client
+        .post("/admin/users/2")
+        .header("cookie", &owner)
+        .form(&form(&[
+            ("role", "author"),
+            ("email", "author@example.com"),
+            ("display_name", "Author"),
+            ("bio", ""),
+            ("website", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    client
+        .post("/admin/content/page")
+        .header("cookie", &author)
+        .form(&form(&[
+            ("title", "Guides"),
+            ("slug", "guides"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // The lock is held for the whole deletion, so a re-parent racing it waits
+    // rather than slipping between the check and the delete. Held here from
+    // another session — a session-level advisory lock conflicts with the
+    // transaction-level one `lock_page_hierarchy` takes, they share one lock
+    // space — so the deletion cannot start while it is held. If it did not take
+    // the lock at all it would return immediately, which is what makes this
+    // test discriminating rather than a description.
+    {
+        use diesel_async::RunQueryDsl;
+        let mut holder = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::sql_query(format!(
+            "SELECT pg_advisory_lock({})",
+            cms::content::PAGE_HIERARCHY_LOCK_KEY
+        ))
+        .execute(&mut holder)
+        .await
+        .expect("take the lock");
+
+        let mut worker = TestDb::shared().await.pool().get().await.expect("conn");
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            cms::content::delete_user(&mut worker, 2),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the deletion must wait on the hierarchy lock, not race it"
+        );
+
+        diesel::sql_query(format!(
+            "SELECT pg_advisory_unlock({})",
+            cms::content::PAGE_HIERARCHY_LOCK_KEY
+        ))
+        .execute(&mut holder)
+        .await
+        .expect("release the lock");
+    }
+
+    // With the lock released it completes.
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    cms::content::delete_user(&mut conn, 2)
+        .await
+        .expect("the deletion proceeds once the lock is free");
+}

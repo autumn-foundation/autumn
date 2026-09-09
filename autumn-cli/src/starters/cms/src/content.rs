@@ -1273,13 +1273,23 @@ pub async fn delete_user(conn: &mut AsyncPgConnection, target_id: i64) -> Autumn
                 // `post_terms` row takes `FOR KEY SHARE` on the post it
                 // references, and that conflicts, so a concurrent filing waits
                 // for this transaction rather than racing it.
-                // Refused before anything is deleted, and inside the
-                // transaction so the answer cannot go stale: another author's
-                // live page filed under one of these would be silently
-                // re-rooted by `parent_id ... ON DELETE SET NULL`, changing its
-                // canonical URL and breaking every link to it. The explicit
-                // trash path already refuses for this reason; deleting the
-                // author was the way around it.
+                // The hierarchy lock, taken *before* the check and held to
+                // commit, exactly as `set_post_parent` and `transition_status`
+                // take it. Being inside one transaction is not enough on its
+                // own: the count below reads rows this transaction does not
+                // lock, so an editor filing their live page under one of this
+                // author's pages in between would commit first and this
+                // deletion would then re-root it, having asked the question
+                // before the answer changed. Re-parenting takes the same lock,
+                // so it waits.
+                lock_page_hierarchy(conn).await?;
+
+                // Refused before anything is deleted: another author's live
+                // page filed under one of these would be silently re-rooted by
+                // `parent_id ... ON DELETE SET NULL`, changing its canonical
+                // URL and breaking every link to it. The explicit trash path
+                // already refuses for this reason; deleting the author was the
+                // way around it.
                 let orphaned = orphaned_by_deleting_author(conn, target_id).await?;
                 if orphaned > 0 {
                     return Err(AutumnError::unprocessable_msg(format!(
@@ -1659,10 +1669,69 @@ const RESERVED_PATHS: &[&str] = &[
     "startup",
 ];
 
-/// Whether a slug would be shadowed by one of the application's own routes.
+/// The probe segments *this deployment* mounts, once something has looked.
+///
+/// The four names in `RESERVED_PATHS` are the framework's defaults; all four
+/// are configurable. An operator who sets `health.path = "/healthz"` gets a
+/// literal `/healthz` route, which still beats the front controller's wildcard
+/// — so the static list has to be a floor rather than the whole answer.
+static CONFIGURED_PROBE_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record the probe paths this deployment mounts, from its own configuration.
+///
+/// Called from the `Repos` extractor, which is the one place every slug-writing
+/// path passes through and the earliest place the running configuration is in
+/// hand — `bootstrap()` runs before the app is built and has none. Idempotent
+/// and read-mostly: after the first request this is a `OnceLock` hit.
+///
+/// It only ever *adds* to the defaults, so a slug is never un-reserved by a
+/// configuration this has not seen yet.
+pub fn observe_probe_paths(config: &autumn_web::config::AutumnConfig) {
+    if CONFIGURED_PROBE_PATHS.get().is_some() {
+        return;
+    }
+    let _ = CONFIGURED_PROBE_PATHS.set(probe_segments(&config.health));
+}
+
+/// The bare first segments a health configuration mounts.
+///
+/// Pure, and separate from the `OnceLock` above so it can be tested: the store
+/// is process-global by design — one process runs one configuration — which
+/// makes the seeding itself awkward to exercise from a suite that shares a
+/// process.
+#[must_use]
+pub fn probe_segments(health: &autumn_web::config::HealthConfig) -> Vec<String> {
+    if !health.enabled {
+        // Explicitly disabled, so nothing is mounted and nothing is claimed.
+        // The defaults in `RESERVED_PATHS` still stand — a reserved slug
+        // nothing serves costs one suffixed URL, which is the cheap direction
+        // to be wrong in.
+        return Vec::new();
+    }
+    [
+        &health.path,
+        &health.live_path,
+        &health.ready_path,
+        &health.startup_path,
+    ]
+    .iter()
+    .filter_map(|path| {
+        let segment = path.trim_start_matches('/');
+        // One segment only: a probe mounted at `/a/b` cannot shadow a bare
+        // slug, and reserving `a` on its account would be wrong.
+        (!segment.is_empty() && !segment.contains('/')).then(|| segment.to_owned())
+    })
+    .collect()
+}
+
+/// Whether a slug would be shadowed by one of the application's own routes, or
+/// by a framework route this deployment mounts.
 #[must_use]
 pub fn is_reserved_path(slug: &str) -> bool {
     RESERVED_PATHS.contains(&slug)
+        || CONFIGURED_PROBE_PATHS
+            .get()
+            .is_some_and(|paths| paths.iter().any(|path| path == slug))
 }
 
 /// A scheduled post needs a date that is actually in the future.
@@ -2674,6 +2743,72 @@ pub async fn authors_for_posts(
         .collect())
 }
 
+/// Insert a post with a free slug, on the caller's connection.
+///
+/// The `Repos` allocator does the same thing on a connection of its own, which
+/// is what the editor and the API want. The importer needs this shape instead:
+/// its insert has to commit in the *same* transaction as the
+/// `_import_source_slug` marker, because a row written without one is the one
+/// state a retry cannot recognise — the next run sees an ordinary local post
+/// holding that slug and skips it forever, so its terms, status and ancestry
+/// are never restored. A process killed between two statements is enough to
+/// produce it.
+///
+/// Each attempt is a nested transaction, so a lost race rolls back to a
+/// savepoint rather than poisoning the caller's transaction, and the retry can
+/// allocate again.
+pub async fn insert_post_with_unique_slug(
+    conn: &mut AsyncPgConnection,
+    new: crate::models::NewPost,
+) -> AutumnResult<Post> {
+    let mut new = new;
+    crate::hooks::normalize_new_post(&mut new)?;
+    let desired = new.slug.clone();
+
+    for _ in 0..5 {
+        let attempt = new.clone();
+        let desired = desired.clone();
+        let outcome = conn
+            .transaction(async move |conn| {
+                let slug = ensure_unique_slug(conn, &attempt.post_type, &desired, None).await?;
+                let row = crate::models::NewPost { slug, ..attempt };
+                let saved: Post = diesel::insert_into(posts::table)
+                    .values(&row)
+                    .returning(Post::as_returning())
+                    .get_result(conn)
+                    .await?;
+                Ok::<_, AutumnError>(saved)
+            })
+            .await;
+        match outcome {
+            Ok(post) => return Ok(post),
+            // Both slug indexes, for the reason the `Repos` allocator spells
+            // out: either can be the one a lost race reports, and re-running
+            // allocation is the right answer to both.
+            Err(error)
+                if autumn_web::error::unique_violation_field(
+                    &error,
+                    &[
+                        (
+                            "idx_posts_bare_path_slug",
+                            "slug",
+                            "That URL is already taken",
+                        ),
+                        ("idx_posts_type_slug", "slug", "That URL is already taken"),
+                    ],
+                )
+                .is_some() =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(AutumnError::conflict_msg(
+        "Could not allocate a unique URL for this content; try a different title or slug",
+    ))
+}
+
 /// A term as an export file describes it.
 ///
 /// The parent is a **slug**, not an id: ids mean nothing across installations,
@@ -3068,7 +3203,7 @@ pub async fn publish_due_post(
 
 #[cfg(test)]
 mod slug_shape_tests {
-    use super::{Registration, reads_as_date_archive, segment_claim};
+    use super::{Registration, probe_segments, reads_as_date_archive, segment_claim};
 
     /// The namespace answer covers every branch `permalinks::resolve` tries
     /// before it reaches bare post/page content — the whole point of having one
@@ -3109,5 +3244,38 @@ mod slug_shape_tests {
         assert!(!reads_as_date_archive("2026-review"));
         assert!(!reads_as_date_archive("about"));
         assert!(!reads_as_date_archive(""));
+    }
+    /// A renamed probe still claims its segment.
+    ///
+    /// All four probe paths are configurable, so the four names in
+    /// `RESERVED_PATHS` are a floor rather than the answer: an operator who
+    /// sets `health.path = "/healthz"` gets a literal `/healthz` route, which
+    /// beats the front controller's wildcard exactly as `/health` does.
+    #[test]
+    fn a_renamed_probe_path_is_still_claimed() {
+        let mut health = autumn_web::config::HealthConfig::default();
+        assert_eq!(
+            probe_segments(&health),
+            vec!["health", "live", "ready", "startup"],
+            "the defaults are what `RESERVED_PATHS` already carries"
+        );
+
+        "/healthz".clone_into(&mut health.path);
+        let segments = probe_segments(&health);
+        assert!(segments.contains(&"healthz".to_owned()));
+        assert!(
+            !segments.contains(&"health".to_owned()),
+            "the renamed path replaces the default rather than adding to it"
+        );
+
+        // A probe nested under a prefix cannot shadow a bare slug, and
+        // reserving its first segment on that account would be wrong.
+        "/internal/health".clone_into(&mut health.path);
+        let segments = probe_segments(&health);
+        assert!(!segments.iter().any(|s| s == "internal" || s == "health"));
+
+        // Disabled probes mount nothing and claim nothing.
+        health.enabled = false;
+        assert!(probe_segments(&health).is_empty());
     }
 }

@@ -57,6 +57,12 @@ impl FromRequestParts<AppState> for Repos {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // The earliest point the running configuration is in hand — `bootstrap`
+        // happens before the app is built. Every path that allocates a slug
+        // passes through here, and after the first request this is a `OnceLock`
+        // hit. See `content::observe_probe_paths`.
+        crate::content::observe_probe_paths(&state.config());
+
         Ok(Self {
             users: PgUserRepository::from_request_parts(parts, state).await?,
             posts: PgPostRepository::from_request_parts(parts, state).await?,
