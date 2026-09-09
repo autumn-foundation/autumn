@@ -486,10 +486,25 @@ impl CustomDomainTask {
                 }
                 return;
             }
-            Err(e) => tracing::warn!(
-                hostname,
-                "failed to persist custom-domain issuing state: {e}"
-            ),
+            Err(e) => {
+                // No durable in-flight state means even a successful order
+                // could not be recorded: the record stays `Verified`, the
+                // certificate would fail to activate the same way, and the
+                // next tick would spend another CA attempt on it. Stop before
+                // contacting the CA.
+                self.record_failure(
+                    hostname,
+                    tenant,
+                    now_unix,
+                    format!("refusing to order: the issuing state could not be persisted ({e})"),
+                    true,
+                )
+                .await;
+                if let Err(e) = lease.release().await {
+                    tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
+                }
+                return;
+            }
         }
         self.limiter.record_attempt(hostname, now_unix);
 

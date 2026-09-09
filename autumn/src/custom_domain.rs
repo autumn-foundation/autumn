@@ -855,6 +855,20 @@ impl CustomDomainRegistry {
             return Err(RegisterError::Reserved { pattern });
         }
 
+        // Refuse a full registry BEFORE creating this hostname's write gate.
+        // The authoritative check is inside the gate below; this one exists so
+        // that a tenant-facing endpoint hammered with unique hostnames cannot
+        // mint a gate per attempt while every attempt is refused anyway.
+        let full = {
+            let index = read_lock(&self.index);
+            index.len() >= self.max_domains && !index.contains_key(&host)
+        };
+        if full {
+            return Err(RegisterError::LimitReached {
+                max: self.max_domains,
+            });
+        }
+
         // Taken BEFORE the index is inspected, so the whole registration —
         // claim and save — is serialised against an offboard of the same
         // hostname. Claiming first and gating afterwards let a concurrent
@@ -899,9 +913,27 @@ impl CustomDomainRegistry {
     }
 
     /// The write gate for one hostname, creating it on first use.
+    ///
+    /// Gates outlive the operations that used them, so the map is swept once it
+    /// grows past the registry's own cap: an `Arc` nobody but the map holds has
+    /// no operation behind it and cannot be the one this caller is about to
+    /// take. Without the sweep every hostname ever passed here — an offboarded
+    /// domain, a refused registration — kept an entry for the life of the
+    /// process, so a tenant-facing endpoint could grow this map without bound.
     async fn write_gate(&self, host: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.writes.lock().await;
+        if gates.len() >= self.gate_high_water() && !gates.contains_key(host) {
+            gates.retain(|_, gate| Arc::strong_count(gate) > 1);
+        }
         Arc::clone(gates.entry(host.to_owned()).or_default())
+    }
+
+    /// When to sweep idle write gates: the registry's cap plus room for the
+    /// operations in flight over hostnames that are not registered (an
+    /// offboard, a refused registration), so the sweep is rare rather than
+    /// per-call.
+    const fn gate_high_water(&self) -> usize {
+        self.max_domains.saturating_add(64)
     }
 
     /// The record for `hostname` (normalising the lookup key), if registered.
@@ -2003,6 +2035,50 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The write-gate map must stay bounded: every hostname ever gated used to
+    /// keep an entry for the life of the process, and two paths made that
+    /// unbounded rather than merely bounded by the registry — a refused
+    /// registration (the gate was minted before the cap was checked) and an
+    /// offboarded domain, whose gate outlived it.
+    #[tokio::test]
+    async fn write_gates_are_bounded_by_the_registry_not_by_hostnames_ever_seen() {
+        let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 2);
+        for host in ["a.clientco.com", "b.clientco.com"] {
+            registry.register(host, "tenant-a", 0).await.unwrap();
+        }
+
+        // A tenant-facing endpoint hammered with unique hostnames against a
+        // full registry mints nothing: the cap is checked before the gate.
+        for i in 0..500 {
+            let host = format!("flood-{i}.clientco.com");
+            assert!(matches!(
+                registry.register(&host, "tenant-evil", 0).await,
+                Err(RegisterError::LimitReached { .. })
+            ));
+        }
+        assert_eq!(
+            registry.writes.lock().await.len(),
+            2,
+            "a refused registration must not leave a gate behind"
+        );
+
+        // And a long churn of register/offboard cycles is swept rather than
+        // keeping one entry per hostname ever seen.
+        for host in ["a.clientco.com", "b.clientco.com"] {
+            assert!(registry.remove(host).await.unwrap());
+        }
+        for i in 0..300 {
+            let host = format!("churn-{i}.clientco.com");
+            registry.register(&host, "tenant-a", 0).await.unwrap();
+            assert!(registry.remove(&host).await.unwrap());
+        }
+        let gates = registry.writes.lock().await.len();
+        assert!(
+            gates <= registry.gate_high_water(),
+            "idle gates must be swept, but {gates} are held"
+        );
+    }
 
     #[test]
     fn apex_detection() {

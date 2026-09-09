@@ -979,7 +979,7 @@ async fn a_tenant_teardown_leaves_a_hostname_another_tenant_took_over() {
     // and a certificate belonging to someone who was never being torn down.
     let dir = tempfile::tempdir().unwrap();
     let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
-    let store = Arc::new(PausingDeleteStore::new());
+    let (store, reached) = PausingDeleteStore::new();
     let registry = Arc::new(CustomDomainRegistry::new(
         Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
         100,
@@ -1003,9 +1003,9 @@ async fn a_tenant_teardown_leaves_a_hostname_another_tenant_took_over() {
         let task = Arc::clone(&task);
         async move { task.offboard_tenant("tenant-a").await.unwrap() }
     });
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    reached
+        .await
+        .expect("the fixture must report reaching its pause");
     // The second hostname changes hands while the teardown is suspended.
     assert!(registry.remove("b-second.clientco.com").await.unwrap());
     registry
@@ -1049,16 +1049,24 @@ struct PauseAfterSaveStore {
     inner: Arc<FsAcmeStore>,
     gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
     release: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    entered: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
 }
 
 impl PauseAfterSaveStore {
-    fn new(inner: Arc<FsAcmeStore>) -> Self {
+    /// The store, and a receiver that fires once the first certificate is
+    /// written and the order is suspended before activating it.
+    fn new(inner: Arc<FsAcmeStore>) -> (Arc<Self>, futures::channel::oneshot::Receiver<()>) {
         let (tx, rx) = futures::channel::oneshot::channel();
-        Self {
-            inner,
-            gate: Mutex::new(Some(rx)),
-            release: Mutex::new(Some(tx)),
-        }
+        let (entered_tx, entered_rx) = futures::channel::oneshot::channel();
+        (
+            Arc::new(Self {
+                inner,
+                gate: Mutex::new(Some(rx)),
+                release: Mutex::new(Some(tx)),
+                entered: Mutex::new(Some(entered_tx)),
+            }),
+            entered_rx,
+        )
     }
 
     fn release(&self) {
@@ -1102,6 +1110,10 @@ impl autumn_web::acme::store::AcmeStore for PauseAfterSaveStore {
         Box::pin(async move {
             self.inner.save_cert(id, cert).await?;
             if let Some(rx) = held {
+                let signal = self.entered.lock().unwrap().take();
+                if let Some(tx) = signal {
+                    let _ = tx.send(());
+                }
                 let _ = rx.await;
             }
             Ok(())
@@ -1126,7 +1138,7 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
     // order completes.
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
-    let certs = Arc::new(PauseAfterSaveStore::new(Arc::clone(&fs)));
+    let (certs, reached) = PauseAfterSaveStore::new(Arc::clone(&fs));
     let registry = Arc::new(CustomDomainRegistry::new(
         Arc::new(MemoryCustomDomainStore::new()),
         100,
@@ -1166,9 +1178,9 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
         let task = Arc::clone(&task);
         async move { task.tick(NOW).await }
     });
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    reached
+        .await
+        .expect("the fixture must report reaching its pause");
 
     // The hostname changes hands, and the successor installs its own pair over
     // the same certificate id and activates it.
@@ -1210,6 +1222,120 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
     let record = registry.get("app.clientco.com").unwrap();
     assert_eq!(record.tenant, "tenant-b");
     assert_eq!(record.status, DomainStatus::Active);
+}
+
+/// A registry store whose saves fail once armed, leaving reads intact.
+#[derive(Debug, Default)]
+struct FailingSaveStore {
+    inner: MemoryCustomDomainStore,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl FailingSaveStore {
+    fn fail_saves(&self) {
+        self.failing.store(true, Ordering::SeqCst);
+    }
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for FailingSaveStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        self.inner.load_all()
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Box::pin(async move {
+                Err(std::io::Error::other(
+                    "the custom-domain directory is read-only",
+                ))
+            });
+        }
+        self.inner.save(domain)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.delete(hostname)
+    }
+}
+
+#[tokio::test]
+async fn an_order_is_not_placed_when_the_issuing_state_cannot_be_persisted() {
+    // Without durable in-flight state the certificate could not be activated
+    // either — the activation write fails the same way — so the order would
+    // spend a slot of the deployment's budget and the CA's rate limit on a
+    // certificate that can never be recorded, and the next tick would spend
+    // another.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let store = Arc::new(FailingSaveStore::default());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    let issuer = ScriptedIssuer::new(&[]);
+    let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&alerts);
+    let task = CustomDomainTask {
+        registry: Arc::clone(&registry),
+        cache: Arc::new(CustomDomainCertCache::new(8)),
+        certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier: TableVerifier::new(&[("app.clientco.com", points_here())])
+            as Arc<dyn DomainVerifier>,
+        issuer: Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        ingress: ExpectedIngress {
+            hostname: Some("ingress.myapp.com".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        },
+        renew_before_days: 30,
+        reporter: Arc::new(move |message: String| sink.lock().unwrap().push(message)),
+        recovery: None,
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
+        cert_store_paths: Some(certs),
+        retained_cert_ids: HashSet::new(),
+    };
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_verified("app.clientco.com", NOW)
+        .await
+        .unwrap();
+
+    store.fail_saves();
+    task.tick(NOW).await;
+
+    assert_eq!(
+        issuer.count(),
+        0,
+        "an order whose in-flight state cannot be persisted must not reach the CA"
+    );
+    assert_eq!(
+        registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Verified,
+        "and the record stays where it was"
+    );
+    let alerts = alerts.lock().unwrap().clone();
+    assert_eq!(alerts.len(), 1, "the operator is told why: {alerts:?}");
+    assert!(alerts[0].contains("could not be persisted"), "{alerts:?}");
 }
 
 /// A certificate store that refuses to delete, so a test can assert what
@@ -1294,16 +1420,24 @@ struct SlowCoordinator {
     inner: autumn_web::scheduler::InProcessSchedulerCoordinator,
     gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
     release: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    entered: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
 }
 
 impl SlowCoordinator {
-    fn new() -> Self {
+    /// The coordinator, and a receiver that fires once the held `try_acquire`
+    /// is entered.
+    fn new() -> (Arc<Self>, futures::channel::oneshot::Receiver<()>) {
         let (tx, rx) = futures::channel::oneshot::channel();
-        Self {
-            inner: autumn_web::scheduler::InProcessSchedulerCoordinator::new("test-replica"),
-            gate: Mutex::new(Some(rx)),
-            release: Mutex::new(Some(tx)),
-        }
+        let (entered_tx, entered_rx) = futures::channel::oneshot::channel();
+        (
+            Arc::new(Self {
+                inner: autumn_web::scheduler::InProcessSchedulerCoordinator::new("test-replica"),
+                gate: Mutex::new(Some(rx)),
+                release: Mutex::new(Some(tx)),
+                entered: Mutex::new(Some(entered_tx)),
+            }),
+            entered_rx,
+        )
     }
 
     fn release(&self) {
@@ -1335,6 +1469,10 @@ impl autumn_web::scheduler::SchedulerCoordinator for SlowCoordinator {
         let held = self.gate.lock().unwrap().take();
         Box::pin(async move {
             if let Some(rx) = held {
+                let signal = self.entered.lock().unwrap().take();
+                if let Some(tx) = signal {
+                    let _ = tx.send(());
+                }
                 let _ = rx.await;
             }
             self.inner
@@ -1359,7 +1497,7 @@ async fn an_order_is_abandoned_when_the_hostname_stops_being_this_tenants() {
     ));
     registry.load().await.unwrap();
     let issuer = ScriptedIssuer::new(&[]);
-    let coordinator = Arc::new(SlowCoordinator::new());
+    let (coordinator, reached) = SlowCoordinator::new();
     let task = Arc::new(CustomDomainTask {
         registry: Arc::clone(&registry),
         cache: Arc::new(CustomDomainCertCache::new(8)),
@@ -1392,10 +1530,9 @@ async fn an_order_is_abandoned_when_the_hostname_stops_being_this_tenants() {
         let task = Arc::clone(&task);
         async move { task.tick(NOW).await }
     });
-    // Let the tick verify the domain and reach the held lease.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    reached
+        .await
+        .expect("the fixture must report reaching its pause");
     // The tenant offboards and another one connects the same hostname.
     assert!(registry.remove("app.clientco.com").await.unwrap());
     registry
@@ -1427,16 +1564,26 @@ struct PausingDeleteStore {
     inner: MemoryCustomDomainStore,
     gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
     release: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+    /// Fires when the paused delete is entered, so a test synchronises on the
+    /// suspension itself rather than on a number of `yield_now()`s — which is
+    /// a guess about the scheduler, and a flake under a loaded test binary.
+    entered: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
 }
 
 impl PausingDeleteStore {
-    fn new() -> Self {
+    /// The store, and a receiver that fires once the paused delete is entered.
+    fn new() -> (Arc<Self>, futures::channel::oneshot::Receiver<()>) {
         let (tx, rx) = futures::channel::oneshot::channel();
-        Self {
-            inner: MemoryCustomDomainStore::new(),
-            gate: Mutex::new(Some(rx)),
-            release: Mutex::new(Some(tx)),
-        }
+        let (entered_tx, entered_rx) = futures::channel::oneshot::channel();
+        (
+            Arc::new(Self {
+                inner: MemoryCustomDomainStore::new(),
+                gate: Mutex::new(Some(rx)),
+                release: Mutex::new(Some(tx)),
+                entered: Mutex::new(Some(entered_tx)),
+            }),
+            entered_rx,
+        )
     }
 
     fn release(&self) {
@@ -1471,6 +1618,10 @@ impl autumn_web::custom_domain::CustomDomainStore for PausingDeleteStore {
         let held = self.gate.lock().unwrap().take();
         Box::pin(async move {
             if let Some(rx) = held {
+                let signal = self.entered.lock().unwrap().take();
+                if let Some(tx) = signal {
+                    let _ = tx.send(());
+                }
                 let _ = rx.await;
             }
             self.inner.delete(hostname).await
@@ -1489,7 +1640,7 @@ async fn a_retention_sweep_leaves_a_domain_that_came_up_while_it_ran() {
     // seconds after their domain came up, taking the certificate with it.
     let dir = tempfile::tempdir().unwrap();
     let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
-    let store = Arc::new(PausingDeleteStore::new());
+    let (store, reached) = PausingDeleteStore::new();
     let registry = Arc::new(CustomDomainRegistry::new(
         Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
         100,
@@ -1524,10 +1675,9 @@ async fn a_retention_sweep_leaves_a_domain_that_came_up_while_it_ran() {
         let task = Arc::clone(&task);
         async move { task.prune(NOW + 86_400, false).await.unwrap() }
     });
-    // Let the sweep reach the held delete for the first candidate.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    reached
+        .await
+        .expect("the fixture must report reaching its pause");
     // The second domain finishes setup while the sweep is suspended.
     registry
         .record_active("b-latecomer.clientco.com", NOW + 10, NOW + 90 * 86_400)

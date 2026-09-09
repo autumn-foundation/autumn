@@ -804,6 +804,10 @@ struct PausingDeleteStore {
     inner: MemoryCustomDomainStore,
     release: tokio::sync::Notify,
     paused: std::sync::atomic::AtomicBool,
+    /// Fires when the held delete is entered, so a test synchronises on the
+    /// suspension itself rather than on a number of `yield_now()`s — a guess
+    /// about the scheduler, and a flake under a loaded test binary.
+    entered: tokio::sync::Notify,
 }
 
 impl PausingDeleteStore {
@@ -812,6 +816,7 @@ impl PausingDeleteStore {
             inner: MemoryCustomDomainStore::new(),
             release: tokio::sync::Notify::new(),
             paused: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
         }
     }
 
@@ -822,6 +827,11 @@ impl PausingDeleteStore {
 
     fn release(&self) {
         self.release.notify_one();
+    }
+
+    /// Resolves once the held `delete` has been entered.
+    async fn reached_pause(&self) {
+        self.entered.notified().await;
     }
 }
 
@@ -848,6 +858,7 @@ impl autumn_web::custom_domain::CustomDomainStore for PausingDeleteStore {
     ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
         Box::pin(async move {
             if self.paused.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
                 self.release.notified().await;
             }
             self.inner.delete(hostname).await
@@ -876,10 +887,8 @@ async fn a_registration_racing_an_offboard_of_the_same_hostname_stays_durable() 
         let registry = Arc::clone(&registry);
         async move { registry.remove("app.clientco.com").await.unwrap() }
     });
-    // Let the offboard take the write gate and reach the held delete.
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    // Wait for the offboard to take the write gate and reach the held delete.
+    store.reached_pause().await;
     let reconnect = tokio::spawn({
         let registry = Arc::clone(&registry);
         async move {
@@ -888,9 +897,8 @@ async fn a_registration_racing_an_offboard_of_the_same_hostname_stays_durable() 
                 .await
         }
     });
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    // The reconnect is now queued behind the same write gate; let it get there.
+    tokio::task::yield_now().await;
     store.release();
 
     assert!(offboard.await.unwrap());
