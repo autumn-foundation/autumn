@@ -947,3 +947,185 @@ async fn a_malformed_ingress_hostname_is_refused_at_startup() {
         Some("ingress.myapp.com")
     );
 }
+
+// ── Codex round 4 ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_stored_domain_the_configuration_now_reserves_never_hydrates() {
+    // Reservations come from configuration — the ACME domains, the tenancy
+    // base domain, the ingress hostname — so a name that was a legitimate
+    // third-party domain when it was registered becomes the deployment's own
+    // the moment an operator adds that zone. `register` refuses a reserved
+    // name, but the record persisted BEFORE the change is still on disk, and a
+    // hydration that trusts it hands the operator's own hostname to whoever
+    // registered it first: custom-domain lookup runs ahead of ordinary
+    // subdomain tenancy, so the stale record wins every request after the
+    // restart.
+    let store = Arc::new(MemoryCustomDomainStore::new());
+    let before = CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    );
+    for (host, tenant) in [
+        ("acme.myapp.com", "tenant-evil"),
+        ("app.clientco.com", "tenant-a"),
+    ] {
+        before.register(host, tenant, NOW).await.unwrap();
+        before.record_active(host, NOW, NOW + 86_400).await.unwrap();
+    }
+
+    // The operator now serves `myapp.com` themselves.
+    let after = Arc::new(
+        CustomDomainRegistry::new(
+            Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+            10,
+        )
+        .with_reserved(["myapp.com".to_owned(), "*.myapp.com".to_owned()]),
+    );
+    assert_eq!(
+        after.load().await.unwrap(),
+        1,
+        "only the still-legitimate domain may hydrate"
+    );
+    assert!(
+        after.get("acme.myapp.com").is_none(),
+        "a now-reserved hostname must not come back from the store"
+    );
+    assert!(
+        after.tenant_for_host("acme.myapp.com").is_none(),
+        "and must not route"
+    );
+    assert!(
+        after.get("app.clientco.com").is_some(),
+        "an unaffected domain still hydrates"
+    );
+
+    // The point of all of it: the reserved host resolves through ordinary
+    // subdomain tenancy again, not to the tenant that had claimed it.
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "subdomain".to_owned();
+    config.tenancy.base_domain = Some("myapp.com".to_owned());
+    let req = Request::builder()
+        .header("Host", "acme.myapp.com")
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    assert_eq!(
+        extract_tenant_from_parts_with_domains(&mut parts, &config, Some(&after))
+            .await
+            .unwrap(),
+        "acme",
+        "the operator's own subdomain must resolve to its own tenant"
+    );
+
+    // Quarantined, not deleted: reverting the configuration restores it.
+    let reverted = CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    );
+    assert_eq!(reverted.load().await.unwrap(), 2);
+}
+
+/// A store whose `save` fails on demand, leaving `load_all` intact.
+#[derive(Debug, Default)]
+struct FailingSaveStore {
+    inner: MemoryCustomDomainStore,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl FailingSaveStore {
+    fn fail_saves(&self) {
+        self.fail.store(true, Ordering::SeqCst);
+    }
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for FailingSaveStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        self.inner.load_all()
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Box::pin(async move { Err(std::io::Error::other("the disk is full")) });
+        }
+        self.inner.save(domain)
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.delete(hostname)
+    }
+}
+
+#[tokio::test]
+async fn a_state_change_that_fails_to_persist_is_not_left_in_the_index() {
+    // The index is what routes and what the SNI resolver reads, so publishing
+    // a state the store rejected serves a domain this process cannot justify
+    // after a restart: `record_active_for` reported failure while the domain
+    // went on routing as `active`, and the state then vanished at the next
+    // boot with nothing to explain it.
+    let store = Arc::new(FailingSaveStore::default());
+    let registry = CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    );
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_verified("app.clientco.com", NOW)
+        .await
+        .unwrap();
+
+    store.fail_saves();
+    registry
+        .record_active_for("app.clientco.com", "tenant-a", NOW, NOW + 86_400)
+        .await
+        .expect_err("the store write must surface as an error");
+
+    let live = registry.get("app.clientco.com").unwrap();
+    assert_eq!(
+        live.status,
+        DomainStatus::Verified,
+        "a state that did not reach the store must not be published to the index"
+    );
+    assert!(
+        !registry.is_servable("app.clientco.com"),
+        "and must not route or serve"
+    );
+
+    // A failure that cannot be persisted is dropped the same way: it would
+    // otherwise show a tenant a reason and a backoff that disappear at the
+    // next restart.
+    registry
+        .record_failure("app.clientco.com", NOW, "order rejected", 60)
+        .await
+        .expect_err("the store write must surface as an error");
+    let live = registry.get("app.clientco.com").unwrap();
+    assert_eq!(live.failure_reason, None);
+    assert_eq!(live.consecutive_failures, 0);
+    assert!(live.is_due(NOW));
+
+    // The index and the store still agree.
+    let restarted = CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    );
+    restarted.load().await.unwrap();
+    assert_eq!(
+        restarted.get("app.clientco.com").unwrap(),
+        registry.get("app.clientco.com").unwrap()
+    );
+}

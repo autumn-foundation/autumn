@@ -1762,6 +1762,45 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
     }
 }
 
+/// Grade port 80 on one ingress target, for tenant custom domains.
+///
+/// Deliberately independent of the deployment certificate's challenge mode.
+/// Tenant certificates are ALWAYS validated over HTTP-01 — a tenant's zone is
+/// the tenant's, so this deployment can hold no credential to write a DNS-01
+/// `_acme-challenge` record in it — while the deployment's own certificate may
+/// well use DNS-01, under which `check_acme_ports_for_challenge` calls a closed
+/// port 80 optional. Without this check, an operator running DNS-01 with a
+/// firewall that drops inbound TCP/80 sees a clean doctor run while every
+/// tenant domain fails its order.
+#[must_use]
+pub fn check_custom_domain_http01_impl(target: &str, port_80: PortReachability) -> CheckResult {
+    match port_80 {
+        PortReachability::Open => CheckResult {
+            name: "custom_domain_http01",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "port 80 on the custom-domain ingress ({target}) is reachable"
+            )),
+            hint: None,
+        },
+        PortReachability::Refused | PortReachability::TimedOut | PortReachability::Error => {
+            CheckResult {
+                name: "custom_domain_http01",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "port 80 on the custom-domain ingress ({target}) is not reachable \
+                     ({port_80:?}); every tenant custom domain is validated over HTTP-01, whatever \
+                     challenge this deployment's own certificate uses"
+                )),
+                hint: Some(
+                    "Open inbound TCP/80 to the ingress tenants are told to point at, so the CA \
+                     can fetch /.well-known/acme-challenge for their hostnames",
+                ),
+            }
+        }
+    }
+}
+
 /// Resolve `hostname` and grade it against the configured ingress, through the
 /// SAME grader the runtime verifier uses — so doctor and the running app can
 /// never disagree about whether a domain points here.
@@ -8945,6 +8984,18 @@ pub fn run(opts: DoctorOptions) {
                 .as_ref()
                 .filter(|cd| cd.enabled)
                 .map(autumn_web::config::CustomDomainsConfig::ingress);
+            // Every ingress target a tenant can be pointed at: the CNAME
+            // hostname for a subdomain, the A/AAAA addresses for an apex, which
+            // cannot carry a CNAME. Each is a separate path into the
+            // deployment, so each is probed by name.
+            let http01_targets: Vec<String> = cd_ingress.as_ref().map_or_else(Vec::new, |ing| {
+                ing.hostname
+                    .iter()
+                    .cloned()
+                    .chain(ing.ipv4.iter().map(ToString::to_string))
+                    .chain(ing.ipv6.iter().map(ToString::to_string))
+                    .collect()
+            });
             let registered_count = registered.len();
             tasks.push(Box::new(move || {
                 check_custom_domains_config_impl(
@@ -9002,6 +9053,20 @@ pub fn run(opts: DoctorOptions) {
                             ));
                         }
                         result
+                    }));
+                }
+            }
+
+            // Tenant certificates are always HTTP-01, so port 80 must be open
+            // at the ingress even when this deployment's own certificate uses
+            // DNS-01 — the acme_ports check calls a closed port 80 optional in
+            // that mode, which is right for the deployment and wrong for every
+            // tenant domain.
+            if opts.online {
+                for target in http01_targets {
+                    tasks.push(Box::new(move || {
+                        let p80 = probe_port(&target, 80);
+                        check_custom_domain_http01_impl(&target, p80)
                     }));
                 }
             }
@@ -12538,6 +12603,44 @@ pub struct Vault {
         assert_eq!(
             check_custom_domain_dns_impl(&probe("active", CustomDomainDns::IngressUnknown)).status,
             CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn port_80_is_required_for_custom_domains_whatever_the_deployment_uses() {
+        // The deployment's own certificate may be issued over DNS-01, under
+        // which a closed port 80 is merely optional. A tenant's zone is the
+        // tenant's, so no tenant certificate can ever use DNS-01: they are all
+        // HTTP-01, and a firewall that drops inbound TCP/80 fails every one of
+        // them while `acme_ports` reports the deployment healthy.
+        let optional_for_the_deployment = check_acme_ports_for_challenge(
+            "myapp.com",
+            PortReachability::Refused,
+            PortReachability::Open,
+            true,
+        );
+        assert_eq!(optional_for_the_deployment.status, CheckStatus::Warn);
+
+        let result =
+            check_custom_domain_http01_impl("ingress.myapp.com", PortReachability::Refused);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "a closed port 80 blocks every tenant custom domain"
+        );
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("ingress.myapp.com"), "{detail}");
+        assert!(detail.contains("HTTP-01"), "{detail}");
+
+        for unreachable in [PortReachability::TimedOut, PortReachability::Error] {
+            assert_eq!(
+                check_custom_domain_http01_impl("203.0.113.10", unreachable).status,
+                CheckStatus::Fail
+            );
+        }
+        assert_eq!(
+            check_custom_domain_http01_impl("ingress.myapp.com", PortReachability::Open).status,
+            CheckStatus::Pass
         );
     }
 

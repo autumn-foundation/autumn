@@ -798,6 +798,29 @@ impl CustomDomainRegistry {
         let mut index = write_lock(&self.index);
         index.clear();
         for record in records {
+            // A reservation can appear AFTER a domain was connected: the
+            // operator adds a tenancy base domain, another name to the
+            // deployment certificate, or an ingress hostname. `register`
+            // refuses a reserved name, but the record written before that
+            // change is still in the store, and hydrating it hands the
+            // deployment's own hostname to whoever registered it first —
+            // custom-domain lookup runs ahead of ordinary subdomain tenancy,
+            // so the stale record wins every request from the restart on.
+            //
+            // Quarantined, not deleted: the record stays in the store, so
+            // reverting the configuration restores the domain, while the
+            // retention prune clears the certificate of a hostname the
+            // registry no longer knows.
+            if let Some(pattern) = self.reserved_match(&record.hostname) {
+                tracing::error!(
+                    hostname = %record.hostname,
+                    tenant = %record.tenant,
+                    pattern = %pattern,
+                    "refusing to load a custom domain the configuration now reserves; offboard it \
+                     or drop the reservation"
+                );
+                continue;
+            }
             index.insert(record.hostname.clone(), record);
         }
         self.hydrated
@@ -1243,20 +1266,30 @@ impl CustomDomainRegistry {
         };
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
-        let updated = {
-            let mut index = write_lock(&self.index);
-            let Some(record) = index.get_mut(&host) else {
-                return Ok(false);
-            };
-            if !guard(record) {
-                return Ok(false);
-            }
-            f(record);
-            let updated = record.clone();
-            drop(index);
-            updated
+        // Apply to a COPY, persist, and only then publish. Mutating the live
+        // index first left a state the store had rejected routing and serving
+        // anyway: `record_active` reported failure while the domain went on
+        // being served from it, and the state then vanished at the next
+        // restart with nothing to explain either half. Every writer for this
+        // hostname holds this same gate, so nothing can change the record
+        // between the copy and the publish.
+        let Some(current) = read_lock(&self.index).get(&host).cloned() else {
+            return Ok(false);
         };
-        self.store.save(&updated).await.map(|()| true)
+        if !guard(&current) {
+            return Ok(false);
+        }
+        let mut updated = current;
+        f(&mut updated);
+        self.store.save(&updated).await?;
+        let mut index = write_lock(&self.index);
+        // An offboard cannot interleave under the gate, but the index is the
+        // routing table: if the record is gone, leave it gone rather than
+        // resurrecting a hostname nothing owns.
+        Ok(index.get_mut(&host).is_some_and(|slot| {
+            *slot = updated;
+            true
+        }))
     }
 }
 
