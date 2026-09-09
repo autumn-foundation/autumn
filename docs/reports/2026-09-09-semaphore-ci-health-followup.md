@@ -113,14 +113,21 @@ The new `live_upgrade` Linux hit does **not** disprove or replace the
 macOS-specific framing of the existing 3-hit cluster — that would overreach
 from a single data point on a *different assertion*, where "different
 assertion" plausibly means "different bug," not "same bug, different OS."
-What it does establish: a hot-upgrade timing sensitivity has now been
-observed on more than one platform, in more than one form, which is reason
-enough to widen the still-undispatched rerun campaign beyond macOS-only
-rather than to unify the two signatures' diagnoses. Only a rerun campaign
-that reproduces the *same* signature on both platforms would justify
-treating them as one mechanism. Per Semaphore's law 3 (product/test verdict
-rendered first), neither signature's test tolerance nor the product code
-should change until that campaign renders a verdict.
+It establishes nothing on its own either: a single, unreproduced failure at
+a fixed-duration load window (v2 never observed serving traffic) is equally
+consistent with runner-timing sensitivity, with a deterministic bug specific
+to that commit's own changes, or with an unrelated one-off cause — there is
+no same-commit rerun to distinguish those. Treat it as an **unclassified
+Linux signature**, logged for its own sake, not yet evidence of anything
+beyond "one more organic hit exists." The recommendation below to widen the
+still-undispatched rerun campaign to include a Linux/coverage-shaped sample
+follows from cheapness and completeness (the campaign is already being
+built; broadening its scope costs little), not from this one hit having
+established a cross-platform mechanism. Only a rerun campaign that
+reproduces the *same* signature on both platforms would justify treating
+them as one mechanism. Per Semaphore's law 3 (product/test verdict rendered
+first), neither signature's test tolerance nor the product code should
+change until that campaign renders a verdict.
 
 `cache_stampede`'s second hit doesn't change its diagnosis (still open, still
 undiagnosed), but it does change its priority: two hits of the identical
