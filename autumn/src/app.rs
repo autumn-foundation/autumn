@@ -4173,7 +4173,12 @@ impl AppBuilder {
         // an X actually registered on the live registry. Catches
         // the "wired the macro arg, forgot the `.policy(...)`
         // builder call" footgun before any 500 lands.
-        validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        validate_repository_policies_registered(
+            &all_routes,
+            &scoped_groups,
+            state.policy_registry(),
+            &config,
+        );
         #[cfg(feature = "mail")]
         if let Some(handle) = suppression_store {
             state.insert_extension(handle);
@@ -6388,6 +6393,7 @@ impl AppBuilder {
             mcp,
             #[cfg(feature = "mail")]
             mount_unsubscribe_endpoint,
+            policy_registrations,
             ..
         } = self;
 
@@ -6432,6 +6438,23 @@ impl AppBuilder {
         //
         // Ordered as the serving path orders them, so an app with more than one
         // problem reports the same first error either way.
+        // `.policy::<R, _>(...)` / `.scope::<R, _>(...)` are DEFERRED closures the
+        // serving path replays onto live state before checking that every
+        // `#[repository(policy = X)]` route actually has an X registered. The
+        // export dropped them and checked only that the macro argument existed,
+        // so an app that declares a policy but forgets the builder call — which
+        // refuses to start under a production profile — still exported a
+        // contract `--check` would approve.
+        //
+        // A throwaway `PolicyRegistry` is enough: the check only ever reads the
+        // registry, and building real `AppState` would open the database this
+        // command promises not to touch.
+        let export_registry = crate::authorization::PolicyRegistry::default();
+        for register in policy_registrations {
+            register(&export_registry);
+        }
+        validate_repository_policies_registered(&routes, &scoped_groups, &export_registry, &config);
+
         let mcp_mount_path: Option<&str> = {
             #[cfg(feature = "mcp")]
             {
@@ -11873,17 +11896,23 @@ fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
 }
 
 #[allow(clippy::cognitive_complexity)]
+/// Takes the `PolicyRegistry` rather than the whole `AppState` — which is all
+/// `collect_unregistered_repository_handlers` ever needed — so the no-boot
+/// export can run this rule too, against a throwaway registry the deferred
+/// registrations are replayed onto. Requiring `AppState` would have meant
+/// building state, which is exactly what an export advertised as opening no
+/// database must not do (issue #802).
 fn validate_repository_policies_registered(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],
-    state: &AppState,
+    registry: &crate::authorization::PolicyRegistry,
     config: &AutumnConfig,
 ) {
     let profile = config.profile.as_deref().unwrap_or("default");
     let strict = is_production_profile(profile);
 
     let (missing_policies, missing_scopes) =
-        collect_unregistered_repository_handlers(routes, scoped_groups, state.policy_registry());
+        collect_unregistered_repository_handlers(routes, scoped_groups, registry);
 
     if missing_policies.is_empty() && missing_scopes.is_empty() {
         return;

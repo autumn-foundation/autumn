@@ -1114,7 +1114,18 @@ pub fn emit_schema_fn_body_named(
     let mut required_pushes: Vec<TokenStream> = Vec::new();
     if !all_optional {
         for f in fields {
-            if treat_as_optional(f) {
+            // `skip_serializing_if` means a RESPONSE may omit the field, so
+            // `required` is wrong for it whatever its type. The standalone
+            // derive's audit already refuses this attribute on anything that is
+            // neither `Option`-named nor defaulted — precisely because the
+            // survivors are describable as optional — but it makes that
+            // judgement from the last path segment, so an application's own
+            // `domain::Option<T>` passed the audit and then landed in `required`
+            // anyway once the emitter's identity guard recognised the impostor.
+            // Deciding it here, on the attribute rather than on the type, makes
+            // the audit's stated premise actually true and needs no runtime
+            // identity: the attribute is exactly what a proc macro can see.
+            if treat_as_optional(f) || field_has_skip_serializing_if(f) {
                 continue;
             }
             let Some(name) = resolve_name(f) else {
