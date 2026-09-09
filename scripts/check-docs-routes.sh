@@ -352,60 +352,51 @@ def corpus(root):
 # "…probe `/actuator/health`." does not become `/actuator/health.` and get
 # reported as a missing endpoint.
 #
-# The lookahead after the prefix is load-bearing, and its absence was a silent
-# hole rather than a cosmetic one. Without it `/actuatorhealth` matches just
-# `/actuator`, which then RESOLVES against the bare-prefix rule — so the gate
-# would green-light a URL that 404s, by truncating it down to one that does not.
-# A gate that answers a question the reader did not ask is worse than one that
-# declines to answer.
+# EXTRACTION IS ONE RULE, deliberately, after three review rounds found the same
+# bug at three depths. Take the longest run of RFC 3986 path characters starting
+# at the prefix, then strip trailing sentence punctuation. Nothing else.
 #
-# A TRAILING SLASH IS KEPT, not stripped, because axum distinguishes the
-# mounted `/actuator/health` from `/actuator/health/` and mounts no normalizing
-# layer — so a documented trailing slash is a 404 the old pattern silently
-# truncated away. `resolves()` reads it as "the subtree below this", which is
-# what the two shapes the corpus actually writes both mean: `Disallow:
-# /actuator/` in a robots.txt sample, and `/actuator/…` in prose. Under a leaf
-# that has nothing below it, the same reading rejects `/actuator/health/`.
+# THE BUG THAT RULE EXISTS TO END. Every path character left out of a
+# hand-picked class is a place the match stops early, and a match that stops
+# early hands `resolves()` a SHORTER path than the page printed — which then
+# resolves, so the gate green-lights a URL that 404s by shortening it into one
+# that does not. That is the single worst thing a drift gate can do, and it
+# arrived three times in a row from three different characters:
 #
-# The segment class carries the RFC 3986 path characters that are never prose
-# punctuation — `~ + % & = $ @` alongside the obvious ones — for one reason:
-# every one of them that is left out becomes a place the match can stop early,
-# and a match that stops early hands `resolves()` a SHORTER path than the page
-# printed. `/actuator/health~old` truncating to `/actuator/health` is the same
-# bug as `/actuatorhealth` truncating to `/actuator`, one segment further along.
-# Characters that really do end a path in running text — `, ; : ! ' ( ) ? > #`
-# — stay out, and `?` in particular must stay out because a query string is not
-# part of the path (`/actuator/logfile?level=warn`).
-DOC_PATH = re.compile(
-    r"/actuator(?![A-Za-z0-9_~+%&=$@-])"
-    r"(?:/[A-Za-z0-9_*{}~+%&=$@-]+(?:\.[A-Za-z0-9_~+%&=$@-]+)*)*/?")
+#   `/actuatorhealth`      -> `/actuator`           (no separator)
+#   `/actuator/health/`    -> `/actuator/health`    (trailing slash)
+#   `/actuator/health~old` -> `/actuator/health`    (sub-delim)
+#
+# Enumerating the characters that must be INSIDE a path is a losing game; the
+# grammar already enumerates them. So `PATH_CHARS` is RFC 3986's `pchar` —
+# unreserved, sub-delims, `:` and `@` — plus `/` and the `{}` a documented route
+# parameter is written with. `%` is included as itself, since a page writes
+# `%2F` rather than decoding it.
+#
+# WHAT IS LEFT OUT IS THE POINT: `?` `#` `<` `>` `"` `[` `]` `` ` `` and
+# whitespace, none of which is a path character, and each of which really does
+# end a path in running text. `?` matters most — a query string is not part of
+# the path, so `GET /actuator/logfile?level=warn` in logging-pii.md must extract
+# `/actuator/logfile` and resolve.
+PATH_CHARS = r"A-Za-z0-9\-._~%!$&'()*+,;=:@{}"
+DOC_PATH = re.compile(rf"/actuator[{PATH_CHARS}/]*")
 
-# Sentence punctuation stripped from the end of a match. `/` is deliberately
-# ABSENT (it is significant, per above) and so are the three characters a survey
-# of the corpus found genuinely terminating a path, each of which the match must
-# stop at rather than swallow:
-#   `?`  a query string — `GET /actuator/logfile?level=warn` in logging-pii.md.
-#        The PATH ends at the `?`; the query is not part of it.
-#   `>`  a markdown autolink — `<http://localhost:3000/actuator/health>` in
-#        tutorial/01-project-setup.md.
-#   `:`  a `::`-separated logger target — `/actuator/loggers/my_app::orders` in
-#        skills/autumn-web/SKILL.md, a legal `{name}` value.
-# None of the three is a defect, so none is reported; they are listed here
-# because "reject every unrecognized suffix" would report all three.
+# Sentence punctuation stripped from the END of a match, which is what lets
+# `PATH_CHARS` stay faithful to the grammar without reporting prose. `.`, `,`,
+# `;`, `:`, `)` and `'` are all legal path characters AND all common sentence
+# punctuation; the difference is only ever position, so position is what decides.
+#
+#   "probe /actuator/health."            -> `/actuator/health`   (a sentence)
+#   "GET /actuator/health;old"           -> `/actuator/health;old` (a path)
+#   "/actuator/loggers/my_app::orders"   -> kept whole, a legal `{name}` value
+#
+# `/` is deliberately ABSENT: a trailing slash is significant, since axum
+# distinguishes the mounted `/actuator/health` from `/actuator/health/` and
+# mounts no normalizing layer. `resolves()` reads it as "the subtree below
+# this" — what both shapes the corpus writes mean (`Disallow: /actuator/` in a
+# robots.txt sample, `/actuator/…` in prose) — and rejects it under a leaf that
+# has nothing below it.
 TRAILING = ".,;:!?)\"'`]}>"
-
-# `/actuatorhealth` — the separator dropped. Reported on its own, because the
-# lookahead above only stops the gate from mis-reading it; something still has
-# to say it is wrong, and a missing slash is the most plausible way a documented
-# actuator URL 404s.
-#
-# A HYPHEN IS NOT A MISSING SEPARATOR, which is why `_` and alphanumerics are
-# matched here but `-` is not. `/actuator-dashboard` is a distinct route a reader
-# may legitimately mount, not a typo of an actuator endpoint — the framework's
-# own router test asserts exactly that, mounting `/actuator-dashboard` to prove
-# the actuator prefix must not swallow it. Reporting it would be this gate
-# claiming a path was meant to be one of ours.
-MISSING_SEPARATOR = re.compile(r"/actuator[A-Za-z0-9_][A-Za-z0-9_./{}-]*")
 
 # A line that hands the reader a REQUEST rather than a name: a `curl`
 # invocation, or an HTTP method immediately followed by a path. Only these
@@ -425,8 +416,14 @@ MISSING_SEPARATOR = re.compile(r"/actuator[A-Za-z0-9_][A-Za-z0-9_./{}-]*")
 # the corpus writes the request line both ways: `GET /actuator/logfile?level=warn`
 # in `logging-pii.md`, and `GET http://localhost:3000/dev/trigger-error` in
 # `dev-error-overlay.md`. Both hand the reader something to send.
+#
+# The method list is the whole of RFC 9110 plus `PATCH` (RFC 5789) rather than
+# the handful the corpus happens to use, for the same reason `PATH_CHARS` is the
+# grammar rather than a hand-picked set: a method left out is a request line
+# read as prose, and the standard already enumerates them.
 REQUEST_LINE = re.compile(
-    r"\bcurl\b|\b(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+(?:https?://[^\s/]+)?/")
+    r"\bcurl\b|\b(?:GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH)"
+    r"\s+(?:https?://[^\s/]+)?/")
 
 # `<!-- route-surface-allow: /actuator/x — reason -->`. The reason is required:
 # a waiver without one outlives the sentence it was written for. Matched over
@@ -491,8 +488,16 @@ def waived_lines(text):
 def documented(text):
     """Yield (line_no, path, requested) for every `/actuator/…` path a page shows.
 
-    Missing-separator spellings are yielded too, so they are reported rather
-    than skipped; nothing mounts them, so resolution rejects them on its own.
+    A malformed spelling is yielded whole rather than trimmed to something that
+    resolves — `/actuatorhealth`, `/actuator.health`, `/actuator/health;old`.
+    Nothing mounts any of them, so resolution rejects them on its own and the
+    reader is told which line to look at.
+
+    The ONE spelling skipped is `/actuator-…`. A hyphen starts a different name,
+    and `router.rs` mounts `/actuator-dashboard` in its own test precisely to
+    prove the actuator prefix must not swallow a sibling route. Reporting it
+    would be this gate asserting that a path was MEANT to be one of ours, which
+    it cannot know.
 
     `requested` marks a path the page hands someone to REQUEST rather than to
     read, which is the one distinction the prefix rule needs and the only one
@@ -501,11 +506,11 @@ def documented(text):
     """
     for lineno, line in enumerate(blank_comments(text).splitlines(), 1):
         requested = bool(REQUEST_LINE.search(line))
-        for pattern in (DOC_PATH, MISSING_SEPARATOR):
-            for match in pattern.finditer(line):
-                path = match.group(0).rstrip(TRAILING)
-                if path:
-                    yield lineno, path, requested
+        for match in DOC_PATH.finditer(line):
+            path = match.group(0).rstrip(TRAILING)
+            if not path or path[len(PREFIX):].startswith("-"):
+                continue
+            yield lineno, path, requested
 
 
 # ── Resolution ───────────────────────────────────────────────────────────────
@@ -748,6 +753,38 @@ def self_test():
         [(1, "/actuator/")],
     ))
 
+    # The same characters, now at the END, where they are punctuation rather
+    # than path. Position is the only thing that separates the two populations,
+    # so position is what decides — this is the half that keeps `PATH_CHARS`
+    # faithful to the grammar without the gate reporting ordinary prose.
+    # A closing paren is the one character where the two populations genuinely
+    # collide and prose wins: "(/actuator/health)" is common and a balanced
+    # paren inside an actuator path is not. So the trailing `)` is stripped even
+    # from `/actuator/health(old)`. The path is still reported — it just loses
+    # its last character on the way — which is the right side to err on, since
+    # the alternative reports every parenthesised mention in the corpus.
+    cases.append((
+        "a trailing `)` is punctuation even mid-token",
+        [q for _, q, _r in documented("GET /actuator/health(old)\n")],
+        ["/actuator/health(old"],
+    ))
+    cases.append((
+        "…and the result still does not resolve",
+        resolves("/actuator/health(old", surface), False,
+    ))
+
+    for sentence, want in (
+        ("probe /actuator/health.", "/actuator/health"),
+        ("either /actuator/health, or the probe", "/actuator/health"),
+        ("see /actuator/health; it is cheap", "/actuator/health"),
+        ("the probe (/actuator/health) is cheap", "/actuator/health"),
+        ("mounted at /actuator/health: the liveness view", "/actuator/health"),
+    ):
+        cases.append((
+            f"trailing punctuation is dropped: {sentence[:34]!r}",
+            [q for _, q, _r in documented(sentence + "\n")], [want],
+        ))
+
     # Three suffixes a corpus survey found genuinely terminating a path. Each
     # must stop the match without being reported, because "reject every
     # unrecognized suffix" would report all three and every one is correct.
@@ -801,6 +838,11 @@ def self_test():
         ("/actuator/*  GET      -> actuator", False),
         # A route-listing table row: the `|` is not a scheme.
         ("| GET | /actuator/health | liveness |", False),
+        # Every standard method, not the handful the corpus happens to use.
+        ("OPTIONS /actuator/webhooks", True),
+        ("TRACE /actuator/webhooks", True),
+        ("CONNECT /actuator/webhooks", True),
+        ("HEAD /actuator/health", True),
         ('access_log_exclude = ["/health", "/actuator", "/static"]', False),
         ("Everything under `/actuator/webhooks` is sensitive.", False),
     ):
@@ -812,7 +854,14 @@ def self_test():
     # can stop early, and an early stop hands `resolves()` a SHORTER path than
     # the page printed — the `/actuatorhealth` bug one segment further along.
     for spelling in ("/actuator/health~old", "/actuator/health+old",
-                     "/actuator/health%2Fold", "/actuator/health@2"):
+                     "/actuator/health%2Fold", "/actuator/health@2",
+                     # `:` `;` `,` `.` `!` `'` `(` `)` are path characters AND
+                     # sentence punctuation. Mid-path they are kept; the
+                     # TRAILING cases below prove they are dropped at the end.
+                     "/actuator/health:old", "/actuator/health;old",
+                     "/actuator/health,old", "/actuator/health.old",
+                     "/actuator/health!old",
+                     "/actuatorhealth", "/actuator.health"):
         cases.append((
             f"`{spelling}` is extracted whole, not truncated",
             [q for _, q, _r in documented(f"GET {spelling}\n")], [spelling],
