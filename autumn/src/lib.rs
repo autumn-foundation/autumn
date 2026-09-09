@@ -177,6 +177,8 @@ pub use autumn_edge as edge;
 pub mod edge_support;
 #[cfg(feature = "edge")]
 pub use edge_support::CacheEdgeKv;
+#[cfg(feature = "db")]
+pub mod confidential;
 pub mod encryption;
 pub mod entropy;
 pub mod error;

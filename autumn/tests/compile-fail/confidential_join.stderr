@@ -1,0 +1,11 @@
+error[E0599]: no method named `on` found for struct `BlindIndexPredicate<F>` in the current scope
+ --> tests/compile-fail/confidential_join.rs:4:73
+  |
+4 | fn main() { let _ = ConfidentialField::<Email>::blind_index_eq(token()).on(token()); }
+  |                                                                         ^^
+  |
+help: there is a method `or` with a similar name
+  |
+4 - fn main() { let _ = ConfidentialField::<Email>::blind_index_eq(token()).on(token()); }
+4 + fn main() { let _ = ConfidentialField::<Email>::blind_index_eq(token()).or(token()); }
+  |

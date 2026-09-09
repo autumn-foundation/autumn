@@ -95,6 +95,23 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_shard_key_unknown.rs");
 
+    // Confidential fields expose only a named blind-index equality capability.
+    // Ordinary filtering, ordering, ranges, patterns, uniqueness, joins,
+    // derivations and full-text search are all compile-time refusals.
+    #[cfg(feature = "db")]
+    for fixture in [
+        "where",
+        "order",
+        "range",
+        "pattern",
+        "unique",
+        "join",
+        "derivation",
+        "search",
+    ] {
+        t.compile_fail(format!("tests/compile-fail/confidential_{fixture}.rs"));
+    }
+
     // `#[validate(nested)]` collides with this crate's own `ValidateExt` when
     // both are in scope in the struct's own defining module -- true of
     // `#[model]`-generated structs too, since `#[model]` forwards
@@ -618,6 +635,15 @@ fn compile_pass_tests_a() {
     // Encrypted column field attribute (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_encrypted.rs");
+
+    // Confidential writes, owner-scoped reads, and the one named equality
+    // capability remain available.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/confidential_insertion.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/confidential_owner_scoped.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/confidential_blind_index.rs");
 
     // Full versioned repository over an encrypted model (requires db feature)
     #[cfg(feature = "db")]
