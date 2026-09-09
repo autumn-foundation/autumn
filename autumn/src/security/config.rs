@@ -251,17 +251,24 @@ pub fn validate_signing_secret(
 ///
 /// **Negative result (checked, not shipped):** the per-byte hex fold below
 /// routes every one of the 32 output bytes through `core::fmt::write` ->
-/// `Formatter::pad_integral` -> `LowerHex::fmt` (7.43% of the whole profile,
-/// inclusive) instead of a direct nibble lookup. Swapping it for
-/// `hex::encode` (already used for identical byte-to-hex encoding elsewhere
-/// in this crate: `ledger.rs`, `migrate.rs`, `sigv4.rs`, ...) was measured on
-/// the same bench/machine: instructions 806,998,060 -> 769,584,433 total
-/// (base-subtracted per-request 132,954.8 -> 126,764.3 Ir, -4.66%), DHAT
-/// allocation blocks and bytes unchanged (both approaches make exactly one
-/// `String` allocation). -4.66% clears neither the 5%-of-instructions nor the
-/// 10%-of-allocations impact floor — it is the ceiling of what this narrow,
-/// safe substitution can remove, since the untouchable SHA-256 compression
-/// dominates the rest of this function's cost — so no fix is shipped.
+/// `Formatter::pad_integral` -> `LowerHex::fmt` instead of a direct nibble
+/// lookup. `core::fmt::write`'s own inclusive share of the whole profile
+/// (7.43%) is *not* this fold's isolated cost — `write!`/`format!` run all
+/// over the request pipeline (tracing spans, header formatting, ...), so
+/// that figure also counts calls with nothing to do with this function.
+/// Swapping the fold for `hex::encode` (already used for identical
+/// byte-to-hex encoding elsewhere in this crate: `ledger.rs`, `migrate.rs`,
+/// `sigv4.rs`, ...) and diffing `hmac_sha256_hex`'s own inclusive Ir
+/// before vs. after isolates it instead: 136,026,523 -> 99,533,081
+/// (-36,493,442 Ir, 4.52% of the whole profile — the fold's actual
+/// addressable share). Measured on the same bench/machine: instructions
+/// 806,998,060 -> 769,584,433 total (base-subtracted per-request
+/// 132,954.8 -> 126,764.3 Ir, -4.66%), DHAT allocation blocks and bytes
+/// unchanged (both approaches make exactly one `String` allocation).
+/// -4.66% clears neither the 5%-of-instructions nor the 10%-of-allocations
+/// impact floor — it is the ceiling of what this narrow, safe substitution
+/// can remove, since the untouchable SHA-256 compression dominates the
+/// rest of this function's cost — so no fix is shipped.
 ///
 /// # Panics
 ///
