@@ -282,6 +282,7 @@ pub fn run(
             // reaching the `diesel` subprocess and dying with a raw OS error (the
             // `diesel` CLI preflight was deliberately skipped for all-SQLite runs).
             let mut sqlite_unsupported = false;
+            let mut collision_seen = false;
             for (label, url) in &targets {
                 eprintln!("\u{2500}\u{2500} {label} \u{2500}\u{2500}");
                 if is_sqlite_target(url) {
@@ -295,14 +296,30 @@ pub fn run(
                     sqlite_unsupported = true;
                     continue;
                 }
+                // Diesel tracks a migration by version alone, so with an app
+                // migration on a framework version both sides can read as
+                // applied here while one never ran. Say so first, and exit
+                // non-zero at the end, rather than present a clean report.
+                let is_shard = label.starts_with("shard:");
+                if let Some(message) = framework_version_collision_error(
+                    std::path::Path::new(&migrations_dir),
+                    is_shard,
+                ) {
+                    eprintln!(
+                        "  \u{2717} Migration version collision, so the status below cannot \
+                         tell the two apart: {message}"
+                    );
+                    eprintln!();
+                    collision_seen = true;
+                }
                 show_status(url, &migrations_dir);
                 show_rollback_availability(url, &migrations_dir);
                 // Shard targets only require the shard framework migrations, so
                 // report against that set instead of the full control-plane one.
-                show_framework_status(url, label.starts_with("shard:"));
+                show_framework_status(url, is_shard);
                 eprintln!();
             }
-            if sqlite_unsupported {
+            if sqlite_unsupported || collision_seen {
                 std::process::exit(1);
             }
         }
@@ -619,7 +636,9 @@ fn run_single_target(
     // tracks a migration under its directory's version only, so unlike the
     // SQLite path this one cannot carry the app migration under a substitute.
     // Stop before anything runs, with the rename to make.
-    if let Some(message) = framework_version_collision_error(std::path::Path::new(migrations_dir)) {
+    if let Some(message) =
+        framework_version_collision_error(std::path::Path::new(migrations_dir), is_shard)
+    {
         eprintln!("\u{274C} Migration version collision: {message}");
         return false;
     }
@@ -1798,6 +1817,7 @@ fn run_down(
             args,
             url,
             dir,
+            label.starts_with("shard:"),
             with_maintenance,
             &mut maintenance_enabled,
             preflighted_plan,
@@ -1963,6 +1983,7 @@ fn run_down_target(
     args: &DownArgs,
     database_url: &str,
     dir: &Path,
+    is_shard: bool,
     with_maintenance: bool,
     maintenance_enabled: &mut bool,
     preflighted_plan: &[String],
@@ -2026,7 +2047,7 @@ fn run_down_target(
         // Rollback plans by version too and excludes framework versions from
         // the plan, so a colliding app migration would be skipped as
         // framework-owned: the same refusal as the apply path.
-        if let Some(message) = framework_version_collision_error(dir) {
+        if let Some(message) = framework_version_collision_error(dir, is_shard) {
             return Err(MigrationError::Migration(format!(
                 "migration version collision: {message}"
             )));
@@ -2042,12 +2063,18 @@ fn run_down_target(
 }
 
 /// The refusal for an app `migrations_dir` that shares a version with a
-/// framework migration on a Postgres target (see
-/// [`autumn_web::migrate::app_framework_version_collisions`]), one remedy per
-/// collision, or `None` when there is nothing to refuse. A directory that
-/// cannot be enumerated is refused too, since the check could not run.
-fn framework_version_collision_error(migrations_dir: &Path) -> Option<String> {
-    match autumn_web::migrate::app_framework_version_collisions(migrations_dir) {
+/// framework migration the target receives (see
+/// [`autumn_web::migrate::app_framework_version_collisions`]; a shard gets
+/// only the shard-required sets), one remedy per collision, or `None` when
+/// there is nothing to refuse. A directory that cannot be enumerated is
+/// refused too, since the check could not run.
+fn framework_version_collision_error(migrations_dir: &Path, is_shard: bool) -> Option<String> {
+    let target = if is_shard {
+        autumn_web::migrate::FrameworkTarget::Shard
+    } else {
+        autumn_web::migrate::FrameworkTarget::Control
+    };
+    match autumn_web::migrate::app_framework_version_collisions(migrations_dir, target) {
         Ok(collisions) if collisions.is_empty() => None,
         Ok(collisions) => Some(
             collisions
@@ -2929,7 +2956,12 @@ mod tests {
         std::fs::create_dir_all(&colliding).expect("migration dir");
         std::fs::write(colliding.join("up.sql"), "SELECT 1;\n").expect("up.sql");
         std::fs::write(colliding.join("down.sql"), "SELECT 1;\n").expect("down.sql");
-        let message = framework_version_collision_error(&dir).expect("a collision is refused");
+        let message =
+            framework_version_collision_error(&dir, false).expect("a collision is refused");
+        assert!(
+            framework_version_collision_error(&dir, true).is_some(),
+            "the derivation migration reaches shards too"
+        );
         assert!(message.contains("20260907101530_zzz_app"), "{message}");
         assert!(
             message.contains("20260907101530_create_derivations"),
@@ -2945,7 +2977,8 @@ mod tests {
         std::fs::create_dir_all(&own).expect("migration dir");
         std::fs::write(own.join("up.sql"), "SELECT 1;\n").expect("up.sql");
         std::fs::write(own.join("down.sql"), "SELECT 1;\n").expect("down.sql");
-        assert!(framework_version_collision_error(&dir).is_none());
+        assert!(framework_version_collision_error(&dir, false).is_none());
+        assert!(framework_version_collision_error(&dir, true).is_none());
     }
 
     #[test]

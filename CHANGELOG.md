@@ -395,9 +395,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version masks nothing, and an app migration a database already ran under
   such a version keeps its record under its new tracked version instead of
   running twice; on a Postgres target, where the app set goes through the
-  `diesel` CLI, it refuses to apply or roll back while an app migration
-  shares a version with a framework one, naming both and the rename to
-  make) and as a standalone set the runtime applies when a
+  `diesel` CLI, it refuses to apply or roll back, and says so in `status`,
+  while an app migration shares a version with a framework migration that
+  target receives, naming both and the rename to make) and as a standalone
+  set the runtime applies when a
   derivation is
   registered (on every shard primary too).
   Each batch locks its state row, so replicas take turns on one sweep.

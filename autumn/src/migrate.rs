@@ -809,17 +809,47 @@ impl FrameworkVersionCollision {
     }
 }
 
+/// Which framework sets a Postgres target receives from `autumn migrate`.
+///
+/// The control database gets the whole control-plane set; a shard only the
+/// three shard-required sets (version history, commit-hook queue, derivation
+/// state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameworkTarget {
+    /// The control database: [`FRAMEWORK_MIGRATIONS`].
+    Control,
+    /// A shard: the sets [`run_pending_shard_framework_migrations`] applies.
+    Shard,
+}
+
+impl FrameworkTarget {
+    /// The embedded sets this target receives.
+    #[must_use]
+    pub fn sets(self) -> Vec<&'static EmbeddedMigrations> {
+        match self {
+            Self::Control => vec![&FRAMEWORK_MIGRATIONS],
+            Self::Shard => vec![
+                &crate::version_history::VERSION_HISTORY_MIGRATIONS,
+                &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+                &crate::derivation::DERIVATION_MIGRATIONS,
+            ],
+        }
+    }
+}
+
 /// The versions the app's `migrations_dir` shares with a framework migration
-/// of another name, over every framework set (the control set and the three
-/// shard-required sets).
+/// of another name among the sets `target` receives.
 ///
 /// `autumn migrate` on a Postgres target applies the app set through the
 /// `diesel` CLI, which tracks a migration under its directory's version only,
 /// so unlike the `SQLite` path it cannot carry a colliding app migration
 /// under a substitute version; a collision there means whichever side runs
 /// first masks the other for good. The CLI therefore asks here before it
-/// applies or rolls back anything, and stops with [`FrameworkVersionCollision::remedy`]
-/// when the answer is not empty. A framework migration that the control set
+/// applies, rolls back or reports status, and stops with
+/// [`FrameworkVersionCollision::remedy`] when the answer is not empty. Only
+/// the sets the target will actually apply count: a shard never receives a
+/// control-only migration, so a version shared with one is no collision
+/// there. A framework migration that the control set
 /// carries under the very same name as its standalone set is the intended
 /// duplicate and is not a collision. An absent `migrations_dir` has nothing
 /// to collide.
@@ -830,6 +860,7 @@ impl FrameworkVersionCollision {
 /// cannot be enumerated.
 pub fn app_framework_version_collisions(
     migrations_dir: &Path,
+    target: FrameworkTarget,
 ) -> Result<Vec<FrameworkVersionCollision>, MigrationError> {
     if !migrations_dir.exists() {
         return Ok(Vec::new());
@@ -842,12 +873,7 @@ pub fn app_framework_version_collisions(
     })?;
     let app_pairs = migration_versions_and_names::<Pg, _>(&app)?;
     let mut framework_pairs: Vec<(String, String)> = Vec::new();
-    for set in [
-        &FRAMEWORK_MIGRATIONS,
-        &crate::version_history::VERSION_HISTORY_MIGRATIONS,
-        &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
-        &crate::derivation::DERIVATION_MIGRATIONS,
-    ] {
+    for set in target.sets() {
         framework_pairs.extend(migration_versions_and_names::<Pg, _>(set)?);
     }
     let mut collisions: Vec<FrameworkVersionCollision> = Vec::new();
@@ -3424,15 +3450,18 @@ mod tests {
         std::fs::create_dir_all(&colliding).expect("migration dir");
         std::fs::write(colliding.join("up.sql"), "SELECT 1;\n").expect("up.sql");
         std::fs::write(colliding.join("down.sql"), "SELECT 1;\n").expect("down.sql");
-        let collisions = app_framework_version_collisions(&dir).expect("enumerate");
-        assert_eq!(
-            collisions,
-            vec![FrameworkVersionCollision {
-                version: "20260907101530".to_owned(),
-                app_migration: "20260907101530_zzz_app".to_owned(),
-                framework_migration: "20260907101530_create_derivations".to_owned(),
-            }]
-        );
+        let expected = vec![FrameworkVersionCollision {
+            version: "20260907101530".to_owned(),
+            app_migration: "20260907101530_zzz_app".to_owned(),
+            framework_migration: "20260907101530_create_derivations".to_owned(),
+        }];
+        // The derivation migration reaches both kinds of target.
+        let collisions =
+            app_framework_version_collisions(&dir, FrameworkTarget::Control).expect("control");
+        assert_eq!(collisions, expected);
+        let on_shard =
+            app_framework_version_collisions(&dir, FrameworkTarget::Shard).expect("shard");
+        assert_eq!(on_shard, expected);
         let remedy = collisions[0].remedy();
         assert!(remedy.contains("20260907101530_zzz_app"), "{remedy}");
         assert!(
@@ -3455,21 +3484,55 @@ mod tests {
         std::fs::create_dir_all(&own).expect("migration dir");
         std::fs::write(own.join("up.sql"), "SELECT 1;\n").expect("up.sql");
         std::fs::write(own.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        for target in [FrameworkTarget::Control, FrameworkTarget::Shard] {
+            assert!(
+                app_framework_version_collisions(&dir, target)
+                    .expect("own")
+                    .is_empty()
+            );
+            let empty = scratch_migrations_dir("empty");
+            assert!(
+                app_framework_version_collisions(&empty, target)
+                    .expect("empty")
+                    .is_empty()
+            );
+            let absent = empty.join("nowhere");
+            assert!(
+                app_framework_version_collisions(&absent, target)
+                    .expect("absent")
+                    .is_empty()
+            );
+        }
+    }
+
+    /// A shard receives only the shard-required sets, so an app migration
+    /// sharing a version with a control-only framework migration is a
+    /// collision on the control database and none on a shard.
+    #[test]
+    fn a_control_only_framework_version_does_not_collide_on_a_shard() {
+        let shard_versions: std::collections::BTreeSet<String> = FrameworkTarget::Shard
+            .sets()
+            .into_iter()
+            .flat_map(|set| migration_versions_and_names::<Pg, _>(set).expect("enumerate"))
+            .map(|(version, _)| version)
+            .collect();
+        let (version, name) = migration_versions_and_names::<Pg, _>(&FRAMEWORK_MIGRATIONS)
+            .expect("enumerate")
+            .into_iter()
+            .find(|(version, _)| !shard_versions.contains(version))
+            .expect("the control set has a control-only migration");
+        let dir = scratch_migrations_dir("control-only");
+        let colliding = dir.join(format!("{version}_zzz_app"));
+        std::fs::create_dir_all(&colliding).expect("migration dir");
+        std::fs::write(colliding.join("up.sql"), "SELECT 1;\n").expect("up.sql");
+        std::fs::write(colliding.join("down.sql"), "SELECT 1;\n").expect("down.sql");
+        let on_control =
+            app_framework_version_collisions(&dir, FrameworkTarget::Control).expect("control");
+        assert_eq!(on_control.len(), 1, "{on_control:?}");
+        assert_eq!(on_control[0].framework_migration, name);
         assert!(
-            app_framework_version_collisions(&dir)
-                .expect("own")
-                .is_empty()
-        );
-        let empty = scratch_migrations_dir("empty");
-        assert!(
-            app_framework_version_collisions(&empty)
-                .expect("empty")
-                .is_empty()
-        );
-        let absent = empty.join("nowhere");
-        assert!(
-            app_framework_version_collisions(&absent)
-                .expect("absent")
+            app_framework_version_collisions(&dir, FrameworkTarget::Shard)
+                .expect("shard")
                 .is_empty()
         );
     }

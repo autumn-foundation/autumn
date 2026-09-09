@@ -130,8 +130,9 @@ version the framework one now claims keeps that record, moved to the app
 migration's new tracked version, rather than running it twice; on a Postgres
 target, where the app set goes through the `diesel` CLI and cannot be carried
 under a substitute version, `autumn migrate` instead refuses to apply or roll
-back while an app migration shares a version with a framework one, naming
-both and the rename to make), and the
+back, and reports it in `status`, while an app migration shares a version
+with a framework migration that target receives, naming both and the rename
+to make), and the
 runtime folds the same
 migration in as a standalone set (on every shard target too) whenever the
 binary registers at least one `#[derivation]`. An application with no
