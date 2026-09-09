@@ -229,6 +229,55 @@ fn enum_schema_body(
 /// Not refused, because the attribute is common and usually only reformats a
 /// value of the same JSON type — but a converter that changes the type is
 /// misdescribed. Register such a type's schema by hand.
+/// Refuse `#[serde(skip_serializing_if = "…")]` where omission is not valid in
+/// BOTH directions.
+///
+/// Split out of [`reject_undescribable_struct`] for length; the reasoning is
+/// inline below because it is the whole of the rule.
+fn reject_undescribable_conditional_skip(
+    field: &syn::Field,
+    container_attrs: &[syn::Attribute],
+) -> syn::Result<()> {
+    // Direction-dependent for the same reason, and describable only when
+    // something makes omission valid on the REQUEST side too. A field or
+    // container `#[serde(default)]` does: deserialization fills the field
+    // in, serialization may omit it, and a not-`required` property is then
+    // accurate in both directions.
+    //
+    // Being spelled `Option<T>` does NOT, and used to be accepted here.
+    // That premise is only true for `std`'s `Option`, which a proc macro
+    // cannot verify — it sees the tokens as written, so an application's own
+    // `domain::Option<T>` reads identically and serde requires it on the
+    // request side. The two possible guesses are both wrong for that type:
+    // marking it `required` lets a response omit what the schema demands,
+    // marking it optional lets a client omit what serde rejects. It is not
+    // describable by one schema, so it is refused rather than guessed.
+    //
+    // The cost falls on `Option<T>` + `skip_serializing_if` with no
+    // `#[serde(default)]`, which used to compile. The fix is that one
+    // attribute, and it is a NO-OP for a real `Option` — serde already
+    // fills a missing one with `None` — so the suggestion is correct
+    // whichever of the two the type turns out to be.
+    if crate::schema::field_has_skip_serializing_if(field)
+        && !crate::schema::has_serde_default(&field.attrs)
+        && !crate::schema::has_serde_default(container_attrs)
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "#[derive(OpenApiSchema)] cannot describe a field with \
+             `#[serde(skip_serializing_if = ...)]` and no `#[serde(default)]`: that \
+             attribute governs serialization only, so a response may omit the field \
+             while serde still rejects a request that does. Being spelled `Option<T>` \
+             is not enough — this macro sees only the tokens, and a type of your own \
+             named `Option` reads the same but is required on the way in. Add \
+             `#[serde(default)]` (a no-op for a real `Option<T>`, which serde already \
+             fills with `None`), or write the `OpenApiSchema` impl by hand and register \
+             it with `OpenApiConfig::register_schema`.",
+        ));
+    }
+    Ok(())
+}
+
 fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) -> syn::Result<()> {
     // ── Container ────────────────────────────────────────────────────
     if let Some(word) = crate::schema::serde_bare_word(&input.attrs, &["transparent", "untagged"]) {
@@ -308,30 +357,7 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
                 ),
             ));
         }
-        // Direction-dependent for the same reason, but only when nothing else
-        // already makes omission valid on the REQUEST side. Three things can:
-        // an `Option<T>` type, a field `#[serde(default)]`, or a container
-        // `#[serde(default)]`. With any of them the rejection's own premise --
-        // "serde still rejects a request that omits it" -- is simply false:
-        // deserialization fills the field in, serialization may omit it, and a
-        // not-`required` property describes both directions accurately. The
-        // emitter below already marks such a field optional, so refusing it here
-        // rejected a type it could in fact describe.
-        if crate::schema::field_has_skip_serializing_if(field)
-            && !crate::schema::is_option_type(&field.ty)
-            && !crate::schema::has_serde_default(&field.attrs)
-            && !crate::schema::has_serde_default(&input.attrs)
-        {
-            return Err(syn::Error::new_spanned(
-                field,
-                "#[derive(OpenApiSchema)] cannot describe a non-`Option` field with \
-                 `#[serde(skip_serializing_if = ...)]`: that attribute governs serialization \
-                 only, so a response may omit the field while serde still rejects a request \
-                 that does. Make the field `Option<T>` (where it costs nothing, being optional \
-                 already), or write the `OpenApiSchema` impl by hand and register it with \
-                 `OpenApiConfig::register_schema`.",
-            ));
-        }
+        reject_undescribable_conditional_skip(field, &input.attrs)?;
         // Same deserialize-only widening as on a variant, one level down.
         // serde accepts an object carrying ONLY the alias, while the emitted
         // schema names the canonical property and marks it `required` — so a

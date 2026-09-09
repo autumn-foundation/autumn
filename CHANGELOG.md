@@ -236,7 +236,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the list with the framework's `[retention]` sweep merged in, exactly as the
   serving path does — the collision it most often catches is between a
   hand-declared task and that generated one, so validating the unmerged list
-  would miss the very case it exists for.
+  would miss the very case it exists for. The merge happens in exactly one
+  place, `merge_framework_scheduled_tasks`, covering both the
+  `#[repository(..., retention(...))]` sweeps and the config-driven one.
+
+- **Breaking:** `#[derive(OpenApiSchema)]` now refuses
+  `#[serde(skip_serializing_if = "…")]` on a field with no `#[serde(default)]`,
+  including on `Option<T>`, which previously compiled. `skip_serializing_if`
+  governs serialization only, so a response may omit the field while serde still
+  rejects a request that omits it; being spelled `Option<T>` used to be accepted
+  as proof that omission is valid on the way in, but a proc macro sees only the
+  tokens, and an application's own type named `Option` reads identically while
+  serde does require it. For such a type neither answer is right — `required`
+  lets a response omit what the schema demands, optional lets a client omit what
+  serde rejects — so the shape is refused rather than guessed. Add
+  `#[serde(default)]`, which is a no-op on a real `Option<T>` (serde already
+  fills a missing one with `None`) and makes omission genuinely valid in both
+  directions. `#[model]` is unaffected: its read schema describes a response
+  only.
 
 
 ### Changed

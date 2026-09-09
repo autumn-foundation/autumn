@@ -263,12 +263,19 @@ fn opaque_predicate_distinguishes_a_fieldless_struct_from_a_placeholder() {
 //       tags: Vec<String>,          // must NOT compile
 //   }
 //
-// On `Option<T>` there is no conflict — already not required — and it compiles:
+// Being spelled `Option<T>` is NOT on its own enough, and used to be. The macro
+// sees only the tokens, so an application's own `domain::Option<T>` reads
+// identically while serde requires it on the way in — and for that type neither
+// answer is right: `required` lets a response omit what the schema demands,
+// optional lets a client omit what serde rejects. What makes omission valid in
+// BOTH directions is `#[serde(default)]`, which the derive now insists on. It is
+// a no-op on a real `Option<T>` (serde already fills a missing one with `None`),
+// so the requirement costs one attribute and buys a schema that cannot lie:
 #[derive(Serialize, Deserialize, OpenApiSchema)]
 #[allow(dead_code)]
 struct OptionalWithSkip {
     always: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     sometimes: Option<String>,
 }
 

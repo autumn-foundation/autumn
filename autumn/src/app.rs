@@ -6438,6 +6438,7 @@ impl AppBuilder {
         // The config-only preconditions first, in `run()`'s order: a split role
         // on a non-durable jobs backend, or a duplicate scheduled task name,
         // stops startup before anything route-shaped is even looked at.
+        let tasks = merge_framework_scheduled_tasks(tasks, &config);
         if let Err(message) = validate_config_preconditions(&config, &tasks) {
             eprintln!("\u{2717} Cannot export a spec for an app that cannot start: {message}");
             std::process::exit(1);
@@ -11745,6 +11746,34 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
     preflight.map_err(|error| error.to_string())
 }
 
+/// Append every framework-owned scheduled task to the declared list.
+///
+/// Two sources, both of which `run()` merges before validating names: the
+/// `#[repository(..., retention(...))]` sweeps collected from `inventory`, and
+/// the config-driven `[retention]` sweep. A no-boot export that validated only
+/// the DECLARED list would miss the collision this check most often catches —
+/// between a hand-declared `#[scheduled]` fn and one of these generated names.
+///
+/// `run()` performs these same two merges inline, at two different points in its
+/// prologue — the repository sweeps before the config load, the framework one
+/// after — so it cannot call this without a reordering. What is shared is the
+/// RULE: each merge here is a single call to the same
+/// `collect_retention_tasks` / `framework_retention_task` the serving path
+/// calls, so only the sequencing is restated, not the logic.
+#[cfg(feature = "openapi")]
+fn merge_framework_scheduled_tasks(
+    mut tasks: Vec<crate::task::TaskInfo>,
+    config: &AutumnConfig,
+) -> Vec<crate::task::TaskInfo> {
+    #[cfg(feature = "db")]
+    tasks.extend(crate::retention::collect_retention_tasks());
+    if let Some(retention_task) = crate::data_retention::framework_retention_task(&config.retention)
+    {
+        tasks.push(retention_task);
+    }
+    tasks
+}
+
 /// Every CONFIG-only precondition the serving path enforces before it boots.
 ///
 /// Sibling of [`validate_pre_router_preconditions`], which covers the
@@ -11756,10 +11785,16 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
 /// * a `web`/`worker` process role on a non-durable jobs backend — the web
 ///   replica would enqueue into an in-memory queue no worker can drain;
 /// * a duplicate `#[scheduled]` task name, which spawns two loops competing for
-///   one coordination lock. The framework's own `[retention]` sweep is merged in
-///   first, exactly as `run()` merges it, because the collision this catches is
-///   most often between a hand-declared task and that generated one — validating
-///   the unmerged list would miss precisely the case the check exists for.
+///   one coordination lock.
+///
+/// `tasks` must ALREADY be the fully merged list — hand-declared entries plus
+/// the `#[repository(..., retention(...))]` sweeps plus the framework's
+/// `[retention]` sweep — because that is the list whose names actually collide.
+/// Merging here instead double-counts against the caller's own merge: `run()`
+/// pushes the framework sweep before reaching this, so synthesising it again
+/// reported its fixed `autumn-retention-sweep` name as a duplicate and refused
+/// to start every app with a `[retention]` window. Build the list once, with
+/// [`merge_framework_scheduled_tasks`].
 ///
 /// Returns the message to report; the caller decides how to fail, because the
 /// serving path also has a database pool to stop on the way out and the export
@@ -11779,13 +11814,7 @@ fn validate_config_preconditions(
         ));
     }
 
-    let retention_task = crate::data_retention::framework_retention_task(&config.retention);
-    crate::task::validate_unique_task_names(
-        tasks
-            .iter()
-            .chain(retention_task.iter())
-            .map(|task| task.name.as_str()),
-    )?;
+    crate::task::validate_unique_task_names(tasks.iter().map(|task| task.name.as_str()))?;
 
     Ok(())
 }
