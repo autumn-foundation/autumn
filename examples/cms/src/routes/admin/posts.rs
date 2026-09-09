@@ -94,20 +94,25 @@ pub struct PostForm {
     pub menu_order: Option<String>,
     #[serde(default)]
     pub featured_media_id: Option<String>,
-    /// Category ids, one per checked box.
+    /// Checked term ids, keyed by taxonomy slug: `taxonomies[category]=3`.
+    ///
+    /// Keyed rather than a fixed `categories` field so the editor is driven by
+    /// the registry: a plugin registering a taxonomy for this post type gets
+    /// controls without the form growing a field. Special-casing `category` and
+    /// `post_tag` is what left custom taxonomies creatable but unattachable.
     ///
     /// Decoded by `PostForm::from_body` rather than the `Form` extractor: a
     /// checkbox group posts the same key repeatedly, and `Form<T>` decodes
-    /// bodies through `serde_urlencoded`, which has no repeated-key-to-sequence
-    /// rule. Submitting *any* category through the editor therefore failed the
-    /// whole save with "invalid type: string, expected a sequence" — the
-    /// feature did not work at all, and no test noticed because none of them
-    /// ever ticked a box.
+    /// bodies through `serde_urlencoded`, which has neither a
+    /// repeated-key-to-sequence rule nor the bracketed-key one this needs.
     #[serde(default)]
-    pub categories: Vec<i64>,
-    /// A comma-separated tag list, as WordPress's tag box takes.
+    pub taxonomies: std::collections::HashMap<String, Vec<i64>>,
+    /// Comma-separated term names for flat taxonomies, keyed by slug:
+    /// `taxonomy_names[post_tag]=rust, web`. Names rather than ids because a
+    /// flat taxonomy's box creates what it does not find, as WordPress's tag
+    /// box does.
     #[serde(default)]
-    pub tags: String,
+    pub taxonomy_names: std::collections::HashMap<String, String>,
     /// When scheduling: the local datetime the post goes live.
     #[serde(default)]
     pub publish_at: Option<String>,
@@ -192,12 +197,21 @@ pub async fn list(
     let registered = resolve_type(&post_type)?;
 
     let mut posts: Vec<Post> = match (&filters.status, &filters.s) {
+        // The status filter applies to a search too. Matching the search arm
+        // first and dropping `status` showed published and trashed matches
+        // under a filter whose label says it contains only drafts — the screen
+        // contradicting its own control.
         (_, Some(query)) if !query.trim().is_empty() => repos
             .posts
             .search(query.trim())
             .await?
             .into_iter()
             .filter(|p| p.post_type == post_type)
+            .filter(|p| match filters.status.as_deref() {
+                Some(status) if !status.is_empty() => p.status == status,
+                // The unfiltered search still hides trash, like the plain list.
+                _ => p.status != "trash",
+            })
             .collect(),
         (Some(status), _) if !status.is_empty() => {
             repos
@@ -389,49 +403,66 @@ pub async fn edit_form(
     .into_response())
 }
 
+/// One editor control for one registered taxonomy.
+///
+/// Built from the registry rather than from two hard-coded slugs, so a plugin
+/// registering a taxonomy for this post type gets a working control — the
+/// previous shape let an administrator create custom terms through the generic
+/// term screens and then gave them no way to attach one to anything.
+struct TaxonomyField {
+    slug: &'static str,
+    label: &'static str,
+    hierarchical: bool,
+    /// Every term, for a hierarchical taxonomy's checkbox list.
+    terms: Vec<Term>,
+    /// Which of them this post carries.
+    selected: Vec<i64>,
+    /// The comma-separated names, for a flat taxonomy's box.
+    names: String,
+}
+
 /// Everything the editor form needs besides the post itself.
 struct EditorContext {
-    categories: Vec<Term>,
-    selected_categories: Vec<i64>,
-    tags: String,
+    taxonomies: Vec<TaxonomyField>,
     parents: Vec<Post>,
     media: Vec<Attachment>,
 }
 
 impl EditorContext {
     async fn load(repos: &Repos, registered: &PostType, post: Option<&Post>) -> AutumnResult<Self> {
-        let taxonomies = content_types::taxonomies_for(registered.slug);
-        let has_categories = taxonomies.iter().any(|t| t.slug == "category");
-        let has_tags = taxonomies.iter().any(|t| t.slug == "post_tag");
-
-        let categories = if has_categories {
-            repos.terms.find_by_taxonomy("category".to_owned()).await?
-        } else {
-            Vec::new()
+        // One control per taxonomy this type registers, whatever they are.
+        let assigned = match post {
+            Some(post) => repos.post_terms(post.id).await?,
+            None => Vec::new(),
         };
-
-        let (selected_categories, tags) = match post {
-            Some(post) => {
-                let assigned = repos.post_terms(post.id).await?;
-                let selected = assigned
-                    .iter()
-                    .filter(|t| t.taxonomy == "category")
-                    .map(|t| t.id)
-                    .collect();
-                let tag_names = if has_tags {
-                    assigned
-                        .iter()
-                        .filter(|t| t.taxonomy == "post_tag")
-                        .map(|t| t.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+        let mut taxonomies = Vec::new();
+        for taxonomy in content_types::taxonomies_for(registered.slug) {
+            let mine: Vec<&Term> = assigned
+                .iter()
+                .filter(|term| term.taxonomy == taxonomy.slug)
+                .collect();
+            taxonomies.push(TaxonomyField {
+                slug: taxonomy.slug,
+                label: taxonomy.plural,
+                hierarchical: taxonomy.hierarchical,
+                // A hierarchical taxonomy lists every term as a checkbox; a
+                // flat one takes names, so it needs no term list.
+                terms: if taxonomy.hierarchical {
+                    repos
+                        .terms
+                        .find_by_taxonomy(taxonomy.slug.to_owned())
+                        .await?
                 } else {
-                    String::new()
-                };
-                (selected, tag_names)
-            }
-            None => (Vec::new(), String::new()),
-        };
+                    Vec::new()
+                },
+                selected: mine.iter().map(|term| term.id).collect(),
+                names: mine
+                    .iter()
+                    .map(|term| term.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
 
         // A hierarchical type offers a parent selector. It excludes the post
         // itself *and* every descendant of it: picking a descendant closes a
@@ -473,9 +504,7 @@ impl EditorContext {
         };
 
         Ok(Self {
-            categories,
-            selected_categories,
-            tags,
+            taxonomies,
             parents,
             media,
         })
@@ -623,30 +652,41 @@ fn editor(
                     }
                 }
 
-                @if !context.categories.is_empty() {
-                    fieldset class="bg-white rounded-lg shadow p-5" {
-                        legend class="font-semibold text-sm px-1" { "Categories" }
-                        div class="space-y-1 mt-2 max-h-56 overflow-y-auto" {
-                            @for term in &context.categories {
-                                label class="flex items-center gap-2 text-sm" {
-                                    input type="checkbox" name="categories" value=(term.id)
-                                          checked[context.selected_categories.contains(&term.id)]
-                                          class="rounded border-gray-300";
-                                    (term.name)
+                // One control per registered taxonomy, hierarchical ones as a
+                // checkbox list and flat ones as a comma-separated box. Driven
+                // by the registry, so a plugin's taxonomy is editable here
+                // without this markup knowing its name.
+                @for field in &context.taxonomies {
+                    @if field.hierarchical {
+                        @if !field.terms.is_empty() {
+                            fieldset class="bg-white rounded-lg shadow p-5" {
+                                legend class="font-semibold text-sm px-1" { (field.label) }
+                                div class="space-y-1 mt-2 max-h-56 overflow-y-auto" {
+                                    @for term in &field.terms {
+                                        label class="flex items-center gap-2 text-sm" {
+                                            input type="checkbox"
+                                                  name=(format!("taxonomies[{}]", field.slug))
+                                                  value=(term.id)
+                                                  checked[field.selected.contains(&term.id)]
+                                                  class="rounded border-gray-300";
+                                            (term.name)
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-
-                @if content_types::taxonomies_for(registered.slug).iter().any(|t| t.slug == "post_tag") {
-                    div class="bg-white rounded-lg shadow p-5" {
-                        label for="tags" class="block font-semibold text-sm mb-2" { "Tags" }
-                        input #tags type="text" name="tags" value=(context.tags)
-                              placeholder="rust, web, async"
-                              class="w-full border rounded px-3 py-2 text-sm";
-                        p class="text-xs text-gray-400 mt-1" {
-                            "Comma separated. New tags are created automatically."
+                    } @else {
+                        div class="bg-white rounded-lg shadow p-5" {
+                            label for=(format!("taxonomy-{}", field.slug))
+                                  class="block font-semibold text-sm mb-2" { (field.label) }
+                            input id=(format!("taxonomy-{}", field.slug)) type="text"
+                                  name=(format!("taxonomy_names[{}]", field.slug))
+                                  value=(field.names)
+                                  placeholder="rust, web, async"
+                                  class="w-full border rounded px-3 py-2 text-sm";
+                            p class="text-xs text-gray-400 mt-1" {
+                                "Comma separated. New entries are created automatically."
+                            }
                         }
                     }
                 }
@@ -1041,7 +1081,13 @@ fn requested_status(form: &PostForm, user: &User) -> String {
     }
 }
 
-/// Save the post's categories and tags, creating any tag that does not exist.
+/// The term ids this submission asks for, across every taxonomy the post type
+/// registers, creating terms for a flat taxonomy's names as WordPress does.
+///
+/// Driven by the registry rather than by the two built-in slugs, so a plugin's
+/// taxonomy is attachable through the same code that handles categories and
+/// tags. Special-casing `category` and `post_tag` is what left a custom
+/// taxonomy creatable through the term screens and unattachable from anywhere.
 async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> AutumnResult<Vec<i64>> {
     let taxonomies = content_types::taxonomies_for(&post.post_type);
     if taxonomies.is_empty() {
@@ -1049,82 +1095,83 @@ async fn resolve_term_ids(repos: &Repos, post: &Post, form: &PostForm) -> Autumn
     }
 
     let mut term_ids: Vec<i64> = Vec::new();
-    if taxonomies.iter().any(|t| t.slug == "category") {
-        // Resolved and filtered, not trusted. The ids come from a form, and
-        // `set_post_terms` checks neither the term's taxonomy nor whether that
-        // taxonomy applies to this post type — so a crafted submission could
-        // file a post under a custom taxonomy registered for something else
-        // entirely, after which that taxonomy's public archive listed it.
-        //
-        // The rule is the registration's: a term may be attached only if its
-        // taxonomy names this post type.
-        let applicable: std::collections::HashSet<&str> =
-            taxonomies.iter().map(|taxonomy| taxonomy.slug).collect();
-        for id in form.categories.iter().copied() {
-            let allowed = repos
-                .terms
-                .find_by_id(id)
-                .await?
-                .is_some_and(|term| applicable.contains(term.taxonomy.as_str()));
-            if allowed {
-                term_ids.push(id);
-            }
-        }
-    }
 
-    if taxonomies.iter().any(|t| t.slug == "post_tag") {
-        for raw in form.tags.split(',') {
-            let name = raw.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let slug = autumn_web::slugify(name);
-            if slug.is_empty() {
-                continue;
-            }
-            // Find-or-create, matching WordPress's tag box: typing a new tag
-            // creates it.
-            let existing = repos
-                .terms
-                .find_by_slug(slug.clone())
-                .await?
-                .into_iter()
-                .find(|t| t.taxonomy == "post_tag");
-            let term = match existing {
-                Some(term) => term,
-                None => {
-                    repos
-                        .terms
-                        .save(&crate::models::NewTerm {
-                            taxonomy: "post_tag".to_owned(),
-                            name: name.to_owned(),
-                            slug,
-                            description: String::new(),
-                            parent_id: None,
-                        })
-                        .await?
-                }
-            };
-            term_ids.push(term.id);
-        }
-    }
-
-    // `set_post_terms` replaces the post's filings wholesale, so anything this
-    // form does not reconstruct is deleted. The editor renders `category` and
-    // `post_tag` only, which meant an ordinary save silently unfiled a post
-    // from every custom taxonomy — including the ones the importer had just
-    // restored. Carry those forward: the form is not evidence about taxonomies
-    // it never showed.
-    let editable: std::collections::HashSet<&str> = taxonomies
-        .iter()
-        .map(|taxonomy| taxonomy.slug)
-        .filter(|slug| matches!(*slug, "category" | "post_tag"))
-        .collect();
+    // Filings in taxonomies this editor does not render are carried forward.
+    // `set_post_terms` replaces the whole set, so anything the form did not
+    // reconstruct would be deleted — and the form is not evidence about a
+    // taxonomy it never showed. Now that the controls are registry-driven, that
+    // set is exactly "taxonomies this post type does not register", which is
+    // what an import or a direct write can leave behind.
+    let rendered: std::collections::HashSet<&str> =
+        taxonomies.iter().map(|taxonomy| taxonomy.slug).collect();
     for term in repos.post_terms(post.id).await? {
-        if !editable.contains(term.taxonomy.as_str()) {
+        if !rendered.contains(term.taxonomy.as_str()) {
             term_ids.push(term.id);
         }
     }
+
+    for taxonomy in &taxonomies {
+        if taxonomy.hierarchical {
+            // Ids, resolved and filtered rather than trusted: they come from a
+            // form, and `set_post_terms` checks neither the term's taxonomy nor
+            // whether that taxonomy applies to this post type. A crafted
+            // submission could otherwise file a post under a taxonomy
+            // registered for something else, after which that taxonomy's public
+            // archive listed it.
+            let Some(submitted) = form.taxonomies.get(taxonomy.slug) else {
+                continue;
+            };
+            for id in submitted.iter().copied() {
+                let belongs = repos
+                    .terms
+                    .find_by_id(id)
+                    .await?
+                    .is_some_and(|term| term.taxonomy == taxonomy.slug);
+                if belongs {
+                    term_ids.push(id);
+                }
+            }
+        } else {
+            // Names, find-or-create — a flat taxonomy's box creates what it
+            // does not find, matching WordPress's tag box.
+            let Some(submitted) = form.taxonomy_names.get(taxonomy.slug) else {
+                continue;
+            };
+            for raw in submitted.split(',') {
+                let name = raw.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let slug = autumn_web::slugify(name);
+                if slug.is_empty() {
+                    continue;
+                }
+                let existing = repos
+                    .terms
+                    .find_by_slug(slug.clone())
+                    .await?
+                    .into_iter()
+                    .find(|t| t.taxonomy == taxonomy.slug);
+                let term = match existing {
+                    Some(term) => term,
+                    None => {
+                        repos
+                            .terms
+                            .save(&crate::models::NewTerm {
+                                taxonomy: taxonomy.slug.to_owned(),
+                                name: name.to_owned(),
+                                slug,
+                                description: String::new(),
+                                parent_id: None,
+                            })
+                            .await?
+                    }
+                };
+                term_ids.push(term.id);
+            }
+        }
+    }
+
     term_ids.sort_unstable();
     term_ids.dedup();
 

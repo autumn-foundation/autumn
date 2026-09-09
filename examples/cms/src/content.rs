@@ -188,6 +188,11 @@ pub async fn transition_status(
                 Some(actor) => post.record_revision_by(conn, &summary, actor).await?,
                 None => post.record_revision(conn, &summary).await?,
             }
+            // Pruned here as well as on the edit and restore paths. Without it
+            // `REVISION_LIMIT` bounded only *edits*: a post cycled through
+            // draft → publish → draft grew its history without limit, which is
+            // exactly the unbounded `wp_posts` growth the cap exists to avoid.
+            prune_revisions(conn, post_id).await?;
         }
 
         // Stamp the first publish date, and never move it afterwards — an

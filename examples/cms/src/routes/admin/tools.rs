@@ -95,6 +95,11 @@ pub struct ExportPost {
     /// restore that silently unpins every sticky post has changed the site.
     #[serde(default)]
     pub sticky: bool,
+    /// Hand-set ordering for hierarchical content. Same reasoning again: a
+    /// restore that resets every page to `0` discards the navigation order an
+    /// editor arranged by hand, and nothing tells them it happened.
+    #[serde(default)]
+    pub menu_order: i32,
     /// Term slugs, qualified by taxonomy.
     #[serde(default)]
     pub terms: Vec<ExportTermRef>,
@@ -298,6 +303,7 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 parent: parent_slug,
                 published_at: post.published_at,
                 sticky: post.sticky,
+                menu_order: post.menu_order,
                 terms: assigned
                     .iter()
                     .map(|t| ExportTermRef {
@@ -548,6 +554,7 @@ pub async fn import(
                 status: "draft".to_owned(),
                 author_id,
                 parent_id: None,
+                menu_order: post.menu_order,
                 // Resolved against the media restored above, falling back to a
                 // row already on this site with that slug — importing into a
                 // populated site should re-attach to the image that is already
@@ -565,7 +572,6 @@ pub async fn import(
                     },
                     None => None,
                 },
-                menu_order: 0,
                 comment_status: post.comment_status.clone(),
                 password: post.password.clone(),
                 sticky: post.sticky,

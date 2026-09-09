@@ -610,7 +610,7 @@ async fn create_post(
             ("body", body),
             ("status", status),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             // Browsers omit an unchecked checkbox entirely, so the handler
             // reads an absent `comment_status` as "closed". The real editor
             // renders this box checked; the fixture has to say so too.
@@ -979,7 +979,7 @@ async fn a_password_protected_post_withholds_its_body_until_unlocked() {
             ("body", "The hidden text."),
             ("status", "publish"),
             ("password", "letmein"),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await;
@@ -1032,7 +1032,7 @@ async fn a_protected_post_withholds_its_excerpt_and_comments_everywhere() {
             ),
             ("status", "publish"),
             ("password", "letmein"),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -1109,7 +1109,7 @@ async fn a_protected_post_refuses_comments_until_unlocked() {
             ("body", "Body."),
             ("status", "publish"),
             ("password", "letmein"),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -1185,7 +1185,7 @@ async fn a_post_and_a_page_cannot_take_the_same_bare_path() {
             ("body", "Page body."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await
@@ -1230,7 +1230,7 @@ async fn a_stale_editor_submission_is_refused() {
             ("body", "First editor's text."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
             ("lock_version", stale_version),
         ]))
@@ -1248,7 +1248,7 @@ async fn a_stale_editor_submission_is_refused() {
             ("body", "Second editor's text."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
             ("lock_version", stale_version),
         ]))
@@ -1357,7 +1357,7 @@ async fn export_preserves_password_protection_and_page_ancestry() {
             ("body", "Parent."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await;
@@ -1379,7 +1379,7 @@ async fn export_preserves_password_protection_and_page_ancestry() {
             ("body", "Child."),
             ("status", "publish"),
             ("password", "shh"),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("parent_id", parent_id.as_str()),
         ]))
         .send()
@@ -1528,7 +1528,7 @@ async fn editing_a_post_records_a_restorable_revision() {
             ("body", "Second draft."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await
@@ -1580,7 +1580,7 @@ async fn tags_typed_into_the_editor_are_created_and_archived() {
             ("body", "Body."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", "Rust, Web Frameworks"),
+            ("taxonomy_names[post_tag]", "Rust, Web Frameworks"),
         ]))
         .send()
         .await
@@ -1756,7 +1756,7 @@ async fn a_year_shaped_slug_stays_reachable() {
             ("body", "A year in review."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -1876,7 +1876,7 @@ async fn a_page_is_addressed_by_its_ancestry() {
             ("body", "Parent page."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await;
@@ -1898,7 +1898,7 @@ async fn a_page_is_addressed_by_its_ancestry() {
             ("body", "Child page."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("parent_id", parent_id.as_str()),
         ]))
         .send()
@@ -1941,7 +1941,7 @@ async fn unlocking_a_hidden_post_discloses_nothing() {
             ("body", "Not for publication."),
             ("status", "draft"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await;
@@ -2099,7 +2099,7 @@ async fn a_type_that_disables_comments_refuses_them_however_the_row_is_set() {
             ("body", "Reach us here."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -2268,7 +2268,7 @@ async fn protected_post_password_attempts_are_throttled() {
             ("body", "The protected text."),
             ("status", "publish"),
             ("password", "correcthorse"),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await;
@@ -2328,7 +2328,7 @@ async fn importing_under_a_trashed_parent_keeps_the_child_reachable() {
             ("body", "Old parent."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await;
@@ -2407,7 +2407,7 @@ async fn search_does_not_reach_into_a_protected_body() {
             ("body", "The acquisition of Zephyrine closes in March."),
             ("status", "publish"),
             ("password", "letmein"),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await
@@ -2765,7 +2765,7 @@ async fn a_published_post_cannot_be_saved_without_a_title() {
             ("body", "Body."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -2826,7 +2826,7 @@ async fn a_revision_is_attributed_to_the_editor_who_made_it() {
             ("body", "Edited by somebody else."),
             ("status", "draft"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -3087,7 +3087,7 @@ async fn restoring_an_untitled_revision_onto_a_live_post_is_refused() {
             ("body", "First body."),
             ("status", "draft"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -3114,7 +3114,7 @@ async fn restoring_an_untitled_revision_onto_a_live_post_is_refused() {
             ("body", "Second body."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
         ]))
         .send()
@@ -3225,7 +3225,7 @@ async fn a_refused_admin_creation_persists_nothing() {
                 ("body", "Should not persist."),
                 ("status", "private"),
                 ("password", ""),
-                ("tags", ""),
+                ("taxonomy_names[post_tag]", ""),
                 ("comment_status", "open"),
             ]))
             .send()
@@ -3396,7 +3396,7 @@ async fn saving_a_post_keeps_assignments_the_editor_does_not_render() {
             ("body", "Edited body."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", "rust"),
+            ("taxonomy_names[post_tag]", "rust"),
             ("comment_status", "open"),
         ]))
         .send()
@@ -3828,10 +3828,10 @@ async fn a_crafted_category_id_from_another_taxonomy_is_ignored() {
             ("body", "Body."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
             ("comment_status", "open"),
-            ("categories", news_id.as_str()),
-            ("categories", foreign_id.as_str()),
+            ("taxonomies[category]", news_id.as_str()),
+            ("taxonomies[category]", foreign_id.as_str()),
         ]))
         .send()
         .await
@@ -3966,9 +3966,9 @@ async fn checking_a_category_box_saves_the_post() {
         ("body", "Body."),
         ("status", "publish"),
         ("password", ""),
-        ("tags", ""),
+        ("taxonomy_names[post_tag]", ""),
         ("comment_status", "open"),
-        ("categories", ids[0].as_str()),
+        ("taxonomies[category]", ids[0].as_str()),
     ];
     client
         .post(&format!("/admin/content/post/{id}"))
@@ -3979,7 +3979,7 @@ async fn checking_a_category_box_saves_the_post() {
         .assert_status(303);
 
     // …and two, which is the shape a checkbox group actually posts.
-    fields.push(("categories", ids[1].as_str()));
+    fields.push(("taxonomies[category]", ids[1].as_str()));
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
@@ -4479,7 +4479,7 @@ async fn the_configured_front_page_stays_selected() {
             ("body", "The front page."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", ""),
+            ("taxonomy_names[post_tag]", ""),
         ]))
         .send()
         .await;
@@ -4569,11 +4569,11 @@ async fn clearing_every_category_removes_the_post_from_its_archives() {
             ("body", "Body."),
             ("status", "publish"),
             ("password", ""),
-            ("tags", "rust"),
+            ("taxonomy_names[post_tag]", "rust"),
             ("comment_status", "open"),
         ];
         if let Some(id) = extra {
-            fields.push(("categories", id));
+            fields.push(("taxonomies[category]", id));
         }
         form(&fields)
     };
@@ -4595,7 +4595,10 @@ async fn clearing_every_category_removes_the_post_from_its_archives() {
 
     // Now clear every category and tag.
     let mut cleared = base(None);
-    cleared = cleared.replace("tags=rust", "tags=");
+    cleared = cleared.replace(
+        "taxonomy_names%5Bpost_tag%5D=rust",
+        "taxonomy_names%5Bpost_tag%5D=",
+    );
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
@@ -4709,4 +4712,145 @@ async fn a_scheduled_publication_snapshots_the_scheduled_state() {
         "the snapshot must record the scheduled state, not the published one: {}",
         &after[..after.len().min(60)]
     );
+}
+
+/// A plugin's taxonomy is editable through the post editor.
+///
+/// The editor recognised only `category` and `post_tag`, so an administrator
+/// could create custom terms through the generic term screens and then had no
+/// way to attach one to anything — the registry-driven workflow the starter
+/// advertises stopped halfway.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_registered_custom_taxonomy_is_editable() {
+    // Registered before the client is built, and deliberately for `page` rather
+    // than `post`: the registry is process-global, so adding a taxonomy to
+    // `post` would change every other test's editor. `page` has no taxonomies
+    // of its own, which also makes this a clean check that the controls come
+    // from the registry rather than from the two built-in slugs.
+    {{crate_name}}::content_types::register_taxonomy({{crate_name}}::content_types::Taxonomy {
+        slug: "shelf",
+        singular: "Shelf",
+        plural: "Shelves",
+        hierarchical: true,
+        post_types: &["page"],
+        rewrite_base: "shelf",
+    })
+    .expect("shelf registers cleanly");
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/terms/shelf")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("name", "Reference"),
+            ("slug", ""),
+            ("description", ""),
+            ("parent_id", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let terms: serde_json::Value = client
+        .get("/api/v1/terms?taxonomy=shelf")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let shelf_id = terms.as_array().expect("array")[0]["id"]
+        .as_i64()
+        .expect("id")
+        .to_string();
+
+    let created = client
+        .post("/admin/content/page")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Handbook"),
+            ("slug", "handbook"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(created.status, 303);
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    // The editor renders a control for it…
+    let editor = client
+        .get(&format!("/admin/content/page/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    assert!(
+        editor.contains("Shelves") && editor.contains("taxonomies[shelf]"),
+        "the editor must render a control for a registered taxonomy:\n{editor}"
+    );
+
+    // …and submitting it attaches the term.
+    client
+        .post(&format!("/admin/content/page/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Handbook"),
+            ("slug", "handbook"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("taxonomies[shelf]", shelf_id.as_str()),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+
+    let filed = try_execute(
+        TestDb::shared().await,
+        &format!(
+            "SELECT 1/COUNT(*) FROM post_terms pt JOIN terms t ON t.id = pt.term_id \
+             WHERE pt.post_id = {id} AND t.taxonomy = 'shelf'"
+        ),
+    )
+    .await;
+    assert!(
+        filed.is_ok(),
+        "the custom taxonomy term must be attached: {filed:?}"
+    );
+
+    // And clearing it detaches again.
+    client
+        .post(&format!("/admin/content/page/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Handbook"),
+            ("slug", "handbook"),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await
+        .assert_status(303);
+    let still = try_execute(
+        TestDb::shared().await,
+        &format!(
+            "SELECT 1/COUNT(*) FROM post_terms pt JOIN terms t ON t.id = pt.term_id \
+             WHERE pt.post_id = {id} AND t.taxonomy = 'shelf'"
+        ),
+    )
+    .await;
+    assert!(still.is_err(), "clearing the control must detach the term");
 }
