@@ -3643,12 +3643,297 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// A nested item of a hierarchical custom type stays reachable.
+///
+/// A custom type is addressed as `/{archive_base}/{slug}` with no ancestry
+/// walk, and `idx_posts_type_slug` makes `(post_type, slug)` unique for it
+/// whatever its parent — so there is no ambiguity to resolve. Excluding its
+/// nested items from resolution instead 404'd them at the only URL the site
+/// ever advertises for them. That exclusion was mine, one round earlier: the
+/// rule is about being addressed by a *path*, which is pages, not about having
+/// a parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_nested_custom_type_item_is_still_reachable() {
+    // Registered before the client is built; the registry is process-global.
+    // The slug and archive base are deliberately unusual: the registry is
+    // process-global, so a type registered here is registered for every test
+    // that runs after it, and a base that collides with a slug another test
+    // uses changes that test's outcome. `manuals` did exactly that to
+    // `an_import_does_not_reparent_a_local_post_that_shares_a_slug`.
+    cms::content_types::register_post_type(cms::content_types::PostType {
+        hierarchical: true,
+        archive_base: "runbooks",
+        ..cms::content_types::PostType::new("runbook", "Runbook", "Runbooks")
+    })
+    .expect("runbook registers cleanly");
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let item = async |title: &str, slug: &str, parent: &str| -> String {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            (
+                "body",
+                if parent.is_empty() {
+                    "The parent."
+                } else {
+                    "The child."
+                },
+            ),
+            ("status", "publish"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+        ];
+        if !parent.is_empty() {
+            fields.push(("parent_id", parent));
+        }
+        let response = client
+            .post("/admin/content/runbook")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(response.status, 303, "create {title}: {}", response.text());
+        response
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .to_owned()
+    };
+
+    let parent = item("Setup", "setup", "").await;
+    item("Wiring", "wiring", &parent).await;
+
+    sign_out(&client);
+    // Both at the two-segment shape the permalink builder mints for this type.
+    client
+        .get("/runbook/setup")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("The parent.");
+    client
+        .get("/runbook/wiring")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("The child.");
+}
+
+/// A hierarchy edit settles every descendant's path, not just its own.
+///
+/// A page's path is built from its ancestors, so renaming or re-parenting one
+/// rewrites the canonical URL of everything under it. `guard_page_path` checked
+/// only the edited row, so a rename could hand a *child's* path to the health
+/// probe while the parent's own path was fine — the probe then shadows a child
+/// the listings and the sitemap keep advertising.
+///
+/// The paths are asserted rather than the refusal: `CONFIGURED_PROBE_PATHS` is
+/// a process-global `OnceLock` that an integration test cannot set
+/// deterministically, and a nested probe path is the only way to reach the
+/// refusal. That the guard refuses a claimed multi-segment path is covered by
+/// `a_claimed_path_is_refused_whatever_mints_it`; what was missing, and what
+/// this pins, is that the descendants are in the set at all.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_hierarchy_edit_settles_every_descendant_path() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let page = async |title: &str, slug: &str, parent: &str| -> i64 {
+        let mut fields = vec![
+            ("title", title),
+            ("slug", slug),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+        ];
+        if !parent.is_empty() {
+            fields.push(("parent_id", parent));
+        }
+        let response = client
+            .post("/admin/content/page")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        assert_eq!(response.status, 303, "create {title}: {}", response.text());
+        response
+            .header("location")
+            .expect("redirect")
+            .rsplit('/')
+            .next()
+            .expect("id")
+            .parse()
+            .expect("a numeric id")
+    };
+
+    let old = page("Old", "old", "").await;
+    let status = page("Status", "status", &old.to_string()).await;
+    page("Deep", "deep", &status.to_string()).await;
+
+    let paths = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::content::page_paths_under(&mut conn, old)
+            .await
+            .expect("the paths")
+    };
+    let mut rendered: Vec<String> = paths.iter().map(|path| path.join("/")).collect();
+    rendered.sort();
+    assert_eq!(
+        rendered,
+        vec!["old/status".to_owned(), "old/status/deep".to_owned()],
+        "an edit at the root settles every path beneath it \
+         (the root's own path is top-level, so it has none of this shape)"
+    );
+}
+
+/// A backup carries the discussion, with its nesting and moderation states.
+///
+/// The envelope had posts, terms and attachments and no comments, so a restore
+/// brought a site back with every thread gone and every count at zero — the
+/// approved discussion, the moderation queue and the spam decisions a moderator
+/// had already made, none of them recoverable from the file.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_export_carries_comments_and_an_import_restores_them() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Discussed", "Body.", "publish").await;
+
+    // A registered root, a guest reply under it, and one of each held state.
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             VALUES ({post_id}, NULL, 1, 'Owner', 'owner@example.com', '', '',
+                     'The root', 'approved', NOW() - interval '3 hours')"
+        ),
+    )
+    .await
+    .expect("seed the root");
+    try_execute(
+        TestDb::shared().await,
+        &format!(
+            "INSERT INTO comments (post_id, parent_id, author_id, author_name, author_email,
+                                   author_url, author_ip, body, status, created_at)
+             VALUES
+               ({post_id}, (SELECT id FROM comments WHERE body = 'The root'), NULL,
+                'Guest', 'guest@example.com', '', '', 'A nested reply', 'approved',
+                NOW() - interval '2 hours'),
+               ({post_id}, NULL, NULL, 'Waiting', 'waiting@example.com', '', '',
+                'Held for moderation', 'pending', NOW() - interval '1 hours'),
+               ({post_id}, NULL, NULL, 'Spammer', 'spam@example.com', '', '',
+                'Buy things', 'spam', NOW())"
+        ),
+    )
+    .await
+    .expect("seed the rest");
+
+    let payload = client
+        .get("/admin/tools/export")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("the export parses");
+    let comments = &parsed["posts"][0]["comments"];
+    assert_eq!(
+        comments.as_array().map(Vec::len),
+        Some(3),
+        "three roots, with the reply nested under one of them:\n{payload}"
+    );
+    assert!(
+        payload.contains("A nested reply") && payload.contains("Buy things"),
+        "every state travels, not only the approved ones"
+    );
+
+    // Restore into an empty site.
+    let fresh = db_client().await;
+    let cookie = register(&fresh, "owner").await;
+    let result = import_export(&fresh, &cookie, &payload).await;
+    result
+        .assert_ok()
+        .assert_body_contains("restored, moderation states and all");
+
+    let (approved, pending, spam, nested): (i64, i64, i64, i64) = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let count = async |conn: &mut _, status: &'static str| -> i64 {
+            RunQueryDsl::get_result(
+                cms::schema::comments::table
+                    .filter(cms::schema::comments::status.eq(status))
+                    .count(),
+                conn,
+            )
+            .await
+            .expect("the count")
+        };
+        let approved = count(&mut conn, "approved").await;
+        let pending = count(&mut conn, "pending").await;
+        let spam = count(&mut conn, "spam").await;
+        let nested: i64 = RunQueryDsl::get_result(
+            cms::schema::comments::table
+                .filter(cms::schema::comments::parent_id.is_not_null())
+                .count(),
+            &mut conn,
+        )
+        .await
+        .expect("the count");
+        (approved, pending, spam, nested)
+    };
+    assert_eq!(
+        (approved, pending, spam, nested),
+        (2, 1, 1, 1),
+        "every state and the nesting come back"
+    );
+
+    // And the post's counter agrees, so the thread renders.
+    let count: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            cms::schema::posts::table
+                .filter(cms::schema::posts::slug.eq("discussed"))
+                .select(cms::schema::posts::comment_count),
+            &mut conn,
+        )
+        .await
+        .expect("the post")
+    };
+    assert_eq!(count, 2, "the counter is rebuilt from the approved rows");
+
+    // Re-running does not append a second copy of the thread.
+    import_export(&fresh, &cookie, &payload).await.assert_ok();
+    let total: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::get_result(cms::schema::comments::table.count(), &mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(total, 4, "a second import is a no-op for comments");
+}
+
 /// A top-level page resolves even when a nested namesake was created first.
 ///
 /// `idx_pages_parent_slug` scopes a nested page's slug to its parent and
 /// `idx_posts_bare_path_slug` only constrains top-level ones, so `/about/team`
 /// and `/team` are both legal. `find_by_slug` has no ordering, so taking the
-/// first row and *then* asking whether it was top-level 404'"'"'d the real `/team`
+/// first row and *then* asking whether it was top-level 404'd the real `/team`
 /// whenever the nested row came back first — which, created first, it does.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -4656,7 +4941,7 @@ async fn an_export_round_trip_keeps_featured_media() {
         .assert_ok()
         .text();
     let payload: serde_json::Value = serde_json::from_str(&exported).expect("valid export JSON");
-    assert_eq!(payload["version"], serde_json::json!(4));
+    assert_eq!(payload["version"], serde_json::json!(5));
     assert_eq!(
         payload["attachments"][0]["slug"],
         serde_json::json!("cover-image")

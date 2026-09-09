@@ -988,8 +988,8 @@ fn page_url(base_path: &str, page: usize) -> String {
 
 /// Find a post by type and slug, excluding trashed content.
 ///
-/// A hierarchical type is addressed by its full path, so only a *top-level* row
-/// answers a single segment: `/team` must not resolve to `/about/team`, and two
+/// A **page** is addressed by its full path, so only a top-level page answers a
+/// single segment: `/team` must not resolve to `/about/team`, and two
 /// pages named `team` under different parents must not both answer at `/team`.
 ///
 /// The condition belongs in the candidate filter, not after it. `find_by_slug`
@@ -999,9 +999,16 @@ fn page_url(base_path: &str, page: usize) -> String {
 /// that took the first row and *then* asked whether it was top-level rejected a
 /// perfectly good page whenever the nested row happened to come back first,
 /// 404ing it at its own canonical URL.
+///
+/// Pages only, not every hierarchical type. A custom type is addressed as
+/// `/{archive_base}/{slug}` with no ancestry walk, and `idx_posts_type_slug`
+/// makes `(post_type, slug)` unique for it whatever its parent — so there is no
+/// ambiguity to resolve, and excluding its nested items instead 404s them at
+/// the only URL the site ever advertises. Generalising this rule to
+/// "hierarchical" was mine, one round ago, and it was wrong: what makes the
+/// rule necessary is being addressed by a *path*, not having a parent.
 async fn find_visible(repos: &Repos, post_type: &str, slug: &str) -> AutumnResult<Option<Post>> {
-    let top_level_only =
-        content_types::find_post_type(post_type).is_some_and(|registered| registered.hierarchical);
+    let top_level_only = post_type == "page";
     Ok(repos
         .posts
         .find_by_slug(slug.to_owned())

@@ -806,11 +806,11 @@ fn editor(
                                 "(for Scheduled, " (context.settings.timezone) ")"
                             }
                         }
-                        // Rendered *and* read back in the site'"'"'s zone. The control
+                        // Rendered *and* read back in the site's zone. The control
                         // submits a wall clock with no offset, so naming the zone
                         // beside it is part of the fix rather than decoration:
                         // whichever zone the browser is in, this field means the
-                        // site'"'"'s.
+                        // site's.
                         input #publish_at type="datetime-local" name="publish_at"
                               value=(post.and_then(|p| p.published_at)
                                   .map(|d| context.settings.format_datetime_local(d))

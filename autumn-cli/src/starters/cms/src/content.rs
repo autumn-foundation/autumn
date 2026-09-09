@@ -599,7 +599,7 @@ pub async fn set_post_terms(
         // taxonomy save that took a term lock first and then blocked on the
         // post (the insert below key-shares it through the foreign key) closes
         // the cycle and PostgreSQL aborts one of them. Taking it here also
-        // costs nothing on the editor'"'"'s path, which already holds this lock
+        // costs nothing on the editor's path, which already holds this lock
         // from the stale-edit check.
         let _locked_post: Option<i64> = posts::table
             .find(post_id)
@@ -2452,11 +2452,53 @@ pub async fn post_by_id(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnRes
 /// A bare slug is caught long before this by `ensure_unique_slug`; what this
 /// adds is the nested case, which only a page can reach.
 pub async fn guard_page_path(conn: &mut AsyncPgConnection, post_id: i64) -> AutumnResult<()> {
+    for path in page_paths_under(conn, post_id).await? {
+        guard_claimed_path(&path, "page")?;
+    }
+    Ok(())
+}
+
+/// Every canonical page path a hierarchy edit at `post_id` settles: the edited
+/// page's own, and one for each of its descendants.
+///
+/// Separate from the guard because it is the half that was missing and the half
+/// worth asserting on its own. A page's path is built from its ancestors, so
+/// renaming or re-parenting one rewrites the canonical URL of everything under
+/// it — and checking only the edited row let a rename hand a *child's* path to
+/// the health probe while the parent's own path was fine. With
+/// `health.path = "/section/status"`, renaming `/old` to `section` claims
+/// nothing for the parent and gives `/section/status` to the probe, which then
+/// shadows a child the listings and the sitemap keep advertising.
+///
+/// Bounded by `descendant_ids`, which is bounded by `MAX_PAGE_DEPTH`.
+pub async fn page_paths_under(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<Vec<Vec<String>>> {
+    let mut ids = vec![post_id];
+    ids.extend(descendant_ids(conn, post_id).await?);
+    let mut paths = Vec::new();
+    for id in ids {
+        if let Some(path) = page_path_of(conn, id).await? {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+/// One nested page's canonical path, walking up to its root.
+///
+/// `None` for anything that is not a nested page: a top-level page and a
+/// non-page type are addressed by other rules, checked elsewhere.
+async fn page_path_of(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<Option<Vec<String>>> {
     let Some(post) = post_by_id(conn, post_id).await? else {
-        return Ok(());
+        return Ok(None);
     };
     if post.post_type != "page" || post.parent_id.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut segments = vec![post.slug.clone()];
@@ -2475,7 +2517,7 @@ pub async fn guard_page_path(conn: &mut AsyncPgConnection, post_id: i64) -> Autu
     }
     segments.reverse();
 
-    guard_claimed_path(&segments, "page")
+    Ok(Some(segments))
 }
 
 /// Refuse content whose URL a framework route already serves.
@@ -2516,7 +2558,7 @@ pub fn guard_term_path(taxonomy: &str, slug: &str) -> AutumnResult<()> {
 /// walks. The editor used to compute this from the full set of pages it had
 /// already loaded — which stopped being an option once the parent picker became
 /// a bounded window, since a descendant outside the window would then have been
-/// offered as its own ancestor'"'"'s parent.
+/// offered as its own ancestor's parent.
 pub async fn descendant_ids(
     conn: &mut AsyncPgConnection,
     post_id: i64,
@@ -3113,15 +3155,15 @@ pub async fn populated_terms(
 /// The reads were repository calls, each taking its own pooled connection and
 /// therefore its own snapshot: a page renamed while the export ran could be
 /// written into the file under its old slug as a post and its new slug as some
-/// other page'"'"'s ancestor. The restore then cannot resolve that parent and files
+/// other page's ancestor. The restore then cannot resolve that parent and files
 /// the child at the top level — a backup that is silently wrong, which is worse
 /// than one that fails. See [`export_snapshot`].
 pub struct ExportRows {
-    /// Every term, grouped by taxonomy in the registry'"'"'s order.
+    /// Every term, grouped by taxonomy in the registry's order.
     pub terms_by_taxonomy: Vec<(String, Vec<Term>)>,
     /// The posts to export: registered types, trash excluded, type by type.
     pub posts: Vec<Post>,
-    /// Every post by id, *including* trash and unregistered types. A page'"'"'s
+    /// Every post by id, *including* trash and unregistered types. A page's
     /// path is built through its ancestors, and an ancestor may be either.
     pub posts_by_id: std::collections::HashMap<i64, Post>,
     /// Author usernames by account id.
@@ -3130,12 +3172,18 @@ pub struct ExportRows {
     pub terms_by_post: std::collections::HashMap<i64, Vec<Term>>,
     /// Every attachment, oldest first.
     pub attachments: Vec<crate::models::Attachment>,
+    /// Every comment on the exported posts, by post id, in creation order.
+    ///
+    /// All statuses, not just approved: a backup that restores a site without
+    /// its moderation queue has thrown away work, and one that restores spam as
+    /// discussion is worse.
+    pub comments_by_post: std::collections::HashMap<i64, Vec<Comment>>,
     /// The same rows by id, for resolving featured images.
     pub attachments_by_id: std::collections::HashMap<i64, crate::models::Attachment>,
 }
 
 impl ExportRows {
-    /// A page'"'"'s ancestor slugs, outermost first, resolved in memory.
+    /// A page's ancestor slugs, outermost first, resolved in memory.
     ///
     /// The same walk and the same bound as [`crate::routes::site::Repos::page_ancestry`],
     /// against the snapshot rather than the live table — which is the whole
@@ -3205,9 +3253,9 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
         .map(|post| (post.id, post.clone()))
         .collect();
 
-    // Type by type, in registry order, so the file'"'"'s shape does not depend on
+    // Type by type, in registry order, so the file's shape does not depend on
     // insertion order. Trash is deliberately excluded: an export is a backup of
-    // the site'"'"'s content, and restoring somebody'"'"'s deleted drafts into a fresh
+    // the site's content, and restoring somebody's deleted drafts into a fresh
     // install is a surprise, not a feature.
     let mut posts = Vec::new();
     for post_type in crate::content_types::all_post_types() {
@@ -3219,15 +3267,43 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
         );
     }
 
-    let author_ids: Vec<i64> = posts.iter().map(|post| post.author_id).collect();
+    let post_ids: Vec<i64> = posts.iter().map(|post| post.id).collect();
+
+    // One query for every exported post's comments, ordered so the tree can be
+    // rebuilt from parents down.
+    let comment_rows: Vec<Comment> = if post_ids.is_empty() {
+        Vec::new()
+    } else {
+        comments::table
+            .filter(comments::post_id.eq_any(&post_ids))
+            .order((comments::created_at.asc(), comments::id.asc()))
+            .select(Comment::as_select())
+            .load(conn)
+            .await?
+    };
+    let mut comments_by_post: std::collections::HashMap<i64, Vec<Comment>> =
+        std::collections::HashMap::new();
+    for comment in &comment_rows {
+        comments_by_post
+            .entry(comment.post_id)
+            .or_default()
+            .push(comment.clone());
+    }
+
+    // Post authors *and* comment authors. Resolving only the former left every
+    // registered commenter exported as a guest, so a restore would strip their
+    // account from their own comments.
+    let mut author_ids: Vec<i64> = posts.iter().map(|post| post.author_id).collect();
+    author_ids.extend(comment_rows.iter().filter_map(|comment| comment.author_id));
+    author_ids.sort_unstable();
+    author_ids.dedup();
     let usernames = users_by_ids(conn, &author_ids)
         .await?
         .into_iter()
         .map(|(id, user)| (id, user.username))
         .collect();
 
-    // Two queries for every post'"'"'s terms rather than two per post.
-    let post_ids: Vec<i64> = posts.iter().map(|post| post.id).collect();
+    // Two queries for every post's terms rather than two per post.
     let links: Vec<(i64, i64)> = if post_ids.is_empty() {
         Vec::new()
     } else {
@@ -3266,6 +3342,7 @@ async fn export_rows(conn: &mut AsyncPgConnection) -> AutumnResult<ExportRows> {
         terms_by_post,
         attachments,
         attachments_by_id,
+        comments_by_post,
     })
 }
 
@@ -3532,7 +3609,7 @@ pub async fn parent_candidates(
 }
 
 /// One page of a taxonomy's terms with the taxonomy's total, for the admin
-/// screen'"'"'s list and its pager.
+/// screen's list and its pager.
 pub async fn terms_page_with_total(
     conn: &mut AsyncPgConnection,
     taxonomy: &str,
@@ -3610,7 +3687,7 @@ pub async fn term_ids_in_taxonomy(
 /// The terms named by a set of ids, for resolving the parent names a page of
 /// the term list refers to.
 ///
-/// The list renders each term'"'"'s parent name, and it used to find that parent in
+/// The list renders each term's parent name, and it used to find that parent in
 /// the same in-memory set — which silently became wrong the moment the set was
 /// a page rather than the whole taxonomy: a term whose parent sits on another
 /// page would have rendered with no parent at all.
@@ -3869,6 +3946,183 @@ pub async fn insert_post_with_unique_slug(
 /// The parent is a **slug**, not an id: ids mean nothing across installations,
 /// which is the same rule the post ancestry and the term references follow.
 #[derive(Debug, Clone)]
+/// One comment as an export file describes it.
+///
+/// Nesting is expressed by embedding replies rather than by carrying ids: an id
+/// means nothing in another database, and a parent column would need the same
+/// two-pass resolution the terms need. A tree needs neither.
+pub struct ImportedComment {
+    /// The registered account's **username**, if the comment had one. Resolved
+    /// against this site; an unknown one becomes a guest comment under the name
+    /// the file carries, rather than being attributed to somebody else.
+    pub author_username: Option<String>,
+    pub author_name: String,
+    pub author_email: String,
+    pub author_url: String,
+    pub body: String,
+    pub status: String,
+    pub created_at: chrono::NaiveDateTime,
+    pub replies: Vec<ImportedComment>,
+}
+
+/// Restore a post's comments, with their nesting, authorship and moderation
+/// states, in one transaction.
+///
+/// Returns how many comments this call created.
+///
+/// Skipped entirely when the post already has any comment. An import that says
+/// it skips existing content must not append a second copy of a thread to a
+/// post that already carries one — and unlike a post, a comment has no natural
+/// key to dedupe on, so "this post already has a discussion" is the honest
+/// guard. It is also what makes a re-run of a half-finished import safe.
+pub async fn import_comments(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+    incoming: &[ImportedComment],
+) -> AutumnResult<usize> {
+    if incoming.is_empty() {
+        return Ok(0);
+    }
+    // Resolved before the transaction: one query for every username the file
+    // mentions, rather than one per comment.
+    let mut usernames: Vec<String> = Vec::new();
+    collect_usernames(incoming, &mut usernames);
+    usernames.sort_unstable();
+    usernames.dedup();
+    let accounts: std::collections::HashMap<String, i64> = if usernames.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        users::table
+            .filter(users::username.eq_any(&usernames))
+            .select((users::username, users::id))
+            .load::<(String, i64)>(conn)
+            .await?
+            .into_iter()
+            .collect()
+    };
+
+    let incoming: Vec<ImportedComment> = incoming.iter().map(clone_imported).collect();
+    conn.transaction(async move |conn| {
+        // The post row first — the lock order every write here follows, and the
+        // same lock the counter rebuild takes at the end.
+        let locked: Option<Post> = posts::table
+            .find(post_id)
+            .select(Post::as_select())
+            .for_update()
+            .first(conn)
+            .await
+            .optional()?;
+        if locked.is_none() {
+            return Ok(0);
+        }
+
+        let existing: i64 = comments::table
+            .filter(comments::post_id.eq(post_id))
+            .count()
+            .get_result(conn)
+            .await?;
+        if existing > 0 {
+            return Ok(0);
+        }
+
+        let mut created = 0usize;
+        let mut level: Vec<(Option<i64>, &ImportedComment)> =
+            incoming.iter().map(|c| (None, c)).collect();
+        for _ in 0..=MAX_COMMENT_DEPTH {
+            if level.is_empty() {
+                break;
+            }
+            let mut next: Vec<(Option<i64>, &ImportedComment)> = Vec::new();
+            for (parent_id, comment) in level {
+                let mut new = crate::models::NewComment {
+                    post_id,
+                    parent_id,
+                    author_id: comment
+                        .author_username
+                        .as_ref()
+                        .and_then(|username| accounts.get(username).copied()),
+                    author_name: comment.author_name.clone(),
+                    author_email: comment.author_email.clone(),
+                    author_url: comment.author_url.clone(),
+                    author_ip: String::new(),
+                    body: comment.body.clone(),
+                    // Clamped to a status the site recognises. An unknown one
+                    // becomes `pending` rather than `approved`: the direction
+                    // that shows a moderator something is the safe one.
+                    status: if crate::hooks::COMMENT_STATUSES.contains(&comment.status.as_str()) {
+                        comment.status.clone()
+                    } else {
+                        "pending".to_owned()
+                    },
+                };
+                // The model's declared rules, which this direct insert never
+                // runs. A file with an over-long or empty body is a file this
+                // site would not have produced; skipping the row keeps the rest
+                // of the restore rather than failing it.
+                if crate::hooks::validate_comment(&mut new).is_err() {
+                    continue;
+                }
+                // `created_at` explicitly, not the column default. A thread
+                // restored with every timestamp set to the moment of the
+                // restore has lost its chronology — and the renderer orders by
+                // `(created_at, id)`, so it would also read back in a different
+                // order than it was written in.
+                let saved: Comment = diesel::insert_into(comments::table)
+                    .values((
+                        comments::post_id.eq(new.post_id),
+                        comments::parent_id.eq(new.parent_id),
+                        comments::author_id.eq(new.author_id),
+                        comments::author_name.eq(&new.author_name),
+                        comments::author_email.eq(&new.author_email),
+                        comments::author_url.eq(&new.author_url),
+                        comments::author_ip.eq(&new.author_ip),
+                        comments::body.eq(&new.body),
+                        comments::status.eq(&new.status),
+                        comments::created_at.eq(comment.created_at),
+                    ))
+                    .returning(Comment::as_returning())
+                    .get_result(conn)
+                    .await?;
+                created += 1;
+                for reply in &comment.replies {
+                    next.push((Some(saved.id), reply));
+                }
+            }
+            level = next;
+        }
+
+        // Replies past the cap are dropped rather than flattened onto the root:
+        // the renderer draws `MAX_COMMENT_DEPTH` levels, and a reply grafted
+        // somewhere it does not belong is worse than one that is absent.
+
+        recount_post_comments(conn, post_id).await?;
+        Ok::<_, AutumnError>(created)
+    })
+    .await
+}
+
+fn collect_usernames(comments: &[ImportedComment], into: &mut Vec<String>) {
+    for comment in comments {
+        if let Some(username) = &comment.author_username {
+            into.push(username.clone());
+        }
+        collect_usernames(&comment.replies, into);
+    }
+}
+
+fn clone_imported(comment: &ImportedComment) -> ImportedComment {
+    ImportedComment {
+        author_username: comment.author_username.clone(),
+        author_name: comment.author_name.clone(),
+        author_email: comment.author_email.clone(),
+        author_url: comment.author_url.clone(),
+        body: comment.body.clone(),
+        status: comment.status.clone(),
+        created_at: comment.created_at,
+        replies: comment.replies.iter().map(clone_imported).collect(),
+    }
+}
+
 pub struct ImportedTerm {
     pub taxonomy: String,
     pub name: String,

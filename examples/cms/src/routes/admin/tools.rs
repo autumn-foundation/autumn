@@ -123,6 +123,43 @@ pub struct ExportPost {
     /// was unrecoverable even with the blob store backed up.
     #[serde(default)]
     pub featured_media: Option<String>,
+    /// The post's discussion, nested as it is rendered.
+    ///
+    /// Carried in version 5. Without it a backup restored a site with every
+    /// thread gone and every comment count at zero — approved discussion,
+    /// the moderation queue, and the spam decisions a moderator had already
+    /// made, none of them recoverable from the file. WordPress's WXR carries
+    /// `wp:comment` for exactly this reason.
+    #[serde(default)]
+    pub comments: Vec<ExportComment>,
+}
+
+/// One comment in an export file.
+///
+/// Nesting is a tree rather than a parent id, because an id means nothing in
+/// another database — the same reasoning that makes `author` a username and
+/// `parent` a slug elsewhere in this format.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportComment {
+    /// The registered account's **username**, absent for a guest.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// The name and email as stored on the comment. A registered commenter
+    /// renders under their current account name, but these are what the row
+    /// carries and what a guest comment is identified by.
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default)]
+    pub author_email: String,
+    #[serde(default)]
+    pub author_url: String,
+    pub body: String,
+    /// `approved`, `pending`, `spam` or `trash` — the moderation decision,
+    /// which is work a restore must not discard.
+    pub status: String,
+    pub created_at: chrono::NaiveDateTime,
+    #[serde(default)]
+    pub replies: Vec<ExportComment>,
 }
 
 /// An attachment's row, including the handle that locates its bytes.
@@ -207,10 +244,10 @@ fn default_comment_status() -> String {
 /// missing password would have silently unprotected content, whereas a missing
 /// media list only means there is none to restore. Refusing version 2 outright
 /// would strand backups for no safety gain.
-pub const EXPORT_VERSION: u32 = 4;
+pub const EXPORT_VERSION: u32 = 5;
 
 /// The versions this site can read.
-const READABLE_EXPORT_VERSIONS: &[u32] = &[2, 3, 4];
+const READABLE_EXPORT_VERSIONS: &[u32] = &[2, 3, 4, 5];
 
 /// How much of the request budget multipart framing and the CSRF field may use.
 ///
@@ -385,6 +422,8 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
                 })
                 .collect(),
             featured_media,
+            // Nested from the flat rows, which are already in creation order.
+            comments: export_comments(rows.comments_by_post.get(&post.id), &rows.usernames),
         });
     }
 
@@ -424,6 +463,63 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
             autumn_web::slugify(&settings.site_title)
         ))
         .into_response())
+}
+
+/// The file's comment tree, in the shape `content::import_comments` restores.
+fn imported_comments(comments: &[ExportComment]) -> Vec<content::ImportedComment> {
+    comments
+        .iter()
+        .map(|comment| content::ImportedComment {
+            author_username: comment.author.clone(),
+            author_name: comment.author_name.clone(),
+            author_email: comment.author_email.clone(),
+            author_url: comment.author_url.clone(),
+            body: comment.body.clone(),
+            status: comment.status.clone(),
+            created_at: comment.created_at,
+            replies: imported_comments(&comment.replies),
+        })
+        .collect()
+}
+
+/// Nest a post's flat comment rows into the tree the file carries.
+///
+/// Built from the roots down, so a row whose parent is missing — a comment
+/// whose parent was deleted by a direct write — is dropped rather than promoted
+/// to a root it never was.
+fn export_comments(
+    rows: Option<&Vec<crate::models::Comment>>,
+    usernames: &std::collections::HashMap<i64, String>,
+) -> Vec<ExportComment> {
+    let Some(rows) = rows else {
+        return Vec::new();
+    };
+    fn children(
+        rows: &[crate::models::Comment],
+        parent: Option<i64>,
+        depth: usize,
+        usernames: &std::collections::HashMap<i64, String>,
+    ) -> Vec<ExportComment> {
+        // The same bound the write path enforces, so a cycle from a direct
+        // write cannot make the export recurse forever.
+        if depth > crate::content::MAX_COMMENT_DEPTH + 1 {
+            return Vec::new();
+        }
+        rows.iter()
+            .filter(|row| row.parent_id == parent)
+            .map(|row| ExportComment {
+                author: row.author_id.and_then(|id| usernames.get(&id).cloned()),
+                author_name: row.author_name.clone(),
+                author_email: row.author_email.clone(),
+                author_url: row.author_url.clone(),
+                body: row.body.clone(),
+                status: row.status.clone(),
+                created_at: row.created_at,
+                replies: children(rows, Some(row.id), depth + 1, usernames),
+            })
+            .collect()
+    }
+    children(rows, None, 0, usernames)
 }
 
 /// What identifies a post inside an export file.
@@ -659,6 +755,7 @@ pub async fn import(
 
     let mut restored = 0_usize;
     let mut skipped = 0_usize;
+    let mut comments_restored = 0_usize;
     let mut orphaned = 0_i64;
     // (created id, post type, the identity AS WRITTEN IN THE FILE, parent
     // identity). The written identity is the key the file's parent references
@@ -770,6 +867,13 @@ pub async fn import(
             if transitioned {
                 transitioned_ids.push(ours.id);
             }
+            // The discussion too. Skipped when the post already carries one, so
+            // finishing a half-done import does not append a second copy — see
+            // `content::import_comments`.
+            let incoming = imported_comments(&post.comments);
+            comments_restored += repos
+                .with_conn(async |conn| content::import_comments(conn, ours.id, &incoming).await)
+                .await?;
             created_ids.push((
                 ours.id,
                 post.post_type.clone(),
@@ -926,6 +1030,10 @@ pub async fn import(
         if transitioned {
             transitioned_ids.push(created_id);
         }
+        let incoming = imported_comments(&post.comments);
+        comments_restored += repos
+            .with_conn(async |conn| content::import_comments(conn, created_id, &incoming).await)
+            .await?;
         created_ids.push((
             created_id,
             post.post_type.clone(),
@@ -1015,6 +1123,13 @@ pub async fn import(
             h2 class="font-semibold mb-2" { "Import complete" }
             p class="text-sm text-gray-700" {
                 (restored) " imported, " (skipped) " already present."
+            }
+            @if comments_restored > 0 {
+                p class="text-sm text-gray-700 mt-1" {
+                    (autumn_web::format::pluralize(
+                        i64::try_from(comments_restored).unwrap_or(i64::MAX), "comment"))
+                    " restored, moderation states and all."
+                }
             }
             @if orphaned > 0 {
                 p class="text-sm text-amber-700 mt-2" {
