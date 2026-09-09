@@ -1,4 +1,4 @@
-# 🗃️ Ledger: batch the dependent(destroy) leaf cascade (statements 10002→2)
+# 🗃️ Ledger: batch the dependent(destroy) leaf cascade (statements 10002→3)
 
 ## 🎯 Workload
 
@@ -84,10 +84,18 @@ calls=1      buffers=5066     SELECT id FROM "ledger_dd_comments" WHERE "post_id
 
 **After** (`after/output.txt`):
 ```
+calls=1      buffers=5066     SELECT count(*) FROM (SELECT id FROM "ledger_dd_comments" WHERE "post_id" = $1 ORDER BY id FOR UPDATE) AS __autumn_locked
 calls=1      buffers=63       SELECT $2 FROM ONLY "public"."ledger_dd_comments" x WHERE $1 = "post_id" FOR KEY SHARE OF x
 calls=1      buffers=5063     DELETE FROM "ledger_dd_comments" WHERE "post_id" = $1
--- total: calls=2 buffers=5126 --
+-- total: calls=3 buffers=10192 --
 ```
+
+The first statement is a mandatory pre-lock (added during review, see
+"Concurrency hardening" below): it locks every selected child row, in
+ascending id order, before the batched `DELETE` runs. It costs the same
+index scan as the baseline's own `SELECT id ... FOR UPDATE` (line 81 above)
+because it touches the same rows — but wrapped in an outer `count(*)` so
+only a single row ever crosses the wire, instead of one per locked child.
 
 The `FOR KEY SHARE OF x` statement in both dumps is Postgres's own internal
 FK-integrity check on the parent `DELETE FROM ledger_dd_posts` (verifying no
@@ -163,17 +171,61 @@ if destroy_fast_path_eligible {
 }
 ```
 
-No new SQL was written for this fix: `dependent_delete_all` already
-existed, already shipped behind `on_delete = delete_all`, and already had
-its own test coverage and its own batched counter-cache path
-(`counter_cache_before_delete_many`, itself already used and tested by the
-`delete_many` bulk-delete path). This just gives `Destroy` a second,
-narrower way to reach the same helper `DeleteAll` already reaches, exactly
-when `Destroy`'s extra guarantees (hooks, soft-delete, versioning,
-recursion) aren't in play.
+`destroy_fast_path_eligible` also excludes `config.position.is_some()`
+(added during review, see below): a `position(...)` child's row-level
+rank-compaction triggers only ever see one departing row at a time, so a
+batched multi-row `DELETE` would leave the survivors' ranks gapped or
+duplicated the same way `delete_many` already avoids by forcing single-row
+chunks for that exact configuration.
 
-No migration: no schema or index change, no new statement shape besides
-one already in production use behind `delete_all`.
+`dependent_delete_all` already existed, already shipped behind
+`on_delete = delete_all`, and already had its own test coverage and its
+own batched counter-cache path (`counter_cache_before_delete_many`, itself
+already used and tested by the `delete_many` bulk-delete path). This gives
+`Destroy` a second, narrower way to reach the same helper `DeleteAll`
+already reaches, exactly when `Destroy`'s extra guarantees (hooks,
+soft-delete, versioning, recursion) aren't in play. One new statement
+shape was added to it during review — the pre-lock below — everything else
+is the pre-existing helper.
+
+No migration: no schema or index change.
+
+### 🔒 Concurrency hardening (review round)
+
+Three issues surfaced by review, all in `dependent_delete_all` itself
+(`autumn/src/repository.rs`) rather than the macro-side eligibility gate,
+so they apply equally to the pre-existing `on_delete = delete_all` caller:
+
+1. **Stale reparent race.** The original fix's id snapshot (for the
+   counter-cache decrement path) was an unlocked `SELECT`, unlike the
+   per-row Destroy loop's `SELECT ... FOR UPDATE`. A child reparented away
+   between the snapshot and the batched `DELETE`/decrement could have its
+   counter-cached parent wrongly decremented while surviving untouched.
+   Fixed by locking the same predicate the per-row loop always locked
+   (`dependent_child_ids_for_update`) before reading it.
+2. **Deadlock on divergent lock order.** With no counter caches, the fast
+   path fell straight through to a bulk `DELETE` with no pre-lock at all,
+   whose row-lock acquisition order is plan-dependent. Two concurrent
+   cascades reaching an overlapping child set through *different* foreign
+   keys (a diamond: the same child table `dependent(..., on_delete =
+   destroy)` of two different parents) could then lock the same rows in
+   opposite orders and deadlock. Fixed by taking the ordered pre-lock
+   unconditionally, in the same ascending-`id` order every caller uses.
+3. **O(rows) memory/network for a cache-free cascade.** Locking
+   unconditionally (point 2) then risked reintroducing an O(rows) cost for
+   a huge fan-out with no counter caches: an id-loading `SELECT` transfers
+   one row per locked child regardless of whether the driver buffers them.
+   Fixed by wrapping the lock-only variant's `SELECT` in an outer
+   `count(*)` (`lock_dependent_children_for_update`) — `FOR UPDATE` is
+   legal on the unaggregated inner query, so every row is still locked
+   server-side, but only the outer count ever reaches the client. The
+   `after/output.txt` statement list above is the result: one lock
+   statement whose buffer cost matches the row-touching work, but a single
+   row on the wire.
+
+None of these change the eligibility gate or the equivalence guarantees
+below — they only change how `dependent_delete_all` itself takes its
+locks, which is exactly the code path this report already measures.
 
 ## 📊 Measurement
 
@@ -184,19 +236,24 @@ reset before the measured `delete_by_id` call. Full dumps in
 
 | | before | after |
 |---|---:|---:|
-| `ledger_dd_comments` statement calls | 10,002 | **2** |
-| `ledger_dd_comments` statement buffers | 45,583 | **5,126** |
+| `ledger_dd_comments` statement calls | 10,002 | **3** |
+| `ledger_dd_comments` statement buffers | 45,583 | **10,192** |
 | comments cascaded | 5,000 | 5,000 |
 
-Statement count: **10,002 → 2**, i.e. O(N) → O(1) — an N+1 elimination,
+Statement count: **10,002 → 3**, i.e. O(N) → O(1) — an N+1 elimination,
 admissible on its own per the Ledger process ("statement count per unit of
 work drops from O(n) to O(1)... needs no other justification"). Buffers:
-**45,583 → 5,126, a 88.8% reduction** — comfortably clears the ≥20% floor
+**45,583 → 10,192, a 77.6% reduction** — comfortably clears the ≥20% floor
 independently. Both floors are cleared by the same change; neither is
-manufactured — 2 of the 5,126 post-fix buffers are the FK-check statement
-shared with the baseline, so essentially all of the reduction is the
-cascade itself. No `temp_blks_written` at any point (no spill, either
-side, confirmed in both dumps).
+manufactured — 63 of the 10,192 post-fix buffers are the FK-check
+statement shared with the baseline, so essentially all of the reduction is
+the cascade itself. The post-fix buffer count is higher than the raw
+statement-count win alone would suggest because the mandatory pre-lock
+(see "Concurrency hardening" above) touches the same rows the baseline's
+own `SELECT id ... FOR UPDATE` did (line 81's 5,066 buffers) — the win is
+in never reloading and deleting each row individually afterwards, not in
+skipping the lock scan. No `temp_blks_written` at any point (no spill,
+either side, confirmed in both dumps).
 
 ## ✅ Equivalence
 
