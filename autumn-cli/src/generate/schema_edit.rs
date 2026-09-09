@@ -1886,51 +1886,25 @@ pub fn remove_main_mod_declarations(existing: &str, names: &[&str]) -> String {
     out
 }
 
-/// Inject the `#[path]`-qualified `mod schema;` / `mod models;` declarations
-/// that link a scaffolded app's `src/schema.rs` and `src/models/` into the
-/// standalone `src/bin/seed.rs` binary (issue #1718).
-///
-/// `autumn seed --count/--model` resolves a model by name through an
-/// `inventory` registry that each `#[autumn_web::model]` submits into. That
-/// registry is only populated with models actually **compiled into the seed
-/// binary** — but `autumn new` emits `src/bin/seed.rs` as a separate `[[bin]]`
-/// target that links neither `src/main.rs` nor `src/models/`, so a scaffolded
-/// model was never visible to it and `--model M` returned
-/// `unknown model M; available: (none)`. Declaring the models (and the
-/// `schema` module they `use crate::schema::…` from) directly in `seed.rs`
-/// pulls their `inventory::submit!`s into the seed binary.
-///
-/// The `#[path]` form is required because `src/bin/seed.rs`'s own module tree
-/// has no `models`/`schema` child relative to `src/bin/`; the attribute points
-/// each declaration at the real file under `src/`. Child modules of
-/// `models/mod.rs` (`mod post;` → `src/models/post.rs`) resolve relative to
-/// that file's directory, so no per-model edit is needed here — regenerating
-/// or adding a model just extends `src/models/mod.rs`, which this single
-/// declaration already re-exports into the seed binary.
-///
-/// Idempotent: a declaration already present (in any `mod x;` / `pub mod x;`
-/// form, with or without a preceding `#[path]` attribute) is left untouched,
-/// so repeated `generate` runs converge. The inverse
-/// [`unlink_models_from_seed_bin`] removes these injected declarations at
-/// destroy time — necessary because `autumn destroy` **deletes**
-/// `src/models/mod.rs` / `src/schema.rs` once its `ModDecl`/`SchemaTable`
-/// reverts empty them (destroying the last model), which would otherwise leave
-/// `seed.rs`'s `#[path]` links dangling at missing files and break
-/// `cargo check --bins` / `autumn seed`.
+/// Link the generated schema and models into the standalone seed binary.
+/// This compiles each model's inventory registration into that binary.
 #[must_use]
 pub fn link_models_into_seed_bin(existing: &str) -> String {
-    // (module name, full declaration incl. its `#[path]` attribute)
     let entries: [(&str, &str); 2] = [
         ("schema", "#[path = \"../schema.rs\"]\nmod schema;"),
         ("models", "#[path = \"../models/mod.rs\"]\nmod models;"),
     ];
+    let mut existing = existing.to_owned();
+    for (name, block) in entries {
+        existing = qualify_plain_mod(&existing, name, block.lines().next().unwrap());
+    }
     let needed: Vec<&str> = entries
         .iter()
-        .filter(|(name, _)| !has_mod_declaration(existing, name))
+        .filter(|(name, _)| !has_mod_declaration(&existing, name))
         .map(|(_, decl)| *decl)
         .collect();
     if needed.is_empty() {
-        return existing.to_owned();
+        return existing;
     }
     let block = needed.join("\n");
 
@@ -1967,6 +1941,35 @@ pub fn link_models_into_seed_bin(existing: &str) -> String {
         out.pop();
     }
     out
+}
+
+fn qualify_plain_mod(existing: &str, name: &str, path_attribute: &str) -> String {
+    let private = format!("mod {name};");
+    let public = format!("pub {private}");
+    let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
+    let Some(index) = lines
+        .iter()
+        .position(|line| line.trim() == private || line.trim() == public)
+    else {
+        return existing.to_owned();
+    };
+
+    let has_path = lines[..index]
+        .iter()
+        .rev()
+        .take_while(|line| line.trim_start().starts_with("#["))
+        .any(|line| line.trim_start().starts_with("#[path"));
+    if has_path {
+        return existing.to_owned();
+    }
+
+    let indent = &lines[index][..lines[index].len() - lines[index].trim_start().len()];
+    lines.insert(index, format!("{indent}{path_attribute}"));
+    let mut qualified = lines.join("\n");
+    if existing.ends_with('\n') {
+        qualified.push('\n');
+    }
+    qualified
 }
 
 /// Remove the `#[path]`-qualified `mod schema;` / `mod models;` declarations
@@ -7604,6 +7607,34 @@ use autumn_web::seed::SeedContext;
             linked.contains("mod schema;"),
             "must still add the missing `mod schema;`:\n{linked}"
         );
+    }
+
+    #[test]
+    fn link_seed_bin_qualifies_plain_existing_declarations() {
+        let existing = "\
+//! seed
+mod schema;
+mod models;
+fn main() {}
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert!(linked.contains("#[path = \"../schema.rs\"]\nmod schema;"));
+        assert!(linked.contains("#[path = \"../models/mod.rs\"]\nmod models;"));
+        assert_eq!(linked.matches("mod schema;").count(), 1);
+        assert_eq!(linked.matches("mod models;").count(), 1);
+    }
+
+    #[test]
+    fn link_seed_bin_preserves_visibility_and_custom_paths() {
+        let existing = "\
+#[path = \"custom_schema.rs\"]
+pub mod schema;
+pub mod models;
+";
+        let linked = link_models_into_seed_bin(existing);
+        assert!(linked.contains("#[path = \"custom_schema.rs\"]\npub mod schema;"));
+        assert!(linked.contains("#[path = \"../models/mod.rs\"]\npub mod models;"));
+        assert_eq!(link_models_into_seed_bin(&linked), linked);
     }
 
     #[test]
