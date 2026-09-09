@@ -466,11 +466,30 @@ impl CustomDomainTask {
             }
         };
 
-        if let Err(e) = self.registry.record_issuing(hostname).await {
-            tracing::warn!(
+        // The lease wait is an await, and the registry can move underneath it.
+        // Re-assert ownership as part of the transition: ordering for a
+        // hostname that was offboarded meanwhile spends a slot of the budget
+        // and the CA's rate limit on a certificate `install` would only
+        // discard, and ordering for one re-registered by another tenant would
+        // move THEIR record to `Issuing` for an order that was never theirs.
+        match self.registry.record_issuing_for(hostname, tenant).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    hostname,
+                    tenant,
+                    "abandoning a custom-domain order: the hostname is no longer this tenant's to \
+                     order for"
+                );
+                if let Err(e) = lease.release().await {
+                    tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
+                }
+                return;
+            }
+            Err(e) => tracing::warn!(
                 hostname,
                 "failed to persist custom-domain issuing state: {e}"
-            );
+            ),
         }
         self.limiter.record_attempt(hostname, now_unix);
 
@@ -702,11 +721,23 @@ impl CustomDomainTask {
     }
 
     /// Drop everything this process holds for an offboarded hostname.
+    ///
+    /// A certificate that cannot be deleted does not fail the offboarding: the
+    /// domain is already unroutable and unservable, and reporting failure would
+    /// suggest none of it happened. It is ALERTED instead — an offboarded
+    /// tenant's private key left on disk is an operator's problem, and nothing
+    /// else retries it: the orphan prune only runs when a `[retention]
+    /// custom_domains` window is configured, and it is unset by default.
     async fn purge_local(&self, host: &str) {
         self.cache.remove(host);
         self.limiter.forget(host);
         if let Err(e) = self.certs.delete_cert(&cert_id_for(host)).await {
-            tracing::warn!(hostname = %host, "failed to delete the offboarded certificate: {e}");
+            let message = format!(
+                "offboarded custom domain {host} but could not delete its certificate: {e}. The \
+                 certificate and private key are still on disk"
+            );
+            tracing::warn!("{message}");
+            (self.reporter)(message);
         }
     }
 

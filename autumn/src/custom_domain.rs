@@ -1037,6 +1037,39 @@ impl CustomDomainRegistry {
         .await
     }
 
+    /// [`record_issuing`](Self::record_issuing), but only while `tenant` owns a
+    /// hostname that is actually orderable. Returns whether it applied.
+    ///
+    /// Ordering waits for a lease, and the registry can move underneath that
+    /// wait. An unconditional transition let the order run anyway: for a
+    /// hostname that had been offboarded it spent a slot of the deployment's
+    /// budget and the CA's rate limit on a certificate `install` would then
+    /// discard, and for one re-registered by someone else it moved the NEW
+    /// tenant's record to `Issuing` for an order that was never theirs.
+    ///
+    /// `Active` still applies — that is a renewal, and its record legitimately
+    /// stays `Active` while the order runs — but `PendingDns` does not: a
+    /// re-registration has not proven its own DNS yet.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_issuing_for(&self, hostname: &str, tenant: &str) -> io::Result<bool> {
+        self.mutate_if(
+            hostname,
+            |d| {
+                d.tenant == tenant
+                    && matches!(d.status, DomainStatus::Verified | DomainStatus::Active)
+            },
+            |d| {
+                if d.status == DomainStatus::Verified {
+                    d.status = DomainStatus::Issuing;
+                }
+            },
+        )
+        .await
+    }
+
     /// Record a successfully issued certificate: the domain is now served.
     ///
     /// # Errors

@@ -971,6 +971,213 @@ async fn offboarding_the_last_failing_domain_clears_the_operator_alert() {
     );
 }
 
+/// A certificate store that refuses to delete, so a test can assert what
+/// offboarding does when the key cannot be removed.
+#[derive(Debug)]
+struct UndeletableCertStore(Arc<FsAcmeStore>);
+
+impl autumn_web::acme::store::AcmeStore for UndeletableCertStore {
+    fn load_account(
+        &self,
+    ) -> autumn_web::acme::store::StoreFuture<'_, std::io::Result<Option<Vec<u8>>>> {
+        self.0.load_account()
+    }
+
+    fn save_account<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        self.0.save_account(data)
+    }
+
+    fn load_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+    ) -> autumn_web::acme::store::StoreFuture<
+        'a,
+        std::io::Result<Option<autumn_web::acme::store::StoredCert>>,
+    > {
+        self.0.load_cert(id)
+    }
+
+    fn save_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+        cert: &'a autumn_web::acme::store::StoredCert,
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        self.0.save_cert(id, cert)
+    }
+
+    fn delete_cert<'a>(
+        &'a self,
+        _id: &'a CertId,
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        Box::pin(async move { Err(std::io::Error::other("the certificate store is read-only")) })
+    }
+}
+
+#[tokio::test]
+async fn an_offboard_that_cannot_delete_the_certificate_alerts_the_operator() {
+    // Offboarding still succeeds — the domain is already unroutable, and
+    // reporting failure would suggest none of it happened — but an offboarded
+    // tenant's private key left on disk must not be silent. Nothing else
+    // retries it: the orphan prune runs only when a `[retention]
+    // custom_domains` window is configured, and it is unset by default.
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.certs = Arc::new(UndeletableCertStore(Arc::clone(&h.store)))
+        as Arc<dyn autumn_web::acme::store::AcmeStore>;
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    assert!(
+        h.task.offboard("app.clientco.com").await.unwrap(),
+        "the routing removal still succeeds"
+    );
+    assert!(h.registry.get("app.clientco.com").is_none());
+    let alerts = h.alerts.lock().unwrap().clone();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("app.clientco.com"), "{alerts:?}");
+    assert!(alerts[0].contains("private key"), "{alerts:?}");
+}
+
+/// A coordinator that holds `try_acquire` until released, so a test can change
+/// the registry while an order is waiting for its lease.
+#[derive(Debug)]
+struct SlowCoordinator {
+    inner: autumn_web::scheduler::InProcessSchedulerCoordinator,
+    gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    release: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+}
+
+impl SlowCoordinator {
+    fn new() -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        Self {
+            inner: autumn_web::scheduler::InProcessSchedulerCoordinator::new("test-replica"),
+            gate: Mutex::new(Some(rx)),
+            release: Mutex::new(Some(tx)),
+        }
+    }
+
+    fn release(&self) {
+        let sender = self.release.lock().unwrap().take();
+        if let Some(tx) = sender {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl autumn_web::scheduler::SchedulerCoordinator for SlowCoordinator {
+    fn backend(&self) -> &'static str {
+        "in_process"
+    }
+
+    fn replica_id(&self) -> &str {
+        autumn_web::scheduler::SchedulerCoordinator::replica_id(&self.inner)
+    }
+
+    fn try_acquire<'a>(
+        &'a self,
+        task_name: &'a str,
+        tick_key: &'a str,
+        coordination: autumn_web::task::TaskCoordination,
+    ) -> autumn_web::scheduler::SchedulerFuture<
+        'a,
+        autumn_web::AutumnResult<Option<autumn_web::scheduler::SchedulerLease>>,
+    > {
+        let held = self.gate.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(rx) = held {
+                let _ = rx.await;
+            }
+            self.inner
+                .try_acquire(task_name, tick_key, coordination)
+                .await
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_order_is_abandoned_when_the_hostname_stops_being_this_tenants() {
+    // Acquiring the lease is an await, and the registry moves underneath it.
+    // Ordering anyway spends a slot of the deployment's budget and the CA's
+    // rate limit on a certificate `install` would only discard — and, for a
+    // hostname re-registered by someone else, moves THAT tenant's record to
+    // `issuing` for an order that was never theirs.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        100,
+    ));
+    registry.load().await.unwrap();
+    let issuer = ScriptedIssuer::new(&[]);
+    let coordinator = Arc::new(SlowCoordinator::new());
+    let task = Arc::new(CustomDomainTask {
+        registry: Arc::clone(&registry),
+        cache: Arc::new(CustomDomainCertCache::new(8)),
+        certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier: TableVerifier::new(&[("app.clientco.com", points_here())])
+            as Arc<dyn DomainVerifier>,
+        issuer: Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        ingress: ExpectedIngress {
+            hostname: Some("ingress.myapp.com".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        },
+        renew_before_days: 30,
+        reporter: Arc::new(|_| {}),
+        recovery: None,
+        coordinator: Arc::clone(&coordinator)
+            as Arc<dyn autumn_web::scheduler::SchedulerCoordinator>,
+        leadership_degraded: false,
+        cert_store_paths: Some(Arc::clone(&certs)),
+        retained_cert_ids: HashSet::new(),
+    });
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    let tick = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.tick(NOW).await }
+    });
+    // Let the tick verify the domain and reach the held lease.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    // The tenant offboards and another one connects the same hostname.
+    assert!(registry.remove("app.clientco.com").await.unwrap());
+    registry
+        .register("app.clientco.com", "tenant-b", NOW + 1)
+        .await
+        .unwrap();
+    coordinator.release();
+    tick.await.unwrap();
+
+    assert_eq!(
+        issuer.count(),
+        0,
+        "the order belonged to a tenant that no longer owns the hostname"
+    );
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-b");
+    assert_eq!(
+        record.status,
+        DomainStatus::PendingDns,
+        "the new tenant's record must not be dragged into someone else's order"
+    );
+}
+
 /// A registry store whose next `delete` blocks until released, so a test can
 /// hold the retention sweep inside one offboard and change the registry
 /// underneath it.
