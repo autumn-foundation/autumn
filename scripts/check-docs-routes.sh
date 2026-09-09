@@ -366,8 +366,19 @@ def corpus(root):
 # what the two shapes the corpus actually writes both mean: `Disallow:
 # /actuator/` in a robots.txt sample, and `/actuator/…` in prose. Under a leaf
 # that has nothing below it, the same reading rejects `/actuator/health/`.
+#
+# The segment class carries the RFC 3986 path characters that are never prose
+# punctuation — `~ + % & = $ @` alongside the obvious ones — for one reason:
+# every one of them that is left out becomes a place the match can stop early,
+# and a match that stops early hands `resolves()` a SHORTER path than the page
+# printed. `/actuator/health~old` truncating to `/actuator/health` is the same
+# bug as `/actuatorhealth` truncating to `/actuator`, one segment further along.
+# Characters that really do end a path in running text — `, ; : ! ' ( ) ? > #`
+# — stay out, and `?` in particular must stay out because a query string is not
+# part of the path (`/actuator/logfile?level=warn`).
 DOC_PATH = re.compile(
-    r"/actuator(?![A-Za-z0-9_-])(?:/[A-Za-z0-9_*{}-]+(?:\.[A-Za-z0-9_-]+)*)*/?")
+    r"/actuator(?![A-Za-z0-9_~+%&=$@-])"
+    r"(?:/[A-Za-z0-9_*{}~+%&=$@-]+(?:\.[A-Za-z0-9_~+%&=$@-]+)*)*/?")
 
 # Sentence punctuation stripped from the end of a match. `/` is deliberately
 # ABSENT (it is significant, per above) and so are the three characters a survey
@@ -409,8 +420,13 @@ MISSING_SEPARATOR = re.compile(r"/actuator[A-Za-z0-9_][A-Za-z0-9_./{}-]*")
 # `/actuator`", `Disallow: /actuator/`, and the ~20 `/actuator/*` family
 # mentions — is a NAME, and reporting those would be the gate calling correct
 # lines defects.
+#
+# The scheme-and-authority between the method and the path is optional because
+# the corpus writes the request line both ways: `GET /actuator/logfile?level=warn`
+# in `logging-pii.md`, and `GET http://localhost:3000/dev/trigger-error` in
+# `dev-error-overlay.md`. Both hand the reader something to send.
 REQUEST_LINE = re.compile(
-    r"\bcurl\b|\b(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+/")
+    r"\bcurl\b|\b(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+(?:https?://[^\s/]+)?/")
 
 # `<!-- route-surface-allow: /actuator/x — reason -->`. The reason is required:
 # a waiver without one outlives the sentence it was written for. Matched over
@@ -779,14 +795,32 @@ def self_test():
     for line, want in (
         ("curl http://localhost:3000/actuator/webhooks", True),
         ("GET /actuator/logfile?level=warn", True),
+        # The absolute-URL request form, which `dev-error-overlay.md` writes.
+        ("GET http://localhost:3000/actuator/webhooks", True),
         # A route-table column, not a request: the method FOLLOWS the path.
         ("/actuator/*  GET      -> actuator", False),
+        # A route-listing table row: the `|` is not a scheme.
+        ("| GET | /actuator/health | liveness |", False),
         ('access_log_exclude = ["/health", "/actuator", "/static"]', False),
         ("Everything under `/actuator/webhooks` is sensitive.", False),
     ):
         got = [r for _, _, r in documented(line + "\n")]
-        cases.append((f"request-position detection: {line[:40]!r}",
+        cases.append((f"request-position detection: {line[:44]!r}",
                       got and got[0], want if got else None))
+
+    # Every path character left out of the segment class is a place the match
+    # can stop early, and an early stop hands `resolves()` a SHORTER path than
+    # the page printed — the `/actuatorhealth` bug one segment further along.
+    for spelling in ("/actuator/health~old", "/actuator/health+old",
+                     "/actuator/health%2Fold", "/actuator/health@2"):
+        cases.append((
+            f"`{spelling}` is extracted whole, not truncated",
+            [q for _, q, _r in documented(f"GET {spelling}\n")], [spelling],
+        ))
+        cases.append((
+            f"`{spelling}` does not resolve",
+            resolves(spelling, surface), False,
+        ))
 
     # Reader-facing surfaces a `*.md`-under-`docs/` view of the corpus misses.
     # The scaffolded README is a `.md.tmpl`; `.claude/skills/` is a second skill
