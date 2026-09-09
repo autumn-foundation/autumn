@@ -2187,6 +2187,105 @@ async fn the_size_report_counts_a_refreshed_materialized_view() {
     }
 }
 
+/// A materialized view left `WITH NO DATA` is left `WITH NO DATA`.
+///
+/// The refresh pass exists so a view's own heap cannot keep serving the PII the
+/// base tables just lost. A view created — or last refreshed — `WITH NO DATA`
+/// holds no rows at all, so it has nothing to leak, and refreshing it would run
+/// the view's query and materialize a heap the database deliberately does not
+/// have. On the expensive query such a view usually guards, that is time and
+/// disk the scrub was never asked to spend — inside the transaction, so
+/// exhausting either rolls the whole run back.
+///
+/// The exception is a view a POPULATED view reads: `REFRESH` on the dependent
+/// fails outright while its source is unpopulated, and an unrefreshed populated
+/// view keeps its pre-scrub rows. So the source is refreshed after all — and
+/// emptied again once the dependent has been rebuilt from it, which leaves both
+/// exactly as the run found them.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unpopulated_materialized_view_is_left_unpopulated() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "matview_nodata").await;
+    client
+        .batch_execute(
+            // `deferred_report` is the standalone case, `source_report` the one
+            // `dependent_report` reads — unpopulated only after the dependent
+            // was built, which is the only way that shape can arise.
+            "CREATE MATERIALIZED VIEW kept_report AS SELECT id, email FROM users; \
+             CREATE MATERIALIZED VIEW deferred_report AS \
+                 SELECT id, email FROM users WITH NO DATA; \
+             CREATE MATERIALIZED VIEW source_report AS SELECT id, email FROM users; \
+             CREATE MATERIALIZED VIEW dependent_report AS \
+                 SELECT id, email FROM source_report; \
+             REFRESH MATERIALIZED VIEW source_report WITH NO DATA;",
+        )
+        .await
+        .unwrap();
+    let unpopulated = |view: &str| {
+        format!(
+            "SELECT count(*) FROM pg_class rel \
+             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+             WHERE rel.relname = '{view}' AND NOT rel.relispopulated"
+        )
+    };
+    for view in ["deferred_report", "source_report"] {
+        assert_eq!(
+            count(&client, &unpopulated(view)).await,
+            1,
+            "{view} must start unpopulated, or this test proves nothing"
+        );
+    }
+    // The dependent kept its rows when its source was emptied, so it is a
+    // populated view still holding pre-scrub addresses.
+    assert_eq!(
+        seeded_rows(&client, "dependent_report", "email").await,
+        200,
+        "the dependent must start holding the addresses the scrub has to remove"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    sample_project(dir);
+    let url = format!("{base}/matview_nodata");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let (_o, stderr) = run_autumn_ok(dir, &["db", "scrub", "--sample", "users=1%"], &envs);
+
+    assert!(
+        stderr.contains("kept_report (materialized view refreshed)"),
+        "a populated view must still be refreshed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("deferred_report"),
+        "the standalone unpopulated view must not be touched at all: {stderr}"
+    );
+    assert!(
+        stderr.contains("source_report (materialized view left unpopulated)"),
+        "the source a populated view reads must be refreshed and then emptied \
+         again: {stderr}"
+    );
+
+    for view in ["deferred_report", "source_report"] {
+        assert_eq!(
+            count(&client, &unpopulated(view)).await,
+            1,
+            "the scrub must leave {view} unpopulated"
+        );
+    }
+    // And the refreshes that do run still do their job: each populated view is
+    // rebuilt from the scrubbed base table rather than left holding what it
+    // copied — including the one whose source had to be repopulated first.
+    for view in ["kept_report", "dependent_report"] {
+        assert_eq!(
+            seeded_rows(&client, view, "email").await,
+            0,
+            "{view} must be rebuilt from the scrubbed rows"
+        );
+    }
+}
+
 /// A purged framework table is compacted and measured like any other.
 ///
 /// `[framework] purge` empties its tables, and `DELETE` frees no file space, so

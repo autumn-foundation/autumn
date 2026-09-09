@@ -2879,6 +2879,15 @@ fn classify_and_apply(
             for view in &facts.materialized_views {
                 eprintln!("  REFRESH MATERIALIZED VIEW {};", qualified_ident(view));
             }
+            // And the same restore `execute` runs, in the same position: a view
+            // the database left `WITH NO DATA` is populated only so a dependent
+            // can be rebuilt from it, and emptied again once it has been.
+            for view in &facts.transient_views {
+                eprintln!(
+                    "  REFRESH MATERIALIZED VIEW {} WITH NO DATA;",
+                    qualified_ident(view)
+                );
+            }
             // The last statement inside the transaction, and the whole reason
             // the compaction below can tell a scrubbed target from an aborted
             // one. In an aborted transaction this SELECT is refused like every
@@ -2955,8 +2964,11 @@ fn classify_and_apply(
             url,
             plan,
             &purges,
-            &facts.materialized_views,
-            &facts.all_materialized_views,
+            &ViewRefresh {
+                ordered: &facts.materialized_views,
+                all: &facts.all_materialized_views,
+                transient: &facts.transient_views,
+            },
             sampling.as_ref(),
             label,
         )
@@ -3300,15 +3312,52 @@ fn report_plan(label: &str, plan: &ScrubPlan) {
     }
 }
 
-/// Everything about one live database that the pure classifier cannot read from
-/// the schema IR, gathered in a single connection.
+/// The shared prefix of the materialized-view queries: every view in `public`
+/// (`mv`), the source-to-dependent edges among them (`edge`), the closure the
+/// run has to refresh (`needed`), and those edges restricted to it (`nedge`).
 ///
-/// The IR [`crate::schema::introspect`] produces is shaped for *migration
-/// diffing*, not for "is it safe to rewrite this column": it records only
-/// outgoing single-column foreign keys, drops generated/identity semantics, and
-/// says nothing about row-level security, triggers, partitions, materialized
-/// views, or schemas outside `public`. Every one of those decides whether an
-/// `UPDATE` this command emits succeeds, silently under-applies, or leaks — so
+/// `needed` is every POPULATED view, plus every view one of those reads, however
+/// deep. Both halves matter:
+///
+/// - A view created — or last refreshed — `WITH NO DATA` holds no rows at all.
+///   Measured on `PostgreSQL` 16.13: `REFRESH ... WITH NO DATA` truncates the
+///   heap (24 kB to 8 kB on a 200-row view) and selecting from one afterwards
+///   raises `materialized view "…" has not been populated`. So it has no
+///   pre-scrub copy to rebuild, and refreshing it would run the view's query and
+///   materialize a heap the database deliberately does not have — on the
+///   expensive query such a view usually guards, time and disk spent inside the
+///   scrub's transaction, where exhausting either rolls the whole run back.
+/// - An unpopulated view a populated one reads is a different case: `REFRESH`
+///   on the dependent fails outright while its source is unpopulated (measured:
+///   `materialized view "mv_a" has not been populated`), and an unrefreshed
+///   populated view keeps its pre-scrub rows. So the source is refreshed after
+///   all — and `transient_views` puts it back afterwards, which is safe because
+///   emptying a source does not un-populate the dependent already rebuilt from
+///   it (measured: the dependent kept `relispopulated` and all 200 rows).
+///
+/// `needed` recurses with `UNION`, not `UNION ALL`, so it terminates on its own
+/// and needs no depth cap. The ordered walk built on top of it still has one,
+/// and the unreachable-view refusal exists to catch what that cap drops.
+const MV_REFRESH_CLOSURE: &str = "WITH RECURSIVE mv AS ( \
+     SELECT rel.oid, rel.relispopulated FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind = 'm' \
+ ), edge AS ( \
+     SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source \
+     FROM pg_depend d \
+     JOIN pg_rewrite r ON r.oid = d.objid \
+     WHERE d.classid = 'pg_rewrite'::regclass \
+       AND r.ev_class IN (SELECT oid FROM mv) \
+       AND d.refobjid IN (SELECT oid FROM mv) \
+       AND d.refobjid <> r.ev_class \
+ ), needed AS ( \
+     SELECT oid FROM mv WHERE relispopulated \
+     UNION \
+     SELECT e.source FROM edge e JOIN needed n ON n.oid = e.dependent \
+ ), nedge AS ( \
+     SELECT dependent, source FROM edge WHERE dependent IN (SELECT oid FROM needed) \
+ )";
+
 /// Tables a statement naming them can fire a user-defined rewrite rule on.
 ///
 /// Unlike triggers this needs no walk up `pg_inherits`: measured on
@@ -3419,6 +3468,15 @@ pub struct ServerEndpoint {
     pub data_directory: Option<String>,
 }
 
+/// Everything about one live database that the pure classifier cannot read from
+/// the schema IR, gathered in a single connection.
+///
+/// The IR [`crate::schema::introspect`] produces is shaped for *migration
+/// diffing*, not for "is it safe to rewrite this column": it records only
+/// outgoing single-column foreign keys, drops generated/identity semantics, and
+/// says nothing about row-level security, triggers, partitions, materialized
+/// views, or schemas outside `public`. Every one of those decides whether an
+/// `UPDATE` this command emits succeeds, silently under-applies, or leaks — so
 /// they are probed here rather than assumed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DatabaseFacts {
@@ -3469,10 +3527,12 @@ pub struct DatabaseFacts {
     /// pass is its last write, so a trigger here fires after every rewrite and
     /// can put pre-scrub values into a table already scrubbed.
     pub delete_triggered_tables: BTreeSet<String>,
-    /// Materialized views, in dependency order (sources before dependents), so
-    /// refreshing them in sequence never re-derives from stale data.
+    /// The materialized views the run refreshes, in dependency order (sources
+    /// before dependents), so refreshing them in sequence never re-derives from
+    /// stale data. Drawn from the `MV_REFRESH_CLOSURE` set, not from every view:
+    /// one left `WITH NO DATA` that nothing populated reads is not refreshed.
     pub materialized_views: Vec<String>,
-    /// EVERY materialized view in `public`, enumerated flat.
+    /// That same closure, enumerated flat.
     ///
     /// The ordered list above is built by a recursive walk that stops at a depth
     /// cap, so a view past it is absent from that list — and the size report
@@ -3480,8 +3540,17 @@ pub struct DatabaseFacts {
     /// announce a laptop-sized result while an unmeasured view still held the
     /// disk. A view that is not refreshed still occupies its heap, so honest
     /// measurement enumerates them all; refresh ORDER is a separate question and
-    /// keeps its own list.
+    /// keeps its own list. It has to be drawn from the same closure the ordered
+    /// list is, though: the unreachable-view refusal compares the two, so a view
+    /// present in only one of them reads as one the walk could not reach.
     pub all_materialized_views: Vec<String>,
+    /// The closure members that were UNPOPULATED when the run found them.
+    ///
+    /// Each is refreshed only because a populated view reads it, and emptied
+    /// again with `REFRESH ... WITH NO DATA` once that dependent has been
+    /// rebuilt — so a view the database deliberately left unpopulated is one the
+    /// scrub leaves unpopulated too.
+    pub transient_views: Vec<String>,
     /// Non-system schemas other than `public` that hold base tables. The whole
     /// classification universe is `public`-only, so these are refused.
     pub other_schemas: BTreeSet<String>,
@@ -4009,39 +4078,49 @@ fn probe_database_facts(
     .collect();
 
     // Materialized views in dependency order: a view that reads another must be
-    // refreshed after it, or it re-derives from pre-scrub data.
+    // refreshed after it, or it re-derives from pre-scrub data. Restricted to
+    // the closure `MV_REFRESH_CLOSURE` defines — every populated view, and the
+    // views those read, however deep.
     let materialized_views = names(
-        "WITH RECURSIVE mv AS ( \
-             SELECT rel.oid FROM pg_class rel \
-             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             WHERE rel.relkind = 'm' \
-         ), edge AS ( \
-             SELECT DISTINCT r.ev_class AS dependent, d.refobjid AS source \
-             FROM pg_depend d \
-             JOIN pg_rewrite r ON r.oid = d.objid \
-             WHERE d.classid = 'pg_rewrite'::regclass \
-               AND r.ev_class IN (SELECT oid FROM mv) \
-               AND d.refobjid IN (SELECT oid FROM mv) \
-               AND d.refobjid <> r.ev_class \
-         ), depth AS ( \
-             SELECT oid, 0 AS lvl FROM mv \
-             WHERE oid NOT IN (SELECT dependent FROM edge) \
-             UNION ALL \
-             SELECT e.dependent, d.lvl + 1 FROM edge e JOIN depth d ON d.oid = e.source \
-             WHERE d.lvl < 32 \
-         ) \
-         SELECT rel.relname AS name FROM (SELECT oid, max(lvl) AS lvl FROM depth GROUP BY oid) o \
-         JOIN pg_class rel ON rel.oid = o.oid ORDER BY o.lvl, rel.relname",
+        &format!(
+            "{MV_REFRESH_CLOSURE}, depth AS ( \
+                 SELECT oid, 0 AS lvl FROM needed \
+                 WHERE oid NOT IN (SELECT dependent FROM nedge) \
+                 UNION ALL \
+                 SELECT e.dependent, d.lvl + 1 FROM nedge e JOIN depth d ON d.oid = e.source \
+                 WHERE d.lvl < 32 \
+             ) \
+             SELECT rel.relname AS name \
+             FROM (SELECT oid, max(lvl) AS lvl FROM depth GROUP BY oid) o \
+             JOIN pg_class rel ON rel.oid = o.oid ORDER BY o.lvl, rel.relname"
+        ),
         &mut conn,
     )?;
 
-    // Flat, uncapped, and deliberately not the recursive walk above: the size
-    // report measures over this, and a view the walk's depth cap dropped still
-    // occupies its heap.
+    // The same closure, flat and uncapped: the size report measures over this,
+    // and a view the walk's depth cap dropped still occupies its heap. It has to
+    // be the same set the ordered list is drawn from, because the
+    // unreachable-view refusal compares the two — a view missing from only one
+    // of them would be read as a view the walk could not reach.
     let all_materialized_views = names(
-        "SELECT rel.relname AS name FROM pg_class rel \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE rel.relkind = 'm' ORDER BY rel.relname",
+        &format!(
+            "{MV_REFRESH_CLOSURE} \
+             SELECT rel.relname AS name FROM needed n \
+             JOIN pg_class rel ON rel.oid = n.oid ORDER BY rel.relname"
+        ),
+        &mut conn,
+    )?;
+
+    // The members of that closure that were unpopulated when the run found
+    // them: refreshed only because a populated view reads them, and emptied
+    // again once it has been.
+    let transient_views = names(
+        &format!(
+            "{MV_REFRESH_CLOSURE} \
+             SELECT rel.relname AS name FROM needed n \
+             JOIN pg_class rel ON rel.oid = n.oid \
+             WHERE NOT rel.relispopulated ORDER BY rel.relname"
+        ),
         &mut conn,
     )?;
 
@@ -4101,6 +4180,7 @@ fn probe_database_facts(
         delete_triggered_tables,
         materialized_views,
         all_materialized_views,
+        transient_views,
         other_schemas,
         framework_tables,
         public_columns,
@@ -4817,21 +4897,26 @@ fn rewrite_encrypted_column(
 /// sample's own outcome when `--sample` was given.
 type Applied = (Vec<(String, usize)>, Option<sample::SampleOutcome>);
 
+/// The materialized-view work one target's transaction owes: which views to
+/// refresh and in what order, the flat closure the size report measures over,
+/// and the members to return to `WITH NO DATA` once their dependents are built.
+struct ViewRefresh<'a> {
+    ordered: &'a [String],
+    all: &'a [String],
+    transient: &'a [String],
+}
+
 /// Run every statement for one database inside a single transaction, so a
 /// failure can never leave a half-scrubbed database behind.
 fn execute(
     url: &str,
     plan: &ScrubPlan,
     purges: &[(String, String)],
-    materialized_views: &[String],
-    all_materialized_views: &[String],
+    views: &ViewRefresh<'_>,
     sampling: Option<&sample::SamplePlan>,
     label: &str,
 ) -> Result<Applied, ScrubError> {
-    if plan.tables.is_empty()
-        && purges.is_empty()
-        && materialized_views.is_empty()
-        && sampling.is_none()
+    if plan.tables.is_empty() && purges.is_empty() && views.ordered.is_empty() && sampling.is_none()
     {
         return Ok((Vec::new(), None));
     }
@@ -4887,7 +4972,7 @@ fn execute(
                 // view the walk's depth cap dropped still holds its heap, and
                 // measuring only the ordered subset is what let the report
                 // announce a size a large unmeasured view contradicted.
-                &also_measured(&purged_tables(purges), all_materialized_views),
+                &also_measured(&purged_tables(purges), views.all),
             )?);
         }
         // The deferred purges, now that the sample has emptied what referenced
@@ -4952,13 +5037,26 @@ fn execute(
         // Inside the transaction, so a refresh the role is not allowed to run
         // rolls the rewrites back rather than committing base tables that a
         // stale materialized view still contradicts.
-        for view in materialized_views {
+        for view in views.ordered {
             sql_query(format!(
                 "REFRESH MATERIALIZED VIEW {}",
                 qualified_ident(view)
             ))
             .execute(conn)?;
             counts.push((format!("{view} (materialized view refreshed)"), 0));
+        }
+        // And back to `WITH NO DATA` for the ones that only had to be populated
+        // so a dependent could be rebuilt from them. Last, after every refresh,
+        // because emptying a source before its dependent is rebuilt makes that
+        // refresh fail — and safe here, because emptying it afterwards does not
+        // un-populate the dependent already rebuilt from it.
+        for view in views.transient {
+            sql_query(format!(
+                "REFRESH MATERIALIZED VIEW {} WITH NO DATA",
+                qualified_ident(view)
+            ))
+            .execute(conn)?;
+            counts.push((format!("{view} (materialized view left unpopulated)"), 0));
         }
         Ok(())
     })

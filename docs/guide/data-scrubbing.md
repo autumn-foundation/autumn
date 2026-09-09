@@ -401,7 +401,8 @@ the largest thing it removes — leaving it out would report a laptop-sized resu
 for a database still holding that buffer's whole file.
 
 The materialized views the run refreshes are measured too, on both sides of the
-ratio. A view is rebuilt from whatever survives the sample, so one over a table
+ratio (a view left `WITH NO DATA` that nothing populated reads is neither
+refreshed nor measured — it occupies no heap). A view is rebuilt from whatever survives the sample, so one over a table
 `always_include` keeps whole does not shrink at all; measuring the sampled base
 tables alone reported `488.0 kB → 232.0 kB` on a database whose refreshed view
 still held 44 MB. They are measured but not compacted — `REFRESH` has already
@@ -723,7 +724,12 @@ apply-time error.
 - **Materialized views are refreshed** (in dependency order, inside the scrub's
   own transaction) since they hold their own copy of whatever they selected — so
   a refresh the role is not allowed to run rolls the rewrites back rather than
-  committing base tables a stale view contradicts.
+  committing base tables a stale view contradicts. A view left `WITH NO DATA` is
+  the one exception: it holds no rows to scrub, so it is skipped rather than
+  populated, and the scrub does not spend the query time and disk it was left
+  unpopulated to save. If a populated view reads it, it is refreshed after all —
+  the dependent cannot be rebuilt otherwise — and emptied again once that
+  dependent has been, so both end as the run found them.
 - **A key column holding PII can only be declared `safe`.** A natural key
   (`patients(ssn PRIMARY KEY)`) cannot be anonymized in place without rewriting
   every row that references it, which this command does not do — so it is kept

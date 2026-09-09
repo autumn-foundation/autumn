@@ -499,6 +499,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comes from a recursive walk with a depth cap, and a view past it would be left
   out of both sides of the ratio while still holding its heap. Refresh order and
   measurement are now separate questions with separate lists.
+  Both lists are now drawn from the views the run actually has to refresh:
+  every POPULATED view, plus every view one of those reads. A materialized view
+  left `WITH NO DATA` holds no rows — selecting from one raises `materialized
+  view "…" has not been populated` — so it has no pre-scrub copy to rebuild, and
+  refreshing it ran the view's query and materialized a heap the database
+  deliberately did not have: on the expensive query such a view usually guards,
+  time and disk spent inside the scrub's transaction, where exhausting either
+  rolls the whole run back. One a populated view reads is the exception, because
+  the dependent's own `REFRESH` fails while its source is unpopulated and an
+  unrefreshed populated view keeps its pre-scrub rows — so it is refreshed, and
+  then emptied again with `REFRESH ... WITH NO DATA` once the dependent has been
+  rebuilt. Measured: the dependent keeps its rows and its populated state when
+  its source is emptied afterwards, so both relations end as the run found them.
   A partition leaf whose top-level parent is emptied by `[framework] purge` is
   treated like one under `never_include` — its outgoing foreign key is ignored
   rather than refused. Purging the parent removes every leaf row before the
