@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **web:** the `application/problem+json` `errors` array no longer includes a
+  field whose validation entry carries zero messages — it now matches
+  `AutumnError`'s `Display`, which already skipped such a field (issue
+  #2587 follow-up). `AutumnError::validation(...)` takes a raw
+  `HashMap<String, Vec<String>>`, so an app that inserts a field
+  unconditionally but only pushes a message when it actually fails produced
+  a body like `{"field":"title","messages":[]}` — a client reading `errors`
+  saw a field named as failing with no reason given, while the same error's
+  logged `Display` output correctly omitted it. `errors` now filters
+  empty-message fields the same way `Display` does.
+
 ### Security
 
 - **MCP `tools/call` dispatch now enforces `AppBuilder::layer(...)` custom
