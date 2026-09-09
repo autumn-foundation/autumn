@@ -55,9 +55,10 @@
 //! rollup keyed by success criterion.
 //!
 //! The walk is as conservative as the scanner: a call is followed only when the
-//! called name is defined exactly once across the scan; method calls,
-//! type-qualified associated calls and functions passed by name are not
-//! resolved; and the path is the one **declared** on the handler (mount-time
+//! called name is defined exactly once across the scan **as a free item**;
+//! method calls, type-qualified associated calls, functions passed by name and
+//! names a parameter or local shadows are not resolved; and the path is the one
+//! **declared** on the handler (mount-time
 //! prefixes are applied at runtime). So `status: "pass"` means no finding was
 //! attributed to that route, not that the page is proven clean — the summary's
 //! `unrouted` count qualifies it. An unattributed finding is still a finding:
@@ -602,6 +603,11 @@ struct FnDecl {
     calls: BTreeSet<String>,
     /// Route attributes on this function, if any.
     routes: Vec<RouteDecl>,
+    /// Whether a bare `name()` elsewhere can reach this function. A nested item
+    /// is visible only inside its enclosing block, and an associated function
+    /// is reached through a receiver or a type-qualified path — neither of
+    /// which this scan resolves — so neither is a target.
+    callable: bool,
 }
 
 /// Route attribute macros that serve markup. `#[static_get]` is one of them —
@@ -629,7 +635,17 @@ const DECL_KEYWORDS: [&str; 6] = ["fn", "struct", "enum", "union", "trait", "mod
 /// scaffolding is neither a route nor a rendering path, and indexing it would
 /// only create name collisions that suppress real attribution.
 fn collect_fns(trees: &[TokenTree], file: &str, out: &mut Vec<FnDecl>) {
+    collect_fns_in(trees, file, true, out);
+}
+
+/// [`collect_fns`], carrying whether items at this level are reachable by a
+/// bare name. Free items in a module are; items inside a function body or an
+/// `impl`/`trait` block are not.
+fn collect_fns_in(trees: &[TokenTree], file: &str, callable: bool, out: &mut Vec<FnDecl>) {
     let mut pending: Vec<RouteDecl> = Vec::new();
+    // Set when an `impl`/`trait` head is seen, so its block is descended as
+    // associated items.
+    let mut assoc_block = false;
     let mut i = 0;
     while i < trees.len() {
         if is_cfg_test_attr(trees, i) {
@@ -662,6 +678,21 @@ fn collect_fns(trees: &[TokenTree], file: &str, out: &mut Vec<FnDecl>) {
                 let inner: Vec<TokenTree> = body.stream().into_iter().collect();
                 let mut calls = BTreeSet::new();
                 collect_calls(&inner, &mut calls);
+                // A name bound in this function — a parameter, a local, a
+                // closure argument — shadows any free function that shares it,
+                // so calling it does not reach that function.
+                let mut bound = BTreeSet::new();
+                // The parameter list is the first parenthesized group after the
+                // name; a return type or a `where` clause can sit between it
+                // and the body.
+                if let Some(params) = trees[i + 2..body_at].iter().find_map(|tree| match tree {
+                    TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => Some(g),
+                    _ => None,
+                }) {
+                    collect_idents(&params.stream().into_iter().collect::<Vec<_>>(), &mut bound);
+                }
+                collect_bindings(&inner, &mut bound);
+                calls.retain(|call| !bound.contains(call));
                 let start = trees[i].span().start();
                 let end = body.span().end();
                 out.push(FnDecl {
@@ -671,13 +702,17 @@ fn collect_fns(trees: &[TokenTree], file: &str, out: &mut Vec<FnDecl>) {
                     end: (end.line, end.column),
                     calls,
                     routes: std::mem::take(&mut pending),
+                    callable,
                 });
-                collect_fns(&inner, file, out);
+                collect_fns_in(&inner, file, false, out);
                 i = body_at + 1;
                 continue;
             }
             // An attribute binds to the next item. If that item is not a
             // function, the route attributes seen so far are not ours.
+            if matches!(ident.to_string().as_str(), "impl" | "trait") {
+                assoc_block = true;
+            }
             if !matches!(
                 ident.to_string().as_str(),
                 "pub" | "async" | "unsafe" | "extern"
@@ -690,11 +725,15 @@ fn collect_fns(trees: &[TokenTree], file: &str, out: &mut Vec<FnDecl>) {
             // function (an `extern "C" { … }` block, a `struct` body), so a
             // route attribute seen before it was not ours.
             TokenTree::Group(group) => {
-                if group.delimiter() == Delimiter::Brace {
+                let brace = group.delimiter() == Delimiter::Brace;
+                if brace {
                     pending.clear();
                 }
                 let inner: Vec<TokenTree> = group.stream().into_iter().collect();
-                collect_fns(&inner, file, out);
+                collect_fns_in(&inner, file, callable && !(brace && assoc_block), out);
+                if brace {
+                    assoc_block = false;
+                }
             }
             // Likewise a literal: `extern "C"` leads with one.
             TokenTree::Literal(_) => pending.clear(),
@@ -830,6 +869,84 @@ fn collect_calls(trees: &[TokenTree], out: &mut BTreeSet<String>) {
     }
 }
 
+/// Every identifier in `trees`, at any depth.
+///
+/// Used on a parameter list, where the binding names are mixed with type names.
+/// Collecting both over-approximates what is shadowed, which only ever drops a
+/// call edge — the safe direction — and type names are `UpperCamelCase` while
+/// function names are `snake_case`, so they rarely collide in practice.
+fn collect_idents(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    for tree in trees {
+        match tree {
+            TokenTree::Ident(ident) => {
+                out.insert(ident.to_string());
+            }
+            TokenTree::Group(group) => {
+                collect_idents(&group.stream().into_iter().collect::<Vec<_>>(), out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names bound by a `let` statement or a closure argument list anywhere in
+/// `trees`.
+///
+/// Both are read loosely — every identifier between `let` and the `=`/`;` that
+/// ends its pattern, and every identifier between a pair of `|` — because
+/// over-collecting only drops a call edge, while under-collecting would let a
+/// shadowed name resolve to an unrelated function.
+fn collect_bindings(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    let mut i = 0;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Ident(ident) if *ident == "let" => {
+                i += 1;
+                while let Some(tree) = trees.get(i) {
+                    match tree {
+                        TokenTree::Punct(p) if p.as_char() == '=' || p.as_char() == ';' => break,
+                        TokenTree::Ident(id) => {
+                            out.insert(id.to_string());
+                        }
+                        TokenTree::Group(group) => {
+                            collect_idents(&group.stream().into_iter().collect::<Vec<_>>(), out);
+                        }
+                        TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+                    }
+                    i += 1;
+                }
+            }
+            // A closure argument list. A lone `|` (a bitwise or, a match-arm
+            // alternative) has no closing pipe on this level and collects
+            // nothing.
+            TokenTree::Punct(p) if p.as_char() == '|' => {
+                let mut j = i + 1;
+                let mut names = BTreeSet::new();
+                let closed = loop {
+                    match trees.get(j) {
+                        Some(TokenTree::Punct(q)) if q.as_char() == '|' => break true,
+                        Some(TokenTree::Ident(id)) => {
+                            names.insert(id.to_string());
+                        }
+                        Some(TokenTree::Punct(_) | TokenTree::Literal(_)) => {}
+                        Some(TokenTree::Group(_)) | None => break false,
+                    }
+                    j += 1;
+                };
+                if closed {
+                    out.extend(names);
+                    i = j;
+                }
+            }
+            TokenTree::Group(group) => {
+                collect_bindings(&group.stream().into_iter().collect::<Vec<_>>(), out);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
 /// Whether the identifier at `trees[i]` names a free function this scan can
 /// resolve by name — see [`collect_calls`] for the shapes this rejects.
 fn is_resolvable_call(trees: &[TokenTree], i: usize) -> bool {
@@ -873,7 +990,7 @@ impl<'a> RouteGraph<'a> {
         // A name defined more than once is unresolvable, so it is not indexed.
         let mut by_name: std::collections::HashMap<&str, Option<usize>> =
             std::collections::HashMap::new();
-        for (index, decl) in fns.iter().enumerate() {
+        for (index, decl) in fns.iter().enumerate().filter(|(_, d)| d.callable) {
             by_name
                 .entry(decl.name.as_str())
                 .and_modify(|slot| *slot = None)
@@ -3792,6 +3909,127 @@ mod tests {
         let report = report_for(&[("api.rs", src)]);
         assert_eq!(report.routes.len(), 1);
         assert_eq!(report.routes[0].status, "pass");
+    }
+
+    #[test]
+    fn a_nested_fn_is_not_a_target_for_a_bare_call() {
+        // Rust makes a nested item visible only inside its enclosing block, so
+        // an unrelated route's bare `render()` cannot reach it.
+        let src = r#"
+            fn outer() -> Markup {
+                fn render() -> Markup { html! { img src="/x.png"; } }
+                html! { span { "hi" } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (render()) } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn an_associated_fn_is_not_a_target_for_a_bare_call() {
+        // A method is reached through a receiver or a type-qualified path,
+        // neither of which this scan resolves.
+        let src = r#"
+            impl Card {
+                fn render(&self) -> Markup { html! { img src="/x.png"; } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (render()) } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_module_level_fn_is_still_a_target_for_a_bare_call() {
+        // Items in a module are reachable by a bare name through a `use`, so
+        // scoping must not cost the ordinary case.
+        let src = r#"
+            mod views {
+                fn sidebar() -> Markup { html! { img src="/x.png"; } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_route_on_an_associated_fn_is_still_a_route() {
+        let src = r#"
+            impl Dashboard {
+                #[get("/a")]
+                async fn show(&self) -> Markup { html! { img src="/x.png"; } }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_shadowing_parameter_is_not_resolved_as_a_helper() {
+        // The handler calls its own parameter, not the free function that
+        // happens to share the name.
+        let src = r#"
+            #[get("/a")]
+            async fn a(view: impl Fn() -> Markup) -> Markup { html! { (view()) } }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_shadowing_local_is_not_resolved_as_a_helper() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                let view = || html! { span { "local" } };
+                html! { (view()) }
+            }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_shadowing_closure_parameter_is_not_resolved_as_a_helper() {
+        let src = r#"
+            #[get("/a")]
+            async fn a(rows: Vec<Row>) -> Markup {
+                html! { @for row in rows { (rows.iter().map(|view| view()).count()) } }
+            }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn shadowing_in_one_handler_does_not_hide_a_real_call_in_another() {
+        // Bindings are per function: `b` really does call the free `sidebar`.
+        let src = r#"
+            #[get("/a")]
+            async fn a(sidebar: impl Fn() -> Markup) -> Markup { html! { (sidebar()) } }
+
+            #[get("/b")]
+            async fn b() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /b".to_owned()]
+        );
     }
 
     #[test]

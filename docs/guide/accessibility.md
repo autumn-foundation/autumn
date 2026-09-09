@@ -477,8 +477,11 @@ The first choice is a constructor argument, so a group of choices always has at
 least one. A visible group name renders `<fieldset><legend>`; `.aria_label(..)` /
 `.labelled_by(..)` render a `<div>` instead. Both carry `role="radiogroup"` —
 `<fieldset>` alone maps to role `group`, which does not support `aria-required`.
-Each choice gets an `id` unique within the group, derived from its value, that
-pairs it with its own `<label for=…>`. `aria-invalid` and any `hx-*` attributes
+Each choice gets an `id` that pairs it with its own `<label for=…>`, derived
+from the group name and the choice value. A `-` inside either is doubled, so
+group `a-b` choice `c` and group `a` choice `b-c` cannot collide. The same group
+rendered repeatedly — one per table row — shares its form name by design, so
+`.id_prefix(..)` supplies the discriminator. `aria-invalid` and any `hx-*` attributes
 land on each `<input>`, where assistive technology reads validity and htmx reads
 a value; `aria-describedby` and `aria-required` stay on the group.
 
@@ -585,10 +588,15 @@ in a shared partial names the routes that reach it:
 The walk is as conservative as the scanner. A call is followed only when the
 called name is defined **exactly once** across the scan — two functions sharing
 a name cannot be told apart from tokens, and guessing would blame a route that
-never renders the markup. Three call shapes are skipped outright: a method call
+never renders the markup. A bare `name()` resolves only to a free item — a nested `fn` is visible just
+inside its own block, and an associated `fn` is reached through a receiver or a
+type-qualified path — so neither is a target. Four more call shapes are skipped
+outright: a method call
 (`page.sidebar()`), a type-qualified associated call (`Widget::new()` — Rust
-names types in `UpperCamelCase`, so `views::sidebar()` still resolves), and a
-function passed by name rather than called (`.map(render_row)`). `#[cfg(test)]`
+names types in `UpperCamelCase`, so `views::sidebar()` still resolves), a
+function passed by name rather than called (`.map(render_row)`), and a name
+bound inside the function — a parameter, a local, a closure argument — which
+shadows any free function that shares it. `#[cfg(test)]`
 items are skipped, and the `path` is the path **as declared**: mount-time
 prefixes (a `scope`, a nested router) are applied at runtime and are not
 resolved here.

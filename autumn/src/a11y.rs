@@ -1901,6 +1901,7 @@ impl RadioOption {
 #[derive(Debug, Clone)]
 pub struct RadioGroup<State> {
     name: String,
+    id_prefix: Option<String>,
     options: Vec<RadioOption>,
     required: bool,
     aria_required: bool,
@@ -1920,6 +1921,7 @@ impl RadioGroup<NoLabel> {
     pub fn new(name: impl Into<String>, first: RadioOption) -> Self {
         Self {
             name: name.into(),
+            id_prefix: None,
             options: vec![first],
             required: false,
             aria_required: false,
@@ -1957,6 +1959,7 @@ impl RadioGroup<NoLabel> {
     fn with_label(self, label: LabelSource) -> RadioGroup<Labeled> {
         RadioGroup {
             name: self.name,
+            id_prefix: self.id_prefix,
             options: self.options,
             required: self.required,
             aria_required: self.aria_required,
@@ -1983,6 +1986,18 @@ impl<State> RadioGroup<State> {
     #[must_use]
     pub fn options(mut self, options: impl IntoIterator<Item = RadioOption>) -> Self {
         self.options.extend(options);
+        self
+    }
+
+    /// Prefix every choice `id` with `prefix`.
+    ///
+    /// Ids derive from the group name and the choice value, which is enough
+    /// while each group appears once. The same group rendered repeatedly — one
+    /// per table row, say — shares its form name by design, so the caller
+    /// supplies the discriminator that keeps the ids unique in the document.
+    #[must_use]
+    pub fn id_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.id_prefix = Some(prefix.into());
         self
     }
 
@@ -2057,19 +2072,25 @@ impl<State> RadioGroup<State> {
     }
 }
 
-/// One `id` per choice, unique within the group.
+/// One `id` per choice, unique within the group and unambiguous across groups.
 ///
 /// The id pairs each `<input>` with its `<label for=…>`, so a duplicate would
-/// break the very association the primitive exists to guarantee. Ids derive
-/// from the choice value reduced to the safe `[A-Za-z0-9_-]` alphabet; two
-/// values that reduce to the same text are separated by an index suffix, so
-/// those ids depend on the order the colliding choices were added.
-fn radio_option_ids(name: &str, options: &[RadioOption]) -> Vec<String> {
-    let group = slug(name);
+/// break the very association the primitive exists to guarantee. Each part is
+/// reduced to the safe `[A-Za-z0-9_-]` alphabet, and a `-` inside a part is
+/// doubled so the single `-` that joins the parts cannot be mistaken for one:
+/// without that, group `a-b` choice `c` and group `a` choice `b-c` would both
+/// read `a-b-c`, and no per-group check can see the other group. Two choices
+/// that still reduce to the same text within one group are separated by an
+/// index suffix, so those ids depend on the order they were added.
+fn radio_option_ids(prefix: Option<&str>, name: &str, options: &[RadioOption]) -> Vec<String> {
+    let group = prefix.map_or_else(
+        || id_part(name),
+        |prefix| format!("{}-{}", id_part(prefix), id_part(name)),
+    );
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::with_capacity(options.len());
     for (index, option) in options.iter().enumerate() {
-        let base = format!("{group}-{}", slug(&option.value));
+        let base = format!("{group}-{}", id_part(&option.value));
         let mut id = base.clone();
         let mut suffix = index;
         while !seen.insert(id.clone()) {
@@ -2081,17 +2102,21 @@ fn radio_option_ids(name: &str, options: &[RadioOption]) -> Vec<String> {
     ids
 }
 
-/// Reduce `text` to the `[A-Za-z0-9_-]` alphabet an HTML `id` can safely carry.
-fn slug(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+/// One part of a choice `id`: reduced to the `[A-Za-z0-9_-]` alphabet an HTML
+/// `id` can safely carry, with every `-` doubled so a part never contains the
+/// single `-` that separates parts.
+fn id_part(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '-' {
+            out.push_str("--");
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push_str("--");
+        }
+    }
+    out
 }
 
 impl Render for RadioGroup<Labeled> {
@@ -2106,7 +2131,7 @@ impl Render for RadioGroup<Labeled> {
             .aria_invalid
             .map(|invalid| if invalid { "true" } else { "false" });
         let aria_required = self.aria_required.then_some("true");
-        let ids = radio_option_ids(&self.name, &self.options);
+        let ids = radio_option_ids(self.id_prefix.as_deref(), &self.name, &self.options);
         // A group holds one selection: more than one `checked` control is a
         // document-conformance error, and a browser would keep only the last,
         // so the rendered state would disagree with what the user sees. Only
@@ -2500,14 +2525,61 @@ mod tests {
                 &rest[..rest.find('"').expect("id closes")]
             })
             .collect();
+        // A `-` inside a part is doubled, so all three reduce to `plan-a--b`
+        // and the index suffix separates them.
         assert_eq!(
             ids,
-            vec!["plan-a-b", "plan-a-b-1", "plan-a-b-2"],
+            vec!["plan-a--b", "plan-a--b-1", "plan-a--b-2"],
             "{markup}"
         );
         for id in &ids {
             assert!(markup.contains(&format!(r#"for="{id}""#)), "{markup}");
         }
+    }
+
+    #[test]
+    fn radio_group_ids_do_not_collide_across_groups() {
+        // `("a-b", "c")` and `("a", "b-c")` would both reduce to `a-b-c` if the
+        // separator were ambiguous. Two groups cannot see each other's `seen`
+        // set, so the derivation itself has to keep them apart.
+        let one = RadioGroup::new("a-b", RadioOption::new("c", "C"))
+            .label("One")
+            .render()
+            .into_string();
+        let two = RadioGroup::new("a", RadioOption::new("b-c", "BC"))
+            .label("Two")
+            .render()
+            .into_string();
+        let id_of = |markup: &str| {
+            let at = markup.find(r#" id=""#).expect("an id") + 5;
+            markup[at..][..markup[at..].find('"').expect("id closes")].to_owned()
+        };
+        assert_ne!(id_of(&one), id_of(&two), "{one}\n{two}");
+    }
+
+    #[test]
+    fn radio_group_ids_keep_the_plain_shape_when_nothing_needs_escaping() {
+        let markup = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+            .label("Shipping speed")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"id="speed-standard""#), "{markup}");
+    }
+
+    #[test]
+    fn radio_group_id_prefix_separates_repeated_groups() {
+        // The same group rendered per table row needs distinct ids; the form
+        // name is shared by design, so the caller supplies the discriminator.
+        let markup = RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+            .id_prefix("row-7")
+            .label("Shipping speed")
+            .render()
+            .into_string();
+        assert!(markup.contains(r#"id="row--7-speed-standard""#), "{markup}");
+        assert!(
+            markup.contains(r#"for="row--7-speed-standard""#),
+            "{markup}"
+        );
     }
 
     #[test]

@@ -662,7 +662,8 @@ Per-primitive setters (in addition to the shared set):
   `.multiple()` (sets the `multiple` attribute).
 - **`RadioGroup::new(name, first)`** — the first `RadioOption` is a constructor
   argument, so a group always has a choice; `.option(RadioOption)` /
-  `.options(iter)`, `.checked_value(s)`. `RadioOption::new(value, label)`
+  `.options(iter)`, `.checked_value(s)`, `.id_prefix(s)` (for the same group
+  rendered repeatedly). `RadioOption::new(value, label)`
   requires the choice label; `.checked()` / `.disabled()`. The group renders
   `<fieldset><legend>` (visible name) or `<div>` (ARIA name), both with
   `role="radiogroup"`; `aria-invalid` and `hx-*` land on each `<input>`,

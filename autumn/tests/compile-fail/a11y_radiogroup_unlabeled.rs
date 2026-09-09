@@ -17,6 +17,7 @@ fn main() {
         .aria_invalid(true)
         .described_by("speed-error")
         .class("field")
+        .id_prefix("row-7")
         .label_class("field__legend")
         .hx("post", "/quote")
         .render();

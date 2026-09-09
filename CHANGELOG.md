@@ -599,9 +599,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports separately under 1.3.1, 3.3.2 and 4.1.2; the summary gains `routes`,
   `routes_failing` and `unrouted`. Attribution is a conservative lower bound in
   the same spirit as the scanner: a call is followed only when the called name
-  is defined exactly once across the scan; method calls, type-qualified
-  associated calls (`Widget::new()`) and functions passed by name are not
-  resolved; and the path is the one declared on the handler (mount-time prefixes
+  is defined exactly once across the scan as a free item (a nested or
+  associated `fn` is not a bare-call target); method calls, type-qualified
+  associated calls (`Widget::new()`), functions passed by name and names a
+  parameter or local shadows are not resolved; and the path is the one declared on the handler (mount-time prefixes
   are applied at runtime and are not resolved). So `status: "pass"` means no
   finding was attributed to that route, which `summary.unrouted` qualifies.
   Exit codes are unchanged — route data reports, it does not gate.
@@ -620,8 +621,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   support `aria-required`. `aria-invalid` and `hx-*` land on each `<input>`,
   where assistive technology reads validity and htmx reads a value;
   `aria-describedby` and `aria-required` stay on the group. `checked_value(..)`
-  sets the single selection authoritatively, and each choice gets an id unique
-  within the group, pairing it with its own `<label for=…>`.
+  sets the single selection authoritatively, and each choice gets an id pairing
+  it with its own `<label for=…>` — derived from the group name and the choice
+  value with any `-` doubled, so two groups cannot collide, and prefixable with
+  `.id_prefix(..)` when the same group is rendered repeatedly.
 
 - **An actuator path drift gate for the docs corpus [no-plugin]:** the five
   docs gates that came before it cover the link a reader clicks
