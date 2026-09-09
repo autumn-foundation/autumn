@@ -402,13 +402,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/actuator/routes` report the declared method behind an HTMX method override;
   there is no `/actuator/routes`, and the route table with its declared methods
   is served from `/actuator/graph`.
-  The truth set is the string literals passed to `actuator_route_path()` across
-  non-test workspace Rust source — the one path builder every actuator mount
-  goes through, whose own doc comment says why ("so paths match
-  byte-for-byte"). Nothing to regenerate: a renamed endpoint lands in the same
-  commit as the rename, and `#[cfg(test)] mod` bodies are stripped first so a
-  path that exists only in an assertion never confers existence on a documented
-  one. Resolution is deliberately permissive in three ways that each make the
+  The truth set is the string literals passed to `actuator_route_path()` at a
+  `.route(…)` **mount**, across non-test workspace Rust source — the one path
+  builder every actuator mount goes through, whose own doc comment says why
+  ("so paths match byte-for-byte"). Nothing to regenerate: a renamed endpoint
+  lands in the same commit as the rename. The same builder is also called from
+  two inventories (`actuator_endpoint_paths`, `actuator_mutating_routes`) and
+  from `alerts.rs`; those are read as second copies of a list, never as evidence
+  that a URL answers, so an endpoint dropped from the router but left in an
+  inventory cannot go on blessing documentation for a path nothing serves.
+  `#[cfg(test)] mod` bodies are stripped for the same reason — a drift gate must
+  not be able to inherit the drift it is checking for. Resolution is deliberately permissive in three ways that each make the
   gate report *fewer* paths — a mounted `{param}` matches a concrete value
   (`/actuator/loggers/root`), a documented path that is a prefix of a mounted
   one resolves (`/actuator/webhooks`), and a `*` segment matches anything

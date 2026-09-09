@@ -44,17 +44,31 @@
 #   set of paths the framework actually mounts.
 #
 # TRUTH SET: the string literals passed to `actuator::actuator_route_path()`
-# across non-test workspace Rust source — 23 suffixes. That helper is the ONE
-# path builder the actuator uses: the mount list (`actuator_router_with_prefix`),
-# the enumeration the startup barrier reads (`actuator_endpoint_paths`), the
-# non-`GET` mounts (`actuator_mutating_routes`) and the alert pointers
-# (`alerts::actuator_where_to_look`) all go through it, and its own doc comment
-# says why — "so paths match byte-for-byte". Reading the literals it is called
-# with is therefore the same list the router mounts, with no snapshot to
-# regenerate: a renamed endpoint lands in the same commit as the rename.
-# `#[cfg(test)] mod …` bodies are stripped first, so a path that exists only in
-# an assertion (`/actuator/loggers/{bogus}`, `/actuatorsomething`) never
-# confers existence on a documented one.
+# AT A `.route(…)` MOUNT, across non-test workspace Rust source — 23 suffixes.
+# That helper is the one path builder every actuator mount goes through, and its
+# own doc comment says why: "so paths match byte-for-byte". Reading the literals
+# it is mounted with is therefore the list the router serves, with no snapshot to
+# regenerate — a renamed endpoint lands in the same commit as the rename.
+#
+# TWO KINDS OF `actuator_route_path` CALL ARE DELIBERATELY NOT READ, and the
+# distinction is the whole reason this gate can be trusted. Besides the mounts,
+# `actuator.rs` calls the builder from two INVENTORIES —
+# `actuator_endpoint_paths` (the GET path list the startup barrier seeds its
+# allow-list from) and `actuator_mutating_routes` (the non-GET pairs the route
+# listing classifies) — and `alerts.rs` calls it to build a `where_to_look`
+# pointer. Those are second copies of a list, not evidence that a URL answers.
+# The three agree today; an earlier draft of this gate read their union anyway,
+# and that union is wrong in both directions and in exactly the way this gate
+# exists to prevent. An endpoint dropped from the router but left in an
+# inventory would go on blessing documentation for a path nothing serves, and an
+# inventory-only entry would be accepted with no handler behind it. A drift gate
+# must not be able to inherit the drift it is checking for.
+#
+# `#[cfg(test)] mod …` bodies are stripped for the same reason, one step
+# further: a path that exists only in an assertion
+# (`/actuator/loggers/{bogus}`, `/actuatorsomething`, both in `actuator.rs`'s
+# tests) must never confer existence on a documented one — least of all a string
+# written to prove a path is WRONG.
 #
 # RESOLUTION, and why it is deliberately permissive in three places:
 #   - A mounted `{param}` segment matches any documented segment, so
@@ -169,16 +183,31 @@ PREFIX = "/actuator"
 
 # ── Truth set: the paths the actuator actually mounts ────────────────────────
 
-# `actuator_route_path(<prefix expr>, "<suffix>")`. The prefix argument is
-# spelled four different ways across the call sites (`prefix`,
-# `&config.actuator.prefix`, `&cfg.actuator.prefix`, and a `crate::actuator::`
-# qualified form split across lines), so it is matched loosely and only the
-# suffix literal is captured. A call whose suffix is NOT a literal
-# (`alerts.rs` passes `condition.actuator_suffix()`) contributes nothing here,
-# which is correct: every suffix that method can return is also written as a
-# literal at its mount site.
+# `.route(&actuator_route_path(<prefix expr>, "<suffix>"), …)` — a MOUNT, not a
+# mention. The prefix argument is spelled several ways across the file
+# (`prefix`, `&config.actuator.prefix`, a `crate::actuator::`-qualified form
+# split across lines), so it is matched loosely and only the suffix literal is
+# captured. A call whose suffix is not a literal (`alerts.rs` passes
+# `condition.actuator_suffix()`) contributes nothing, which is correct: every
+# suffix that method can return is also written as a literal at its mount site.
+#
+# WHY THE `.route(` PREFIX IS PART OF THE PATTERN, and not an incidental
+# tightening. `actuator.rs` calls this same builder from three places: the
+# mounts in `actuator_router_with_prefix`, and two INVENTORIES —
+# `actuator_endpoint_paths` (the GET path list the startup barrier seeds its
+# allow-list from) and `actuator_mutating_routes` (the non-GET pairs the route
+# listing classifies). The three agree today, and an earlier draft of this gate
+# unioned all of them. That union is wrong in both directions and in exactly the
+# way this gate exists to prevent: an endpoint dropped from the router but left
+# in an inventory would keep blessing documentation for a path nothing serves,
+# and an inventory-only entry would be accepted with no handler behind it. A
+# drift gate must not be able to inherit the drift it is checking for, which is
+# the same reason `#[cfg(test)]` bodies are stripped below. So the truth set is
+# what is MOUNTED, and the inventories are read as what they are: second copies
+# of a list, with no authority over whether a URL answers.
 ROUTE_CALL = re.compile(
-    r"actuator_route_path\(\s*[^,;()]*(?:\([^()]*\))?[^,;()]*,\s*\"([^\"]*)\"")
+    r"\.route\(\s*&\s*(?:[A-Za-z0-9_]+::)*actuator_route_path\(\s*"
+    r"[^,;()]*(?:\([^()]*\))?[^,;()]*,\s*\"([^\"]*)\"")
 
 # `#[cfg(test)] mod <name> { … }`, removed before the scan above runs.
 #
@@ -218,14 +247,18 @@ def mounted_paths(root):
     suffixes = set()
     for rel in filter(None, listing.split("\0")):
         src = (root / rel).read_text(encoding="utf-8", errors="ignore")
-        if "actuator_route_path(" not in src:
+        if ".route(" not in src or "actuator_route_path(" not in src:
             continue
         suffixes.update(ROUTE_CALL.findall(strip_test_mods(src)))
+    # A truth set that silently empties is worse than no gate: every documented
+    # path would resolve against nothing and the corpus would report clean
+    # forever. Fail loudly instead, on the assumption the router was refactored
+    # out from under this pattern.
     if not suffixes:
         sys.exit(
-            "FAIL: no `actuator_route_path(…, \"…\")` call sites found. The path "
-            "builder was renamed or moved; this gate has no truth set to read "
-            "and would pass everything. Fix ROUTE_CALL in "
+            "FAIL: no `.route(&actuator_route_path(…, \"…\"))` mounts found. The "
+            "actuator router or its path builder was refactored; this gate has "
+            "no truth set to read and would pass everything. Fix ROUTE_CALL in "
             "scripts/check-docs-routes.sh."
         )
     return sorted(PREFIX + s for s in suffixes)
@@ -481,6 +514,32 @@ def self_test():
         "the real surface is non-empty",
         len(mounted_paths(ROOT)) > 10,
         True,
+    ))
+
+    # A mount confers existence; a second copy of the list does not. Both halves
+    # are pinned, because a pattern loose enough to admit the inventory and one
+    # tight enough to miss a real mount fail in opposite directions and only one
+    # of them is visible from a green corpus run.
+    mount_src = '.route(\n    &actuator_route_path(prefix, "/served"),\n    get(h),\n)'
+    inventory_src = 'paths.push(actuator_route_path(prefix, "/inventory_only"));'
+    alert_src = 'crate::actuator::actuator_route_path(prefix, "/pointer_only")'
+    cases.append((
+        "a `.route(…)` mount is read",
+        ROUTE_CALL.findall(mount_src), ["/served"],
+    ))
+    cases.append((
+        "an inventory entry is not read",
+        ROUTE_CALL.findall(inventory_src), [],
+    ))
+    cases.append((
+        "an alert `where_to_look` pointer is not read",
+        ROUTE_CALL.findall(alert_src), [],
+    ))
+    cases.append((
+        "a mount inside a `#[cfg(test)] mod` is not read",
+        ROUTE_CALL.findall(strip_test_mods(
+            "#[cfg(test)]\nmod tests {\n" + mount_src + "\n}\n")),
+        [],
     ))
 
     passed = failed = 0
