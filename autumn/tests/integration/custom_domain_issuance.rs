@@ -971,6 +971,247 @@ async fn offboarding_the_last_failing_domain_clears_the_operator_alert() {
     );
 }
 
+#[tokio::test]
+async fn a_tenant_teardown_leaves_a_hostname_another_tenant_took_over() {
+    // `offboard_tenant` walks a snapshot and each offboard awaits, so a
+    // hostname freed early can be re-registered by SOMEONE ELSE before a later
+    // one runs. Removing it unconditionally disconnects that tenant — a domain
+    // and a certificate belonging to someone who was never being torn down.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let store = Arc::new(PausingDeleteStore::new());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    let task = Arc::new(task_over(
+        Arc::clone(&registry),
+        Arc::new(CustomDomainCertCache::new(8)),
+        Arc::clone(&certs),
+        TableVerifier::new(&[]) as Arc<dyn DomainVerifier>,
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    ));
+
+    // `list_for_tenant` sorts by hostname, so `a-` is torn down first and holds
+    // the sweep inside its store delete.
+    for host in ["a-first.clientco.com", "b-second.clientco.com"] {
+        registry.register(host, "tenant-a", NOW).await.unwrap();
+    }
+
+    let teardown = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.offboard_tenant("tenant-a").await.unwrap() }
+    });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    // The second hostname changes hands while the teardown is suspended.
+    assert!(registry.remove("b-second.clientco.com").await.unwrap());
+    registry
+        .register("b-second.clientco.com", "tenant-b", NOW + 1)
+        .await
+        .unwrap();
+    let successor_cert = CertId::from_domains(&["b-second.clientco.com".to_owned()]);
+    certs
+        .save_cert(
+            &successor_cert,
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    store.release();
+
+    assert_eq!(
+        teardown.await.unwrap(),
+        1,
+        "only the hostname still belonging to tenant-a is torn down"
+    );
+    assert!(registry.get("a-first.clientco.com").is_none());
+    let survivor = registry
+        .get("b-second.clientco.com")
+        .expect("the new tenant's domain must survive the old tenant's teardown");
+    assert_eq!(survivor.tenant, "tenant-b");
+    assert!(
+        certs.load_cert(&successor_cert).await.unwrap().is_some(),
+        "and must keep its certificate"
+    );
+}
+
+/// A certificate store that completes the first `save_cert` and then blocks
+/// until released, so a test can act in the window between an order writing
+/// its certificate and activating it.
+#[derive(Debug)]
+struct PauseAfterSaveStore {
+    inner: Arc<FsAcmeStore>,
+    gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    release: Mutex<Option<futures::channel::oneshot::Sender<()>>>,
+}
+
+impl PauseAfterSaveStore {
+    fn new(inner: Arc<FsAcmeStore>) -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        Self {
+            inner,
+            gate: Mutex::new(Some(rx)),
+            release: Mutex::new(Some(tx)),
+        }
+    }
+
+    fn release(&self) {
+        let sender = self.release.lock().unwrap().take();
+        if let Some(tx) = sender {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl autumn_web::acme::store::AcmeStore for PauseAfterSaveStore {
+    fn load_account(
+        &self,
+    ) -> autumn_web::acme::store::StoreFuture<'_, std::io::Result<Option<Vec<u8>>>> {
+        self.inner.load_account()
+    }
+
+    fn save_account<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.save_account(data)
+    }
+
+    fn load_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+    ) -> autumn_web::acme::store::StoreFuture<
+        'a,
+        std::io::Result<Option<autumn_web::acme::store::StoredCert>>,
+    > {
+        self.inner.load_cert(id)
+    }
+
+    fn save_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+        cert: &'a autumn_web::acme::store::StoredCert,
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        let held = self.gate.lock().unwrap().take();
+        Box::pin(async move {
+            self.inner.save_cert(id, cert).await?;
+            if let Some(rx) = held {
+                let _ = rx.await;
+            }
+            Ok(())
+        })
+    }
+
+    fn delete_cert<'a>(
+        &'a self,
+        id: &'a CertId,
+    ) -> autumn_web::acme::store::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.delete_cert(id)
+    }
+}
+
+#[tokio::test]
+async fn a_stale_order_does_not_delete_the_successors_certificate() {
+    // The certificate id is a hash of the hostname, so a stale order and its
+    // successor address the same file. Losing the activation race, the stale
+    // order discards "its" certificate — but by then the successor has written
+    // its own pair over that id, and deleting it leaves that tenant recorded
+    // active with nothing on disk, failing every handshake until a repair
+    // order completes.
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let certs = Arc::new(PauseAfterSaveStore::new(Arc::clone(&fs)));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        100,
+    ));
+    registry.load().await.unwrap();
+    let task = Arc::new(CustomDomainTask {
+        registry: Arc::clone(&registry),
+        cache: Arc::new(CustomDomainCertCache::new(8)),
+        certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier: TableVerifier::new(&[("app.clientco.com", points_here())])
+            as Arc<dyn DomainVerifier>,
+        issuer: ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        ingress: ExpectedIngress {
+            hostname: Some("ingress.myapp.com".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        },
+        renew_before_days: 30,
+        reporter: Arc::new(|_| {}),
+        recovery: None,
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
+        cert_store_paths: Some(Arc::clone(&fs)),
+        retained_cert_ids: HashSet::new(),
+    });
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    // tenant-a's order writes its certificate and suspends before activating.
+    let tick = tokio::spawn({
+        let task = Arc::clone(&task);
+        async move { task.tick(NOW).await }
+    });
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    // The hostname changes hands, and the successor installs its own pair over
+    // the same certificate id and activates it.
+    assert!(registry.remove("app.clientco.com").await.unwrap());
+    registry
+        .register("app.clientco.com", "tenant-b", NOW + 1)
+        .await
+        .unwrap();
+    let cert_id = CertId::from_domains(&["app.clientco.com".to_owned()]);
+    fs.save_cert(
+        &cert_id,
+        &autumn_web::acme::store::StoredCert {
+            chain_pem: RENEWED_CERT_PEM.to_owned(),
+            key_pem: RENEWED_KEY_PEM.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        registry
+            .record_active_for("app.clientco.com", "tenant-b", NOW + 2, NOW + 90 * 86_400)
+            .await
+            .unwrap()
+    );
+
+    // The stale order now resumes and loses the activation race.
+    certs.release();
+    tick.await.unwrap();
+
+    let stored = fs
+        .load_cert(&cert_id)
+        .await
+        .unwrap()
+        .expect("the successor's certificate must survive the stale order's cleanup");
+    assert_eq!(
+        stored.chain_pem, RENEWED_CERT_PEM,
+        "and must still be the successor's own pair, not the stale order's"
+    );
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-b");
+    assert_eq!(record.status, DomainStatus::Active);
+}
+
 /// A certificate store that refuses to delete, so a test can assert what
 /// offboarding does when the key cannot be removed.
 #[derive(Debug)]

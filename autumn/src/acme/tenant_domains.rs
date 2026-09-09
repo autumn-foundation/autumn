@@ -573,8 +573,26 @@ impl CustomDomainTask {
             .map_err(|e| format!("failed to persist the active state for {hostname}: {e}"))?;
         if !activated {
             self.cache.remove(hostname);
-            if let Err(e) = self.certs.delete_cert(&cert_id_for(hostname)).await {
-                tracing::warn!(hostname, "failed to delete a superseded certificate: {e}");
+            // Delete only the pair THIS order wrote. The certificate id is a
+            // hash of the hostname, so a successor that issued and saved its
+            // own pair in the meantime holds the same id: an unconditional
+            // delete here would take that valid certificate with it, leaving
+            // the successor recorded as active with nothing on disk.
+            match self.certs.load_cert(&cert_id_for(hostname)).await {
+                Ok(Some(current)) if current.chain_pem == stored.chain_pem => {
+                    if let Err(e) = self.certs.delete_cert(&cert_id_for(hostname)).await {
+                        tracing::warn!(hostname, "failed to delete a superseded certificate: {e}");
+                    }
+                }
+                Ok(Some(_)) => tracing::debug!(
+                    hostname,
+                    "leaving the stored certificate alone: it is the successor's, not this order's"
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    hostname,
+                    "cannot tell whether the stored certificate is this order's, so leaving it: {e}"
+                ),
             }
             return Err(format!(
                 "discarding the certificate: {hostname} changed hands while it was being issued"
@@ -679,9 +697,33 @@ impl CustomDomainTask {
         let Ok(host) = crate::custom_domain::normalize_hostname(hostname) else {
             return Ok(false);
         };
-        let removed = self.registry.remove(&host).await?;
-        self.purge_local(&host).await;
-        self.clear_alert_if_healthy(crate::custom_domain::now_unix());
+        self.offboard_guarded(&host, |_| true).await
+    }
+
+    /// Remove one hostname while `guard` holds for the stored record, then drop
+    /// what this process holds for it.
+    ///
+    /// Every offboarding path goes through here. The guard runs inside the
+    /// registry's per-hostname write gate, so a caller that chose this hostname
+    /// before an `.await` — a retention sweep, a tenant-wide teardown — re-
+    /// asserts that choice against the record as it is now rather than
+    /// disconnecting whoever holds the hostname by the time its turn comes.
+    async fn offboard_guarded(
+        &self,
+        host: &str,
+        guard: impl FnOnce(&crate::custom_domain::CustomDomain) -> bool,
+    ) -> std::io::Result<bool> {
+        let removed = self.registry.remove_if(host, guard).await?;
+        // Purge only while the hostname is still nobody's. A successor that
+        // registered in the gap owns whatever sits at this hostname's cache
+        // slot and certificate id now, and deleting those would leave THEIR
+        // domain recorded as active with nothing to serve.
+        if self.registry.get(host).is_none() {
+            self.purge_local(host).await;
+        }
+        if removed {
+            self.clear_alert_if_healthy(crate::custom_domain::now_unix());
+        }
         Ok(removed)
     }
 
@@ -701,8 +743,7 @@ impl CustomDomainTask {
             return Ok(false);
         };
         let removed = self
-            .registry
-            .remove_if(&host, |current| {
+            .offboard_guarded(&host, |current| {
                 current.tenant == expected.tenant
                     && current.status == expected.status
                     && current.registered_at_unix == expected.registered_at_unix
@@ -713,11 +754,8 @@ impl CustomDomainTask {
                 hostname = %host,
                 "skipping a retention offboard: the domain changed while the sweep was running"
             );
-            return Ok(false);
         }
-        self.purge_local(&host).await;
-        self.clear_alert_if_healthy(crate::custom_domain::now_unix());
-        Ok(true)
+        Ok(removed)
     }
 
     /// Drop everything this process holds for an offboarded hostname.
@@ -757,6 +795,12 @@ impl CustomDomainTask {
 
     /// Offboard every domain a tenant owns. Returns how many were removed.
     ///
+    /// The hostname list is a snapshot and each offboard awaits, so every
+    /// removal re-asserts the tenant: a hostname freed early in the sweep can
+    /// be re-registered by ANOTHER tenant before a later one runs, and removing
+    /// it unconditionally would disconnect a tenant who was never part of this
+    /// teardown.
+    ///
     /// # Errors
     ///
     /// Propagates the registry store's delete error.
@@ -769,7 +813,13 @@ impl CustomDomainTask {
             .collect();
         let mut removed = 0;
         for hostname in hostnames {
-            if self.offboard(&hostname).await? {
+            let Ok(host) = crate::custom_domain::normalize_hostname(&hostname) else {
+                continue;
+            };
+            if self
+                .offboard_guarded(&host, |current| current.tenant == tenant)
+                .await?
+            {
                 removed += 1;
             }
         }
@@ -943,7 +993,11 @@ impl CustomDomainTask {
                 continue;
             }
             let mut deleted = true;
-            for path in [&chain, &key] {
+            // The KEY first. `list_certs` discovers candidates from their
+            // `.chain.pem`, so a crash after removing the chain would strand a
+            // private key no later sweep can ever find again. This order leaves
+            // at worst a public chain behind, which the next sweep re-lists.
+            for path in [&key, &chain] {
                 if let Err(e) = std::fs::remove_file(path) {
                     tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
                     deleted = false;
