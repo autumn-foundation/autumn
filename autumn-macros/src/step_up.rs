@@ -162,33 +162,6 @@ fn build_check_call(max_age_tokens: &TokenStream) -> TokenStream {
     }
 }
 
-/// Returns `true` if `ty` contains an `impl Trait` anywhere in its tree.
-///
-/// Rust forbids `impl Trait` in local variable type annotations, so the
-/// macro must skip the explicit annotation for return types like
-/// `AutumnResult<impl IntoResponse>` even though the top-level type is not
-/// `impl Trait` itself.
-fn type_contains_impl_trait(ty: &syn::Type) -> bool {
-    match ty {
-        syn::Type::ImplTrait(_) => true,
-        syn::Type::Path(tp) => tp.path.segments.iter().any(|seg| match &seg.arguments {
-            syn::PathArguments::AngleBracketed(args) => args.args.iter().any(|arg| match arg {
-                syn::GenericArgument::Type(t) => type_contains_impl_trait(t),
-                _ => false,
-            }),
-            syn::PathArguments::Parenthesized(args) => {
-                args.inputs.iter().any(type_contains_impl_trait)
-                    || matches!(&args.output,
-                            syn::ReturnType::Type(_, t) if type_contains_impl_trait(t))
-            }
-            syn::PathArguments::None => false,
-        }),
-        syn::Type::Reference(r) => type_contains_impl_trait(&r.elem),
-        syn::Type::Tuple(t) => t.elems.iter().any(type_contains_impl_trait),
-        _ => false,
-    }
-}
-
 /// Expand the `#[step_up]` / `#[step_up(max_age = "Nm")]` attribute.
 #[allow(clippy::too_many_lines)]
 // `item` is only ever borrowed via `split_leading_items_and_fn(&item)` now,
@@ -218,6 +191,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // review on #2513, tenth finding). See
     // `param_helpers::STATIC_ROUTE_HANDLER_MARKER`'s doc comment.
     if let Some(err) = crate::param_helpers::reject_if_incompatible_route_marker(&input_fn) {
+        return err;
+    }
+
+    // An attribute sharing #[authorize]'s argument grammar under a different
+    // name is refused rather than guessed at — see
+    // `authorize::reject_if_ambiguous_authorize_shape`'s doc comment.
+    if let Some(err) = crate::authorize::reject_if_ambiguous_authorize_shape(&input_fn) {
         return err;
     }
 
@@ -318,11 +298,13 @@ pub fn step_up_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Avoid `let x: T = …` when T contains `impl Trait` at any depth.
         // Rust rejects `impl Trait` in local variable type annotations; drop
         // the annotation and let type inference handle it instead.
-        syn::ReturnType::Type(_, ty) if type_contains_impl_trait(ty) => quote! {
-            ::autumn_web::reexports::axum::response::IntoResponse::into_response(
-                (async move #original_body).await
-            )
-        },
+        syn::ReturnType::Type(_, ty) if crate::param_helpers::type_contains_impl_trait(ty) => {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(
+                    (async move #original_body).await
+                )
+            }
+        }
         syn::ReturnType::Type(_, ty) => quote! {
             let __autumn_inner: #ty = (async move #original_body).await;
             ::autumn_web::reexports::axum::response::IntoResponse::into_response(__autumn_inner)

@@ -2880,6 +2880,7 @@ when export is disabled.
 The generated `fly.toml` wires Fly's `[metrics]` block to this endpoint:
 
 ```toml
+# fly.toml — Fly's own [metrics] block, not Autumn's `[metrics]` section
 [metrics]
   port = 3000
   path = "/actuator/prometheus"
@@ -2893,6 +2894,7 @@ still want it unreachable from public traffic. The Fly-native way is to scrape a
 Bind a second internal listener and point `[metrics]` at it:
 
 ```toml
+# fly.toml — Fly's own [metrics] block, not Autumn's `[metrics]` section
 [metrics]
   port = 9091                       # internal-only; no [http_service] on it
   path = "/actuator/prometheus"
