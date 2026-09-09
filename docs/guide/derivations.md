@@ -189,7 +189,10 @@ plain `counter_cache` on another model, a `#[votable]` model's aggregate
 column, a `#[repository(..., position(...))]` ordering column, a model's
 `#[lock_version]` token or `tenant_id` discriminator, or a
 `#[commentable(counter_cache = ...)]` parent's
-count (each registers the column it claims for exactly this check). A database failure does not: it is logged, the sweep for that target
+count (each registers the column it claims for exactly this check). Column and
+table names are compared as the database compares quoted identifiers: exactly on
+Postgres, ASCII-case-insensitively on SQLite, where `score` and `Score` are one
+column. A database failure does not: it is logged, the sweep for that target
 is skipped, and a derivation whose backfill has not run yet is stale rather than
 broken, which the actuator reports exactly.
 

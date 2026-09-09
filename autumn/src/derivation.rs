@@ -379,6 +379,21 @@ fn check_registry(defs: &[&DerivationDef]) -> AutumnResult<()> {
     check_source_columns(defs, &claims)
 }
 
+/// The key an identifier is compared under in the registry checks.
+///
+/// Every statement quotes its identifiers, and on Postgres a quoted identifier
+/// is case-sensitive: `"Score"` and `"score"` are two columns, so the spelling
+/// is the key. `SQLite` folds ASCII case even inside quotes, so there the two
+/// spellings are one column and must collide.
+#[cfg(not(feature = "sqlite"))]
+fn ident_key(ident: &str) -> String {
+    ident.to_owned()
+}
+#[cfg(feature = "sqlite")]
+fn ident_key(ident: &str) -> String {
+    ident.to_ascii_lowercase()
+}
+
 /// The child columns a definition reads: the grouping key and the tenant
 /// column every aggregate reads implicitly, then every `{c}."<column>"` in
 /// its contribution and its lowered filter.
@@ -409,13 +424,13 @@ fn source_columns(def: &DerivationDef) -> Vec<&'static str> {
 /// token, the tenant discriminator) are fine to read.
 fn check_source_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -> AutumnResult<()> {
     for def in defs {
-        let sources = source_columns(def);
+        let sources: Vec<String> = source_columns(def).into_iter().map(ident_key).collect();
         // The table whose columns are this derivation's sources: the child's.
-        let source_table = def.child_table;
+        let source_table = ident_key(def.child_table);
         if let Some(other) = defs.iter().find(|other| {
             other.name != def.name
-                && other.parent_table == source_table
-                && sources.contains(&other.column)
+                && ident_key(other.parent_table) == source_table
+                && sources.contains(&ident_key(other.column))
         }) {
             return Err(AutumnError::from(std::io::Error::other(format!(
                 "derivation `{}` on {}::{} reads `{}.{}`, which derivation `{}` on {}::{} \
@@ -435,8 +450,8 @@ fn check_source_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -
         }
         if let Some(claim) = claims.iter().find(|claim| {
             claim.direct_sql
-                && claim.parent_table == source_table
-                && sources.contains(&claim.column)
+                && ident_key(claim.parent_table) == source_table
+                && sources.contains(&ident_key(claim.column))
         }) {
             return Err(AutumnError::from(std::io::Error::other(format!(
                 "derivation `{}` on {}::{} reads `{}.{}`, which {}::{} (child table `{}`) \
@@ -486,14 +501,15 @@ fn check_unique_names(defs: &[&DerivationDef]) -> AutumnResult<()> {
 /// two derivations counts twice. No repair can fix that: the two definitions
 /// disagree on what the column means, so each sweep would undo the other.
 fn check_unique_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -> AutumnResult<()> {
-    let mut seen: HashMap<(&str, &str), &DerivationDef> = HashMap::new();
+    let mut seen: HashMap<(String, String), &DerivationDef> = HashMap::new();
     for def in defs {
+        let key = (ident_key(def.parent_table), ident_key(def.column));
         // A plain counter cache on the same column is the same double count,
         // and worse: the derivation's backfill would then overwrite every
         // parent with a total over its own source alone.
         if let Some(claim) = claims
             .iter()
-            .find(|claim| (claim.parent_table, claim.column) == (def.parent_table, def.column))
+            .find(|claim| (ident_key(claim.parent_table), ident_key(claim.column)) == key)
         {
             return Err(AutumnError::from(std::io::Error::other(format!(
                 "derivation `{}` on {}::{} maintains `{}.{}`, which the counter cache \
@@ -510,7 +526,7 @@ fn check_unique_columns(defs: &[&DerivationDef], claims: &[CounterCacheClaim]) -
                 claim.child_table,
             ))));
         }
-        if let Some(first) = seen.insert((def.parent_table, def.column), def) {
+        if let Some(first) = seen.insert(key, def) {
             return Err(AutumnError::from(std::io::Error::other(format!(
                 "two derivations both maintain `{}.{}`: `{}` on {}::{} and `{}` on \
                  {}::{}. The column would count twice, so remove one or point it \
@@ -1662,6 +1678,69 @@ mod tests {
             "column \"published_comment_count\" does not exist",
         ));
         assert!(!is_lock_contention(&other));
+    }
+
+    /// `posts.score` and `posts.Score`: one column on `SQLite`, two on Postgres.
+    fn case_variant_pair() -> (DerivationDef, DerivationDef) {
+        let lower = DerivationDef {
+            name: "dv_posts.score",
+            column: "score",
+            ..count_def()
+        };
+        let upper = DerivationDef {
+            name: "dv_posts.Score",
+            column: "Score",
+            ..count_def()
+        };
+        (lower, upper)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_folds_identifier_case_in_the_registry_checks() {
+        // Quoted identifiers stay case-insensitive on SQLite, so two spellings
+        // of one column are one column: both would update it, and their
+        // backfills would overwrite each other.
+        let (lower, upper) = case_variant_pair();
+        let message = check_unique_columns(&[&lower, &upper], &[])
+            .expect_err("two spellings of one column collide")
+            .to_string();
+        assert!(message.contains("dv_posts.Score"), "{message}");
+        let claim = CounterCacheClaim {
+            model: "DvLike",
+            child_table: "DV_LIKES",
+            parent_table: "DV_POSTS",
+            column: "SCORE",
+            direct_sql: true,
+            module_path: "likes::module",
+        };
+        check_unique_columns(&[&lower], &[claim]).expect_err("a claim collides across case too");
+        // A source read under another spelling is the same source.
+        let reads_upper = DerivationDef {
+            name: "dv_posts.sum_of_score",
+            column: "sum_of_score",
+            child_table: "DV_COMMENTS",
+            transform: "sum(Score)",
+            contrib_sql: "{c}.\"Score\"",
+            ..count_def()
+        };
+        let maintains_lower = DerivationDef {
+            name: "dv_comments.score",
+            parent_table: "dv_comments",
+            column: "score",
+            ..count_def()
+        };
+        check_source_columns(&[&maintains_lower, &reads_upper], &[])
+            .expect_err("a source matched across case is still maintained");
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn postgres_keeps_identifier_case_in_the_registry_checks() {
+        // Every statement quotes its identifiers, and quoted identifiers are
+        // case-sensitive on Postgres: `"Score"` and `"score"` are two columns.
+        let (lower, upper) = case_variant_pair();
+        check_unique_columns(&[&lower, &upper], &[]).expect("two columns coexist");
     }
 
     #[test]
