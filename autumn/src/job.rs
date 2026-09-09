@@ -17859,7 +17859,7 @@ mod tests {
     }
 
     /// Issue #1907: `jobs.backend = "sqlite"` is refused on a build with no
-    /// SQLite backend, rather than folding into the unknown-backend fallback to
+    /// `SQLite` backend, rather than folding into the unknown-backend fallback to
     /// the non-durable local queue.
     #[cfg(not(feature = "sqlite"))]
     #[tokio::test]

@@ -799,7 +799,7 @@ mod tests {
     // exercises the same default-method derivation (`backend() == "postgres"`)
     // via a minimal double, without a database.
     /// Issue #1907: `scheduler.backend = "sqlite"` is refused on a build with
-    /// no SQLite backend, and the refusal names the Postgres alternative.
+    /// no `SQLite` backend, and the refusal names the Postgres alternative.
     #[cfg(not(feature = "sqlite"))]
     #[test]
     fn sqlite_scheduler_backend_is_refused_without_the_sqlite_feature() {
