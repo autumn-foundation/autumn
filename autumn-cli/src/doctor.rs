@@ -1812,23 +1812,25 @@ pub fn resolve_custom_domain_dns(
     use autumn_web::custom_domain::{ObservedTarget, VerificationOutcome, grade_dns_verification};
 
     // A resolver reports the addresses a name ends at and follows CNAMEs
-    // silently, so an ingress configured only as a hostname is resolved to its
-    // addresses first — exactly what `CustomDomainTask::effective_ingress`
-    // does at runtime.
+    // silently, so the ingress hostname is resolved and its addresses ADDED to
+    // whatever was configured explicitly — exactly the union
+    // `CustomDomainTask::effective_ingress` builds at runtime. Resolving it
+    // only when no address was configured would fail the setup the guide
+    // documents: subdomains CNAME to a load balancer while apex domains use
+    // static A/AAAA records, two different address sets, so every correctly
+    // connected subdomain would read as pointing elsewhere.
     let mut expected = ingress.clone();
-    if expected.ipv4.is_empty() && expected.ipv6.is_empty() {
-        let Some(host) = expected.hostname.clone() else {
-            return CustomDomainDns::IngressUnknown;
-        };
+    if let Some(host) = expected.hostname.clone() {
         for addr in resolve_addresses(&host) {
             match addr {
-                std::net::IpAddr::V4(v4) => expected.ipv4.push(v4),
-                std::net::IpAddr::V6(v6) => expected.ipv6.push(v6),
+                std::net::IpAddr::V4(v4) if !expected.ipv4.contains(&v4) => expected.ipv4.push(v4),
+                std::net::IpAddr::V6(v6) if !expected.ipv6.contains(&v6) => expected.ipv6.push(v6),
+                _ => {}
             }
         }
-        if expected.ipv4.is_empty() && expected.ipv6.is_empty() {
-            return CustomDomainDns::IngressUnknown;
-        }
+    }
+    if expected.ipv4.is_empty() && expected.ipv6.is_empty() {
+        return CustomDomainDns::IngressUnknown;
     }
 
     let observed = resolve_addresses(hostname);
@@ -12604,6 +12606,40 @@ pub struct Vault {
             check_custom_domain_dns_impl(&probe("active", CustomDomainDns::IngressUnknown)).status,
             CheckStatus::Warn
         );
+    }
+
+    #[test]
+    fn the_ingress_hostname_is_resolved_alongside_the_configured_addresses() {
+        // The documented mixed setup: tenant subdomains CNAME to a load
+        // balancer while apex domains use static A/AAAA records. Those are two
+        // different address sets, and the runtime grades against their UNION
+        // (`CustomDomainTask::effective_ingress`). Resolving the hostname only
+        // when no address was configured made doctor fail every correctly
+        // connected subdomain — and disagree with the app about it.
+        let ingress = autumn_web::custom_domain::ExpectedIngress {
+            // Resolvable without a network, and not one of the apex addresses.
+            hostname: Some("localhost".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert_eq!(
+            resolve_custom_domain_dns("localhost", &ingress),
+            CustomDomainDns::PointsHere,
+            "a domain pointing at the ingress HOSTNAME must grade as pointing here even when \
+             apex addresses are configured too"
+        );
+
+        // A domain at neither is still elsewhere, and the address it does
+        // resolve to is named.
+        let apex_only = autumn_web::custom_domain::ExpectedIngress {
+            hostname: Some("no-such-ingress.invalid".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        };
+        assert!(matches!(
+            resolve_custom_domain_dns("localhost", &apex_only),
+            CustomDomainDns::PointsElsewhere { .. }
+        ));
     }
 
     #[test]
