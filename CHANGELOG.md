@@ -104,6 +104,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   72% → 54%; allocation bytes/blocks per render unchanged (both paths make
   exactly one `String` allocation).
 
+### Fixed
+
+- **openapi:** `#[model]` types no longer export as untyped blobs (issue #802).
+  The macro has always emitted `OpenApiSchema` impls for a model and its `New*` /
+  `Update*` companions, but never submitted the compile-time inventory
+  descriptor the spec and MCP back-fills actually resolve types through — so
+  nothing could *find* those impls, and every `#[repository(api = "…")]`
+  endpoint documented its own model as the generic
+  `{"type": "object", "title": "X"}` placeholder unless the app repeated each
+  one by hand through `OpenApiConfig::register_schema`. The `bookmarks`
+  example's entire REST surface was in that state. All three companions now
+  register themselves, so a model on the API boundary carries real fields with
+  no wiring, and a generated client sees a typed struct instead of `unknown` /
+  `serde_json::Value`. Apps that were registering models explicitly are
+  unaffected: an explicit `register_schema` is still seeded first and still wins.
+
+- **openapi:** an application type whose last path segment is `Option` or `Vec`
+  is no longer described as nullable or as an array (issue #802). Both macros
+  match those two wrappers on the type's **last path segment**, because a proc
+  macro sees only the tokens as written — so an app's own `domain::Option<T>` or
+  `domain::Vec<T>` (ordinary structs that merely spell that name) took the
+  nullable / array branch. A `#[model]` field of such a type was published as
+  `oneOf [T, null]` or `type: array` and, worse, dropped from `required`, so a
+  generated client could omit a field the server demands; an `#[api]` handler
+  returning `Json<domain::Option<T>>` documented the *inner* type it never
+  wraps. Nothing flagged it: no opaque component was emitted, so
+  `autumn openapi export --strict` passed while it happened. Both paths now
+  check the type's full runtime `type_name` before treating it as a `std`
+  wrapper — the same escape the scalar table already uses for its own
+  last-segment collisions — so a colliding type resolves to its registered
+  schema, or to an honest `$ref` that `--strict` reports as opaque. Genuine
+  `Option` / `Vec` are unchanged, requiredness included.
+
+- **openapi:** a handler that takes or returns `Json<serde_json::Value>` is
+  documented as arbitrary JSON rather than as an empty object (issue #802). The
+  route macro emitted an ordinary named `$ref` for it; nothing registers a
+  schema for that external type, so the back-fill resolved it to the opaque
+  `{"type":"object"}` placeholder — which misdescribes every array, scalar and
+  `null` such a handler legitimately carries, and made
+  `autumn openapi export --strict` fail on a handler that is behaving
+  correctly. The `#[model]` field path already special-cased this; the
+  route-level builder now does too, keyed on the same full `type_name`, so an
+  application's own type named `Value` still gets its ordinary `$ref`. The
+  optional form is deliberately *not* wrapped in `oneOf [.., null]`: the
+  unconstrained schema already admits `null`, and `oneOf` requires exactly one
+  branch to match, so wrapping it would reject the very `null` it permits.
+
+- **openapi:** `autumn openapi export` now runs the router's MCP checks too, so
+  it cannot certify a spec for an app that will not start (issue #802). The
+  preflight already ran four of the serving path's rules; an app mounting MCP at
+  a malformed path, or at one a user or `OpenAPI` route already owns, is
+  rejected by `build_router_pre_state` at startup but passed `--check`. The
+  mount-path rule is extracted from that function rather than copied, joining
+  the others, so there is still exactly one definition per rule.
+
+- **openapi:** `autumn openapi export` also runs the two preconditions `run()`
+  enforced itself, and applies the same builder overrides, before generating
+  (issue #802). The preflight mirrored `build_router_pre_state` faithfully, but
+  `run()` checks two more things outside it: an app with **no routes at all**
+  panics at startup, and a mutating `#[repository(api = "…")]` with no paired
+  `policy` refuses to start under a production profile. Either could export a
+  document `--check` would approve for an application that never reaches router
+  construction. Both now live in one `validate_pre_router_preconditions` the two
+  paths share, so a precondition added to the serving path is in the exporter by
+  construction rather than by remembering. Separately, the
+  `.mount_unsubscribe_endpoint()` builder flag — which decides whether
+  `/_autumn/unsubscribe` is claimed, and so what the collision checks see — is
+  now folded into the config before those checks on the export path too; it was
+  already copied at two `run_*` sites, and is now shared by all three.
+
+- **openapi:** `autumn openapi export` honors the `[openapi] enabled` profile
+  gate when checking mount paths (issue #802). With the endpoint disabled,
+  `run()` hands the router `None`, so it neither validates the `OpenAPI` mount
+  paths nor treats them as claimed `GET`s — an application route may
+  legitimately own `/openapi.json` under that profile. The exporter validated
+  them unconditionally and so *rejected* an application that starts perfectly
+  well: the same class of disagreement with the serving path as being too lax,
+  pointing the other way. All three mount-sensitive checks (path validation,
+  the `OpenAPI` collision scan, and the MCP one, which reserves those same
+  paths) now read one resolved value, so they cannot disagree about whether the
+  endpoint is mounted. The document itself is still exported either way — the
+  gate governs serving, not whether the contract can be written down.
+
+- **openapi:** the external-scalar identity check compares the real type path,
+  not a crate-name prefix (issue #802). `chrono`'s date/time types and
+  `uuid::Uuid` are matched by the macro on their last path segment, and a
+  runtime check then confirmed the identity really was external — but that check
+  was `starts_with("chrono::")`, which accepts *every* type in a crate that
+  happens to be named `chrono`. A downstream crate of that name defining its own
+  `DateTime` was inlined as a string even when serde writes an object, and no
+  opaque component was emitted, so `--strict` could not see it. Each scalar now
+  compares against `type_name` of the genuine type, reached through
+  `autumn_web::reexports` — so the check cannot drift if `chrono` moves a type
+  between internal modules, and cannot be satisfied by a namespace collision.
+  `DateTime<Tz>` compares the path before the `<`, so every zone still
+  qualifies. `uuid` joins the `reexports` module for this.
+
+- **openapi:** a field carrying `#[serde(skip_serializing_if = "…")]` is no
+  longer advertised as `required` (issue #802). That attribute means a response
+  may omit the field, so `required` is wrong for it whatever its type. The
+  standalone derive's audit already refuses the attribute on anything neither
+  `Option`-named nor defaulted — precisely because the survivors are
+  describable as optional — but it judged `Option`-ness by the last path
+  segment, so an application's own `domain::Option<T>` passed the audit and
+  then landed in `required` anyway once the emitter's identity guard recognised
+  the impostor, leaving a schema its own responses could violate. The decision
+  now keys on the attribute rather than the type, which is exactly what a proc
+  macro can see.
+
+- **openapi:** `autumn openapi export` verifies deferred `.policy::<R, _>(…)` /
+  `.scope::<R, _>(…)` registrations (issue #802). Those builder calls are
+  closures the serving path replays onto live state before checking that every
+  `#[repository(policy = X)]` route really has an `X` registered — a check that
+  refuses to start under a production profile. The export dropped the closures
+  and confirmed only that the macro argument existed, so an app declaring a
+  policy but missing the builder call exported a contract `--check` would
+  approve. It now replays them onto a throwaway `PolicyRegistry` and runs the
+  same rule; `validate_repository_policies_registered` takes that registry
+  rather than the whole `AppState`, which is all it ever read, so the export
+  still opens no database.
+
+- **openapi:** `autumn openapi export` runs the two config-only guards that stop
+  a boot before anything route-shaped is looked at (issue #802): a `web`/`worker`
+  process role on a non-durable jobs backend — where the web replica enqueues
+  into an in-memory queue no worker can drain — and a duplicate `#[scheduled]`
+  task name, which spawns two loops competing for one coordination lock. Either
+  refuses to start, and neither was reachable from the router, so an export that
+  mirrored the router faithfully still approved the contract. Both now live in a
+  `validate_config_preconditions` the two paths share. The task check validates
+  the list with the framework's `[retention]` sweep merged in, exactly as the
+  serving path does — the collision it most often catches is between a
+  hand-declared task and that generated one, so validating the unmerged list
+  would miss the very case it exists for. The merge happens in exactly one
+  place, `merge_framework_scheduled_tasks`, covering both the
+  `#[repository(..., retention(...))]` sweeps and the config-driven one.
+
+- **Breaking:** `#[derive(OpenApiSchema)]` now refuses
+  `#[serde(skip_serializing_if = "…")]` on a field with no `#[serde(default)]`,
+  including on `Option<T>`, which previously compiled. `skip_serializing_if`
+  governs serialization only, so a response may omit the field while serde still
+  rejects a request that omits it; being spelled `Option<T>` used to be accepted
+  as proof that omission is valid on the way in, but a proc macro sees only the
+  tokens, and an application's own type named `Option` reads identically while
+  serde does require it. For such a type neither answer is right — `required`
+  lets a response omit what the schema demands, optional lets a client omit what
+  serde rejects — so the shape is refused rather than guessed. Add
+  `#[serde(default)]`, which is a no-op on a real `Option<T>` (serde already
+  fills a missing one with `None`) and makes omission genuinely valid in both
+  directions. `#[model]` is unaffected: its read schema describes a response
+  only. See the [migration guide](docs/migrations/next.md).
+
+- **openapi:** `autumn openapi export` no longer applies the application-router
+  checks under a non-HTTP process role (issue #802). With `role = "worker"`,
+  `run()` takes the probe-only branch and never builds the application router,
+  so none of those six rules execute — a route may legitimately own
+  `/openapi.json` under that profile. Enforcing them anyway *rejected* a
+  deployment that starts perfectly well. The config-only preconditions still
+  apply to every role, because `run()` performs those before it branches, and
+  the document is still exported either way: it is built from the routes and the
+  `OpenApiConfig`, neither of which depends on the role, so a worker-profile
+  export writes down the same contract the web role serves.
+
+
 ### Changed
 
 - **web:** `AutumnError`'s `Display` now appends the failing fields to a
@@ -346,7 +509,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COMMENT ON`, `GRANT`/`REVOKE`, `MERGE`, a writing CTE and the Postgres-only
   `CREATE INDEX`/`CREATE TABLE` clauses — and fails the `up.sql` gate, since they
   cannot apply. Postgres classification is unchanged.
-
+- **openapi:** `#[derive(OpenApiSchema)]` now covers enums whose variants are
+  all unit variants, emitting the closed string set serde puts on the wire
+  (`{"type": "string", "enum": [...]}`) and honoring `#[serde(rename)]`,
+  `#[serde(rename_all)]` and `#[serde(skip)]`. Previously the derive rejected
+  every enum outright, so an enum on the API boundary had no opt-in short of a
+  hand-written impl and fell back to the opaque object placeholder. Enums with
+  data-carrying variants are still a compile error rather than a guess: serde's
+  representation for those depends on `#[serde(tag/content/untagged)]`, so an
+  inferred shape could confidently advertise a contract the handler will not
+  accept.
+- **openapi:** the opaque-schema predicate MCP used to warn on degraded tool
+  input schemas is now `openapi::is_opaque_object_schema`, paired with a new
+  `openapi::opaque_component_schemas` that reports every placeholder component in
+  a built spec along with the operations reaching it. `autumn openapi export`
+  prints that report on every run, so a half-untyped contract is a visible
+  condition rather than a silent one. Behaviour of the existing MCP warnings is
+  unchanged — they now call the shared predicate instead of a private copy.
 - **plugin-sandbox:** three consequences of #1632 that an existing sandbox
   embedder will notice. `SandboxManifest` gains `grants` and `quotas` fields, so
   a struct literal over it needs two more lines — prefer `SandboxManifest::parse`
@@ -776,6 +955,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SQLite app needs it to compile at all (#1924).
 
 ### Added
+
+- **openapi:** `autumn openapi export` gets the spec out of the app without
+  running it (issue #802). It compiles the target binary and runs it in a dump
+  mode that binds no port and opens no database connection — the same no-boot
+  child-process protocol `autumn routes` uses — then writes the same OpenAPI 3.1
+  document `/openapi.json` serves, built through the very same
+  `collect_openapi_docs` + `generate_spec` pair so an exported spec and a served
+  one cannot drift. Until now the only ways to obtain the contract were to boot
+  the server and curl it, or to run a full static build (`autumn build` emits
+  `dist/openapi.json` as a side effect, and bails out entirely on an app with no
+  `#[static_get]` routes). `--out <path>` writes a file, `--check <path>`
+  re-exports and fails on drift against a committed copy — comparing parsed JSON
+  rather than bytes, and printing the operations that were added, removed or
+  changed — and `--strict` additionally fails on any opaque component schema.
+  An app built without the `openapi` feature, or one that never called
+  `.openapi(...)`, reports which of the two it is instead of emitting nothing.
+  The point of the command is to hand the standard generators
+  (`openapi-typescript`, `progenitor`, `openapi-generator`) a spec worth
+  generating from; Autumn does not ship its own client emitters.
 
 - **plugin-sandbox:** the capability vocabulary grows past request handling
   (issue #1632). A sandboxed plugin's manifest may now ask for `kv`,

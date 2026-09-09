@@ -727,6 +727,50 @@ async fn beta_page() -> &'static str {
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
 
+### OpenApiSchema: `#[serde(skip_serializing_if)]` now needs `#[serde(default)]`
+
+**Why:** `skip_serializing_if` governs serialization alone — a response may omit
+the field, while serde still rejects a *request* that omits it. The derive used
+to accept the attribute whenever the field was spelled `Option<T>`, treating
+that as proof omission is valid on the way in. It is only proof for `std`'s
+`Option`, and a proc macro cannot tell: it sees the tokens as written, so an
+application's own type named `Option` reads identically and *is* required on the
+way in. For such a type neither answer is right — marking the property
+`required` lets a response omit what the schema demands, marking it optional
+lets a client omit what serde rejects — so the shape is refused rather than
+guessed. `#[serde(default)]` is what actually makes omission valid in both
+directions, and it is a no-op on a real `Option<T>`, which serde already fills
+with `None` when the field is missing.
+
+**Before (`0.7`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+struct Profile {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
+}
+```
+
+**After (`0.8`):**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, autumn_web::openapi::OpenApiSchema)]
+struct Profile {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nickname: Option<String>,
+}
+```
+
+**Automation:** `manual` — the fix is one attribute, but deciding it is the
+right fix is not mechanical. On a genuine `Option<T>` adding `#[serde(default)]`
+changes nothing and is always correct; on any other type it changes what serde
+accepts, so a codemod that added it everywhere would silently widen a request
+contract. `#[model]` is unaffected: its read schema describes a response only,
+so a conditionally-skipped column there stays sound without the attribute.
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
