@@ -3643,6 +3643,135 @@ async fn an_absurd_page_number_does_not_overflow() {
     }
 }
 
+/// An ordinary save does not move a published post's date.
+///
+/// The `datetime-local` control is prefilled from the stored date and submits
+/// on every save, so an unconditional write rewrote `published_at` whenever
+/// anything else on the form changed — truncating the seconds off a publication
+/// record each time, and reordering posts published within the same minute. A
+/// deliberate change still applies; what this pins is that saving a title does
+/// not silently redate the post.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn saving_a_published_post_does_not_move_its_date() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Dated", "Body.", "publish").await;
+
+    // A stored date with seconds on it, which is what the form cannot express.
+    try_execute(
+        TestDb::shared().await,
+        &format!("UPDATE posts SET published_at = TIMESTAMP '2026-03-04 05:06:07' WHERE id = {id}"),
+    )
+    .await
+    .expect("stamp a precise date");
+
+    let stored = async || -> Option<chrono::NaiveDateTime> {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        RunQueryDsl::first(
+            {{crate_name}}::schema::posts::table
+                .find(id)
+                .select({{crate_name}}::schema::posts::published_at),
+            &mut conn,
+        )
+        .await
+        .expect("the post")
+    };
+
+    // Open the editor and save it back exactly as rendered — the browser
+    // submits the prefilled field whether or not anybody touched it.
+    let editor = client
+        .get(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .text();
+    let prefilled = editor
+        .split("name=\"publish_at\"")
+        .nth(1)
+        .and_then(|rest| rest.split("value=\"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .expect("the prefilled date")
+        .to_owned();
+    assert_eq!(
+        prefilled, "2026-03-04T05:06",
+        "the control renders minute precision, which is the whole problem"
+    );
+
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Dated, retitled"),
+                    ("slug", "dated"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("publish_at", &prefilled),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+
+    assert_eq!(
+        stored().await,
+        Some(
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 4)
+                .unwrap()
+                .and_hms_opt(5, 6, 7)
+                .unwrap()
+        ),
+        "an untouched field must leave the publication record alone, seconds included"
+    );
+
+    // A deliberate change still applies — the guard is against accidents, not
+    // against editing.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Dated, retitled"),
+                    ("slug", "dated"),
+                    ("excerpt", ""),
+                    ("body", "Body."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("publish_at", "2026-03-05T09:30"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+    assert_eq!(
+        stored().await,
+        Some(
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 5)
+                .unwrap()
+                .and_hms_opt(9, 30, 0)
+                .unwrap()
+        ),
+        "a date the editor actually typed is applied"
+    );
+}
+
 /// A nested item of a hierarchical custom type stays reachable.
 ///
 /// A custom type is addressed as `/{archive_base}/{slug}` with no ancestry

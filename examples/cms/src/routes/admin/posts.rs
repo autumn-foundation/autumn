@@ -189,6 +189,23 @@ fn optional_id(raw: Option<&String>) -> Option<i64> {
 /// against `Utc::now()` — so an editor in UTC-7 who scheduled a post for 09:00
 /// had it publish at 02:00 their time. The site timezone is what turns the
 /// wall-clock reading into the instant it names.
+/// Whether a submitted date is the one already stored, to the precision the
+/// form can express.
+///
+/// `datetime-local` submits `%Y-%m-%dT%H:%M`, so a stored timestamp with
+/// seconds round-trips back a minute earlier. Comparing at the *form's*
+/// precision is what tells "the editor did not touch this" apart from "the
+/// editor moved it", and keeps the stored seconds in the first case.
+fn same_minute(stored: Option<chrono::NaiveDateTime>, submitted: chrono::NaiveDateTime) -> bool {
+    use chrono::Timelike as _;
+    stored.is_some_and(|stored| {
+        stored
+            .with_second(0)
+            .and_then(|truncated| truncated.with_nanosecond(0))
+            == Some(submitted)
+    })
+}
+
 fn scheduled_at(
     form: &PostForm,
     settings: &crate::settings::Settings,
@@ -1340,7 +1357,28 @@ pub async fn update(
                             post.featured_media_id = media;
                             post.menu_order = order;
                             match scheduled_for {
-                                Some(when) => post.published_at = Some(when),
+                                // Written only when the editor actually moved
+                                // the field. The control is prefilled from the
+                                // stored date and submits on every save, so an
+                                // unconditional write rewrote `published_at`
+                                // whenever anything else on the form changed —
+                                // and `datetime-local` has minute precision, so
+                                // each of those saves silently truncated the
+                                // seconds off a publication record and could
+                                // reorder posts published within the same
+                                // minute. Nobody asked for that; it is not an
+                                // edit, it is a round-trip artefact.
+                                //
+                                // A *deliberate* change still applies, on a live
+                                // post as much as a draft: correcting a
+                                // publication date is an editorial act
+                                // WordPress supports, and the editor who typed a
+                                // new date can see what it will do. What this
+                                // refuses is moving the date by accident.
+                                Some(when) if !same_minute(post.published_at, when) => {
+                                    post.published_at = Some(when);
+                                }
+                                Some(_) => {}
                                 // Blanking the date field on something that has
                                 // never actually been live clears the timestamp.
                                 // Leaving it made "unschedule this" keep the old
@@ -1353,8 +1391,10 @@ pub async fn update(
                                 //
                                 // Only for a row that is not live: for a published
                                 // or private post `published_at` is a publication
-                                // record, and an edit must never reorder the blog
-                                // index.
+                                // record, and clearing the field is how a browser
+                                // reports a value it could not parse as much as it
+                                // is a deliberate act — so on a live post it means
+                                // nothing and is ignored.
                                 None if !matches!(post.status.as_str(), "publish" | "private") => {
                                     post.published_at = None;
                                 }
