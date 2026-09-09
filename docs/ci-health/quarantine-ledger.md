@@ -112,9 +112,14 @@ without also filling in the intake form above.
   overhead as unquantified, not a confirmed slowdown. Failure is at
   `tests/live_upgrade.rs:567`: `"the new build should have served part of
   the load"` — the v2 binary never appeared in the observed read set —
-  which is a **different assertion** than the connection-error check
-  (line ~551) the 3 macOS hits above were classified against. Full run: 5
-  passed, 1 failed in the `hot-upgrade` package.
+  which is a **different assertion** than `assert_eq!(connect_errors, 0)`
+  at the file's then-`line 268`, the connection-error check the 3 macOS
+  hits above were classified against per the 2026-09-04 census. That
+  single counter has since been split by the #2510 fix into `refused == 0`
+  / `hard == 0` around today's lines 520-528 — cited by name rather than a
+  guessed current line number, since the file has been refactored since
+  the census ran. Full run: 5 passed, 1 failed in the `hot-upgrade`
+  package.
   - **Why this is logged here but not folded into the macOS cluster's
     diagnosis**: same test file, but a different assertion can mean a
     different bug entirely — "the new build never took over" and "requests

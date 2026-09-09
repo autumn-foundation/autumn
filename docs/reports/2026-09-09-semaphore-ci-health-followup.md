@@ -71,8 +71,12 @@ than trusting the run-level conclusion:
      taken here, so any execution-time overhead is unquantified. Failure:
      `tests/live_upgrade.rs:567` — `"the new build should have served part
      of the load"` — a *different* assertion than the 3 macOS hits in the
-     2026-09-04 census (those failed the connection-error check, ~line
-     551). The new build's version string never showed up in the read set
+     2026-09-04 census (those failed `assert_eq!(connect_errors, 0)` at
+     the file's then-`line 268`; that single counter has since been split
+     by the #2510 fix into `refused == 0` / `hard == 0` around today's
+     lines 520-528 — cited by name, not by a guessed current line number,
+     since the file has been refactored since the census ran). The new
+     build's version string never showed up in the read set
      during the test's fixed observation window. Same test file, but a
      different assertion can mean a different bug — this is not treated as
      evidence against the macOS-specific framing of the existing 3-hit
