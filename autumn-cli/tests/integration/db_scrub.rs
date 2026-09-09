@@ -2597,11 +2597,31 @@ fn printed_transaction(stderr: &str) -> String {
         .iter()
         .position(|l| l.trim() == "COMMIT;")
         .expect("the dry run must print the commit");
-    lines[start..=end]
+    let body: Vec<String> = lines[start..=end]
         .iter()
         .map(|l| l.strip_prefix("  ").unwrap_or(l))
-        .collect::<Vec<_>>()
-        .join("\n")
+        // `\gset` is psql's, not the server's: it hands this SELECT's value to
+        // the post-commit fence, and psql consumes the suffix as the statement
+        // terminator. Sent down the wire instead — which is what this test does,
+        // having no psql — the server sees it and answers `syntax error at or
+        // near "\"`, measured on PostgreSQL 16.13. The SELECT itself is ordinary
+        // SQL, so the suffix becomes the semicolon psql would have supplied.
+        .map(|l| {
+            l.strip_suffix(" \\gset")
+                .map_or_else(|| (*l).to_owned(), |sql| format!("{sql};"))
+        })
+        .collect();
+    // Nothing ELSE in the transaction may be a psql meta-command. One would not
+    // run here at all, and skipping it silently would leave this test claiming it
+    // executed the printed SQL when it had quietly dropped a line of it.
+    for line in &body {
+        assert!(
+            !line.trim_start().starts_with('\\'),
+            "the printed transaction must hold no psql meta-command this test \
+             would have to skip: {line}"
+        );
+    }
+    body.join("\n")
 }
 
 /// A root and three levels below it, with the foreign keys added deepest-first
