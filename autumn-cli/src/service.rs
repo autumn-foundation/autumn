@@ -108,9 +108,28 @@ pub fn service_name(project_identity: &str) -> String {
             }
         })
         .collect();
-    let mut name = format!("{SERVICE_NAME_PREFIX}{sanitized}");
-    name.truncate(MAX_SERVICE_NAME);
-    name
+    let name = format!("{SERVICE_NAME_PREFIX}{sanitized}");
+    if name.chars().count() <= MAX_SERVICE_NAME {
+        return name;
+    }
+    // Too long. Truncating from the end would cut the `-<dirhash>` suffix —
+    // the only part that distinguishes two checkouts sharing a directory name —
+    // so two long projects would collide on one SCM entry and the second
+    // install, uninstall and status would all target the first's service. Trim
+    // the human-readable half instead and keep the hash whole.
+    let (readable, hash) = sanitized
+        .rsplit_once('-')
+        .map_or((sanitized.as_str(), ""), |(head, tail)| (head, tail));
+    let suffix = if hash.is_empty() {
+        String::new()
+    } else {
+        format!("-{hash}")
+    };
+    let room = MAX_SERVICE_NAME
+        .saturating_sub(SERVICE_NAME_PREFIX.chars().count())
+        .saturating_sub(suffix.chars().count());
+    let readable: String = readable.chars().take(room).collect();
+    format!("{SERVICE_NAME_PREFIX}{readable}{suffix}")
 }
 
 /// The human-facing name shown in `services.msc`.
@@ -372,7 +391,18 @@ pub fn run(action: ServiceAction, _opts: &crate::serve::ServeOptions) -> i32 {
 }
 
 #[cfg(windows)]
-pub use windows_impl::run;
+pub use windows_impl::{restart_registered, run};
+
+/// Restart a registered service through the Service Control Manager, when this
+/// project has one.
+///
+/// `None` means no service is registered and the caller should take its ordinary
+/// daemon path. Always `None` off Windows.
+#[cfg(not(windows))]
+#[must_use]
+pub fn restart_registered(_project_identity: &str) -> Option<Result<(), String>> {
+    None
+}
 
 #[cfg(windows)]
 mod windows_impl {
@@ -644,6 +674,107 @@ mod windows_impl {
                 ));
             }
             std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Restart this project's registered service through the Service Control
+    /// Manager.
+    ///
+    /// `None` when no service is registered, which tells the caller to take its
+    /// ordinary daemon path. Routing through the SCM matters because the naive
+    /// `stop()` + `start()` pair does the wrong thing here: the stop makes the
+    /// host report `Stopped`, and the start then launches a **detached** daemon
+    /// outside the SCM — so the command reports a successful restart while the
+    /// service sits stopped and the replacement app has no crash supervision,
+    /// and the next boot brings up a second instance beside it.
+    pub fn restart_registered(project_identity: &str) -> Option<Result<(), String>> {
+        let name = service_name(project_identity);
+        // Only when something is actually registered; a missing service is the
+        // ordinary daemon case, not an error.
+        super::registered_service_state(project_identity)?;
+        Some(restart_service(&name))
+    }
+
+    /// Stop then start the SCM entry, waiting for each transition.
+    fn restart_service(name: &str) -> Result<(), String> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(|e| {
+            format!(
+                "cannot reach the Service Control Manager ({e}). Restarting a \
+                     service needs an elevated (Administrator) shell."
+            )
+        })?;
+        let service = manager
+            .open_service(
+                name,
+                ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+            )
+            .map_err(|e| {
+                let raw = match &e {
+                    windows_service::Error::Winapi(io) => io.raw_os_error(),
+                    _ => None,
+                };
+                if super::open_failure_is_access_denied(raw) {
+                    format!(
+                        "cannot open `{name}`: access denied. Restarting a service \
+                         needs an elevated (Administrator) shell; nothing was \
+                         changed."
+                    )
+                } else {
+                    format!("cannot open `{name}`: {e}")
+                }
+            })?;
+        let paths = crate::paths::RuntimePaths::resolve(&serve::project_identity_for(None)).ok();
+        let stop_timeout = scm_stop_timeout(paths.as_ref());
+        if service
+            .query_status()
+            .map_err(|e| format!("cannot query `{name}`: {e}"))?
+            .current_state
+            != ServiceState::Stopped
+        {
+            service
+                .stop()
+                .map_err(|e| format!("cannot stop `{name}`: {e}"))?;
+            wait_for_state(&service, name, ServiceState::Stopped, stop_timeout)?;
+        }
+        service
+            .start::<&std::ffi::OsStr>(&[])
+            .map_err(|e| format!("cannot start `{name}`: {e}"))?;
+        // The same budget an install allows, so a restart that re-provisions a
+        // managed cluster is not called a failure.
+        wait_for_state(
+            &service,
+            name,
+            ServiceState::Running,
+            serve::start_ready_timeout(true),
+        )?;
+        println!("autumn serve: restarted the Windows service `{name}`");
+        Ok(())
+    }
+
+    /// Poll until `service` reaches `wanted`, or `timeout` elapses.
+    fn wait_for_state(
+        service: &windows_service::service::Service,
+        name: &str,
+        wanted: ServiceState,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let state = service
+                .query_status()
+                .map_err(|e| format!("cannot query `{name}`: {e}"))?
+                .current_state;
+            if state == wanted {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "`{name}` did not reach {wanted:?} within {}s; it is {state:?}",
+                    timeout.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -1072,7 +1203,30 @@ mod tests {
     #[test]
     fn service_name_stays_within_the_scm_length_limit() {
         let name = service_name(&"x".repeat(500));
-        assert!(name.len() <= MAX_SERVICE_NAME, "{}", name.len());
+        assert!(name.chars().count() <= MAX_SERVICE_NAME, "{}", name.len());
+    }
+
+    #[test]
+    fn a_truncated_service_name_keeps_the_hash_that_distinguishes_checkouts() {
+        // The hash suffix is the ONLY thing separating two checkouts that share
+        // a directory name. Truncating from the end would drop it, so two long
+        // projects would collide on one SCM entry — and the second's uninstall
+        // would deregister the first's service.
+        let one = service_name(&format!("{}-a1b2c3d4", "x".repeat(500)));
+        let two = service_name(&format!("{}-9f8e7d6c", "x".repeat(500)));
+        assert!(one.ends_with("-a1b2c3d4"), "{one}");
+        assert!(two.ends_with("-9f8e7d6c"), "{two}");
+        assert_ne!(one, two, "two checkouts must not share a service name");
+        assert!(one.chars().count() <= MAX_SERVICE_NAME);
+    }
+
+    #[test]
+    fn an_identity_with_no_hash_still_truncates_safely() {
+        // Defensive: `project_identity` always appends one, but a name built
+        // some other way must not panic or overrun.
+        let name = service_name(&"x".repeat(500));
+        assert!(name.starts_with(SERVICE_NAME_PREFIX));
+        assert!(name.chars().count() <= MAX_SERVICE_NAME);
     }
 
     #[test]

@@ -4708,7 +4708,7 @@ impl AppBuilder {
             let addr = listener
                 .local_addr()
                 .map_or(configured_addr, |bound| bound.to_string());
-            bound_endpoint = format!("tcp {addr}");
+            bound_endpoint = format!("tcp {}", dialable_endpoint(&addr));
             // When `[server.tls]` is set (and the `tls` feature is built in),
             // wrap the just-bound TCP listener in a rustls acceptor so the same
             // host:port serves HTTPS. Fail fast on any cert/key problem — the
@@ -9875,6 +9875,33 @@ fn signal_serve_ready(drain_budget_secs: u64, bound_endpoint: &str) {
     }
 }
 
+/// Turn a bound address into one a client can actually dial.
+///
+/// A wildcard bind is a *bind*, never a dial address — the same rule
+/// `[cluster] advertise_addr` already enforces, for the same reason: handing a
+/// peer `0.0.0.0` gives it something nothing can reach, and the failure then
+/// looks like a network fault rather than the address it is. The production
+/// smart default binds `0.0.0.0`, so without this a `--release` daemon publishes
+/// an undialable `serve.addr` while reporting a successful start.
+///
+/// Only the *host* is rewritten, to loopback of the matching family; the
+/// resolved port is what the supervisor could not have known and is preserved
+/// exactly. An address that is already specific passes through untouched, and so
+/// does one that will not parse — better to publish what we bound than to invent
+/// something.
+fn dialable_endpoint(addr: &str) -> String {
+    let Ok(parsed) = addr.parse::<std::net::SocketAddr>() else {
+        return addr.to_owned();
+    };
+    if !parsed.ip().is_unspecified() {
+        return addr.to_owned();
+    }
+    match parsed {
+        std::net::SocketAddr::V4(_) => format!("127.0.0.1:{}", parsed.port()),
+        std::net::SocketAddr::V6(_) => format!("[::1]:{}", parsed.port()),
+    }
+}
+
 /// The readiness file's contents: the drain budget, then the bound endpoint.
 ///
 /// Two lines rather than one structured value so the first line stays exactly
@@ -14261,6 +14288,38 @@ mod tests {
     // drain for, and where it actually bound. The second is what lets
     // `autumn serve --daemon` write an address-discovery file on a platform
     // with no Unix socket to name in advance.
+
+    #[test]
+    fn a_wildcard_bind_is_published_as_a_dialable_loopback_address() {
+        // The production smart default binds `0.0.0.0`, and `local_addr()`
+        // faithfully reports it. Publishing that in `serve.addr` would hand a
+        // thin client an address nothing can dial while the start reported
+        // success — the same trap `[cluster] advertise_addr` already rejects.
+        assert_eq!(dialable_endpoint("0.0.0.0:3000"), "127.0.0.1:3000");
+        assert_eq!(dialable_endpoint("[::]:3000"), "[::1]:3000");
+    }
+
+    #[test]
+    fn a_specific_bind_is_published_exactly_as_bound() {
+        // Rewriting one would be worse than the bug: the supervisor would
+        // advertise an interface the app is not on.
+        assert_eq!(dialable_endpoint("192.168.1.10:3000"), "192.168.1.10:3000");
+        assert_eq!(dialable_endpoint("127.0.0.1:8080"), "127.0.0.1:8080");
+        assert_eq!(dialable_endpoint("[::1]:8080"), "[::1]:8080");
+    }
+
+    #[test]
+    fn the_resolved_port_survives_the_rewrite() {
+        // The port is the half the supervisor could not have known — `port = 0`
+        // resolves in the kernel — so losing it would defeat the whole report.
+        assert_eq!(dialable_endpoint("0.0.0.0:49152"), "127.0.0.1:49152");
+    }
+
+    #[test]
+    fn an_unparseable_address_is_published_unchanged() {
+        // Better to publish what was bound than to invent something.
+        assert_eq!(dialable_endpoint("not-an-address"), "not-an-address");
+    }
 
     #[test]
     fn serve_ready_payload_leads_with_the_drain_budget() {

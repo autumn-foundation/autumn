@@ -193,6 +193,24 @@ fn run_lifecycle(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
         Some(ServeAction::Stop) => stop(opts),
         Some(ServeAction::Status) => status(opts),
         Some(ServeAction::Restart) => {
+            // A registered Windows service owns this project's lifecycle, so
+            // restart it through the Service Control Manager. The daemon path
+            // below would stop the service host (its app drains, the host reports
+            // `Stopped`) and then launch a DETACHED daemon outside the SCM —
+            // reporting a successful restart while leaving the service stopped,
+            // the replacement app unsupervised, and the next boot bringing up a
+            // second instance beside it.
+            if let Some(outcome) =
+                crate::service::restart_registered(&project_identity(opts.package.as_deref()))
+            {
+                return match outcome {
+                    Ok(()) => 0,
+                    Err(message) => {
+                        eprintln!("autumn serve restart: {message}");
+                        1
+                    }
+                };
+            }
             // `restart` is a fresh invocation, so `opts` reflects the restart
             // command's flags — not the original `start`. Recover managed-PG mode
             // and release mode from the running daemon's address file so a bare

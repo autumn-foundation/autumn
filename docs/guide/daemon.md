@@ -145,7 +145,9 @@ any other.
 It is not a separate lifecycle. The service hosts the same app child
 `--daemon` hosts and writes the same pidfile, address file and log, so
 `autumn serve status` and `autumn serve stop` keep working against it, and a
-`sc.exe stop` runs the same cooperative drain. An app that exits cleanly, or one
+`sc.exe stop` runs the same cooperative drain. `autumn serve restart` restarts
+the *service* through the Service Control Manager rather than starting a loose
+daemon beside it, so the app that comes back is still supervised. An app that exits cleanly, or one
 an operator stopped, is left stopped; an app that crashes or fails to boot is
 restarted by the Service Control Manager.
 
