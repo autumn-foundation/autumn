@@ -795,8 +795,21 @@ KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 
 BARE_FLAG = re.compile(r"^[a-z_][a-z_0-9]*$")
 
+# Macros whose FIRST argument is positional even when written as a bare
+# identifier. `parse_authorize_args` takes the leading bare path as the action
+# verb (`#[authorize(update, resource = Post)]`), so reading it as a flag
+# reported a supported form as drift.
+#
+# This is an explicit list rather than a structural test, and deliberately so:
+# `#[repository(Post, api, mcp)]` also leads with a positional, but there `api`
+# and `mcp` ARE flags, and nothing in the parsers distinguishes "first bare
+# path is a value" from "bare paths are flags" without reading intent. A short
+# list that a self-test pins is honest; a heuristic that guesses would be the
+# kind of over-reach that has cost this gate false positives already.
+POSITIONAL_FIRST_IDENT = frozenset({"authorize"})
 
-def top_level_keys(args):
+
+def top_level_keys(args, macro=None):
     """The argument names at the attribute's own nesting level.
 
     Two shapes count, because the macro rejects a typo in either:
@@ -854,15 +867,20 @@ def top_level_keys(args):
         i += 1
 
     names = []
+    first = True
     for segment in "".join(buf).split(","):
         segment = segment.strip()
         if not segment:
             continue
+        leading = first
+        first = False
         if "=" in segment.replace("==", ""):
             head = segment.split("=", 1)[0].strip()
             if BARE_FLAG.match(head):
                 names.append((head, False))
         elif BARE_FLAG.match(segment):
+            if leading and macro in POSITIONAL_FIRST_IDENT:
+                continue  # the action verb, not a flag
             names.append((segment, True))
     return names
 
@@ -876,7 +894,7 @@ def top_level_keys(args):
 MACRO_OPEN = re.compile(
     r"#\[\s*(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
-    + r")\s*\("
+    + r")\s*([(\[{])"
 )
 # `cfg_attr(<pred>, <attr>, …)` applies each `<attr>` when the predicate holds,
 # so a conditionally-applied Autumn macro is a real invocation the compiler
@@ -889,7 +907,7 @@ CFG_ATTR_OPEN = re.compile(r"#\[\s*cfg_attr\s*\(")
 BARE_MACRO_OPEN = re.compile(
     r"\b(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
-    + r")\s*\("
+    + r")\s*([(\[{])"
 )
 
 
@@ -985,8 +1003,18 @@ def _masked_spans(text):
     return spans
 
 
-def _close_of(text, start):
-    """Index of the delimiter closing the group opened just before `start`."""
+CLOSER_OF = {"(": ")", "[": "]", "{": "}"}
+
+
+def _close_of(text, start, opener="("):
+    """Index of the delimiter closing the group opened just before `start`.
+
+    A proc-macro attribute accepts any delimited token tree, so
+    `#[secured { policy = "x" }]` and `#[secured [policy = "x"]]` are real
+    invocations the macro still rejects; recognising only `(` left both
+    entirely ungated.
+    """
+    closer = CLOSER_OF[opener]
     i, depth = start, 1
     while i < len(text) and depth:
         ch = text[i]
@@ -1003,9 +1031,9 @@ def _close_of(text, start):
             if nxt is not None:
                 i = nxt
                 continue
-        if ch in "([":
+        if ch == opener:
             depth += 1
-        elif ch in ")]":
+        elif ch == closer:
             depth -= 1
             if depth == 0:
                 return i
@@ -1043,7 +1071,8 @@ def find_macro_calls(text):
                 # never applies the attribute, and reporting it would fail the
                 # gate on a snippet that quotes a spelling on purpose.
                 continue
-            end = _close_of(text, match.end())
+            opener = match.group(2) if pattern is MACRO_OPEN else "("
+            end = _close_of(text, match.end(), opener)
             if end is None:
                 continue
             body = text[match.end() : end]
@@ -1060,7 +1089,7 @@ def find_macro_calls(text):
             for inner in BARE_MACRO_OPEN.finditer(body):
                 if any(s <= inner.start() < e for s, e in body_masked):
                     continue
-                inner_end = _close_of(body, inner.end())
+                inner_end = _close_of(body, inner.end(), inner.group(2))
                 if inner_end is None:
                     continue
                 out.append(
@@ -1131,7 +1160,7 @@ def judge_fences(rel, fence_lines, accepted, judgeable, waived):
     for macro, args, offset in find_macro_calls(text):
         if macro not in judgeable:
             continue
-        for key, is_flag in top_level_keys(args):
+        for key, is_flag in top_level_keys(args, macro):
             if key in accepted[macro] or (macro, key) in waived:
                 continue
             out.append((macro, key, f"{rel}:{line_of(offset)}", is_flag))
@@ -1215,7 +1244,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len = "`", 3
+    open_char, open_len = None, 0
     for lineno, line in enumerate(lines, 1):
         # A fenced example inside a block quote is still an example a reader
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
@@ -1225,21 +1254,28 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         run = _fence_run(stripped)
         if run:
             char, length = run
-            if inside:
+            if open_char is not None:
                 # CommonMark: a fence closes only on the same character, at
                 # least as long as the opener. Removing a fixed three
                 # characters read ````rust as the language "`rust" and skipped
                 # the block entirely — and longer fences are exactly what an
                 # example containing triple backticks requires.
                 if char == open_char and length >= open_len:
-                    collected.append(current)
-                    current, inside = [], False
+                    if inside:
+                        collected.append(current)
+                        current = []
+                    inside = False
+                    open_char, open_len = None, 0
             else:
+                # Every fence is tracked, not only Rust ones. A ````text block
+                # displaying a literal ```rust example is documentation ABOUT
+                # a fence; treating the inner delimiter as live structure made
+                # the displayed attribute fail the gate.
                 lang = stripped[length:].strip().lower()
+                open_char, open_len = char, length
                 inside = lang.startswith("rust")
                 if inside:
                     fences += 1
-                    open_char, open_len = char, length
             continue
         if inside:
             current.append((lineno, BLOCKQUOTE.sub("", line)))
@@ -1253,7 +1289,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len = "`", 3
+    open_char, open_len = None, 0
     for lineno, line in enumerate(lines, 1):
         doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
         if not doc:
@@ -1262,6 +1298,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             if inside:
                 collected.append(current)
             current, inside = [], False
+            open_char, open_len = None, 0
             continue
         body = doc.group(1).strip()
         # Same delimiter rule as the markdown half: character and run length,
@@ -1270,21 +1307,26 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         run = _fence_run(body)
         if run:
             char, length = run
-            if inside:
+            if open_char is not None:
                 if char == open_char and length >= open_len:
-                    collected.append(current)
-                    current, inside = [], False
+                    if inside:
+                        collected.append(current)
+                        current = []
+                    inside = False
+                    open_char, open_len = None, 0
             else:
                 # rustdoc fences default to Rust, and the attribute-bearing
-                # ones are usually `ignore` / `no_run` / `compile_fail`.
+                # ones are usually `ignore` / `no_run` / `compile_fail`. A
+                # `text` fence is still tracked so a Rust fence displayed
+                # inside it is not read as live structure.
                 lang = body[length:].strip().lower()
+                open_char, open_len = char, length
                 inside = lang == "" or re.match(
                     r"^(rust|ignore|no_run|compile_fail|should_panic|edition\d+)",
                     lang,
                 ) is not None
                 if inside:
                     fences += 1
-                    open_char, open_len = char, length
             continue
         if inside:
             current.append((lineno, body))
@@ -1849,6 +1891,81 @@ def self_test():
         "rustdoc: tilde fence is scanned",
         scan_text('//! ~~~ignore\n//! #[secured(policy = "x")]\n//! ~~~\n', ".rs"),
         [("secured", "policy")],
+    )
+
+    # A Rust fence DISPLAYED inside a non-Rust fence is documentation about a
+    # fence, not one. Every fence is tracked; only Rust ones are judged.
+    check(
+        "markdown: rust fence displayed inside a text fence is not scanned",
+        scan_text(
+            '````text\n```rust\n#[secured(policy = "x")]\n```\n````\n', ".md"
+        ),
+        [],
+    )
+    check(
+        "markdown: a real fence after a text fence is still scanned",
+        scan_text(
+            '```text\n#[secured(policy = "shown")]\n```\n'
+            '```rust\n#[secured(policy = "real")]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: rust fence displayed inside a text fence is not scanned",
+        scan_text(
+            '//! ````text\n//! ```rust\n//! #[secured(policy = "x")]\n//! ```\n//! ````\n',
+            ".rs",
+        ),
+        [],
+    )
+
+    # A proc-macro attribute accepts any delimited token tree.
+    check(
+        "markdown: brace-delimited attribute is inspected",
+        scan_text('```rust\n#[secured { policy = "x" }]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: bracket-delimited attribute is inspected",
+        scan_text('```rust\n#[secured [policy = "x"]]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: brace-delimited with a valid key passes",
+        scan_text('```rust\n#[secured { scopes = ["a:b"] }]\n```\n', ".md"),
+        [],
+    )
+
+    # `#[authorize]` takes its action verb positionally, bare or quoted.
+    check(
+        "markdown: authorize's positional action is not a flag",
+        scan_text("```rust\n#[authorize(update, resource = Post)]\n```\n", ".md"),
+        [],
+    )
+    check(
+        "markdown: authorize's other keys are still judged",
+        scan_text("```rust\n#[authorize(update, bogus = 1)]\n```\n", ".md"),
+        [("authorize", "bogus")],
+    )
+    check(
+        "markdown: the quoted action form still passes",
+        scan_text(
+            '```rust\n#[authorize("update", resource = Post)]\n```\n', ".md"
+        ),
+        [],
+    )
+    # …and the exemption is confined to that macro: elsewhere a leading bare
+    # identifier is a flag and stays judged.
+    check(
+        "markdown: a leading flag on another macro is still judged",
+        scan_text("```rust\n#[job(uniqe)]\n```\n", ".md"),
+        [("job", "uniqe")],
+    )
+    check(
+        "markdown: repository's leading positional and flags both work",
+        scan_text("```rust\n#[repository(Post, api, mcp)]\n```\n", ".md"),
+        [],
     )
 
     check(
