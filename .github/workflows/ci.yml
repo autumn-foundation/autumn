@@ -430,6 +430,34 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-routes.sh --self-test && ./scripts/check-docs-routes.sh
+      - name: Macro argument gate
+        # The seventh thing a reader copies off a page: the keyword arguments
+        # inside an Autumn attribute macro. The gates above cover the links,
+        # commands, `AUTUMN_*` variables, `autumn.toml` keys, `autumn_web::…`
+        # paths and `/actuator/…` URLs; nothing covered the surface the guide
+        # spends most of its Rust on.
+        #
+        # The baseline run found five occurrences of one spelling,
+        # `#[secured(policy = "…")]`, across `docs/guide/downloads.md` (twice),
+        # a `skills/` reference, and the rustdoc module headers of
+        # `autumn/src/download.rs` and `autumn/src/range.rs`. `#[secured]` has
+        # never had a `policy` key — the grammar is bare role literals and/or
+        # `scopes = ["…"]` — so every reader who pasted it got a build error on
+        # their own file. It survived because nothing compiles these fences:
+        # both rustdoc blocks are ```ignore, and markdown fences are compiled
+        # by nothing at all, so the spelling propagated from one file to four.
+        #
+        # Truth set is each macro's accepted keys read straight out of
+        # `autumn-macros/src/`, never a snapshot, so a renamed key lands in the
+        # same commit as the rename. The extractor is deliberately permissive
+        # and a macro whose grammar it cannot read is skipped rather than
+        # failed: a gate that reports a key the macro does accept gets waived
+        # away wholesale, while one that misses a key only fails to catch what
+        # nothing was catching before.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-macro-args.sh --self-test && ./scripts/check-docs-macro-args.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`

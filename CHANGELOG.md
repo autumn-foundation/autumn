@@ -51,6 +51,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Docs gate: Autumn macro arguments are checked against the macros.**
+  `scripts/check-docs-macro-args.sh` joins the docs-only CI job, gating the
+  seventh thing a reader copies off a page: the keyword arguments inside an
+  attribute macro (`#[secured]`, `#[job]`, `#[scheduled]`, `#[cached]`,
+  `#[model]`, `#[repository]` and 14 siblings). The links, commands,
+  `AUTUMN_*` variables, `autumn.toml` keys, `autumn_web::…` paths and
+  `/actuator/…` URLs were already gated; the surface the guide spends most of
+  its Rust on was not. It reads 215 markdown files (1,004 Rust fences) and 593
+  rustdoc sources (872 fences) — the rustdoc half matters because ```ignore
+  blocks ship to docs.rs and nothing compiles them. Accepted keys are read out
+  of `autumn-macros/src/` on every run rather than from a snapshot, so a
+  renamed key lands in the same commit as the rename. Carries `--list` and a
+  20-case `--self-test`. The baseline run found five defects.
+
 - **Migration version gate: starter templates no longer collide with their
   examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror
   of its committed example and the two never coexist in one database, so
@@ -65,6 +79,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now `assert_starter_matches_example(starter, project_name)`, called by both
   the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
+
+- **docs:** the five doc sites that told readers to write
+  `#[secured(policy = "…")]` now use the form the macro parses,
+  `#[secured(scopes = ["…"])]`. `#[secured]` has never had a `policy` key — its
+  grammar is bare role literals and/or `scopes = ["…"]` — so a reader who
+  pasted the annotation onto their own handler got a build error quoting a
+  grammar they had copied in good faith. Two of the five were the rustdoc
+  module headers of `autumn/src/download.rs` and `autumn/src/range.rs`, which
+  land on docs.rs as the reference pages for `Download` and ranged responses;
+  the others were `docs/guide/downloads.md` (twice) and a `skills/` reference.
+  Both rustdoc fences are ```ignore and markdown fences are compiled by
+  nothing, so the spelling propagated from one file into four unchecked. The
+  ability names are corrected to the corpus's own scope convention
+  (`reports:read`, `media:watch`, matching `docs/guide/openapi.md` and
+  `docs/guide/authentication.md`), and `docs/guide/downloads.md` — which had no
+  outbound links at all — now links to the `#[secured]` reference, so a reader
+  who lands mid-task has somewhere to go.
 
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
