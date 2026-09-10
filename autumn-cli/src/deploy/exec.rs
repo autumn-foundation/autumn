@@ -2357,7 +2357,7 @@ pub fn release_id_from_dir(dir: &str) -> Option<&str> {
 /// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
 /// state — all captured in the SAME remote round-trip, so a drifted live-slot
 /// marker can be reconciled against the live proxy and a concurrent `server.port`
-/// change refused, both without a second probe.
+/// change detected, both without a second probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployProbe {
     /// First-vs-redeploy decision (parsed exactly as before from the marker).
@@ -2366,7 +2366,8 @@ pub struct DeployProbe {
     /// the reconcile then falls back to the marker, fail-safe).
     pub proxy_list: String,
     /// The installed kamal-proxy unit's `--http-port` (#2073), used by the redeploy
-    /// path to refuse a concurrent `server.port` change before touching the proxy.
+    /// path to detect a concurrent `server.port` change before touching the proxy
+    /// and resolve it to a [`PublicPortMove`].
     pub installed_proxy_port: InstalledProxyPort,
     /// The proxy TLS/host options the last forward deploy recorded (#2074), used by
     /// the redeploy path to PRESERVE the old release's options on the durability
@@ -4153,8 +4154,10 @@ mod tests {
     /// Redeploy cutover ops: the live release is on blue, so the candidate takes
     /// green (loopback 3002). The cutover re-registers the still-live OLD release at
     /// the DERIVED live-slot port (`plan.live_port`, blue = 3001) — correct because
-    /// the redeploy path refuses a concurrent `server.port` change at pre-flight
-    /// (#2073), so the public port is unchanged and derived == actual.
+    /// `plan.public_port` here IS the port the live release was actually deployed
+    /// under (#2073's `PublicPortMove` is the caller's job to resolve BEFORE
+    /// building this `plan`; this helper builds it already-resolved, as if
+    /// unchanged), so derived == actual.
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
         sample_cutover_ops_with(env, MigrateStep::Run)
     }
@@ -5544,6 +5547,30 @@ mod tests {
         assert!(
             restart.shell.contains("--target '127.0.0.1:3002'"),
             "the re-register targets the NOW-LIVE release's loopback port: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn public_port_rebind_ops_threads_tls_and_host_through_the_reregister() {
+        // The phase-4 rebind must carry the now-live release's OWN TLS/host, exactly
+        // as `refresh_installed_ops` does for any other re-register (#2074's own TLS
+        // tests exhaustively cover the underlying mechanism; this only confirms the
+        // wrapper forwards `reregister_options` unchanged).
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: true,
+            host: Some("app.example.com".to_owned()),
+        };
+        let controller = super::super::proxy::KamalProxyController::new(60)
+            .with_tls_host(Some("app.example.com".to_owned()));
+        let ops = public_port_rebind_ops(&cfg, &controller, RELEASE_ID, 3002, &options, 8080);
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert!(
+            restart.shell.contains("--host 'app.example.com' --tls"),
+            "the phase-4 re-register carries the release's own TLS/host: {}",
             restart.shell,
         );
     }

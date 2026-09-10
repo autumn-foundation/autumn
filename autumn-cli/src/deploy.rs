@@ -4172,11 +4172,20 @@ where
         // already cut over is left behind.
         // Repair the drifted marker as an early op — before the cutover's
         // record-previous-release reads it — so the on-disk marker matches the proxy
-        // truth even if the rest of the deploy is interrupted.
+        // truth even if the rest of the deploy is interrupted. Uses `state.slots
+        // .public_port` — the EFFECTIVE public port `probe_host_for_up` planned this
+        // host's slots from (the OLD port across a detected `server.port` move,
+        // #2073) — never `input.public_port` (the newly requested one): the repair
+        // must persist the port the live release ACTUALLY binds, not one derived
+        // from a port that has not taken effect yet.
         if state.repair {
             ops.insert(
                 0,
-                exec::live_slot_marker_repair_op(cfg, state.slots.live_slot, input.public_port),
+                exec::live_slot_marker_repair_op(
+                    cfg,
+                    state.slots.live_slot,
+                    state.slots.public_port,
+                ),
             );
         }
         // Host preparation goes in AFTER the repair insert so it ends up ahead of
@@ -4268,16 +4277,17 @@ where
                         if single {
                             return Err(DeployError::Exec(rebind_err.to_string()));
                         }
-                        outcomes[index] = fleet::HostOutcome::Degraded {
-                            label: "public-port-rebind",
-                        };
-                        degraded.push((host_plan.host.clone(), "public-port-rebind"));
                         match rebind_err {
                             // The release is live and reachable at the OLD port — a
-                            // recoverable, traffic-healthy degradation, so the
-                            // rollout continues past it (matching every other
-                            // post-cutover housekeeping failure).
+                            // recoverable, traffic-healthy degradation (exactly what
+                            // `Degraded` means elsewhere), so the rollout continues
+                            // past it like every other post-cutover housekeeping
+                            // failure.
                             exec::PublicPortRebindError::RolledBack { .. } => {
+                                outcomes[index] = fleet::HostOutcome::Degraded {
+                                    label: "public-port-rebind",
+                                };
+                                degraded.push((host_plan.host.clone(), "public-port-rebind"));
                                 eprintln!(
                                     "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} \
                                      {rebind_err}\n",
@@ -4287,13 +4297,23 @@ where
                                 );
                                 continue;
                             }
-                            // The proxy's public bind is now unknown — unlike every
-                            // other post-cutover failure this may mean traffic is
-                            // NOT reachable, so halt rather than roll forward.
+                            // The proxy's public bind is now unknown — unlike a
+                            // `Degraded` host this one may NOT be reachable, so it
+                            // must never be reported as "traffic is fine" (that is
+                            // `Degraded`'s fixed summary text) and must never be
+                            // auto-compensated by an ordinary proxy-flip rollback,
+                            // which could target a proxy that is not even listening.
+                            // `Manual` is the existing "needs a human, do not touch"
+                            // outcome (mirrors `AmbiguousMarkers`) — halt rather than
+                            // roll forward.
                             exec::PublicPortRebindError::RollbackFailed { .. } => {
+                                outcomes[index] = fleet::HostOutcome::Manual {
+                                    reason: fleet::MANUAL_PUBLIC_PORT_UNKNOWN,
+                                };
                                 eprintln!(
-                                    "\n\u{274C} rollout halted at {} \
-                                     (`public-port-rebind`) \u{2014} {rebind_err}\n",
+                                    "\n\u{274C} rollout halted at {} (`public-port-rebind`) \
+                                     \u{2014} the remaining hosts were not touched \u{2014} \
+                                     {rebind_err}\n",
                                     host_plan.host,
                                 );
                                 halt = Some((host_plan.host.clone(), "public-port-rebind"));
@@ -5800,6 +5820,100 @@ mod tests {
             restart_shells[1].contains("--target '127.0.0.1:82'"),
             "phase 4 re-registers the candidate's OWN loopback port: {}",
             restart_shells[1],
+        );
+    }
+
+    #[test]
+    fn a_public_port_rebind_failure_degrades_the_host_and_continues_the_rollout() {
+        // #2073 Option C, fleet path: web-a's phase-4 rebind fails once (its FORWARD
+        // restart, the label's 2nd occurrence — the 1st is the cutover's own
+        // durability-refresh call, an unrelated no-op) but the rollback to the old
+        // port succeeds. Traffic stays healthy at the old port, so the rollout
+        // continues past web-a onto web-b.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let probe_a = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe_a)
+            .script("web-a", "probe-release-dir", "absent")
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 2);
+        let recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a rolled-back port move degrades a host but never halts the rollout");
+
+        let labels_a = recorder.run_labels_for("web-a");
+        assert_eq!(
+            labels_a
+                .iter()
+                .filter(|l| **l == "proxy-restart-if-changed")
+                .count(),
+            3,
+            "one no-op from the cutover's own durability refresh, one FAILING phase-4 \
+             forward attempt, one SUCCEEDING phase-4 rollback attempt: {labels_a:?}"
+        );
+        // The rollout continued past web-a's degradation onto web-b.
+        assert!(
+            recorder.run_labels_for("web-b").contains(&"drain-old"),
+            "web-b must still be deployed after web-a degrades: {:?}",
+            recorder.run_labels_for("web-b")
+        );
+    }
+
+    #[test]
+    fn a_public_port_rebind_double_failure_halts_the_rollout_as_manual() {
+        // #2073 Option C, fleet path: web-a's phase-4 rebind fails AND its own
+        // rollback ALSO fails (occurrences 2 and 3 of the label — occurrence 1, the
+        // cutover's own durability-refresh call, still succeeds so the cutover
+        // itself lands normally). The proxy's public bind on web-a is now unknown,
+        // so the rollout halts rather than rolling forward onto web-b, and web-a is
+        // reported `Manual` — never `Degraded` (which would falsely claim "traffic
+        // is fine").
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let probe_a = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe_a)
+            .script("web-a", "probe-release-dir", "absent")
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 2)
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 3);
+        let recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a doubly-failed port move must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-a");
+        assert_eq!(halt.failed_step, "public-port-rebind");
+        assert_eq!(
+            halt.manual,
+            vec![("web-a".to_owned(), fleet::MANUAL_PUBLIC_PORT_UNKNOWN)],
+            "web-a must be reported Manual (needs a human), never Degraded, which \
+             would falsely claim traffic is fine"
+        );
+        assert!(
+            halt.degraded.is_empty(),
+            "web-a's unknown public bind must not be counted as a healthy degradation: \
+             {:?}",
+            halt.degraded,
+        );
+        // web-b was graded (the fleet-wide probe phase runs before any host is
+        // mutated) but never MUTATED — the halt happened at the first host.
+        assert!(
+            recorder
+                .run_labels_for("web-b")
+                .iter()
+                .all(|l| READ_ONLY_PROBES.contains(l)),
+            "web-b must not be mutated once the rollout halts at web-a: {:?}",
+            recorder.run_labels_for("web-b")
         );
     }
 
