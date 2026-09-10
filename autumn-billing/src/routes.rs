@@ -33,7 +33,9 @@ use std::sync::Arc;
 
 use autumn_web::negotiate::{Format, Negotiate};
 use autumn_web::reexports::axum::body::Bytes;
-use autumn_web::reexports::axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request, State};
+use autumn_web::reexports::axum::extract::{
+    FromRequest, FromRequestParts, OriginalUri, Request, State,
+};
 use autumn_web::reexports::axum::response::{IntoResponse, Redirect, Response};
 use autumn_web::reexports::axum::routing::{get, post};
 use autumn_web::reexports::axum::{Json, Router};
@@ -46,6 +48,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::BillingService;
 use crate::config::BillingConfig;
 use crate::error::BillingError;
 use crate::gate::{Billing, session_user_id};
@@ -54,7 +57,6 @@ use crate::plan::{Plan, PlanId};
 use crate::provider::{CheckoutRequest, CustomerRequest, HostedSession, PortalRequest};
 use crate::reconcile::{self, ReconcileOutcome};
 use crate::store::CustomerUpsert;
-use crate::BillingService;
 
 /// The plugin router (paths relative to the prefix).
 pub fn router(config: &BillingConfig) -> Router<AppState> {
@@ -161,7 +163,7 @@ fn parse_body<T: DeserializeOwned>(headers: &HeaderMap, body: &[u8]) -> Result<T
 }
 
 /// 303 for a browser, JSON for an API client.
-fn hosted_response(negotiate: &Negotiate, session: HostedSession) -> Response {
+fn hosted_response(negotiate: &Negotiate, session: &HostedSession) -> Response {
     match negotiate.format() {
         Format::Json => Json(json!({ "url": session.url, "id": session.id })).into_response(),
         Format::Html => Redirect::to(&session.url).into_response(),
@@ -245,7 +247,7 @@ async fn checkout(
         .create_checkout(request)
         .await
         .map_err(BillingError::into_autumn)?;
-    Ok(hosted_response(&negotiate, session))
+    Ok(hosted_response(&negotiate, &session))
 }
 
 /// `POST {prefix}/portal` — open the hosted billing portal.
@@ -270,7 +272,7 @@ async fn portal(
         .create_portal(request)
         .await
         .map_err(BillingError::into_autumn)?;
-    Ok(hosted_response(&negotiate, session))
+    Ok(hosted_response(&negotiate, &session))
 }
 
 /// `GET {prefix}/subscription` — the mirror view. Never calls the provider.

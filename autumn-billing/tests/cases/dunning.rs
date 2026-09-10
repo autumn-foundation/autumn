@@ -31,7 +31,8 @@ fn clocked(app: TestApp) -> TestApp {
 
 /// Build an app on `store` and `provider` with `billing`, then mirror a linked
 /// customer, an active subscription and one failed invoice (dunning row
-/// attempt 1, due at `at(3600)`).
+/// attempt 1, due at `at(3600)`). Event times lie before the app clock
+/// (`base_time()`), as they do in production.
 async fn dunning_harness(
     billing: BillingConfig,
     store: Arc<MemoryBillingStore>,
@@ -40,7 +41,7 @@ async fn dunning_harness(
     let h = harness_with_hooks(billing, Arc::new(NoHooks), store, provider, clocked);
     h.store
         .upsert_customer(
-            CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(-300))
                 .with_user("42")
                 .with_email("a@example.test"),
         )
@@ -50,7 +51,7 @@ async fn dunning_harness(
         SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
             .with_price(PRO_PRICE),
     );
-    apply_event(&h.client, event("evt_sub", at(100), sub))
+    apply_event(&h.client, event("evt_sub", at(-200), sub))
         .await
         .unwrap();
     let failed = BillingEventKind::InvoicePaymentFailed(
@@ -63,7 +64,7 @@ async fn dunning_harness(
         .with_subscription("sub_1")
         .with_attempt_count(1),
     );
-    apply_event(&h.client, event("evt_fail", at(200), failed))
+    apply_event(&h.client, event("evt_fail", at(-100), failed))
         .await
         .unwrap();
     h.client.assert_job_enqueued(RETRY_JOB_NAME);
@@ -287,19 +288,23 @@ async fn transport_error_keeps_the_row_pending_and_fails_the_job() {
         notification_kinds(&h.client, RECIPIENT).await,
         ["billing.payment_failed"]
     );
-    // The framework's retry finds the row still due and claims it again.
+    // The framework's retry (same job, next attempt) finds the row still due
+    // and claims it again. Run the handler the way the runtime would.
     h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
-    let service = autumn_billing::BillingService::require(h.client.state()).unwrap();
-    let invoice = invoice(&h).await;
-    let again = autumn_web::job::enqueue(
-        RETRY_JOB_NAME,
-        serde_json::json!({ "invoice_id": invoice.id }),
-    );
-    // Direct enqueue goes through the worker; assert via the store.
-    again.await.unwrap();
-    wait_for(|| async { row(&h).await.state == DunningState::Recovered }).await;
+    let open_invoice = invoice(&h).await;
+    let job = autumn_billing::dunning::job_infos()
+        .into_iter()
+        .find(|info| info.name == RETRY_JOB_NAME)
+        .expect("retry job registered");
+    (job.handler)(
+        h.client.state().clone(),
+        serde_json::json!({ "invoice_id": open_invoice.id }),
+    )
+    .await
+    .unwrap();
     assert_eq!(h.provider.retry_calls(), 2);
-    drop(service);
+    assert_eq!(row(&h).await.state, DunningState::Recovered);
+    assert_eq!(invoice(&h).await.status, InvoiceStatus::Paid);
 }
 
 /// Poll `check` every 25 ms for up to five seconds.

@@ -69,13 +69,39 @@ pub(crate) fn due_at(now: DateTime<Utc>, delay: Duration) -> Result<DateTime<Utc
         .ok_or_else(|| BillingError::Config("dunning delay overflows the calendar".to_owned()))
 }
 
+/// This app's job client: the runtime installs it on `AppState`; the
+/// process-global client is the fallback.
+///
+/// # Errors
+///
+/// Returns [`BillingError::Store`] when no job runtime is started.
+pub(crate) fn job_client(state: &AppState) -> Result<Arc<JobClient>, BillingError> {
+    state
+        .extension::<JobClient>()
+        .or_else(job::global_job_client)
+        .ok_or_else(|| BillingError::store("job runtime is not started"))
+}
+
 /// Put the retry for `invoice_id` on the queue at `when`. A uniqueness
 /// coalesce (an equivalent job already waits) is a success.
-async fn schedule(invoice_id: &str, when: DateTime<Utc>) -> Result<(), BillingError> {
-    let args = DunningRetryArgs {
+///
+/// # Errors
+///
+/// Returns [`BillingError::Store`] when the job cannot be queued.
+pub(crate) async fn schedule(
+    state: &AppState,
+    invoice_id: &str,
+    when: DateTime<Utc>,
+) -> Result<(), BillingError> {
+    let client = job_client(state)?;
+    let payload = serde_json::to_value(DunningRetryArgs {
         invoice_id: invoice_id.to_owned(),
-    };
-    match DunningRetryJob::enqueue_at(args, when).await {
+    })
+    .map_err(|error| BillingError::store(format!("dunning args: {error}")))?;
+    match client
+        .enqueue_due(RETRY_JOB_NAME, payload, Some(when))
+        .await
+    {
         Ok(()) => Ok(()),
         Err(error) if error.to_string().contains("unique job is already") => {
             tracing::debug!(invoice_id, "🍂 Autumn Billing: retry already queued");
@@ -96,7 +122,10 @@ async fn run_retry(
     let store = service.store();
     let now = state.clock().now();
     let Some(row) = store.dunning_by_invoice(invoice_id).await? else {
-        tracing::debug!(invoice_id, "🍂 Autumn Billing: no dunning row; retry skipped");
+        tracing::debug!(
+            invoice_id,
+            "🍂 Autumn Billing: no dunning row; retry skipped"
+        );
         return Ok(());
     };
     if row.state != DunningState::Pending {
@@ -113,7 +142,7 @@ async fn run_retry(
             due = %row.next_attempt_at,
             "🍂 Autumn Billing: retry not due; re-queued"
         );
-        return schedule(invoice_id, row.next_attempt_at).await;
+        return schedule(state, invoice_id, row.next_attempt_at).await;
     }
     if !store
         .claim_dunning_attempt(invoice_id, row.attempt, now)
@@ -127,7 +156,10 @@ async fn run_retry(
         return Ok(());
     }
     let Some(invoice) = store.invoice_by_id(invoice_id).await? else {
-        tracing::error!(invoice_id, "🍂 Autumn Billing: dunning row without an invoice");
+        tracing::error!(
+            invoice_id,
+            "🍂 Autumn Billing: dunning row without an invoice"
+        );
         restore_pending(service, &row, now).await?;
         return Err(BillingError::NotFound("invoice"));
     };
@@ -243,7 +275,7 @@ async fn declined(
         row.state = DunningState::Pending;
         row.updated_at = now;
         store.upsert_dunning(row.clone()).await?;
-        schedule(&invoice.id, due).await?;
+        schedule(state, &invoice.id, due).await?;
         tracing::info!(
             invoice_id = %invoice.id,
             attempt = next,
@@ -275,26 +307,25 @@ async fn declined(
             .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)
             .await?;
         if action == ExhaustionAction::CancelSubscription {
-            match subscription {
-                Some(subscription) => {
-                    if let Err(error) = service
-                        .provider()
-                        .cancel_subscription(&subscription.provider_subscription_id)
-                        .await
-                    {
-                        // The mirror says unpaid; the operator reconciles the provider.
-                        tracing::error!(
-                            subscription_id,
-                            provider_subscription_id = %subscription.provider_subscription_id,
-                            error = %error,
-                            "🍂 Autumn Billing: provider cancel failed after dunning exhausted"
-                        );
-                    }
+            if let Some(subscription) = subscription {
+                if let Err(error) = service
+                    .provider()
+                    .cancel_subscription(&subscription.provider_subscription_id)
+                    .await
+                {
+                    // The mirror says unpaid; the operator reconciles the provider.
+                    tracing::error!(
+                        subscription_id,
+                        provider_subscription_id = %subscription.provider_subscription_id,
+                        error = %error,
+                        "🍂 Autumn Billing: provider cancel failed after dunning exhausted"
+                    );
                 }
-                None => tracing::warn!(
+            } else {
+                tracing::warn!(
                     subscription_id,
                     "🍂 Autumn Billing: dunning exhausted for an unknown subscription"
-                ),
+                );
             }
         }
     }
@@ -330,12 +361,12 @@ pub fn rearm_pending(state: AppState, service: Arc<BillingService>) {
         return;
     };
     handle.spawn(async move {
-        let Some(client) = wait_for_job_client(&state).await else {
+        if !wait_for_job_client(&state).await {
             tracing::warn!(
                 "🍂 Autumn Billing: job runtime did not start within {REARM_WAIT:?}; dunning rows not re-armed"
             );
             return;
-        };
+        }
         let rows = match service.store().open_dunning().await {
             Ok(rows) => rows,
             Err(error) => {
@@ -345,7 +376,7 @@ pub fn rearm_pending(state: AppState, service: Arc<BillingService>) {
         };
         let mut armed = 0_usize;
         for row in rows {
-            if rearm_row(&state, &service, &client, row).await {
+            if rearm_row(&state, &service, row).await {
                 armed = armed.saturating_add(1);
             }
         }
@@ -356,12 +387,7 @@ pub fn rearm_pending(state: AppState, service: Arc<BillingService>) {
 }
 
 /// Queue one open row. A row left `Running` by a crash runs now.
-async fn rearm_row(
-    state: &AppState,
-    service: &BillingService,
-    client: &JobClient,
-    mut row: DunningAttempt,
-) -> bool {
+async fn rearm_row(state: &AppState, service: &BillingService, mut row: DunningAttempt) -> bool {
     if row.state == DunningState::Running {
         let now = state.clock().now();
         row.state = DunningState::Pending;
@@ -376,21 +402,8 @@ async fn rearm_row(
             return false;
         }
     }
-    let payload = match serde_json::to_value(DunningRetryArgs {
-        invoice_id: row.invoice_id.clone(),
-    }) {
-        Ok(payload) => payload,
-        Err(error) => {
-            tracing::warn!(error = %error, "🍂 Autumn Billing: dunning args not serializable");
-            return false;
-        }
-    };
-    match client
-        .enqueue_due(RETRY_JOB_NAME, payload, Some(row.next_attempt_at))
-        .await
-    {
+    match schedule(state, &row.invoice_id, row.next_attempt_at).await {
         Ok(()) => true,
-        Err(error) if error.to_string().contains("unique job is already") => true,
         Err(error) => {
             tracing::warn!(
                 invoice_id = %row.invoice_id,
@@ -402,15 +415,15 @@ async fn rearm_row(
     }
 }
 
-/// This app's job client, once the runtime installed it.
-async fn wait_for_job_client(state: &AppState) -> Option<Arc<JobClient>> {
+/// `true` once the job runtime installed its client on `state`.
+async fn wait_for_job_client(state: &AppState) -> bool {
     let deadline = tokio::time::Instant::now() + REARM_WAIT;
     loop {
-        if let Some(client) = state.extension::<JobClient>() {
-            return Some(client);
+        if state.extension::<JobClient>().is_some() {
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return false;
         }
         tokio::time::sleep(REARM_POLL).await;
     }

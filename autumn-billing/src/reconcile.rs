@@ -25,7 +25,7 @@
 use autumn_web::AppState;
 use chrono::{DateTime, Utc};
 
-use crate::dunning::{self, DunningRetryArgs, DunningRetryJob};
+use crate::dunning;
 use crate::error::BillingError;
 use crate::event::{
     BillingEvent, BillingEventKind, CheckoutSnapshot, InvoiceSnapshot, SubscriptionSnapshot,
@@ -332,7 +332,10 @@ impl Ctx<'_> {
 
     /// The open schedule row for `invoice`: kept when one is in progress,
     /// else a new first attempt.
-    async fn open_dunning(&self, invoice: &Invoice) -> Result<Option<DunningAttempt>, BillingError> {
+    async fn open_dunning(
+        &self,
+        invoice: &Invoice,
+    ) -> Result<Option<DunningAttempt>, BillingError> {
         let store = self.service.store();
         if let Some(row) = store.dunning_by_invoice(&invoice.id).await?
             && matches!(row.state, DunningState::Pending | DunningState::Running)
@@ -364,14 +367,7 @@ impl Ctx<'_> {
             row = row.with_subscription(subscription_id.clone());
         }
         store.upsert_dunning(row.clone()).await?;
-        DunningRetryJob::enqueue_at(
-            DunningRetryArgs {
-                invoice_id: invoice.id.clone(),
-            },
-            due,
-        )
-        .await
-        .map_err(|error| BillingError::store(format!("enqueue dunning retry: {error}")))?;
+        dunning::schedule(self.state, &invoice.id, due).await?;
         tracing::info!(
             invoice_id = %invoice.id,
             due = %due,

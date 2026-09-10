@@ -48,13 +48,14 @@ pub(crate) async fn send_to_customer(
         .user_id
         .as_deref()
         .and_then(|user_id| service.hooks().recipient_for(user_id));
-    match recipient {
-        Some(recipient) => send(state, recipient, kind, payload).await,
-        None => tracing::debug!(
+    if let Some(recipient) = recipient {
+        send(state, recipient, kind, payload).await;
+    } else {
+        tracing::debug!(
             kind,
             customer_id = %customer.id,
             "🍂 Autumn Billing: no notification recipient for customer; skipped"
-        ),
+        );
     }
 }
 

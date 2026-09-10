@@ -372,7 +372,9 @@ async fn webhook_malformed_event_is_500_so_the_provider_redelivers() {
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         pinned,
     );
-    let resp = support::post_webhook(&h.client, b"{\"not\": \"an event\"}").await;
+    // The delivery id is present, so `SignedWebhook` accepts the request;
+    // the body is not a `BillingEvent`.
+    let resp = support::post_webhook(&h.client, br#"{"id":"evt_bad_1","kind":"nope"}"#).await;
     assert_eq!(resp.status.as_u16(), 500, "{}", resp.text());
     assert_eq!(h.store.applied_event_count().await.unwrap(), 0);
 }

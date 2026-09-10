@@ -199,7 +199,8 @@ impl Billing {
     /// Join the plan and evaluate entitlement.
     fn view(&self, subscription: Subscription) -> SubscriptionView {
         let plan = resolve_plan(self.service.catalog(), &subscription).cloned();
-        let entitled = plan.is_some() && self.status_ok(subscription.status) && self.in_period(&subscription);
+        let entitled =
+            plan.is_some() && self.status_ok(subscription.status) && self.in_period(&subscription);
         SubscriptionView {
             subscription,
             plan,
