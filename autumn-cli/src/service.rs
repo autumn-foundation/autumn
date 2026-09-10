@@ -73,6 +73,15 @@ const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// stop uses.
 const STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
 
+/// Ceiling on the reported wait hint.
+///
+/// The Service Control Manager carries it as milliseconds in a `u32`, and
+/// `windows-service` **panics** converting anything larger. The budget comes
+/// from user config, so an absurd `shutdown_timeout_secs` would otherwise take
+/// down the service host mid-stop — leaving the service stuck in `StopPending`
+/// until the SCM gives up. A day is far beyond any real drain.
+const MAX_WAIT_HINT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// How often the service host checks on its app child and for a stop request.
 ///
 /// Short relative to any real drain: `autumn serve stop` creates the request
@@ -129,7 +138,28 @@ pub fn service_description(working_dir: &std::path::Path) -> String {
 /// draining correctly.
 #[must_use]
 pub fn stop_wait_hint(drain_budget_secs: u64) -> Duration {
-    Duration::from_secs(drain_budget_secs).saturating_add(STOP_HOOK_HEADROOM)
+    Duration::from_secs(drain_budget_secs)
+        .saturating_add(STOP_HOOK_HEADROOM)
+        .min(MAX_WAIT_HINT)
+}
+
+/// Whether a stop has been asked for, given what the last poll saw.
+///
+/// Latching, and checked BEFORE the child is reaped. `autumn serve stop` creates
+/// the request file and only then waits out the drain — seconds at minimum — so
+/// the request is always visible first; latching means the cleanup that later
+/// removes that file cannot turn an operator's stop into a phantom crash and
+/// trigger a restart the operator did not want.
+///
+/// Pure, so the Windows service host's crash-versus-stop decision is unit-tested
+/// on every platform rather than only by a fifteen-minute CI wait.
+#[must_use]
+pub fn stop_was_requested(
+    already_seen: bool,
+    control_asked: bool,
+    request_file_exists: bool,
+) -> bool {
+    already_seen || control_asked || request_file_exists
 }
 
 /// Whether an app-child exit should be reported to the Service Control Manager
@@ -143,6 +173,36 @@ pub fn stop_wait_hint(drain_budget_secs: u64) -> Duration {
 #[must_use]
 pub fn exit_is_intentional(stop_requested: bool, exit_code: Option<i32>) -> bool {
     stop_requested || exit_code == Some(0)
+}
+
+/// The drain budget to assume when the daemon has not recorded one.
+///
+/// Never zero. The service host reads `serve.addr`'s `stop_budget_secs`, and a
+/// missing or unreadable record — a partial write, or a concurrent
+/// `autumn serve stop` that already cleaned up — would otherwise yield `0` and
+/// make every subsequent SCM stop a force-kill after the bare grace buffer. That
+/// is precisely the "hard kill that skips shutdown hooks" this slice exists to
+/// eliminate, reachable through `sc.exe stop`.
+pub const FALLBACK_DRAIN_BUDGET_SECS: u64 = 60;
+
+/// The drain budget to record at install time, resolved from the project's own
+/// configuration under the profile the service will run.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "the Windows service arm, compiled and tested everywhere"
+    )
+)]
+fn install_budget_secs(opts: &crate::serve::ServeOptions) -> u64 {
+    let base_dir = opts
+        .package
+        .as_deref()
+        .and_then(crate::dev::find_manifest_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let profile = crate::serve::effective_profile(opts.profile.as_deref(), opts.release);
+    let (prestop, shutdown) = crate::serve::resolve_shutdown_budget(&base_dir, Some(&profile));
+    prestop.saturating_add(shutdown)
 }
 
 /// What `install-service` records for `run-service` to read back.
@@ -404,6 +464,9 @@ mod windows_impl {
             // The same budget a `--daemon` start allows, so a first boot that
             // provisions a managed cluster is not called a failure.
             serve::start_ready_timeout(opts.bundled_pg),
+            // And the same drain budget the app resolved for itself, so a
+            // machine shutdown is not shorter than a `stop`.
+            stop_wait_hint(super::install_budget_secs(opts)),
         ) {
             eprintln!("autumn serve install-service: {e}");
             return 1;
@@ -423,6 +486,7 @@ mod windows_impl {
         working_dir: &std::path::Path,
         record_path: &std::path::Path,
         start_timeout: Duration,
+        preshutdown_timeout: Duration,
     ) -> Result<(), String> {
         let manager = ServiceManager::local_computer(
             None::<&str>,
@@ -490,6 +554,11 @@ mod windows_impl {
         service
             .set_failure_actions_on_non_crash_failures(true)
             .map_err(|e| format!("cannot arm the service restart policy: {e}"))?;
+        // Give the drain the same budget at machine shutdown that it gets from a
+        // plain `sc stop`. Best-effort: an older Windows that refuses this still
+        // gets the 180-second `PRESHUTDOWN` default, which beats the 5-second
+        // `SHUTDOWN` share by a wide margin.
+        let _ = service.set_preshutdown_timeout(preshutdown_timeout);
         service
             .start::<&std::ffi::OsStr>(&[])
             .map_err(|e| format!("registered the service but could not start it: {e}"))?;
@@ -529,14 +598,24 @@ mod windows_impl {
         let paths = RuntimePaths::resolve(&identity).ok();
 
         let deregistered = match deregister(&name) {
-            Ok(()) => true,
+            Ok(Deregistered::Removed | Deregistered::WasNotRegistered) => true,
             Err(e) => {
                 eprintln!("autumn serve uninstall-service: {e}");
                 false
             }
         };
-        // Clean up regardless of whether the SCM entry was there: a half-removed
-        // install is exactly when leftovers strand the next one.
+        // Only once the SCM entry is gone. Removing the record while the service
+        // is still registered `AutoStart` leaves a host that cannot read its own
+        // configuration, cannot log why, and is restarted forever by the very
+        // failure policy this command was asked to remove.
+        if !deregistered {
+            eprintln!(
+                "autumn serve uninstall-service: `{name}` is still registered, so \
+                 its state was left in place. Stop it (`sc.exe stop {name}`) and \
+                 retry."
+            );
+            return 1;
+        }
         if let Some(paths) = paths.as_ref() {
             // A managed cluster outlives the app when a stop had to escalate, so
             // reap it before removing the records that identify it. The data
@@ -545,9 +624,6 @@ mod windows_impl {
             serve::reap_managed_postgres_for(paths);
             serve::cleanup_daemon_state(paths);
             let _ = std::fs::remove_file(paths.service_record_file());
-        }
-        if !deregistered {
-            return 1;
         }
         println!("autumn serve: removed the Windows service `{name}`");
         if let Some(paths) = paths.as_ref() {
@@ -560,7 +636,16 @@ mod windows_impl {
     }
 
     /// Stop (if running) and delete the SCM entry.
-    fn deregister(name: &str) -> Result<(), String> {
+    /// What [`deregister`] found.
+    enum Deregistered {
+        /// The SCM entry was there and is now gone.
+        Removed,
+        /// There was no such service — an uninstall of a half-installed project,
+        /// which still has state worth cleaning up.
+        WasNotRegistered,
+    }
+
+    fn deregister(name: &str) -> Result<Deregistered, String> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| {
             format!(
@@ -568,12 +653,13 @@ mod windows_impl {
                      service needs an elevated (Administrator) shell."
             )
         })?;
-        let service = manager
-            .open_service(
-                name,
-                ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
-            )
-            .map_err(|e| format!("no registered service `{name}` to remove ({e})"))?;
+        let Ok(service) = manager.open_service(
+            name,
+            ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
+        ) else {
+            // Nothing registered. Not an error: the operator asked for it gone.
+            return Ok(Deregistered::WasNotRegistered);
+        };
         let state = |service: &windows_service::service::Service| {
             service.query_status().map(|s| s.current_state)
         };
@@ -600,6 +686,7 @@ mod windows_impl {
         }
         service
             .delete()
+            .map(|()| Deregistered::Removed)
             .map_err(|e| format!("cannot deregister `{name}`: {e}"))
     }
 
@@ -707,8 +794,11 @@ mod windows_impl {
             // request is always visible first — and latching it here means the
             // later cleanup that removes the file cannot turn an operator's stop
             // into a phantom crash.
-            saw_stop_request =
-                saw_stop_request || stop_requested.load(Ordering::SeqCst) || stop_file.exists();
+            saw_stop_request = super::stop_was_requested(
+                saw_stop_request,
+                stop_requested.load(Ordering::SeqCst),
+                stop_file.exists(),
+            );
             if saw_stop_request && !announced_stop {
                 // Tell the Service Control Manager how long this will take, or it
                 // declares a correctly-draining service hung.
@@ -750,7 +840,7 @@ mod windows_impl {
             ServiceControl::Interrogate => {
                 service_control_handler::ServiceControlHandlerResult::NoError
             }
-            ServiceControl::Stop | ServiceControl::Shutdown => {
+            ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
                 let _ = process::create_stop_request(&stop_file);
                 stop_requested.store(true, Ordering::SeqCst);
                 service_control_handler::ServiceControlHandlerResult::NoError
@@ -791,8 +881,16 @@ mod windows_impl {
                 .set_service_status(ServiceStatus {
                     service_type: ServiceType::OWN_PROCESS,
                     current_state: state,
+                    // `PRESHUTDOWN`, not `SHUTDOWN`. A machine shutdown gives
+                    // every `SHUTDOWN`-accepting service a share of
+                    // `WaitToKillServiceTimeout` — 5 seconds by default — and no
+                    // wait hint extends it, so an app with a 30-second drain
+                    // would be terminated mid-drain on every reboot and its
+                    // managed cluster left for WAL recovery. `PRESHUTDOWN` runs
+                    // earlier, with a 180-second default we raise to cover the
+                    // app's own budget. The two flags are mutually exclusive.
                     controls_accepted: if state == ServiceState::Running {
-                        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+                        ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN
                     } else {
                         ServiceControlAccept::empty()
                     },
@@ -831,7 +929,10 @@ mod windows_impl {
             Duration::default(),
         )?;
 
-        let budget = serve::recorded_stop_budget(&paths).unwrap_or_default();
+        // Never `unwrap_or_default()`: a zero budget turns every SCM stop into a
+        // force-kill after the grace buffer alone.
+        let budget =
+            serve::recorded_stop_budget(&paths).unwrap_or(super::FALLBACK_DRAIN_BUDGET_SECS);
         let (app_exit_code, saw_stop_request) = watch_app(
             &mut child,
             &paths,
@@ -907,10 +1008,30 @@ mod tests {
     }
 
     #[test]
-    fn stop_wait_hint_does_not_overflow_on_an_absurd_budget() {
-        // The budget comes from user config, and a wrapping add would produce a
-        // tiny hint — the failure mode, arrived at by arithmetic.
-        assert!(stop_wait_hint(u64::MAX) >= Duration::from_secs(u64::MAX - 1));
+    fn stop_wait_hint_is_clamped_to_what_the_scm_can_carry() {
+        // The budget comes from user config. A wrapping add would produce a tiny
+        // hint; an unclamped one PANICS inside `windows-service`, which converts
+        // it to `u32` milliseconds — taking down the service host mid-stop and
+        // stranding the service in `StopPending`.
+        let hint = stop_wait_hint(u64::MAX);
+        assert_eq!(hint, MAX_WAIT_HINT);
+        assert!(
+            u32::try_from(hint.as_millis()).is_ok(),
+            "the SCM carries the hint as u32 milliseconds"
+        );
+        // Real budgets are untouched.
+        assert!(stop_wait_hint(35) < MAX_WAIT_HINT);
+    }
+
+    #[test]
+    fn the_fallback_drain_budget_is_never_zero() {
+        // The service host uses it when `serve.addr` cannot be read. Zero would
+        // make `sc.exe stop` force-kill after the grace buffer alone — a hard
+        // kill that skips shutdown hooks, which is the outcome this whole slice
+        // exists to eliminate.
+        assert_ne!(FALLBACK_DRAIN_BUDGET_SECS, 0);
+        // And it survives into the hint the SCM is told to wait for.
+        assert!(stop_wait_hint(FALLBACK_DRAIN_BUDGET_SECS) > STOP_HOOK_HEADROOM);
     }
 
     #[test]
@@ -924,6 +1045,37 @@ mod tests {
     #[test]
     fn a_clean_exit_is_intentional_even_with_no_stop_request() {
         assert!(exit_is_intentional(false, Some(0)));
+    }
+
+    #[test]
+    fn a_stop_request_latches_once_seen() {
+        // `autumn serve stop`'s cleanup removes the request file after the app
+        // exits. Without the latch, the host's next poll would see no request,
+        // read the exit as a crash, and have the SCM restart a daemon the
+        // operator just stopped.
+        assert!(stop_was_requested(true, false, false));
+    }
+
+    #[test]
+    fn either_channel_alone_requests_a_stop() {
+        // The Service Control Manager's handler sets the flag; `autumn serve
+        // stop` only creates the file. Both must count, or one of the two ways
+        // to stop a service-hosted daemon reads as a crash.
+        assert!(stop_was_requested(false, true, false));
+        assert!(stop_was_requested(false, false, true));
+    }
+
+    #[test]
+    fn no_signal_at_all_is_not_a_stop() {
+        assert!(!stop_was_requested(false, false, false));
+    }
+
+    #[test]
+    fn a_latched_stop_survives_an_exit_code_that_looks_like_a_crash() {
+        // The two halves compose: a drain that overran is force-killed (non-zero
+        // exit) but is still the operator's stop, not a crash to restart.
+        let saw = stop_was_requested(false, true, false);
+        assert!(exit_is_intentional(saw, Some(1)));
     }
 
     #[test]

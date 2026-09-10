@@ -2343,25 +2343,40 @@ jobs:
           Write-Host "::group::drain probe log"
           $probes | Write-Host
           Write-Host "::endgroup::"
-          $during = $probes | Where-Object {
+          # `@(...)` on every pipeline: PowerShell unrolls a single-element
+          # result to a scalar, and the indexing below would then slice a STRING.
+          $during = @($probes | Where-Object {
             $parts = $_ -split ','
             ([datetime]::Parse($parts[0], $null, [System.Globalization.DateTimeStyles]::RoundtripKind)) -gt $stopBegan
-          }
+          })
           $servedDuring = @($during | Where-Object { $_ -match ',200$' })
           if ($servedDuring.Count -lt 1) {
             throw "no request succeeded after the stop began — the server stopped accepting immediately instead of draining"
           }
-          # Requests issued while the app is still accepting must all succeed.
-          # Once the drain closes the listener, later probes legitimately fail —
-          # so the assertion is on the run BEFORE the first failure, which is the
-          # window the success metric is about.
-          $firstFailure = $during.IndexOf(($during | Where-Object { $_ -match ',FAIL$' } | Select-Object -First 1))
-          $beforeFailure = if ($firstFailure -lt 0) { $during } else { $during[0..([math]::Max($firstFailure - 1, 0))] }
-          $failedInFlight = @($beforeFailure | Where-Object { $_ -notmatch ',200$' })
-          if ($failedInFlight.Count -gt 0) {
-            throw "requests failed while the server was still accepting: $($failedInFlight -join '; ')"
+
+          # The issue's success metric: 0 failed in-flight requests. Graded as a
+          # CONTIGUOUS run of successes from the moment the stop began until the
+          # drain closes the listener — after which failures are correct and
+          # expected. A naive "everything before the first FAIL succeeded" is
+          # vacuously true (the log's only other value IS `200`), so the real
+          # assertion is that the successful run covers the prestop grace: the
+          # server has to keep answering for the whole window it promised, not
+          # just for one probe.
+          $firstFailureIndex = -1
+          for ($i = 0; $i -lt $during.Count; $i++) {
+            if ($during[$i] -match ',FAIL$') { $firstFailureIndex = $i; break }
           }
-          Write-Host "$($servedDuring.Count) requests completed after the stop began, 0 failed in flight"
+          $servedRun = if ($firstFailureIndex -lt 0) { $during } else { $during[0..$firstFailureIndex] | Select-Object -SkipLast 1 }
+          $servedRun = @($servedRun)
+          if ($servedRun.Count -lt 1) {
+            throw "the very first request after the stop began failed — the listener was dropped, not drained"
+          }
+          $lastServed = [datetime]::Parse(($servedRun[-1] -split ',')[0], $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+          $servedFor = ($lastServed - $stopBegan).TotalSeconds
+          Write-Host "served for $servedFor s after the stop began ($($servedRun.Count) requests, 0 failed in flight)"
+          if ($servedFor -lt 6) {
+            throw "the server stopped accepting $servedFor s into an 8s prestop grace — in-flight requests were cut"
+          }
 
           # The app's on_shutdown hook ran, so the cluster stopped itself and
           # removed its pidfile. A survivor is the orphan #1616/#1639 forbid.
@@ -2420,7 +2435,10 @@ jobs:
           $autumn = "$env:GITHUB_WORKSPACE\target\debug\autumn.exe"
           Set-Location "$env:JOURNEY_DIR\tier1_app"
 
-          & $autumn serve install-service --bundled-pg
+          # Flags belong to `serve`, before the subcommand: `--bundled-pg` is
+          # an argument of `serve`, not of `install-service`, and clap gives
+          # everything after a subcommand name to that subcommand.
+          & $autumn serve --bundled-pg install-service
           if ($LASTEXITCODE -ne 0) { throw "autumn serve install-service failed with $LASTEXITCODE" }
 
           # `doctor` must report the service — AC-6. Take the name from there
@@ -2436,7 +2454,9 @@ jobs:
           }
           $svc = $Matches[1]
           if ($Matches[2] -ne 'Running') { throw "doctor reports `$svc as $($Matches[2]), not Running" }
-          if ($check.detail -notmatch 'daemon running') { throw "doctor did not see the service's app: $($check.detail)" }
+          # `-notmatch 'daemon running'` would never fire: the negative detail
+          # is "no daemon running for this project", which contains it.
+          if ($check.detail -match 'no daemon running') { throw "doctor did not see the service's app: $($check.detail)" }
 
           # (a) starts at boot, and (c) is visible to native Windows tooling.
           $qc = & sc.exe qc $svc | Out-String
@@ -2446,6 +2466,37 @@ jobs:
           $qf = & sc.exe qfailure $svc | Out-String
           Write-Host $qf
           if ($qf -notmatch 'RESTART') { throw "no restart-on-failure action is configured: $qf" }
+
+          # AC-3: a supervisor-stopped server drains. `sc.exe stop` is the OS
+          # service manager asking, and the host must translate it into the SAME
+          # cooperative drain `autumn serve stop` triggers — not a termination.
+          # Graded the way the CLI-stop step is: by wall clock against the
+          # configured prestop grace, which a hard kill cannot satisfy.
+          $env:AUTUMN_SERVER__PRESTOP_GRACE_SECS = "8"
+          $scmStopBegan = Get-Date
+          & sc.exe stop $svc | Write-Host
+          $deadline = (Get-Date).AddMinutes(5)
+          while ((& sc.exe query $svc | Out-String) -notmatch 'STOPPED') {
+            if ((Get-Date) -gt $deadline) { throw "the service did not reach STOPPED after sc.exe stop" }
+            Start-Sleep -Milliseconds 500
+          }
+          $scmStopTook = ((Get-Date) - $scmStopBegan).TotalSeconds
+          Write-Host "sc.exe stop took $scmStopTook s"
+          # A host that force-killed its app would reach STOPPED in well under
+          # the grace the app owes before it stops accepting.
+          if ($scmStopTook -lt 6) {
+            throw "sc.exe stop returned in $scmStopTook s, faster than the 8s prestop grace — the app was terminated, not drained"
+          }
+          # The app's own on_shutdown hook ran, so the cluster stopped itself.
+          $svcPgAfterStop = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'postmaster.pid' -ErrorAction SilentlyContinue
+          if ($svcPgAfterStop) { throw "an SCM stop orphaned the managed cluster: $($svcPgAfterStop.FullName)" }
+          # Back up for the crash test below.
+          & sc.exe start $svc | Write-Host
+          $deadline = (Get-Date).AddMinutes(10)
+          while ((& sc.exe query $svc | Out-String) -notmatch 'RUNNING') {
+            if ((Get-Date) -gt $deadline) { throw "the service did not restart after sc.exe start" }
+            Start-Sleep -Seconds 2
+          }
 
           # The forced crash. Kill the APP, not the host: that is what exercises
           # the host's own supervision reporting a failure to the SCM, which is
@@ -2484,6 +2535,16 @@ jobs:
           if (Test-Path $env:DAEMON_ADDR_FILE) { throw "serve.addr survived uninstall" }
           $records = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'serve.service.toml' -ErrorAction SilentlyContinue
           if ($records) { throw "the service record survived uninstall: $($records.FullName)" }
+          # The AC's third clause: no orphaned managed-Postgres cluster. The
+          # service ran `--bundled-pg`, so its cluster lives under the runtime
+          # dir; a surviving postmaster.pid is the orphan, and a missing
+          # PG_VERSION would mean uninstall deleted the operator's database —
+          # which the command explicitly promises not to do.
+          $svcPg = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'postmaster.pid' -ErrorAction SilentlyContinue
+          if ($svcPg) { throw "uninstall left a managed Postgres running: $($svcPg.FullName)" }
+          $svcData = Get-ChildItem -Path $env:AUTUMN_RUNTIME_DIR -Recurse -Filter 'PG_VERSION' -ErrorAction SilentlyContinue
+          if (-not $svcData) { throw "uninstall removed the managed cluster's data dir; the operator's database must survive" }
+          Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | ForEach-Object { throw "a postgres process survived uninstall (pid $($_.Id))" }
           exit 0
 
       - name: "Policy: Tier 2 commands fail fast, not silently"

@@ -294,6 +294,54 @@ fn the_policy_doc_url_in_the_code_points_at_the_published_guide() {
 }
 
 #[test]
+fn the_windows_journey_job_still_gates_the_daemon_lifecycle() {
+    // #1639 promoted the daemon lifecycle to Tier 1, and a tier promise with no
+    // gate is a wish. The `windows-tier1` job's own meta-test below only checks
+    // that the job exists — these steps could be deleted without a single test
+    // going red, which is exactly how a Tier 1 claim rots back into a Tier 2
+    // reality. Pinned by step name, the way this repo already pins the
+    // cold-start tests it needs named in `generator-conformance.yml`.
+    let ci = read(".github/workflows/ci.yml");
+    for step in [
+        "Journey: the daemon starts, is discoverable, and serves",
+        "Journey: stop drains in-flight requests and stops Postgres cleanly",
+        "Journey: restart brings the daemon back as a new process",
+        "Journey: register a boot-start service that survives a crash",
+    ] {
+        assert!(
+            ci.contains(step),
+            "the Windows journey must still gate `{step}`"
+        );
+    }
+}
+
+#[test]
+fn the_daemon_journey_asserts_the_things_the_acceptance_criteria_name() {
+    // Guards against the steps surviving as names while their assertions are
+    // hollowed out. Each string below is the one that makes its step mean what
+    // its title says.
+    let ci = read(".github/workflows/ci.yml");
+    for (what, needle) in [
+        ("a tcp discovery file", r#"transport\s*=\s*"tcp""#),
+        ("a second start is rejected", "already running"),
+        ("the stop is observably a drain", "prestop grace"),
+        ("the managed cluster is not orphaned", "postmaster.pid"),
+        ("boot start", "AUTO_START"),
+        ("crash restart", "RESTART"),
+        (
+            "a supervised restart is observed",
+            "supervised restart observed",
+        ),
+        ("the service entry is gone", "1060"),
+    ] {
+        assert!(
+            ci.contains(needle),
+            "the Windows journey must still assert {what}"
+        );
+    }
+}
+
+#[test]
 fn the_windows_tier_one_ci_job_exists_and_gates_trunk_dev() {
     // AC 3: the journey job must actually exist, run on windows-latest, and be
     // wired into a workflow that runs on pull requests targeting trunk-dev.

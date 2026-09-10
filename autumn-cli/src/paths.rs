@@ -158,17 +158,29 @@ impl RuntimePaths {
         let dirs = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, project)
             .ok_or(PathsError::NoPlatformDir)?;
 
+        // On Windows `data_dir()` is **roaming** `%APPDATA%`, and none of this is
+        // roaming state: a pidfile is machine-specific (a roamed one would feed
+        // the single-instance guard on a different machine), a managed-Postgres
+        // cluster must not be synced at logoff or sit on a redirected UNC share,
+        // and a Local System service cannot reach a user's redirected folder at
+        // all. Use `%LOCALAPPDATA%`, which is what the guide and the policy
+        // table have always documented.
+        let base = if cfg!(windows) {
+            dirs.data_local_dir()
+        } else {
+            dirs.data_dir()
+        };
         // `runtime_dir()` is `Some` only on Linux when `XDG_RUNTIME_DIR` is set;
         // fall back to a `run/` subdir of the data dir on macOS/Windows and on
         // headless Linux so the daemon never writes to cwd or `/tmp`.
         let runtime = dirs
             .runtime_dir()
-            .map_or_else(|| dirs.data_dir().join("run"), Path::to_path_buf);
-        let data = dirs.data_dir().to_path_buf();
+            .map_or_else(|| base.join("run"), Path::to_path_buf);
+        let data = base.to_path_buf();
         // Prefer the XDG state dir for logs on Linux; otherwise nest under data.
         let logs = dirs
             .state_dir()
-            .map_or_else(|| dirs.data_dir().join("logs"), |s| s.join("logs"));
+            .map_or_else(|| base.join("logs"), |s| s.join("logs"));
 
         let socket = resolve_socket_path(&runtime, project);
         Ok(Self {
@@ -383,12 +395,22 @@ fn owner_only_acl_args(dir: &Path, owner: &str) -> Vec<std::ffi::OsString> {
     args
 }
 
-/// The account name to grant, from `USERDOMAIN` and `USERNAME`.
+/// The trustee to grant, parsed from `whoami /user /fo csv /nh` output.
 ///
-/// Prefers the domain-qualified spelling, which is unambiguous on a
-/// domain-joined machine. A blank component is treated as absent: building
-/// `CORP\` or a bare `\dev` would make `icacls` refuse the whole command, which
-/// (because hardening fails closed) would refuse the daemon.
+/// The **token's SID**, not `%USERDOMAIN%\%USERNAME%`. Those are ordinary
+/// inherited environment variables, and naming an account by name breaks in
+/// exactly the contexts that matter here: a build agent running as Local System
+/// resolves to `WORKGROUP\MACHINE$`, which `icacls` cannot map on a
+/// non-domain-joined host, and an Entra-joined device's `AzureAD\<name>` often
+/// fails to resolve too. Because hardening fails closed, an unresolvable
+/// trustee would not degrade the ACL — it would refuse to start the daemon at
+/// all.
+///
+/// `icacls` accepts a SID as `*S-1-5-…`, the same spelling this module already
+/// uses for the two built-in trustees.
+///
+/// The line looks like `"CORP\dev","S-1-5-21-…-1001"`. Pure, so the parsing is
+/// tested on every platform.
 #[cfg_attr(
     not(windows),
     allow(
@@ -396,46 +418,113 @@ fn owner_only_acl_args(dir: &Path, owner: &str) -> Vec<std::ffi::OsString> {
         reason = "the Windows hardening arm, compiled and tested everywhere"
     )
 )]
-fn owner_trustee_from(domain: Option<String>, user: Option<String>) -> Option<String> {
-    let user = user
-        .map(|u| u.trim().to_owned())
-        .filter(|u| !u.is_empty())?;
-    let domain = domain
-        .map(|d| d.trim().to_owned())
-        .filter(|d| !d.is_empty());
-    Some(domain.map_or_else(|| user.clone(), |d| format!("{d}\\{user}")))
+fn owner_sid_from_whoami(output: &str) -> Option<String> {
+    let sid = output
+        .lines()
+        .find(|line| line.contains("S-1-"))?
+        .rsplit(',')
+        .next()?
+        .trim()
+        .trim_matches('"')
+        .trim();
+    // A SID is `S-1-<authority>-<subauthorities>`; anything else means the tool
+    // printed something we did not expect, and it must not be pasted into an ACL.
+    let is_sid = sid.starts_with("S-1-")
+        && sid.len() > 4
+        && sid[4..].chars().all(|c| c.is_ascii_digit() || c == '-');
+    is_sid.then(|| format!("*{sid}"))
 }
 
-/// Apply [`owner_only_acl_args`] to `dir`.
+/// A tool under `%SystemRoot%\System32`.
+///
+/// Absolute so a `PATH` entry — or, for `CreateProcess`, the current directory,
+/// which is the operator's project — cannot shadow it. `SystemRoot` is set by
+/// the OS; a caller who can rewrite our environment can already run code as us,
+/// so reading it here adds no exposure.
+#[cfg(windows)]
+fn system32_tool(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned()))
+        .join("System32")
+        .join(name)
+}
+
+/// The current token's SID, for use as an `icacls` trustee.
+#[cfg(windows)]
+fn current_owner_sid() -> std::io::Result<String> {
+    let output = std::process::Command::new(system32_tool("whoami.exe"))
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()?;
+    owner_sid_from_whoami(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "could not determine this account's SID, so daemon state cannot be \
+             restricted to it",
+        )
+    })
+}
+
+/// Restrict `dir` to its owner, `SYSTEM` and `Administrators`.
 ///
 /// Fails **closed**, exactly as the Unix `harden_private_dir` does: the runtime
 /// dir holds the records `stop`/`status` act on, so starting a daemon while they
 /// stay writable by other local users is the outcome this exists to prevent.
-/// `icacls.exe` ships with every supported Windows and is invoked by absolute
-/// path so a `PATH` entry cannot shadow it.
+///
+/// Three steps, mirroring what the Unix arm checks:
+///
+/// 1. Refuse a **reparse point**. A junction needs no privilege to create and
+///    `icacls` follows one, so hardening a pre-created junction would strip and
+///    rewrite the ACL of whatever it points at — and the daemon would then write
+///    its state there.
+/// 2. Take **ownership**. An object's owner implicitly keeps `WRITE_DAC`, so a
+///    directory another local user pre-created stays theirs to re-open whatever
+///    DACL we write. Taking ownership from someone else needs privilege, so on a
+///    foreign-owned directory this step fails and the daemon refuses — the
+///    Windows analog of the Unix `st_uid` check.
+/// 3. Apply the DACL.
+///
+/// One gap is documented rather than papered over: the directory is created
+/// before it is hardened, so on a shared root a local user racing the creation
+/// can open a handle under the inherited ACL and keep it (Windows checks access
+/// at open, not at use). Closing that needs an explicit security descriptor at
+/// creation time, which is not reachable without `unsafe`. Under the default
+/// `%LOCALAPPDATA%` root there is no such race — the parent is already
+/// owner-only.
 #[cfg(windows)]
 fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
-    let Some(owner) = owner_trustee_from(
-        std::env::var("USERDOMAIN").ok(),
-        std::env::var("USERNAME").ok(),
-    ) else {
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
-                "refusing to use {} for daemon state: USERNAME is unset, so its \
-                 access cannot be restricted to the owning user",
+                "refusing to use {} for daemon state: it is a link or not a \
+                 directory, so its access cannot be restricted",
                 dir.display()
             ),
         ));
-    };
-    let icacls = std::path::PathBuf::from(
-        std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned()),
-    )
-    .join("System32")
-    .join("icacls.exe");
-    let output = std::process::Command::new(&icacls)
-        .args(owner_only_acl_args(dir, &owner))
-        .output()?;
+    }
+    let owner = current_owner_sid()?;
+    let icacls = system32_tool("icacls.exe");
+    // Ownership first: a DACL written on a directory someone else owns is not a
+    // restriction, because the owner can rewrite it.
+    let take_ownership = vec![
+        dir.as_os_str().to_os_string(),
+        "/setowner".into(),
+        std::ffi::OsString::from(&owner),
+        "/Q".into(),
+    ];
+    run_icacls(&icacls, dir, &take_ownership, &owner)?;
+    run_icacls(&icacls, dir, &owner_only_acl_args(dir, &owner), &owner)
+}
+
+/// Run one `icacls` invocation, turning a non-zero exit into a fail-closed error.
+#[cfg(windows)]
+fn run_icacls(
+    icacls: &Path,
+    dir: &Path,
+    args: &[std::ffi::OsString],
+    owner: &str,
+) -> std::io::Result<()> {
+    let output = std::process::Command::new(icacls).args(args).output()?;
     if output.status.success() {
         return Ok(());
     }
@@ -550,7 +639,7 @@ mod tests {
 
     #[test]
     fn owner_only_acl_grants_exactly_the_owner_system_and_administrators() {
-        let args = owner_only_acl_args(Path::new(r"C:\state\demo"), "CORP\\dev");
+        let args = owner_only_acl_args(Path::new(r"C:\state\demo"), "*S-1-5-21-1-2-3-1001");
         let rendered: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -574,7 +663,7 @@ mod tests {
             "every trustee needs its own /grant:r: {rendered:?}"
         );
         assert!(
-            rendered.contains(&r"CORP\dev:(OI)(CI)F".to_owned()),
+            rendered.contains(&"*S-1-5-21-1-2-3-1001:(OI)(CI)F".to_owned()),
             "{rendered:?}"
         );
     }
@@ -584,7 +673,7 @@ mod tests {
         // "SYSTEM" and "Administrators" are localized; a German or Japanese
         // Windows would fail to resolve them and the grant would be refused.
         // Well-known SIDs are locale-independent.
-        let args = owner_only_acl_args(Path::new("state"), "dev");
+        let args = owner_only_acl_args(Path::new("state"), "*S-1-5-21-1-2-3-1001");
         let rendered: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -604,22 +693,80 @@ mod tests {
     }
 
     #[test]
-    fn owner_trustee_prefers_the_qualified_domain_account() {
+    fn owner_sid_is_taken_from_the_token_not_the_environment() {
+        // `whoami /user /fo csv /nh` prints `"DOMAIN\user","SID"`.
         assert_eq!(
-            owner_trustee_from(Some("CORP".into()), Some("dev".into())).as_deref(),
-            Some(r"CORP\dev")
+            owner_sid_from_whoami(
+                "\"CORP\\dev\",\"S-1-5-21-1111111111-222222222-333333333-1001\"\r\n"
+            )
+            .as_deref(),
+            Some("*S-1-5-21-1111111111-222222222-333333333-1001")
         );
-        assert_eq!(
-            owner_trustee_from(None, Some("dev".into())).as_deref(),
-            Some("dev")
+    }
+
+    #[test]
+    fn owner_sid_refuses_anything_that_is_not_a_sid() {
+        // The value is pasted straight into an ACL, so a tool that printed an
+        // error, a localized header, or nothing at all must refuse rather than
+        // harden the directory to something unintended.
+        assert_eq!(owner_sid_from_whoami(""), None);
+        assert_eq!(owner_sid_from_whoami("ERROR: Access is denied.\n"), None);
+        assert_eq!(owner_sid_from_whoami("\"CORP\\dev\",\"NOT-A-SID\"\n"), None);
+        assert_eq!(owner_sid_from_whoami("\"CORP\\dev\",\"S-1-5-x-1\"\n"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_dirs_restricts_the_runtime_dir_to_its_owner() {
+        // The Windows counterpart of `ensure_dirs_makes_socket_parent_private`.
+        // Without it, deleting the `restrict_to_owner` calls from `ensure_dirs`
+        // leaves every test in this repo green while daemon state stays readable
+        // to other local users — the exact "a doc paragraph is not an
+        // implementation" gap. `cargo test --workspace` runs on `windows-latest`
+        // in CI, so this executes there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
+        paths.ensure_dirs().expect("ensure_dirs");
+        let output = std::process::Command::new(system32_tool("icacls.exe"))
+            .arg(paths.pid_file().parent().expect("runtime dir"))
+            .output()
+            .expect("icacls");
+        let acl = String::from_utf8_lossy(&output.stdout);
+        // `Everyone` and the local `Users` group are what an inherited ACL from
+        // a shared root brings in; neither may survive the hardening.
+        assert!(
+            !acl.contains("S-1-1-0") && !acl.contains("Everyone"),
+            "runtime dir is reachable by Everyone: {acl}"
         );
-        // A blank value is not an account name; treating it as one would build
-        // `\` and make icacls refuse the whole grant.
-        assert_eq!(
-            owner_trustee_from(Some("CORP".into()), Some("  ".into())),
-            None
+        assert!(
+            !acl.contains("S-1-5-32-545") && !acl.contains("\\Users:"),
+            "runtime dir is reachable by all local users: {acl}"
         );
-        assert_eq!(owner_trustee_from(Some("CORP".into()), None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_puts_windows_state_under_local_app_data() {
+        // Roaming `%APPDATA%` would sync a managed-Postgres cluster at logoff,
+        // roam a machine-specific pidfile onto another machine, and — under
+        // folder redirection — put daemon state on a UNC share a Local System
+        // service cannot reach. The guide and the policy table both promise
+        // `%LOCALAPPDATA%`; this keeps that promise true. CI cannot catch it:
+        // every journey step sets `AUTUMN_RUNTIME_DIR`, which bypasses this.
+        temp_env::with_var(RUNTIME_DIR_ENV, None::<&str>, || {
+            let paths = RuntimePaths::resolve("demo").expect("resolve");
+            let local = std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA");
+            assert!(
+                paths.pid_file().starts_with(&local),
+                "daemon state must live under %LOCALAPPDATA%: {}",
+                paths.pid_file().display()
+            );
+            assert!(
+                paths.pg_data_dir().starts_with(&local),
+                "the managed cluster must not roam: {}",
+                paths.pg_data_dir().display()
+            );
+        });
     }
 
     #[test]

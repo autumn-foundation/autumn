@@ -71,11 +71,18 @@ Windows — never the current directory, `/tmp`, or `/etc`. Set
 
 Access is restricted to you. On Unix the directories are `0700` and the files
 `0600`. Windows has no mode bits, so the directories get the equivalent ACL —
-the owning user, `SYSTEM` and the local `Administrators` group, with inheritance
-broken so nothing wider leaks in from a parent directory. Everything created
-inside (the log, the address file, the managed-Postgres cluster) inherits it. If
-that ACL cannot be applied the daemon **refuses to start** rather than run with
-its records writable by other local users.
+your account (by SID, so it resolves on a domain-joined or Entra-joined machine
+too), `SYSTEM` and the local `Administrators` group, with inheritance broken so
+nothing wider leaks in from a parent directory. Everything created inside (the
+log, the address file, the managed-Postgres cluster) inherits it. Autumn also
+takes ownership of the directory, because an object's owner can rewrite its ACL
+no matter what it says. If any of that cannot be applied — including on a
+directory another user already owns — the daemon **refuses to start** rather
+than run with its records reachable by other local users.
+
+On Windows this is `%LOCALAPPDATA%`, never roaming `%APPDATA%`: a pidfile is
+machine-specific, and a managed-Postgres cluster must not be synced at logoff or
+placed on a redirected network share.
 
 ## Windows
 
@@ -90,7 +97,7 @@ self-host the app. It reports the address it actually bound back to the CLI,
 which records it:
 
 ```toml
-# %LOCALAPPDATA%\autumn\<project>\data\run\serve.addr
+# %LOCALAPPDATA%\autumn\<project>\data\run\serve.addr   (never Roaming)
 pid = 4242
 transport = "tcp"
 address = "127.0.0.1:3000"
@@ -109,12 +116,15 @@ is stopped cleanly, not orphaned. Only once the daemon's recorded budget expires
 does `stop` escalate, and then it force-kills the whole process tree rather than
 just the app.
 
-A foreground `autumn serve` drains the same way when a supervisor or the OS
-stops it: `CTRL_CLOSE`, `CTRL_LOGOFF`, `CTRL_SHUTDOWN` and `CTRL_BREAK` all
-trigger the graceful path. Note that Windows allows only about five seconds
-after those events before terminating the process regardless, so an app
-configured to drain for longer should be stopped through `autumn serve stop` or
-the Service Control Manager — both of which wait for the app's own budget.
+A foreground `autumn serve` also drains on a console control event —
+`CTRL_C` and `CTRL_BREAK` run the full graceful path, and `CTRL_CLOSE`,
+`CTRL_LOGOFF` and `CTRL_SHUTDOWN` start it. Be aware of what the last three
+really buy: Windows *tells* a process about them rather than asking, and the
+grace period applies to the handler, not to the work the handler starts — so a
+drain longer than a second or two will lose that race. **Stop an Autumn app
+through `autumn serve stop` or the Service Control Manager**, both of which wait
+for the app's own recorded budget. Closing a console window is a fallback, not
+the supported stop.
 
 ### Running as a Windows service
 
@@ -149,6 +159,15 @@ registration to one command with no credentials to store. It reads and writes
 the state directory the installing user created, which is why that directory's
 ACL admits `SYSTEM`. Non-default service accounts are not configured by these
 commands; use `sc.exe config` if you need one.
+
+> **What the service trusts.** `install-service` records the built binary's path
+> and your project directory, and the Service Control Manager runs that binary as
+> `Local System` at every boot. Anyone who can write to either can therefore run
+> code as `SYSTEM`. Keep the project under a directory only you and
+> administrators can write — your user profile is fine, a folder created at the
+> root of `C:\` is not. `install-service` also **builds** your project, so run
+> it from an elevated shell only for a project you would be willing to build
+> there.
 
 ## Databases
 

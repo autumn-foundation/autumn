@@ -419,9 +419,21 @@ fn daemon_endpoint(paths: &RuntimePaths) -> Option<DaemonEndpoint> {
     })
 }
 
-/// Whether a listener is answering at this project's daemon endpoint.
-fn daemon_endpoint_is_live(paths: &RuntimePaths) -> bool {
-    daemon_endpoint(paths).is_some_and(|endpoint| endpoint.is_live())
+/// Whether a listener is answering at the endpoint the CLI *chose* for this
+/// project.
+///
+/// Deliberately [`forced_endpoint`], not [`daemon_endpoint`]. On Unix the two
+/// are the same and a live listener on our socket path is conclusive. On Windows
+/// `daemon_endpoint` falls back to whatever `serve.addr` recorded — a TCP
+/// `host:port` shared with every other project that never changed the default —
+/// so a bare connect proves only that *something* is listening. Letting that
+/// veto a start would wedge a project whose daemon crashed: any other listener
+/// on the port makes `--daemon` refuse and `stop` decline to clean up, with no
+/// documented way out. Windows single-instance rests instead on the pidfile,
+/// whose start-time identity check is real there, plus the OS refusing a second
+/// bind.
+fn forced_endpoint_is_live(paths: &RuntimePaths) -> bool {
+    forced_endpoint(paths).is_some_and(|endpoint| endpoint.is_live())
 }
 
 /// The PID of the process listening on the Unix socket at `path`, via
@@ -445,7 +457,7 @@ fn socket_owner_pid(_path: &Path) -> Option<u32> {
 /// reused PID that is genuinely not the listener is rejected where the kernel
 /// can tell us).
 fn endpoint_identity_matches(paths: &RuntimePaths, pid: u32) -> bool {
-    endpoint_owner_pid(paths).map_or_else(|| daemon_endpoint_is_live(paths), |owner| owner == pid)
+    endpoint_owner_pid(paths).map_or_else(|| forced_endpoint_is_live(paths), |owner| owner == pid)
 }
 
 /// The PID owning this project's daemon endpoint, where the OS will say.
@@ -490,7 +502,17 @@ fn confirmed_running(
         // is our daemon binding its endpoint; otherwise confirm the PID actually
         // owns the endpoint (SO_PEERCRED on Linux, else liveness) so a reused PID
         // isn't accepted.
-        _ => startup_in_progress || endpoint_identity_matches(paths, rec.pid),
+        //
+        // The last arm covers a daemon we can see but not query — a Windows
+        // service running as Local System, read from the operator's ordinary
+        // shell. Calling that "stale" would report a running service as stopped
+        // and let `stop` delete its records; calling it "running" costs only that
+        // `stop` then tries and fails to kill it, and correctly refuses.
+        _ => {
+            startup_in_progress
+                || endpoint_identity_matches(paths, rec.pid)
+                || process::process_is_out_of_reach(rec.pid)
+        }
     }
 }
 
@@ -740,7 +762,7 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
     // above misses a healthy daemon whose `serve.pid` is missing/corrupt, and
     // reaping would cut that daemon off from its database before
     // `launch_daemon_child`'s live-socket guard rejects this start.
-    if opts.bundled_pg && !startup_in_progress(&paths) && !daemon_endpoint_is_live(&paths) {
+    if opts.bundled_pg && !startup_in_progress(&paths) && !forced_endpoint_is_live(&paths) {
         reap_managed_postgres(&paths);
     }
 
@@ -966,7 +988,7 @@ fn launch_daemon_child(
     // A live listener already owning the endpoint means a daemon is serving here
     // even if the pidfile is missing or stale; refuse so readiness can't latch
     // onto the pre-existing listener (mirrors the pidfile guard).
-    if let Some(endpoint) = daemon_endpoint(paths)
+    if let Some(endpoint) = forced_endpoint(paths)
         && endpoint.is_live()
     {
         return Err(format!(
@@ -1457,7 +1479,7 @@ fn stop(opts: &ServeOptions) -> i32 {
         // delete the successor's state and reap its just-started Postgres.
         if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.pid != rec.pid)
             || startup_in_progress(&paths)
-            || daemon_endpoint_is_live(&paths)
+            || forced_endpoint_is_live(&paths)
         {
             println!("autumn serve: not running (a newer daemon has since started)");
             return 0;
@@ -1495,20 +1517,39 @@ fn stop(opts: &ServeOptions) -> i32 {
     };
     #[cfg(not(unix))]
     let request = process::StopRequest::File(&stop_file);
-    if !process::stop_record(
+    let outcome = process::stop_record(
         &rec,
         stop_timeout(opts, recorded_release, recorded_budget),
         &request,
-    ) {
-        // The daemon is still alive and we couldn't signal it (e.g. it is owned
-        // by another user — `kill` returned `EPERM`). Do NOT remove its state or
-        // report success: that would orphan a running daemon and lie to scripts.
-        eprintln!(
-            "autumn serve: could not stop the daemon (pid {}); it may be owned by \
-             another user or unresponsive. Leaving its state in place.",
+    );
+    match &outcome {
+        process::StopOutcome::Drained => {}
+        // Killed after it missed its budget, or without ever being asked. Either
+        // way its `on_shutdown` hooks may not have run, so say so rather than
+        // print a bare "stopped" — a managed cluster left holding its data dir
+        // is exactly what the operator needs to know about.
+        process::StopOutcome::Escalated => eprintln!(
+            "autumn serve: the daemon (pid {}) did not finish draining within its \
+             budget and was force-stopped. Its shutdown hooks may not have run.",
             rec.pid
-        );
-        return 1;
+        ),
+        process::StopOutcome::Unreachable(why) => eprintln!(
+            "autumn serve: could not ask the daemon (pid {}) to drain ({why}), so \
+             it was force-stopped without draining. In-flight requests were cut \
+             and its shutdown hooks did not run.",
+            rec.pid
+        ),
+        process::StopOutcome::Failed => {
+            // Still alive and we couldn't stop it (e.g. owned by another user).
+            // Do NOT remove its state or report success: that would orphan a
+            // running daemon and lie to scripts.
+            eprintln!(
+                "autumn serve: could not stop the daemon (pid {}); it may be owned \
+                 by another user or unresponsive. Leaving its state in place.",
+                rec.pid
+            );
+            return 1;
+        }
     }
     // A concurrent `start` can reclaim the now-stale pidfile and bring up a
     // successor (even a new managed cluster on the same data dir) while we were
@@ -1544,17 +1585,32 @@ fn stop(opts: &ServeOptions) -> i32 {
 /// which the OS may have recycled — these checks stop us from mistaking an
 /// unrelated process (or a *different* cluster) for this one.
 fn live_postmaster_pid(data_dir: &Path) -> Option<u32> {
-    let pidfile = data_dir.join("postmaster.pid");
-    let pid = std::fs::read_to_string(&pidfile)
-        .ok()
-        .and_then(|s| s.lines().next()?.trim().parse::<u32>().ok())?;
-    if !process::is_process_alive(pid) {
+    let contents = std::fs::read_to_string(data_dir.join("postmaster.pid")).ok()?;
+    let lock = PostmasterLock::parse(&contents)?;
+    // The file says which data dir it describes; require it to be ours. Portable
+    // (Windows exposes no process cwd), and stronger than the cwd check it
+    // replaces because it holds even for a postmaster we cannot open.
+    if !lock.describes(data_dir) {
         return None;
     }
-    if process::process_command_name(pid).is_some_and(|name| name != "postgres") {
+    if !process::is_process_alive(lock.pid) {
         return None;
     }
-    if let Some(cwd) = process::process_cwd(pid) {
+    if process::process_command_name(lock.pid).is_some_and(|name| name != "postgres") {
+        return None;
+    }
+    // Bind the PID to *this* postmaster. Without it a recycled PID whose image
+    // happens to be named `postgres` is signalled and force-killed — and the
+    // signal goes through a named pipe whose server could be a squatter, from a
+    // reaper that runs as Local System inside the service host.
+    if let Some(recorded) = lock.start_epoch_secs
+        && let Some(live) = process::process_start_epoch_secs(lock.pid)
+        && live.abs_diff(recorded) > POSTMASTER_START_SKEW_SECS
+    {
+        return None;
+    }
+    // Belt and braces where the platform still offers it.
+    if let Some(cwd) = process::process_cwd(lock.pid) {
         let same_dir = std::fs::canonicalize(&cwd)
             .ok()
             .zip(std::fs::canonicalize(data_dir).ok())
@@ -1563,7 +1619,68 @@ fn live_postmaster_pid(data_dir: &Path) -> Option<u32> {
             return None;
         }
     }
-    Some(pid)
+    Some(lock.pid)
+}
+
+/// How far a live process's creation time may differ from the start time
+/// `postmaster.pid` records before we stop believing they are the same process.
+///
+/// Not zero: `PostgreSQL` writes `time(NULL)` from inside the postmaster, after
+/// the process was created, and the OS reports creation time at second
+/// resolution. A few seconds of slack keeps a legitimate cluster reapable while
+/// still making a recycled PID overwhelmingly unlikely to pass.
+const POSTMASTER_START_SKEW_SECS: u64 = 5;
+
+/// The fields of `postmaster.pid` this CLI reads.
+///
+/// `PostgreSQL`'s lock file is line-oriented and its layout is fixed by
+/// `src/include/miscadmin.h`: PID, data directory, start time, port, and so on.
+/// Parsing it here — rather than reading only line one — is what lets the reaper
+/// confirm both *which cluster* the file describes and *whether the PID is still
+/// that postmaster*, on every platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostmasterLock {
+    /// Line 1: the postmaster's process id.
+    pid: u32,
+    /// Line 2: the data directory it opened.
+    data_dir: PathBuf,
+    /// Line 3: when it started, in Unix-epoch seconds. `None` for a truncated
+    /// file (a cluster still writing it, or an old `PostgreSQL`).
+    start_epoch_secs: Option<u64>,
+}
+
+impl PostmasterLock {
+    /// Parse the lock file. `None` when line one is not a PID — the only field
+    /// without which nothing can be done.
+    fn parse(contents: &str) -> Option<Self> {
+        let mut lines = contents.lines();
+        let pid = lines.next()?.trim().parse::<u32>().ok()?;
+        let data_dir = PathBuf::from(lines.next().unwrap_or_default().trim());
+        let start_epoch_secs = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
+        Some(Self {
+            pid,
+            data_dir,
+            start_epoch_secs,
+        })
+    }
+
+    /// Whether this file describes the cluster at `data_dir`.
+    ///
+    /// Compared after canonicalization so a symlinked or differently-spelled
+    /// path still matches. A file with no data-dir line (truncated mid-write) is
+    /// accepted: refusing would strand a cluster the reaper exists to clean up.
+    fn describes(&self, data_dir: &Path) -> bool {
+        if self.data_dir.as_os_str().is_empty() {
+            return true;
+        }
+        std::fs::canonicalize(&self.data_dir)
+            .ok()
+            .zip(std::fs::canonicalize(data_dir).ok())
+            .map_or_else(
+                || self.data_dir == data_dir,
+                |(theirs, ours)| theirs == ours,
+            )
+    }
 }
 
 /// Reap a managed Postgres cluster the daemon may have left running. If a live
@@ -2133,6 +2250,98 @@ mod tests {
             Some("127.0.0.1:4321".to_owned())
         );
         assert_eq!(child_reported_budget(&paths), Some(12));
+    }
+
+    // ── Endpoint liveness (issue #1639) ────────────────────────────────────
+
+    #[test]
+    fn a_bound_tcp_port_reads_as_live_and_a_closed_one_does_not() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        assert!(tcp_is_live(&addr), "a bound port must read as live");
+        drop(listener);
+        assert!(!tcp_is_live(&addr), "a closed port must not read as live");
+    }
+
+    #[test]
+    fn an_unresolvable_address_is_not_live_rather_than_hanging() {
+        assert!(!tcp_is_live("not a host:port"));
+        assert!(!tcp_is_live(""));
+    }
+
+    #[test]
+    fn an_endpoint_probes_the_transport_it_names() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        assert!(
+            DaemonEndpoint {
+                transport: "tcp".to_owned(),
+                address: addr.clone(),
+            }
+            .is_live()
+        );
+        // The same address read as a unix socket path is not a live socket, so a
+        // corrupt transport field cannot make a TCP listener look like ours.
+        assert!(
+            !DaemonEndpoint {
+                transport: "unix".to_owned(),
+                address: addr,
+            }
+            .is_live()
+        );
+    }
+
+    // ── PostgreSQL lock file (issue #1639) ─────────────────────────────────
+    //
+    // The reaper signals and force-kills the PID this file names, from a path
+    // that runs as Local System under a registered service. Binding that PID to
+    // *this* cluster is what stops a recycled one being hit.
+
+    #[test]
+    fn a_postmaster_lock_reads_pid_data_dir_and_start_time() {
+        // The layout is fixed by PostgreSQL's `src/include/miscadmin.h`.
+        let lock = PostmasterLock::parse("4242\n/var/lib/pg\n1750000000\n5432\n").expect("parse");
+        assert_eq!(lock.pid, 4242);
+        assert_eq!(lock.data_dir, Path::new("/var/lib/pg"));
+        assert_eq!(lock.start_epoch_secs, Some(1_750_000_000));
+    }
+
+    #[test]
+    fn a_postmaster_lock_without_a_pid_is_unusable() {
+        assert_eq!(PostmasterLock::parse(""), None);
+        assert_eq!(PostmasterLock::parse("not-a-pid\n/var/lib/pg\n"), None);
+    }
+
+    #[test]
+    fn a_truncated_postmaster_lock_still_yields_its_pid() {
+        // A cluster caught mid-write must still be reapable — that is the state
+        // this reaper exists to clean up.
+        let lock = PostmasterLock::parse("4242\n").expect("parse");
+        assert_eq!(lock.pid, 4242);
+        assert_eq!(lock.start_epoch_secs, None);
+        assert!(
+            lock.describes(Path::new("/anywhere")),
+            "no data dir recorded"
+        );
+    }
+
+    #[test]
+    fn a_postmaster_lock_for_another_cluster_is_rejected() {
+        // Without this the reaper would signal whatever PID a foreign lock file
+        // happens to name.
+        let lock = PostmasterLock::parse("4242\n/some/other/cluster\n1750000000\n").expect("parse");
+        assert!(!lock.describes(Path::new("/var/lib/pg")));
+    }
+
+    #[test]
+    fn a_postmaster_lock_matches_its_own_dir_through_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("pg");
+        std::fs::create_dir(&real).expect("mkdir");
+        let recorded = std::fs::canonicalize(&real).expect("canonicalize");
+        let lock = PostmasterLock::parse(&format!("4242\n{}\n1750000000\n", recorded.display()))
+            .expect("parse");
+        assert!(lock.describes(&real));
     }
 
     // ── Windows daemon wiring (issue #1639) ────────────────────────────────

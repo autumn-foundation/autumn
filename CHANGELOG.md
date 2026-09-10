@@ -23,16 +23,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cooperative-shutdown file rather than force-killing, so in-flight requests
   finish, `on_shutdown` hooks run and a managed Postgres child is stopped
   cleanly; only once the daemon's recorded budget expires does it escalate, and
-  then it reaps the whole process tree. A foreground server drains the same way
-  when a supervisor or the OS stops it (`CTRL_CLOSE`, `CTRL_LOGOFF`,
-  `CTRL_SHUTDOWN`, `CTRL_BREAK`). Two new commands, `autumn serve
+  then it reaps the whole process tree. `stop` now also says which of those
+  happened, on both platforms — a force-kill after an overrun, or one that could
+  not ask at all, is no longer reported as a plain "stopped". A foreground server
+  drains on a console control event too (`CTRL_C` and `CTRL_BREAK` fully;
+  `CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN` best-effort, since Windows tells
+  rather than asks). Two new commands, `autumn serve
   install-service` and `autumn serve uninstall-service`, register the daemon as
   a Windows service that starts at boot and restarts after a crash and remove it
   again cleanly; the service hosts the same app the daemon does, so `status` and
   `stop` keep working against it. Daemon state under `%LOCALAPPDATA%` is created
   with an owner-only ACL (the owning user, `SYSTEM` and `Administrators`, with
   inheritance broken), the Windows analog of the Unix `0700`/`0600` posture, and
-  the daemon refuses to start if it cannot be applied. `autumn doctor` gains a
+  the daemon refuses to start if it cannot be applied — including on a directory
+  another local user owns, since an owner can rewrite any ACL. Windows daemon
+  state moves from roaming `%APPDATA%` to `%LOCALAPPDATA%`, which is what the
+  guide always documented: a pidfile is machine-specific and a managed-Postgres
+  cluster must not be synced at logoff or land on a redirected network share. `autumn doctor` gains a
   `daemon_service` check reporting whether a daemon or a registered service is
   running for this project and what the service journey still needs. See
   [the daemon guide](docs/guide/daemon.md#windows).

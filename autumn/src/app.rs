@@ -13567,12 +13567,22 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
     // its readiness flip, prestop grace, in-flight drain and `on_shutdown` hooks
     // instead of dying mid-request (#1639).
     //
-    // `CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN` come with an OS-imposed grace
-    // period (about five seconds by default) after which Windows terminates the
-    // process regardless — so an app configured to drain for longer than that
-    // should be stopped through `autumn serve stop` or the Service Control
-    // Manager, both of which wait for the app's own budget. `docs/guide/daemon.md`
-    // says so where an operator will read it.
+    // How much time each event actually buys differs, and the difference
+    // matters enough to be exact about:
+    //
+    // * `CTRL_C` and `CTRL_BREAK` do not terminate the process at all. The drain
+    //   runs to completion.
+    // * `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN` are told-not-asked: the
+    //   OS-imposed budget is how long the *handler routine* may run, and tokio's
+    //   handler returns immediately (which is what lets this future wake), so
+    //   the drain then races process termination. It is best-effort, and on a
+    //   long budget it will lose.
+    //
+    // That is why a supervisor should stop an Autumn app through
+    // `autumn serve stop` or the Service Control Manager, both of which wait for
+    // the app's own recorded budget. `docs/guide/daemon.md` says so where an
+    // operator will read it. These arms are still worth having: they turn the
+    // common console cases into a real drain, and cost nothing in the rest.
     #[cfg(windows)]
     let terminate = async {
         use tokio::signal::windows;

@@ -165,6 +165,61 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     }
 }
 
+/// The start time of `pid` as **Unix-epoch seconds**, where the platform
+/// reports it in those units.
+///
+/// Distinct from [`process_start_time`], whose units are platform-defined and
+/// only ever compared against a value this program recorded itself. This one is
+/// compared against a wall-clock stamp written by *another* program — the start
+/// time in `PostgreSQL`'s `postmaster.pid` — so the units have to be real.
+///
+/// `None` on Linux, whose `/proc` `starttime` is jiffies since boot, and on
+/// macOS, which reports nothing. Callers then fall back to whatever other
+/// identity evidence they have.
+#[must_use]
+pub fn process_start_epoch_secs(pid: u32) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        windows_impl::process_creation_time(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether `pid` is alive but **out of our reach** — running under an account
+/// we cannot query.
+///
+/// Only meaningful where the platform normally reports a start time and did not
+/// for this process. That combination means the process exists (the enumeration
+/// lists every process regardless of access) while `OpenProcess` was refused —
+/// which is exactly a service running as Local System, seen from the operator's
+/// ordinary shell.
+///
+/// Callers use it to answer "running, but I cannot verify or manage it" instead
+/// of "stale". The difference matters: a daemon registered with
+/// `autumn serve install-service` runs as Local System, so without this an
+/// unprivileged `autumn serve status` would call it stopped and `stop` would
+/// delete a live service's records.
+///
+/// `false` on Unix. Linux always reports a start time, so an unreadable one
+/// means gone; macOS never reports one, so treating "unknown" as "out of reach"
+/// there would disable the PID-reuse guard the whole lifecycle rests on.
+#[must_use]
+pub fn process_is_out_of_reach(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        is_process_alive(pid) && process_start_time(pid).is_none()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Whether a recorded lockfile owner is still our live daemon.
 ///
 /// Requires the PID to be alive AND — when both the recorded and current start
@@ -438,12 +493,21 @@ pub struct ProcRow {
 /// in strangers that merely inherited a dead daemon's number. A child cannot
 /// predate its parent, so a row that started *before* the process it claims as
 /// its parent belongs to that PID's previous owner and is dropped. Rows already
-/// visited are skipped, so a snapshot with a parent cycle terminates.
+/// visited are skipped, so a snapshot with a parent cycle terminates. A root
+/// that is not in the snapshot yields nothing at all — see below.
 ///
 /// Pure, so the Windows reaping policy is unit-tested on every platform.
 #[must_use]
 pub fn descendants_of(root: u32, rows: &[ProcRow]) -> Vec<u32> {
-    let root_created = rows.iter().find(|r| r.pid == root).map_or(0, |r| r.created);
+    // The root must be in the snapshot. If it has already exited, its PID is
+    // free to be recycled and every row still naming it as a parent belongs to
+    // whoever held that number before — with no start time to compare against,
+    // the guard below is disabled precisely where it is needed most. Sweeping
+    // nothing is the only safe answer; the caller's own reapers (the managed
+    // Postgres one) cover what is actually ours.
+    let Some(root_created) = rows.iter().find(|r| r.pid == root).map(|r| r.created) else {
+        return Vec::new();
+    };
     let mut seen = std::collections::BTreeSet::from([root]);
     let mut frontier = vec![(root, root_created)];
     let mut found = Vec::new();
@@ -534,6 +598,34 @@ pub fn clear_stop_request(path: &Path) {
 /// How long to wait for a force-killed process to actually disappear.
 const KILL_SETTLE: Duration = Duration::from_secs(5);
 
+/// What [`stop_record`] achieved.
+///
+/// Distinguishing these matters: only `Drained` means the app's `on_shutdown`
+/// hooks ran, and the other three each need a different thing said to the
+/// operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The daemon drained and exited within its budget.
+    Drained,
+    /// It was asked, missed its budget, and the process tree was force-killed.
+    /// Shutdown hooks may not have run.
+    Escalated,
+    /// The drain could not be requested at all, so it was force-killed without
+    /// being asked. Carries why, because nothing else will surface it.
+    Unreachable(String),
+    /// It is still alive and could not be killed — e.g. owned by another user.
+    /// The caller must not delete its state or report success.
+    Failed,
+}
+
+impl StopOutcome {
+    /// Whether the daemon is gone afterwards.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
 /// Gracefully stop the daemon identified by `record`: ask it to drain via
 /// `request`, wait up to `timeout` for it to exit, then force-kill the process
 /// tree if it is still alive. Returns `true` only if the recorded process is
@@ -552,17 +644,22 @@ const KILL_SETTLE: Duration = Duration::from_secs(5);
 /// A failed delivery skips the drain wait: the app was never asked to drain, so
 /// waiting out its budget only delays the escalation.
 ///
-/// A `false` return means the daemon could **not** be stopped — e.g. it is owned
-/// by another user and both the signal and the kill are refused — so the caller
-/// must not delete its state or report success.
+/// [`StopOutcome::Failed`] means the daemon could **not** be stopped — e.g. it is
+/// owned by another user and both the signal and the kill are refused — so the
+/// caller must not delete its state or report success.
 #[must_use]
-pub fn stop_record(record: &PidRecord, timeout: Duration, request: &StopRequest<'_>) -> bool {
-    let asked = deliver_stop_request(record, request).is_ok();
+pub fn stop_record(
+    record: &PidRecord,
+    timeout: Duration,
+    request: &StopRequest<'_>,
+) -> StopOutcome {
+    let delivery = deliver_stop_request(record, request);
+    let asked = delivery.is_ok();
     if asked && wait_for_record_exit(record, timeout) {
-        return true;
+        return StopOutcome::Drained;
     }
     if !is_record_alive(record) {
-        return true;
+        return StopOutcome::Drained;
     }
     // The app missed its graceful-drain budget and is still our daemon, so its
     // `on_shutdown` hooks (which stop a managed Postgres child) may not have
@@ -572,7 +669,19 @@ pub fn stop_record(record: &PidRecord, timeout: Duration, request: &StopRequest<
     // taking it loses the parentage the sweep walks.
     force_kill_group(record.pid);
     force_kill(record.pid);
-    wait_for_record_exit(record, KILL_SETTLE)
+    if !wait_for_record_exit(record, KILL_SETTLE) {
+        return StopOutcome::Failed;
+    }
+    match delivery {
+        // Killed after it missed its budget: hooks may not have run.
+        Ok(()) => StopOutcome::Escalated,
+        // Killed without ever being asked: hooks certainly did not run. The
+        // caller has to say so — on Windows the request is a file create, which
+        // can fail (a full volume, a directory at the path, an AV lock) while
+        // the kill still succeeds, so a silent "stopped" would report a graceful
+        // drain that never happened.
+        Err(e) => StopOutcome::Unreachable(e.to_string()),
+    }
 }
 
 /// The name of the named pipe `PostgreSQL` listens on for emulated signals on
@@ -639,14 +748,37 @@ pub fn stop_postmaster(_pid: u32, _timeout: Duration) {
 /// Windows process primitives behind this module's platform-neutral seam.
 ///
 /// The workspace forbids `unsafe`, so everything here goes through `sysinfo`'s
-/// safe process API or plain `std` I/O. Every entry point returns a plain Rust
-/// value and swallows a refused query into `None`/`false`, matching how the Unix
-/// arms treat a refused syscall.
+/// safe process API, plain `std` I/O, or a `System32` tool invoked by absolute
+/// path. Every entry point returns a plain Rust value and swallows a refused
+/// query into `None`/`false`, matching how the Unix arms treat a refused
+/// syscall — with one deliberate exception, [`is_process_alive`], where "cannot
+/// tell" must not read as "dead".
 #[cfg(windows)]
 mod windows_impl {
     use super::ProcRow;
     use std::io::Write as _;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    /// How many times to retry the `PostgreSQL` signal pipe, and how long to
+    /// wait between attempts.
+    ///
+    /// The postmaster's signal thread hands each connected instance to a
+    /// dispatch thread and only then creates the next one, so there is a window
+    /// with no listening instance. `PostgreSQL`'s own `pgkill` retries for
+    /// exactly this reason; without it a stop lands in that window, waits out
+    /// the full timeout, and force-kills a cluster that was one retry away from
+    /// a clean fast shutdown.
+    const PG_SIGNAL_ATTEMPTS: u32 = 10;
+    const PG_SIGNAL_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// `SECURITY_IDENTIFICATION`, for `dwSecurityQosFlags`.
+    ///
+    /// Without an explicit level, opening a named pipe grants the pipe's server
+    /// `SecurityImpersonation` — it may call `ImpersonateNamedPipeClient` and
+    /// act as us. `stop_postmaster` is reached from the Local System service
+    /// host, so a squatter on the pipe path would inherit SYSTEM. Identification
+    /// lets the server learn who we are and nothing more.
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
     /// Load just `pid`'s row, or every row when `pid` is `None`.
     fn snapshot(pid: Option<u32>) -> System {
@@ -672,18 +804,34 @@ mod windows_impl {
     ///
     /// The process list comes from a `ToolHelp` snapshot, which enumerates every
     /// process regardless of whether we could open it — so a daemon owned by
-    /// another user reads as alive, the analog of `kill`'s `EPERM`, and never has
-    /// its lock stolen.
+    /// another user reads as alive, the analog of `kill`'s `EPERM`, and never
+    /// has its lock stolen.
+    ///
+    /// `CreateToolhelp32Snapshot` fails transiently (`ERROR_BAD_LENGTH`) when
+    /// the process table changes mid-walk, and `sysinfo` reports that as an
+    /// empty list rather than an error — indistinguishable from "the process is
+    /// gone". Answering "dead" there would let a second daemon start alongside a
+    /// live one. So a negative answer is confirmed against a full snapshot: an
+    /// empty machine-wide list is proof the snapshot failed, not that nothing is
+    /// running, and we answer "alive" — the direction that never steals a lock.
     pub(super) fn is_process_alive(pid: u32) -> bool {
-        pid != 0 && snapshot(Some(pid)).process(Pid::from_u32(pid)).is_some()
+        if pid == 0 {
+            return false;
+        }
+        if snapshot(Some(pid)).process(Pid::from_u32(pid)).is_some() {
+            return true;
+        }
+        let all = snapshot(None);
+        all.processes().is_empty() || all.process(Pid::from_u32(pid)).is_some()
     }
 
     /// When `pid` started, in seconds since the Unix epoch.
     ///
-    /// Coarser than Linux's jiffy-resolution `starttime`, but it is the
-    /// comparison that makes the daemon lifecycle's PID-reuse guards conclusive
-    /// on Windows instead of best-effort. `None` when the process is gone;
-    /// normalized away from `0`, which the pidfile encodes as "unknown".
+    /// Coarser than Linux's jiffy-resolution `starttime`, and `None` for a
+    /// process we cannot open — notably a Local System service's app child seen
+    /// from an ordinary shell — in which case callers fall back to a PID-only
+    /// liveness check exactly as they do on macOS. Normalized away from `0`,
+    /// which the pidfile encodes as "unknown".
     pub(super) fn process_creation_time(pid: u32) -> Option<u64> {
         if pid == 0 {
             return None;
@@ -715,16 +863,32 @@ mod windows_impl {
         Some(name.to_string_lossy().to_lowercase())
     }
 
-    /// Terminate `pid`. A process we cannot open or terminate is left alone —
-    /// the caller's post-kill liveness wait is what decides success.
+    /// Terminate `pid`.
+    ///
+    /// `taskkill.exe` by **absolute path**. `sysinfo`'s own `Process::kill()`
+    /// shells out to a bare `taskkill.exe`, which `CreateProcess` resolves
+    /// through the current directory — the operator's project — before
+    /// `System32`. This escalation runs as Local System inside the service host,
+    /// so a `taskkill.exe` checked into a project directory would run as SYSTEM
+    /// instead of stopping anything. Same reasoning as `icacls` in
+    /// `crate::paths`.
+    ///
+    /// A process we cannot open or terminate is left alone; the caller's
+    /// post-kill liveness wait is what decides success.
     pub(super) fn terminate(pid: u32) {
         if pid == 0 {
             return;
         }
-        let system = snapshot(Some(pid));
-        if let Some(process) = system.process(Pid::from_u32(pid)) {
-            process.kill();
-        }
+        let taskkill = std::path::PathBuf::from(
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned()),
+        )
+        .join("System32")
+        .join("taskkill.exe");
+        let _ = std::process::Command::new(taskkill)
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
     /// Every process on the machine, with its recorded parent and start time —
@@ -743,18 +907,33 @@ mod windows_impl {
 
     /// Deliver one emulated `PostgreSQL` signal byte to `pid`'s signal pipe.
     ///
-    /// The pipe is created in byte mode (`src/backend/port/win32/signal.c`), so
-    /// opening the path and writing one byte is the whole protocol — no Win32
-    /// call needed. Returns whether the byte was accepted; a cluster that already
-    /// exited serves no pipe, so `false` is the normal outcome there and the
-    /// caller's liveness wait handles it.
+    /// Opening the path and writing one byte is the whole protocol
+    /// (`src/backend/port/win32/signal.c`) — no Win32 call needed. The pipe is
+    /// opened with an explicit `SECURITY_IDENTIFICATION` level so a squatter on
+    /// the path cannot impersonate this (possibly Local System) process.
+    ///
+    /// Returns whether the byte was accepted. A cluster that already exited
+    /// serves no pipe, so `false` is the normal outcome there and the caller's
+    /// liveness wait handles it.
     pub(super) fn send_pg_signal(pid: u32, signal: u8) -> bool {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(super::pgsignal_pipe_name(pid))
-            .and_then(|mut pipe| pipe.write_all(&[signal]).and_then(|()| pipe.flush()))
-            .is_ok()
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let path = super::pgsignal_pipe_name(pid);
+        for attempt in 0..PG_SIGNAL_ATTEMPTS {
+            let delivered = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(&path)
+                .and_then(|mut pipe| pipe.write_all(&[signal]).and_then(|()| pipe.flush()))
+                .is_ok();
+            if delivered {
+                return true;
+            }
+            if attempt + 1 < PG_SIGNAL_ATTEMPTS {
+                std::thread::sleep(PG_SIGNAL_RETRY);
+            }
+        }
+        false
     }
 }
 
@@ -1000,6 +1179,120 @@ mod tests {
         ];
         let found = descendants_of(100, &rows);
         assert!(found.contains(&200) && found.contains(&300), "{found:?}");
+    }
+
+    /// A child that outlives a short stop budget, plus a thread already blocked
+    /// in `wait()` on it.
+    ///
+    /// The reaper is not incidental. `stop_record` is written for a **detached**
+    /// daemon, which the OS reparents when it exits; a test's own child instead
+    /// becomes a zombie, and `kill(pid, 0)` reports a zombie as alive — so
+    /// without something reaping concurrently, every escalation here would time
+    /// out and report `Failed`, testing the harness rather than the code.
+    ///
+    /// Neither command watches the cooperative-shutdown file, which is the
+    /// point: they model an app that misses its drain budget. `ping` rather than
+    /// `timeout` on Windows, because `timeout` refuses a redirected stdin.
+    fn long_running_child() -> (u32, std::thread::JoinHandle<()>) {
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("60");
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "ping -n 61 127.0.0.1"]);
+            c
+        };
+        let mut child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a long-running child");
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        (pid, reaper)
+    }
+
+    // ── Stop outcomes (#1639) ────────────────────────────────────────────
+    //
+    // Only `Drained` means the app's `on_shutdown` hooks ran. The other arms
+    // each need something different said to the operator, and reporting a
+    // graceful stop that never happened is the failure this distinction exists
+    // to prevent.
+
+    #[test]
+    fn a_child_that_ignores_the_request_is_escalated_after_the_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stop_file = dir.path().join("serve.stop");
+        let (pid, reaper) = long_running_child();
+        let rec = PidRecord {
+            pid,
+            start_time: process_start_time(pid),
+        };
+        let outcome = stop_record(
+            &rec,
+            Duration::from_millis(200),
+            &StopRequest::File(&stop_file),
+        );
+        assert_eq!(outcome, StopOutcome::Escalated);
+        assert!(outcome.stopped());
+        assert!(
+            stop_file.is_file(),
+            "the drain was requested before the kill"
+        );
+        reaper.join().expect("reaper");
+    }
+
+    #[test]
+    fn an_undeliverable_request_is_reported_rather_than_passed_off_as_a_drain() {
+        // A directory at the request path makes `File::create` fail. The daemon
+        // is still killed — but calling that "stopped" would tell the operator
+        // their in-flight requests drained when nothing was ever asked.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = dir.path().join("serve.stop");
+        std::fs::create_dir(&blocked).expect("mkdir");
+        let (pid, reaper) = long_running_child();
+        let rec = PidRecord {
+            pid,
+            start_time: process_start_time(pid),
+        };
+        // A 30-second budget that is never waited out: an undeliverable request
+        // must escalate immediately rather than stall the operator's `stop`.
+        let began = std::time::Instant::now();
+        let outcome = stop_record(&rec, Duration::from_secs(30), &StopRequest::File(&blocked));
+        assert!(
+            matches!(outcome, StopOutcome::Unreachable(_)),
+            "expected Unreachable, got {outcome:?}"
+        );
+        assert!(outcome.stopped());
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "an unasked daemon must not be waited out"
+        );
+        reaper.join().expect("reaper");
+    }
+
+    #[test]
+    fn a_dead_daemon_reports_drained_without_killing_anything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rec = PidRecord {
+            pid: 2_147_483_640,
+            start_time: None,
+        };
+        assert_eq!(
+            stop_record(
+                &rec,
+                Duration::from_millis(50),
+                &StopRequest::File(&dir.path().join("serve.stop")),
+            ),
+            StopOutcome::Drained
+        );
     }
 
     // ── PostgreSQL-on-Windows signal pipe (#1639) ────────────────────────
