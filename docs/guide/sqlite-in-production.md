@@ -192,6 +192,14 @@ published support contract**. Available **today**:
   AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of
   being refused, and the generated auth session store is typed against
   `::autumn_web::RuntimeConnection` so it compiles on either backend.
+- **Backend-aware `generate teams` (#1927)** — the organizations / memberships /
+  invitations scaffold, refused on SQLite until now, emits its migration in the
+  app's dialect. The portable parts are shared: the `role` / `status` `CHECK`
+  enums, the `UNIQUE (tenant_id, user_id)` constraint, and the partial
+  `idx_invitations_pending_email` unique index (SQLite has had partial indexes
+  since 3.8.0). Its Rust templates needed no fork — `#[repository]` binds
+  `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
+  sql-types both diesel backends carry.
 - **DB-backed sessions store on SQLite (#1908)** — the `generate auth`
   tracked-sessions store bounds its query functions by
   `::autumn_web::RuntimeBackend` instead of a hard-coded `diesel::pg::Pg`, so the
@@ -717,6 +725,24 @@ Additional generator shapes are refused on SQLite:
 > feature), so it compiles on whichever backend the app selected. Its query
 > functions bind `::autumn_web::RuntimeBackend` for the same reason (#1908), and
 > the scaffolded session-management guide emits its SQL in the app's dialect.
+
+> **`generate teams` now generates on SQLite (#1927).** Also historically
+> refused, it emits its organizations / memberships / invitations migration in
+> the app's dialect. The `role` / `status` `CHECK` enums, the
+> `UNIQUE (tenant_id, user_id)` constraint and the partial
+> `idx_invitations_pending_email` unique index are portable and shared. Nothing
+> else in the generator needed forking: the `#[repository]` macro binds
+> `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
+> sql-types both diesel backends carry.
+>
+> These five — `auth`, `mailer --list-unsubscribe`, `notifications`, `pwa`,
+> `teams` — are every generator that hand-writes `CREATE TABLE` DDL rather than
+> deriving it from a model's fields, which is the shape #1927 was opened about.
+> A guard plans each against a SQLite app, applies and rolls back every
+> migration it emits on a real in-memory SQLite, and scans the SQL for
+> Postgres-only spellings. That scan is not redundant: SQLite accepts an unknown
+> type name (falling back to BLOB affinity), so `id BIGSERIAL PRIMARY KEY`
+> applies cleanly there and simply stops auto-incrementing.
 
 > **Full-text search now generates on SQLite (#2047).** The `--searchable` /
 > `#[searchable]` scaffold — historically rejected at generate time on SQLite —

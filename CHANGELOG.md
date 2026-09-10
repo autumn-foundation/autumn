@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli/generate:** `autumn generate teams` is now **backend-aware on SQLite**
+  (#1927). It was refused at generate time because its migration was fixed
+  Postgres DDL; it now emits the organizations/memberships/invitations tables in
+  the app's own dialect — `INTEGER PRIMARY KEY AUTOINCREMENT`, `INTEGER`
+  user-id columns, and `TEXT ... DEFAULT CURRENT_TIMESTAMP` timestamps. The
+  portable parts are shared and unchanged: the `role`/`status` `CHECK` enums,
+  the `UNIQUE (tenant_id, user_id)` idempotency constraint, and the partial
+  `idx_invitations_pending_email` unique index. Everything else the generator
+  emits was already backend-neutral — `#[repository]` binds
+  `::autumn_web::RuntimeConnection`, and `src/teams/schema.rs` uses only
+  sql-types both diesel backends carry — so no template needed forking. Postgres
+  SQL is unchanged. This closes the generator audit #1927 asked for: `auth`,
+  `mailer --list-unsubscribe`, `notifications`, `pwa` and `teams` are the
+  generators that hand-write `CREATE TABLE` DDL, and all five are now covered by
+  a guard that plans each against a SQLite app, applies and rolls back every
+  migration it emits on a real in-memory SQLite, and scans the SQL for
+  Postgres-only spellings. `counter_cache` was audited and left alone: its
+  `ALTER TABLE ... ADD COLUMN ... BIGINT NOT NULL DEFAULT 0` / `DROP COLUMN` is
+  already portable, since SQLite gives `BIGINT` integer affinity and so reads
+  back without schema drift.
+
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the

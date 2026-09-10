@@ -52,13 +52,16 @@
 //!   is required for `--api` projects, whose starter strips it), and ensures
 //!   the generated code's own direct dependencies (`diesel`, `diesel-async`,
 //!   `pq-sys`, `chrono`, `serde`, `serde_json`, `validator`, `maud`) are
-//!   present. Requires the Postgres backend — see `sqlite_teams_unsupported_error`.
+//!   present. Works on either backend: the migration DDL is emitted in the
+//!   app's own dialect (issue #1927).
 //!
 //! Warns (does not auto-edit `autumn.toml` — too many possible existing
 //! shapes/profiles to safely text-patch) that `[tenancy]` needs
 //! `session_key = "organization_id"`.
 
 use std::path::{Path, PathBuf};
+
+use autumn_web::config::DatabaseBackend;
 
 use super::emit::{Plan, Revert};
 use super::model::ensure_cargo_dependencies;
@@ -120,11 +123,13 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
 /// injectable/deterministic in tests, mirroring
 /// [`super::migration::plan_migration_with_options`].
 ///
-/// `for_destroy` mirrors [`super::policy::plan_policy`]'s parameter for
+/// `_for_destroy` mirrors [`super::policy::plan_policy`]'s parameter for
 /// signature symmetry with the other generators' generate/destroy split, but
 /// `teams` has no existence guard to skip on the destroy path (unlike
 /// `policy`, which requires a target model) — the plan built here is
-/// identical either way.
+/// identical either way. It was also the escape hatch for the old
+/// `SQLite`-rejection guard; the migration is backend-aware now (issue #1927),
+/// so there is no generate-only rejection left to suppress on the revert path.
 ///
 /// # Errors
 /// Returns [`GenerateError::NotInProject`] outside an Autumn project, or
@@ -132,22 +137,17 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
 pub fn plan_teams(
     project_root: &Path,
     timestamp: &str,
-    for_destroy: bool,
+    _for_destroy: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    // `teams`' migration and model/repository templates are fixed Postgres
-    // DDL/Diesel code with no SQLite-aware rendering path (see
-    // `sqlite_teams_unsupported_error`'s doc comment) — reject up front
-    // rather than emit a migration `autumn migrate` would fail to apply.
-    // Skipped on the destroy path so a project that somehow already has
-    // `teams` generated (e.g. from before this backend check existed) can
-    // still be cleaned up.
-    if !for_destroy
-        && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
-    {
-        return Err(super::sqlite_teams_unsupported_error());
-    }
+    // The emitted DDL is backend-aware (issue #1927), resolved the same way
+    // `autumn migrate` resolves the database URL (env vars, then the
+    // profile-merged `autumn.toml` / `.env`); Postgres is the default when
+    // nothing is configured. Everything else this generator emits is already
+    // backend-neutral: `#[repository]` binds `::autumn_web::RuntimeConnection`,
+    // and `schema.rs` uses only sql-types both diesel backends carry.
+    let backend = super::detect_backend(project_root);
 
     let mut plan = Plan::new(project_root);
 
@@ -200,7 +200,7 @@ pub fn plan_teams(
             .join("migrations")
             .join(format!("{timestamp}_create_teams"))
     });
-    plan.create(migration_dir.join("up.sql"), MIGRATION_UP.to_owned());
+    plan.create(migration_dir.join("up.sql"), render_migration_up(backend));
     plan.create(migration_dir.join("down.sql"), MIGRATION_DOWN.to_owned());
 
     // ── src/main.rs: mod teams; + routes![...] ──────────────────────────
@@ -1629,7 +1629,7 @@ pub async fn create_invitation(
         // already serialize concurrent `create_invitation` calls for this
         // organization, so this should be unreachable in practice.
         // `idx_invitations_pending_email` (a partial unique index on
-        // `(tenant_id, email) WHERE status = 'pending'`, see MIGRATION_UP)
+        // `(tenant_id, email) WHERE status = 'pending'`, see render_migration_up)
         // stays as defense in depth: any INSERT that still slips past the
         // check above fails closed instead of leaving two live pending
         // tokens for the same invitee.
@@ -2586,26 +2586,70 @@ pub async fn remove_member(
 "#;
 
 // ── Migration SQL ────────────────────────────────────────────────────────
-//
-// Postgres DDL only, mirroring `examples/teams`'s migration byte-for-byte
-// (minus its `users` table — a generated app already has its own from
-// `autumn generate auth`). Unlike the `model`/`scaffold`/`migration`
-// generators, `teams` has no `SQLite`-dialect variant (issue #1614's
-// backend-aware DDL work did not extend to this generator).
 
-const MIGRATION_UP: &str = r"-- Organizations, memberships, and invitations for team membership (issue
+/// Backend-specific column fragments for the hand-written `teams` migration
+/// DDL (issue #1927).
+///
+/// The three tables are one `CREATE TABLE` literal each, so only the column
+/// TYPES differ between backends: `SQLite` has no `BIGSERIAL`, no `NOW()`, and
+/// no dedicated timestamp type. Everything else is portable and stays shared —
+/// `TEXT`, the `role`/`status` `CHECK` enums, the `UNIQUE` constraints, the
+/// indexes, and the partial unique index (`SQLite` has had partial indexes
+/// since 3.8.0). Mirrors `auth.rs`'s `AuthDdl`.
+///
+/// Each fragment renders into the fixed-width column the Postgres DDL already
+/// aligns to, so its SQL is unchanged by the fork.
+#[derive(Clone, Copy)]
+struct TeamsDdl {
+    /// Auto-increment primary-key definition (the SQL after `id `).
+    pk: &'static str,
+    /// The type of a `user_id` / `invited_by_user_id` integer column.
+    int: &'static str,
+    /// The type of a timestamp column.
+    ts: &'static str,
+    /// The `DEFAULT` expression for a row's creation time.
+    now: &'static str,
+}
+
+impl TeamsDdl {
+    const fn for_backend(backend: DatabaseBackend) -> Self {
+        match backend {
+            DatabaseBackend::Postgres => Self {
+                pk: "BIGSERIAL PRIMARY KEY",
+                int: "BIGINT",
+                ts: "TIMESTAMP",
+                now: "NOW()",
+            },
+            DatabaseBackend::Sqlite => Self {
+                pk: "INTEGER PRIMARY KEY AUTOINCREMENT",
+                int: "INTEGER",
+                ts: "TEXT",
+                now: "CURRENT_TIMESTAMP",
+            },
+        }
+    }
+}
+
+/// The `teams` `up.sql` in the app's own dialect (issue #1927).
+///
+/// Mirrors `examples/teams`'s migration — minus its `users` table, which a
+/// generated app already has from `autumn generate auth`.
+fn render_migration_up(backend: DatabaseBackend) -> String {
+    let d = TeamsDdl::for_backend(backend);
+    format!(
+        r"-- Organizations, memberships, and invitations for team membership (issue
 -- #1261). Deliberately does NOT create (or reference via REFERENCES) a
 -- `users` table — your app already has its own from `autumn generate auth`;
--- `memberships.user_id` / `invitations.invited_by_user_id` are bare BIGINT
--- with no FK, so this migration has no ordering dependency on when your
--- users table was created.
+-- `memberships.user_id` / `invitations.invited_by_user_id` are bare integer
+-- columns with no FK, so this migration has no ordering dependency on when
+-- your users table was created.
 
 -- An organization (tenant). Creating one makes the creator an `owner`
 -- member (see `src/teams/routes/organizations.rs`).
 CREATE TABLE organizations (
-    id         BIGSERIAL PRIMARY KEY,
+    id         {pk},
     name       TEXT      NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at {ts:<9} NOT NULL DEFAULT {now}
 );
 
 -- The user <-> organization join row, carrying the closed `role` enum
@@ -2621,11 +2665,11 @@ CREATE TABLE organizations (
 -- accept: a second INSERT for the same (tenant_id, user_id) pair fails
 -- closed instead of creating a duplicate membership.
 CREATE TABLE memberships (
-    id         BIGSERIAL PRIMARY KEY,
+    id         {pk},
     tenant_id  TEXT      NOT NULL,
-    user_id    BIGINT    NOT NULL,
+    user_id    {int:<9} NOT NULL,
     role       TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at {ts:<9} NOT NULL DEFAULT {now},
     UNIQUE (tenant_id, user_id)
 );
 CREATE INDEX idx_memberships_tenant ON memberships (tenant_id);
@@ -2636,7 +2680,7 @@ CREATE INDEX idx_memberships_user ON memberships (user_id);
 -- raw token — so a database leak cannot be replayed as an accept link.
 -- `status` starts `pending`; accepting sets it to `accepted`, revoking sets
 -- it to `revoked`. Both are terminal: the accept handler checks
--- `status = 'pending'` AND `expires_at > now()` before creating a
+-- `status = 'pending'` AND an unexpired `expires_at` before creating a
 -- membership, so an expired/revoked/already-accepted token renders a clear
 -- error instead of a second membership row or a panic. The partial unique
 -- index below is the concurrency backstop for `create_invitation`: two
@@ -2646,20 +2690,26 @@ CREATE INDEX idx_memberships_user ON memberships (user_id);
 -- second transaction's INSERT fails closed against this index instead of
 -- leaving two live pending tokens for the same invitee.
 CREATE TABLE invitations (
-    id                 BIGSERIAL PRIMARY KEY,
+    id                 {pk},
     tenant_id          TEXT      NOT NULL,
     email              TEXT      NOT NULL,
     role               TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
     token_hash         TEXT      NOT NULL UNIQUE,
     status             TEXT      NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'revoked')),
-    invited_by_user_id BIGINT    NOT NULL,
-    expires_at         TIMESTAMP NOT NULL,
-    created_at         TIMESTAMP NOT NULL DEFAULT NOW()
+    invited_by_user_id {int:<9} NOT NULL,
+    expires_at         {ts:<9} NOT NULL,
+    created_at         {ts:<9} NOT NULL DEFAULT {now}
 );
 CREATE INDEX idx_invitations_tenant ON invitations (tenant_id);
 CREATE INDEX idx_invitations_email ON invitations (email);
 CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';
-";
+",
+        pk = d.pk,
+        int = d.int,
+        ts = d.ts,
+        now = d.now,
+    )
+}
 
 const MIGRATION_DOWN: &str = "DROP TABLE IF EXISTS invitations;\nDROP TABLE IF EXISTS memberships;\nDROP TABLE IF EXISTS organizations;\n";
 
@@ -2958,8 +3008,82 @@ async fn main() {
     /// `SQLite`-aware rendering path — a `SQLite`-backed project must be
     /// rejected at generate time with an actionable error, not emit a
     /// migration `autumn migrate` would fail to apply (Codex review finding).
+    /// The Postgres `up.sql` exactly as it read before the `SQLite` dialect
+    /// fork (issue #1927). A verbatim copy, deliberately not shared with the
+    /// renderer: a snapshot the code under test builds is no snapshot.
+    const PRE_FORK_POSTGRES_MIGRATION_UP: &str = r"-- Organizations, memberships, and invitations for team membership (issue
+-- #1261). Deliberately does NOT create (or reference via REFERENCES) a
+-- `users` table — your app already has its own from `autumn generate auth`;
+-- `memberships.user_id` / `invitations.invited_by_user_id` are bare BIGINT
+-- with no FK, so this migration has no ordering dependency on when your
+-- users table was created.
+
+-- An organization (tenant). Creating one makes the creator an `owner`
+-- member (see `src/teams/routes/organizations.rs`).
+CREATE TABLE organizations (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT      NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- The user <-> organization join row, carrying the closed `role` enum
+-- (`owner` | `admin` | `member`, see `src/teams/role.rs`). `tenant_scoped`
+-- on `#[repository(Membership, ...)]` filters every read/write by the
+-- active organization at the SQL level (issue #695's row-level
+-- multi-tenancy seam, not a second isolation mechanism) — but the macro's
+-- generated queries unconditionally filter on a column literally named
+-- `tenant_id` (`TEXT`), so this holds the organization's id in its string
+-- form rather than a typed FK; application code parses it back to `i64`
+-- where it needs to look up the `Organization` row itself. The UNIQUE
+-- constraint is the idempotency backstop for a double-clicked invitation
+-- accept: a second INSERT for the same (tenant_id, user_id) pair fails
+-- closed instead of creating a duplicate membership.
+CREATE TABLE memberships (
+    id         BIGSERIAL PRIMARY KEY,
+    tenant_id  TEXT      NOT NULL,
+    user_id    BIGINT    NOT NULL,
+    role       TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, user_id)
+);
+CREATE INDEX idx_memberships_tenant ON memberships (tenant_id);
+CREATE INDEX idx_memberships_user ON memberships (user_id);
+
+-- A single-use, expiring, cryptographically-random email invitation. Only
+-- the SHA-256 hash of the token is stored (`hash_api_token`) — never the
+-- raw token — so a database leak cannot be replayed as an accept link.
+-- `status` starts `pending`; accepting sets it to `accepted`, revoking sets
+-- it to `revoked`. Both are terminal: the accept handler checks
+-- `status = 'pending'` AND `expires_at > now()` before creating a
+-- membership, so an expired/revoked/already-accepted token renders a clear
+-- error instead of a second membership row or a panic. The partial unique
+-- index below is the concurrency backstop for `create_invitation`: two
+-- concurrent requests for the same (tenant_id, email) each revoke-then-insert
+-- in their own transaction, so a `SELECT ... WHERE status = 'pending'` alone
+-- cannot serialize them (no prior row to lock when none exists yet) — the
+-- second transaction's INSERT fails closed against this index instead of
+-- leaving two live pending tokens for the same invitee.
+CREATE TABLE invitations (
+    id                 BIGSERIAL PRIMARY KEY,
+    tenant_id          TEXT      NOT NULL,
+    email              TEXT      NOT NULL,
+    role               TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    token_hash         TEXT      NOT NULL UNIQUE,
+    status             TEXT      NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'revoked')),
+    invited_by_user_id BIGINT    NOT NULL,
+    expires_at         TIMESTAMP NOT NULL,
+    created_at         TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_invitations_tenant ON invitations (tenant_id);
+CREATE INDEX idx_invitations_email ON invitations (email);
+CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';
+";
+
+    /// Backend-aware DDL (issue #1927): `generate teams` on a `SQLite` app
+    /// scaffolds its migration in `SQLite` dialect instead of being rejected,
+    /// and leaks no Postgres-only spelling.
     #[test]
-    fn plan_rejects_sqlite_backend() {
+    fn plan_teams_emits_sqlite_ddl() {
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -2974,19 +3098,194 @@ async fn main() {
                 )
                 .unwrap();
 
-                let err = plan_teams(tmp.path(), "20260101000000", false).unwrap_err();
-                assert!(matches!(err, GenerateError::Config(_)), "{err:?}");
-                assert!(err.to_string().contains("Postgres"), "{err}");
-                assert!(!tmp.path().join("src/teams").exists());
+                plan_teams(tmp.path(), "20260101000000", false)
+                    .expect("generate teams must scaffold on a SQLite app")
+                    .execute(Flags::default())
+                    .unwrap();
+
+                let up = fs::read_to_string(
+                    tmp.path()
+                        .join("migrations/20260101000000_create_teams/up.sql"),
+                )
+                .unwrap();
+
+                // Every auto-increment id uses the SQLite spelling.
+                assert_eq!(
+                    up.matches("id         INTEGER PRIMARY KEY AUTOINCREMENT")
+                        .count()
+                        + up.matches("id                 INTEGER PRIMARY KEY AUTOINCREMENT")
+                            .count(),
+                    3,
+                    "all three tables need a SQLite auto-increment id: {up}"
+                );
+                // Foreign-key and timestamp columns are SQLite-typed.
+                assert!(
+                    up.contains("user_id    INTEGER   NOT NULL"),
+                    "FK columns must be INTEGER on SQLite: {up}"
+                );
+                assert!(
+                    up.contains("created_at TEXT      NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+                    "created_at must default to CURRENT_TIMESTAMP on SQLite: {up}"
+                );
+                for leak in ["BIGSERIAL", "BIGINT", "NOW()", "TIMESTAMP "] {
+                    assert!(
+                        !up.contains(leak),
+                        "SQLite up.sql leaked Postgres-only `{leak}`: {up}"
+                    );
+                }
             },
         );
     }
 
-    /// The `SQLite` rejection must not block `autumn destroy teams` cleaning
-    /// up a project that somehow already has `teams` generated (e.g. from
-    /// before this backend check existed).
+    /// The `SQLite` migration is tested by RUNNING it, not by matching strings:
+    /// `up.sql` applies to a real in-memory `SQLite`, a row survives a write/read
+    /// cycle through each table, every constraint the DDL exists for still bites,
+    /// and `down.sql` rolls the whole thing back.
     #[test]
-    fn destroy_is_not_blocked_by_sqlite_rejection() {
+    fn teams_sqlite_migration_applies_and_round_trips() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        let up = render_migration_up(DatabaseBackend::Sqlite);
+        conn.batch_execute(&up)
+            .expect("the SQLite up.sql must be valid SQLite DDL");
+
+        let run = |conn: &mut diesel::SqliteConnection, sql: &str| {
+            diesel::sql_query(sql.to_owned()).execute(conn)
+        };
+
+        // A row round-trips through each table, with the id auto-assigned and
+        // `created_at` defaulted by SQLite rather than by the app.
+        run(
+            &mut conn,
+            "INSERT INTO organizations (name) VALUES ('Acme')",
+        )
+        .expect("insert an organization");
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            id: i64,
+            #[diesel(sql_type = diesel::sql_types::Timestamp)]
+            created_at: chrono::NaiveDateTime,
+        }
+        let orgs: Vec<Row> = diesel::sql_query("SELECT id, created_at FROM organizations")
+            .load(&mut conn)
+            .expect("an organization row must load back through diesel's sql types");
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].id, 1, "id must be auto-assigned");
+        assert!(
+            orgs[0].created_at.and_utc().timestamp() > 0,
+            "created_at must be defaulted to a parseable timestamp by SQLite"
+        );
+
+        run(
+            &mut conn,
+            "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 7, 'owner')",
+        )
+        .expect("insert a membership");
+        run(
+            &mut conn,
+            "INSERT INTO invitations (tenant_id, email, role, token_hash, invited_by_user_id, \
+             expires_at) VALUES ('1', 'a@b.test', 'member', 'h1', 7, '2030-01-01 00:00:00')",
+        )
+        .expect("insert an invitation");
+
+        // The `role` CHECK is enforced, not decorative.
+        assert!(
+            run(
+                &mut conn,
+                "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 8, 'wizard')",
+            )
+            .is_err(),
+            "the role CHECK must reject an out-of-enum role on SQLite"
+        );
+        // The `status` CHECK likewise.
+        assert!(
+            run(
+                &mut conn,
+                "INSERT INTO invitations (tenant_id, email, role, token_hash, status, \
+                 invited_by_user_id, expires_at) VALUES ('1', 'c@b.test', 'member', 'h9', \
+                 'mailed', 7, '2030-01-01 00:00:00')",
+            )
+            .is_err(),
+            "the status CHECK must reject an out-of-enum status on SQLite"
+        );
+        // The double-click idempotency backstop on (tenant_id, user_id).
+        assert!(
+            run(
+                &mut conn,
+                "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 7, 'member')",
+            )
+            .is_err(),
+            "the memberships UNIQUE must reject a duplicate (tenant_id, user_id)"
+        );
+        // The PARTIAL unique index is the concurrency backstop for two
+        // simultaneous invitations to the same invitee — SQLite has to honor
+        // both the uniqueness AND the `WHERE status = 'pending'` predicate.
+        assert!(
+            run(
+                &mut conn,
+                "INSERT INTO invitations (tenant_id, email, role, token_hash, \
+                 invited_by_user_id, expires_at) VALUES ('1', 'a@b.test', 'member', 'h2', 7, \
+                 '2030-01-01 00:00:00')",
+            )
+            .is_err(),
+            "the partial unique index must reject a second PENDING invite for one invitee"
+        );
+        run(
+            &mut conn,
+            "UPDATE invitations SET status = 'revoked' WHERE token_hash = 'h1'",
+        )
+        .expect("revoke the first invitation");
+        run(
+            &mut conn,
+            "INSERT INTO invitations (tenant_id, email, role, token_hash, invited_by_user_id, \
+             expires_at) VALUES ('1', 'a@b.test', 'member', 'h3', 7, '2030-01-01 00:00:00')",
+        )
+        .expect("once the first invite is revoked the partial index must let a new one in");
+
+        // `down.sql` is dialect-neutral, but it has to actually undo this.
+        conn.batch_execute(MIGRATION_DOWN)
+            .expect("down.sql must roll the SQLite migration back");
+        assert!(
+            run(&mut conn, "SELECT 1 FROM organizations").is_err(),
+            "down.sql must drop the tables"
+        );
+    }
+
+    /// The Postgres SQL is unchanged by the `SQLite` fork (issue #1927):
+    /// existing projects, and `examples/teams` which this DDL mirrors, must see
+    /// the same statements as before.
+    ///
+    /// Compared statement-by-statement rather than over the whole file: two
+    /// `--` comment lines were reworded, because they named `BIGINT` and
+    /// `now()` and the `SQLite` output uses neither. Every line of SQL must
+    /// still match the pre-fork text exactly.
+    #[test]
+    fn teams_postgres_migration_sql_is_unchanged() {
+        fn statements(sql: &str) -> Vec<&str> {
+            sql.lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect()
+        }
+        assert_eq!(
+            statements(&render_migration_up(DatabaseBackend::Postgres)),
+            statements(PRE_FORK_POSTGRES_MIGRATION_UP),
+            "the Postgres DDL must not drift when the SQLite dialect is added"
+        );
+    }
+
+    /// `autumn destroy teams` round-trips a `SQLite` project (issue #1927).
+    ///
+    /// Generate and destroy under the SAME backend, which is the whole
+    /// lifecycle now that `generate` no longer refuses `SQLite`. Flipping the
+    /// backend BETWEEN the two is a different case, and one `destroy` refuses
+    /// without `--force` for every backend-aware generator alike: the
+    /// provenance invocation carries a backend fingerprint, so a plan
+    /// recomputed under the other backend is not the plan that wrote the file.
+    #[test]
+    fn destroy_round_trips_on_a_sqlite_app() {
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -2995,22 +3294,29 @@ async fn main() {
             ],
             || {
                 let tmp = project();
-                plan_teams(tmp.path(), "20260101000000", false)
-                    .unwrap()
-                    .execute(Flags::default())
-                    .unwrap();
-
                 fs::write(
                     tmp.path().join("autumn.toml"),
                     "[database]\nprimary_url = \"sqlite://app.db\"\n",
                 )
                 .unwrap();
+
+                plan_teams(tmp.path(), "20260101000000", false)
+                    .unwrap()
+                    .execute(Flags::default())
+                    .unwrap();
+                assert!(tmp.path().join("src/teams").exists());
 
                 plan_teams(tmp.path(), "20260101000000", true)
                     .unwrap()
                     .revert(Flags::default())
                     .unwrap();
                 assert!(!tmp.path().join("src/teams").exists());
+                assert!(
+                    !tmp.path()
+                        .join("migrations/20260101000000_create_teams")
+                        .exists(),
+                    "destroy must take the SQLite migration back out too"
+                );
             },
         );
     }
@@ -3405,14 +3711,20 @@ async fn main() {
     /// and the generated handler must translate that constraint's
     /// violation into a friendly conflict rather than a raw 500 (Codex
     /// review finding).
+    ///
+    /// Asserted on BOTH dialects: the index is portable, so the `SQLite` fork
+    /// (issue #1927) must not have dropped it.
     #[test]
     fn migration_has_partial_unique_index_for_pending_invitation_email() {
-        assert!(
-            MIGRATION_UP.contains(
-                "CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';"
-            ),
-            "{MIGRATION_UP}"
-        );
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            let up = render_migration_up(backend);
+            assert!(
+                up.contains(
+                    "CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';"
+                ),
+                "{backend:?}: {up}"
+            );
+        }
     }
 
     #[test]
