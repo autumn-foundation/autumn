@@ -336,3 +336,33 @@ pub struct DunningAttempt {
     /// Last update time (app clock).
     pub updated_at: DateTime<Utc>,
 }
+
+impl DunningAttempt {
+    /// Build a schedule row with no subscription link.
+    #[must_use]
+    pub fn new(
+        invoice_id: impl Into<String>,
+        customer_id: impl Into<String>,
+        attempt: i64,
+        next_attempt_at: DateTime<Utc>,
+        state: DunningState,
+        updated_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.into(),
+            customer_id: customer_id.into(),
+            subscription_id: None,
+            attempt,
+            next_attempt_at,
+            state,
+            updated_at,
+        }
+    }
+
+    /// Set the local subscription id.
+    #[must_use]
+    pub fn with_subscription(mut self, subscription_id: impl Into<String>) -> Self {
+        self.subscription_id = Some(subscription_id.into());
+        self
+    }
+}

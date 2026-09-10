@@ -162,6 +162,68 @@ pub struct SubscriptionUpsert {
     pub now: DateTime<Utc>,
 }
 
+impl SubscriptionUpsert {
+    /// Build an upsert with quantity 1 and no plan, price or period end.
+    #[must_use]
+    pub fn new(
+        new_id: impl Into<String>,
+        customer_id: impl Into<String>,
+        provider_subscription_id: impl Into<ProviderId>,
+        status: SubscriptionStatus,
+        occurred_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            new_id: new_id.into(),
+            customer_id: customer_id.into(),
+            provider_subscription_id: provider_subscription_id.into(),
+            provider_price_id: None,
+            plan_id: None,
+            status,
+            quantity: 1,
+            current_period_end: None,
+            cancel_at_period_end: false,
+            occurred_at,
+            now,
+        }
+    }
+
+    /// Set the provider price id.
+    #[must_use]
+    pub fn with_price(mut self, price_id: impl Into<ProviderId>) -> Self {
+        self.provider_price_id = Some(price_id.into());
+        self
+    }
+
+    /// Set the resolved plan.
+    #[must_use]
+    pub fn with_plan(mut self, plan_id: impl Into<PlanId>) -> Self {
+        self.plan_id = Some(plan_id.into());
+        self
+    }
+
+    /// Set the quantity.
+    #[must_use]
+    pub const fn with_quantity(mut self, quantity: i64) -> Self {
+        self.quantity = quantity;
+        self
+    }
+
+    /// Set the period end.
+    #[must_use]
+    pub const fn with_period_end(mut self, end: DateTime<Utc>) -> Self {
+        self.current_period_end = Some(end);
+        self
+    }
+
+    /// Set `cancel_at_period_end`.
+    #[must_use]
+    pub const fn with_cancel_at_period_end(mut self, cancel: bool) -> Self {
+        self.cancel_at_period_end = cancel;
+        self
+    }
+}
+
 /// Invoice upsert keyed by `provider_invoice_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -188,6 +250,57 @@ pub struct InvoiceUpsert {
     pub occurred_at: DateTime<Utc>,
     /// App clock.
     pub now: DateTime<Utc>,
+}
+
+impl InvoiceUpsert {
+    /// Build an upsert with no subscription, attempt count 0 and no next attempt.
+    #[must_use]
+    #[allow(clippy::too_many_arguments, reason = "every field is required")]
+    pub fn new(
+        new_id: impl Into<String>,
+        customer_id: impl Into<String>,
+        provider_invoice_id: impl Into<ProviderId>,
+        status: InvoiceStatus,
+        amount_due: Money,
+        amount_paid: Money,
+        occurred_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            new_id: new_id.into(),
+            customer_id: customer_id.into(),
+            subscription_id: None,
+            provider_invoice_id: provider_invoice_id.into(),
+            status,
+            amount_due,
+            amount_paid,
+            attempt_count: 0,
+            next_payment_attempt: None,
+            occurred_at,
+            now,
+        }
+    }
+
+    /// Set the local subscription id.
+    #[must_use]
+    pub fn with_subscription(mut self, subscription_id: impl Into<String>) -> Self {
+        self.subscription_id = Some(subscription_id.into());
+        self
+    }
+
+    /// Set the provider attempt count.
+    #[must_use]
+    pub const fn with_attempt_count(mut self, count: i64) -> Self {
+        self.attempt_count = count;
+        self
+    }
+
+    /// Set the provider's next attempt time.
+    #[must_use]
+    pub const fn with_next_payment_attempt(mut self, at: DateTime<Utc>) -> Self {
+        self.next_payment_attempt = Some(at);
+        self
+    }
 }
 
 /// The mirror store.
