@@ -92,7 +92,17 @@ jobs:
         # webhook route, and `storage` gates the upload path — both are request-path
         # modules carrying the panic gate, so they have to be in this feature list
         # for their `deny(clippy::…)` block to be compiled at all.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
+        #
+        # `constela` is here for the same reason: it parses, validates and renders
+        # a document a language model wrote, so a panic in that tree is a 500 that
+        # whoever shapes the model's prompt can trigger on demand. Its nine modules
+        # carry the panic gate and are configured out without this feature.
+        #
+        # KEEP IN SYNC with the identical list in scripts/pre-push-check.sh --
+        # check-panic-gate.sh verifies every gated module's feature is covered by an
+        # enforcing CI clippy lane, so a feature dropped from here silently disarms
+        # that module's deny block.
+        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" --all-targets -- -D warnings
       - name: Clippy (autumn-web, plugin-sandbox — panic gate)
         # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
         # above compiles `plugin_sandbox`'s request-path modules and their
@@ -430,6 +440,34 @@ jobs:
         # Shares this docs-only job for the same reason as the gates above:
         # no toolchain, no cache, reports in seconds.
         run: ./scripts/check-docs-routes.sh --self-test && ./scripts/check-docs-routes.sh
+      - name: Macro argument gate
+        # The seventh thing a reader copies off a page: the keyword arguments
+        # inside an Autumn attribute macro. The gates above cover the links,
+        # commands, `AUTUMN_*` variables, `autumn.toml` keys, `autumn_web::…`
+        # paths and `/actuator/…` URLs; nothing covered the surface the guide
+        # spends most of its Rust on.
+        #
+        # The baseline run found five occurrences of one spelling,
+        # `#[secured(policy = "…")]`, across `docs/guide/downloads.md` (twice),
+        # a `skills/` reference, and the rustdoc module headers of
+        # `autumn/src/download.rs` and `autumn/src/range.rs`. `#[secured]` has
+        # never had a `policy` key — the grammar is bare role literals and/or
+        # `scopes = ["…"]` — so every reader who pasted it got a build error on
+        # their own file. It survived because nothing compiles these fences:
+        # both rustdoc blocks are ```ignore, and markdown fences are compiled
+        # by nothing at all, so the spelling propagated from one file to four.
+        #
+        # Truth set is each macro's accepted keys read straight out of
+        # `autumn-macros/src/`, never a snapshot, so a renamed key lands in the
+        # same commit as the rename. The extractor is deliberately permissive
+        # and a macro whose grammar it cannot read is skipped rather than
+        # failed: a gate that reports a key the macro does accept gets waived
+        # away wholesale, while one that misses a key only fails to catch what
+        # nothing was catching before.
+        #
+        # Shares this docs-only job for the same reason as the gates above:
+        # no toolchain, no cache, reports in seconds.
+        run: ./scripts/check-docs-macro-args.sh --self-test && ./scripts/check-docs-macro-args.sh
       - name: Plugin surface gate
         # The declared plugin API surface (issue #1601) has a compiled half —
         # the `plugin-contract` job below builds `autumn-plugin-reference`
@@ -495,7 +533,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.85.5
+      - uses: taiki-e/install-action@v2.87.5
         with:
           tool: cargo-deny@0.20.2
       # Advisories go through the shared gate (issue #1600) so PR CI, the
@@ -769,6 +807,7 @@ jobs:
         lane:
           [
             markdown,
+            constela,
             inbound-mail,
             i18n,
             plugin-sandbox,
@@ -816,6 +855,27 @@ jobs:
           cargo test -p autumn-web --features markdown --test integration_tests rich_text
           cargo test -p autumn-web --features markdown --lib markdown::
           cargo test -p autumn-web --features markdown --doc markdown::
+      - name: Run constela-gated tests (generated-UI allowlist)
+        if: matrix.lane == 'constela'
+        # `constela` is not a default feature, so the `test` job's `cargo test
+        # --workspace` compiles neither the module's in-module suites nor
+        # `autumn/tests/integration/constela.rs` (gated on `constela`). That
+        # integration module IS the safety claim for the generated-UI path: an
+        # adversarial corpus of script-bearing tags, `on*` handlers, obfuscated
+        # `javascript:` spellings, attribute-quote breakouts and runtime-
+        # assembled URLs, each asserted to be refused at validation or at
+        # render. A regression there is stored XSS in an app serving
+        # model-generated UI, so it has to run in a lane that blocks merge.
+        #
+        # The second invocation adds `markdown`, which is what makes the
+        # `markdown` node kind reachable: without it that node fails validation
+        # with `constela.feature_required` and the sanitizing render path is
+        # never exercised.
+        run: |
+          cargo test -p autumn-web --features constela --lib constela::
+          cargo test -p autumn-web --features constela --doc constela
+          cargo test -p autumn-web --features constela --test integration_tests constela
+          cargo test -p autumn-web --features "constela,markdown" --test integration_tests constela
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
         if: matrix.lane == 'inbound-mail'
         # `inbound-mail` and its provider aliases are not default features, so
@@ -1406,7 +1466,7 @@ jobs:
       # Coverage is not bound by the crates.io baseline, so this list is a
       # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
       # `acme`, `managed-pg*`, `system-tests`, `test-support`, ...).
-      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
+      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
       # `postgresql_embedded`'s build script downloads Postgres binaries via
       # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
       # fails the build with a 403. Authenticate with the job's token to get
@@ -1439,7 +1499,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.87.5
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)

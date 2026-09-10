@@ -102,7 +102,7 @@ database topology:
 docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d postgres-primary postgres-replica
 
 # 2. Apply migrations to the primary using the explicit migrator
-AUTUMN_PROFILE=dev cargo run -p bookmarks-distributed --bin migrate
+AUTUMN_PROFILE=dev cargo run -p bookmarks-distributed --bin bookmarks-distributed-migrate
 
 # 3. Run the app locally (dev profile auto-detected)
 cargo run -p bookmarks-distributed
