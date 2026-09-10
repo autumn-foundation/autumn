@@ -60,10 +60,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/actuator/…` URLs were already gated; the surface the guide spends most of
   its Rust on was not. It reads 215 markdown files (1,004 Rust fences) and 593
   rustdoc sources (872 fences) — the rustdoc half matters because ```ignore
-  blocks ship to docs.rs and nothing compiles them. Accepted keys are read out
-  of `autumn-macros/src/` on every run rather than from a snapshot, so a
-  renamed key lands in the same commit as the rename. Carries `--list` and a
-  20-case `--self-test`. The baseline run found five defects.
+  blocks ship to docs.rs and nothing compiles them. Bare and qualified call
+  sites (`#[autumn_web::model(…)]`) and multiline attributes are all read.
+  Accepted keys are read out of `autumn-macros/src/` on every run rather than
+  from a snapshot, so a renamed key lands in the same commit as the rename, and
+  extraction is scoped to each macro's own argument parser — located
+  structurally as the function taking `attr: TokenStream` but not
+  `item: TokenStream` — rather than to its whole source file, so `model.rs`'s
+  ~10k lines of codegen cannot bless `username` as a `#[model(…)]` key. A macro
+  whose grammar cannot be read that way is skipped rather than reported
+  against; 18 of 20 are judged. Carries `--list` and a 34-case `--self-test`.
+  The baseline run found five defects.
 
 - **Migration version gate: starter templates no longer collide with their
   examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror

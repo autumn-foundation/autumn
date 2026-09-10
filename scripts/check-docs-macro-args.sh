@@ -54,18 +54,38 @@
 #   key.as_deref() != Some("max_age")    `#[step_up(max_age = …)]`
 #   "sum" => / "count" | "sum"           match-arm grammars
 #
-# The union is deliberately permissive. A gate that reports a key the macro
-# does accept is worse than one that misses a key it doesn't: the first teaches
-# readers to distrust the gate and gets waived away wholesale, the second only
-# fails to catch what nothing was catching before. Every narrowing below is
-# there because the permissive read produced a false positive on this corpus:
+# **Where** those patterns are read matters as much as what they match. Run
+# over a whole source file they are far too generous: `model.rs` is ~10k lines
+# of codegen, and reading all of it accepted `username`, `mouse` and `goose` as
+# `#[model(...)]` keys — so `#[model(username = "x")]` passed a corpus run
+# clean. `parse_attr_args`, the function that actually parses that attribute,
+# takes `table` and `managed`.
+#
+# So extraction is scoped to the macro's own argument parser, found
+# structurally rather than by name: the function in the owning file whose
+# signature takes the raw `attr: TokenStream` but NOT `item: TokenStream`. That
+# is the dedicated arg parser; the one taking both is the macro entry point,
+# which reaches the entire implementation. From there the reader follows calls
+# transitively into other functions and `impl` blocks in the same file, so a
+# grammar split across helpers (`job.rs`'s `parse_basic_arg` /
+# `parse_uniqueness_arg` / `parse_concurrency_arg`) is read whole. Twelve of
+# the twenty macros resolve to such a parser; the other eight parse their
+# arguments inline in the macro entry, and fall back to reading that.
+#
+# The union is still deliberately permissive within that scope. A gate that
+# reports a key the macro does accept is worse than one that misses a key it
+# doesn't: the first teaches readers to distrust the gate and gets waived away
+# wholesale, the second only fails to catch what nothing was catching before.
+# Every narrowing below is there because the permissive read produced a false
+# positive on this corpus:
 #
 #   - **A macro whose grammar the extractor cannot read is skipped, not
-#     failed.** If a source yields zero keys, this gate cannot judge its
-#     arguments and says so under `--list` rather than reporting every key its
-#     pages use. All 20 macros are judgeable today; the guard exists so that a
-#     macro rewritten into a shape the extractor does not know goes quiet
-#     instead of going loud against correct documentation.
+#     failed.** If the scope yields zero keys, this gate cannot judge that
+#     macro's arguments and says so under `--list` rather than reporting every
+#     key its pages use. `api_doc` and `service` are skipped today; the other
+#     18 are judged, and the self-test holds a floor under that count so a
+#     refactor cannot quietly empty the truth set — the failure mode where a
+#     gate keeps passing because it stopped looking.
 #   - **Only fenced Rust is read.** `docs/guide/agent-authority.md` discusses a
 #     `#[repository(.., grant = X)]` key in prose as an explicitly-named
 #     follow-up that does not exist yet. That is a correct sentence about a
@@ -207,17 +227,82 @@ def strip_test_mods(src):
     return "".join(out)
 
 
+FN_OPEN = re.compile(r"\bfn\s+([a-z_0-9]+)\s*(?:<[^>]*>)?\s*\(")
+IMPL_OPEN = re.compile(r"\bimpl\b[^{;]*?\bfor\s+([A-Za-z][A-Za-z0-9_]*)\s*\{")
+IDENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+ATTR_PARAM = re.compile(r"\battr\s*:\s*(?:proc_macro2::)?TokenStream")
+ITEM_PARAM = re.compile(r"\bitem\s*:\s*(?:proc_macro2::)?TokenStream")
+
+
+def _balanced(src, open_idx, opener="{", closer="}"):
+    """Text between `open_idx`'s delimiter and its match."""
+    i, depth = open_idx + 1, 1
+    while i < len(src) and depth:
+        if src[i] == opener:
+            depth += 1
+        elif src[i] == closer:
+            depth -= 1
+        i += 1
+    return src[open_idx + 1 : i - 1], i
+
+
+def code_blocks(src):
+    """`name -> [(body, signature)]` for every fn and trait `impl` in `src`."""
+    out = collections.defaultdict(list)
+    for match in FN_OPEN.finditer(src):
+        params, after = _balanced(src, match.end() - 1, "(", ")")
+        brace = src.find("{", after)
+        semi = src.find(";", after)
+        if brace == -1 or (semi != -1 and semi < brace):
+            continue  # a trait method declaration, not a definition
+        body, _ = _balanced(src, brace)
+        out[match.group(1)].append((body, params))
+    for match in IMPL_OPEN.finditer(src):
+        brace = src.index("{", match.start())
+        body, _ = _balanced(src, brace)
+        out[match.group(1)].append((body, ""))
+    return out
+
+
 def accepted_keys():
-    """Read each macro's accepted argument keys out of its own source."""
+    """Read each macro's accepted argument keys out of its own arg parser.
+
+    Scoped rather than file-wide — see the header. The parser is identified
+    structurally: it takes the raw `attr: TokenStream` and, unlike the macro
+    entry point, not `item: TokenStream`. Calls are then followed transitively
+    within the file so a grammar split across helpers is read whole.
+    """
     out = {}
     for macro, filename in OWNERS.items():
         path = MACRO_SRC / filename
         if not path.exists():
             out[macro] = set()
             continue
-        text = strip_test_mods(
-            path.read_text(encoding="utf-8", errors="replace")
-        )
+        src = strip_test_mods(path.read_text(encoding="utf-8", errors="replace"))
+        blocks = code_blocks(src)
+        takes_attr, arg_parsers = [], []
+        for name, defs in blocks.items():
+            for _, params in defs:
+                if not ATTR_PARAM.search(params):
+                    continue
+                takes_attr.append(name)
+                if not ITEM_PARAM.search(params):
+                    arg_parsers.append(name)
+        # Prefer the dedicated parser; fall back to the macro entry for the
+        # macros that parse their arguments inline.
+        roots = arg_parsers or takes_attr
+        seen, queue, scoped = set(), list(roots), []
+        while queue:
+            name = queue.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for body, _ in blocks.get(name, []):
+                scoped.append(body)
+                for ident in set(IDENT.findall(body)):
+                    if ident in blocks and ident not in seen:
+                        queue.append(ident)
+        text = "\n".join(scoped)
         keys = set()
         for pattern in KEY_PATTERNS:
             keys |= set(re.findall(pattern, text))
@@ -279,44 +364,48 @@ WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([a-z_0-9]+)")
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 
 
-MACRO_OPEN = re.compile(r"#\[(" + "|".join(sorted(OWNERS)) + r")\(")
+# A call site may qualify the macro: `#[autumn_web::repository(...)]` and
+# `#[autumn_macros::model(...)]` are documented, idiomatic forms and appear in
+# shipped rustdoc (`autumn/src/aggregate.rs`, `autumn/src/classify/mod.rs`).
+# Requiring the bare name would leave every qualified invocation ungated.
+MACRO_OPEN = re.compile(
+    r"#\[(?:autumn_web::|autumn_macros::|autumn::)?("
+    + "|".join(sorted(OWNERS))
+    + r")\("
+)
 
 
-class MacroCalls:
-    """Find `#[macro(…)]` calls and hand back their argument text.
+def find_macro_calls(text):
+    """Yield `(macro, args, offset)` for each `#[macro(…)]` call in `text`.
 
     Depth-aware rather than regular, because the arguments are not
     bracket-free: `#[secured(scopes = ["a:b"])]` and
     `#[lifecycle(transitions = [...])]` both carry a nested array, and a
-    `[^\\]]*` body stops dead at the first `]`. That made every
-    array-valued form invisible to this gate — including `scopes`, the one
-    working spelling the baseline defect had to be corrected *to*. Caught by
-    renaming `scopes` in `secured.rs` and watching the gate stay silent when
-    it should have reported every page still saying `scopes`.
+    `[^\\]]*` body stops dead at the first `]`. That made every array-valued
+    form invisible to this gate — including `scopes`, the one working spelling
+    the baseline defect had to be corrected *to*. Caught by renaming `scopes`
+    in `secured.rs` and watching the gate stay silent when it should have
+    reported every page still saying `scopes`.
+
+    `text` is a whole fence, not a line, so an attribute spread over several
+    lines — the house style for `#[repository(...)]` and `#[lifecycle(...)]`
+    once they carry more than one key — is matched like any other.
     """
-
-    @staticmethod
-    def findall(text):
-        out = []
-        for match in MACRO_OPEN.finditer(text):
-            i = match.end()
-            depth = 1
-            while i < len(text) and depth:
-                ch = text[i]
-                if ch in "([":
-                    depth += 1
-                elif ch in ")]":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                i += 1
-            if depth == 0:
-                out.append((match.group(1), text[match.end():i]))
-        return out
-
-
-def macro_call_re():
-    return MacroCalls
+    out = []
+    for match in MACRO_OPEN.finditer(text):
+        i, depth = match.end(), 1
+        while i < len(text) and depth:
+            ch = text[i]
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth == 0:
+            out.append((match.group(1), text[match.end() : i], match.start()))
+    return out
 
 
 def is_archived(rel):
@@ -346,62 +435,96 @@ def rustdoc_files():
     return out
 
 
-def scan_markdown(path, accepted, judgeable, calls):
-    """Yield (macro, key, line) for keyword args inside fenced Rust."""
-    rel = path.relative_to(ROOT)
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+def judge_fences(rel, fence_lines, accepted, judgeable, waived):
+    """Judge one fence's keyword arguments.
+
+    `fence_lines` is the fence body as `(lineno, text)` pairs. They are joined
+    and scanned as one string rather than line by line: an attribute spread
+    over several lines is a single call, and matching per line skipped every
+    one of them — including the multiline `#[repository(...)]` and
+    `#[lifecycle(...)]` blocks in shipped rustdoc. Offsets map back to the
+    original line so a report still points at the attribute.
+    """
+    if not fence_lines:
+        return []
+    text = "\n".join(t for _, t in fence_lines)
+    starts, pos = [], 0
+    for lineno, chunk in fence_lines:
+        starts.append((pos, lineno))
+        pos += len(chunk) + 1
+
+    def line_of(offset):
+        found = fence_lines[0][0]
+        for start, lineno in starts:
+            if start <= offset:
+                found = lineno
+            else:
+                break
+        return found
+
+    out = []
+    for macro, args, offset in find_macro_calls(text):
+        if macro not in judgeable:
+            continue
+        for key in KEYWORD_ARG.findall(args):
+            if key in accepted[macro] or (macro, key) in waived:
+                continue
+            out.append((macro, key, f"{rel}:{line_of(offset)}"))
+    return out
+
+
+def collect_waivers(lines):
     waived = set()
     for line in lines:
         for macro, key in WAIVER.findall(line):
             waived.add((macro, key))
-    inside = False
-    fences = 0
-    found = []
+    return waived
+
+
+def scan_markdown(path, accepted, judgeable, _calls=None):
+    """Yield (macro, key, line) for keyword args inside fenced Rust."""
+    rel = path.relative_to(ROOT)
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    waived = collect_waivers(lines)
+    inside, fences, found, current = False, 0, [], []
     for lineno, line in enumerate(lines, 1):
         stripped = line.lstrip()
         if stripped.startswith("```") or stripped.startswith("~~~"):
             if inside:
-                inside = False
+                found.extend(judge_fences(rel, current, accepted, judgeable, waived))
+                current, inside = [], False
             else:
                 lang = stripped[3:].strip().lower()
                 inside = lang.startswith("rust")
                 if inside:
                     fences += 1
             continue
-        if not inside:
-            continue
-        for macro, args in calls.findall(line):
-            if macro not in judgeable:
-                continue
-            for key in KEYWORD_ARG.findall(args):
-                if key in accepted[macro] or (macro, key) in waived:
-                    continue
-                found.append((macro, key, f"{rel}:{lineno}"))
+        if inside:
+            current.append((lineno, line))
+    found.extend(judge_fences(rel, current, accepted, judgeable, waived))
     return found, fences
 
 
-def scan_rustdoc(path, accepted, judgeable, calls):
+def scan_rustdoc(path, accepted, judgeable, _calls=None):
     """Same, over ```-fenced Rust inside `//!` and `///` doc comments."""
     rel = path.relative_to(ROOT)
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    waived = set()
-    for line in lines:
-        for macro, key in WAIVER.findall(line):
-            waived.add((macro, key))
-    inside = False
-    fences = 0
-    found = []
+    waived = collect_waivers(lines)
+    inside, fences, found, current = False, 0, [], []
     for lineno, line in enumerate(lines, 1):
         doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
         if not doc:
             # A non-doc line ends any fence: an unterminated fence must not
             # swallow the rest of the file.
-            inside = False
+            if inside:
+                found.extend(judge_fences(rel, current, accepted, judgeable, waived))
+            current, inside = [], False
             continue
         body = doc.group(1).strip()
         if body.startswith("```"):
             if inside:
-                inside = False
+                found.extend(judge_fences(rel, current, accepted, judgeable, waived))
+                current, inside = [], False
             else:
                 # rustdoc fences default to Rust, and the attribute-bearing
                 # ones are usually `ignore` / `no_run` / `compile_fail`.
@@ -413,32 +536,25 @@ def scan_rustdoc(path, accepted, judgeable, calls):
                 if inside:
                     fences += 1
             continue
-        if not inside:
-            continue
-        for macro, args in calls.findall(body):
-            if macro not in judgeable:
-                continue
-            for key in KEYWORD_ARG.findall(args):
-                if key in accepted[macro] or (macro, key) in waived:
-                    continue
-                found.append((macro, key, f"{rel}:{lineno}"))
+        if inside:
+            current.append((lineno, body))
+    found.extend(judge_fences(rel, current, accepted, judgeable, waived))
     return found, fences
 
 
 def run_scan():
     accepted = accepted_keys()
     judgeable = {m for m, keys in accepted.items() if keys}
-    calls = macro_call_re()
     defects = []
     md_files = markdown_files()
     rs_files = rustdoc_files()
     md_fences = rs_fences = 0
     for path in md_files:
-        found, fences = scan_markdown(path, accepted, judgeable, calls)
+        found, fences = scan_markdown(path, accepted, judgeable)
         defects.extend(found)
         md_fences += fences
     for path in rs_files:
-        found, fences = scan_rustdoc(path, accepted, judgeable, calls)
+        found, fences = scan_rustdoc(path, accepted, judgeable)
         defects.extend(found)
         rs_fences += fences
     stats = {
@@ -493,7 +609,6 @@ def list_surface():
 def self_test():
     accepted = accepted_keys()
     judgeable = {m for m, keys in accepted.items() if keys}
-    calls = macro_call_re()
     passed = failed = 0
 
     def check(name, got, want):
@@ -506,7 +621,7 @@ def self_test():
 
     import tempfile
 
-    def scan_text(text, suffix):
+    def scan_text_full(text, suffix):
         with tempfile.NamedTemporaryFile(
             "w", suffix=suffix, dir=ROOT, delete=False, encoding="utf-8"
         ) as fh:
@@ -514,10 +629,16 @@ def self_test():
             tmp = pathlib.Path(fh.name)
         try:
             scanner = scan_markdown if suffix == ".md" else scan_rustdoc
-            found, _ = scanner(tmp, accepted, judgeable, calls)
-            return [(m, k) for m, k, _ in found]
+            found, _ = scanner(tmp, accepted, judgeable)
+            return found
         finally:
             tmp.unlink()
+
+    def scan_text(text, suffix):
+        return [(m, k) for m, k, _ in scan_text_full(text, suffix)]
+
+    def scan_text_lines(text, suffix):
+        return [loc.rsplit(":", 1)[1] for _, _, loc in scan_text_full(text, suffix)]
 
     # The truth set is read from the macro sources, not a snapshot.
     check("secured accepts scopes", "scopes" in accepted["secured"], True)
@@ -526,7 +647,13 @@ def self_test():
     check("step_up accepts max_age", "max_age" in accepted["step_up"], True)
     check("cached accepts ttl", "ttl" in accepted["cached"], True)
     check("model accepts table", "table" in accepted["model"], True)
-    check("every macro is judgeable", len(judgeable), len(OWNERS))
+    # Not every macro is judgeable, and that is the safe direction: a scope
+    # that yields no keys means this gate cannot read that grammar, so it says
+    # nothing rather than reporting every key the macro's pages use. The floor
+    # guards against a refactor quietly emptying the truth set wholesale — the
+    # failure mode where a gate keeps passing because it stopped looking.
+    check("most macros are judgeable", len(judgeable) >= 17, True)
+    check("skipped macros are named", sorted(set(OWNERS) - judgeable), ["api_doc", "service"])
 
     # A bad key inside a fence is a defect.
     check(
@@ -570,6 +697,60 @@ def self_test():
         "rustdoc: array-valued arg is scanned, not skipped",
         scan_text('//! ```ignore\n//! #[secured(bogus = ["a:b"])]\n//! ```\n', ".rs"),
         [("secured", "bogus")],
+    )
+
+    # Extraction is scoped to the arg parser, not the whole file. `model.rs`
+    # mentions `username` in ~10k lines of codegen; `parse_attr_args` does not
+    # accept it, so `#[model(username = …)]` is a defect.
+    check("model accepts managed", "managed" in accepted["model"], True)
+    check("model rejects username", "username" in accepted["model"], False)
+    check(
+        "markdown: a codegen word is not an accepted key",
+        scan_text('```rust\n#[model(username = "x")]\n```\n', ".md"),
+        [("model", "username")],
+    )
+    # A grammar split across helper parsers is still read whole.
+    check("job accepts unique_by (helper parser)", "unique_by" in accepted["job"], True)
+    check(
+        "job accepts concurrency_key (helper parser)",
+        "concurrency_key" in accepted["job"],
+        True,
+    )
+
+    # A qualified invocation is the same call. Both forms ship in rustdoc.
+    check(
+        "markdown: qualified path is inspected",
+        scan_text('```rust\n#[autumn_web::model(bogus = "x")]\n```\n', ".md"),
+        [("model", "bogus")],
+    )
+    check(
+        "rustdoc: qualified path is inspected",
+        scan_text('//! ```ignore\n//! #[autumn_macros::model(bogus = 1)]\n//! ```\n', ".rs"),
+        [("model", "bogus")],
+    )
+
+    # A multiline attribute is one call, not a set of unparseable lines.
+    check(
+        "markdown: multiline attribute is scanned",
+        scan_text(
+            '```rust\n#[model(\n    table = "posts",\n    bogus = 1,\n)]\n```\n', ".md"
+        ),
+        [("model", "bogus")],
+    )
+    check(
+        "rustdoc: multiline attribute is scanned",
+        scan_text(
+            '//! ```ignore\n//! #[model(\n//!     table = "posts",\n'
+            "//!     bogus = 1,\n//! )]\n//! ```\n",
+            ".rs",
+        ),
+        [("model", "bogus")],
+    )
+    # A multiline call reports the line the attribute opens on.
+    check(
+        "markdown: multiline defect reports the opening line",
+        scan_text_lines("pad\n```rust\n#[model(\n    bogus = 1,\n)]\n```\n", ".md"),
+        ["3"],
     )
     # `==` is a comparison, not a keyword argument.
     check(
