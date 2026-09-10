@@ -817,6 +817,19 @@ BARE_FLAG = re.compile(r"^[a-z_][a-z_0-9]*$")
 # look like a flag to be judged as one.
 KEY_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+
+def _plain_ident(name):
+    """A raw identifier reduced to the identifier it spells.
+
+    `r#policy` IS `policy` — the prefix only escapes the name from Rust's
+    keyword list — so `#[secured(r#policy = "x")]` is the same rejected key.
+    I found this gap myself several rounds ago while auditing the lexer and
+    declined it as a safe miss, on the grounds that no macro has a
+    keyword-colliding key. That was the wrong question: what matters is what a
+    reader can write, not what the parsers happen to name.
+    """
+    return name[2:] if name.startswith("r#") else name
+
 # Macros whose FIRST argument is positional even when written as a bare
 # identifier. `parse_authorize_args` takes the leading bare path as the action
 # verb (`#[authorize(update, resource = Post)]`), so reading it as a flag
@@ -928,13 +941,14 @@ def top_level_keys(args, macro=None):
             # else already makes the attribute unparseable for a reason this
             # gate could not name. A miss is the safe direction; a confidently
             # wrong message is not.
+            head = _plain_ident(head)
             if KEY_IDENT.match(head):
                 names.append((head, False))
-        elif BARE_FLAG.match(segment):
+        elif BARE_FLAG.match(_plain_ident(segment)):
             leading, first = first, False
             if leading and macro in POSITIONAL_FIRST_IDENT:
                 continue  # the action verb, not a flag
-            names.append((segment, True))
+            names.append((_plain_ident(segment), True))
     return names
 
 
@@ -1558,7 +1572,20 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
+    in_html_comment = False
     for lineno, line in enumerate(lines, 1):
+        # A fence inside an HTML comment is not rendered, so a reader cannot
+        # see or copy it — and the gate was failing CI on a block someone had
+        # deliberately commented OUT. Only tracked outside a fence, where
+        # `<!--` is markup rather than code. Waivers are unaffected: they are
+        # collected from the raw lines, not from this scan.
+        if in_html_comment:
+            if "-->" in line:
+                in_html_comment = False
+            continue
+        if open_char is None and "<!--" in line and "-->" not in line.split("<!--", 1)[1]:
+            in_html_comment = True
+            continue
         if open_char is None:
             # Track the innermost list item's content column, but only outside
             # a fence — inside one, a line beginning `- ` is code, not a list.
@@ -1621,8 +1648,32 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
+    in_block_doc = False
     for lineno, line in enumerate(lines, 1):
-        doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
+        # `/** … */` and `/*! … */` are doc comments too, and `rustdoc --test`
+        # collects and runs their fences exactly as it does `///`'s. Only the
+        # line forms were recognised, so a whole legitimate doc form was
+        # ungated. Entered only outside a fence, where `/**` is markup rather
+        # than code.
+        if in_block_doc:
+            text = line
+            if "*/" in text:
+                text = text.split("*/", 1)[0]
+                in_block_doc = False
+            doc_text = re.sub(r"^\s*\*\s?", "", text)
+        elif open_char is None and re.match(r"^\s*/\*[*!]", line):
+            body_after = re.sub(r"^\s*/\*[*!]\s?", "", line)
+            if "*/" in body_after:
+                body_after = body_after.split("*/", 1)[0]
+            else:
+                in_block_doc = True
+            doc_text = body_after
+        else:
+            doc_text = None
+        if doc_text is not None:
+            doc = re.match(r"(.*)", doc_text, re.S)
+        else:
+            doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
         if not doc:
             # A blank line or an ordinary comment between two doc lines does
             # not break the doc comment: rustdoc concatenates the attributes
@@ -2164,6 +2215,47 @@ def self_test():
             ".rs",
         ),
         [("secured", "policy")],
+    )
+    # A fence inside an HTML comment is not rendered, so a reader can neither
+    # see nor copy it.
+    check(
+        "markdown: a fence inside an HTML comment is not scanned",
+        scan_text('<!--\n```rust\n#[secured(policy = "x")]\n```\n-->\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: a fence after a one-line HTML comment is still scanned",
+        scan_text(
+            '<!-- note -->\n\n```rust\n#[secured(policy = "x")]\n```\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    # `r#policy` IS `policy`; the prefix only escapes the keyword list.
+    check(
+        "markdown: a raw identifier key is caught",
+        scan_text('```rust\n#[secured(r#policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a raw identifier naming a real flag passes",
+        scan_text('```rust\n#[job(r#unique, queue = "mail")]\n```\n', ".md"),
+        [],
+    )
+    # `/** … */` and `/*! … */` are doc comments too, and rustdoc tests them.
+    check(
+        "rustdoc: a block doc comment is scanned",
+        scan_text('/** doc\n```\n#[secured(policy = "x")]\n```\n*/\npub fn f() {}\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an inner block doc comment with star decoration is scanned",
+        scan_text('/*!\n * ```\n * #[secured(policy = "x")]\n * ```\n */\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an ordinary block comment is not a doc comment",
+        scan_text('/* note\n```\n#[secured(policy = "x")]\n```\n*/\npub fn g() {}\n', ".rs"),
+        [],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
     check(
