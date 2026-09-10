@@ -18,8 +18,8 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, RunQueryDsl};
 
 use super::{
-    BillingStore, CustomerUpsert, EventClaim, InvoiceUpsert, StoreFuture, SubscriptionUpsert,
-    Write, should_apply,
+    BillingStore, CustomerUpsert, EventClaim, Guard, InvoiceUpsert, StoreFuture,
+    SubscriptionUpsert, Write, guard,
 };
 use crate::error::BillingError;
 use crate::model::{
@@ -350,20 +350,22 @@ impl From<BillingError> for TxError {
     }
 }
 
-impl From<TxError> for BillingError {
-    fn from(err: TxError) -> Self {
-        match err {
-            TxError::Db(err) => db_err(&err),
-            TxError::Billing(err) => err,
+impl TxError {
+    /// Map to a [`BillingError`]; `op` names the store operation.
+    fn into_billing(self, op: &'static str) -> BillingError {
+        match self {
+            Self::Db(err) => db_err(op, &err),
+            Self::Billing(err) => err,
         }
     }
 }
 
-/// Log the cause and map it to a `Store` error. The message names the
-/// operation class only; the SQL detail stays in the log.
-fn db_err(err: &dyn std::fmt::Display) -> BillingError {
-    tracing::warn!(error = %err, "🍂 Autumn Billing: mirror store query failed");
-    BillingError::store(format!("database query failed: {err}"))
+/// Map a database error to a `Store` error. The error message names the
+/// operation only. The raw driver error (which can carry key values) goes to
+/// the `debug` log.
+fn db_err(op: &'static str, err: &dyn std::fmt::Display) -> BillingError {
+    tracing::debug!(op, error = %err, "🍂 Autumn Billing: mirror store query failed");
+    BillingError::store(format!("database query failed: {op}"))
 }
 
 const fn is_unique_violation(err: &DieselError) -> bool {
@@ -396,7 +398,10 @@ impl DbBillingStore {
     }
 
     async fn conn(&self) -> Result<PooledConn, BillingError> {
-        self.pool.get().await.map_err(|err| db_err(&err))
+        self.pool
+            .get()
+            .await
+            .map_err(|err| db_err("acquire connection", &err))
     }
 }
 
@@ -424,7 +429,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("claim_event", &err))?;
             match existing {
                 // First delivery: insert-if-absent. A concurrent insert of the
                 // same id loses on the primary key and is a duplicate.
@@ -442,7 +447,7 @@ impl BillingStore for DbBillingStore {
                     {
                         Ok(_) => Ok(EventClaim::Claimed),
                         Err(err) if is_unique_violation(&err) => Ok(EventClaim::Duplicate),
-                        Err(err) => Err(db_err(&err)),
+                        Err(err) => Err(db_err("claim_event", &err)),
                     }
                 }
                 Some(Some(_)) => Ok(EventClaim::Duplicate),
@@ -463,7 +468,7 @@ impl BillingStore for DbBillingStore {
                     .set(billing_events::claimed_at.eq(to_naive(now)))
                     .execute(&mut conn)
                     .await
-                    .map_err(|err| db_err(&err))?;
+                    .map_err(|err| db_err("claim_event", &err))?;
                     Ok(if updated == 1 {
                         EventClaim::Claimed
                     } else {
@@ -481,7 +486,7 @@ impl BillingStore for DbBillingStore {
                 .set(billing_events::applied_at.eq(Some(to_naive(now))))
                 .execute(&mut conn)
                 .await
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("finish_event", &err))?;
             Ok(())
         })
     }
@@ -498,7 +503,7 @@ impl BillingStore for DbBillingStore {
             )
             .execute(&mut conn)
             .await
-            .map_err(|err| db_err(&err))?;
+            .map_err(|err| db_err("release_event", &err))?;
             Ok(())
         })
     }
@@ -511,7 +516,7 @@ impl BillingStore for DbBillingStore {
                 .count()
                 .get_result(&mut conn)
                 .await
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("applied_event_count", &err))?;
             Ok(u64::try_from(count).unwrap_or(0))
         })
     }
@@ -519,7 +524,9 @@ impl BillingStore for DbBillingStore {
     fn upsert_customer(&self, upsert: CustomerUpsert) -> StoreFuture<'_, Customer> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            let row: CustomerRow = conn
+            let user_id = upsert.user_id.clone();
+            let provider_customer_id = upsert.provider_customer_id.clone();
+            let result: Result<CustomerRow, TxError> = conn
                 .transaction(async move |conn| -> Result<CustomerRow, TxError> {
                     let existing: Option<CustomerRow> = billing_customers::table
                         .filter(
@@ -560,8 +567,33 @@ impl BillingStore for DbBillingStore {
                         .await?;
                     Ok(current)
                 })
-                .await?;
-            Ok(row.into_model())
+                .await;
+            match result {
+                Ok(row) => Ok(row.into_model()),
+                // A concurrent call linked the same user (partial unique index
+                // on `user_id`) or mirrored the same provider customer. That
+                // row is the customer; the extra provider customer is an orphan.
+                Err(TxError::Db(err)) if is_unique_violation(&err) => {
+                    let linked = match &user_id {
+                        Some(user_id) => self.customer_by_user(user_id).await?,
+                        None => None,
+                    };
+                    let row = match linked {
+                        Some(row) => Some(row),
+                        None => self.customer_by_provider_id(&provider_customer_id).await?,
+                    };
+                    let Some(row) = row else {
+                        return Err(db_err("upsert_customer", &err));
+                    };
+                    tracing::info!(
+                        customer_id = %row.id,
+                        provider_customer_id = %provider_customer_id,
+                        "🍂 Autumn Billing: customer already mirrored by a concurrent call; existing row kept"
+                    );
+                    Ok(row)
+                }
+                Err(err) => Err(err.into_billing("upsert_customer")),
+            }
         })
     }
 
@@ -574,7 +606,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("customer_by_id", &err))?;
             Ok(row.map(CustomerRow::into_model))
         })
     }
@@ -589,7 +621,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("customer_by_user", &err))?;
             Ok(row.map(CustomerRow::into_model))
         })
     }
@@ -606,7 +638,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("customer_by_provider_id", &err))?;
             Ok(row.map(CustomerRow::into_model))
         })
     }
@@ -643,20 +675,27 @@ impl BillingStore for DbBillingStore {
                         };
                         let current_status = SubscriptionStatus::parse(&current.status)
                             .ok_or_else(|| bad_stored("subscription status", &current.status))?;
-                        if !should_apply(
+                        match guard(
                             to_utc(current.last_event_at),
                             current_status.rank(),
                             current_status.is_terminal(),
                             upsert.occurred_at,
                             upsert.status.rank(),
                         ) {
-                            return Ok(Write::Stale(current));
+                            Guard::Apply => {}
+                            Guard::Unchanged => return Ok(Write::Unchanged(current)),
+                            Guard::Stale => return Ok(Write::Stale(current)),
                         }
-                        let row = SubscriptionRow::from_upsert(
+                        let mut row = SubscriptionRow::from_upsert(
                             current.id.clone(),
                             to_utc(current.created_at),
                             upsert,
                         );
+                        // A snapshot without these fields keeps the stored values.
+                        row.provider_price_id = row.provider_price_id.or(current.provider_price_id);
+                        row.plan_id = row.plan_id.or(current.plan_id);
+                        row.current_period_end =
+                            row.current_period_end.or(current.current_period_end);
                         diesel::update(billing_subscriptions::table.find(&row.id))
                             .set(&row)
                             .execute(conn)
@@ -664,11 +703,9 @@ impl BillingStore for DbBillingStore {
                         Ok(Write::Applied(row))
                     },
                 )
-                .await?;
-            Ok(match write {
-                Write::Applied(row) => Write::Applied(row.into_model()?),
-                Write::Stale(row) => Write::Stale(row.into_model()?),
-            })
+                .await
+                .map_err(|err| err.into_billing("upsert_subscription"))?;
+            write.try_map(SubscriptionRow::into_model)
         })
     }
 
@@ -681,7 +718,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("subscription_by_id", &err))?;
             row.map(SubscriptionRow::into_model).transpose()
         })
     }
@@ -701,7 +738,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("subscription_by_provider_id", &err))?;
             row.map(SubscriptionRow::into_model).transpose()
         })
     }
@@ -721,7 +758,7 @@ impl BillingStore for DbBillingStore {
                 .select(SubscriptionRow::as_select())
                 .load(&mut conn)
                 .await
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("subscriptions_for_customer", &err))?;
             rows.into_iter().map(SubscriptionRow::into_model).collect()
         })
     }
@@ -741,7 +778,7 @@ impl BillingStore for DbBillingStore {
                 ))
                 .execute(&mut conn)
                 .await
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("set_subscription_status", &err))?;
             if updated == 0 {
                 return Ok(None);
             }
@@ -751,7 +788,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("set_subscription_status", &err))?;
             row.map(SubscriptionRow::into_model).transpose()
         })
     }
@@ -785,14 +822,16 @@ impl BillingStore for DbBillingStore {
                     };
                     let current_status = InvoiceStatus::parse(&current.status)
                         .ok_or_else(|| bad_stored("invoice status", &current.status))?;
-                    if !should_apply(
+                    match guard(
                         to_utc(current.last_event_at),
                         current_status.rank(),
                         false,
                         upsert.occurred_at,
                         upsert.status.rank(),
                     ) {
-                        return Ok(Write::Stale(current));
+                        Guard::Apply => {}
+                        Guard::Unchanged => return Ok(Write::Unchanged(current)),
+                        Guard::Stale => return Ok(Write::Stale(current)),
                     }
                     // `None` keeps the stored link.
                     let subscription_id =
@@ -809,11 +848,9 @@ impl BillingStore for DbBillingStore {
                         .await?;
                     Ok(Write::Applied(row))
                 })
-                .await?;
-            Ok(match write {
-                Write::Applied(row) => Write::Applied(row.into_model()?),
-                Write::Stale(row) => Write::Stale(row.into_model()?),
-            })
+                .await
+                .map_err(|err| err.into_billing("upsert_invoice"))?;
+            write.try_map(InvoiceRow::into_model)
         })
     }
 
@@ -826,7 +863,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("invoice_by_id", &err))?;
             row.map(InvoiceRow::into_model).transpose()
         })
     }
@@ -843,7 +880,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("invoice_by_provider_id", &err))?;
             row.map(InvoiceRow::into_model).transpose()
         })
     }
@@ -865,7 +902,8 @@ impl BillingStore for DbBillingStore {
                 }
                 Ok(())
             })
-            .await?;
+            .await
+            .map_err(|err| err.into_billing("upsert_dunning"))?;
             Ok(())
         })
     }
@@ -882,7 +920,7 @@ impl BillingStore for DbBillingStore {
                 .first(&mut conn)
                 .await
                 .optional()
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("dunning_by_invoice", &err))?;
             row.map(DunningRow::into_model).transpose()
         })
     }
@@ -912,7 +950,7 @@ impl BillingStore for DbBillingStore {
             ))
             .execute(&mut conn)
             .await
-            .map_err(|err| db_err(&err))?;
+            .map_err(|err| db_err("claim_dunning_attempt", &err))?;
             Ok(updated == 1)
         })
     }
@@ -932,8 +970,49 @@ impl BillingStore for DbBillingStore {
                 .select(DunningRow::as_select())
                 .load(&mut conn)
                 .await
-                .map_err(|err| db_err(&err))?;
+                .map_err(|err| db_err("open_dunning", &err))?;
             rows.into_iter().map(DunningRow::into_model).collect()
+        })
+    }
+
+    fn settle_dunning<'a>(
+        &'a self,
+        invoice_id: &'a str,
+        expected_attempt: i64,
+        from: &'a [DunningState],
+        row: DunningAttempt,
+    ) -> StoreFuture<'a, bool> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let states: Vec<&'static str> = from.iter().map(|state| state.as_str()).collect();
+            let row = DunningRow::from_model(row);
+            // One conditional update is the compare-and-set.
+            let updated = diesel::update(
+                billing_dunning::table.filter(
+                    billing_dunning::invoice_id
+                        .eq(invoice_id)
+                        .and(billing_dunning::state.eq_any(states))
+                        .and(billing_dunning::attempt.eq(expected_attempt)),
+                ),
+            )
+            .set(&row)
+            .execute(&mut conn)
+            .await
+            .map_err(|err| db_err("settle_dunning", &err))?;
+            Ok(updated == 1)
+        })
+    }
+
+    fn prune_events(&self, before: DateTime<Utc>) -> StoreFuture<'_, u64> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let deleted = diesel::delete(
+                billing_events::table.filter(billing_events::applied_at.lt(to_naive(before))),
+            )
+            .execute(&mut conn)
+            .await
+            .map_err(|err| db_err("prune_events", &err))?;
+            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
         })
     }
 }

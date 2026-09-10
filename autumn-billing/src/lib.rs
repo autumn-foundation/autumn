@@ -271,21 +271,24 @@ impl BillingPlugin {
 
     fn resolve_store(
         state: &AppState,
+        config: &BillingConfig,
         injected: Option<Arc<dyn BillingStore>>,
-    ) -> Arc<dyn BillingStore> {
+    ) -> Result<Arc<dyn BillingStore>, BillingError> {
         if let Some(store) = injected {
-            return store;
+            return Ok(store);
         }
         #[cfg(feature = "db")]
         if let Some(pool) = autumn_web::db::DbState::pool(state).cloned() {
-            return Arc::new(DbBillingStore::new(pool));
+            return Ok(Arc::new(DbBillingStore::new(pool)));
         }
+        let is_production = is_production_profile(state.profile());
+        check_memory_store(is_production, config)?;
         if state.profile() != "test" {
             tracing::warn!(
                 "🍂 Autumn Billing: no database pool; using the in-memory mirror, which is lost on restart"
             );
         }
-        Arc::new(MemoryBillingStore::new())
+        Ok(Arc::new(MemoryBillingStore::new()))
     }
 
     fn resolve_provider(
@@ -339,10 +342,10 @@ impl Plugin for BillingPlugin {
             let store = store.clone();
             let hooks = hooks.clone();
             async move {
-                let is_production = matches!(state.profile(), "prod" | "production");
+                let is_production = is_production_profile(state.profile());
                 config.validate(is_production)?;
                 let provider = Self::resolve_provider(&state, &config, provider)?;
-                let store = Self::resolve_store(&state, store);
+                let store = Self::resolve_store(&state, &config, store)?;
                 verify_webhook_endpoint(&state, &config, provider.as_ref())?;
                 // `insert_extension` wraps the value in its own `Arc`, keyed
                 // by `BillingService`; read that handle back for the re-arm.
@@ -359,6 +362,25 @@ impl Plugin for BillingPlugin {
             }
         })
     }
+}
+
+/// `true` for the production profile names.
+fn is_production_profile(profile: &str) -> bool {
+    matches!(profile, "prod" | "production")
+}
+
+/// The in-memory mirror is lost on restart. Production refuses it unless
+/// the config opts in.
+fn check_memory_store(is_production: bool, config: &BillingConfig) -> Result<(), BillingError> {
+    if is_production && !config.allow_memory_store_in_production {
+        return Err(BillingError::Config(
+            "autumn-billing: no database pool in production; the in-memory mirror is lost \
+             on restart. Configure a database, or set \
+             billing.allow_memory_store_in_production = true to accept this."
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Fail boot when the app did not declare the webhook receiver, or declared
@@ -539,6 +561,35 @@ mod conformance_tests {
             CheckStatus::Fail,
             "expected collision to be detected"
         );
+    }
+}
+
+#[cfg(test)]
+mod store_resolution_tests {
+    use super::{BillingConfig, BillingError, check_memory_store, is_production_profile};
+
+    #[test]
+    fn production_refuses_the_memory_mirror_unless_allowed() {
+        let default = BillingConfig::default();
+        let err = check_memory_store(true, &default).expect_err("production refuses memory");
+        let BillingError::Config(message) = err else {
+            panic!("expected a config error");
+        };
+        assert!(
+            message.contains("allow_memory_store_in_production"),
+            "{message}"
+        );
+        check_memory_store(false, &default).expect("development accepts memory");
+        let allowed = BillingConfig::default().allow_memory_store_in_production(true);
+        check_memory_store(true, &allowed).expect("opt-in accepts memory");
+    }
+
+    #[test]
+    fn production_profile_names() {
+        assert!(is_production_profile("prod"));
+        assert!(is_production_profile("production"));
+        assert!(!is_production_profile("test"));
+        assert!(!is_production_profile("dev"));
     }
 }
 

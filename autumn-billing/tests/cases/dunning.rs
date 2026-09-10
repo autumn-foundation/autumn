@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_billing::dunning::RETRY_JOB_NAME;
+use autumn_billing::dunning::{RETRY_JOB_NAME, RUNNING_STALE_AFTER, TRANSPORT_RETRY_DELAY};
 use autumn_billing::event::{InvoiceSnapshot, SubscriptionSnapshot};
 use autumn_billing::model::{DunningAttempt, Invoice, Subscription};
 use autumn_billing::provider::PaymentAttemptOutcome;
@@ -14,12 +14,13 @@ use autumn_billing::{
     DunningState, ExhaustionAction, InvoiceStatus, MemoryBillingStore, Money, NoHooks, ProviderId,
     SubscriptionStatus,
 };
-use autumn_web::test::TestApp;
+use autumn_web::test::{TestApp, TestClient};
 use autumn_web::time::TickingClock;
 
 use super::support::{
-    self, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE, apply_event, at, event,
-    harness_with_hooks, notification_kinds, notification_routes,
+    self, DynHarness, FailingStore, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE,
+    apply_event, at, event, harness_dyn, harness_with_hooks, notification_kinds,
+    notification_routes,
 };
 
 const RECIPIENT: i64 = 42;
@@ -39,7 +40,22 @@ async fn dunning_harness(
     provider: Arc<FakeProvider>,
 ) -> Harness {
     let h = harness_with_hooks(billing, Arc::new(NoHooks), store, provider, clocked);
-    h.store
+    seed_failed_invoice(&h.client, h.store.as_ref()).await;
+    h
+}
+
+/// Like [`dunning_harness`] over any store (a failure-injecting one).
+async fn dunning_harness_dyn(store: Arc<dyn BillingStore>) -> DynHarness {
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    let h = harness_dyn(support::config(), store, provider, clocked);
+    seed_failed_invoice(&h.client, h.store.as_ref()).await;
+    h
+}
+
+/// Mirror a linked customer, an active subscription and one failed invoice
+/// (dunning row attempt 1, due at `at(3600)`).
+async fn seed_failed_invoice(client: &TestClient, store: &dyn BillingStore) {
+    store
         .upsert_customer(
             CustomerUpsert::new("local-1", "fake", "cus_1", at(-300))
                 .with_user("42")
@@ -51,7 +67,7 @@ async fn dunning_harness(
         SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
             .with_price(PRO_PRICE),
     );
-    apply_event(&h.client, event("evt_sub", at(-200), sub))
+    apply_event(client, event("evt_sub", at(-200), sub))
         .await
         .unwrap();
     let failed = BillingEventKind::InvoicePaymentFailed(
@@ -64,11 +80,40 @@ async fn dunning_harness(
         .with_subscription("sub_1")
         .with_attempt_count(1),
     );
-    apply_event(&h.client, event("evt_fail", at(-100), failed))
+    apply_event(client, event("evt_fail", at(-100), failed))
         .await
         .unwrap();
-    h.client.assert_job_enqueued(RETRY_JOB_NAME);
-    h
+    client.assert_job_enqueued(RETRY_JOB_NAME);
+}
+
+async fn invoice_on(store: &dyn BillingStore) -> Invoice {
+    store
+        .invoice_by_provider_id(&ProviderId::new("in_1"))
+        .await
+        .unwrap()
+        .expect("invoice mirrored")
+}
+
+async fn row_on(store: &dyn BillingStore) -> DunningAttempt {
+    let invoice = invoice_on(store).await;
+    store
+        .dunning_by_invoice(&invoice.id)
+        .await
+        .unwrap()
+        .expect("dunning row")
+}
+
+/// Run the retry job handler once for `invoice_id`, as the runtime would.
+async fn run_retry_handler(client: &TestClient, invoice_id: &str) -> autumn_web::AutumnResult<()> {
+    let job = autumn_billing::dunning::job_infos()
+        .into_iter()
+        .find(|info| info.name == RETRY_JOB_NAME)
+        .expect("retry job registered");
+    (job.handler)(
+        client.state().clone(),
+        serde_json::json!({ "invoice_id": invoice_id }),
+    )
+    .await
 }
 
 async fn standard_harness() -> Harness {
@@ -270,41 +315,161 @@ async fn cancel_failure_on_exhaustion_is_logged_not_retried() {
 }
 
 #[tokio::test]
-async fn transport_error_keeps_the_row_pending_and_fails_the_job() {
+async fn transport_error_reschedules_the_same_attempt() {
     let h = standard_harness().await;
     h.provider
         .script_retry(Err(BillingError::provider("fake", "connection reset")));
+    h.client.advance_clock(Duration::from_secs(3601));
+    // The job succeeds: the schedule row stays the truth and the framework
+    // never dead-letters it.
+    perform_ok(&h).await;
+    assert_eq!(h.provider.retry_calls(), 1);
+    let pending = row(&h).await;
+    assert_eq!(pending.attempt, 1, "the attempt is not consumed");
+    assert_eq!(pending.state, DunningState::Pending);
+    assert_eq!(
+        pending.next_attempt_at,
+        at(3601) + chrono::Duration::from_std(TRANSPORT_RETRY_DELAY).unwrap()
+    );
+    h.client.assert_job_enqueued(RETRY_JOB_NAME);
+    assert_eq!(
+        notification_kinds(&h.client, RECIPIENT).await,
+        ["billing.payment_failed"]
+    );
+    // Not due yet: a run before the delay makes no provider call.
+    perform_ok(&h).await;
+    assert_eq!(h.provider.retry_calls(), 1);
+    // Due: the same attempt runs again with the same idempotency key.
+    h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
+    h.client.advance_clock(TRANSPORT_RETRY_DELAY);
+    perform_ok(&h).await;
+    assert_eq!(h.provider.retry_calls(), 2);
+    let invoice = invoice(&h).await;
+    let keys: Vec<String> = h
+        .provider
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            FakeCall::RetryInvoice {
+                idempotency_key, ..
+            } => Some(idempotency_key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![format!("autumn-billing:{}:1", invoice.id); 2]);
+    assert_eq!(row(&h).await.state, DunningState::Recovered);
+    assert_eq!(invoice.status, InvoiceStatus::Paid);
+}
+
+#[tokio::test]
+async fn store_error_after_claim_restores_pending() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    // The first read after the claim fails.
+    store.fail_on("invoice_by_id", 1);
+    let h = dunning_harness_dyn(store.clone()).await;
     h.client.advance_clock(Duration::from_secs(3601));
     let report = h.client.perform_enqueued_jobs().await;
     let failures = report.failures();
     assert_eq!(failures.len(), 1, "{report:?}");
     assert_eq!(failures[0].0, RETRY_JOB_NAME);
+    assert_eq!(h.provider.retry_calls(), 0);
+    // Not stuck in Running: same attempt, same due time.
+    let restored = row_on(h.store.as_ref()).await;
+    assert_eq!(restored.state, DunningState::Pending);
+    assert_eq!(restored.attempt, 1);
+    assert_eq!(restored.next_attempt_at, at(3600));
+    // The framework's retry claims it again and completes.
+    h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
+    let invoice = invoice_on(h.store.as_ref()).await;
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
     assert_eq!(h.provider.retry_calls(), 1);
-    let pending = row(&h).await;
-    assert_eq!(pending.attempt, 1);
-    assert_eq!(pending.state, DunningState::Pending);
-    assert_eq!(pending.next_attempt_at, at(3600));
+    assert_eq!(
+        row_on(h.store.as_ref()).await.state,
+        DunningState::Recovered
+    );
+    assert_eq!(
+        invoice_on(h.store.as_ref()).await.status,
+        InvoiceStatus::Paid
+    );
+}
+
+#[tokio::test]
+async fn stale_running_row_is_reclaimed() {
+    let h = standard_harness().await;
+    h.client.advance_clock(Duration::from_secs(3601));
+    let invoice_id = invoice(&h).await.id;
+    // A run claimed the attempt and died more than RUNNING_STALE_AFTER ago.
+    let stale_since = at(3601) - chrono::Duration::from_std(RUNNING_STALE_AFTER).unwrap();
+    assert!(
+        h.store
+            .claim_dunning_attempt(&invoice_id, 1, stale_since - chrono::Duration::seconds(1))
+            .await
+            .unwrap()
+    );
+    h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
+    run_retry_handler(&h.client, &invoice_id).await.unwrap();
+    assert_eq!(h.provider.retry_calls(), 1);
+    assert_eq!(row(&h).await.state, DunningState::Recovered);
+    assert_eq!(invoice(&h).await.status, InvoiceStatus::Paid);
+
+    // A row claimed less than RUNNING_STALE_AFTER ago is in flight elsewhere:
+    // no provider call, the row stays Running, and a check is queued.
+    let h = standard_harness().await;
+    h.client.advance_clock(Duration::from_secs(3601));
+    let invoice_id = invoice(&h).await.id;
+    assert!(
+        h.store
+            .claim_dunning_attempt(&invoice_id, 1, at(3601))
+            .await
+            .unwrap()
+    );
+    run_retry_handler(&h.client, &invoice_id).await.unwrap();
+    assert_eq!(h.provider.retry_calls(), 0);
+    let running = row(&h).await;
+    assert_eq!(running.state, DunningState::Running);
+    assert_eq!(running.updated_at, at(3601));
+    h.client.assert_job_enqueued(RETRY_JOB_NAME);
+}
+
+#[tokio::test]
+async fn settle_after_reconcile_closed_the_row_is_a_no_op() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let h = dunning_harness_dyn(store.clone()).await;
+    h.client.advance_clock(Duration::from_secs(3601));
+    let invoice = invoice_on(h.store.as_ref()).await;
+    // While the provider call is in flight, a subscription.deleted event
+    // closes the row. Model it as a write before the job's first settle.
+    let backing = inner.clone();
+    let mut canceled_row = row_on(h.store.as_ref()).await;
+    canceled_row.state = DunningState::Canceled;
+    canceled_row.updated_at = at(3601);
+    store.before(
+        "settle_dunning",
+        1,
+        Box::new(move || {
+            let backing = backing.clone();
+            let canceled_row = canceled_row.clone();
+            Box::pin(async move {
+                backing.upsert_dunning(canceled_row).await.unwrap();
+            })
+        }),
+    );
+    h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
+    assert_eq!(h.provider.retry_calls(), 1);
+    assert_eq!(store.calls("settle_dunning"), 1);
+    // The reconcile decision wins: no recovery written, no notification.
+    assert_eq!(row_on(h.store.as_ref()).await.state, DunningState::Canceled);
+    assert_eq!(
+        invoice_on(h.store.as_ref()).await.status,
+        InvoiceStatus::Open
+    );
     assert_eq!(
         notification_kinds(&h.client, RECIPIENT).await,
         ["billing.payment_failed"]
     );
-    // The framework's retry (same job, next attempt) finds the row still due
-    // and claims it again. Run the handler the way the runtime would.
-    h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
-    let open_invoice = invoice(&h).await;
-    let job = autumn_billing::dunning::job_infos()
-        .into_iter()
-        .find(|info| info.name == RETRY_JOB_NAME)
-        .expect("retry job registered");
-    (job.handler)(
-        h.client.state().clone(),
-        serde_json::json!({ "invoice_id": open_invoice.id }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(h.provider.retry_calls(), 2);
-    assert_eq!(row(&h).await.state, DunningState::Recovered);
-    assert_eq!(invoice(&h).await.status, InvoiceStatus::Paid);
 }
 
 /// Poll `check` every 25 ms for up to five seconds.
@@ -362,18 +527,23 @@ async fn restart_re_arms_pending_rows() {
 }
 
 #[tokio::test]
-async fn restart_resets_a_running_row_and_runs_it() {
+async fn restart_reclaims_an_abandoned_running_row_and_runs_it() {
     let store = MemoryBillingStore::shared();
     let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
     let app_a = dunning_harness(support::config(), store.clone(), provider.clone()).await;
     let invoice_id = invoice(&app_a).await.id;
-    // A retry was claimed and the process died mid-flight.
-    assert!(
-        store
-            .claim_dunning_attempt(&invoice_id, 1, at(3600))
-            .await
-            .unwrap()
-    );
+    // A due retry was claimed and the process died mid-flight, long enough
+    // ago that the new process's clock is past `updated_at + RUNNING_STALE_AFTER`.
+    let stale = chrono::Duration::from_std(RUNNING_STALE_AFTER).unwrap();
+    let mut abandoned = store
+        .dunning_by_invoice(&invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    abandoned.state = DunningState::Running;
+    abandoned.next_attempt_at = at(-3600);
+    abandoned.updated_at = at(0) - stale - chrono::Duration::seconds(1);
+    store.upsert_dunning(abandoned).await.unwrap();
     drop(app_a);
 
     provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
@@ -384,7 +554,8 @@ async fn restart_resets_a_running_row_and_runs_it() {
         provider.clone(),
         clocked,
     );
-    // The row goes back to Pending, due now; the worker runs it at once.
+    // Re-armed at max(next_attempt_at, updated_at + RUNNING_STALE_AFTER),
+    // which is due: the worker reclaims it and runs it at once.
     wait_for(|| async {
         store
             .dunning_by_invoice(&invoice_id)
@@ -403,5 +574,47 @@ async fn restart_resets_a_running_row_and_runs_it() {
             .status,
         InvoiceStatus::Paid
     );
+    drop(app_b);
+}
+
+#[tokio::test]
+async fn restart_does_not_reset_a_fresh_running_row() {
+    let store = MemoryBillingStore::shared();
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    let app_a = dunning_harness(support::config(), store.clone(), provider.clone()).await;
+    let invoice_id = invoice(&app_a).await.id;
+    // Claimed just now: another instance may still own it.
+    assert!(
+        store
+            .claim_dunning_attempt(&invoice_id, 1, at(-100))
+            .await
+            .unwrap()
+    );
+    drop(app_a);
+
+    let app_b = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        store.clone(),
+        provider.clone(),
+        clocked,
+    );
+    wait_for(|| async {
+        app_b
+            .client
+            .enqueued_jobs()
+            .iter()
+            .any(|j| j.name == RETRY_JOB_NAME && j.payload["invoice_id"] == invoice_id)
+    })
+    .await;
+    // Queued for the reclaim threshold, not run: the row is left Running.
+    assert_eq!(provider.retry_calls(), 0);
+    let row = store
+        .dunning_by_invoice(&invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, DunningState::Running);
+    assert_eq!(row.updated_at, at(-100));
     drop(app_b);
 }

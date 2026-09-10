@@ -200,6 +200,9 @@ pub struct BillingConfig {
     pub stripe: StripeConfig,
     /// Plans declared in `[[billing.plans]]`.
     pub plans: Vec<Plan>,
+    /// Let a production app run on the in-memory mirror (lost on restart).
+    /// Default `false`: production boot fails without a database pool.
+    pub allow_memory_store_in_production: bool,
 }
 
 impl Default for BillingConfig {
@@ -215,6 +218,7 @@ impl Default for BillingConfig {
             dunning: DunningPolicy::standard(),
             stripe: StripeConfig::default(),
             plans: Vec::new(),
+            allow_memory_store_in_production: false,
         }
     }
 }
@@ -329,6 +333,13 @@ impl BillingConfig {
         self
     }
 
+    /// Let a production app run on the in-memory mirror.
+    #[must_use]
+    pub const fn allow_memory_store_in_production(mut self, allow: bool) -> Self {
+        self.allow_memory_store_in_production = allow;
+        self
+    }
+
     /// The webhook route path (`{prefix}/webhook`).
     #[must_use]
     pub fn webhook_path(&self) -> String {
@@ -403,6 +414,11 @@ impl BillingConfig {
                 "{STRIPE_WEBHOOK_SECRET_ENV} is not set; production requires a webhook secret"
             ))
         })?;
+        if !self.stripe.api_base.starts_with("https://") {
+            return Err(BillingError::Config(
+                "billing.stripe.api_base must start with https:// in production".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -446,6 +462,7 @@ struct BillingToml {
     stripe: Option<StripeToml>,
     #[serde(default)]
     plans: Vec<PlanToml>,
+    allow_memory_store_in_production: Option<bool>,
 }
 
 impl BillingToml {
@@ -464,6 +481,9 @@ impl BillingToml {
                 .map_or(defaults.dunning, DunningToml::into_policy),
             stripe: self.stripe.map_or(defaults.stripe, StripeToml::into_config),
             plans: self.plans.into_iter().map(PlanToml::into_plan).collect(),
+            allow_memory_store_in_production: self
+                .allow_memory_store_in_production
+                .unwrap_or(defaults.allow_memory_store_in_production),
         }
     }
 }
@@ -558,6 +578,7 @@ cancel_url = "https://app.test/cancel"
 portal_return_url = "https://app.test/account"
 allow_past_due = true
 grace_period_hours = 24
+allow_memory_store_in_production = true
 
 [billing.dunning]
 enabled = true
@@ -612,6 +633,7 @@ interval = "year"
         assert_eq!(cfg.portal_return_url, "https://app.test/account");
         assert!(cfg.allow_past_due);
         assert_eq!(cfg.grace_period, Duration::from_secs(24 * 3600));
+        assert!(cfg.allow_memory_store_in_production);
 
         assert!(cfg.dunning.enabled);
         assert_eq!(
@@ -834,6 +856,36 @@ interval = "year"
         let blank = live().stripe_webhook_secret("");
         let message = err_message(blank.validate(true));
         assert!(message.contains(STRIPE_WEBHOOK_SECRET_ENV), "{message}");
+    }
+
+    #[test]
+    fn validate_production_rejects_http_api_base() {
+        let mut cfg = live();
+        cfg.stripe.api_base = "http://stripe-mock:12111".to_owned();
+        let message = err_message(cfg.validate(true));
+        assert!(message.contains("api_base"), "{message}");
+        assert!(message.contains("https://"), "{message}");
+        // Development may point at a local mock.
+        cfg.validate(false).unwrap();
+        let mut https = live();
+        https.stripe.api_base = "https://api.stripe.example".to_owned();
+        https.validate(true).unwrap();
+    }
+
+    #[test]
+    fn allow_memory_store_in_production_defaults_to_false() {
+        assert!(!BillingConfig::default().allow_memory_store_in_production);
+        let cfg = BillingConfig::from_toml_str("[billing]\n").unwrap();
+        assert!(!cfg.allow_memory_store_in_production);
+        let cfg =
+            BillingConfig::from_toml_str("[billing]\nallow_memory_store_in_production = true\n")
+                .unwrap();
+        assert!(cfg.allow_memory_store_in_production);
+        assert!(
+            BillingConfig::default()
+                .allow_memory_store_in_production(true)
+                .allow_memory_store_in_production
+        );
     }
 
     #[test]

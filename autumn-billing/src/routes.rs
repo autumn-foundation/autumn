@@ -52,7 +52,7 @@ use crate::BillingService;
 use crate::config::BillingConfig;
 use crate::error::BillingError;
 use crate::gate::{Billing, session_user_id};
-use crate::model::{Customer, Subscription};
+use crate::model::{Customer, Subscription, SubscriptionStatus};
 use crate::plan::{Plan, PlanId};
 use crate::provider::{CheckoutRequest, CustomerRequest, HostedSession, PortalRequest};
 use crate::reconcile::{self, ReconcileOutcome};
@@ -185,15 +185,26 @@ async fn customer_for(
         .create_customer(CustomerRequest::new(local_id.clone(), user_id))
         .await?;
     let now = state.clock().now();
-    store
+    let customer = store
         .upsert_customer(
-            CustomerUpsert::new(local_id, provider.name(), provider_customer_id, now)
+            CustomerUpsert::new(local_id, provider.name(), provider_customer_id.clone(), now)
                 .with_user(user_id),
         )
-        .await
+        .await?;
+    // A concurrent checkout linked the user first. Its row is the customer;
+    // the provider customer created here is an orphan.
+    if customer.provider_customer_id != provider_customer_id {
+        tracing::info!(
+            customer_id = %customer.id,
+            orphan_provider_customer_id = %provider_customer_id,
+            "🍂 Autumn Billing: concurrent checkout linked the user; existing customer used"
+        );
+    }
+    Ok(customer)
 }
 
 /// `true` when the customer has a subscription the provider still bills.
+/// An `incomplete` row is an abandoned checkout; it does not block a new one.
 async fn has_live_subscription(
     service: &BillingService,
     user_id: &str,
@@ -203,7 +214,9 @@ async fn has_live_subscription(
         return Ok(false);
     };
     let rows = store.subscriptions_for_customer(&customer.id).await?;
-    Ok(rows.iter().any(|row| row.status.is_live()))
+    Ok(rows
+        .iter()
+        .any(|row| row.status.is_live() && row.status != SubscriptionStatus::Incomplete))
 }
 
 /// `POST {prefix}/checkout` — start hosted checkout for `plan`.

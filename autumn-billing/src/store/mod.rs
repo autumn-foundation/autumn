@@ -4,7 +4,7 @@
 //! Two implementations: [`MemoryBillingStore`] (tests, DB-less apps) and
 //! [`DbBillingStore`] (Postgres / `SQLite` through `RuntimeConnection`).
 //! The ordering guard for upserts lives in the store: an upsert applies only
-//! when `should_apply` says so.
+//! when `guard` says so.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -14,7 +14,8 @@ use chrono::{DateTime, Utc};
 
 use crate::error::BillingError;
 use crate::model::{
-    Customer, DunningAttempt, Invoice, InvoiceStatus, ProviderId, Subscription, SubscriptionStatus,
+    Customer, DunningAttempt, DunningState, Invoice, InvoiceStatus, ProviderId, Subscription,
+    SubscriptionStatus,
 };
 use crate::money::Money;
 use crate::plan::PlanId;
@@ -44,7 +45,11 @@ pub enum EventClaim {
 pub enum Write<T> {
     /// The row was inserted or updated.
     Applied(T),
-    /// An equal or newer event was already applied. `T` is the stored row.
+    /// The same event was already applied (same instant, same status).
+    /// Nothing was written. `T` is the stored row.
+    Unchanged(T),
+    /// A newer event was already applied. Nothing was written. `T` is the
+    /// stored row.
     Stale(T),
 }
 
@@ -53,7 +58,7 @@ impl<T> Write<T> {
     #[must_use]
     pub fn into_inner(self) -> T {
         match self {
-            Self::Applied(row) | Self::Stale(row) => row,
+            Self::Applied(row) | Self::Unchanged(row) | Self::Stale(row) => row,
         }
     }
 
@@ -62,24 +67,59 @@ impl<T> Write<T> {
     pub const fn is_applied(&self) -> bool {
         matches!(self, Self::Applied(_))
     }
+
+    /// `true` when the event was already applied, so its side effects can
+    /// run again without a write.
+    #[must_use]
+    pub const fn is_unchanged(&self) -> bool {
+        matches!(self, Self::Unchanged(_))
+    }
+
+    /// The row wrapped in the same variant, or the first error.
+    pub(crate) fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Write<U>, E> {
+        Ok(match self {
+            Self::Applied(row) => Write::Applied(f(row)?),
+            Self::Unchanged(row) => Write::Unchanged(f(row)?),
+            Self::Stale(row) => Write::Stale(f(row)?),
+        })
+    }
+}
+
+/// Decision of the ordering guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Guard {
+    /// Write the incoming snapshot.
+    Apply,
+    /// The incoming snapshot is the stored one. Do not write.
+    Unchanged,
+    /// The stored snapshot is newer. Do not write.
+    Stale,
 }
 
 /// Ordering guard shared by every store.
 ///
 /// Apply when the incoming event is newer, or is at the same instant and its
-/// status ranks higher. Never leave a terminal status.
+/// status ranks higher. The same instant and rank is a redelivery. Never
+/// leave a terminal status.
 #[must_use]
-pub(crate) fn should_apply(
+pub(crate) fn guard(
     existing_at: DateTime<Utc>,
     existing_rank: u8,
     existing_terminal: bool,
     incoming_at: DateTime<Utc>,
     incoming_rank: u8,
-) -> bool {
-    if existing_terminal {
-        return false;
+) -> Guard {
+    if incoming_at == existing_at && incoming_rank == existing_rank {
+        return Guard::Unchanged;
     }
-    incoming_at > existing_at || (incoming_at == existing_at && incoming_rank > existing_rank)
+    if existing_terminal {
+        return Guard::Stale;
+    }
+    if incoming_at > existing_at || (incoming_at == existing_at && incoming_rank > existing_rank) {
+        Guard::Apply
+    } else {
+        Guard::Stale
+    }
 }
 
 /// Customer upsert keyed by `provider_customer_id`.
@@ -412,4 +452,21 @@ pub trait BillingStore: Send + Sync + 'static {
 
     /// Every row in `Pending` or `Running`, ordered by `next_attempt_at`.
     fn open_dunning(&self) -> StoreFuture<'_, Vec<DunningAttempt>>;
+
+    /// Compare-and-set write of `row`: applied only when the stored row for
+    /// `invoice_id` is in one of `from` at `expected_attempt`. Returns
+    /// `true` when the row was written.
+    fn settle_dunning<'a>(
+        &'a self,
+        invoice_id: &'a str,
+        expected_attempt: i64,
+        from: &'a [DunningState],
+        row: DunningAttempt,
+    ) -> StoreFuture<'a, bool>;
+
+    // ── Retention ───────────────────────────────────────────────────────
+
+    /// Delete applied ledger rows with `applied_at < before`. In-flight
+    /// claims are kept. Returns the number of rows deleted.
+    fn prune_events(&self, before: DateTime<Utc>) -> StoreFuture<'_, u64>;
 }

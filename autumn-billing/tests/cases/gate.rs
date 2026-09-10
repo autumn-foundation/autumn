@@ -284,7 +284,8 @@ async fn zero_grace_makes_expired_period_403() {
 }
 
 #[tokio::test]
-async fn missing_period_end_is_entitled() {
+async fn missing_period_end_uses_last_event_plus_grace() {
+    // Default grace is 72h from the last event: 71h ago is entitled, 73h is not.
     let h = build();
     let customer = seed_customer(&h.store, "7").await;
     h.store
@@ -294,10 +295,62 @@ async fn missing_period_end_is_entitled() {
             Some(PRO_PRICE),
             SubscriptionStatus::Active,
             None,
-            now(),
+            now() - hours(71),
         ))
         .await
         .unwrap();
+    h.client.acting_as("7").await;
+    h.client.get("/pro").send().await.assert_status(200);
+
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "1",
+            Some(PRO_PRICE),
+            SubscriptionStatus::Active,
+            None,
+            now() - hours(73),
+        ))
+        .await
+        .unwrap();
+    h.client.acting_as("7").await;
+    h.client.get("/pro").send().await.assert_status(403);
+}
+
+#[tokio::test]
+async fn active_row_beats_newer_incomplete_row() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "active",
+            Some(PRO_PRICE),
+            SubscriptionStatus::Active,
+            Some(now() + hours(24)),
+            now() - hours(2),
+        ))
+        .await
+        .unwrap();
+    // An abandoned second checkout: newer, live, not entitled.
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "abandoned",
+            Some(TEAM_PRICE),
+            SubscriptionStatus::Incomplete,
+            None,
+            now() - hours(1),
+        ))
+        .await
+        .unwrap();
+    let billing = Billing::from_state(h.client.state()).expect("plugin started");
+    let view = billing.current_subscription("7").await.unwrap().unwrap();
+    assert_eq!(view.subscription.status, SubscriptionStatus::Active);
+    assert_eq!(view.plan.as_ref().map(|p| p.id.as_str()), Some("pro"));
+    assert!(view.entitled);
     h.client.acting_as("7").await;
     h.client.get("/pro").send().await.assert_status(200);
 }

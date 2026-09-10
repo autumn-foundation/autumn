@@ -819,6 +819,307 @@ pub async fn open_dunning_ordered_and_filtered(store: &dyn BillingStore) {
     assert_eq!(open, ["dun-c-inv-early", "dun-c-inv-mid", "dun-c-inv-late"]);
 }
 
+// ── Fix round 2 properties ──────────────────────────────────────────────
+
+/// One customer row per user: a second provider customer for a linked user
+/// returns the linked row unchanged.
+pub async fn customer_one_row_per_user(store: &dyn BillingStore) {
+    let first = store
+        .upsert_customer(
+            CustomerUpsert::new("cust-d-1", "stripe", "cus_cust_d1", at(0)).with_user("u-d"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.id, "cust-d-1");
+    // A concurrent checkout created another provider customer for the user.
+    let second = store
+        .upsert_customer(
+            CustomerUpsert::new("cust-d-2", "stripe", "cus_cust_d2", at(1)).with_user("u-d"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second, first, "the linked row wins unchanged");
+    assert!(
+        store
+            .customer_by_provider_id(&ProviderId::new("cus_cust_d2"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the orphan provider customer is not mirrored"
+    );
+    assert!(store.customer_by_id("cust-d-2").await.unwrap().is_none());
+    // Linking an unlinked row to an already linked user keeps one row too.
+    store
+        .upsert_customer(CustomerUpsert::new(
+            "cust-d-3",
+            "stripe",
+            "cus_cust_d3",
+            at(2),
+        ))
+        .await
+        .unwrap();
+    let third = store
+        .upsert_customer(
+            CustomerUpsert::new("cust-d-4", "stripe", "cus_cust_d3", at(3)).with_user("u-d"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(third, first);
+    let unlinked = store.customer_by_id("cust-d-3").await.unwrap().unwrap();
+    assert_eq!(unlinked.user_id, None);
+    assert_eq!(store.customer_by_user("u-d").await.unwrap(), Some(first));
+}
+
+/// The same event again (same instant, same status) is `Unchanged`, also
+/// for a terminal row.
+pub async fn subscription_unchanged_redelivery(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "sub-f", None).await;
+    let first = store
+        .upsert_subscription(sub_upsert(
+            "sub-f",
+            &customer,
+            "k",
+            SubscriptionStatus::Active,
+            100,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut again = sub_upsert("sub-f", &customer, "k", SubscriptionStatus::Active, 100);
+    again.quantity = 9;
+    again.now = at(2000);
+    let again = store.upsert_subscription(again).await.unwrap();
+    assert!(again.is_unchanged());
+    assert!(!again.is_applied());
+    assert_eq!(again.into_inner(), first, "nothing was written");
+
+    store
+        .upsert_subscription(sub_upsert(
+            "sub-f",
+            &customer,
+            "k",
+            SubscriptionStatus::Canceled,
+            200,
+        ))
+        .await
+        .unwrap();
+    let canceled_again = store
+        .upsert_subscription(sub_upsert(
+            "sub-f",
+            &customer,
+            "k",
+            SubscriptionStatus::Canceled,
+            200,
+        ))
+        .await
+        .unwrap();
+    assert!(canceled_again.is_unchanged(), "terminal redelivery");
+    let older = store
+        .upsert_subscription(sub_upsert(
+            "sub-f",
+            &customer,
+            "k",
+            SubscriptionStatus::Active,
+            150,
+        ))
+        .await
+        .unwrap();
+    assert!(!older.is_unchanged());
+    assert!(!older.is_applied());
+}
+
+/// A newer snapshot without price, plan or period end keeps the stored
+/// values; the other fields are replaced.
+pub async fn subscription_missing_fields_keep_stored_values(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "sub-g", None).await;
+    store
+        .upsert_subscription(sub_upsert(
+            "sub-g",
+            &customer,
+            "k",
+            SubscriptionStatus::Active,
+            100,
+        ))
+        .await
+        .unwrap();
+    let bare = SubscriptionUpsert::new(
+        "sub-g-sub-k-200",
+        &customer,
+        "sub_sub-g_k",
+        SubscriptionStatus::PastDue,
+        at(200),
+        at(2000),
+    )
+    .with_quantity(4);
+    let row = store.upsert_subscription(bare).await.unwrap();
+    assert!(row.is_applied());
+    let row = row.into_inner();
+    assert_eq!(row.provider_price_id, Some(ProviderId::new("price_pro")));
+    assert_eq!(row.plan_id, Some(PlanId::new("pro")));
+    assert_eq!(row.current_period_end, Some(at(100 + 86_400)));
+    assert_eq!(row.status, SubscriptionStatus::PastDue);
+    assert_eq!(row.quantity, 4);
+    assert_eq!(row.last_event_at, at(200));
+    assert_eq!(
+        store.subscription_by_id("sub-g-sub-k-100").await.unwrap(),
+        Some(row)
+    );
+}
+
+/// The same invoice event again is `Unchanged`.
+pub async fn invoice_unchanged_redelivery(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "inv-c", None).await;
+    let first = store
+        .upsert_invoice(invoice_upsert(
+            "inv-c",
+            &customer,
+            "k",
+            InvoiceStatus::Open,
+            100,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut again = invoice_upsert("inv-c", &customer, "k", InvoiceStatus::Open, 100);
+    again.attempt_count = 7;
+    again.now = at(2000);
+    let again = store.upsert_invoice(again).await.unwrap();
+    assert!(again.is_unchanged());
+    assert_eq!(again.into_inner(), first, "nothing was written");
+}
+
+/// `settle_dunning` writes only from one of `from` at the expected attempt.
+pub async fn settle_dunning_is_compare_and_set(store: &dyn BillingStore) {
+    let open = dunning("dun-d", "k", 1, 10, DunningState::Pending);
+    store.upsert_dunning(open.clone()).await.unwrap();
+    let mut closed = open.clone();
+    closed.state = DunningState::Canceled;
+    closed.updated_at = at(5);
+    assert!(
+        !store
+            .settle_dunning("dun-d-inv-k", 1, &[DunningState::Running], closed.clone())
+            .await
+            .unwrap(),
+        "wrong state"
+    );
+    assert!(
+        !store
+            .settle_dunning(
+                "dun-d-inv-k",
+                2,
+                &[DunningState::Pending, DunningState::Running],
+                closed.clone()
+            )
+            .await
+            .unwrap(),
+        "wrong attempt"
+    );
+    assert!(
+        !store
+            .settle_dunning("dun-d-missing", 1, &[DunningState::Pending], closed.clone())
+            .await
+            .unwrap(),
+        "no row"
+    );
+    assert_eq!(
+        store.dunning_by_invoice("dun-d-inv-k").await.unwrap(),
+        Some(open),
+        "a refused settle writes nothing"
+    );
+    assert!(
+        store
+            .settle_dunning(
+                "dun-d-inv-k",
+                1,
+                &[DunningState::Pending, DunningState::Running],
+                closed.clone()
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.dunning_by_invoice("dun-d-inv-k").await.unwrap(),
+        Some(closed.clone())
+    );
+    let mut recovered = closed;
+    recovered.state = DunningState::Recovered;
+    assert!(
+        !store
+            .settle_dunning(
+                "dun-d-inv-k",
+                1,
+                &[DunningState::Pending, DunningState::Running],
+                recovered
+            )
+            .await
+            .unwrap(),
+        "a settled row is not settled again"
+    );
+    // The written row may carry a new attempt number.
+    let running = dunning("dun-d", "n", 1, 10, DunningState::Running);
+    store.upsert_dunning(running).await.unwrap();
+    let next = dunning("dun-d", "n", 2, 40, DunningState::Pending);
+    assert!(
+        store
+            .settle_dunning("dun-d-inv-n", 1, &[DunningState::Running], next.clone())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.dunning_by_invoice("dun-d-inv-n").await.unwrap(),
+        Some(next)
+    );
+}
+
+/// `prune_events` deletes applied rows older than `before` and keeps
+/// in-flight claims and newer rows. Instants lie far before every other
+/// property's, so the cutoff touches this property's rows only.
+pub async fn prune_events_deletes_applied_rows_before(store: &dyn BillingStore) {
+    let count_before = store.applied_event_count().await.unwrap();
+    for id in ["prune-a-old", "prune-a-new", "prune-a-inflight"] {
+        assert_eq!(
+            store
+                .claim_event(id, "k", at(-1_000_000), STALE)
+                .await
+                .unwrap(),
+            EventClaim::Claimed
+        );
+    }
+    store
+        .finish_event("prune-a-old", at(-900_000))
+        .await
+        .unwrap();
+    store.finish_event("prune-a-new", at(50)).await.unwrap();
+    assert_eq!(store.prune_events(at(-800_000)).await.unwrap(), 1);
+    assert_eq!(store.applied_event_count().await.unwrap(), count_before + 1);
+    assert_eq!(
+        store
+            .claim_event("prune-a-old", "k", at(60), STALE)
+            .await
+            .unwrap(),
+        EventClaim::Claimed,
+        "a pruned id is a new event"
+    );
+    assert_eq!(
+        store
+            .claim_event("prune-a-new", "k", at(60), STALE)
+            .await
+            .unwrap(),
+        EventClaim::Duplicate
+    );
+    // Re-claimed inside `STALE` of the claim, so only the prune could have
+    // freed it.
+    assert_eq!(
+        store
+            .claim_event("prune-a-inflight", "k", at(-999_999), STALE)
+            .await
+            .unwrap(),
+        EventClaim::Duplicate,
+        "an in-flight claim is kept"
+    );
+    assert_eq!(store.prune_events(at(-800_000)).await.unwrap(), 0);
+}
+
 /// Run every property on one store.
 pub async fn run_contract(store: &dyn BillingStore) {
     ledger_claim_finish_and_release(store).await;
@@ -837,6 +1138,12 @@ pub async fn run_contract(store: &dyn BillingStore) {
     dunning_upsert_replaces(store).await;
     dunning_claim_is_compare_and_set(store).await;
     open_dunning_ordered_and_filtered(store).await;
+    customer_one_row_per_user(store).await;
+    subscription_unchanged_redelivery(store).await;
+    subscription_missing_fields_keep_stored_values(store).await;
+    invoice_unchanged_redelivery(store).await;
+    settle_dunning_is_compare_and_set(store).await;
+    prune_events_deletes_applied_rows_before(store).await;
 }
 
 /// The suite against `MemoryBillingStore`, one test per property.
@@ -870,6 +1177,12 @@ mod memory {
         dunning_upsert_replaces,
         dunning_claim_is_compare_and_set,
         open_dunning_ordered_and_filtered,
+        customer_one_row_per_user,
+        subscription_unchanged_redelivery,
+        subscription_missing_fields_keep_stored_values,
+        invoice_unchanged_redelivery,
+        settle_dunning_is_compare_and_set,
+        prune_events_deletes_applied_rows_before,
     );
 
     #[tokio::test]

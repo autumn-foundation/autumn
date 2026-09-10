@@ -20,7 +20,8 @@
 //! A user is entitled when the mirror holds a subscription that is
 //! `active` or `trialing` (`past_due` only with `allow_past_due`), whose
 //! price maps to a catalog plan, and whose `current_period_end` plus the
-//! grace period is not in the past. Every missing piece denies.
+//! grace period is not in the past. Without a known period end the grace
+//! period counts from the last event applied. Every missing piece denies.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -165,8 +166,9 @@ impl Billing {
 
     /// The user's current subscription from the mirror. No provider call.
     ///
-    /// Picks the live subscription with the newest event, else the newest
-    /// row of any status.
+    /// Picks an entitled subscription first, then a live one, then the
+    /// newest event within that group. An abandoned `incomplete` checkout
+    /// never hides an active subscription.
     ///
     /// # Errors
     ///
@@ -180,12 +182,16 @@ impl Billing {
             return Ok(None);
         };
         let rows = store.subscriptions_for_customer(&customer.id).await?;
-        let live = rows
-            .iter()
-            .filter(|row| row.status.is_live())
-            .max_by_key(|row| row.last_event_at);
-        let best = live.or_else(|| rows.iter().max_by_key(|row| row.last_event_at));
-        Ok(best.map(|row| self.view(row.clone())))
+        Ok(rows
+            .into_iter()
+            .map(|row| self.view(row))
+            .max_by_key(|view| {
+                (
+                    view.entitled,
+                    view.subscription.status.is_live(),
+                    view.subscription.last_event_at,
+                )
+            }))
     }
 
     /// `true` when `user_id` satisfies `rule`. Default deny.
@@ -232,12 +238,13 @@ impl Billing {
         }
     }
 
-    /// `true` when `current_period_end + grace` is not in the past, or no
-    /// period end is known.
+    /// `true` when `current_period_end + grace` is not in the past. Without
+    /// a period end the deadline is `last_event_at + grace`: a mirror the
+    /// provider stopped feeding lapses either way.
     fn in_period(&self, subscription: &Subscription) -> bool {
-        let Some(end) = subscription.current_period_end else {
-            return true;
-        };
+        let end = subscription
+            .current_period_end
+            .unwrap_or(subscription.last_event_at);
         let grace = chrono::Duration::from_std(self.service.config().grace_period)
             .unwrap_or(chrono::Duration::MAX);
         let now = self.state.clock().now();

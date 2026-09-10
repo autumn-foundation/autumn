@@ -17,8 +17,9 @@ use autumn_web::time::TickingClock;
 use serde_json::json;
 
 use super::support::{
-    self, FakeParser, FakeProvider, Harness, PRO_PRICE, apply_event, at, checkout_kind, event,
-    harness, harness_with_hooks, notification_kinds, notification_routes, notifications_for,
+    self, FailingStore, FakeParser, FakeProvider, Harness, PRO_PRICE, apply_event, at,
+    checkout_kind, event, harness, harness_dyn, harness_with_hooks, notification_kinds,
+    notification_routes, notifications_for, post_webhook,
 };
 
 const USER: &str = "42";
@@ -431,6 +432,138 @@ async fn subscription_deleted_closes_open_dunning_and_notifies() {
         kinds,
         ["billing.payment_failed", "billing.subscription_canceled"]
     );
+}
+
+#[tokio::test]
+async fn redelivery_after_schedule_failure_completes_the_side_effects() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let h = harness_dyn(
+        support::config(),
+        store.clone(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        |app| {
+            app.with_clock(TickingClock::starting_at(support::base_time()))
+                .routes(notification_routes())
+        },
+    );
+    h.store
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
+                .with_user(USER)
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_sub", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
+    let applied_before = h.store.applied_event_count().await.unwrap();
+    // The invoice is mirrored, then opening the dunning row fails.
+    store.fail_on("upsert_dunning", 1);
+    let body = serde_json::to_vec(&event("evt_fail", at(200), invoice_failed(1))).unwrap();
+    let first = post_webhook(&h.client, &body).await;
+    assert_eq!(first.status.as_u16(), 500, "{}", first.text());
+    assert_eq!(
+        h.store.applied_event_count().await.unwrap(),
+        applied_before,
+        "the claim was released"
+    );
+    let invoice = h
+        .store
+        .invoice_by_provider_id(&ProviderId::new("in_1"))
+        .await
+        .unwrap()
+        .expect("invoice mirrored by the failed delivery");
+    assert!(
+        h.store
+            .dunning_by_invoice(&invoice.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    h.client.assert_no_jobs_enqueued();
+
+    // The provider redelivers. The invoice write is `Unchanged`; the
+    // dunning row and the job are still made.
+    let second = post_webhook(&h.client, &body).await;
+    assert_eq!(second.status.as_u16(), 200, "{}", second.text());
+    assert_eq!(second.json::<serde_json::Value>()["outcome"], "applied");
+    assert_eq!(
+        h.store.applied_event_count().await.unwrap(),
+        applied_before + 1
+    );
+    let row = h
+        .store
+        .dunning_by_invoice(&invoice.id)
+        .await
+        .unwrap()
+        .expect("dunning row opened on redelivery");
+    assert_eq!(row.state, DunningState::Pending);
+    assert_eq!(row.attempt, 1);
+    h.client
+        .assert_job_enqueued_with(RETRY_JOB_NAME, json!({ "invoice_id": invoice.id }));
+    // Notifications and hooks belong to the delivery that applied the write.
+    assert!(notifications_for(&h.client, RECIPIENT).await.is_empty());
+}
+
+#[tokio::test]
+async fn payment_failed_on_a_canceled_subscription_opens_no_dunning() {
+    for ended in [SubscriptionStatus::Canceled, SubscriptionStatus::Unpaid] {
+        let h = linked_harness().await;
+        apply_event(&h.client, event("evt_sub", at(100), sub_changed(ended)))
+            .await
+            .unwrap();
+        let outcome = apply_event(&h.client, event("evt_fail", at(200), invoice_failed(1)))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ReconcileOutcome::Applied { .. }));
+        let invoice = invoice(&h).await;
+        assert_eq!(invoice.status, InvoiceStatus::Open);
+        assert!(dunning(&h).await.is_none(), "{ended:?}: no dunning row");
+        h.client.assert_no_jobs_enqueued();
+        // The customer is still told (after the cancel notice, when there is one).
+        let failed: Vec<_> = notifications_for(&h.client, RECIPIENT)
+            .await
+            .into_iter()
+            .filter(|n| n.kind == "billing.payment_failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "{ended:?}");
+        assert_eq!(failed[0].payload["attempt"], json!(null));
+    }
+}
+
+#[tokio::test]
+async fn payment_failed_before_subscription_backfills_the_dunning_link() {
+    let h = linked_harness().await;
+    // The failure arrives first: the row has no subscription link.
+    apply_event(&h.client, event("evt_fail", at(200), invoice_failed(1)))
+        .await
+        .unwrap();
+    let row = dunning(&h).await.expect("dunning row");
+    assert_eq!(row.subscription_id, None);
+    apply_event(
+        &h.client,
+        event("evt_sub", at(100), sub_changed(SubscriptionStatus::PastDue)),
+    )
+    .await
+    .unwrap();
+    // The next failure event links the invoice and back-fills the row.
+    apply_event(&h.client, event("evt_fail2", at(300), invoice_failed(2)))
+        .await
+        .unwrap();
+    let sub = subscription(&h).await;
+    assert_eq!(
+        invoice(&h).await.subscription_id.as_deref(),
+        Some(sub.id.as_str())
+    );
+    let row = dunning(&h).await.expect("dunning row");
+    assert_eq!(row.subscription_id.as_deref(), Some(sub.id.as_str()));
+    assert_eq!(row.attempt, 1);
+    assert_eq!(row.state, DunningState::Pending);
 }
 
 #[tokio::test]

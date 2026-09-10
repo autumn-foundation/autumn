@@ -76,7 +76,12 @@ entitlements = ["export"]
 
 The plugin registers its migration through `plugin_migrations`; the next
 `autumn migrate` creates `billing_customers`, `billing_subscriptions`,
-`billing_invoices`, `billing_events` and `billing_dunning`.
+`billing_invoices`, `billing_events` and `billing_dunning`. A partial unique
+index on `billing_customers.user_id` keeps one customer per user when two
+checkouts race. Without a database pool the plugin falls back to an in-memory
+mirror that is lost on restart; a production profile refuses to boot on it
+unless `billing.allow_memory_store_in_production = true`. Production also
+requires `billing.stripe.api_base` to start with `https://`.
 
 ## 3. Routes
 
@@ -124,6 +129,7 @@ Entitled means: status `active` or `trialing` (`past_due` only with
 `allow_past_due`), the price maps to a catalog plan, and
 `current_period_end + grace_period` is not in the past. The grace period
 (default 72 h) bounds how long a dead webhook keeps a lapsed customer entitled.
+When no period end is known the deadline is `last_event_at + grace_period`.
 Everything else is denied.
 
 ## 5. The mirror and idempotency
@@ -141,16 +147,18 @@ the claim releases it, so the provider's redelivery applies again.
 `autumn_billing_dunning_retry` job at the first retry time. The row is the
 schedule; the job only carries the invoice id and reads the row, so a duplicate
 run, an early run, or a restart is safe. On startup the plugin re-arms every
-open row. Each retry asks the provider to collect the invoice again with a
-stable idempotency key:
+open row and prunes applied ledger rows older than 30 days. A row left
+`running` by a crashed process is reclaimed 10 minutes after its last update.
+Each retry asks the provider to collect the invoice again with a stable
+idempotency key:
 
 - paid → `recovered`, notification `billing.payment_recovered`
 - declined → next retry, notification `billing.payment_failed`
 - declined after the last retry → subscription `unpaid` in the mirror first,
   then `cancel_subscription` at the provider (`ExhaustionAction::MarkUnpaid`
   skips the cancel), notification `billing.dunning_exhausted`
-- transport error → the job returns an error and the runtime retries with
-  backoff; the schedule does not advance
+- transport error → the same attempt is rescheduled 15 minutes later and the
+  job returns `Ok`; the schedule row stays the truth and is never dead-lettered
 
 Defaults: three retries. The first retry runs 1 day after the failure, the
 second 3 days after that, the third 5 days after that (days 1, 4 and 9).

@@ -484,3 +484,292 @@ pub async fn notification_kinds(client: &TestClient, recipient: i64) -> Vec<Stri
     items.sort_by_key(|n| n.id);
     items.into_iter().map(|n| n.kind).collect()
 }
+
+// ── Fix round 2 helpers (failure injection) ───────────────────────────────
+
+/// Boxed hook run before a store call.
+pub type BeforeHook =
+    Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
+
+/// A [`BillingStore`] decorator that delegates to `inner`, errors on the
+/// N-th call of a named method, and can run a hook before the N-th call of
+/// a named method (to model a write that races the call). Every delegated
+/// call yields first, so two requests on one runtime interleave.
+pub struct FailingStore {
+    inner: Arc<dyn BillingStore>,
+    failures: Mutex<Vec<(String, usize)>>,
+    hooks: Mutex<Vec<(String, usize, BeforeHook)>>,
+    calls: Mutex<std::collections::HashMap<String, usize>>,
+}
+
+impl FailingStore {
+    /// Wrap `inner`.
+    pub fn wrap(inner: Arc<dyn BillingStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            failures: Mutex::new(Vec::new()),
+            hooks: Mutex::new(Vec::new()),
+            calls: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Error on the `nth` (1-based) call of `method`.
+    pub fn fail_on(&self, method: &str, nth: usize) {
+        self.failures.lock().unwrap().push((method.to_owned(), nth));
+    }
+
+    /// Run `hook` before the `nth` (1-based) call of `method`.
+    pub fn before(&self, method: &str, nth: usize, hook: BeforeHook) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), nth, hook));
+    }
+
+    /// Number of calls of `method` so far.
+    pub fn calls(&self, method: &str) -> usize {
+        self.calls.lock().unwrap().get(method).copied().unwrap_or(0)
+    }
+
+    async fn enter(&self, method: &str) -> Result<(), BillingError> {
+        tokio::task::yield_now().await;
+        let n = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls
+                .entry(method.to_owned())
+                .and_modify(|n| *n += 1)
+                .or_insert(1)
+        };
+        let hook = self
+            .hooks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(m, nth, _)| m == method && *nth == n)
+            .map(|(_, _, hook)| hook());
+        if let Some(hook) = hook {
+            hook.await;
+        }
+        let fails = self
+            .failures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(m, nth)| m == method && *nth == n);
+        if fails {
+            return Err(BillingError::store(format!(
+                "injected failure: {method} call {n}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+macro_rules! delegate {
+    ($self:ident, $method:ident $(, $arg:expr)*) => {
+        Box::pin(async move {
+            $self.enter(stringify!($method)).await?;
+            $self.inner.$method($($arg),*).await
+        })
+    };
+}
+
+impl BillingStore for FailingStore {
+    fn claim_event<'a>(
+        &'a self,
+        event_id: &'a str,
+        kind: &'a str,
+        now: chrono::DateTime<chrono::Utc>,
+        stale_after: std::time::Duration,
+    ) -> autumn_billing::store::StoreFuture<'a, autumn_billing::store::EventClaim> {
+        delegate!(self, claim_event, event_id, kind, now, stale_after)
+    }
+
+    fn finish_event<'a>(
+        &'a self,
+        event_id: &'a str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, ()> {
+        delegate!(self, finish_event, event_id, now)
+    }
+
+    fn release_event<'a>(
+        &'a self,
+        event_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, ()> {
+        delegate!(self, release_event, event_id)
+    }
+
+    fn applied_event_count(&self) -> autumn_billing::store::StoreFuture<'_, u64> {
+        delegate!(self, applied_event_count)
+    }
+
+    fn upsert_customer(
+        &self,
+        upsert: autumn_billing::store::CustomerUpsert,
+    ) -> autumn_billing::store::StoreFuture<'_, autumn_billing::Customer> {
+        delegate!(self, upsert_customer, upsert)
+    }
+
+    fn customer_by_id<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        delegate!(self, customer_by_id, id)
+    }
+
+    fn customer_by_user<'a>(
+        &'a self,
+        user_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        delegate!(self, customer_by_user, user_id)
+    }
+
+    fn customer_by_provider_id<'a>(
+        &'a self,
+        provider_customer_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
+        delegate!(self, customer_by_provider_id, provider_customer_id)
+    }
+
+    fn upsert_subscription(
+        &self,
+        upsert: autumn_billing::store::SubscriptionUpsert,
+    ) -> autumn_billing::store::StoreFuture<'_, autumn_billing::store::Write<Subscription>> {
+        delegate!(self, upsert_subscription, upsert)
+    }
+
+    fn subscription_by_id<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<Subscription>> {
+        delegate!(self, subscription_by_id, id)
+    }
+
+    fn subscription_by_provider_id<'a>(
+        &'a self,
+        provider_subscription_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<Subscription>> {
+        delegate!(self, subscription_by_provider_id, provider_subscription_id)
+    }
+
+    fn subscriptions_for_customer<'a>(
+        &'a self,
+        customer_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Vec<Subscription>> {
+        delegate!(self, subscriptions_for_customer, customer_id)
+    }
+
+    fn set_subscription_status<'a>(
+        &'a self,
+        id: &'a str,
+        status: SubscriptionStatus,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<Subscription>> {
+        delegate!(self, set_subscription_status, id, status, now)
+    }
+
+    fn upsert_invoice(
+        &self,
+        upsert: autumn_billing::store::InvoiceUpsert,
+    ) -> autumn_billing::store::StoreFuture<'_, autumn_billing::store::Write<autumn_billing::Invoice>>
+    {
+        delegate!(self, upsert_invoice, upsert)
+    }
+
+    fn invoice_by_id<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Invoice>> {
+        delegate!(self, invoice_by_id, id)
+    }
+
+    fn invoice_by_provider_id<'a>(
+        &'a self,
+        provider_invoice_id: &'a ProviderId,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Invoice>> {
+        delegate!(self, invoice_by_provider_id, provider_invoice_id)
+    }
+
+    fn upsert_dunning(
+        &self,
+        attempt: autumn_billing::DunningAttempt,
+    ) -> autumn_billing::store::StoreFuture<'_, ()> {
+        delegate!(self, upsert_dunning, attempt)
+    }
+
+    fn dunning_by_invoice<'a>(
+        &'a self,
+        invoice_id: &'a str,
+    ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::DunningAttempt>> {
+        delegate!(self, dunning_by_invoice, invoice_id)
+    }
+
+    fn claim_dunning_attempt<'a>(
+        &'a self,
+        invoice_id: &'a str,
+        attempt: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, bool> {
+        delegate!(self, claim_dunning_attempt, invoice_id, attempt, now)
+    }
+
+    fn open_dunning(
+        &self,
+    ) -> autumn_billing::store::StoreFuture<'_, Vec<autumn_billing::DunningAttempt>> {
+        delegate!(self, open_dunning)
+    }
+
+    fn settle_dunning<'a>(
+        &'a self,
+        invoice_id: &'a str,
+        expected_attempt: i64,
+        from: &'a [autumn_billing::DunningState],
+        row: autumn_billing::DunningAttempt,
+    ) -> autumn_billing::store::StoreFuture<'a, bool> {
+        delegate!(
+            self,
+            settle_dunning,
+            invoice_id,
+            expected_attempt,
+            from,
+            row
+        )
+    }
+
+    fn prune_events(
+        &self,
+        before: chrono::DateTime<chrono::Utc>,
+    ) -> autumn_billing::store::StoreFuture<'_, u64> {
+        delegate!(self, prune_events, before)
+    }
+}
+
+/// A built app over any store (a decorated one, for failure injection).
+pub struct DynHarness {
+    pub client: TestClient,
+    pub store: Arc<dyn BillingStore>,
+    pub provider: Arc<FakeProvider>,
+}
+
+/// Like [`harness_with_hooks`] with `NoHooks`, over any store.
+pub fn harness_dyn(
+    billing: BillingConfig,
+    store: Arc<dyn BillingStore>,
+    provider: Arc<FakeProvider>,
+    customize: impl FnOnce(TestApp) -> TestApp,
+) -> DynHarness {
+    let app = TestApp::new().config(autumn_config(&billing)).plugin(
+        BillingPlugin::new()
+            .config(billing)
+            .plans(&catalog())
+            .provider(provider.clone())
+            .store(store.clone()),
+    );
+    let client = customize(app).build();
+    DynHarness {
+        client,
+        store,
+        provider,
+    }
+}

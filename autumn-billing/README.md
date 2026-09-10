@@ -44,7 +44,8 @@ autumn_web::app()
 
 `BillingPlugin` also accepts `.provider(..)`, `.store(..)` and `.hooks(..)`.
 The default store is the database when a pool exists, else memory (lost on
-restart).
+restart). In production the memory store is a boot error unless
+`billing.allow_memory_store_in_production = true`.
 
 The bare `.plugin(autumn_billing::BillingPlugin::new())` boots with config
 from the environment only and an empty plan catalog. Registering the plugin
@@ -77,6 +78,7 @@ cancel_url = "/billing/cancel"   # redirect after an abandoned checkout
 portal_return_url = "/"          # redirect when the customer leaves the portal
 allow_past_due = false           # entitle `past_due` subscriptions
 grace_period_hours = 72          # entitlement past `current_period_end`
+allow_memory_store_in_production = false # boot without a database pool in production
 
 [billing.dunning]
 enabled = true                       # `false`: mirror and notify, never retry
@@ -86,7 +88,7 @@ on_exhausted = "cancel_subscription" # or "mark_unpaid"
 [billing.stripe]
 secret_key = "sk_test_..."           # STRIPE_SECRET_KEY wins
 webhook_secret = "whsec_..."         # STRIPE_WEBHOOK_SECRET wins
-api_base = "https://api.stripe.com"  # AUTUMN_BILLING__STRIPE__API_BASE wins
+api_base = "https://api.stripe.com"  # AUTUMN_BILLING__STRIPE__API_BASE wins; https:// in production
 
 [[billing.plans]]                    # none by default; merged with the code catalog
 id = "pro"
@@ -109,7 +111,7 @@ Environment values win over `autumn.toml` values. Blank values are ignored.
 | --- | --- |
 | `STRIPE_SECRET_KEY` | API key (`sk_live_…` / `sk_test_…`). Production rejects test keys. Overrides `billing.stripe.secret_key`. |
 | `STRIPE_WEBHOOK_SECRET` | Webhook signing secret (`whsec_…`). Overrides `billing.stripe.webhook_secret`. |
-| `AUTUMN_BILLING__STRIPE__API_BASE` | Stripe API base URL. Overrides `billing.stripe.api_base`. |
+| `AUTUMN_BILLING__STRIPE__API_BASE` | Stripe API base URL. Overrides `billing.stripe.api_base`. Production requires `https://`. |
 | `AUTUMN_BILLING__ROUTE_PREFIX` | Mount point of the routes. Overrides `billing.route_prefix`. |
 
 ## Plans
@@ -164,7 +166,8 @@ async fn export(billing: Billing, session: Session) -> AutumnResult<&'static str
 A user is entitled when the mirror subscription is `active` or `trialing`
 (`past_due` only with `allow_past_due = true`), the price maps to a catalog
 plan, and `current_period_end` plus `grace_period` (default 72h) is not in
-the past. Every missing piece denies.
+the past. Without a known period end the grace period counts from the last
+event applied to the row. Every missing piece denies.
 
 ## Routes
 
@@ -193,7 +196,9 @@ let billing = BillingConfig::from_env()
 ```
 
 After a restart the plugin re-arms every pending row from the store. No
-retry is lost.
+retry is lost. A retry whose provider call fails in transport keeps its
+attempt number and runs again 15 minutes later; a row left `running` by a
+crashed process is reclaimed after 10 minutes.
 
 **Stripe Smart Retries**: disable them in the Stripe dashboard when the
 plugin retries, or the two schedules compete. To keep Stripe's retries, use
@@ -219,7 +224,10 @@ Money fields serialize as `{"minor": 1999, "currency": "USD"}`.
 Five tables: `billing_customers`, `billing_subscriptions`,
 `billing_invoices`, `billing_events` (the idempotency ledger) and
 `billing_dunning`. The migration is `20260910000000_billing_mirror`, registered
-by the plugin. Without a pool the plugin uses the in-memory store.
+by the plugin. A partial unique index on `billing_customers.user_id` keeps
+one customer per user when two checkouts race. Applied ledger rows older than
+30 days are pruned at startup. Without a pool the plugin uses the in-memory
+store; production refuses it unless `allow_memory_store_in_production` is set.
 
 ## Tests
 

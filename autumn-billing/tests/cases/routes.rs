@@ -11,7 +11,7 @@ use autumn_web::time::FixedClock;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 
-use super::support::{self, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE};
+use super::support::{self, FailingStore, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE};
 
 fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 10, 12, 0, 0).unwrap()
@@ -125,6 +125,75 @@ async fn checkout_after_a_canceled_subscription_is_allowed() {
         .send()
         .await
         .assert_status(303);
+}
+
+#[tokio::test]
+async fn checkout_after_an_incomplete_checkout_is_allowed() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    seed_subscription(&h.store, &customer, SubscriptionStatus::Incomplete).await;
+    h.client.acting_as("7").await;
+    h.client
+        .post("/billing/checkout")
+        .form("plan=pro")
+        .send()
+        .await
+        .assert_status(303);
+}
+
+#[tokio::test]
+async fn concurrent_checkouts_link_one_customer() {
+    let inner = MemoryBillingStore::shared();
+    // The decorator yields on every store call, so the two requests
+    // interleave between the lookup and the link.
+    let store = FailingStore::wrap(inner.clone());
+    let h = support::harness_dyn(support::config(), store, FakeProvider::new(), pinned);
+    h.client.acting_as("7").await;
+    let (a, b) = tokio::join!(
+        h.client.post("/billing/checkout").form("plan=pro").send(),
+        h.client.post("/billing/checkout").form("plan=pro").send(),
+    );
+    for resp in [&a, &b] {
+        assert!(
+            matches!(resp.status.as_u16(), 303 | 409),
+            "{} {}",
+            resp.status,
+            resp.text()
+        );
+    }
+    // Exactly one mirrored customer carries user 7: whichever request linked
+    // first. The other provider customer is an orphan, not a second link.
+    let linked = inner
+        .customer_by_user("7")
+        .await
+        .unwrap()
+        .expect("one linked customer");
+    let created = [ProviderId::new("cus_fake_1"), ProviderId::new("cus_fake_2")];
+    assert!(created.contains(&linked.provider_customer_id));
+    for id in &created {
+        let mirrored = inner.customer_by_provider_id(id).await.unwrap();
+        if *id == linked.provider_customer_id {
+            assert_eq!(mirrored.as_ref(), Some(&linked));
+        } else {
+            assert!(mirrored.is_none(), "{id} must not be mirrored");
+        }
+    }
+    let checkouts: Vec<ProviderId> = h
+        .provider
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            FakeCall::CreateCheckout(req) => Some(req.provider_customer_id),
+            _ => None,
+        })
+        .collect();
+    assert!(!checkouts.is_empty());
+    assert!(
+        checkouts
+            .iter()
+            .all(|id| *id == linked.provider_customer_id),
+        "every checkout uses the linked customer: {checkouts:?}"
+    );
 }
 
 #[tokio::test]
@@ -432,6 +501,79 @@ fn route_infos_match_the_mounted_paths() {
     );
     let prefixed = route_infos(&support::config().route_prefix("/pay/"));
     assert_eq!(prefixed[3].path, "/pay/webhook");
+}
+
+/// Config that passes production validation.
+fn production_config() -> BillingConfig {
+    support::config()
+        .stripe_secret_key("sk_live_fake_key_for_tests")
+        .stripe_webhook_secret(support::TEST_WEBHOOK_SECRET)
+}
+
+fn boot_panic_message(build: impl FnOnce() -> Harness) -> String {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+    let payload = result.err().expect("boot fails");
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        })
+}
+
+#[tokio::test]
+async fn production_refuses_the_memory_mirror_unless_allowed() {
+    let billing = production_config();
+    let autumn = support::autumn_config(&billing);
+    let message = boot_panic_message(|| {
+        // `config` replaces the whole config, so the profile comes after it.
+        let app = TestApp::new().config(autumn).profile("prod").plugin(
+            BillingPlugin::new()
+                .config(billing)
+                .plans(&support::catalog())
+                .provider(FakeProvider::new()),
+        );
+        let client = pinned(app).build();
+        Harness {
+            client,
+            store: MemoryBillingStore::shared(),
+            provider: FakeProvider::new(),
+        }
+    });
+    assert!(
+        message.contains("allow_memory_store_in_production"),
+        "{message}"
+    );
+
+    let billing = production_config().allow_memory_store_in_production(true);
+    let autumn = support::autumn_config(&billing);
+    let app = TestApp::new().config(autumn).profile("prod").plugin(
+        BillingPlugin::new()
+            .config(billing)
+            .plans(&support::catalog())
+            .provider(FakeProvider::new()),
+    );
+    let client = pinned(app).build();
+    // Booted on the memory mirror.
+    let service = autumn_billing::BillingService::require(client.state()).expect("plugin started");
+    assert!(
+        service
+            .store()
+            .customer_by_user("nobody")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let resp = client.get("/billing/subscription").send().await;
+    assert!(
+        resp.status.as_u16() < 500,
+        "{} {}",
+        resp.status,
+        resp.text()
+    );
 }
 
 #[tokio::test]

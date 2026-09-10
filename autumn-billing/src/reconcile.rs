@@ -20,7 +20,9 @@
 //! Sequence: claim the event id in the ledger → upsert snapshots (the store
 //! applies the ordering guard) → open or close dunning → notify → mark
 //! applied. A failure after the claim releases it, so the provider's
-//! redelivery is applied again; every step is idempotent.
+//! redelivery is applied again; every step is idempotent. A redelivery of a
+//! snapshot already in the mirror (`Write::Unchanged`) repeats the idempotent
+//! steps (dunning row, job) but not notifications or hooks.
 
 use autumn_web::AppState;
 use chrono::{DateTime, Utc};
@@ -36,6 +38,9 @@ use crate::store::{
     CustomerUpsert, EventClaim, InvoiceUpsert, SubscriptionUpsert, Write as StoreWrite,
 };
 use crate::{BillingService, EVENT_CLAIM_STALE_AFTER};
+
+/// The states a reconcile may close.
+const OPEN_STATES: &[DunningState] = &[DunningState::Pending, DunningState::Running];
 
 /// What `apply` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,12 +230,24 @@ impl Ctx<'_> {
         if let Some(end) = snapshot.current_period_end {
             upsert = upsert.with_period_end(end);
         }
-        let StoreWrite::Applied(subscription) = store.upsert_subscription(upsert).await? else {
-            tracing::debug!(
-                provider_subscription_id = %snapshot.provider_subscription_id,
-                "🍂 Autumn Billing: stale subscription event; mirror unchanged"
-            );
-            return Ok(());
+        let subscription = match store.upsert_subscription(upsert).await? {
+            StoreWrite::Applied(subscription) => subscription,
+            // A redelivery after a failure past the write: repeat the
+            // idempotent step only. Notifications and hooks ran, or never
+            // will, with the first delivery.
+            StoreWrite::Unchanged(subscription) => {
+                if subscription.status == SubscriptionStatus::Canceled {
+                    self.close_dunning_for(&subscription.id).await?;
+                }
+                return Ok(());
+            }
+            StoreWrite::Stale(_) => {
+                tracing::debug!(
+                    provider_subscription_id = %snapshot.provider_subscription_id,
+                    "🍂 Autumn Billing: stale subscription event; mirror unchanged"
+                );
+                return Ok(());
+            }
         };
         if subscription.status == SubscriptionStatus::Canceled {
             self.close_dunning_for(&subscription.id).await?;
@@ -250,16 +267,26 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// Cancel every open dunning row of `subscription_id`.
+    /// Cancel every open dunning row of `subscription_id`. Compare-and-set,
+    /// so a retry that settles the row at the same time is not overwritten.
     async fn close_dunning_for(&self, subscription_id: &str) -> Result<(), BillingError> {
         let store = self.service.store();
-        for mut row in store.open_dunning().await? {
+        for row in store.open_dunning().await? {
             if row.subscription_id.as_deref() != Some(subscription_id) {
                 continue;
             }
-            row.state = DunningState::Canceled;
-            row.updated_at = self.now;
-            store.upsert_dunning(row).await?;
+            let mut closed = row.clone();
+            closed.state = DunningState::Canceled;
+            closed.updated_at = self.now;
+            let written = store
+                .settle_dunning(&row.invoice_id, row.attempt, OPEN_STATES, closed)
+                .await?;
+            if !written {
+                tracing::debug!(
+                    invoice_id = %row.invoice_id,
+                    "🍂 Autumn Billing: dunning row settled elsewhere; not closed"
+                );
+            }
         }
         Ok(())
     }
@@ -303,19 +330,27 @@ impl Ctx<'_> {
         occurred_at: DateTime<Utc>,
     ) -> Result<(), BillingError> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
-        let StoreWrite::Applied(invoice) = write else {
-            tracing::debug!(
-                provider_invoice_id = %snapshot.provider_invoice_id,
-                "🍂 Autumn Billing: stale payment_failed event; mirror unchanged"
-            );
-            return Ok(());
+        let (invoice, applied) = match write {
+            StoreWrite::Applied(invoice) => (invoice, true),
+            StoreWrite::Unchanged(invoice) => (invoice, false),
+            StoreWrite::Stale(_) => {
+                tracing::debug!(
+                    provider_invoice_id = %snapshot.provider_invoice_id,
+                    "🍂 Autumn Billing: stale payment_failed event; mirror unchanged"
+                );
+                return Ok(());
+            }
         };
         let policy = &self.service.config().dunning;
+        // Idempotent: a redelivery makes sure the row exists and is queued.
         let row = if policy.enabled {
             self.open_dunning(&invoice).await?
         } else {
             None
         };
+        if !applied {
+            return Ok(());
+        }
         notify::send_to_customer(
             self.state,
             self.service,
@@ -331,20 +366,50 @@ impl Ctx<'_> {
     }
 
     /// The open schedule row for `invoice`: kept when one is in progress,
-    /// else a new first attempt.
+    /// else a new first attempt. No row when the invoice's subscription has
+    /// ended or is `unpaid`: there is nothing left to collect for.
     async fn open_dunning(
         &self,
         invoice: &Invoice,
     ) -> Result<Option<DunningAttempt>, BillingError> {
         let store = self.service.store();
-        if let Some(row) = store.dunning_by_invoice(&invoice.id).await?
+        if let Some(subscription_id) = &invoice.subscription_id
+            && let Some(subscription) = store.subscription_by_id(subscription_id).await?
+            && (subscription.status.is_terminal()
+                || subscription.status == SubscriptionStatus::Unpaid)
+        {
+            tracing::info!(
+                invoice_id = %invoice.id,
+                subscription_id,
+                status = subscription.status.as_str(),
+                "🍂 Autumn Billing: subscription ended; dunning not opened"
+            );
+            return Ok(None);
+        }
+        if let Some(mut row) = store.dunning_by_invoice(&invoice.id).await?
             && matches!(row.state, DunningState::Pending | DunningState::Running)
         {
+            // The failure arrived before the subscription: back-fill the link.
+            if row.subscription_id.is_none() && invoice.subscription_id.is_some() {
+                let mut linked = row.clone();
+                linked.subscription_id.clone_from(&invoice.subscription_id);
+                linked.updated_at = self.now;
+                if store
+                    .settle_dunning(&row.invoice_id, row.attempt, &[row.state], linked.clone())
+                    .await?
+                {
+                    row = linked;
+                }
+            }
             tracing::debug!(
                 invoice_id = %invoice.id,
                 attempt = row.attempt,
                 "🍂 Autumn Billing: dunning already open; schedule kept"
             );
+            // The unique pending window dedupes an already queued retry.
+            if row.state == DunningState::Pending {
+                dunning::schedule(self.state, &invoice.id, row.next_attempt_at).await?;
+            }
             return Ok(Some(row));
         }
         let Some(delay) = self.service.config().dunning.delay_for(1) else {
@@ -382,19 +447,27 @@ impl Ctx<'_> {
         occurred_at: DateTime<Utc>,
     ) -> Result<(), BillingError> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
-        let StoreWrite::Applied(invoice) = write else {
-            return Ok(());
+        let (invoice, applied) = match write {
+            StoreWrite::Applied(invoice) => (invoice, true),
+            StoreWrite::Unchanged(invoice) => (invoice, false),
+            StoreWrite::Stale(_) => return Ok(()),
         };
         let store = self.service.store();
-        let Some(mut row) = store.dunning_by_invoice(&invoice.id).await? else {
+        let Some(row) = store.dunning_by_invoice(&invoice.id).await? else {
             return Ok(());
         };
         if !matches!(row.state, DunningState::Pending | DunningState::Running) {
             return Ok(());
         }
-        row.state = DunningState::Recovered;
-        row.updated_at = self.now;
-        store.upsert_dunning(row).await?;
+        let mut recovered = row.clone();
+        recovered.state = DunningState::Recovered;
+        recovered.updated_at = self.now;
+        let written = store
+            .settle_dunning(&row.invoice_id, row.attempt, OPEN_STATES, recovered)
+            .await?;
+        if !written || !applied {
+            return Ok(());
+        }
         notify::send_to_customer(
             self.state,
             self.service,

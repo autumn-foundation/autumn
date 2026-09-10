@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS billing_customers (
     created_at            TIMESTAMP NOT NULL,
     updated_at            TIMESTAMP NOT NULL
 );
-CREATE INDEX IF NOT EXISTS billing_customers_user_idx ON billing_customers (user_id);
+-- One mirrored customer per application user. Partial, so unlinked rows
+-- (provider-only customers) never collide. Valid on Postgres and SQLite.
+CREATE UNIQUE INDEX IF NOT EXISTS billing_customers_user_uidx
+    ON billing_customers (user_id) WHERE user_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS billing_subscriptions (
     id                        TEXT      NOT NULL PRIMARY KEY,

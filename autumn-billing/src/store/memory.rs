@@ -8,8 +8,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::{
-    BillingStore, CustomerUpsert, EventClaim, InvoiceUpsert, StoreFuture, SubscriptionUpsert,
-    Write, should_apply,
+    BillingStore, CustomerUpsert, EventClaim, Guard, InvoiceUpsert, StoreFuture,
+    SubscriptionUpsert, Write, guard,
 };
 use crate::error::BillingError;
 use crate::model::{
@@ -138,6 +138,27 @@ impl BillingStore for MemoryBillingStore {
                 .values()
                 .find(|c| c.provider_customer_id == upsert.provider_customer_id)
                 .map(|c| c.id.clone());
+            // One customer per user. When this call would link `user_id` and
+            // another row already carries it, that row wins unchanged (the
+            // database store hits the partial unique index here).
+            let links_user = upsert.user_id.is_some()
+                && existing
+                    .as_ref()
+                    .is_none_or(|id| inner.customers.get(id).is_some_and(|c| c.user_id.is_none()));
+            if links_user
+                && let Some(linked) = inner
+                    .customers
+                    .values()
+                    .find(|c| c.user_id == upsert.user_id)
+                    .cloned()
+            {
+                tracing::info!(
+                    customer_id = %linked.id,
+                    provider_customer_id = %upsert.provider_customer_id,
+                    "🍂 Autumn Billing: user already linked; new provider customer not mirrored"
+                );
+                return linked;
+            }
             let id = existing.unwrap_or_else(|| upsert.new_id.clone());
             let row = inner
                 .customers
@@ -200,24 +221,27 @@ impl BillingStore for MemoryBillingStore {
                 .find(|s| s.provider_subscription_id == upsert.provider_subscription_id)
                 .cloned();
             if let Some(current) = existing {
-                if !should_apply(
+                match guard(
                     current.last_event_at,
                     current.status.rank(),
                     current.status.is_terminal(),
                     upsert.occurred_at,
                     upsert.status.rank(),
                 ) {
-                    return Write::Stale(current);
+                    Guard::Apply => {}
+                    Guard::Unchanged => return Write::Unchanged(current),
+                    Guard::Stale => return Write::Stale(current),
                 }
+                // A snapshot without these fields keeps the stored values.
                 let row = Subscription {
                     id: current.id.clone(),
                     customer_id: upsert.customer_id,
                     provider_subscription_id: upsert.provider_subscription_id,
-                    provider_price_id: upsert.provider_price_id,
-                    plan_id: upsert.plan_id,
+                    provider_price_id: upsert.provider_price_id.or(current.provider_price_id),
+                    plan_id: upsert.plan_id.or(current.plan_id),
                     status: upsert.status,
                     quantity: upsert.quantity,
-                    current_period_end: upsert.current_period_end,
+                    current_period_end: upsert.current_period_end.or(current.current_period_end),
                     cancel_at_period_end: upsert.cancel_at_period_end,
                     last_event_at: upsert.occurred_at,
                     created_at: current.created_at,
@@ -303,14 +327,16 @@ impl BillingStore for MemoryBillingStore {
                 .find(|i| i.provider_invoice_id == upsert.provider_invoice_id)
                 .cloned();
             if let Some(current) = existing {
-                if !should_apply(
+                match guard(
                     current.last_event_at,
                     current.status.rank(),
                     false,
                     upsert.occurred_at,
                     upsert.status.rank(),
                 ) {
-                    return Write::Stale(current);
+                    Guard::Apply => {}
+                    Guard::Unchanged => return Write::Unchanged(current),
+                    Guard::Stale => return Write::Stale(current),
                 }
                 let row = Invoice {
                     id: current.id.clone(),
@@ -410,6 +436,35 @@ impl BillingStore for MemoryBillingStore {
                 .collect();
             rows.sort_by_key(|d| d.next_attempt_at);
             rows
+        }))
+    }
+
+    fn settle_dunning<'a>(
+        &'a self,
+        invoice_id: &'a str,
+        expected_attempt: i64,
+        from: &'a [DunningState],
+        row: DunningAttempt,
+    ) -> StoreFuture<'a, bool> {
+        ready(self.lock().map(|mut inner| {
+            let Some(current) = inner.dunning.get_mut(invoice_id) else {
+                return false;
+            };
+            if current.attempt != expected_attempt || !from.contains(&current.state) {
+                return false;
+            }
+            *current = row;
+            true
+        }))
+    }
+
+    fn prune_events(&self, before: DateTime<Utc>) -> StoreFuture<'_, u64> {
+        ready(self.lock().map(|mut inner| {
+            let len_before = inner.events.len();
+            inner
+                .events
+                .retain(|_, row| row.applied_at.is_none_or(|applied| applied >= before));
+            u64::try_from(len_before.saturating_sub(inner.events.len())).unwrap_or(u64::MAX)
         }))
     }
 }

@@ -26,7 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `i64` minor units and a `Currency`; read them with `minor()` and
   `currency()`. An exact `Decimal` bridge; no floats.
   The `BillingProvider` trait hides Stripe types so a second provider can
-  land without a breaking change.
+  land without a breaking change. A partial unique index keeps one mirrored
+  customer per user across racing checkouts, every dunning settle is a
+  compare-and-set, a provider transport error reschedules the same attempt
+  instead of failing the job, and a production profile refuses the in-memory
+  mirror unless `billing.allow_memory_store_in_production = true`.
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the
