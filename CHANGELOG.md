@@ -168,6 +168,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI:** the manual macOS contention workflow (`Manual macOS contention
+  check`) is dispatch-only, but GitHub records a failed run on every push —
+  the `plan` step then has no `inputs` to evaluate and exits 1 (issue
+  #2594). Both jobs are now guarded on `github.event_name ==
+  'workflow_dispatch'`, so push events skip cleanly instead of failing, and
+  the `macos-latest` steps can never be reached unasked (macOS minutes are
+  the most expensive in the account). Why a dispatch-only workflow is
+  evaluated on push at all — likely an org-level required-workflow
+  configuration — still wants a look in org settings; noted in the workflow
+  file.
 - **commit hooks:** an immediate after-hook failure now records the hook's
   `AutumnError` via `message()` — the bare title, e.g. `"Validation failed"`
   (issue #2596). All nine generated immediate-failure paths stringified the
