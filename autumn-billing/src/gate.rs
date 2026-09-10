@@ -16,18 +16,24 @@
     )
 )]
 //! The plan gate: read local mirror state, default deny.
+//!
+//! A user is entitled when the mirror holds a subscription that is
+//! `active` or `trialing` (`past_due` only with `allow_past_due`), whose
+//! price maps to a catalog plan, and whose `current_period_end` plus the
+//! grace period is not in the past. Every missing piece denies.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use autumn_web::session::Session;
 use autumn_web::{AppState, AutumnError};
 use axum_core_reexport::FromRequestParts;
 use serde::{Deserialize, Serialize};
 
 use crate::BillingService;
 use crate::error::BillingError;
-use crate::model::Subscription;
-use crate::plan::{Plan, PlanId};
+use crate::model::{Subscription, SubscriptionStatus};
+use crate::plan::{Plan, PlanCatalog, PlanId};
 
 mod axum_core_reexport {
     pub use autumn_web::reexports::axum::extract::FromRequestParts;
@@ -57,6 +63,24 @@ impl PlanRule {
     pub fn entitlement(name: impl Into<String>) -> Self {
         Self::Entitlement(name.into())
     }
+
+    /// `true` when `plan` satisfies the rule.
+    fn accepts(&self, plan: &Plan) -> bool {
+        match self {
+            Self::AnyActive => true,
+            Self::Plan(id) => &plan.id == id,
+            Self::Entitlement(name) => plan.grants(name),
+        }
+    }
+
+    /// Text for the `Forbidden` error.
+    fn describe(&self) -> String {
+        match self {
+            Self::AnyActive => "an active subscription".to_owned(),
+            Self::Plan(id) => format!("plan {id}"),
+            Self::Entitlement(name) => format!("entitlement {name}"),
+        }
+    }
 }
 
 /// A compile-time plan requirement for [`Entitled`].
@@ -75,6 +99,13 @@ pub struct SubscriptionView {
     pub plan: Option<Plan>,
     /// `true` when the gate treats this subscription as entitled.
     pub entitled: bool,
+}
+
+impl SubscriptionView {
+    /// `true` when the view is entitled and its plan satisfies `rule`.
+    fn satisfies(&self, rule: &PlanRule) -> bool {
+        self.entitled && self.plan.as_ref().is_some_and(|plan| rule.accepts(plan))
+    }
 }
 
 /// Service handle for handlers and policies.
@@ -114,6 +145,9 @@ impl Billing {
 
     /// The user's current subscription from the mirror. No provider call.
     ///
+    /// Picks the live subscription with the newest event, else the newest
+    /// row of any status.
+    ///
     /// # Errors
     ///
     /// Returns the store error.
@@ -121,8 +155,17 @@ impl Billing {
         &self,
         user_id: &str,
     ) -> Result<Option<SubscriptionView>, BillingError> {
-        let _ = user_id;
-        Err(BillingError::Unsupported("gate"))
+        let store = self.service.store();
+        let Some(customer) = store.customer_by_user(user_id).await? else {
+            return Ok(None);
+        };
+        let rows = store.subscriptions_for_customer(&customer.id).await?;
+        let live = rows
+            .iter()
+            .filter(|row| row.status.is_live())
+            .max_by_key(|row| row.last_event_at);
+        let best = live.or_else(|| rows.iter().max_by_key(|row| row.last_event_at));
+        Ok(best.map(|row| self.view(row.clone())))
     }
 
     /// `true` when `user_id` satisfies `rule`. Default deny.
@@ -131,8 +174,10 @@ impl Billing {
     ///
     /// Returns the store error.
     pub async fn is_entitled(&self, user_id: &str, rule: &PlanRule) -> Result<bool, BillingError> {
-        let _ = (user_id, rule);
-        Ok(false)
+        Ok(self
+            .current_subscription(user_id)
+            .await?
+            .is_some_and(|view| view.satisfies(rule)))
     }
 
     /// The entitled subscription, or [`BillingError::Forbidden`].
@@ -145,9 +190,52 @@ impl Billing {
         user_id: &str,
         rule: &PlanRule,
     ) -> Result<SubscriptionView, BillingError> {
-        let _ = (user_id, rule);
-        Err(BillingError::Forbidden("gate".to_owned()))
+        match self.current_subscription(user_id).await? {
+            Some(view) if view.satisfies(rule) => Ok(view),
+            _ => Err(BillingError::Forbidden(rule.describe())),
+        }
     }
+
+    /// Join the plan and evaluate entitlement.
+    fn view(&self, subscription: Subscription) -> SubscriptionView {
+        let plan = resolve_plan(self.service.catalog(), &subscription).cloned();
+        let entitled = plan.is_some() && self.status_ok(subscription.status) && self.in_period(&subscription);
+        SubscriptionView {
+            subscription,
+            plan,
+            entitled,
+        }
+    }
+
+    fn status_ok(&self, status: SubscriptionStatus) -> bool {
+        match status {
+            SubscriptionStatus::Active | SubscriptionStatus::Trialing => true,
+            SubscriptionStatus::PastDue => self.service.config().allow_past_due,
+            _ => false,
+        }
+    }
+
+    /// `true` when `current_period_end + grace` is not in the past, or no
+    /// period end is known.
+    fn in_period(&self, subscription: &Subscription) -> bool {
+        let Some(end) = subscription.current_period_end else {
+            return true;
+        };
+        let grace = chrono::Duration::from_std(self.service.config().grace_period)
+            .unwrap_or(chrono::Duration::MAX);
+        let now = self.state.clock().now();
+        end.checked_add_signed(grace)
+            .is_none_or(|deadline| deadline >= now)
+    }
+}
+
+/// The catalog plan for a mirror row: by price id first, then by stored plan id.
+fn resolve_plan<'a>(catalog: &'a PlanCatalog, subscription: &Subscription) -> Option<&'a Plan> {
+    subscription
+        .provider_price_id
+        .as_ref()
+        .and_then(|price| catalog.by_price_id(price))
+        .or_else(|| subscription.plan_id.as_ref().and_then(|id| catalog.get(id)))
 }
 
 impl FromRequestParts<AppState> for Billing {
@@ -185,8 +273,18 @@ impl<R: PlanRequirement> FromRequestParts<AppState> for Entitled<R> {
         parts: &mut autumn_web::reexports::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let _ = (parts, state);
-        Err(AutumnError::forbidden_msg("gate"))
+        let user_id = session_user_id(parts, state)
+            .await
+            .map_err(BillingError::into_autumn)?;
+        let billing = Billing::from_request_parts(parts, state).await?;
+        let view = billing
+            .require(&user_id, &R::rule())
+            .await
+            .map_err(BillingError::into_autumn)?;
+        Ok(Self {
+            view,
+            _rule: PhantomData,
+        })
     }
 }
 
@@ -199,6 +297,13 @@ pub async fn session_user_id(
     parts: &mut autumn_web::reexports::http::request::Parts,
     state: &AppState,
 ) -> Result<String, BillingError> {
-    let _ = (parts, state);
-    Err(BillingError::Unauthenticated)
+    let session = match Session::from_request_parts(parts, state).await {
+        Ok(session) => session,
+        Err(never) => match never {},
+    };
+    session
+        .get(state.auth_session_key())
+        .await
+        .filter(|user_id| !user_id.is_empty())
+        .ok_or(BillingError::Unauthenticated)
 }

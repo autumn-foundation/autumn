@@ -49,19 +49,17 @@ fn sub_upsert(
     status: SubscriptionStatus,
     occurred: i64,
 ) -> SubscriptionUpsert {
-    SubscriptionUpsert {
-        new_id: format!("{prefix}-sub-{key}-{occurred}"),
-        customer_id: customer_id.to_owned(),
-        provider_subscription_id: ProviderId::new(format!("sub_{prefix}_{key}")),
-        provider_price_id: Some(ProviderId::new("price_pro")),
-        plan_id: Some(PlanId::new("pro")),
+    SubscriptionUpsert::new(
+        format!("{prefix}-sub-{key}-{occurred}"),
+        customer_id,
+        format!("sub_{prefix}_{key}"),
         status,
-        quantity: 1,
-        current_period_end: Some(at(occurred + 86_400)),
-        cancel_at_period_end: false,
-        occurred_at: at(occurred),
-        now: at(1000),
-    }
+        at(occurred),
+        at(1000),
+    )
+    .with_price("price_pro")
+    .with_plan(PlanId::new("pro"))
+    .with_period_end(at(occurred + 86_400))
 }
 
 fn invoice_upsert(
@@ -71,19 +69,17 @@ fn invoice_upsert(
     status: InvoiceStatus,
     occurred: i64,
 ) -> InvoiceUpsert {
-    InvoiceUpsert {
-        new_id: format!("{prefix}-inv-{key}-{occurred}"),
-        customer_id: customer_id.to_owned(),
-        subscription_id: None,
-        provider_invoice_id: ProviderId::new(format!("in_{prefix}_{key}")),
+    InvoiceUpsert::new(
+        format!("{prefix}-inv-{key}-{occurred}"),
+        customer_id,
+        format!("in_{prefix}_{key}"),
         status,
-        amount_due: Money::from_minor(1999, Currency::USD),
-        amount_paid: Money::zero(Currency::USD),
-        attempt_count: 1,
-        next_payment_attempt: None,
-        occurred_at: at(occurred),
-        now: at(1000),
-    }
+        Money::from_minor(1999, Currency::USD),
+        Money::zero(Currency::USD),
+        at(occurred),
+        at(1000),
+    )
+    .with_attempt_count(1)
 }
 
 fn dunning(
@@ -93,15 +89,14 @@ fn dunning(
     next: i64,
     state: DunningState,
 ) -> DunningAttempt {
-    DunningAttempt {
-        invoice_id: format!("{prefix}-inv-{key}"),
-        customer_id: format!("{prefix}-cust"),
-        subscription_id: None,
+    DunningAttempt::new(
+        format!("{prefix}-inv-{key}"),
+        format!("{prefix}-cust"),
         attempt,
-        next_attempt_at: at(next),
+        at(next),
         state,
-        updated_at: at(0),
-    }
+        at(0),
+    )
 }
 
 // ── Ledger ──────────────────────────────────────────────────────────────

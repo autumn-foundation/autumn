@@ -379,7 +379,7 @@ pub fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
 }
 
 /// Like [`harness`], but with a custom config and hooks.
-pub fn harness_with(
+pub fn harness_with_hooks(
     billing: BillingConfig,
     hooks: Arc<dyn BillingHooks>,
     store: Arc<MemoryBillingStore>,
@@ -473,7 +473,7 @@ pub async fn notifications_for(
         .get(&format!("/_test/notifications/{recipient}"))
         .send()
         .await;
-    assert_eq!(response.status(), 200, "{}", response.text());
+    response.assert_status(200);
     response.json()
 }
 

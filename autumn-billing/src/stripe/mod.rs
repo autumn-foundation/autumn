@@ -1,7 +1,14 @@
 //! Stripe implementation of [`BillingProvider`].
 //!
 //! Uses `autumn_web::http::Client` named `stripe`, so tests mock it with
-//! `TestApp::http_mock("stripe")`. Stripe types never leave this module.
+//! `TestApp::http_mock("stripe")`. Stripe types never leave this module:
+//! [`events`] decodes webhook bodies and [`client`] talks to the REST API.
+//!
+//! Only `retry_invoice_payment` sends an `Idempotency-Key` header. The
+//! `create_*` calls send none; see the `client` module for why.
+
+mod client;
+mod events;
 
 use autumn_web::AppState;
 use autumn_web::webhook::WebhookEndpointConfig;
@@ -43,7 +50,8 @@ impl StripeProvider {
         Self::new(config.clone(), client)
     }
 
-    /// Build with an explicit client.
+    /// Build with an explicit client. Relative paths resolve against
+    /// `config.api_base`.
     ///
     /// # Errors
     ///
@@ -62,22 +70,23 @@ impl StripeProvider {
                 crate::config::STRIPE_SECRET_KEY_ENV
             )));
         }
+        let client = client.with_base_url(&config.api_base);
         Ok(Self { config, client })
     }
 
     /// Decode a raw Stripe event body. Public for fixture tests.
     ///
+    /// Known event types map to their [`crate::event::BillingEventKind`]; any
+    /// other type decodes to `Ignored`. Both the current and the previous
+    /// Stripe API shapes of subscription and invoice objects are accepted.
+    ///
     /// # Errors
     ///
-    /// Returns [`BillingError::Malformed`] for a known type that cannot be decoded.
+    /// Returns [`BillingError::Malformed`] for a body that is not an event
+    /// envelope, or for a known type whose object cannot be decoded. The
+    /// message never contains the body.
     pub fn parse_event_body(raw: &[u8]) -> Result<BillingEvent, BillingError> {
-        let _ = raw;
-        Err(BillingError::Unsupported("stripe parse"))
-    }
-
-    #[allow(dead_code, reason = "used once the client is implemented")]
-    fn client(&self) -> &autumn_web::http::Client {
-        &self.client
+        events::parse(raw)
     }
 }
 
@@ -106,18 +115,15 @@ impl BillingProvider for StripeProvider {
     }
 
     fn create_customer(&self, request: CustomerRequest) -> ProviderFuture<'_, ProviderId> {
-        let _ = request;
-        Box::pin(async { Err(BillingError::Unsupported("stripe create_customer")) })
+        Box::pin(self.customer(request))
     }
 
     fn create_checkout(&self, request: CheckoutRequest) -> ProviderFuture<'_, HostedSession> {
-        let _ = request;
-        Box::pin(async { Err(BillingError::Unsupported("stripe create_checkout")) })
+        Box::pin(self.checkout(request))
     }
 
     fn create_portal(&self, request: PortalRequest) -> ProviderFuture<'_, HostedSession> {
-        let _ = request;
-        Box::pin(async { Err(BillingError::Unsupported("stripe create_portal")) })
+        Box::pin(self.portal(request))
     }
 
     fn parse_event(&self, raw: &[u8]) -> Result<BillingEvent, BillingError> {
@@ -129,12 +135,10 @@ impl BillingProvider for StripeProvider {
         invoice: &'a ProviderId,
         idempotency_key: &'a str,
     ) -> ProviderFuture<'a, PaymentAttemptOutcome> {
-        let _ = (invoice, idempotency_key);
-        Box::pin(async { Err(BillingError::Unsupported("stripe retry")) })
+        Box::pin(self.pay_invoice(invoice, idempotency_key))
     }
 
     fn cancel_subscription<'a>(&'a self, subscription: &'a ProviderId) -> ProviderFuture<'a, ()> {
-        let _ = subscription;
-        Box::pin(async { Err(BillingError::Unsupported("stripe cancel")) })
+        Box::pin(self.cancel(subscription))
     }
 }

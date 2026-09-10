@@ -4,22 +4,21 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_billing::dunning::RETRY_JOB_NAME;
 use autumn_billing::event::{InvoiceSnapshot, SubscriptionSnapshot};
 use autumn_billing::hooks::HookFuture;
 use autumn_billing::model::{DunningAttempt, DunningState, Invoice, Subscription};
 use autumn_billing::store::CustomerUpsert;
 use autumn_billing::{
-    BillingEventKind, BillingHooks, BillingStore, Currency, DunningPolicy, InvoiceStatus, Money,
-    MemoryBillingStore, PlanId, ProviderId, ReconcileOutcome, SubscriptionStatus,
+    BillingEventKind, BillingHooks, BillingStore, Currency, DunningPolicy, InvoiceStatus,
+    MemoryBillingStore, Money, PlanId, ProviderId, ReconcileOutcome, SubscriptionStatus,
 };
-use autumn_billing::dunning::RETRY_JOB_NAME;
-use autumn_web::test::TestApp;
 use autumn_web::time::TickingClock;
 use serde_json::json;
 
 use super::support::{
     self, FakeParser, FakeProvider, Harness, PRO_PRICE, apply_event, at, checkout_kind, event,
-    harness, harness_with, notification_kinds, notification_routes, notifications_for,
+    harness, harness_with_hooks, notification_kinds, notification_routes, notifications_for,
 };
 
 const USER: &str = "42";
@@ -114,9 +113,12 @@ async fn dunning(h: &Harness) -> Option<DunningAttempt> {
 /// Active subscription, then a failed invoice at `t = 200`.
 async fn failed_invoice_harness() -> Harness {
     let h = linked_harness().await;
-    apply_event(&h.client, event("evt_sub", at(100), sub_changed(SubscriptionStatus::Active)))
-        .await
-        .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_sub", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
     let outcome = apply_event(&h.client, event("evt_fail", at(200), invoice_failed(1)))
         .await
         .unwrap();
@@ -297,7 +299,12 @@ async fn checkout_with_foreign_local_ref_does_not_link() {
 #[tokio::test]
 async fn checkout_with_own_local_ref_keeps_link_and_refreshes_email() {
     let h = linked_harness().await;
-    let kind = checkout_kind("cus_1", Some("local-1"), Some("new@example.test"), Some("sub_1"));
+    let kind = checkout_kind(
+        "cus_1",
+        Some("local-1"),
+        Some("new@example.test"),
+        Some("sub_1"),
+    );
     apply_event(&h.client, event("evt_co", at(100), kind))
         .await
         .unwrap();
@@ -380,7 +387,10 @@ async fn invoice_paid_recovers_dunning() {
     assert_eq!(invoice(&h).await.status, InvoiceStatus::Paid);
     assert_eq!(dunning(&h).await.unwrap().state, DunningState::Recovered);
     let kinds = notification_kinds(&h.client, RECIPIENT).await;
-    assert_eq!(kinds, ["billing.payment_failed", "billing.payment_recovered"]);
+    assert_eq!(
+        kinds,
+        ["billing.payment_failed", "billing.payment_recovered"]
+    );
     // A stale paid event (older than the failure) changes nothing.
     let outcome = apply_event(&h.client, event("evt_old", at(150), invoice_paid()))
         .await
@@ -392,9 +402,12 @@ async fn invoice_paid_recovers_dunning() {
 #[tokio::test]
 async fn paid_invoice_without_dunning_sends_no_recovery_notification() {
     let h = linked_harness().await;
-    apply_event(&h.client, event("evt_sub", at(100), sub_changed(SubscriptionStatus::Active)))
-        .await
-        .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_sub", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
     apply_event(&h.client, event("evt_paid", at(200), invoice_paid()))
         .await
         .unwrap();
@@ -423,7 +436,7 @@ async fn subscription_deleted_closes_open_dunning_and_notifies() {
 #[tokio::test]
 async fn dunning_disabled_notifies_without_a_job() {
     let billing = support::config().dunning(DunningPolicy::disabled());
-    let h = harness_with(
+    let h = harness_with_hooks(
         billing,
         Arc::new(autumn_billing::NoHooks),
         MemoryBillingStore::shared(),
@@ -434,9 +447,12 @@ async fn dunning_disabled_notifies_without_a_job() {
         },
     );
     link_customer(&h, "cus_1").await;
-    apply_event(&h.client, event("evt_sub", at(100), sub_changed(SubscriptionStatus::Active)))
-        .await
-        .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_sub", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
     apply_event(&h.client, event("evt_fail", at(200), invoice_failed(1)))
         .await
         .unwrap();
@@ -485,7 +501,10 @@ impl BillingHooks for RecordingHooks {
     }
 
     fn on_payment_recovered<'a>(&'a self, _invoice: &'a Invoice) -> HookFuture<'a> {
-        self.calls.lock().unwrap().push("payment_recovered".to_owned());
+        self.calls
+            .lock()
+            .unwrap()
+            .push("payment_recovered".to_owned());
         Box::pin(async {})
     }
 }
@@ -493,7 +512,7 @@ impl BillingHooks for RecordingHooks {
 #[tokio::test]
 async fn hooks_fire_and_a_missing_recipient_skips_notifications() {
     let hooks = Arc::new(RecordingHooks::default());
-    let h = harness_with(
+    let h = harness_with_hooks(
         support::config(),
         hooks.clone(),
         MemoryBillingStore::shared(),
@@ -504,16 +523,29 @@ async fn hooks_fire_and_a_missing_recipient_skips_notifications() {
         },
     );
     link_customer(&h, "cus_1").await;
-    apply_event(&h.client, event("evt_sub", at(100), sub_changed(SubscriptionStatus::Trialing)))
-        .await
-        .unwrap();
-    apply_event(&h.client, event("evt_sub2", at(150), sub_changed(SubscriptionStatus::Active)))
-        .await
-        .unwrap();
+    apply_event(
+        &h.client,
+        event(
+            "evt_sub",
+            at(100),
+            sub_changed(SubscriptionStatus::Trialing),
+        ),
+    )
+    .await
+    .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_sub2", at(150), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
     // Stale: no hook call.
-    apply_event(&h.client, event("evt_old", at(120), sub_changed(SubscriptionStatus::PastDue)))
-        .await
-        .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_old", at(120), sub_changed(SubscriptionStatus::PastDue)),
+    )
+    .await
+    .unwrap();
     apply_event(&h.client, event("evt_fail", at(200), invoice_failed(1)))
         .await
         .unwrap();

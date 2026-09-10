@@ -89,7 +89,10 @@ async fn subscription_created_webhook_activates_pro() {
     let view = subscription_json(&h.client).await;
     assert_eq!(view["entitled"], true, "{view}");
     assert_eq!(view["subscription"]["status"], "active");
-    assert_eq!(view["subscription"]["provider_subscription_id"], "sub_test_1");
+    assert_eq!(
+        view["subscription"]["provider_subscription_id"],
+        "sub_test_1"
+    );
     assert_eq!(view["plan"]["id"], "pro");
     assert_eq!(h.store.applied_event_count().await.unwrap(), 1);
 }
@@ -203,7 +206,11 @@ async fn payment_failed_opens_dunning_and_invoice_paid_recovers() {
     assert_eq!(dunning.attempt, 1);
     assert_eq!(dunning.next_attempt_at, now() + chrono::Duration::hours(1));
     h.client.assert_job_enqueued(RETRY_JOB_NAME);
-    assert_eq!(unread_count(&h.client).await, 1, "payment_failed notification");
+    assert_eq!(
+        unread_count(&h.client).await,
+        1,
+        "payment_failed notification"
+    );
     assert_eq!(h.provider.retry_calls(), 0, "retry is not due yet");
 
     support::post_webhook(&h.client, &fixture("invoice_paid"))
@@ -224,7 +231,11 @@ async fn payment_failed_opens_dunning_and_invoice_paid_recovers() {
         .unwrap()
         .expect("dunning row");
     assert_eq!(dunning.state, DunningState::Recovered);
-    assert_eq!(unread_count(&h.client).await, 2, "payment_recovered notification");
+    assert_eq!(
+        unread_count(&h.client).await,
+        2,
+        "payment_recovered notification"
+    );
 }
 
 #[tokio::test]
@@ -304,5 +315,9 @@ async fn restart_rearms_the_pending_retry_job() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert_eq!(h.provider.retry_calls(), 0, "re-arm schedules, never retries");
+    assert_eq!(
+        h.provider.retry_calls(),
+        0,
+        "re-arm schedules, never retries"
+    );
 }

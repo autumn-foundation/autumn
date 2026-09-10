@@ -180,11 +180,11 @@ struct DunningRow {
 
 // ── Conversions ─────────────────────────────────────────────────────────
 
-fn to_naive(at: DateTime<Utc>) -> NaiveDateTime {
+const fn to_naive(at: DateTime<Utc>) -> NaiveDateTime {
     at.naive_utc()
 }
 
-fn to_utc(at: NaiveDateTime) -> DateTime<Utc> {
+const fn to_utc(at: NaiveDateTime) -> DateTime<Utc> {
     at.and_utc()
 }
 
@@ -257,7 +257,9 @@ impl InvoiceRow {
     ) -> Result<Self, BillingError> {
         let currency = upsert.amount_due.currency();
         if upsert.amount_paid.currency() != currency {
-            return Err(MoneyError::CurrencyMismatch(currency, upsert.amount_paid.currency()).into());
+            return Err(
+                MoneyError::CurrencyMismatch(currency, upsert.amount_paid.currency()).into(),
+            );
         }
         Ok(Self {
             id,
@@ -364,7 +366,7 @@ fn db_err(err: &dyn std::fmt::Display) -> BillingError {
     BillingError::store(format!("database query failed: {err}"))
 }
 
-fn is_unique_violation(err: &DieselError) -> bool {
+const fn is_unique_violation(err: &DieselError) -> bool {
     matches!(
         err,
         DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _)
@@ -528,41 +530,35 @@ impl BillingStore for DbBillingStore {
                         .first(conn)
                         .await
                         .optional()?;
-                    match existing {
-                        Some(mut current) => {
-                            if current.user_id.is_none() && upsert.user_id.is_some() {
-                                current.user_id = upsert.user_id;
-                            }
-                            if upsert.email.is_some() {
-                                current.email = upsert.email;
-                            }
-                            current.updated_at = to_naive(upsert.now);
-                            diesel::update(billing_customers::table.find(&current.id))
-                                .set(&current)
-                                .execute(conn)
-                                .await?;
-                            Ok(current)
-                        }
-                        None => {
-                            let row = CustomerRow {
-                                id: upsert.new_id,
-                                user_id: upsert.user_id,
-                                provider: upsert.provider,
-                                provider_customer_id: upsert
-                                    .provider_customer_id
-                                    .as_str()
-                                    .to_owned(),
-                                email: upsert.email,
-                                created_at: to_naive(upsert.now),
-                                updated_at: to_naive(upsert.now),
-                            };
-                            diesel::insert_into(billing_customers::table)
-                                .values(&row)
-                                .execute(conn)
-                                .await?;
-                            Ok(row)
-                        }
+                    let Some(mut current) = existing else {
+                        let row = CustomerRow {
+                            id: upsert.new_id,
+                            user_id: upsert.user_id,
+                            provider: upsert.provider,
+                            provider_customer_id: upsert.provider_customer_id.as_str().to_owned(),
+                            email: upsert.email,
+                            created_at: to_naive(upsert.now),
+                            updated_at: to_naive(upsert.now),
+                        };
+                        diesel::insert_into(billing_customers::table)
+                            .values(&row)
+                            .execute(conn)
+                            .await?;
+                        return Ok(row);
+                    };
+                    // A link is set once; an email is replaced.
+                    if current.user_id.is_none() && upsert.user_id.is_some() {
+                        current.user_id = upsert.user_id;
                     }
+                    if upsert.email.is_some() {
+                        current.email = upsert.email;
+                    }
+                    current.updated_at = to_naive(upsert.now);
+                    diesel::update(billing_customers::table.find(&current.id))
+                        .set(&current)
+                        .execute(conn)
+                        .await?;
+                    Ok(current)
                 })
                 .await?;
             Ok(row.into_model())
@@ -622,47 +618,52 @@ impl BillingStore for DbBillingStore {
         Box::pin(async move {
             let mut conn = self.conn().await?;
             let write: Write<SubscriptionRow> = conn
-                .transaction(async move |conn| -> Result<Write<SubscriptionRow>, TxError> {
-                    let existing: Option<SubscriptionRow> = billing_subscriptions::table
-                        .filter(
-                            billing_subscriptions::provider_subscription_id
-                                .eq(upsert.provider_subscription_id.as_str()),
-                        )
-                        .select(SubscriptionRow::as_select())
-                        .first(conn)
-                        .await
-                        .optional()?;
-                    let Some(current) = existing else {
-                        let row =
-                            SubscriptionRow::from_upsert(upsert.new_id.clone(), upsert.now, upsert);
-                        diesel::insert_into(billing_subscriptions::table)
-                            .values(&row)
+                .transaction(
+                    async move |conn| -> Result<Write<SubscriptionRow>, TxError> {
+                        let existing: Option<SubscriptionRow> = billing_subscriptions::table
+                            .filter(
+                                billing_subscriptions::provider_subscription_id
+                                    .eq(upsert.provider_subscription_id.as_str()),
+                            )
+                            .select(SubscriptionRow::as_select())
+                            .first(conn)
+                            .await
+                            .optional()?;
+                        let Some(current) = existing else {
+                            let row = SubscriptionRow::from_upsert(
+                                upsert.new_id.clone(),
+                                upsert.now,
+                                upsert,
+                            );
+                            diesel::insert_into(billing_subscriptions::table)
+                                .values(&row)
+                                .execute(conn)
+                                .await?;
+                            return Ok(Write::Applied(row));
+                        };
+                        let current_status = SubscriptionStatus::parse(&current.status)
+                            .ok_or_else(|| bad_stored("subscription status", &current.status))?;
+                        if !should_apply(
+                            to_utc(current.last_event_at),
+                            current_status.rank(),
+                            current_status.is_terminal(),
+                            upsert.occurred_at,
+                            upsert.status.rank(),
+                        ) {
+                            return Ok(Write::Stale(current));
+                        }
+                        let row = SubscriptionRow::from_upsert(
+                            current.id.clone(),
+                            to_utc(current.created_at),
+                            upsert,
+                        );
+                        diesel::update(billing_subscriptions::table.find(&row.id))
+                            .set(&row)
                             .execute(conn)
                             .await?;
-                        return Ok(Write::Applied(row));
-                    };
-                    let current_status = SubscriptionStatus::parse(&current.status)
-                        .ok_or_else(|| bad_stored("subscription status", &current.status))?;
-                    if !should_apply(
-                        to_utc(current.last_event_at),
-                        current_status.rank(),
-                        current_status.is_terminal(),
-                        upsert.occurred_at,
-                        upsert.status.rank(),
-                    ) {
-                        return Ok(Write::Stale(current));
-                    }
-                    let row = SubscriptionRow::from_upsert(
-                        current.id.clone(),
-                        to_utc(current.created_at),
-                        upsert,
-                    );
-                    diesel::update(billing_subscriptions::table.find(&row.id))
-                        .set(&row)
-                        .execute(conn)
-                        .await?;
-                    Ok(Write::Applied(row))
-                })
+                        Ok(Write::Applied(row))
+                    },
+                )
                 .await?;
             Ok(match write {
                 Write::Applied(row) => Write::Applied(row.into_model()?),
@@ -794,10 +795,8 @@ impl BillingStore for DbBillingStore {
                         return Ok(Write::Stale(current));
                     }
                     // `None` keeps the stored link.
-                    let subscription_id = upsert
-                        .subscription_id
-                        .clone()
-                        .or(current.subscription_id);
+                    let subscription_id =
+                        upsert.subscription_id.clone().or(current.subscription_id);
                     let row = InvoiceRow::from_upsert(
                         current.id.clone(),
                         to_utc(current.created_at),

@@ -11,15 +11,15 @@ use autumn_billing::provider::PaymentAttemptOutcome;
 use autumn_billing::store::CustomerUpsert;
 use autumn_billing::{
     BillingConfig, BillingError, BillingEventKind, BillingStore, Currency, DunningPolicy,
-    DunningState, ExhaustionAction, InvoiceStatus, MemoryBillingStore, Money, NoHooks,
-    ProviderId, SubscriptionStatus,
+    DunningState, ExhaustionAction, InvoiceStatus, MemoryBillingStore, Money, NoHooks, ProviderId,
+    SubscriptionStatus,
 };
 use autumn_web::test::TestApp;
 use autumn_web::time::TickingClock;
 
 use super::support::{
     self, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE, apply_event, at, event,
-    harness_with, notification_kinds, notification_routes,
+    harness_with_hooks, notification_kinds, notification_routes,
 };
 
 const RECIPIENT: i64 = 42;
@@ -37,7 +37,7 @@ async fn dunning_harness(
     store: Arc<MemoryBillingStore>,
     provider: Arc<FakeProvider>,
 ) -> Harness {
-    let h = harness_with(billing, Arc::new(NoHooks), store, provider, clocked);
+    let h = harness_with_hooks(billing, Arc::new(NoHooks), store, provider, clocked);
     h.store
         .upsert_customer(
             CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
@@ -106,7 +106,10 @@ async fn subscription(h: &Harness) -> Subscription {
 
 /// Run every recorded job and assert none returned an error.
 async fn perform_ok(h: &Harness) {
-    h.client.perform_enqueued_jobs().await.assert_all_succeeded();
+    h.client
+        .perform_enqueued_jobs()
+        .await
+        .assert_all_succeeded();
 }
 
 #[tokio::test]
@@ -200,10 +203,11 @@ async fn exhaustion_marks_unpaid_and_cancels_once() {
     assert_eq!(row(&h).await.state, DunningState::Exhausted);
     assert_eq!(subscription(&h).await.status, SubscriptionStatus::Unpaid);
     assert_eq!(h.provider.cancel_calls(), 1);
-    assert!(h
-        .provider
-        .calls()
-        .contains(&FakeCall::CancelSubscription(ProviderId::new("sub_1"))));
+    assert!(
+        h.provider
+            .calls()
+            .contains(&FakeCall::CancelSubscription(ProviderId::new("sub_1")))
+    );
     assert_eq!(
         notification_kinds(&h.client, RECIPIENT).await,
         [
@@ -275,10 +279,10 @@ async fn transport_error_keeps_the_row_pending_and_fails_the_job() {
     assert_eq!(failures.len(), 1, "{report:?}");
     assert_eq!(failures[0].0, RETRY_JOB_NAME);
     assert_eq!(h.provider.retry_calls(), 1);
-    let row = row(&h).await;
-    assert_eq!(row.attempt, 1);
-    assert_eq!(row.state, DunningState::Pending);
-    assert_eq!(row.next_attempt_at, at(3600));
+    let pending = row(&h).await;
+    assert_eq!(pending.attempt, 1);
+    assert_eq!(pending.state, DunningState::Pending);
+    assert_eq!(pending.next_attempt_at, at(3600));
     assert_eq!(
         notification_kinds(&h.client, RECIPIENT).await,
         ["billing.payment_failed"]
@@ -326,7 +330,7 @@ async fn restart_re_arms_pending_rows() {
     // The process dies before the retry is due.
     drop(app_a);
 
-    let app_b = harness_with(
+    let app_b = harness_with_hooks(
         support::config(),
         Arc::new(NoHooks),
         store.clone(),
@@ -343,7 +347,11 @@ async fn restart_re_arms_pending_rows() {
     .await;
     // Not due yet: no provider call, row untouched.
     assert_eq!(provider.retry_calls(), 0);
-    let row = store.dunning_by_invoice(&invoice_id).await.unwrap().unwrap();
+    let row = store
+        .dunning_by_invoice(&invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(row.state, DunningState::Pending);
     assert_eq!(row.next_attempt_at, at(3600));
 }
@@ -355,11 +363,16 @@ async fn restart_resets_a_running_row_and_runs_it() {
     let app_a = dunning_harness(support::config(), store.clone(), provider.clone()).await;
     let invoice_id = invoice(&app_a).await.id;
     // A retry was claimed and the process died mid-flight.
-    assert!(store.claim_dunning_attempt(&invoice_id, 1, at(3600)).await.unwrap());
+    assert!(
+        store
+            .claim_dunning_attempt(&invoice_id, 1, at(3600))
+            .await
+            .unwrap()
+    );
     drop(app_a);
 
     provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
-    let app_b = harness_with(
+    let app_b = harness_with_hooks(
         support::config(),
         Arc::new(NoHooks),
         store.clone(),

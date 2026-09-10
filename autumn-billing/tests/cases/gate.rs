@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
+use autumn_billing::SubscriptionStatus;
 use autumn_billing::prelude::*;
 use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
-use autumn_billing::{ProviderId, SubscriptionStatus};
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
 use autumn_web::time::FixedClock;
@@ -65,7 +65,11 @@ fn gate_routes(app: TestApp) -> TestApp {
 }
 
 fn build() -> Harness {
-    support::harness(MemoryBillingStore::shared(), FakeProvider::new(), gate_routes)
+    support::harness(
+        MemoryBillingStore::shared(),
+        FakeProvider::new(),
+        gate_routes,
+    )
 }
 
 fn build_with(billing: BillingConfig) -> Harness {
@@ -103,19 +107,24 @@ fn sub(
         Some(TEAM_PRICE) => Some(PlanId::new("team")),
         _ => None,
     };
-    SubscriptionUpsert {
-        new_id: format!("sub-{customer_id}-{key}"),
-        customer_id: customer_id.to_owned(),
-        provider_subscription_id: ProviderId::new(format!("sub_{customer_id}_{key}")),
-        provider_price_id: price.map(ProviderId::new),
-        plan_id,
+    let mut upsert = SubscriptionUpsert::new(
+        format!("sub-{customer_id}-{key}"),
+        customer_id,
+        format!("sub_{customer_id}_{key}"),
         status,
-        quantity: 1,
-        current_period_end: period_end,
-        cancel_at_period_end: false,
         occurred_at,
-        now: now(),
+        now(),
+    );
+    if let Some(price) = price {
+        upsert = upsert.with_price(price);
     }
+    if let Some(plan_id) = plan_id {
+        upsert = upsert.with_plan(plan_id);
+    }
+    if let Some(end) = period_end {
+        upsert = upsert.with_period_end(end);
+    }
+    upsert
 }
 
 /// Seed one subscription for `user_id` on `price` with `status`, period end
@@ -312,16 +321,36 @@ async fn is_entitled_never_sees_another_users_subscription() {
     seed(&h.store, "7", PRO_PRICE, SubscriptionStatus::Active).await;
     let billing = Billing::from_state(h.client.state()).expect("plugin started");
 
-    assert!(billing.is_entitled("7", &PlanRule::AnyActive).await.unwrap());
-    assert!(billing.is_entitled("7", &PlanRule::plan("pro")).await.unwrap());
+    assert!(
+        billing
+            .is_entitled("7", &PlanRule::AnyActive)
+            .await
+            .unwrap()
+    );
+    assert!(
+        billing
+            .is_entitled("7", &PlanRule::plan("pro"))
+            .await
+            .unwrap()
+    );
     assert!(
         billing
             .is_entitled("7", &PlanRule::entitlement("export"))
             .await
             .unwrap()
     );
-    assert!(!billing.is_entitled("8", &PlanRule::AnyActive).await.unwrap());
-    assert!(!billing.is_entitled("8", &PlanRule::plan("pro")).await.unwrap());
+    assert!(
+        !billing
+            .is_entitled("8", &PlanRule::AnyActive)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !billing
+            .is_entitled("8", &PlanRule::plan("pro"))
+            .await
+            .unwrap()
+    );
     assert!(billing.current_subscription("8").await.unwrap().is_none());
 }
 
@@ -336,9 +365,15 @@ async fn require_returns_the_view_or_forbidden() {
     assert_eq!(view.plan.as_ref().map(|p| p.id.as_str()), Some("pro"));
     assert_eq!(view.subscription.status, SubscriptionStatus::Active);
 
-    let err = billing.require("7", &PlanRule::plan("team")).await.unwrap_err();
+    let err = billing
+        .require("7", &PlanRule::plan("team"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, BillingError::Forbidden(_)), "{err}");
-    let err = billing.require("8", &PlanRule::AnyActive).await.unwrap_err();
+    let err = billing
+        .require("8", &PlanRule::AnyActive)
+        .await
+        .unwrap_err();
     assert!(matches!(err, BillingError::Forbidden(_)), "{err}");
 }
 
@@ -414,5 +449,9 @@ async fn billing_extractor_is_503_without_the_plugin() {
         "ok"
     }
     let client = TestApp::new().routes(routes![handle]).build();
-    client.get("/billing-handle").send().await.assert_status(503);
+    client
+        .get("/billing-handle")
+        .send()
+        .await
+        .assert_status(503);
 }

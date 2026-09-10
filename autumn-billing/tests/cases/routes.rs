@@ -5,7 +5,7 @@
 use autumn_billing::prelude::*;
 use autumn_billing::routes::route_infos;
 use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
-use autumn_billing::{ProviderId, SubscriptionStatus};
+use autumn_billing::{PortalRequest, ProviderId, SubscriptionStatus};
 use autumn_web::test::TestApp;
 use autumn_web::time::FixedClock;
 use chrono::{DateTime, TimeZone, Utc};
@@ -36,21 +36,25 @@ async fn seed_customer(store: &MemoryBillingStore, user_id: &str) -> String {
     store.upsert_customer(upsert).await.expect("customer").id
 }
 
-async fn seed_subscription(store: &MemoryBillingStore, customer_id: &str, status: SubscriptionStatus) {
+async fn seed_subscription(
+    store: &MemoryBillingStore,
+    customer_id: &str,
+    status: SubscriptionStatus,
+) {
     store
-        .upsert_subscription(SubscriptionUpsert {
-            new_id: format!("sub-{customer_id}"),
-            customer_id: customer_id.to_owned(),
-            provider_subscription_id: ProviderId::new(format!("sub_{customer_id}")),
-            provider_price_id: Some(ProviderId::new(PRO_PRICE)),
-            plan_id: Some(PlanId::new("pro")),
-            status,
-            quantity: 1,
-            current_period_end: Some(now() + chrono::Duration::days(30)),
-            cancel_at_period_end: false,
-            occurred_at: now(),
-            now: now(),
-        })
+        .upsert_subscription(
+            SubscriptionUpsert::new(
+                format!("sub-{customer_id}"),
+                customer_id,
+                format!("sub_{customer_id}"),
+                status,
+                now(),
+                now(),
+            )
+            .with_price(PRO_PRICE)
+            .with_plan("pro")
+            .with_period_end(now() + chrono::Duration::days(30)),
+        )
         .await
         .expect("subscription");
 }
@@ -395,7 +399,10 @@ async fn csrf_exempts_the_webhook_but_not_checkout() {
         .send()
         .await
         .assert_status(403);
-    assert!(h.provider.calls().is_empty(), "CSRF blocked before the handler");
+    assert!(
+        h.provider.calls().is_empty(),
+        "CSRF blocked before the handler"
+    );
 
     let body = br#"{"id":"evt_csrf_1","occurred_at":"2026-09-10T12:00:00Z","kind":{"type":"ignored","event_type":"charge.refunded"}}"#;
     let resp = support::post_webhook(&h.client, body).await;

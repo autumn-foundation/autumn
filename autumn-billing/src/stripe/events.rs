@@ -175,7 +175,10 @@ impl Context<'_> {
     /// Decode `data.object` as `T`.
     fn decode<T: serde::de::DeserializeOwned>(self, object: Value) -> Result<T, BillingError> {
         serde_json::from_value(object).map_err(|e| {
-            self.malformed(format!("object does not match the expected shape ({})", position(&e)))
+            self.malformed(format!(
+                "object does not match the expected shape ({})",
+                position(&e)
+            ))
         })
     }
 
@@ -197,7 +200,10 @@ fn unix(secs: i64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(secs, 0)
 }
 
-fn checkout(session: CheckoutSession, context: Context<'_>) -> Result<CheckoutSnapshot, BillingError> {
+fn checkout(
+    session: CheckoutSession,
+    context: Context<'_>,
+) -> Result<CheckoutSnapshot, BillingError> {
     let provider_customer_id = session
         .customer
         .map(ObjectRef::into_id)

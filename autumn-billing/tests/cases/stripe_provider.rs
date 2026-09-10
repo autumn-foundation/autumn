@@ -671,7 +671,8 @@ async fn retry_invoice_payment_card_error_is_declined_with_the_code() {
 #[tokio::test]
 async fn retry_invoice_payment_requires_action_is_declined() {
     let mut app = TestApp::new();
-    app.http_mock("stripe")
+    let mock = app
+        .http_mock("stripe")
         .post("/v1/invoices/in_test_1/pay")
         .respond_with(
             400,
@@ -693,12 +694,14 @@ async fn retry_invoice_payment_requires_action_is_declined() {
             reason: "invoice_payment_intent_requires_action".to_owned()
         }
     );
+    mock.expect_called(1);
 }
 
 #[tokio::test]
 async fn retry_invoice_payment_other_4xx_without_code_is_declined_generic() {
     let mut app = TestApp::new();
-    app.http_mock("stripe")
+    let mock = app
+        .http_mock("stripe")
         .post("/v1/invoices/in_test_1/pay")
         .respond_with(
             400,
@@ -719,12 +722,14 @@ async fn retry_invoice_payment_other_4xx_without_code_is_declined_generic() {
             reason: "declined".to_owned()
         }
     );
+    mock.expect_called(1);
 }
 
 #[tokio::test]
 async fn retry_invoice_payment_already_paid_code_is_already_paid() {
     let mut app = TestApp::new();
-    app.http_mock("stripe")
+    let mock = app
+        .http_mock("stripe")
         .post("/v1/invoices/in_test_1/pay")
         .respond_with(
             400,
@@ -741,12 +746,14 @@ async fn retry_invoice_payment_already_paid_code_is_already_paid() {
         .unwrap();
 
     assert_eq!(outcome, PaymentAttemptOutcome::AlreadyPaid);
+    mock.expect_called(1);
 }
 
 #[tokio::test]
 async fn retry_invoice_payment_already_paid_message_without_code_is_already_paid() {
     let mut app = TestApp::new();
-    app.http_mock("stripe")
+    let mock = app
+        .http_mock("stripe")
         .post("/v1/invoices/in_test_1/pay")
         .respond_with(
             400,
@@ -762,6 +769,7 @@ async fn retry_invoice_payment_already_paid_message_without_code_is_already_paid
         .unwrap();
 
     assert_eq!(outcome, PaymentAttemptOutcome::AlreadyPaid);
+    mock.expect_called(1);
 }
 
 #[tokio::test]
@@ -803,7 +811,8 @@ async fn retry_invoice_payment_500_is_a_provider_error_that_never_shows_the_secr
 async fn retry_invoice_payment_transport_failure_is_a_provider_error() {
     // A mock registry with no matching entry fails the send: the transport path.
     let mut app = TestApp::new();
-    app.http_mock("stripe")
+    let mock = app
+        .http_mock("stripe")
         .get("/v1/unrelated")
         .respond_with_status(200);
     let client = app.build();
@@ -825,6 +834,7 @@ async fn retry_invoice_payment_transport_failure_is_a_provider_error() {
         "{err:?}"
     );
     assert!(!err.to_string().contains(TEST_SECRET_KEY));
+    mock.expect_called(0);
 }
 
 #[tokio::test]
@@ -868,7 +878,8 @@ async fn cancel_subscription_treats_404_as_already_gone() {
 #[tokio::test]
 async fn cancel_subscription_500_is_a_provider_error() {
     let mut app = TestApp::new();
-    app.http_mock("stripe")
+    let mock = app
+        .http_mock("stripe")
         .delete("/v1/subscriptions/sub_test_1")
         .respond_with(
             500,
@@ -892,6 +903,7 @@ async fn cancel_subscription_500_is_a_provider_error() {
         "{err:?}"
     );
     assert!(!err.to_string().contains(TEST_SECRET_KEY));
+    mock.expect_called(1);
 }
 
 #[tokio::test]
