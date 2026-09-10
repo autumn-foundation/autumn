@@ -8,7 +8,7 @@
 //!   autumn migrate && autumn seed
 //!
 //! Or directly:
-//!   cargo run --bin seed
+//!   cargo run --bin todo-app-seed
 
 use autumn_web::seed::SeedContext;
 use diesel::prelude::*;
