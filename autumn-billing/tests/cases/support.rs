@@ -322,3 +322,164 @@ pub async fn post_webhook(client: &TestClient, body: &[u8]) -> autumn_web::test:
         .send()
         .await
 }
+
+/// Like [`harness`], with an explicit billing config and `AutumnConfig`
+/// (for `allow_past_due`, a different grace period, or CSRF on).
+pub fn harness_with(
+    billing: BillingConfig,
+    autumn: AutumnConfig,
+    store: Arc<MemoryBillingStore>,
+    provider: Arc<FakeProvider>,
+    customize: impl FnOnce(TestApp) -> TestApp,
+) -> Harness {
+    let app = TestApp::new().config(autumn).plugin(
+        BillingPlugin::new()
+            .config(billing)
+            .plans(&catalog())
+            .provider(provider.clone())
+            .store(store.clone()),
+    );
+    let client = customize(app).build();
+    Harness {
+        client,
+        store,
+        provider,
+    }
+}
+
+/// Post `body` to `/billing/webhook` with a signature computed over
+/// `signed_body`. Equal inputs make a valid delivery; different inputs model
+/// a tampered body.
+pub async fn post_webhook_signed_as(
+    client: &TestClient,
+    signed_body: &[u8],
+    body: &[u8],
+) -> autumn_web::test::TestResponse {
+    let sig = stripe_signature(TEST_WEBHOOK_SECRET, unix_now(), signed_body);
+    client
+        .post("/billing/webhook")
+        .header("stripe-signature", &sig)
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+}
+
+// ── WP-D1 helpers (reconcile / dunning) ───────────────────────────────────
+
+/// Fixed base instant for event times: 2026-01-01T00:00:00Z.
+pub fn base_time() -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+}
+
+/// `base_time()` plus `secs`.
+pub fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    base_time() + chrono::Duration::seconds(secs)
+}
+
+/// Like [`harness`], but with a custom config and hooks.
+pub fn harness_with(
+    billing: BillingConfig,
+    hooks: Arc<dyn BillingHooks>,
+    store: Arc<MemoryBillingStore>,
+    provider: Arc<FakeProvider>,
+    customize: impl FnOnce(TestApp) -> TestApp,
+) -> Harness {
+    let app = TestApp::new().config(autumn_config(&billing)).plugin(
+        BillingPlugin::new()
+            .config(billing)
+            .plans(&catalog())
+            .provider(provider.clone())
+            .store(store.clone())
+            .hooks(hooks),
+    );
+    let client = customize(app).build();
+    Harness {
+        client,
+        store,
+        provider,
+    }
+}
+
+/// Build a `BillingEvent`.
+pub fn event(
+    id: &str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    kind: autumn_billing::BillingEventKind,
+) -> BillingEvent {
+    BillingEvent {
+        id: id.to_owned(),
+        occurred_at,
+        kind,
+    }
+}
+
+/// A `checkout_completed` kind. Built through serde because the snapshot is
+/// `#[non_exhaustive]`.
+pub fn checkout_kind(
+    provider_customer_id: &str,
+    local_customer_ref: Option<&str>,
+    email: Option<&str>,
+    provider_subscription_id: Option<&str>,
+) -> autumn_billing::BillingEventKind {
+    serde_json::from_value(serde_json::json!({
+        "type": "checkout_completed",
+        "provider_customer_id": provider_customer_id,
+        "local_customer_ref": local_customer_ref,
+        "email": email,
+        "provider_subscription_id": provider_subscription_id,
+    }))
+    .expect("checkout kind json")
+}
+
+/// Run `reconcile::apply` against the plugin service installed on `client`.
+pub async fn apply_event(
+    client: &TestClient,
+    event: BillingEvent,
+) -> Result<autumn_billing::ReconcileOutcome, BillingError> {
+    let service = autumn_billing::BillingService::require(client.state()).expect("plugin started");
+    autumn_billing::reconcile::apply(client.state(), &service, event).await
+}
+
+/// Test route: the notification feed of `recipient`, read through the
+/// `Notifications` extractor so handlers and the plugin share one store.
+#[autumn_web::get("/_test/notifications/{recipient}")]
+pub async fn list_notifications_route(
+    notifications: autumn_web::notifications::Notifications,
+    autumn_web::Path(recipient): autumn_web::Path<i64>,
+) -> autumn_web::AutumnResult<autumn_web::Json<Vec<autumn_web::notifications::Notification>>> {
+    let page = notifications
+        .list(
+            recipient,
+            &autumn_web::pagination::ListQuery::default(),
+            &autumn_web::pagination::PageRequest::default(),
+        )
+        .await?;
+    Ok(autumn_web::Json(page.content))
+}
+
+/// Routes to mount with `app.routes(notification_routes())`.
+pub fn notification_routes() -> Vec<autumn_web::Route> {
+    autumn_web::routes![list_notifications_route]
+}
+
+/// Read the notification feed of `recipient` through the test route.
+pub async fn notifications_for(
+    client: &TestClient,
+    recipient: i64,
+) -> Vec<autumn_web::notifications::Notification> {
+    let response = client
+        .get(&format!("/_test/notifications/{recipient}"))
+        .send()
+        .await;
+    assert_eq!(response.status(), 200, "{}", response.text());
+    response.json()
+}
+
+/// Kinds of the notifications of `recipient`, oldest first.
+pub async fn notification_kinds(client: &TestClient, recipient: i64) -> Vec<String> {
+    let mut items = notifications_for(client, recipient).await;
+    items.sort_by_key(|n| n.id);
+    items.into_iter().map(|n| n.kind).collect()
+}
