@@ -1524,11 +1524,19 @@ def _fence_body(line, base=0, in_fence=False):
     column such a marker establishes but still handed the marker itself to the
     fence test, which then saw `-` where the delimiter should be.
     """
-    # Only when no fence is open. Inside one, a line beginning `- ` is CODE —
-    # stripping the marker there turned `- ``` ` inside a raw string into a
-    # closing delimiter and truncated the block. The list tracking already
-    # refused to run inside a fence for the same reason; this half did not.
-    marker = None if in_fence else LIST_MARKER.match(line)
+    # Inside a fence NO container prefix is structure — every line is content,
+    # so a `>` or a `- ` there is code. Last round taught the list half this and
+    # left the quote half beside it unguarded, in this same function; a `> ``` `
+    # in a raw string still truncated the block.
+    if in_fence:
+        return line
+    # Containers are unwrapped in nesting order, outermost first, because
+    # `> - ```rust` is a quote holding a list. Testing the marker against the
+    # raw line meant a quoted list fence was never recognised at all.
+    if _indent_width(line) - base > FENCE_INDENT_MAX:
+        return line
+    line = BLOCKQUOTE.sub("", line)
+    marker = LIST_MARKER.match(line)
     if marker is not None:
         col = _list_content_column(line, marker)
         # Only the padding actually consumed is dropped; any beyond it stays as
@@ -1536,9 +1544,7 @@ def _fence_body(line, base=0, in_fence=False):
         # indented code block rather than a fence.
         used = col - _indent_width(marker.group(1)) - len(marker.group(2))
         line = " " * col + line[len(marker.group(1)) + len(marker.group(2)) + used :]
-    if _indent_width(line) - base > FENCE_INDENT_MAX:
-        return line
-    return BLOCKQUOTE.sub("", line)
+    return line
 
 
 # A list item establishes a content column, and CommonMark measures a fence
@@ -3071,6 +3077,29 @@ def self_test():
             '#[cfg_attr(doc, doc = "```\\n#[secured(policy = \\"x\\")]\\n```")]\n'
             'pub fn g() {}\n',
             ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # Inside a fence no container prefix is structure: a `>` there is code.
+    check(
+        "markdown: a quote-shaped line inside a fence is content",
+        scan_text(
+            '```rust\nlet s = r#"\n> ```\n"#;\n#[secured(policy = "x")]\n```\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    # Containers unwrap outermost first, so a quoted list fence is a fence.
+    check(
+        "markdown: a fence nested in a quote and a list is scanned",
+        scan_text(
+            '> - ```rust\n>   #[secured(policy = "x")]\n>   ```\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a list inside a quote, ordered marker",
+        scan_text(
+            '> 1. ```rust\n>    #[secured(policy = "x")]\n>    ```\n', ".md"
         ),
         [("secured", "policy")],
     )
