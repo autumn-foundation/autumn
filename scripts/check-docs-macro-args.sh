@@ -1407,6 +1407,25 @@ WAIVER_REACH = 6
 FENCE_INDENT_MAX = 3
 
 
+def _indent_width(line):
+    """Columns of leading whitespace, a tab advancing to the next 4-column stop.
+
+    CommonMark measures indentation in columns, not characters, so a single
+    leading tab is already past the fence allowance. Counting characters made
+    `\t> ```rust` — an indented display of a quoted fence — read as a live
+    fence once the quote prefix was stripped.
+    """
+    width = 0
+    for ch in line:
+        if ch == " ":
+            width += 1
+        elif ch == "\t":
+            width += 4 - (width % 4)
+        else:
+            break
+    return width
+
+
 def _fence_body(line):
     """A line with its block-quote prefix removed, unless it is over-indented.
 
@@ -1415,7 +1434,7 @@ def _fence_body(line):
     quote containing one. Stripping the prefix first also stripped the
     indentation that says so, and the display was judged as live Rust.
     """
-    if len(line) - len(line.lstrip(" ")) > FENCE_INDENT_MAX:
+    if _indent_width(line) > FENCE_INDENT_MAX:
         return line
     return BLOCKQUOTE.sub("", line)
 
@@ -1438,10 +1457,9 @@ def _fence_at(body):
     `body` has had any block-quote prefix removed but keeps its indentation,
     which is what decides whether it is a fence at all.
     """
-    indent = len(body) - len(body.lstrip(" "))
-    if indent > FENCE_INDENT_MAX:
+    if _indent_width(body) > FENCE_INDENT_MAX:
         return None
-    stripped = body[indent:]
+    stripped = body.lstrip(" \t")
     for char in ("`", "~"):
         if stripped.startswith(char * 3):
             length = len(stripped) - len(stripped.lstrip(char))
@@ -1997,6 +2015,23 @@ def self_test():
     check(
         "markdown: a quoted fence within the allowance is still scanned",
         scan_text('  > ```rust\n  > #[secured(policy = "x")]\n  > ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    # Indentation is measured in columns, so one tab is already past the
+    # allowance. Counting characters let a tab-indented display through.
+    check(
+        "markdown: a tab-indented display is not a fence",
+        scan_text('\t```rust\n\t#[secured(policy = "x")]\n\t```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: a tab before a quote marker is still over-indented",
+        scan_text('\t> ```rust\n\t> #[secured(policy = "x")]\n\t> ```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: tab-indented content inside a real fence is still scanned",
+        scan_text('```rust\n\t#[secured(policy = "x")]\n```\n', ".md"),
         [("secured", "policy")],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
