@@ -147,44 +147,91 @@ fn eviction_reclaims_to_zero() {
     );
 }
 
-/// Density smoke test: 1000 concurrent cells each holding a small buffer track
-/// exactly, and evicting all of them reclaims everything.
+/// Density smoke test: empty resident cells keep API-accounted payload separate
+/// from their process-resident structural cost, meet the configured target,
+/// and can all be torn down.
 #[test]
 fn density_smoke_thousand_cells() {
     const CELLS: usize = 1000;
-    const BUF: usize = 16;
 
-    // Each cell is charged its value buffer plus the "buf" key's capacity and a
-    // fixed per-entry overhead for the one scratch entry it stores.
-    let kc = String::from("buf").capacity();
-    let overhead = TenantCell::scratch_entry_overhead();
-
-    let registry = TenantCellRegistry::new();
+    let registry = TenantCellRegistry::with_limits(CELLS, None);
     for i in 0..CELLS {
-        let cell = registry.get_or_create(&format!("tenant-{i}"), 0);
-        cell.scratch_insert("buf", vec![0u8; BUF])
-            .expect("insert under unlimited quota");
+        drop(registry.get_or_create(&format!("tenant-{i:04}"), 0));
     }
 
+    assert_eq!(registry.max_cells(), CELLS);
     assert_eq!(registry.len(), CELLS);
     assert_eq!(
         registry.total_tracked_bytes(),
-        CELLS * (BUF + kc + overhead)
+        0,
+        "empty cells have no API-accounted tenant payload"
     );
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, CELLS);
+    // Regression: `HashMap::capacity()` is 1,792 for this workload on the
+    // current SwissTable implementation, but its backing allocation has 2,048
+    // buckets. The structural model must include the load-factor-reserved
+    // slots, not mistake element capacity for bucket count.
+    assert!(structural.registry_bucket_count >= CELLS);
+    assert!(structural.registry_bucket_count.is_power_of_two());
+    assert!(structural.total_bytes > structural.registry_fixed_bytes);
     println!(
-        "size_of::<TenantCell>() = {} bytes (fixed per-cell handle overhead)",
-        std::mem::size_of::<autumn_web::tenant_cell::TenantCell>()
+        "tenant-cell density lower bound: api_accounted_payload={} structural_total={} structural_per_cell={} registry_fixed={} registry_buckets={} (trailing control group, allocation padding, allocator metadata/rounding/fragmentation excluded)",
+        registry.total_tracked_bytes(),
+        structural.total_bytes,
+        structural.per_cell_bytes(),
+        structural.registry_fixed_bytes,
+        structural.registry_bucket_count,
     );
 
     for i in 0..CELLS {
         let evicted = registry
-            .evict(&format!("tenant-{i}"))
+            .evict(&format!("tenant-{i:04}"))
             .expect("each cell was resident");
         drop(evicted);
     }
 
     assert_eq!(registry.len(), 0);
     assert_eq!(registry.total_tracked_bytes(), 0);
+    assert_eq!(registry.structural_overhead().resident_cells, 0);
+}
+
+/// Registry removals may lower `HashMap`'s effective element capacity by
+/// consuming tombstones without releasing its backing allocation. Structural
+/// accounting must therefore preserve the bucket high-water mark.
+#[test]
+fn structural_overhead_preserves_bucket_high_water_after_eviction() {
+    const INITIAL_CELLS: usize = 1792;
+    const EVICTIONS: usize = 1100;
+
+    let registry = TenantCellRegistry::new();
+    for i in 0..INITIAL_CELLS {
+        drop(registry.get_or_create(&format!("churn-{i:04}"), 0));
+    }
+    let before = registry.structural_overhead();
+    assert_eq!(before.registry_bucket_count, 2048);
+
+    for i in 0..EVICTIONS {
+        drop(
+            registry
+                .evict(&format!("churn-{i:04}"))
+                .expect("resident churn cell must be evicted"),
+        );
+    }
+
+    let after = registry.structural_overhead();
+    assert_eq!(after.resident_cells, INITIAL_CELLS - EVICTIONS);
+    assert!(after.registry_element_capacity < before.registry_element_capacity);
+    assert_eq!(after.registry_bucket_count, before.registry_bucket_count);
+
+    for i in EVICTIONS..INITIAL_CELLS {
+        drop(
+            registry
+                .evict(&format!("churn-{i:04}"))
+                .expect("remaining churn cell must be evicted"),
+        );
+    }
+    assert!(registry.is_empty());
 }
 
 /// Replacing an existing scratch key must account only for the net byte delta,
