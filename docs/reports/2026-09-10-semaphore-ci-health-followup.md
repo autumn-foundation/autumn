@@ -122,15 +122,22 @@ timeout, which is the sanctioned direction. The 2026-09-09T13:59Z hit's
 remains, or mechanisms 1/2 happen to resolve it as a side effect despite not
 naming it directly. Only a rerun shows which.
 
-The fix's own evidence (9+ consecutive local `cargo llvm-cov` runs across
-two contention levels, using the literal build CI's `Coverage` job runs) is
-real diagnostic and directional confirmation, but it is self-reported and
-local, not a CI-native same-commit rerun campaign. This role's own bar for
-treating a ledger entry as *closed* — not merely *diagnosed and fixed* — is
-≥20 (≥50 for the macOS cluster's historically sub-10% rate) 0-failure
-reruns from a harness anyone can rerun. That's exactly what
-`manual-macos-contention-check.yml` was built to produce and still hasn't
-been asked to.
+The fix's own evidence (9+ consecutive local, targeted `cargo llvm-cov -p
+hot-upgrade --test live_upgrade` runs across two contention levels) is real
+diagnostic and directional confirmation, but it is self-reported, local,
+and — **correction (post-review)** — not the same build as CI's own
+coverage lane: `ci.yml`'s "Generate coverage (workspace catch-all)" step
+runs `cargo llvm-cov --workspace --exclude autumn-web --exclude autumn-cli
+--all-features --no-report`, a full-workspace all-features build, not the
+single-package targeted command the fix's commit message quotes. This
+role's own bar for treating a ledger entry as *closed* — not merely
+*diagnosed and fixed* — is ≥20 (≥50 for the macOS cluster's historically
+sub-10% rate) 0-failure reruns from a harness anyone can rerun, against
+the actual CI build. `manual-macos-contention-check.yml` was built toward
+that for the macOS side and still hasn't been dispatched even once — and
+even a full dispatch only reaches 20 samples (its `samples` input caps at
+`"20"`), short of the ≥50 bar on its own; no harness at all exists yet for
+either Linux/coverage signature.
 
 **`cache_stampede` and `sim_fault_plan`: unchanged, still undiagnosed.** No
 new hits this pass; still short of a rerun campaign.
@@ -159,9 +166,12 @@ opening a duplicate fix would be pure waste. What this pass does instead:
   `manual-macos-contention-check.yml` against a `trunk-dev` commit at or
   after `8fae8af`. It is macOS-only, plain `cargo test --workspace` — it
   can produce CI-native rerun evidence for the macOS connect-error cluster
-  and for mechanisms 1/2 under ordinary load, but it cannot exercise either
-  Linux/`Coverage (workspace)` signature (both need `cargo llvm-cov`
-  instrumentation to manifest at all). It is still the only rerun harness
+  (tracked against #2510, not #2645 — see the corrected table row above),
+  but it cannot exercise either Linux/`Coverage (workspace)` signature
+  (both need `cargo llvm-cov` instrumentation to manifest at all), and a
+  single dispatch caps at 20 samples — short of the ≥50 this role's own bar
+  calls for at the macOS cluster's historical rate, so closing that half
+  needs multiple dispatches accumulated, not one. It is still the only rerun harness
   this investigation has, and 43 hours idle is 43 hours of not even that
   much evidence. A second, Linux/coverage-shaped harness — flagged as
   future work in the 2026-09-09 report — remains not built. New macOS CI
@@ -176,7 +186,7 @@ already-shipped fix, not a rerun campaign this pass ran itself.
 
 | Test | Hits (this pass) | Cumulative organic hits | Platforms seen | Status |
 |---|---|---|---|---|
-| `live_upgrade` (connection-error assertion) | 0 | 3/17 macOS (2026-09-03/04) | macOS only | Plausibly mechanism #1 or #3 in #2645, not confirmed against these specific hits' logs; `manual-macos-contention-check.yml` can verify CI-natively, still undispatched |
+| `live_upgrade` (connection-error assertion) | 0 | 3/17 macOS (2026-09-03/04) | macOS only | **Correction (post-review):** not #2645 — `refused_errors`/`hard_failures` only increment on the `Err` path from the request call, which neither mechanism 1 (runs before the load loop starts) nor mechanism 3 (handles the `Ok(Observation)` 503 case, not `Err`) touches; already tied to #2510's `refused`/`hard` reclassification per this entry's own pre-existing text below. Unverified CI-natively either way; `manual-macos-contention-check.yml` can produce that evidence, still undispatched |
 | `live_upgrade` (new-build-never-served) | 0 | 1 (2026-09-09) | Linux (coverage) | Mechanism #2 in #2645 — directly supported by the fix's own commit message; unverified CI-natively (no Linux/coverage harness exists) |
 | `live_upgrade` (every-read-must-be-served, refused=0/hard=0) | 1 | 1 (2026-09-09) | Linux (coverage) | **Not attributed to any of the three mechanisms** — `status: 0` observations don't match mechanism 3's exact-503 predicate (checked against merged source); unverified CI-natively (no Linux/coverage harness exists) |
 | `cache_stampede` (line 501) | 0 | 2 (2026-09-03, 2026-09-09) | macOS only | Undiagnosed |
@@ -218,4 +228,7 @@ git show 8fae8af --stat   # PR #2645 merge on trunk-dev, includes the
 ```
 
 Dispatch (still requires sign-off — new macOS CI spend): `sha` pinned to
-`trunk-dev` at or after `8fae8af`, `samples: "20"`.
+`trunk-dev` at or after `8fae8af`, `samples: "20"` — the input's max choice,
+short of the ≥50 this role's own bar calls for on its own, so treat one
+dispatch as a first sample batch toward that total, not sufficient by
+itself, and expect to dispatch again to accumulate the rest.

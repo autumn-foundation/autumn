@@ -154,26 +154,42 @@ without also filling in the intake form above.
   assert from a single log.
 
   The fix's own verification, per its commit message: `cargo llvm-cov
-  --no-report -p hot-upgrade --test live_upgrade` (the exact build CI's
-  `Coverage` job uses) passed 9+ consecutive runs across two local
-  contention levels (4-8 and 16 busy loops on 4 cores), including runs that
-  hit the barrier and still passed. That is real evidence and a named
-  mechanism per test, satisfying the hard gate's diagnosis requirement —
-  but it is a local, self-reported rerun count, not the CI-native ≥20
-  (≥50 for the macOS connect-error signature's sub-10% historical rate)
-  same-commit campaign this role's own evidentiary bar calls for before
-  treating an entry as closed. **Not closing this entry yet.** Two things
-  would close it: (a) `manual-macos-contention-check.yml` — still
-  undispatched, `total_count: 0` again as of this check, now ~43 hours
-  idle since #2627 fixed it — actually run against a commit at or after
-  `8fae8af`. Note this only covers the macOS-observed cluster and
-  mechanisms 1/2 under ordinary load: its `test` job is `runs-on:
-  macos-latest` only, plain `cargo test --workspace`, no Linux leg, no
-  `cargo llvm-cov` instrumentation (checked against the workflow file
-  itself), so it cannot touch either Linux/`Coverage (workspace)`
-  signature — those need a still-unbuilt second harness; or (b) enough
-  organic post-fix PR traffic passing clean to approximate the same bar,
-  on whichever platform/job shape. Zero organic hits in the small
+  --no-report -p hot-upgrade --test live_upgrade` (a targeted, instrumented
+  local rerun — **correction (post-review): not the exact build CI's
+  `Coverage` job uses**, see below) passed 9+ consecutive runs across two
+  local contention levels (4-8 and 16 busy loops on 4 cores), including runs
+  that hit the barrier and still passed. That is real evidence and a named
+  mechanism per test, satisfying the hard gate's diagnosis requirement — but
+  it is a local, self-reported rerun count on a narrower build than CI's,
+  not the CI-native same-commit campaign this role's own evidentiary bar
+  calls for before treating an entry as closed.
+
+  **Correction (post-review): the local command above is not CI's build.**
+  `ci.yml`'s actual "Generate coverage (workspace catch-all)" step runs
+  `cargo llvm-cov clean --workspace` followed by `cargo llvm-cov --workspace
+  --exclude autumn-web --exclude autumn-cli --all-features --no-report` —
+  a full-workspace, all-features build carrying every other crate's
+  instrumentation and compile/link load in the same process, not a
+  single-package `-p hot-upgrade --test live_upgrade` run with the default
+  feature set. The two plausibly differ in exactly the dimension this
+  investigation cares about (contention/timing), so record the fix's own
+  9+ runs as targeted instrumented reruns that support the diagnosis, not
+  as a rerun of the CI build itself.
+
+  **Correction (post-review): closing this entry needs two separate,
+  larger pieces of evidence, not one dispatch.** An earlier version of this
+  paragraph said running `manual-macos-contention-check.yml` once (option
+  (a)) would close the entry. It cannot, on its own, for two reasons: (1)
+  the workflow's `samples` input is a `type: choice` capped at `["5", "10",
+  "20"]` — a single dispatch tops out at 20 macOS samples, short of this
+  role's own ≥50 bar for the macOS cluster's historically sub-10% rate, so
+  closing that half needs ≥50 samples accumulated across multiple
+  dispatches (e.g. three dispatches of 20), not one run; and (2) as
+  established above, this harness is macOS-only and cannot touch either
+  Linux/`Coverage (workspace)` signature at all — those need a
+  still-unbuilt second harness with its own rerun count, run against CI's
+  actual coverage-lane command, before *that* half can close. **Not closing
+  this entry yet, on either half.** Zero organic hits in the small
   post-merge window sampled here (one push-triggered run on `trunk-dev` at
   the fix commit itself, success) — reassuring, but n=1, not evidence.
 
