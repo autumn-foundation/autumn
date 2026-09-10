@@ -279,8 +279,44 @@ WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([a-z_0-9]+)")
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 
 
+MACRO_OPEN = re.compile(r"#\[(" + "|".join(sorted(OWNERS)) + r")\(")
+
+
+class MacroCalls:
+    """Find `#[macro(…)]` calls and hand back their argument text.
+
+    Depth-aware rather than regular, because the arguments are not
+    bracket-free: `#[secured(scopes = ["a:b"])]` and
+    `#[lifecycle(transitions = [...])]` both carry a nested array, and a
+    `[^\\]]*` body stops dead at the first `]`. That made every
+    array-valued form invisible to this gate — including `scopes`, the one
+    working spelling the baseline defect had to be corrected *to*. Caught by
+    renaming `scopes` in `secured.rs` and watching the gate stay silent when
+    it should have reported every page still saying `scopes`.
+    """
+
+    @staticmethod
+    def findall(text):
+        out = []
+        for match in MACRO_OPEN.finditer(text):
+            i = match.end()
+            depth = 1
+            while i < len(text) and depth:
+                ch = text[i]
+                if ch in "([":
+                    depth += 1
+                elif ch in ")]":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            if depth == 0:
+                out.append((match.group(1), text[match.end():i]))
+        return out
+
+
 def macro_call_re():
-    return re.compile(r"#\[(" + "|".join(sorted(OWNERS)) + r")\(([^\]]*)\)\]")
+    return MacroCalls
 
 
 def is_archived(rel):
@@ -515,6 +551,25 @@ def self_test():
         "markdown: good key passes",
         scan_text('```rust\n#[secured(scopes = ["a:b"])]\n```\n', ".md"),
         [],
+    )
+    # An array-valued argument must be *seen*, not skipped. A `[^\]]*` body
+    # stops at the first `]` and silently drops every such form — which is how
+    # a rename of `scopes` could land with the whole corpus still saying
+    # `scopes` and this gate reporting a clean run.
+    check(
+        "markdown: array-valued arg is scanned, not skipped",
+        scan_text('```rust\n#[secured(bogus = ["a:b"])]\n```\n', ".md"),
+        [("secured", "bogus")],
+    )
+    check(
+        "markdown: bad key after an array arg is seen",
+        scan_text('```rust\n#[secured(scopes = ["a"], bogus = 1)]\n```\n', ".md"),
+        [("secured", "bogus")],
+    )
+    check(
+        "rustdoc: array-valued arg is scanned, not skipped",
+        scan_text('//! ```ignore\n//! #[secured(bogus = ["a:b"])]\n//! ```\n', ".rs"),
+        [("secured", "bogus")],
     )
     # `==` is a comparison, not a keyword argument.
     check(
