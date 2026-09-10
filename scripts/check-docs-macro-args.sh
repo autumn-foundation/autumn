@@ -1540,6 +1540,35 @@ def _list_content_column(line, marker=None):
     return _indent_width(m.group(1)) + len(m.group(2)) + _indent_width(m.group(3))
 
 
+def _html_comment_step(text, inside, fence_open, base):
+    """`(skip this line, still inside)` for HTML-comment tracking.
+
+    A fence inside an HTML comment is not rendered, so a reader can neither see
+    nor copy it — in a page or in a doc comment, where `rustdoc --test`
+    likewise reports no tests for one. This lived in the markdown scanner
+    alone, the seventh time a rule was taught to one half of the pair, so it is
+    a shared step rather than a second copy.
+
+    Three things it must not do, each learned the hard way: it does not track
+    inside a fence, where `<!--` is code; it ignores a marker inside an inline
+    code span, which is text ABOUT a marker; and it ignores an over-indented
+    one, which is an indented code block displaying it. The last two matter
+    because an opener with no closer swallows everything after it.
+    """
+    if inside:
+        return True, "-->" not in text
+    markup = INLINE_CODE.sub("", text)
+    displayed = _indent_width(text) - base > FENCE_INDENT_MAX
+    if (
+        not fence_open
+        and not displayed
+        and "<!--" in markup
+        and "-->" not in markup.split("<!--", 1)[1]
+    ):
+        return True, True
+    return False, False
+
+
 def _fence_lang(suffix):
     """The info string's first token, lower-cased.
 
@@ -1598,25 +1627,10 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         # deliberately commented OUT. Only tracked outside a fence, where
         # `<!--` is markup rather than code. Waivers are unaffected: they are
         # collected from the raw lines, not from this scan.
-        if in_html_comment:
-            if "-->" in line:
-                in_html_comment = False
-            continue
-        # `<!--` inside an inline code span is text about a comment, not one.
-        # A page explaining the marker would otherwise open a comment that
-        # never closes and swallow the rest of the file.
-        # …and an over-indented line is an indented code block DISPLAYING the
-        # marker, so it does not open a comment either. This check runs before
-        # the fence machinery, so it has to apply the indentation rule itself.
-        markup = INLINE_CODE.sub("", line)
-        displayed = _indent_width(line) - list_col > FENCE_INDENT_MAX
-        if (
-            open_char is None
-            and not displayed
-            and "<!--" in markup
-            and "-->" not in markup.split("<!--", 1)[1]
-        ):
-            in_html_comment = True
+        skip, in_html_comment = _html_comment_step(
+            line, in_html_comment, open_char is not None, list_col
+        )
+        if skip:
             continue
         if open_char is None:
             # Track the innermost list item's content column, but only outside
@@ -1760,6 +1774,18 @@ def _decode_rust_string(raw):
             i += 1
             continue
         nxt = raw[i + 1 : i + 2]
+        # A backslash before a newline is a line continuation: the newline and
+        # the indentation after it are removed. Rejecting it as unknown threw
+        # away the whole attribute, which is how a multi-line doc attribute
+        # written in the ordinary (non-raw) form went unread.
+        # `nxt in "\r\n"` would be True for the empty string — a lone backslash
+        # at the end of an unterminated literal — and consuming it made the
+        # line-joiner stop one line early on the very form this decodes.
+        if nxt in ("\r", "\n"):
+            i += 2
+            while i < len(raw) and raw[i] in " \t\r\n":
+                i += 1
+            continue
         if nxt in _SIMPLE_ESCAPES:
             out.append(_SIMPLE_ESCAPES[nxt])
             i += 2
@@ -1853,6 +1879,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
     in_block_doc, attr_depth, comment_depth = 0, 0, 0
+    in_html_comment = False
     # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
     # equivalent to, so every rule below — fences, block quotes, indentation,
     # list columns — applies to it without a second implementation. The source
@@ -1960,6 +1987,14 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # closing-suffix check need it.
         # A doc comment is markdown, so a list in one establishes a content
         # column exactly as it does in a page. Same tracking, same scanner.
+        # A doc comment is markdown, so an HTML comment hides a fence here too —
+        # `rustdoc --test` reports no tests for one. Same step as the page
+        # scanner rather than a second copy of it.
+        skip, in_html_comment = _html_comment_step(
+            doc.group(1), in_html_comment, open_char is not None, list_col
+        )
+        if skip:
+            continue
         if open_char is None:
             col = _list_content_column(doc.group(1))
             if col is not None:
@@ -2682,6 +2717,34 @@ def self_test():
         scan_text(
             '#[doc = r#"\n```ignore\n#[secured(policy = "x")]\n```\n"#]\n'
             'pub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # An HTML comment hides a fence in a doc comment exactly as it does in a
+    # page — `rustdoc --test` reports no tests for one.
+    check(
+        "rustdoc: a fence inside an HTML comment is not scanned",
+        scan_text(
+            '//! <!--\n//! ```\n//! #[secured(policy = "x")]\n//! ```\n//! -->\n', ".rs"
+        ),
+        [],
+    )
+    check(
+        "rustdoc: a fence after a one-line HTML comment is still scanned",
+        scan_text(
+            '//! <!-- hidden -->\n//! ```\n//! #[secured(policy = "x")]\n//! ```\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # A backslash before a newline is a line continuation, not an unknown
+    # escape: the newline and the indentation after it are removed.
+    check(
+        "rustdoc: an escaped-newline doc attribute is scanned",
+        scan_text(
+            '#[doc = "```\\n\\\n#[secured(policy = \\"x\\")]\\n\\\n```"]\n'
+            'pub fn f() {}\n',
             ".rs",
         ),
         [("secured", "policy")],
