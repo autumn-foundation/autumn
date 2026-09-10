@@ -3252,27 +3252,35 @@ pub fn check_daemon_service_impl(report: &DaemonServiceReport) -> CheckResult {
             ),
         }
     }
-    // Warn, never fail: neither a stopped daemon nor an unregistered service is
-    // a defect — plenty of projects never want one — and `doctor --strict`
-    // treats a failure as a hard error in pre-commit gates.
-    let status = if report.missing_prerequisites.is_empty() {
-        CheckStatus::Pass
-    } else {
+    if !report.missing_prerequisites.is_empty() {
         parts.push(format!(
-            "missing for the service journey: {}",
+            "for the service journey you would also need: {}",
             report.missing_prerequisites.join("; ")
         ));
-        CheckStatus::Warn
-    };
+    }
     CheckResult {
         name: "daemon_service",
-        status,
+        // **Pass, always.** Every clause here is a normal state, not a defect: a
+        // project that never wants a daemon, a service nobody registered, and —
+        // the one that matters — an ordinary non-elevated shell, which cannot
+        // open the Service Control Manager with `CREATE_SERVICE`.
+        //
+        // That last one is why this is not a warning. `exit_code` treats any
+        // warning as a failure under `--strict`, so warning about elevation
+        // would make `autumn doctor --strict` — itself a Tier 1 command, used in
+        // scripts and pre-commit gates — exit 1 on every unelevated Windows
+        // shell, for a service the user may have no intention of installing.
+        // `platform_support` right above carries the same reasoning for the same
+        // reason; this check reintroduced the failure mode that one was written
+        // to avoid, and must not do it again.
+        //
+        // The prerequisite is still *reported*, in the detail, so a developer
+        // meets it before an access-denied error rather than after.
+        status: CheckStatus::Pass,
         detail: Some(parts.join(". ")),
-        hint: if report.missing_prerequisites.is_empty() {
-            None
-        } else {
-            Some("Re-run from an elevated (Administrator) shell to register or remove a service")
-        },
+        // `format_check_line` prints a hint only on warn/fail, so the pointer
+        // lives in the detail above rather than being silently dropped here.
+        hint: None,
     }
 }
 
@@ -3361,15 +3369,44 @@ mod daemon_service_tests {
     }
 
     #[test]
-    fn a_missing_prerequisite_warns_and_says_what_to_do() {
+    fn a_missing_prerequisite_is_reported_without_failing_strict() {
+        // `exit_code` treats any warning as a failure under `--strict`, and an
+        // ordinary non-elevated shell ALWAYS lacks the SCM access a service
+        // registration needs. Warning here would make `autumn doctor --strict`
+        // exit 1 on every unelevated Windows machine, for a service the user may
+        // never want — the exact trap `platform_support` documents avoiding.
         let result = check_daemon_service_impl(&DaemonServiceReport {
             service_capable: true,
             missing_prerequisites: vec!["administrator rights".to_owned()],
             ..DaemonServiceReport::default()
         });
-        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.status, CheckStatus::Pass);
+        // Reported, though — a developer should meet it here, not in an
+        // access-denied error halfway through an install.
         assert!(result.detail.as_deref().unwrap().contains("administrator"));
-        assert!(result.hint.is_some());
+    }
+
+    #[test]
+    fn the_check_never_warns_so_strict_cannot_fail_on_it() {
+        // Belt and braces over the case above: no combination of these inputs
+        // may produce a warning, because every one of them is a normal state.
+        for service_capable in [true, false] {
+            for prerequisites in [vec![], vec!["administrator rights".to_owned()]] {
+                for daemon in [None, Some((42, "tcp:127.0.0.1:3000".to_owned()))] {
+                    let result = check_daemon_service_impl(&DaemonServiceReport {
+                        service_capable,
+                        daemon,
+                        service: None,
+                        missing_prerequisites: prerequisites.clone(),
+                    });
+                    assert_eq!(
+                        result.status,
+                        CheckStatus::Pass,
+                        "capable={service_capable} prereqs={prerequisites:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

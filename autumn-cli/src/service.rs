@@ -135,7 +135,31 @@ pub fn service_name(project_identity: &str) -> String {
 /// The human-facing name shown in `services.msc`.
 #[must_use]
 pub fn service_display_name(project_identity: &str) -> String {
-    format!("Autumn app: {project_identity}")
+    /// What `service_display_name` prefixes the identity with.
+    const DISPLAY_PREFIX: &str = "Autumn app: ";
+    let display = format!("{DISPLAY_PREFIX}{project_identity}");
+    if display.chars().count() <= MAX_SERVICE_NAME {
+        return display;
+    }
+    // The SCM caps the display name at the same 256 characters as the service
+    // name, and `CreateService` rejects an over-long one — so bounding only the
+    // internal name would still fail `install-service` for a directory name near
+    // Windows' own 255-character component limit. Trim the readable half and keep
+    // the `-<dirhash>` suffix, for the same reason `service_name` does: it is
+    // what tells two checkouts apart in `services.msc`.
+    let (readable, hash) = project_identity
+        .rsplit_once('-')
+        .map_or((project_identity, ""), |(head, tail)| (head, tail));
+    let suffix = if hash.is_empty() {
+        String::new()
+    } else {
+        format!("-{hash}")
+    };
+    let room = MAX_SERVICE_NAME
+        .saturating_sub(DISPLAY_PREFIX.chars().count())
+        .saturating_sub(suffix.chars().count());
+    let readable: String = readable.chars().take(room).collect();
+    format!("{DISPLAY_PREFIX}{readable}{suffix}")
 }
 
 /// The service description shown in `services.msc`.
@@ -692,11 +716,11 @@ mod windows_impl {
         // Only when something is actually registered; a missing service is the
         // ordinary daemon case, not an error.
         super::registered_service_state(project_identity)?;
-        Some(restart_service(&name))
+        Some(restart_service(&name, project_identity))
     }
 
     /// Stop then start the SCM entry, waiting for each transition.
-    fn restart_service(name: &str) -> Result<(), String> {
+    fn restart_service(name: &str, project_identity: &str) -> Result<(), String> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|e| {
             format!(
@@ -724,7 +748,11 @@ mod windows_impl {
                     format!("cannot open `{name}`: {e}")
                 }
             })?;
-        let paths = crate::paths::RuntimePaths::resolve(&serve::project_identity_for(None)).ok();
+        // The SELECTED project's paths. Re-deriving from `None` would read the
+        // workspace root's state for a `-p api` restart and fall back to the
+        // default budget, timing out on a member service that is draining
+        // correctly — and then never starting it again.
+        let paths = crate::paths::RuntimePaths::resolve(project_identity).ok();
         let stop_timeout = scm_stop_timeout(paths.as_ref());
         if service
             .query_status()
@@ -883,7 +911,14 @@ mod windows_impl {
                 .stop()
                 .map_err(|e| format!("cannot stop `{name}`: {e}"))?;
             let deadline = Instant::now() + stop_timeout;
-            while state(&service).unwrap_or(ServiceState::Stopped) != ServiceState::Stopped {
+            // NOT `unwrap_or(Stopped)`: a query that fails is not a service that
+            // stopped. Treating it as one deletes the entry, then reaps Postgres
+            // and removes the daemon records out from under a host that may
+            // still be draining — cutting off the very requests this command
+            // waits for.
+            while state(&service).map_err(|e| format!("cannot query `{name}`: {e}"))?
+                != ServiceState::Stopped
+            {
                 if Instant::now() >= deadline {
                     return Err(format!(
                         "`{name}` did not stop within {}s; it was left registered \
@@ -1227,6 +1262,33 @@ mod tests {
         let name = service_name(&"x".repeat(500));
         assert!(name.starts_with(SERVICE_NAME_PREFIX));
         assert!(name.chars().count() <= MAX_SERVICE_NAME);
+    }
+
+    #[test]
+    fn the_display_name_is_bounded_and_keeps_its_identifying_suffix() {
+        // The SCM caps the display name at the same 256 characters as the
+        // service name, so bounding only the internal name still fails
+        // `CreateService` for a directory name near Windows' 255-character
+        // component limit.
+        let display = service_display_name(&format!("{}-a1b2c3d4", "x".repeat(500)));
+        assert!(
+            display.chars().count() <= MAX_SERVICE_NAME,
+            "{}",
+            display.len()
+        );
+        assert!(display.ends_with("-a1b2c3d4"), "{display}");
+        assert!(display.starts_with("Autumn app: "), "{display}");
+        // Two checkouts stay distinguishable in `services.msc`.
+        let other = service_display_name(&format!("{}-9f8e7d6c", "x".repeat(500)));
+        assert_ne!(display, other);
+    }
+
+    #[test]
+    fn a_short_display_name_is_left_alone() {
+        assert_eq!(
+            service_display_name("mytool-a1b2c3d4"),
+            "Autumn app: mytool-a1b2c3d4"
+        );
     }
 
     #[test]
