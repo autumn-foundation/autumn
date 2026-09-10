@@ -4,6 +4,11 @@ edition.workspace = true
 version.workspace = true
 publish = false
 
+[[bin]]
+name = "seed"
+path = "src/bin/seed.rs"
+test = false
+
 [dependencies]
 # `seed` enables `autumn_web::seed` (SeedContext + the fake-seeder registry) so
 # `src/bin/seed.rs` can do a one-line faked seed and answer

@@ -8,6 +8,7 @@ default-run = "todo-app"
 [[bin]]
 name = "seed"
 path = "src/bin/seed.rs"
+test = false
 
 [features]
 # Enable headless-browser system tests. Requires Chromium on the host.

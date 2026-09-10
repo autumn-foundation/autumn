@@ -2377,6 +2377,10 @@ mod tests {
             content.contains("seed"),
             "Cargo.toml [[bin]] entry should mention 'seed'"
         );
+        assert!(
+            content.contains("test = false"),
+            "seed must not create a test-harness executable"
+        );
         // The seed feature must be enabled on autumn-web so src/bin/seed.rs
         // can import autumn_web::seed::SeedContext without manual edits.
         assert!(

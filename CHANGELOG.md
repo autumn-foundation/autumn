@@ -11026,7 +11026,9 @@ For a narrative tour of this release, see the
   HTML5 input attribute — `{min=N,max=N}`, `{email}`, `{url}` (issue #1388); and
   when a `src/bin/seed.rs` exists the generator idempotently links the
   `schema`/`models` modules into it so `autumn seed --count/--model` resolves
-  the model's factory (issue #1718).
+  the model's factory, including when the seed already has plain module
+  declarations; seed binaries also skip test-harness linking to avoid Windows
+  output-file contention (issue #1718).
 - **http:** SSRF hardening for the outbound HTTP client, all opt-in — the
   default path (shared client, reqwest auto-follow) is unchanged.
   `RequestBuilder::no_redirect()` returns a 3xx verbatim and
