@@ -9,6 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
+  `autumn db restore` now support a `sqlite://` target with no external tools.
+  The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the
+  snapshot is a consistent point in time even while the app writes, and in WAL
+  mode it does not block the writer. The artifact is a real `control.sqlite`
+  database beside the usual `manifest.json`, which now records a per-target
+  `backend` field; an absent field means `postgres`, so every artifact written
+  before this release restores exactly as it did. `restore` verifies the artifact,
+  stages a verified copy beside the target, clears the target's `-wal`, `-shm`
+  and `-journal`, and renames the copy into place keeping the target's mode and
+  owner. Stop the app before restoring: a running process keeps open handles to
+  the old file. `--keep`, `--upload` and offsite restore are unchanged.
+  An artifact whose recorded backend disagrees with the configured database is
+  now refused up front instead of failing inside a driver. A `file:` database URL
+  is percent-decoded the way SQLite decodes a URI filename, so `file:app%20data.db`
+  resolves to the `app data.db` the app actually opens — this also corrects
+  `autumn db replica`, which shares the resolver. `pg_dump` is resolved
+  only when a Postgres target is in the run, so an all-SQLite app no longer needs
+  Postgres client tools to back up.
+  `autumn deploy` treats the SQLite data file as persistent state: a relative
+  `sqlite://app.db` is kept in `app_dir/shared/data` and linked into each release
+  — before the migration one-shot, and again on rollback — so a deploy, a
+  rollback and release retention can never lose or orphan it. An app deployed
+  before this lands keeps its file in the serving release; the next deploy stops
+  and prints the one-time move to make, rather than relocating a live database
+  (SQLite ties the `-wal` name to the resolved path, so a move under a running
+  app is not safe). The deploy never deletes a database file. A database
+  configured *inside*
+  the releases directory, an in-memory one, or a relative path that is not a
+  plain name is now refused at preflight by a new `sqlite_data_file` grader
+  rather than after the first cutover; the grader is emitted only for a SQLite
+  app, so a Postgres deploy's preflight report is unchanged. `autumn doctor`'s
+  `pg_client_tools` check on a SQLite app now passes on the merits instead of
+  deferring to a tracking issue.
+  The `link-data` step decides the whole state space at once rather than guard by
+  guard: it proceeds only when nothing occupies the release's data path or what
+  does is its own link to the shared file, so a legacy symlink pointing at a
+  different database is refused instead of silently swapped for the shared one,
+  even when both exist. A missing shared file is told apart from an unmounted
+  volume by a `shared/sqlite-data-adopted` marker — recorded by a step that runs
+  after the migration that creates the database, refreshed whenever a later
+  deploy sees the file, and kept outside any `shared/data` mount — so a volume that is away stops
+  the deploy instead of creating a fresh empty database beside the orphaned real
+  one. The printed one-time recoveries move every sidecar *before* the database,
+  each step gating the next, so a failed sidecar move leaves the refusal firing
+  and a retry resumes rather than stranding the WAL. Preflight also refuses a
+  relative database whose path is a file the deploy uploads into the release
+  directory (`sqlite://myapp`, `sqlite://autumn.toml`), which the upload would
+  otherwise truncate by writing through the data link; and a relative
+  `[deploy] app_dir`, which made the link target resolve beneath the release
+  directory. For an absolute operator-managed database, a new `check-data-dir`
+  step re-asks the containment question **on the host**, resolving the database
+  path itself — so both a symlinked `app_dir` and a database that is *itself* a
+  symlink into `releases/` are caught. The CLI cannot see either from here, and
+  release retention would have deleted the file. Inside the app directory only
+  `shared/data/` is the app's: the rest of `shared/` holds deploy state
+  (`autumn.env`, `live-slot`, `previous-release`, `proxy-options`, `last-deploy`),
+  and a database configured at one of those paths was overwritten by the deploy
+  step that writes it. A relative database is refused when a release payload is
+  its **leading path component**, not only when it is the whole path — `scp`
+  writes *into* `myapp` when a directory is there, so `sqlite://myapp/myapp` was
+  replaced by the uploaded binary. `autumn db restore` now holds its staging file
+  open and applies the target's mode and owner through that handle, so a symlink
+  swapped in at the predictable staging path after creation can no longer
+  redirect the `chmod`/`chown`; the name is re-checked against the handle's inode
+  before the copy is verified and again before it is published. `check-data-dir`
+  also creates `shared/data/` when an absolute database lives there — the
+  placement the guide recommends — since `prepare-dirs` creates only `shared/`
+  and SQLite cannot create a database whose parent directory is absent; a path
+  outside the app dir is verified but never created — and it applies the same
+  `sqlite-data-adopted` missing-volume guard first, so an absolute database in
+  `shared/data` whose mount is away stops the deploy rather than having its mount
+  point recreated and a fresh empty database created inside it. The marker now
+  covers both placements: keying it on the relative one alone left an absolute
+  database in the deploy's own namespace with no marker and no refusal.
+
 - **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
   management system.** `autumn new <name> --starter cms` now scaffolds a
   complete CMS, joining `saas` as the second curated built-in. The rendered
@@ -64,6 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embedded_saas_matches_example_saas` was a single hard-coded test body; it is
   now `assert_starter_matches_example(starter, project_name)`, called by both
   the `saas` and `cms` gates. No behavior change for `saas`.
+
 ### Fixed
 
 - **web:** the `application/problem+json` `errors` array no longer includes a
