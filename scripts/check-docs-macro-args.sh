@@ -1497,7 +1497,7 @@ def _indent_width(line):
     return width
 
 
-def _fence_body(line, base=0):
+def _fence_body(line, base=0, in_fence=False):
     """A line with its block-quote prefix removed, unless it is over-indented.
 
     The quote marker is itself subject to the indentation rule: at four spaces
@@ -1510,7 +1510,11 @@ def _fence_body(line, base=0):
     column such a marker establishes but still handed the marker itself to the
     fence test, which then saw `-` where the delimiter should be.
     """
-    marker = LIST_MARKER.match(line)
+    # Only when no fence is open. Inside one, a line beginning `- ` is CODE —
+    # stripping the marker there turned `- ``` ` inside a raw string into a
+    # closing delimiter and truncated the block. The list tracking already
+    # refused to run inside a fence for the same reason; this half did not.
+    marker = None if in_fence else LIST_MARKER.match(line)
     if marker is not None:
         col = _list_content_column(line, marker)
         # Only the padding actually consumed is dropped; any beyond it stays as
@@ -1550,36 +1554,73 @@ def _list_content_column(line, marker=None):
     return _indent_width(m.group(1)) + len(m.group(2)) + (1 if pad >= 5 else pad)
 
 
-def _mask_code_spans(text, open_len):
-    """`(text with code spans removed, run length still open)`.
+def _run_at(text, i):
+    """Index past the backtick run starting at `i`."""
+    j = i
+    while j < len(text) and text[j] == "`":
+        j += 1
+    return j
 
-    A code span may cross a physical newline, so a per-line regex could not see
-    that `<!--` on its own line sat inside one — and the marker then opened a
-    comment that swallowed every later fence. A span opens on a backtick run
-    and closes on a run of the same length; the caller resets the state on a
-    blank line, which is where CommonMark ends one.
+
+def _blank_code_spans(text):
+    """`text` with the contents of matched code spans replaced by spaces.
+
+    A span opens on a backtick run and closes on a run of the SAME length. An
+    unmatched run is ordinary text — the first version opened a span on any
+    run and carried it forward, so a stray backtick in prose masked a real
+    `<!--` and the hidden fence under it was scanned and reported.
+
+    Newlines survive, so a caller can split the result back into lines. Spans
+    cannot cross a blank line, so callers resolve one block at a time.
     """
-    out, i, n = [], 0, len(text)
+    out, i, n = list(text), 0, len(text)
     while i < n:
         if text[i] != "`":
-            if not open_len:
-                out.append(text[i])
             i += 1
             continue
-        j = i
-        while j < n and text[j] == "`":
-            j += 1
-        run = j - i
-        if open_len:
-            if run == open_len:
-                open_len = 0
+        j = _run_at(text, i)
+        run, k, closed = j - i, j, None
+        while k < n:
+            if text[k] != "`":
+                k += 1
+                continue
+            m = _run_at(text, k)
+            if m - k == run:
+                closed = m
+                break
+            k = m
+        if closed is None:
+            i = j  # an unmatched run: ordinary text
+            continue
+        for p in range(i, closed):
+            if out[p] != "\n":
+                out[p] = " "
+        i = closed
+    return "".join(out)
+
+
+def _code_span_masked(lines):
+    """`lines` with matched code-span contents blanked, block by block."""
+    out, block = list(lines), []
+
+    def flush():
+        if not block:
+            return
+        masked = _blank_code_spans("\n".join(lines[i] for i in block))
+        for i, seg in zip(block, masked.split("\n")):
+            out[i] = seg
+        block.clear()
+
+    for i, line in enumerate(lines):
+        if line.strip():
+            block.append(i)
         else:
-            open_len = run
-        i = j
-    return "".join(out), open_len
+            flush()
+    flush()
+    return out
 
 
-def _html_comment_step(text, inside, fence_open, base, code_span=0):
+def _html_comment_step(text, inside, fence_open, base, markup=None):
     """`(skip this line, still inside)` for HTML-comment tracking.
 
     A fence inside an HTML comment is not rendered, so a reader can neither see
@@ -1595,10 +1636,9 @@ def _html_comment_step(text, inside, fence_open, base, code_span=0):
     because an opener with no closer swallows everything after it.
     """
     if inside:
-        return True, "-->" not in text, code_span
-    if not text.strip():
-        code_span = 0  # CommonMark: a code span cannot contain a blank line
-    markup, code_span = _mask_code_spans(text, code_span)
+        return True, "-->" not in text
+    if markup is None:
+        markup = text
     displayed = _indent_width(text) - base > FENCE_INDENT_MAX
     if (
         not fence_open
@@ -1606,8 +1646,8 @@ def _html_comment_step(text, inside, fence_open, base, code_span=0):
         and "<!--" in markup
         and "-->" not in markup.split("<!--", 1)[1]
     ):
-        return True, True, code_span
-    return False, False, code_span
+        return True, True
+    return False, False
 
 
 def _fence_lang(suffix):
@@ -1635,7 +1675,13 @@ def _fence_at(body, base=0):
     for char in ("`", "~"):
         if stripped.startswith(char * 3):
             length = len(stripped) - len(stripped.lstrip(char))
-            return char, length, stripped[length:]
+            suffix = stripped[length:]
+            # A backtick fence's info string may not contain a backtick, so
+            # ```rust `example` is not a fence at all. Returning one made the
+            # prose under it read as Rust. (A tilde fence has no such rule.)
+            if char == "`" and "`" in suffix:
+                return None
+            return char, length, suffix
     return None
 
 
@@ -1661,15 +1707,19 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
-    in_html_comment, code_span = False, 0
+    in_html_comment = False
+    # Code spans are resolved for the whole file up front rather than carried
+    # line by line: only a run with a matching close is a span, and that cannot
+    # be known until the close is found.
+    masked = _code_span_masked(lines)
     for lineno, line in enumerate(lines, 1):
         # A fence inside an HTML comment is not rendered, so a reader cannot
         # see or copy it — and the gate was failing CI on a block someone had
         # deliberately commented OUT. Only tracked outside a fence, where
         # `<!--` is markup rather than code. Waivers are unaffected: they are
         # collected from the raw lines, not from this scan.
-        skip, in_html_comment, code_span = _html_comment_step(
-            line, in_html_comment, open_char is not None, list_col, code_span
+        skip, in_html_comment = _html_comment_step(
+            line, in_html_comment, open_char is not None, list_col, masked[lineno - 1]
         )
         if skip:
             continue
@@ -1690,7 +1740,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
         # one, and without stripping the CommonMark `>` prefix the scanner
         # never entered the fence at all.
-        body = _fence_body(line, list_col)
+        body = _fence_body(line, list_col, open_char is not None)
         fence = _fence_at(body, list_col)
         handled = False
         if fence:
@@ -1855,6 +1905,17 @@ def _decode_rust_string(raw):
     return "".join(out)
 
 
+def _after_attribute(line):
+    """Whatever follows a leading `#[…]` on `line`, or the line if it has none."""
+    open_at = line.find("[")
+    if open_at == -1:
+        return ""
+    # `_close_of` returns the index OF the closing delimiter, since its callers
+    # slice the body with it — so the tail starts one past that.
+    end = _close_of(line, open_at + 1, "[")
+    return "" if end is None else line[end + 1 :]
+
+
 def _bracket_delta(text):
     """Net bracket depth `text` adds, skipping literals and comments."""
     depth, i = 0, 0
@@ -1920,7 +1981,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
     in_block_doc, attr_depth, comment_depth = 0, 0, 0
-    in_html_comment, code_span = False, 0
+    in_html_comment = False
     # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
     # equivalent to, so every rule below — fences, block quotes, indentation,
     # list columns — applies to it without a second implementation. The source
@@ -2010,8 +2071,18 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             if not bare or bare.startswith("//"):
                 continue
             if bare.startswith("#"):
-                attr_depth = max(0, _bracket_delta(line))
-                continue
+                depth = _bracket_delta(line)
+                if depth > 0:
+                    attr_depth = depth
+                    continue
+                # Balanced on this line. If an ITEM shares the line —
+                # `#[allow(dead_code)] pub fn a() {}` — the doc comment ends
+                # here after all: the fence belongs to that item, and later
+                # `///` lines document the next one. Treating the whole line as
+                # an attribute-only gap merged two items' documentation.
+                tail = _after_attribute(line)
+                if not tail.strip() or tail.strip().startswith("//"):
+                    continue
             if inside:
                 collected.append(current)
             current, inside = [], False
@@ -2031,8 +2102,8 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # A doc comment is markdown, so an HTML comment hides a fence here too —
         # `rustdoc --test` reports no tests for one. Same step as the page
         # scanner rather than a second copy of it.
-        skip, in_html_comment, code_span = _html_comment_step(
-            doc.group(1), in_html_comment, open_char is not None, list_col, code_span
+        skip, in_html_comment = _html_comment_step(
+            doc.group(1), in_html_comment, open_char is not None, list_col
         )
         if skip:
             continue
@@ -2042,7 +2113,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 list_col = col
             elif doc.group(1).strip() and _indent_width(doc.group(1)) == 0:
                 list_col = 0
-        body = _fence_body(doc.group(1), list_col)
+        body = _fence_body(doc.group(1), list_col, open_char is not None)
         fence = _fence_at(body, list_col)
         handled = False
         if fence:
@@ -2834,6 +2905,41 @@ def self_test():
     check(
         "rustdoc: an unknown fence attribute is not Rust",
         scan_text('//! ```custom\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [],
+    )
+    # An unmatched backtick is ordinary text, so it must not mask a real
+    # comment opener and expose the hidden fence beneath it.
+    check(
+        "markdown: a stray backtick does not mask a comment opener",
+        scan_text(
+            'Prose with a stray ` here\n<!--\n```rust\n'
+            '#[secured(policy = "x")]\n```\n-->\n',
+            ".md",
+        ),
+        [],
+    )
+    # A backtick fence's info string may not contain a backtick.
+    check(
+        "markdown: backticks in the info string mean it is not a fence",
+        scan_text('```rust `example`\n#[secured(policy = "x")]\n```\n', ".md"),
+        [],
+    )
+    # Inside a fence a line beginning `- ` is code, not a list item.
+    check(
+        "markdown: a list-shaped line inside a fence is content",
+        scan_text(
+            '```rust\nlet s = r#"\n- ```\n"#;\n#[secured(policy = "x")]\n```\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    # An attribute sharing its line with an ITEM ends the doc comment.
+    check(
+        "rustdoc: an item sharing the attribute's line ends the fence",
+        scan_text(
+            '/// ```\n#[allow(dead_code)] pub fn a() {}\n'
+            '/// #[secured(policy = "x")]\npub fn b() {}\n',
+            ".rs",
+        ),
         [],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
