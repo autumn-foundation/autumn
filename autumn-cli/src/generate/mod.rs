@@ -498,8 +498,7 @@ pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<()
 mod tests {
     use super::*;
 
-    /// Fail if `sql` carries a spelling that does not belong in `SQLite` DDL,
-    /// ignoring `--` comments (which discuss both dialects).
+    /// The first spelling in `sql` that does not belong in `SQLite` DDL, if any.
     ///
     /// The type names are the silent half of the problem: `SQLite` parses an
     /// unknown type rather than rejecting it, so only a scan catches them. That
@@ -517,9 +516,10 @@ mod tests {
     /// as `INTEGER`, so it reads back without drift (see `counter_cache`, which
     /// emits it on both backends on purpose).
     ///
-    /// Matched on word boundaries, not as bare substrings: a column legitimately
-    /// named `serial_number` must not trip the `SERIAL` entry.
-    fn assert_no_postgres_only_sql(label: &str, dir: &std::path::Path, sql: &str) {
+    /// `--` comments are ignored wherever they start on a line, since they
+    /// discuss both dialects. Matches on word boundaries rather than bare
+    /// substrings, so a column named `serial_number` does not trip `SERIAL`.
+    fn postgres_only_leak(sql: &str) -> Option<&'static str> {
         const NOT_SQLITE: &[&str] = &[
             "BIGSERIAL",
             "SERIAL",
@@ -536,15 +536,67 @@ mod tests {
         ];
         let statements = sql
             .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
+            .map(|line| line.split("--").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n")
             .to_uppercase();
-        for token in NOT_SQLITE {
+        NOT_SQLITE
+            .iter()
+            .copied()
+            .find(|token| contains_word(&statements, token))
+    }
+
+    /// The ban list rejects what it exists for and tolerates what it must.
+    ///
+    /// Without this, [`postgres_only_leak`]'s list could be trimmed to nothing
+    /// and every caller would still pass.
+    #[test]
+    fn postgres_only_leak_flags_leaks_and_spares_lookalikes() {
+        for bad in [
+            "id BIGSERIAL PRIMARY KEY",
+            "id SERIAL PRIMARY KEY",
+            "at TIMESTAMPTZ NOT NULL",
+            "at TIMESTAMP NOT NULL",
+            "meta JSONB NOT NULL",
+            "blob BYTEA",
+            "x DOUBLE PRECISION",
+            "at TEXT NOT NULL DEFAULT NOW()",
+            "id TEXT DEFAULT gen_random_uuid()",
+            "CREATE INDEX i ON t USING GIN (v)",
+        ] {
             assert!(
-                !contains_word(&statements, token),
-                "`generate {label}` leaked `{token}`, which is not valid SQLite DDL, \
-                 into the SQLite migration at {}:\n{sql}",
+                postgres_only_leak(bad).is_some(),
+                "must be flagged as non-SQLite: {bad}"
+            );
+        }
+        for good in [
+            // Word-boundary cases: identifiers that merely CONTAIN a banned word.
+            "serial_number TEXT NOT NULL",
+            "bigserial_legacy_id INTEGER",
+            "timestamp_source TEXT",
+            // Affinity-equivalent, deliberately allowed.
+            "comment_count BIGINT NOT NULL DEFAULT 0",
+            // The dialect we actually want.
+            "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            // Comments discuss both dialects, wherever they start on the line.
+            "-- was BIGSERIAL and DEFAULT NOW() on Postgres",
+            "id INTEGER PRIMARY KEY, -- BIGSERIAL on Postgres",
+        ] {
+            assert_eq!(
+                postgres_only_leak(good),
+                None,
+                "must be accepted as valid SQLite DDL: {good}"
+            );
+        }
+    }
+
+    /// Fail if `sql` carries a spelling that does not belong in `SQLite` DDL.
+    fn assert_no_postgres_only_sql(label: &str, dir: &std::path::Path, sql: &str) {
+        if let Some(token) = postgres_only_leak(sql) {
+            panic!(
+                "`generate {label}` leaked `{token}`, which is not valid SQLite DDL, into \
+                 the SQLite migration at {}:\n{sql}",
                 dir.display()
             );
         }
@@ -701,6 +753,7 @@ mod tests {
         }
         for dir in dirs.iter().rev() {
             let down = std::fs::read_to_string(dir.join("down.sql")).unwrap();
+            assert_no_postgres_only_sql(label, dir, &down);
             conn.batch_execute(&down).unwrap_or_else(|e| {
                 panic!(
                     "`generate {label}` emitted down.sql that SQLite refuses ({}): {e}\n{down}",
@@ -740,6 +793,19 @@ mod tests {
     #[test]
     fn hand_written_ddl_generators_emit_applicable_sqlite_ddl() {
         const TS: &str = "20260101000000";
+
+        // The roster is the audit's scope, so losing an entry must not be
+        // silent — deleting one below fails the equality further down rather
+        // than quietly shrinking what gets checked. Adding a generator that
+        // emits its own migration means adding it to BOTH lists.
+        const AUDITED: &[&str] = &[
+            "auth",
+            "mailer --list-unsubscribe",
+            "notifications",
+            "pwa",
+            "teams",
+            "model … comments:commentable",
+        ];
 
         type Planner = fn(&std::path::Path) -> Result<crate::generate::emit::Plan, GenerateError>;
 
@@ -782,6 +848,15 @@ mod tests {
                 )
             }),
         ];
+
+        assert_eq!(
+            generators
+                .iter()
+                .map(|(label, _)| *label)
+                .collect::<Vec<_>>(),
+            AUDITED,
+            "the audited-generator roster changed; update AUDITED alongside it"
+        );
 
         for (label, plan) in generators {
             temp_env::with_vars(

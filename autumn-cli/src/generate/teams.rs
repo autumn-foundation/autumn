@@ -3257,10 +3257,30 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         )
         .expect("insert an invitation");
 
+        assert_sqlite_constraints_bite(&mut conn);
+
+        // `down.sql` is dialect-neutral, but it has to actually undo this.
+        conn.batch_execute(MIGRATION_DOWN)
+            .expect("down.sql must roll the SQLite migration back");
+        assert!(
+            run(&mut conn, "SELECT 1 FROM organizations").is_err(),
+            "down.sql must drop the tables"
+        );
+    }
+
+    /// Every constraint the `teams` DDL carries must actually bite on `SQLite`,
+    /// not merely parse. Split out of the round-trip test to keep it readable.
+    fn assert_sqlite_constraints_bite(conn: &mut diesel::SqliteConnection) {
+        use diesel::prelude::*;
+
+        let run = |conn: &mut diesel::SqliteConnection, sql: &str| {
+            diesel::sql_query(sql.to_owned()).execute(conn)
+        };
+
         // The `role` CHECK is enforced, not decorative.
         assert!(
             run(
-                &mut conn,
+                conn,
                 "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 8, 'wizard')",
             )
             .is_err(),
@@ -3269,7 +3289,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         // The `status` CHECK likewise.
         assert!(
             run(
-                &mut conn,
+                conn,
                 "INSERT INTO invitations (tenant_id, email, role, token_hash, status, \
                  invited_by_user_id, expires_at) VALUES ('1', 'c@b.test', 'member', 'h9', \
                  'mailed', 7, '2030-01-01 00:00:00')",
@@ -3277,10 +3297,22 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             .is_err(),
             "the status CHECK must reject an out-of-enum status on SQLite"
         );
+        // `token_hash … UNIQUE` is what stops an invitation token being
+        // replayed onto a second row.
+        assert!(
+            run(
+                conn,
+                "INSERT INTO invitations (tenant_id, email, role, token_hash, \
+                 invited_by_user_id, expires_at) VALUES ('2', 'd@b.test', 'member', 'h1', 7, \
+                 '2030-01-01 00:00:00')",
+            )
+            .is_err(),
+            "the token_hash UNIQUE must reject a reused token, even in another tenant"
+        );
         // The double-click idempotency backstop on (tenant_id, user_id).
         assert!(
             run(
-                &mut conn,
+                conn,
                 "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 7, 'member')",
             )
             .is_err(),
@@ -3291,7 +3323,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         // both the uniqueness AND the `WHERE status = 'pending'` predicate.
         assert!(
             run(
-                &mut conn,
+                conn,
                 "INSERT INTO invitations (tenant_id, email, role, token_hash, \
                  invited_by_user_id, expires_at) VALUES ('1', 'a@b.test', 'member', 'h2', 7, \
                  '2030-01-01 00:00:00')",
@@ -3300,24 +3332,16 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             "the partial unique index must reject a second PENDING invite for one invitee"
         );
         run(
-            &mut conn,
+            conn,
             "UPDATE invitations SET status = 'revoked' WHERE token_hash = 'h1'",
         )
         .expect("revoke the first invitation");
         run(
-            &mut conn,
+            conn,
             "INSERT INTO invitations (tenant_id, email, role, token_hash, invited_by_user_id, \
              expires_at) VALUES ('1', 'a@b.test', 'member', 'h3', 7, '2030-01-01 00:00:00')",
         )
         .expect("once the first invite is revoked the partial index must let a new one in");
-
-        // `down.sql` is dialect-neutral, but it has to actually undo this.
-        conn.batch_execute(MIGRATION_DOWN)
-            .expect("down.sql must roll the SQLite migration back");
-        assert!(
-            run(&mut conn, "SELECT 1 FROM organizations").is_err(),
-            "down.sql must drop the tables"
-        );
     }
 
     /// The Postgres SQL is unchanged by the `SQLite` fork (issue #1927):
@@ -3434,6 +3458,29 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
                 assert!(cargo.contains("pq-sys"), "{cargo}");
                 assert!(cargo.contains("\"postgres\""), "{cargo}");
                 assert!(!cargo.contains("libsqlite3-sys"), "{cargo}");
+                assert!(
+                    !autumn_web_entry(&cargo).contains("sqlite"),
+                    "a Postgres app must not get autumn-web's `sqlite` feature: {cargo}"
+                );
+
+                // And the migration itself: without this, `plan_teams` could
+                // stop consulting `detect_backend` altogether — hard-coding
+                // `Sqlite` — and every other test would still pass, handing
+                // every Postgres app SQLite DDL.
+                let up = fs::read_to_string(
+                    tmp.path()
+                        .join("migrations/20260101000000_create_teams/up.sql"),
+                )
+                .unwrap();
+                assert!(up.contains("id         BIGSERIAL PRIMARY KEY"), "{up}");
+                assert!(
+                    up.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+                    "{up}"
+                );
+                assert!(
+                    !up.contains("AUTOINCREMENT") && !up.contains("CURRENT_TIMESTAMP"),
+                    "a Postgres app must not get SQLite DDL: {up}"
+                );
             },
         );
     }
