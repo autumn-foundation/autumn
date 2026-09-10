@@ -1,5 +1,12 @@
 //! Tests for dunning: the retry job reads the schedule row, claims one
 //! attempt at a time, and a restart re-arms from the store.
+//!
+//! `TestApp::build` starts an in-process worker that also runs due jobs, so
+//! `perform_enqueued_jobs` can run a job the worker already ran. That is
+//! safe: every write after the claim is a compare-and-set on the row's state
+//! and attempt, so the second run finds the row settled and makes no
+//! provider call. Assert through the row and the provider's recorded calls,
+//! never through raw run counts.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +26,8 @@ use autumn_web::time::TickingClock;
 
 use super::support::{
     self, DynHarness, FailingStore, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE,
-    apply_event, at, event, harness_dyn, harness_with_hooks, notification_kinds,
-    notification_routes,
+    RecordingHooks, apply_event, at, event, harness_dyn, harness_with_hooks, notification_kinds,
+    notification_routes, wait_until,
 };
 
 const RECIPIENT: i64 = 42;
@@ -239,13 +246,27 @@ async fn already_paid_recovers_too() {
 
 #[tokio::test]
 async fn exhaustion_marks_unpaid_and_cancels_once() {
-    let h = standard_harness().await;
+    let hooks = RecordingHooks::with_recipient(RECIPIENT);
+    let h = harness_with_hooks(
+        support::config(),
+        hooks.clone(),
+        MemoryBillingStore::shared(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        clocked,
+    );
+    seed_failed_invoice(&h.client, h.store.as_ref()).await;
     // Three retries: 1h, 2h, 3h. Every one is declined.
     for delay in [3601, 7200, 10_800] {
         h.client.advance_clock(Duration::from_secs(delay));
         perform_ok(&h).await;
     }
     assert_eq!(h.provider.retry_calls(), 3);
+    let exhausted: Vec<String> = hooks
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("dunning_exhausted"))
+        .collect();
+    assert_eq!(exhausted, ["dunning_exhausted:3"]);
     assert_eq!(row(&h).await.state, DunningState::Exhausted);
     assert_eq!(subscription(&h).await.status, SubscriptionStatus::Unpaid);
     assert_eq!(h.provider.cancel_calls(), 1);
@@ -268,6 +289,14 @@ async fn exhaustion_marks_unpaid_and_cancels_once() {
     perform_ok(&h).await;
     assert_eq!(h.provider.retry_calls(), 3);
     assert_eq!(h.provider.cancel_calls(), 1);
+    assert_eq!(
+        hooks
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("dunning_exhausted"))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -472,25 +501,6 @@ async fn settle_after_reconcile_closed_the_row_is_a_no_op() {
     );
 }
 
-/// Poll `check` every 25 ms for up to five seconds.
-async fn wait_for<F, Fut>(check: F)
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if check().await {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "condition not met within five seconds"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 #[tokio::test]
 async fn restart_re_arms_pending_rows() {
     let store = MemoryBillingStore::shared();
@@ -507,7 +517,7 @@ async fn restart_re_arms_pending_rows() {
         provider.clone(),
         clocked,
     );
-    wait_for(|| async {
+    wait_until(support::RESTART_TIMEOUT, || async {
         app_b
             .client
             .enqueued_jobs()
@@ -556,7 +566,7 @@ async fn restart_reclaims_an_abandoned_running_row_and_runs_it() {
     );
     // Re-armed at max(next_attempt_at, updated_at + RUNNING_STALE_AFTER),
     // which is due: the worker reclaims it and runs it at once.
-    wait_for(|| async {
+    wait_until(support::RESTART_TIMEOUT, || async {
         store
             .dunning_by_invoice(&invoice_id)
             .await
@@ -599,7 +609,7 @@ async fn restart_does_not_reset_a_fresh_running_row() {
         provider.clone(),
         clocked,
     );
-    wait_for(|| async {
+    wait_until(support::RESTART_TIMEOUT, || async {
         app_b
             .client
             .enqueued_jobs()
@@ -617,4 +627,53 @@ async fn restart_does_not_reset_a_fresh_running_row() {
     assert_eq!(row.state, DunningState::Running);
     assert_eq!(row.updated_at, at(-100));
     drop(app_b);
+}
+
+#[tokio::test]
+async fn second_process_does_not_double_retry() {
+    let store = MemoryBillingStore::shared();
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    let app_a = dunning_harness(support::config(), store.clone(), provider.clone()).await;
+    let invoice_id = invoice(&app_a).await.id;
+    // A second instance on the same store re-arms the same row.
+    let app_b = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        store.clone(),
+        provider.clone(),
+        clocked,
+    );
+    wait_until(support::RESTART_TIMEOUT, || async {
+        app_b
+            .client
+            .enqueued_jobs()
+            .iter()
+            .any(|j| j.name == RETRY_JOB_NAME && j.payload["invoice_id"] == invoice_id)
+    })
+    .await;
+
+    // Both clocks pass the due time and both instances run their queue.
+    app_a.client.advance_clock(Duration::from_secs(3601));
+    app_b.client.advance_clock(Duration::from_secs(3601));
+    let (ran_a, ran_b) = tokio::join!(
+        app_a.client.perform_enqueued_jobs(),
+        app_b.client.perform_enqueued_jobs(),
+    );
+    ran_a.assert_all_succeeded();
+    ran_b.assert_all_succeeded();
+
+    // One claim wins; the other run sees the row taken and skips.
+    assert_eq!(provider.retry_calls(), 1);
+    let row = store
+        .dunning_by_invoice(&invoice_id)
+        .await
+        .unwrap()
+        .expect("dunning row");
+    assert_eq!(row.attempt, 2);
+    assert_eq!(row.state, DunningState::Pending);
+    assert_eq!(row.next_attempt_at, at(3601 + 7200));
+    // A later run on either instance is early for attempt 2: still one call.
+    perform_ok(&app_a).await;
+    perform_ok(&app_b).await;
+    assert_eq!(provider.retry_calls(), 1);
 }

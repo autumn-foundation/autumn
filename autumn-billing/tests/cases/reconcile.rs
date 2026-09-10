@@ -1,24 +1,23 @@
 //! Tests for reconcile: one event applied once, ordering, customer linking,
 //! dunning open/close and notifications.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_billing::dunning::RETRY_JOB_NAME;
 use autumn_billing::event::{InvoiceSnapshot, SubscriptionSnapshot};
-use autumn_billing::hooks::HookFuture;
 use autumn_billing::model::{DunningAttempt, DunningState, Invoice, Subscription};
 use autumn_billing::store::CustomerUpsert;
 use autumn_billing::{
-    BillingEventKind, BillingHooks, BillingStore, Currency, DunningPolicy, InvoiceStatus,
-    MemoryBillingStore, Money, PlanId, ProviderId, ReconcileOutcome, SubscriptionStatus,
+    BillingEventKind, BillingStore, Currency, DunningPolicy, InvoiceStatus, MemoryBillingStore,
+    Money, PlanId, ProviderId, ReconcileOutcome, SubscriptionStatus,
 };
 use autumn_web::time::TickingClock;
 use serde_json::json;
 
 use super::support::{
-    self, FailingStore, FakeParser, FakeProvider, Harness, PRO_PRICE, apply_event, at,
-    checkout_kind, event, harness, harness_dyn, harness_with_hooks, notification_kinds,
+    self, FailingStore, FakeParser, FakeProvider, Harness, PRO_PRICE, RecordingHooks, apply_event,
+    at, checkout_kind, event, harness, harness_dyn, harness_with_hooks, notification_kinds,
     notification_routes, notifications_for, post_webhook,
 };
 
@@ -596,55 +595,9 @@ async fn dunning_disabled_notifies_without_a_job() {
     assert_eq!(notes[0].kind, "billing.payment_failed");
 }
 
-/// Hooks that record every callback.
-#[derive(Default)]
-struct RecordingHooks {
-    calls: Mutex<Vec<String>>,
-    recipient: Option<i64>,
-}
-
-impl BillingHooks for RecordingHooks {
-    fn recipient_for(&self, _user_id: &str) -> Option<i64> {
-        self.recipient
-    }
-
-    fn on_subscription_changed<'a>(
-        &'a self,
-        subscription: &'a Subscription,
-        previous: Option<&'a Subscription>,
-    ) -> HookFuture<'a> {
-        self.calls.lock().unwrap().push(format!(
-            "subscription_changed:{}:{}",
-            subscription.status.as_str(),
-            previous.map_or("none", |p| p.status.as_str())
-        ));
-        Box::pin(async {})
-    }
-
-    fn on_payment_failed<'a>(
-        &'a self,
-        _invoice: &'a Invoice,
-        dunning: &'a DunningAttempt,
-    ) -> HookFuture<'a> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("payment_failed:{}", dunning.attempt));
-        Box::pin(async {})
-    }
-
-    fn on_payment_recovered<'a>(&'a self, _invoice: &'a Invoice) -> HookFuture<'a> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push("payment_recovered".to_owned());
-        Box::pin(async {})
-    }
-}
-
 #[tokio::test]
 async fn hooks_fire_and_a_missing_recipient_skips_notifications() {
-    let hooks = Arc::new(RecordingHooks::default());
+    let hooks = RecordingHooks::new();
     let h = harness_with_hooks(
         support::config(),
         hooks.clone(),
@@ -686,7 +639,7 @@ async fn hooks_fire_and_a_missing_recipient_skips_notifications() {
         .await
         .unwrap();
     assert_eq!(
-        *hooks.calls.lock().unwrap(),
+        hooks.calls(),
         [
             "subscription_changed:trialing:none",
             "subscription_changed:active:trialing",
@@ -697,4 +650,60 @@ async fn hooks_fire_and_a_missing_recipient_skips_notifications() {
     // `recipient_for` returned `None`: nothing stored, nothing failed.
     assert!(notifications_for(&h.client, RECIPIENT).await.is_empty());
     assert_eq!(dunning(&h).await.unwrap().state, DunningState::Recovered);
+}
+
+#[tokio::test]
+async fn failed_apply_releases_claim_so_redelivery_applies() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let h = harness_dyn(
+        support::config(),
+        store.clone(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        |app| {
+            app.with_clock(TickingClock::starting_at(support::base_time()))
+                .routes(notification_routes())
+        },
+    );
+    h.store
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
+                .with_user(USER)
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    let body = serde_json::to_vec(&event(
+        "evt_sub",
+        at(100),
+        sub_changed(SubscriptionStatus::Active),
+    ))
+    .unwrap();
+
+    // The first delivery claims the event, then the mirror write fails.
+    store.fail_on("upsert_subscription", 1);
+    let first = post_webhook(&h.client, &body).await;
+    assert_eq!(first.status.as_u16(), 500, "{}", first.text());
+    assert_eq!(h.store.applied_event_count().await.unwrap(), 0);
+    assert!(
+        inner
+            .subscription_by_provider_id(&ProviderId::new("sub_1"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The redelivery of the same event id takes the released claim.
+    let second = post_webhook(&h.client, &body).await;
+    assert_eq!(second.status.as_u16(), 200, "{}", second.text());
+    assert_eq!(second.json::<serde_json::Value>()["outcome"], "applied");
+    assert_eq!(h.store.applied_event_count().await.unwrap(), 1);
+    assert_eq!(store.calls("upsert_subscription"), 2);
+    let sub = inner
+        .subscription_by_provider_id(&ProviderId::new("sub_1"))
+        .await
+        .unwrap()
+        .expect("mirror row");
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.plan_id, Some(PlanId::new("pro")));
 }

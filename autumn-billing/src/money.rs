@@ -553,4 +553,73 @@ mod tests {
             "float types are forbidden in autumn-billing: {offenders:?}"
         );
     }
+
+    /// The migrations store money as BIGINT minor units: no floating point
+    /// column type appears in any `migrations/**/*.sql` file.
+    #[test]
+    fn migrations_have_no_float_column_types() {
+        fn is_word_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_'
+        }
+
+        /// Case-insensitive, whole-word match of a SQL float type name.
+        /// A trailing digit is part of the type (`FLOAT4`, `FLOAT8`).
+        fn has_sql_float_type(text: &str) -> Option<usize> {
+            let upper = text.to_ascii_uppercase();
+            let bytes = upper.as_bytes();
+            for needle in ["REAL", "DOUBLE", "FLOAT"] {
+                let mut from = 0;
+                while let Some(pos) = upper[from..].find(needle) {
+                    let start = from + pos;
+                    let end = start + needle.len();
+                    let before = start.checked_sub(1).map(|i| bytes[i]);
+                    let after = bytes.get(end).copied();
+                    let continues = after.is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+                    if !before.is_some_and(is_word_byte) && !continues {
+                        return Some(upper[..start].lines().count());
+                    }
+                    from = end;
+                }
+            }
+            None
+        }
+
+        fn visit_sql(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read migrations dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    visit_sql(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "sql") {
+                    out.push(path);
+                }
+            }
+        }
+
+        assert_eq!(
+            has_sql_float_type("x BIGINT NOT NULL,\ny double precision"),
+            Some(2)
+        );
+        assert_eq!(has_sql_float_type("y Float4"), Some(1));
+        assert_eq!(has_sql_float_type("amount_real BIGINT, floaty TEXT"), None);
+
+        let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files = Vec::new();
+        visit_sql(&migrations, &mut files);
+        assert!(
+            !files.is_empty(),
+            "no migration files found under {}",
+            migrations.display()
+        );
+        let mut offenders = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("read migration file");
+            if let Some(line) = has_sql_float_type(&text) {
+                offenders.push(format!("{}:{line}", path.display()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "floating point column types are forbidden in autumn-billing migrations: {offenders:?}"
+        );
+    }
 }

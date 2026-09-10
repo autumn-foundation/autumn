@@ -773,3 +773,113 @@ pub fn harness_dyn(
         provider,
     }
 }
+
+// ── Test-gap round helpers ────────────────────────────────────────────────
+
+/// Poll `check` every 25 ms until it is `true`, for at most `timeout` of
+/// real time. The only place the suite waits on the wall clock: the job
+/// runtime and the startup re-arm run on their own tasks.
+pub async fn wait_until<F, Fut>(timeout: std::time::Duration, check: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if check().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not met within {timeout:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Real-clock budget for [`wait_until`] on a process restart.
+pub const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A Stripe fixture with `patch` applied to its JSON before serialization.
+pub fn fixture_with(name: &str, patch: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&fixture(name)).unwrap_or_else(|e| panic!("fixture {name}: {e}"));
+    patch(&mut json);
+    serde_json::to_vec(&json).expect("serialize fixture")
+}
+
+/// Hooks that record every callback as `"<name>:<detail>"`.
+#[derive(Default)]
+pub struct RecordingHooks {
+    calls: Mutex<Vec<String>>,
+    recipient: Option<i64>,
+}
+
+impl RecordingHooks {
+    /// Hooks whose `recipient_for` returns `None`: no notifications.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Hooks that route every notification to `recipient`.
+    pub fn with_recipient(recipient: i64) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            recipient: Some(recipient),
+        })
+    }
+
+    /// Every callback so far, in order.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+}
+
+impl BillingHooks for RecordingHooks {
+    fn recipient_for(&self, _user_id: &str) -> Option<i64> {
+        self.recipient
+    }
+
+    fn on_subscription_changed<'a>(
+        &'a self,
+        subscription: &'a Subscription,
+        previous: Option<&'a Subscription>,
+    ) -> autumn_billing::hooks::HookFuture<'a> {
+        self.record(format!(
+            "subscription_changed:{}:{}",
+            subscription.status.as_str(),
+            previous.map_or("none", |p| p.status.as_str())
+        ));
+        Box::pin(async {})
+    }
+
+    fn on_payment_failed<'a>(
+        &'a self,
+        _invoice: &'a autumn_billing::Invoice,
+        dunning: &'a autumn_billing::DunningAttempt,
+    ) -> autumn_billing::hooks::HookFuture<'a> {
+        self.record(format!("payment_failed:{}", dunning.attempt));
+        Box::pin(async {})
+    }
+
+    fn on_payment_recovered<'a>(
+        &'a self,
+        _invoice: &'a autumn_billing::Invoice,
+    ) -> autumn_billing::hooks::HookFuture<'a> {
+        self.record("payment_recovered".to_owned());
+        Box::pin(async {})
+    }
+
+    fn on_dunning_exhausted<'a>(
+        &'a self,
+        _invoice: &'a autumn_billing::Invoice,
+        dunning: &'a autumn_billing::DunningAttempt,
+    ) -> autumn_billing::hooks::HookFuture<'a> {
+        self.record(format!("dunning_exhausted:{}", dunning.attempt));
+        Box::pin(async {})
+    }
+}

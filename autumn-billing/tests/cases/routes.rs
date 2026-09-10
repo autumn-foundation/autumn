@@ -11,7 +11,11 @@ use autumn_web::time::FixedClock;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 
-use super::support::{self, FailingStore, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE};
+use autumn_web::config::AutumnConfig;
+
+use super::support::{
+    self, FailingStore, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE, fixture_with,
+};
 
 fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 10, 12, 0, 0).unwrap()
@@ -125,6 +129,18 @@ async fn checkout_after_a_canceled_subscription_is_allowed() {
         .send()
         .await
         .assert_status(303);
+    let checkouts: Vec<FakeCall> = h
+        .provider
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, FakeCall::CreateCheckout(_)))
+        .collect();
+    assert_eq!(checkouts.len(), 1, "{checkouts:?}");
+    let FakeCall::CreateCheckout(req) = &checkouts[0] else {
+        unreachable!()
+    };
+    assert_eq!(req.provider_customer_id, ProviderId::new("cus_seeded_7"));
+    assert_eq!(req.provider_price_id, ProviderId::new(PRO_PRICE));
 }
 
 #[tokio::test]
@@ -615,4 +631,112 @@ async fn boot_fails_when_declared_endpoint_preset_differs_from_provider() {
         message.contains("needs provider = ") && message.contains("stripe"),
         "{message}"
     );
+}
+
+#[tokio::test]
+async fn boot_fails_when_webhook_endpoint_is_undeclared() {
+    let billing = support::config();
+    let autumn = AutumnConfig::default();
+    assert!(autumn.security.webhooks.endpoints.is_empty());
+    let message = boot_panic_message(|| {
+        support::harness_with(
+            billing,
+            autumn,
+            MemoryBillingStore::shared(),
+            FakeProvider::new(),
+            pinned,
+        )
+    });
+    // The error prints the TOML entry to add.
+    assert!(
+        message.contains("no signed webhook endpoint is declared at /billing/webhook"),
+        "{message}"
+    );
+    assert!(
+        message.contains("[[security.webhooks.endpoints]]"),
+        "{message}"
+    );
+    assert!(
+        message.contains("path = ") && message.contains("/billing/webhook"),
+        "{message}"
+    );
+    assert!(
+        message.contains("provider = ") && message.contains("stripe"),
+        "{message}"
+    );
+    assert!(message.contains("_WEBHOOK_SECRET"), "{message}");
+}
+
+#[tokio::test]
+async fn boot_fails_in_production_with_a_test_key() {
+    let billing = production_config().stripe_secret_key(support::TEST_SECRET_KEY);
+    let autumn = support::autumn_config(&billing);
+    let message = boot_panic_message(|| {
+        let app = TestApp::new().config(autumn).profile("prod").plugin(
+            BillingPlugin::new()
+                .config(billing)
+                .plans(&support::catalog())
+                .provider(FakeProvider::new())
+                .store(MemoryBillingStore::shared()),
+        );
+        let client = pinned(app).build();
+        Harness {
+            client,
+            store: MemoryBillingStore::shared(),
+            provider: FakeProvider::new(),
+        }
+    });
+    assert!(message.contains("STRIPE_SECRET_KEY"), "{message}");
+    assert!(message.contains("sk_test_"), "{message}");
+    assert!(
+        !message.contains(support::TEST_SECRET_KEY),
+        "leaks the key: {message}"
+    );
+}
+
+#[tokio::test]
+async fn store_resolution_falls_back_to_memory() {
+    // No `.store(..)` and no database pool: the plugin boots on the memory
+    // mirror, and the routes read the same store the webhook writes.
+    let billing = support::config();
+    let provider = FakeProvider::new();
+    let app = TestApp::new()
+        .config(support::autumn_config(&billing))
+        .plugin(
+            BillingPlugin::new()
+                .config(billing)
+                .plans(&support::catalog())
+                .provider(provider.clone()),
+        );
+    let client = pinned(app).build();
+
+    client.acting_as("7").await;
+    client
+        .post("/billing/checkout")
+        .form("plan=pro")
+        .send()
+        .await
+        .assert_status(303);
+    let resp = client.get("/billing/subscription").send().await;
+    resp.assert_status(200);
+    assert_eq!(resp.json::<Value>()["subscription"], Value::Null);
+
+    let body = fixture_with("customer_subscription_created", |json| {
+        json["data"]["object"]["customer"] = Value::from("cus_fake_1");
+    });
+    let resp = support::post_webhook(&client, &body).await;
+    resp.assert_status(200);
+    assert_eq!(resp.json::<Value>()["outcome"], "applied");
+
+    let resp = client.get("/billing/subscription").send().await;
+    resp.assert_status(200);
+    let view: Value = resp.json();
+    assert_eq!(view["entitled"], true, "{view}");
+    assert_eq!(view["subscription"]["status"], "active");
+    assert_eq!(
+        view["subscription"]["provider_subscription_id"],
+        "sub_test_1"
+    );
+    let service = autumn_billing::BillingService::require(client.state()).expect("plugin started");
+    assert_eq!(service.store().applied_event_count().await.unwrap(), 1);
 }
