@@ -1651,6 +1651,80 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     return _judge_collected(rel, collected, accepted, judgeable, waived), fences
 
 
+DOC_ATTR = re.compile(r"^\s*#!?\[\s*doc\s*=\s*")
+
+
+def _doc_attr_text(line):
+    """The markdown in a `#[doc = "…"]` attribute, or None.
+
+    rustdoc renders and TESTS these exactly as it does `///`, so a fence in one
+    reaches docs.rs like any other. Only the literal forms are read — a
+    `#[doc = include_str!(…)]` names a file this scanner would have to resolve,
+    and that file is markdown the corpus walk already covers on its own.
+    """
+    m = DOC_ATTR.match(line)
+    if m is None:
+        return None
+    rest = line[m.end() :]
+    if rest[:1] == "r":
+        opened = re.match(r'r(#*)"', rest)
+        if opened is None:
+            return None
+        closer = '"' + "#" * len(opened.group(1))
+        end = rest.find(closer, opened.end())
+        # A raw literal that does not close on this line is a doc attribute
+        # spanning several source lines. Reading a partial one would invent
+        # markdown that is not there, so it is left as a documented miss —
+        # this scanner is line-based, and a wrong answer is worse than none.
+        if end == -1:
+            return None
+        return rest[opened.end() : end]
+    if rest[:1] != '"':
+        return None
+    end = skip_literal(rest, 0)
+    raw = rest[1 : end - 1]
+    out, i = [], 0
+    while i < len(raw):
+        if raw[i] == "\\" and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            out.append({"n": "\n", "t": "\t", "r": "\r"}.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(raw[i])
+        i += 1
+    return "".join(out)
+
+
+def _bracket_delta(text):
+    """Net bracket depth `text` adds, skipping literals and comments."""
+    depth, i = 0, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "/":
+            nxt = skip_comment(text, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch == "r" and text[i + 1 : i + 2] in ('"', "#"):
+            nxt = skip_raw_literal(text, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch == '"':
+            i = skip_literal(text, i)
+            continue
+        if ch == "'":
+            nxt = _skip_rust_char(text, i)
+            i = nxt if nxt is not None else i + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        i += 1
+    return depth
+
+
 def _block_doc_split(text, depth):
     """`(doc text on this line, depth after it)` inside a block doc comment.
 
@@ -1685,8 +1759,20 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
-    in_block_doc = 0
+    in_block_doc, attr_depth = 0, 0
+    # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
+    # equivalent to, so every rule below — fences, block quotes, indentation,
+    # list columns — applies to it without a second implementation. The source
+    # line number is kept, so a defect still points at the attribute.
+    stream = []
     for lineno, line in enumerate(lines, 1):
+        text = _doc_attr_text(line)
+        if text is None:
+            stream.append((lineno, line))
+            continue
+        for md in text.split("\n"):
+            stream.append((lineno, "/// " + md))
+    for lineno, line in stream:
         # `/** … */` and `/*! … */` are doc comments too, and `rustdoc --test`
         # collects and runs their fences exactly as it does `///`'s. Only the
         # line forms were recognised, so a whole legitimate doc form was
@@ -1707,7 +1793,13 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         if doc_text is not None:
             doc = re.match(r"(.*)", doc_text, re.S)
         else:
-            doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
+            # `////` is an ordinary comment, not a doc comment — rustdoc drops
+            # it while concatenating the `///` lines around it. Matching it as
+            # doc content injected a line into the fenced code that the
+            # doctest never sees, which failed the gate on documentation
+            # rustdoc itself compiles clean. Verified by putting invalid Rust
+            # on a `////` line and watching `rustdoc --test` still pass.
+            doc = re.match(r"^\s*(?://!|///(?!/))\s?(.*)$", line)
         if not doc:
             # A blank line or an ordinary comment between two doc lines does
             # not break the doc comment: rustdoc concatenates the attributes
@@ -1723,8 +1815,18 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             # is not an item, so `/// ```rust`, `#[allow(dead_code)]`,
             # `/// …` all still attach to the one item below, and
             # `rustdoc --test` collects and runs the fence across it.
+            # An attribute can span lines, and only its first one starts with
+            # `#`. Its continuation lines were reaching the reset below and
+            # ending the fence — the previous commit handled the one-line form
+            # and stopped there.
             bare = line.strip()
-            if not bare or bare.startswith("//") or bare.startswith("#"):
+            if attr_depth > 0:
+                attr_depth = max(0, attr_depth + _bracket_delta(line))
+                continue
+            if not bare or bare.startswith("//"):
+                continue
+            if bare.startswith("#"):
+                attr_depth = max(0, _bracket_delta(line))
                 continue
             if inside:
                 collected.append(current)
@@ -2326,6 +2428,52 @@ def self_test():
             ".md",
         ),
         [("secured", "policy")],
+    )
+    # `////` is an ordinary comment. rustdoc drops it while concatenating the
+    # `///` lines around it, so its contents are not part of the doctest.
+    check(
+        "rustdoc: a four-slash comment is not doc content",
+        scan_text(
+            '//! ```\n//// #[secured(policy = "x")]\n//! let x = 1;\n//! ```\n', ".rs"
+        ),
+        [],
+    )
+    check(
+        "rustdoc: three slashes are still doc content",
+        scan_text('//! ```\n/// #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [("secured", "policy")],
+    )
+    # An attribute can span lines, and only its first starts with `#`.
+    check(
+        "rustdoc: a fence survives a multi-line outer attribute",
+        scan_text(
+            '/// ```\n#[cfg(\n    feature = "x"\n)]\n/// #[secured(policy = "x")]\n'
+            '/// ```\npub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # `#[doc = "…"]` is rendered and TESTED by rustdoc exactly as `///` is.
+    check(
+        "rustdoc: a doc attribute is scanned",
+        scan_text(
+            '#[doc = "```\\n#[secured(policy = \\"x\\")]\\n```"]\npub fn f() {}\n', ".rs"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a raw doc attribute is scanned",
+        scan_text(
+            '#[doc = r"```"]\n#[doc = r#"#[secured(policy = "x")]"#]\n'
+            '#[doc = r"```"]\npub fn h() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an unclosed raw doc attribute invents nothing",
+        scan_text('#[doc = r"```\nunclosed\n"]\npub fn i() {}\n', ".rs"),
+        [],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
     check(
