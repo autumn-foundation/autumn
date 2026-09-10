@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`autumn-billing` plugin (#1190):** first-party subscription billing for
+  Stripe. One `.plugin(BillingPlugin::new().config(cfg).plans(&plans))` mounts
+  hosted checkout (`POST /billing/checkout`), the customer portal
+  (`POST /billing/portal`), a read-only `GET /billing/subscription`, and a
+  `POST /billing/webhook` receiver built on `SignedWebhook`. Provider events
+  are reconciled into a local mirror (`billing_customers`,
+  `billing_subscriptions`, `billing_invoices`) through an event ledger, so a
+  redelivered event applies once and out-of-order events converge (an older
+  event never overwrites newer state; a canceled subscription is terminal).
+  `Entitled<R: PlanRequirement>` and `Billing::require` gate handlers on
+  local state, default-deny. Failed payments open a durable dunning schedule
+  (`billing_dunning`) driven by a `#[job]`; the schedule row is the source of
+  truth, so the job survives a restart and re-arms on startup, and every step
+  notifies through the in-app notification store (#1148). Money is
+  `Money { minor: i64, currency }` with an exact `Decimal` bridge; no floats.
+  The `BillingProvider` trait hides Stripe types so a second provider can
+  land without a breaking change.
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the

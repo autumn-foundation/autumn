@@ -156,6 +156,10 @@ REQUEST_PATH_MODULES=(
   autumn/src/replication/status.rs:db
   autumn/src/replication/s3.rs:http-client
   autumn/src/sigv4.rs:default
+  autumn-billing/src/money.rs:default
+  autumn-billing/src/reconcile.rs:default
+  autumn-billing/src/gate.rs:default
+  autumn-billing/src/routes.rs:default
 )
 
 # The manifest may grow, never shrink. Deleting a gated module is a deliberate
@@ -163,7 +167,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=65
+MODULE_COUNT_FLOOR=69
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny
@@ -191,7 +195,7 @@ GATE_FEATURE_EXEMPT=(${FEATURE_LINT_EXEMPT[@]+"${FEATURE_LINT_EXEMPT[@]}"})
 # path is a hole, so the sibling framework crates are swept too. `autumn-cli`
 # (an operator tool) and `autumn-macros` (compile-time proc-macro internals) are
 # deliberately EXEMPT and absent here.
-SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src"
+SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src,autumn-billing/src"
 
 # Read-only inputs for the feature-reachability check.
 CI_WORKFLOW=".github/workflows/ci.yml"

@@ -109,6 +109,7 @@ after checking this table and `docs/guide/`.
 | S3 storage plugin crate | `autumn-storage-s3` |
 | Redis cache plugin crate | `autumn-cache-redis` |
 | Search plugin crate | `autumn-search` |
+| Billing plugin crate | `autumn-billing` |
 | Main entry macro | `#[autumn_web::main]`, not `#[autumn::main]` |
 
 The name `autumn` is the CLI binary, not the framework crate. In code, import
@@ -1721,8 +1722,8 @@ autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
 autumn plugin add autumn-cache-redis --dry-run
 ```
 
-`list` covers the five first-party crates (`autumn-admin-plugin`,
-`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`list` covers the six first-party crates (`autumn-admin-plugin`,
+`autumn-billing`, `autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
 `autumn-storage-s3`) plus community crates found on crates.io under the
 documented `autumn-plugin-<name>` convention.
 
