@@ -807,7 +807,6 @@ WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([A-Za-z_0-9]+)")
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 
 
-BARE_FLAG = re.compile(r"^[a-z_][a-z_0-9]*$")
 # The name to the LEFT of an `=` is a key whatever its case, and no Autumn
 # macro has an upper-case one, so `#[secured(Scopes = ["a:b"])]` is a defect
 # the lower-case pattern above let through. That pattern cannot simply be
@@ -817,7 +816,22 @@ BARE_FLAG = re.compile(r"^[a-z_][a-z_0-9]*$")
 # corpus documents throughout — trading a miss for a false positive on valid
 # pages. Only the key position is case-blind; a bare identifier still has to
 # look like a flag to be judged as one.
-KEY_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Rust identifiers are Unicode (XID), not ASCII, so `polícy` is a real key a
+# reader can write and the macro really does reject. Python's `\w` is
+# Unicode-aware, and `[^\W\d]` is "a word character that is not a digit" — an
+# identifier start.
+KEY_IDENT = re.compile(r"^[^\W\d]\w*$", re.UNICODE)
+
+
+def _is_bare_flag(name):
+    """Whether `name` reads as a bare flag rather than a positional type.
+
+    The key position is case-blind, but this one cannot be: it is what keeps
+    `#[repository(Post, api, mcp)]`'s leading TYPE from being reported. The
+    test is on the first character rather than an ASCII range, so it holds for
+    a non-ASCII identifier too.
+    """
+    return bool(KEY_IDENT.match(name)) and not name[0].isupper()
 
 
 def _plain_ident(name):
@@ -946,7 +960,7 @@ def top_level_keys(args, macro=None):
             head = _plain_ident(head)
             if KEY_IDENT.match(head):
                 names.append((head, False))
-        elif BARE_FLAG.match(_plain_ident(segment)):
+        elif _is_bare_flag(_plain_ident(segment)):
             leading, first = first, False
             if leading and macro in POSITIONAL_FIRST_IDENT:
                 continue  # the action verb, not a flag
@@ -1706,7 +1720,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len, list_col = None, 0, 0
+    open_char, open_len, list_col, fence_quoted = None, 0, 0, False
     in_html_comment = False
     # Code spans are resolved for the whole file up front rather than carried
     # line by line: only a run with a matching close is a span, and that cannot
@@ -1740,6 +1754,17 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
         # one, and without stripping the CommonMark `>` prefix the scanner
         # never entered the fence at all.
+        # A fence opened inside a block quote belongs to that quote, so a line
+        # that is not part of the quote ends BOTH. Removing the prefix without
+        # tracking membership left the fence open across the break and judged
+        # the prose after it as Rust. `rustdoc --test` shows the truth plainly:
+        # the quoted fences collect as two EMPTY doctests, so the unprefixed
+        # line between them was never code.
+        if open_char is not None and fence_quoted and not BLOCKQUOTE.match(line):
+            if inside:
+                collected.append(current)
+                current = []
+            inside, open_char, open_len = False, None, 0
         body = _fence_body(line, list_col, open_char is not None)
         fence = _fence_at(body, list_col)
         handled = False
@@ -1751,6 +1776,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
                 # a fence; treating the inner delimiter as live structure made
                 # the displayed attribute fail the gate.
                 open_char, open_len = char, length
+                fence_quoted = BLOCKQUOTE.match(line) is not None
                 inside = _fence_lang(suffix) == "rust"
                 if inside:
                     fences += 1
@@ -1779,6 +1805,12 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
 
 
 DOC_ATTR = re.compile(r"^\s*#!?\[\s*doc\s*=\s*")
+# `#[cfg_attr(doc, doc = "…")]` is documentation too: rustdoc builds with
+# `cfg(doc)` on, so it renders and TESTS the fence inside. The predicate is not
+# inspected — whatever it is, if the attribute can supply docs under some
+# configuration, a reader can reach that page.
+CFG_ATTR_DOC = re.compile(r"^\s*#!?\[\s*cfg_attr\s*\(")
+DOC_ITEM = re.compile(r"^\s*doc\s*=\s*")
 
 
 def _doc_attr_text(line):
@@ -1821,16 +1853,43 @@ def _doc_attr_at(lines, idx):
     left the rest to be scanned as Rust source, so such an attribute went
     unread. Lines are joined until the literal closes.
     """
-    if DOC_ATTR.match(lines[idx]) is None:
+    conditional = DOC_ATTR.match(lines[idx]) is None
+    if conditional and CFG_ATTR_DOC.match(lines[idx]) is None:
         return None, 1
     joined = lines[idx]
     for end in range(idx, min(idx + _DOC_ATTR_MAX_LINES, len(lines))):
         if end > idx:
             joined += "\n" + lines[end]
-        text = _doc_attr_text(joined)
+        text = (
+            _cfg_attr_doc_text(joined) if conditional else _doc_attr_text(joined)
+        )
         if text is not None:
             return text, end - idx + 1
     return None, 1
+
+
+def _cfg_attr_doc_text(text):
+    """The markdown a `#[cfg_attr(…, doc = "…")]` supplies, or None.
+
+    One attribute may carry several `doc =` items; they are joined in order,
+    exactly as rustdoc concatenates them.
+    """
+    m = CFG_ATTR_DOC.match(text)
+    if m is None:
+        return None
+    end = _close_of(text, m.end(), "(")
+    if end is None:
+        return None
+    docs = []
+    for start, stop in _split_top_level(text[m.end() : end]):
+        item = text[m.end() :][start:stop]
+        if DOC_ITEM.match(item) is None:
+            continue
+        got = _doc_attr_text("#[" + item.strip())
+        if got is None:
+            return None
+        docs.append(got)
+    return "\n".join(docs) if docs else None
 
 
 # An unterminated literal must not make the reader walk the whole file for
@@ -1979,7 +2038,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len, list_col = None, 0, 0
+    open_char, open_len, list_col, fence_quoted = None, 0, 0, False
     in_block_doc, attr_depth, comment_depth = 0, 0, 0
     in_html_comment = False
     # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
@@ -1996,7 +2055,12 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         for md in text.split("\n"):
             stream.append((idx + 1, "/// " + md))
         idx += used
-    for lineno, line in stream:
+    # Code spans are resolved over the stream for the same reason as in the
+    # page scanner. Last commit wired this into the page half and left the doc
+    # half reading raw text — inside the very change whose message said the
+    # step was shared. The step was; its INPUT was not.
+    stream_masked = _code_span_masked([text for _, text in stream])
+    for pos, (lineno, line) in enumerate(stream):
         # `/** … */` and `/*! … */` are doc comments too, and `rustdoc --test`
         # collects and runs their fences exactly as it does `///`'s. Only the
         # line forms were recognised, so a whole legitimate doc form was
@@ -2103,7 +2167,11 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # `rustdoc --test` reports no tests for one. Same step as the page
         # scanner rather than a second copy of it.
         skip, in_html_comment = _html_comment_step(
-            doc.group(1), in_html_comment, open_char is not None, list_col
+            doc.group(1),
+            in_html_comment,
+            open_char is not None,
+            list_col,
+            stream_masked[pos],
         )
         if skip:
             continue
@@ -2113,6 +2181,16 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 list_col = col
             elif doc.group(1).strip() and _indent_width(doc.group(1)) == 0:
                 list_col = 0
+        # Same rule as the page scanner: an unquoted line ends a quoted fence.
+        if (
+            open_char is not None
+            and fence_quoted
+            and not BLOCKQUOTE.match(doc.group(1))
+        ):
+            if inside:
+                collected.append(current)
+                current = []
+            inside, open_char, open_len = False, None, 0
         body = _fence_body(doc.group(1), list_col, open_char is not None)
         fence = _fence_at(body, list_col)
         handled = False
@@ -2126,6 +2204,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 # match whole here too, or ```rustic reads as Rust.
                 token = _fence_lang(suffix)
                 open_char, open_len = char, length
+                fence_quoted = BLOCKQUOTE.match(doc.group(1)) is not None
                 # Enumerated against `rustdoc --test` rather than recalled, with
                 # a bogus attribute as the control: `standalone_crate` and
                 # `ignore-<reason>` both collect a doctest, `custom` does not.
@@ -2941,6 +3020,59 @@ def self_test():
             ".rs",
         ),
         [],
+    )
+    # A fence opened inside a block quote ends where the quote does.
+    check(
+        "rustdoc: an unquoted line ends a quoted fence",
+        scan_text(
+            '/// > ```\n/// #[secured(policy = "x")]\n/// > ```\npub fn f() {}\n', ".rs"
+        ),
+        [],
+    )
+    check(
+        "rustdoc: a fully quoted fence is still scanned",
+        scan_text(
+            '/// > ```\n/// > #[secured(policy = "x")]\n/// > ```\npub fn f() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: an unquoted line ends a quoted fence",
+        scan_text('> ```rust\n#[secured(policy = "x")]\n> ```\n', ".md"),
+        [],
+    )
+    # The code-span mask reaches the doc stream, not only the page scanner.
+    check(
+        "rustdoc: a quoted comment opener does not open a comment",
+        scan_text(
+            '//! The marker `<!--` starts one.\n//! ```\n'
+            '//! #[secured(policy = "x")]\n//! ```\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # Rust identifiers are Unicode, so a non-ASCII key is still a key.
+    check(
+        "markdown: a non-ASCII key is caught",
+        scan_text('```rust\n#[secured(polícy = "x")]\n```\n', ".md"),
+        [("secured", "polícy")],
+    )
+    check(
+        "markdown: a positional type is still not a flag",
+        scan_text("```rust\n#[repository(Post, api, mcp, soft_delete)]\n```\n", ".md"),
+        [],
+    )
+    # `#[cfg_attr(doc, doc = "…")]` supplies documentation rustdoc renders and
+    # tests, so a fence in one is reader-facing.
+    check(
+        "rustdoc: a conditional doc attribute is scanned",
+        scan_text(
+            '#[cfg_attr(doc, doc = "```\\n#[secured(policy = \\"x\\")]\\n```")]\n'
+            'pub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
     check(

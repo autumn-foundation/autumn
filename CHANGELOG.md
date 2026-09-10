@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than reported against, and 30 of 33 are judged. Only an attribute's
   own keys are judged — the identifier introducing a nested group included,
   since a nested group such as `seo(…)` carries its own interior grammar — and both keyword arguments and bare flags (`#[job(unique)]`) are
-  checked while positional arguments are not. Carries `--list` and a 236-case
+  checked while positional arguments are not. Carries `--list` and a 243-case
   `--self-test`. The baseline run found five defects.
 
 - **Migration version gate: starter templates no longer collide with their
