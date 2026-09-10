@@ -20136,7 +20136,8 @@ redirect_uri = "http://localhost/callback"
             String::from("[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n");
         let mut main_rs = String::from("fn main() {\n    autumn_web::app()\n");
         for entry in &schema_owners {
-            manifest.push_str(&format!("{} = \"0.7.0\"\n", entry.crate_name));
+            manifest.push_str(entry.crate_name);
+            manifest.push_str(" = \"0.7.0\"\n");
             main_rs.push_str(entry.mount);
         }
         main_rs.push_str("        ;\n}\n");
