@@ -951,7 +951,11 @@ def top_level_keys(args, macro=None):
 # regex, because a regex separator means `\s*` and `\s*` does not know what a
 # comment is. Writing one that did would also have to give up nested block
 # comments, which `skip_comment` already handles.
-ATTR_OPEN = re.compile(r"#\[")
+# `#` and `[` are separate tokens, so trivia goes between them too:
+# `# /* rationale */ [secured(policy = "x")]` compiles and applies the
+# attribute. Verified with rustc rather than assumed. There are three gaps in
+# an attribute head, not two, and all three are walked the same way.
+ATTR_SIGIL = re.compile(r"#")
 MACRO_NAME = re.compile(
     r"(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
@@ -1161,14 +1165,17 @@ def find_macro_calls(text):
         return any(start <= pos < end for start, end in masked)
 
     out = []
-    for attr in ATTR_OPEN.finditer(text):
+    for attr in ATTR_SIGIL.finditer(text):
         if in_literal(attr.start()):
             # Inside a string or comment this is a *value*, not an
             # invocation: `let shown = r##"#[job(pending = true)]"##;`
             # never applies the attribute, and reporting it would fail the
             # gate on a snippet that quotes a spelling on purpose.
             continue
-        found = _delimited_at(text, attr.end(), MACRO_NAME)
+        bracket = _trivia_end(text, attr.end())
+        if bracket >= len(text) or text[bracket] != "[":
+            continue
+        found = _delimited_at(text, bracket + 1, MACRO_NAME)
         if found is not None:
             match, opener, body_start = found
             end = _close_of(text, body_start, opener)
@@ -1176,7 +1183,7 @@ def find_macro_calls(text):
                 continue
             out.append((match.group(1), text[body_start:end], attr.start()))
             continue
-        found = _delimited_at(text, attr.end(), CFG_ATTR_NAME)
+        found = _delimited_at(text, bracket + 1, CFG_ATTR_NAME)
         if found is None or found[1] != "(":
             continue
         _, _, body_start = found
@@ -1384,12 +1391,28 @@ def assign_waivers(waived, fences):
 WAIVER_REACH = 6
 
 
-def _fence_run(stripped):
-    """`(char, length)` when `stripped` opens or closes a fence, else None."""
+# CommonMark allows a fence to be indented up to three spaces. At four it is
+# an indented code block instead, and its contents are literal text — so a page
+# DISPLAYING a fenced example, indented, has no fence in it at all. Stripping
+# indentation without limit turned such a display into a live fence and failed
+# the gate on a document containing no Rust.
+FENCE_INDENT_MAX = 3
+
+
+def _fence_at(body):
+    """`(char, length, suffix)` when `body` is a fence line, else None.
+
+    `body` has had any block-quote prefix removed but keeps its indentation,
+    which is what decides whether it is a fence at all.
+    """
+    indent = len(body) - len(body.lstrip(" "))
+    if indent > FENCE_INDENT_MAX:
+        return None
+    stripped = body[indent:]
     for char in ("`", "~"):
         if stripped.startswith(char * 3):
             length = len(stripped) - len(stripped.lstrip(char))
-            return char, length
+            return char, length, stripped[length:]
     return None
 
 
@@ -1420,35 +1443,41 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
         # one, and without stripping the CommonMark `>` prefix the scanner
         # never entered the fence at all.
-        stripped = BLOCKQUOTE.sub("", line).lstrip()
-        run = _fence_run(stripped)
-        if run:
-            char, length = run
-            if open_char is not None:
-                # CommonMark: a fence closes only on the same character, at
-                # least as long as the opener. Removing a fixed three
-                # characters read ````rust as the language "`rust" and skipped
-                # the block entirely — and longer fences are exactly what an
-                # example containing triple backticks requires.
-                if char == open_char and length >= open_len:
-                    if inside:
-                        collected.append(current)
-                        current = []
-                    inside = False
-                    open_char, open_len = None, 0
-            else:
+        body = BLOCKQUOTE.sub("", line)
+        fence = _fence_at(body)
+        handled = False
+        if fence:
+            char, length, suffix = fence
+            if open_char is None:
                 # Every fence is tracked, not only Rust ones. A ````text block
                 # displaying a literal ```rust example is documentation ABOUT
                 # a fence; treating the inner delimiter as live structure made
                 # the displayed attribute fail the gate.
-                lang = stripped[length:].strip().lower()
+                lang = suffix.strip().lower()
                 open_char, open_len = char, length
                 inside = lang.startswith("rust")
                 if inside:
                     fences += 1
+                handled = True
+            # CommonMark: a fence closes only on the same character, at least
+            # as long as the opener, AND followed by nothing but whitespace.
+            # Removing a fixed three characters read ````rust as the language
+            # "`rust"; closing on any same-length run truncated a fence at a
+            # ```not-a-close line inside a raw string, so every attribute after
+            # it went unread.
+            elif char == open_char and length >= open_len and not suffix.strip():
+                if inside:
+                    collected.append(current)
+                    current = []
+                inside = False
+                open_char, open_len = None, 0
+                handled = True
+        if handled:
             continue
+        # Not a fence line, or a fence-shaped line that does not close this
+        # fence — either way it is content when one is open.
         if inside:
-            current.append((lineno, BLOCKQUOTE.sub("", line)))
+            current.append((lineno, body))
     collected.append(current)
     return _judge_collected(rel, collected, accepted, judgeable, waived), fences
 
@@ -1463,8 +1492,18 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     for lineno, line in enumerate(lines, 1):
         doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
         if not doc:
-            # A non-doc line ends any fence: an unterminated fence must not
-            # swallow the rest of the file.
+            # A blank line or an ordinary comment between two doc lines does
+            # not break the doc comment: rustdoc concatenates the attributes
+            # either way, and `rustdoc --test` runs a fence that spans the gap
+            # as one block. Resetting here meant the closing delimiter after
+            # such a gap was read as a fresh opener and the code between went
+            # unread. Verified against rustdoc rather than assumed, including
+            # the negative — an item between two doc lines is an error
+            # (E0753), so any other non-doc line still ends the fence, and an
+            # unterminated one still cannot swallow the rest of the file.
+            bare = line.strip()
+            if not bare or bare.startswith("//"):
+                continue
             if inside:
                 collected.append(current)
             current, inside = [], False
@@ -1476,26 +1515,20 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # never opened a fence and everything in it went unread. Third time a
         # rule taught to one scanner had to be taught to the other; they now
         # share every one of them.
-        body = BLOCKQUOTE.sub("", doc.group(1)).strip()
-        # Same delimiter rule as the markdown half: character and run length,
-        # not a fixed three. Fixing only that scanner left this one reading
-        # ````rust as the language "`rust" and skipping the block.
-        run = _fence_run(body)
-        if run:
-            char, length = run
-            if open_char is not None:
-                if char == open_char and length >= open_len:
-                    if inside:
-                        collected.append(current)
-                        current = []
-                    inside = False
-                    open_char, open_len = None, 0
-            else:
+        # Indentation is kept, not stripped: the same CommonMark rules decide a
+        # fence here as in markdown, and both the four-space limit and the
+        # closing-suffix check need it.
+        body = BLOCKQUOTE.sub("", doc.group(1))
+        fence = _fence_at(body)
+        handled = False
+        if fence:
+            char, length, suffix = fence
+            if open_char is None:
                 # rustdoc fences default to Rust, and the attribute-bearing
                 # ones are usually `ignore` / `no_run` / `compile_fail`. A
                 # `text` fence is still tracked so a Rust fence displayed
                 # inside it is not read as live structure.
-                lang = body[length:].strip().lower()
+                lang = suffix.strip().lower()
                 open_char, open_len = char, length
                 inside = lang == "" or re.match(
                     r"^(rust|ignore|no_run|compile_fail|should_panic|edition\d+)",
@@ -1503,9 +1536,18 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 ) is not None
                 if inside:
                     fences += 1
+                handled = True
+            elif char == open_char and length >= open_len and not suffix.strip():
+                if inside:
+                    collected.append(current)
+                    current = []
+                inside = False
+                open_char, open_len = None, 0
+                handled = True
+        if handled:
             continue
         if inside:
-            current.append((lineno, body))
+            current.append((lineno, body.strip()))
     collected.append(current)
     return _judge_collected(rel, collected, accepted, judgeable, waived), fences
 
@@ -1889,6 +1931,72 @@ def self_test():
     check(
         "rustdoc: a quoted non-Rust fence is still not judged",
         scan_text('//! > ```text\n//! > #[secured(policy = "x")]\n//! > ```\n', ".rs"),
+        [],
+    )
+    # CommonMark: a fence may be indented up to three spaces. At four it is an
+    # indented code block, so a page DISPLAYING a fenced example has no fence.
+    check(
+        "markdown: a four-space indented display is not a fence",
+        scan_text('    ```rust\n    #[secured(policy = "x")]\n    ```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: a three-space indented fence is still scanned",
+        scan_text('   ```rust\n   #[secured(policy = "x")]\n   ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a four-space indented display is not a fence",
+        scan_text(
+            '//!     ```rust\n//!     #[secured(policy = "x")]\n//!     ```\n', ".rs"
+        ),
+        [],
+    )
+    # A closing fence may be followed only by whitespace. Closing on any
+    # same-length run truncated the block at a `​```not-a-close` line inside a
+    # raw string, so every attribute after it went unread.
+    check(
+        "markdown: a same-length run with a suffix does not close",
+        scan_text(
+            '```rust\nlet s = r#"\n```not-a-close\n"#;\n#[secured(policy = "x")]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a closing fence may carry trailing whitespace",
+        scan_text('```rust\n#[secured(policy = "x")]\n```   \n', ".md"),
+        [("secured", "policy")],
+    )
+    # rustdoc concatenates doc attributes across a blank line or an ordinary
+    # comment, and runs a fence spanning the gap as one block. Any other
+    # non-doc line still ends the fence.
+    check(
+        "rustdoc: a fence survives a blank source line",
+        scan_text('//! ```\n\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a fence survives an ordinary comment line",
+        scan_text(
+            '//! ```\n// note\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an item still ends an unterminated fence",
+        scan_text('//! ```\npub fn f() {}\n#[secured(policy = "x")]\n', ".rs"),
+        [],
+    )
+    # `#` and `[` are separate tokens, so trivia goes between them too.
+    check(
+        "markdown: trivia between the attribute sigil tokens",
+        scan_text('```rust\n# /* why */ [secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a lone hash is not an attribute",
+        scan_text('```rust\nlet n = 1; // # secured(policy = "x")\n```\n', ".md"),
         [],
     )
 
