@@ -66,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
 
+- **PATCH validation:** merged models now enforce `credit_card` and
+  `non_control_character` rules.
+
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue
@@ -2107,10 +2110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   statements, so `#[model]` cannot detect or refuse it at expansion time.
   `ValidateExt`'s doc comment now documents the hazard and its scope, with the
   workaround (keep the struct's own module free of that import, or use
-  `#[validate(custom(...))]`). `credit_card`/`non_control_character` remain
-  correctly out of scope: they are not in this workspace's enabled `validator`
-  feature set (only `derive`, not `card`/`unic`), so no model can use them
-  today regardless of the update path.
+  `#[validate(custom(...))]`). The workspace now enables `credit_card` and
+  `non_control_character`; merged updates enforce both rules.
 
 - **A CI gate for `AUTUMN_*` config keys named in the docs [no-plugin]:**
   nothing here is agent-facing — it's a CI/docs-harness addition, not new
