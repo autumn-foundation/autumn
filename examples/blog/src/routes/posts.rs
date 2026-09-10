@@ -8,6 +8,7 @@ use autumn_web::cache::cache_fragment_global;
 use autumn_web::config::AutumnConfig;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
+use autumn_web::prelude::{IntoResponse, StatusCode};
 use autumn_web::seo::{SeoMeta, locale_alternates};
 use autumn_web::widgets::{Crumb, HeroConfig, breadcrumb, hero, locale_switcher};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
@@ -201,12 +202,28 @@ fn render_post_card(post: &Post) -> Markup {
     }
 }
 
+/// Look up the message [`NewPost::validate_fields`] recorded against `field`,
+/// if any.
+fn field_error<'a>(errors: &'a [(&str, &str)], field: &str) -> Option<&'a str> {
+    errors
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map(|(_, msg)| *msg)
+}
+
 /// Render the post editor form (used for both new and edit).
-fn post_form(action: &str, post: Option<&Post>) -> Markup {
-    let title_val = post.map_or("", |p| &p.title);
-    let slug_val = post.map_or("", |p| &p.slug);
-    let body_val = post.map_or("", |p| &p.body);
-    let published = post.is_some_and(|p| p.published);
+///
+/// `data` is the values to show — a blank/seeded [`NewPost`] on the initial
+/// GET, or the author's just-rejected submission on a failed POST — and
+/// `errors` is whatever [`NewPost::validate_fields`] found wrong with it
+/// (empty on the GET path). Sharing this one function between the GET routes
+/// and the POST routes' 422 branch is what makes a rejected submission
+/// redisplay with the author's title/slug/body/published choice intact and a
+/// message next to the field that caused it, instead of losing the draft to
+/// a generic error page.
+fn post_form(action: &str, is_edit: bool, data: &NewPost, errors: &[(&str, &str)]) -> Markup {
+    let title_error = field_error(errors, "title");
+    let body_error = field_error(errors, "body");
 
     html! {
         form action=(action) method="post"
@@ -215,21 +232,28 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
             div {
                 label for="title" class="block text-sm font-medium text-stone-700 mb-1.5" { "Title" }
                 input type="text" id="title" name="title"
-                      value=(title_val)
+                      value=(data.title)
                       required
                       autocomplete="off"
                       placeholder="Your post title"
+                      aria-invalid=(if title_error.is_some() { "true" } else { "false" })
+                      aria-describedby="title-error"
                       class="w-full px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
                              text-sm placeholder-stone-400 \
                              focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
                              focus:border-amber-400 transition-colors";
+                div id="title-error" {
+                    @if let Some(msg) = title_error {
+                        p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                    }
+                }
             }
 
             // Slug
             div {
                 label for="slug" class="block text-sm font-medium text-stone-700 mb-1.5" { "Slug" }
                 input type="text" id="slug" name="slug"
-                      value=(slug_val)
+                      value=(data.slug)
                       autocomplete="off"
                       placeholder="auto-generated-from-title"
                       class="w-full px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
@@ -246,11 +270,18 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
                          rows="16"
                          required
                          placeholder="Write your post content here..."
+                         aria-invalid=(if body_error.is_some() { "true" } else { "false" })
+                         aria-describedby="body-error"
                          class="w-full px-4 py-3 bg-white border border-stone-300 rounded-lg \
                                 text-sm placeholder-stone-400 leading-relaxed \
                                 focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
                                 focus:border-amber-400 transition-colors resize-y" {
-                    (body_val)
+                    (data.body)
+                }
+                div id="body-error" {
+                    @if let Some(msg) = body_error {
+                        p class="text-red-600 text-xs mt-1" role="alert" { (msg) }
+                    }
                 }
             }
 
@@ -258,7 +289,7 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
             // absent from form data; #[serde(default)] handles it as false)
             div class="flex items-center gap-3" {
                 input type="checkbox" id="published" name="published" value="true"
-                      checked[published]
+                      checked[data.published]
                       class="w-4 h-4 rounded border-stone-300 text-amber-600 \
                              focus:ring-amber-400/50";
                 label for="published" class="text-sm text-stone-700" { "Publish immediately" }
@@ -270,7 +301,7 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
                        class="px-6 py-2.5 bg-amber-700 text-white text-sm font-medium rounded-lg \
                               shadow-sm hover:bg-amber-800 active:bg-amber-900 \
                               transition-colors" {
-                    @if post.is_some() { "Update Post" } @else { "Create Post" }
+                    @if is_edit { "Update Post" } @else { "Create Post" }
                 }
                 a href=(paths::admin_list())
                    class="px-4 py-2.5 text-sm text-stone-600 hover:text-stone-800 transition-colors" {
@@ -492,11 +523,11 @@ pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
     ))
 }
 
-/// Show the new post form.
-#[get("/admin/new")]
-pub async fn new_form(locale: Locale) -> Markup {
+/// The new-post page body, shared by the GET route and the POST route's 422
+/// branch (see [`post_form`]).
+fn new_post_page(locale: &Locale, data: &NewPost, errors: &[(&str, &str)]) -> Markup {
     layout(
-        &locale,
+        locale,
         None, // `/admin` is excluded from locale-prefixing.
         "New Post \u{2022} Autumn Blog",
         html! {
@@ -507,56 +538,120 @@ pub async fn new_form(locale: Locale) -> Markup {
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "New Post"
             }
-            (post_form(&paths::create(), None))
+            (post_form(&paths::create(), false, data, errors))
         },
     )
 }
 
-/// Create a new post from a form submission.
-#[post("/admin")]
-pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Redirect> {
-    let new_post = form.0.validated()?;
+/// Show the new post form.
+#[get("/admin/new")]
+pub async fn new_form(locale: Locale) -> Markup {
+    new_post_page(&locale, &NewPost::default(), &[])
+}
 
+/// Create a new post from a form submission.
+///
+/// On validation failure (empty title or body) the new-post page is
+/// re-rendered with the author's draft intact and a message next to the
+/// field that failed (422), instead of the generic error page
+/// `NewPost::validated`'s `?` used to produce — which dropped the author off
+/// the form and discarded both fields they had typed.
+#[post("/admin")]
+pub async fn create(
+    locale: Locale,
+    mut db: Db,
+    form: Form<NewPost>,
+) -> AutumnResult<impl IntoResponse> {
+    let submitted = form.0;
+    let errors = submitted.validate_fields();
+    if !errors.is_empty() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            new_post_page(&locale, &submitted, &errors),
+        )
+            .into_response());
+    }
+
+    let new_post = submitted.normalized();
     diesel::insert_into(posts::table)
         .values(&new_post)
         .execute(&mut *db)
         .await?;
 
-    Ok(Redirect::to(&paths::admin_list()))
+    Ok(Redirect::to(&paths::admin_list()).into_response())
+}
+
+/// The edit-post page body, shared by the GET route and the POST route's 422
+/// branch (see [`post_form`]). `crumb_title` drives the breadcrumb/`<title>`
+/// text: the GET route passes the stored post's title, the POST route's
+/// failure branch passes back whatever the author just typed (so the page
+/// reflects what's currently in the box rather than a stale DB value).
+fn edit_post_page(
+    locale: &Locale,
+    id: i64,
+    crumb_title: &str,
+    data: &NewPost,
+    errors: &[(&str, &str)],
+) -> Markup {
+    layout(
+        locale,
+        None, // `/admin` is excluded from locale-prefixing.
+        &format!("Edit: {crumb_title} \u{2022} Autumn Blog"),
+        html! {
+            (breadcrumb(&[
+                Crumb::link("Admin", &paths::admin_list()),
+                Crumb::current(&format!("Edit: {crumb_title}")),
+            ]))
+            h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
+                "Edit Post"
+            }
+            (post_form(&paths::update(id), true, data, errors))
+        },
+    )
 }
 
 /// Show the edit form for a post.
 #[get("/admin/{id}/edit")]
 pub async fn edit_form(locale: Locale, id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     let p = Post::find(*id, &mut db).await?;
+    let data = NewPost {
+        title: p.title.clone(),
+        slug: p.slug.clone(),
+        body: p.body.clone(),
+        published: p.published,
+    };
 
-    Ok(layout(
-        &locale,
-        None, // `/admin` is excluded from locale-prefixing.
-        &format!("Edit: {} \u{2022} Autumn Blog", p.title),
-        html! {
-            (breadcrumb(&[
-                Crumb::link("Admin", &paths::admin_list()),
-                Crumb::current(&format!("Edit: {}", p.title)),
-            ]))
-            h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
-                "Edit Post"
-            }
-            (post_form(&paths::update(p.id), Some(&p)))
-        },
-    ))
+    Ok(edit_post_page(&locale, p.id, &p.title, &data, &[]))
 }
 
 /// Update a post from a form submission.
+///
+/// On validation failure the edit page is re-rendered the same way
+/// [`create`] does — see that handler's doc comment; the same anti-pattern
+/// applied here via `NewPost::validated`'s `?` on the update path too.
 #[post("/admin/{id}")]
-pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnResult<Redirect> {
-    let validated = form.0.validated()?;
+pub async fn update(
+    locale: Locale,
+    id: Path<i64>,
+    mut db: Db,
+    form: Form<NewPost>,
+) -> AutumnResult<impl IntoResponse> {
+    let submitted = form.0;
+    let errors = submitted.validate_fields();
+    if !errors.is_empty() {
+        return Ok((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            edit_post_page(&locale, *id, &submitted.title, &submitted, &errors),
+        )
+            .into_response());
+    }
 
+    let valid = submitted.normalized();
     let changes = UpdatePost {
-        title: Some(validated.title),
-        slug: Some(validated.slug),
-        body: Some(validated.body),
-        published: Some(validated.published),
+        title: Some(valid.title),
+        slug: Some(valid.slug),
+        body: Some(valid.body),
+        published: Some(valid.published),
         // Bump the version token so the cached post card re-renders on the
         // next request (Postgres has no ON UPDATE trigger for `updated_at`).
         updated_at: Some(chrono::Utc::now().naive_utc()),
@@ -574,7 +669,7 @@ pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnRes
         )));
     }
 
-    Ok(Redirect::to(&paths::admin_list()))
+    Ok(Redirect::to(&paths::admin_list()).into_response())
 }
 
 /// Delete a post by ID (htmx endpoint).
@@ -604,3 +699,122 @@ autumn_web::paths![
     update,
     delete_post
 ];
+
+/// Error-path coverage for `create`/`update`'s redisplay-on-failure fix
+/// (issue: `NewPost::validated`'s `?` used to send every rejected
+/// title/body through a generic error page, losing the draft).
+#[cfg(test)]
+mod post_form_tests {
+    use super::*;
+
+    fn blank() -> NewPost {
+        NewPost::default()
+    }
+
+    #[test]
+    fn a_blank_title_is_rejected_with_a_field_message() {
+        let form = NewPost {
+            title: "   ".into(),
+            body: "Some body text".into(),
+            ..blank()
+        };
+        let errors = form.validate_fields();
+        assert_eq!(
+            field_error(&errors, "title"),
+            Some("Title must not be empty")
+        );
+        assert_eq!(field_error(&errors, "body"), None);
+    }
+
+    #[test]
+    fn a_blank_body_is_rejected_with_a_field_message() {
+        let form = NewPost {
+            title: "A real title".into(),
+            body: "  \n ".into(),
+            ..blank()
+        };
+        let errors = form.validate_fields();
+        assert_eq!(field_error(&errors, "title"), None);
+        assert_eq!(field_error(&errors, "body"), Some("Body must not be empty"));
+    }
+
+    #[test]
+    fn a_fully_populated_post_has_no_errors() {
+        let form = NewPost {
+            title: "A real title".into(),
+            body: "Some body text".into(),
+            ..blank()
+        };
+        assert!(form.validate_fields().is_empty());
+    }
+
+    #[test]
+    fn normalized_auto_generates_a_slug_from_the_title_when_left_blank() {
+        let form = NewPost {
+            title: "  Hello World  ".into(),
+            slug: String::new(),
+            body: "  Body text  ".into(),
+            published: true,
+        };
+        let normalized = form.normalized();
+        assert_eq!(normalized.title, "Hello World");
+        assert_eq!(normalized.body, "Body text");
+        assert_eq!(normalized.slug, "hello-world");
+        assert!(normalized.published);
+    }
+
+    /// The rejected form redisplay keeps the author's draft and wires each
+    /// error to its field (adjacent to cause, aria-invalid, preserved
+    /// entered data) instead of dropping them onto a generic error page.
+    #[test]
+    fn a_rejected_submission_keeps_the_authors_input_and_wires_its_error() {
+        let submitted = NewPost {
+            title: String::new(),
+            slug: "my-custom-slug".into(),
+            body: String::new(),
+            published: true,
+        };
+        let errors = submitted.validate_fields();
+        let html = post_form(&paths::create(), false, &submitted, &errors).into_string();
+
+        // The author's draft survives the round trip.
+        assert!(html.contains(r#"value="my-custom-slug""#), "{html}");
+        assert!(
+            html.contains(
+                r#"input type="checkbox" id="published" name="published" value="true" checked"#
+            ),
+            "{html}"
+        );
+
+        // Both failure modes are wired to their field.
+        assert!(html.contains(r#"aria-describedby="title-error""#), "{html}");
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains("Title must not be empty"), "{html}");
+        assert!(html.contains("Body must not be empty"), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[test]
+    fn a_clean_form_shows_no_errors_and_aria_invalid_false() {
+        let data = NewPost {
+            title: "Buy milk".into(),
+            body: "Two percent, please.".into(),
+            ..blank()
+        };
+        let html = post_form(&paths::create(), false, &data, &[]).into_string();
+        assert!(html.contains(r#"aria-invalid="false""#), "{html}");
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains(r#"value="Buy milk""#), "{html}");
+    }
+
+    #[test]
+    fn post_form_labels_the_submit_button_by_is_edit() {
+        let data = blank();
+        let create_html = post_form(&paths::create(), false, &data, &[]).into_string();
+        assert!(create_html.contains("Create Post"), "{create_html}");
+        assert!(!create_html.contains("Update Post"), "{create_html}");
+
+        let edit_html = post_form(&paths::update(1), true, &data, &[]).into_string();
+        assert!(edit_html.contains("Update Post"), "{edit_html}");
+    }
+}
