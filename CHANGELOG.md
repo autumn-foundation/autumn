@@ -168,6 +168,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **build:** renamed colliding example binary targets so no two workspace
+  members produce the same output filename — `todo-app`'s `seed` is now
+  `todo-app-seed`, `bookmarks`' is `bookmarks-seed`, and the two auto-discovered
+  `migrate` bins are `bookmarks-distributed-migrate` /
+  `bookmarks-sharded-migrate`. Duplicate names caused intermittent
+  `LNK1104: cannot open file` failures on `Test (windows-latest)` when two
+  links overlapped (issue #2639). `autumn seed` now resolves the seed binary's
+  real target name from `cargo metadata` instead of hard-coding `--bin seed`,
+  and `scripts/check-example-bin-names.sh` gates the invariant in the future.
 - **docs:** the five doc sites that told readers to write
   `#[secured(policy = "…")]` now use the form the macro parses,
   `#[secured(scopes = ["…"])]`. `#[secured]` has never had a `policy` key — its
