@@ -52,7 +52,20 @@
 #   meta.path.is_ident("ttl")            `#[cached(ttl = …)]`
 #   key != "grant" / ident == "table"    `#[agent_operable(grant = …)]`
 #   key.as_deref() != Some("max_age")    `#[step_up(max_age = …)]`
-#   "sum" => / "count" | "sum"           match-arm grammars
+#   match key.as_str() { "resource" =>   `#[authorize(resource = …)]`
+#
+# That last one is read only where the scrutinee is a *key*. The same shape
+# spells out values elsewhere — `repository.rs` matches `"destroy"`,
+# `"delete_all"`, `"nullify"` and `"restrict"` as the spellings accepted after
+# `on_delete =`, inside `parse_repo_args` itself — and reading those arms let
+# `#[repository(Post, delete_all = true)]` pass, while reading none of them
+# lost `authorize`'s two real keys. What the scrutinee was built from settles
+# it: `key.get_ident()` dispatches keys, `nested.value()?` dispatches values.
+#
+# One key belongs to every macro and appears in no owner file:
+# `crate_path::extract_crate_override` strips `crate = "…"` before any parser
+# runs, and all 33 entry points call it. Omitting it made the supported
+# `#[get("/x", crate = "autumn_web_05")]` report as drift.
 #
 # **Where** those patterns are read matters as much as what they match. Run
 # over a whole source file they are far too generous: `model.rs` is ~10k lines
@@ -119,6 +132,13 @@
 #   - **`==` is not a keyword argument.** `#[cfg(feature = "db")]`-style keys
 #     are matched by `key =` but a comparison inside a macro argument is not,
 #     hence the `=(?!=)` lookahead.
+#   - **A bare flag is an argument; a positional is not.** `#[job(unique)]` and
+#     `#[model(managed)]` take no value, and a typo in one fails the build
+#     exactly like a mistyped key — reading only `key =` left `#[job(uniqe)]`
+#     passing clean. But the type in `#[repository(Post, …)]`, the role literal
+#     in `#[secured("admin")]` and the value in `resource = Post` are
+#     positional, so literals and nested groups are collapsed to a placeholder
+#     before the split and a segment carrying `=` yields only its left side.
 #   - **A delimiter inside a literal is data, not structure.** The depth scan
 #     skips `"…"`, `'…'` and `r#"…"#` before counting, so
 #     `#[secured("admin)", policy = "x")]` no longer ends at the `)` inside the
@@ -249,9 +269,52 @@ KEY_PATTERNS = (
     r'is_ident\("([a-z_0-9]+)"\)',
     r'[!=]=\s*"([a-z_0-9]+)"',
     r'Some\("([a-z_0-9]+)"\)',
-    r'"([a-z_0-9]+)"\s*=>',
-    r'"([a-z_0-9]+)"\s*\|',
 )
+
+# Some grammars dispatch keys through a `match` rather than `is_ident`, so the
+# arms carry real keys — `authorize.rs` does exactly that for `resource` and
+# `from`. But so do *value* grammars: `repository.rs` matches `"destroy"`,
+# `"delete_all"`, `"nullify"` and `"restrict"` as the spellings accepted after
+# `on_delete =`, and those arms sit in `parse_repo_args` itself, so no
+# callee filter can reach them. Reading every arm made
+# `#[repository(Post, delete_all = true)]` pass; reading none of them lost
+# `authorize`'s two real keys.
+#
+# The scrutinee separates them, and it is not a naming convention but what the
+# expression was built from:
+#
+#   match key.as_str() { "resource" => …   ← key.get_ident(), a KEY dispatch
+#   match value.to_string().as_str() { …   ← nested.value()?, a VALUE dispatch
+#
+# So match arms are collected only from blocks whose scrutinee reads as a key
+# and not as a value.
+MATCH_BLOCK = re.compile(r"\bmatch\s+([^{\n]{0,120}?)\s*\{")
+KEYISH_SCRUTINEE = re.compile(r"\b(key|path|ident|name)\b")
+VALUEISH_SCRUTINEE = re.compile(r"\b(value|val|action|kind|lit)\b")
+MATCH_ARM = re.compile(r'"([a-z_0-9]+)"\s*(?:\||=>)')
+
+
+def match_arm_keys(text):
+    """Keys from `match` arms, but only where the scrutinee is a key."""
+    keys = set()
+    for block in MATCH_BLOCK.finditer(text):
+        scrutinee = block.group(1)
+        if VALUEISH_SCRUTINEE.search(scrutinee):
+            continue
+        if not KEYISH_SCRUTINEE.search(scrutinee):
+            continue
+        body, _ = _balanced(text, block.end() - 1)
+        keys |= set(MATCH_ARM.findall(body))
+    return keys
+
+
+# Accepted by every attribute macro, and by none of their own parsers:
+# `crate_path::extract_crate_override` strips `crate = "…"` off the token
+# stream before the macro's parser ever sees it, and all 33 entry points in
+# `lib.rs` call it. Reading only the owner files therefore made
+# `#[get("/x", crate = "autumn_web_05")]` — a supported form, documented for
+# renamed dependencies — report as drift.
+UNIVERSAL_KEYS = frozenset({"crate"})
 
 CFG_TEST_MOD = re.compile(r"#\[cfg\(test\)\]\s*(?:pub\s+)?mod\s+[A-Za-z0-9_]+\s*\{")
 
@@ -389,7 +452,8 @@ def accepted_keys():
         keys = set()
         for pattern in KEY_PATTERNS:
             keys |= set(re.findall(pattern, text))
-        out[macro] = keys
+        keys |= match_arm_keys(text)
+        out[macro] = (keys | UNIVERSAL_KEYS) if keys else set()
     return out
 
 
@@ -447,34 +511,69 @@ WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([a-z_0-9]+)")
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 
 
+BARE_FLAG = re.compile(r"^[a-z_][a-z_0-9]*$")
+
+
 def top_level_keys(args):
-    """The keyword-argument names at the attribute's own nesting level.
+    """The argument names at the attribute's own nesting level.
+
+    Two shapes count, because the macro rejects a typo in either:
+
+        #[job(queue = "mail")]   a keyword argument
+        #[job(unique)]           a bare flag
+
+    Matching only `key =` left `#[job(uniqe)]` and `#[model(managd)]` passing
+    clean even though both fail the build.
+
+    What does *not* count is a positional argument — the type in
+    `#[repository(Post, …)]`, the role literal in `#[secured("admin")]`, the
+    value in `resource = Post`. Literals and nested groups are collapsed to a
+    placeholder first, so a segment that held one is never mistaken for a bare
+    flag, and a segment carrying `=` yields only its left side.
 
     A nested group carries its own grammar: `#[get("/about", seo(title = …,
     og_type = …))]` names `title` and `og_type` as keys of `seo(...)`, not of
-    `#[get]`. Judging them against the outer macro's key set reported three
-    correct SEO pages as drift. Nested grammars are simply not checked, which
-    is the safe direction — a miss, not a false alarm.
+    `#[get]`. Judging them against the outer macro reported three correct SEO
+    pages as drift. Nested grammars are not checked at all, which is the safe
+    direction — a miss, not a false alarm.
     """
     buf, depth, i = [], 0, 0
     while i < len(args):
         ch = args[i]
         if ch in "\"'":
             i = skip_literal(args, i)
+            if depth == 0:
+                buf.append("\x00")  # a literal was here
             continue
         if ch == "r" and args[i + 1 : i + 2] in ('"', "#"):
             nxt = skip_raw_literal(args, i)
             if nxt is not None:
                 i = nxt
+                if depth == 0:
+                    buf.append("\x00")
                 continue
         if ch in "([{":
             depth += 1
+            if depth == 1:
+                buf.append("\x00")  # a nested group was here
         elif ch in ")]}":
             depth -= 1
         elif depth == 0:
             buf.append(ch)
         i += 1
-    return KEYWORD_ARG.findall("".join(buf))
+
+    names = []
+    for segment in "".join(buf).split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if "=" in segment.replace("==", ""):
+            head = segment.split("=", 1)[0].strip()
+            if BARE_FLAG.match(head):
+                names.append((head, False))
+        elif BARE_FLAG.match(segment):
+            names.append((segment, True))
+    return names
 
 
 # A call site may qualify the macro: `#[autumn_web::repository(...)]` and
@@ -621,12 +720,12 @@ def judge_fences(rel, fence_lines, accepted, judgeable, waived):
     for macro, args, offset in find_macro_calls(text):
         if macro not in judgeable:
             continue
-        for key in top_level_keys(args):
+        for key, is_flag in top_level_keys(args):
             if key in accepted[macro]:
                 continue
             if waiver_covers(waived, macro, key, fence_start, fence_end):
                 continue
-            out.append((macro, key, f"{rel}:{line_of(offset)}"))
+            out.append((macro, key, f"{rel}:{line_of(offset)}", is_flag))
     return out
 
 
@@ -768,11 +867,12 @@ def main():
     if not defects:
         return 0
     grouped = collections.defaultdict(list)
-    for macro, key, loc in defects:
-        grouped[(macro, key)].append(loc)
-    for (macro, key), locs in sorted(grouped.items()):
+    for macro, key, loc, is_flag in defects:
+        grouped[(macro, key, is_flag)].append(loc)
+    for (macro, key, is_flag), locs in sorted(grouped.items()):
         known = ", ".join(sorted(stats["accepted"][macro])) or "(none)"
-        print(f"\n  #[{macro}({key} = …)] — {macro} has no `{key}` key", file=sys.stderr)
+        shown = key if is_flag else f"{key} = …"
+        print(f"\n  #[{macro}({shown})] — {macro} has no `{key}` key", file=sys.stderr)
         print(f"      accepts: {known}", file=sys.stderr)
         for loc in locs:
             print(f"      {loc}", file=sys.stderr)
@@ -820,10 +920,10 @@ def self_test():
             tmp.unlink()
 
     def scan_text(text, suffix):
-        return [(m, k) for m, k, _ in scan_text_full(text, suffix)]
+        return [(m, k) for m, k, _, _ in scan_text_full(text, suffix)]
 
     def scan_text_lines(text, suffix):
-        return [loc.rsplit(":", 1)[1] for _, _, loc in scan_text_full(text, suffix)]
+        return [loc.rsplit(":", 1)[1] for _, _, loc, _ in scan_text_full(text, suffix)]
 
     # The truth set is read from the macro sources, not a snapshot.
     check("secured accepts scopes", "scopes" in accepted["secured"], True)
@@ -862,6 +962,61 @@ def self_test():
             '```rust\n#[get("/a", seo(title = "T"), bogus = 1)]\n```\n', ".md"
         ),
         [("get", "bogus")],
+    )
+
+    # `crate = "…"` is stripped by `crate_path::extract_crate_override` before
+    # any macro's own parser runs, so it appears in no owner file while being
+    # valid on all 33.
+    check("crate is universal", "crate" in accepted["get"], True)
+    check(
+        "markdown: crate override is not drift",
+        scan_text('```rust\n#[get("/x", crate = "autumn_web_05")]\n```\n', ".md"),
+        [],
+    )
+
+    # Match arms carry real keys in a key dispatch and values in a value
+    # dispatch; the scrutinee is what separates them.
+    check("authorize accepts resource (key match arm)", "resource" in accepted["authorize"], True)
+    check("authorize accepts from (key match arm)", "from" in accepted["authorize"], True)
+    check(
+        "repository rejects a value match arm",
+        "delete_all" in accepted["repository"],
+        False,
+    )
+    check(
+        "markdown: a root-parser value arm is not an accepted key",
+        scan_text('```rust\n#[repository(Post, delete_all = true)]\n```\n', ".md"),
+        [("repository", "delete_all")],
+    )
+
+    # Bare flags are arguments too, and a typo in one fails the build just the
+    # same. Positional arguments are not.
+    check(
+        "markdown: a misspelled bare flag is caught",
+        scan_text("```rust\n#[job(uniqe)]\n```\n", ".md"),
+        [("job", "uniqe")],
+    )
+    check(
+        "markdown: a correct bare flag passes",
+        scan_text('```rust\n#[job(unique, queue = "mail")]\n```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: bare flags alongside a positional type pass",
+        scan_text("```rust\n#[repository(Post, api, mcp, soft_delete)]\n```\n", ".md"),
+        [],
+    )
+    check(
+        "markdown: a positional literal is not read as a flag",
+        scan_text('```rust\n#[secured("admin")]\n```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: a value after = is not read as a flag",
+        scan_text(
+            "```rust\n#[authorize(\"update\", resource = Post, from = post)]\n```\n", ".md"
+        ),
+        [],
     )
 
     # A bad key inside a fence is a defect.
