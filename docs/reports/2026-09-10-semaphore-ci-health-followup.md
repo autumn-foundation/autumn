@@ -169,9 +169,11 @@ opening a duplicate fix would be pure waste. What this pass does instead:
 
 - **`docs/ci-health/quarantine-ledger.md` updated**: the third `live_upgrade`
   signature (2026-09-09T13:59Z hit) written up in full, PR #2645's fix
-  recorded against the two mechanisms it credibly explains, the third left
-  explicitly unattributed after checking the predicate against the merged
-  source, and the entry kept **open** (not moved to Closed) pending
+  recorded against the one tracked signature it credibly explains (the
+  Linux "new build never served" hit, mechanism 2) — the macOS cluster tied
+  to the earlier #2510 instead, and this third signature left explicitly
+  unattributed to any fix after checking the predicate against the merged
+  source — and the entry kept **open** (not moved to Closed) pending
   CI-native verification — diagnosed-and-fixed is not the same claim as
   closed-per-this-role's-bar, and conflating them is exactly the "merged is
   not the same as verified" trap the 2026-09-09 report already called out
@@ -251,6 +253,9 @@ git show 8fae8af --stat   # PR #2645 merge on trunk-dev, includes the
 
 Dispatch (still requires sign-off — new macOS CI spend): `sha` pinned to
 `trunk-dev` at or after `8fae8af`, `samples: "20"` — the input's max choice,
-short of the ≥50 this role's own bar calls for on its own, so treat one
-dispatch as a first sample batch toward that total, not sufficient by
-itself, and expect to dispatch again to accumulate the rest.
+and, per the corrected rate math above (3/17 ≈ 17.6%, or 3/30 = exactly
+10% folding in the 13/13 clean samples already banked — not below 10%),
+sufficient on its own to clear this role's ≥20 bar for the macOS half in
+one dispatch. It still cannot close the whole entry: it says nothing about
+either Linux/coverage signature, which need a separate, still-unbuilt
+harness.

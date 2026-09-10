@@ -264,12 +264,22 @@ without also filling in the intake form above.
     more than one platform — without yet claiming those sensitivities
     share a mechanism. Only a rerun campaign that reproduces the *same*
     signature on both platforms would justify unifying them.
-- **Verdict not yet rendered**: whether the line-567 signature is a
+- **Verdict not yet rendered** *(superseded — see the 2026-09-10 update at
+  the top of this entry)*: whether the line-567 signature is a
   runner-class/contention timing dependence in the test's load-window
   design, a genuine narrow race in the hot-upgrade handoff
   (`autumn/src/upgrade.rs`) that slow execution merely exposes more
   reliably, or an unrelated failure mode from the 3 macOS connection-error
-  hits entirely. All three remain open.
+  hits entirely. All three remain open. **Superseded 2026-09-10**: PR
+  #2645's mechanism 2 names this exact signature in its own commit message
+  ("no read observed a v2 response inside the fixed window") and fixes it
+  as a runner-class/contention timing dependence in the test's own
+  load-window design — the first of these three options, confirmed
+  test-defect rather than a product handoff race, not merely "slow
+  execution exposing" one. Diagnosed-and-fixed still isn't the same as
+  closed-per-this-role's-bar (see the 2026-09-10 update's own closure
+  paragraph) — this note marks the verdict as rendered, not the entry as
+  closed.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
