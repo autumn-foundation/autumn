@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added client-computed, versioned and fully domain-separated blind indexes for
+  randomized encrypted fields, including canonical normalization, constant-time
+  Rust comparison, explicit collision verification, key-rotation metadata, and
+  collision-resistant migration/index names from `#[encrypted(blind_index)]`.
+
 - **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content
   management system.** `autumn new <name> --starter cms` now scaffolds a
   complete CMS, joining `saas` as the second curated built-in. The rendered
