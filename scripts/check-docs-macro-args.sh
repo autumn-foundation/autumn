@@ -956,11 +956,21 @@ def top_level_keys(args, macro=None):
 # attribute. Verified with rustc rather than assumed. There are three gaps in
 # an attribute head, not two, and all three are walked the same way.
 ATTR_SIGIL = re.compile(r"#")
-MACRO_NAME = re.compile(
-    r"(?:autumn_web::|autumn_macros::|autumn::)?("
-    + "|".join(sorted(OWNERS))
-    + r")\b"
-)
+# A leading `::` is a valid path root, so `#[::autumn_web::secured(…)]` is the
+# same macro as `#[autumn_web::secured(…)]`. It is allowed ONLY in front of a
+# known crate prefix, and the crate prefix only immediately in front of a macro
+# name. Both restrictions are load-bearing rather than tidiness:
+#
+#   `#[::secured(…)]`                                    — a crate NAMED
+#       `secured`, not this macro.
+#   `#[::autumn_web::reexports::axum::routing::get(…)]`  — axum's router
+#       macro, re-exported. It is spelled `get`, takes a path literal, and
+#       has none of `#[get]`'s keyword grammar. It appears in this repo.
+#
+# Widening the path to "any segments ending in a known name" would report the
+# second as `#[get]` drift, which is a false positive on valid Rust.
+_CRATE_PREFIX = r"(?:(?:::)?(?:autumn_web|autumn_macros|autumn)::)?"
+MACRO_NAME = re.compile(_CRATE_PREFIX + r"(" + "|".join(sorted(OWNERS)) + r")\b")
 CFG_ATTR_NAME = re.compile(r"cfg_attr\b")
 
 
@@ -994,9 +1004,7 @@ def _delimited_at(text, i, name_re):
 # follow it (`cfg_attr(feature = "a", inline, secured(…))`), so a `[^,]+`
 # prefix stopped at the predicate's first comma and saw no later payload.
 BARE_MACRO_NAME = re.compile(
-    r"(?:autumn_web::|autumn_macros::|autumn::)?("
-    + "|".join(sorted(OWNERS))
-    + r")\b"
+    _CRATE_PREFIX + r"(" + "|".join(sorted(OWNERS)) + r")\b"
 )
 BARE_CFG_ATTR_NAME = re.compile(r"cfg_attr\b")
 
@@ -1998,6 +2006,40 @@ def self_test():
         "markdown: a lone hash is not an attribute",
         scan_text('```rust\nlet n = 1; // # secured(policy = "x")\n```\n', ".md"),
         [],
+    )
+    # A leading `::` is a valid path root, but only in front of a known crate
+    # prefix — and the prefix only immediately in front of a macro name. The
+    # three negatives below are why: each is valid Rust that is NOT this macro.
+    check(
+        "markdown: a root-qualified path is the same macro",
+        scan_text('```rust\n#[::autumn_web::secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a crate merely NAMED like a macro is not it",
+        scan_text('```rust\n#[::secured(policy = "x")]\n```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: axum's re-exported get is not autumn's get",
+        scan_text(
+            '```rust\n#[::autumn_web::reexports::axum::routing::get("/x")]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: an unknown crate path is not assumed to be autumn's",
+        scan_text('```rust\n#[some_other::secured(policy = "x")]\n```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: a root-qualified cfg_attr payload is reached",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "a", ::autumn_web::secured(policy = "x"))]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
     )
 
     # `x == "…"` names a key only when `x` is one. `window != "pending"` and
