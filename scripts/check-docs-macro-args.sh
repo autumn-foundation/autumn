@@ -1504,7 +1504,15 @@ def _fence_body(line, base=0):
     `    > ```rust` is an indented code block DISPLAYING a quoted fence, not a
     quote containing one. Stripping the prefix first also stripped the
     indentation that says so, and the display was judged as live Rust.
+
+    A list marker on the same line is removed as well: `- ```rust` opens a
+    fence in the item it introduces. The previous round recorded the content
+    column such a marker establishes but still handed the marker itself to the
+    fence test, which then saw `-` where the delimiter should be.
     """
+    marker = LIST_MARKER.match(line)
+    if marker is not None:
+        line = " " * _list_content_column(line, marker) + line[marker.end() :]
     if _indent_width(line) - base > FENCE_INDENT_MAX:
         return line
     return BLOCKQUOTE.sub("", line)
@@ -1519,9 +1527,14 @@ def _fence_body(line, base=0):
 LIST_MARKER = re.compile(r"^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+)")
 
 
-def _list_content_column(line):
-    """The content column a list marker on `line` opens, or None."""
-    m = LIST_MARKER.match(line)
+def _list_content_column(line, marker=None):
+    """The content column a list marker on `line` opens, or None.
+
+    `marker` lets a caller that has already matched pass its match in. The
+    corpus is 1.4M lines and this pattern was being run three times over each
+    of them, which measurably slowed the whole gate.
+    """
+    m = marker if marker is not None else LIST_MARKER.match(line)
     if m is None:
         return None
     return _indent_width(m.group(1)) + len(m.group(2)) + _indent_width(m.group(3))
@@ -1592,8 +1605,17 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         # `<!--` inside an inline code span is text about a comment, not one.
         # A page explaining the marker would otherwise open a comment that
         # never closes and swallow the rest of the file.
+        # …and an over-indented line is an indented code block DISPLAYING the
+        # marker, so it does not open a comment either. This check runs before
+        # the fence machinery, so it has to apply the indentation rule itself.
         markup = INLINE_CODE.sub("", line)
-        if open_char is None and "<!--" in markup and "-->" not in markup.split("<!--", 1)[1]:
+        displayed = _indent_width(line) - list_col > FENCE_INDENT_MAX
+        if (
+            open_char is None
+            and not displayed
+            and "<!--" in markup
+            and "-->" not in markup.split("<!--", 1)[1]
+        ):
             in_html_comment = True
             continue
         if open_char is None:
@@ -1684,6 +1706,31 @@ def _doc_attr_text(line):
     end = skip_literal(rest, 0)
     return _decode_rust_string(rest[1 : end - 1])
 
+
+def _doc_attr_at(lines, idx):
+    """`(markdown, lines consumed)` for a doc attribute at `lines[idx]`.
+
+    A doc attribute may span source lines — the raw form
+    `#[doc = r#"…"#]` is the natural way to write a multi-line one, and an
+    ordinary string literal may carry newlines too. Reading only the first line
+    left the rest to be scanned as Rust source, so such an attribute went
+    unread. Lines are joined until the literal closes.
+    """
+    if DOC_ATTR.match(lines[idx]) is None:
+        return None, 1
+    joined = lines[idx]
+    for end in range(idx, min(idx + _DOC_ATTR_MAX_LINES, len(lines))):
+        if end > idx:
+            joined += "\n" + lines[end]
+        text = _doc_attr_text(joined)
+        if text is not None:
+            return text, end - idx + 1
+    return None, 1
+
+
+# An unterminated literal must not make the reader walk the whole file for
+# every `#[doc` it sees; past this it is left unread, which is a miss.
+_DOC_ATTR_MAX_LINES = 400
 
 _SIMPLE_ESCAPES = {
     "n": "\n",
@@ -1810,14 +1857,16 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     # equivalent to, so every rule below — fences, block quotes, indentation,
     # list columns — applies to it without a second implementation. The source
     # line number is kept, so a defect still points at the attribute.
-    stream = []
-    for lineno, line in enumerate(lines, 1):
-        text = _doc_attr_text(line)
+    stream, idx = [], 0
+    while idx < len(lines):
+        text, used = _doc_attr_at(lines, idx)
         if text is None:
-            stream.append((lineno, line))
+            stream.append((idx + 1, lines[idx]))
+            idx += 1
             continue
         for md in text.split("\n"):
-            stream.append((lineno, "/// " + md))
+            stream.append((idx + 1, "/// " + md))
+        idx += used
     for lineno, line in stream:
         # `/** … */` and `/*! … */` are doc comments too, and `rustdoc --test`
         # collects and runs their fences exactly as it does `///`'s. Only the
@@ -1835,9 +1884,12 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # --test` includes the middle line of `/// ```` / `/** let x = 41; */`
         # / `/// assert_eq!(x + 1, 42);` and the doctest passes, which is how
         # this was settled.
-        elif (
-            re.match(r"^\s*/\*[*!]", line)
-            and not re.match(r"^\s*/\*\*/", line)  # `/**/` is an ordinary comment
+        # `/***` is an ordinary block comment, not a doc comment — `rustdoc
+        # --test` reports zero tests for a fence inside one, where `/**`
+        # reports one. Classifying it as doc failed the gate on a commented-out
+        # or displayed example. `/**/` is ordinary for the same reason.
+        elif re.match(r"^\s*/\*(?:\*(?!\*)|!)", line) and not re.match(
+            r"^\s*/\*\*/", line
         ):
             body_after = re.sub(r"^\s*/\*[*!]\s?", "", line)
             doc_text, in_block_doc = _block_doc_split(body_after, 1)
@@ -2585,6 +2637,51 @@ def self_test():
         scan_text(
             '/// ```\n/* multi\n   line */\n/// #[secured(policy = "x")]\n/// ```\n'
             'pub fn h() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # A fence may begin on the marker's own line.
+    check(
+        "markdown: a fence on the list marker's line is scanned",
+        scan_text('- ```rust\n  #[secured(policy = "x")]\n  ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: an ordered marker's line too",
+        scan_text('1. ```rust\n   #[secured(policy = "x")]\n   ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    # An over-indented `<!--` is a DISPLAY of the marker, so it opens nothing —
+    # otherwise an unclosed one swallows every later fence.
+    check(
+        "markdown: an indented comment marker does not swallow later fences",
+        scan_text(
+            'shown\n\n    <!-- opener with no closer\n\n```rust\n'
+            '#[secured(policy = "x")]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    # `/***` is an ordinary block comment: rustdoc reports zero tests for a
+    # fence inside one, where `/**` reports one.
+    check(
+        "rustdoc: a triple-star comment is not a doc comment",
+        scan_text('/***\n```\n#[secured(policy = "x")]\n```\n*/\npub fn f() {}\n', ".rs"),
+        [],
+    )
+    check(
+        "rustdoc: a double-star comment still is",
+        scan_text('/**\n```\n#[secured(policy = "x")]\n```\n*/\npub fn f() {}\n', ".rs"),
+        [("secured", "policy")],
+    )
+    # A doc attribute may span source lines; the raw form is how a multi-line
+    # one is normally written.
+    check(
+        "rustdoc: a multi-line raw doc attribute is scanned",
+        scan_text(
+            '#[doc = r#"\n```ignore\n#[secured(policy = "x")]\n```\n"#]\n'
+            'pub fn g() {}\n',
             ".rs",
         ),
         [("secured", "policy")],
