@@ -800,6 +800,20 @@ RUSTDOC_CRATES = (
 )
 
 BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+
+
+def _quote_depth(line):
+    """How many block-quote levels `line` opens with.
+
+    A fence belongs to the quote it opened in, so membership is a depth and not
+    a flag: `> ```rust` after a `>> ```rust` opener is OUTSIDE the inner quote,
+    which ends there and takes the fence with it. `rustdoc --test` collects that
+    pair as two EMPTY doctests, so the line between them was never code.
+    """
+    m = BLOCKQUOTE.match(line)
+    return 0 if m is None else m.group(0).count(">")
+
+
 # A code span, so that markup markers quoted inside one are read as text.
 INLINE_CODE = re.compile(r"(`+)(?:(?!\1).)*\1")
 WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([A-Za-z_0-9]+)")
@@ -1693,6 +1707,40 @@ def _fence_lang(suffix):
     return re.split(r"[,\s]", suffix.strip().lower())[0]
 
 
+def _left_its_container(line, quotes, list_col):
+    """Whether `line` has stepped outside the containers an open fence sits in.
+
+    A fence belongs to the block quote and the list item it opened in, and ends
+    with either of them. Quote membership is a depth; list membership is the
+    content column, measured after the quote prefix so a fence inside both is
+    judged on the right text.
+
+    A blank line is never a boundary: it ends neither a list item nor a fence.
+    """
+    if quotes and _quote_depth(line) < quotes:
+        return True
+    # Exactly the levels the fence sits in, never every `>` on the line: inside
+    # a fence a `>` is code, and `> + Send + 'a>> {` — a trait bound in
+    # `docs/guide/mail.md` — read as a quote prefix, left the rest at column 0
+    # and closed a live fence in the middle of a Rust example.
+    body = _strip_quotes(line, quotes)
+    return bool(list_col) and bool(body.strip()) and _indent_width(body) < list_col
+
+
+def _strip_quotes(line, levels):
+    """`line` with exactly `levels` block-quote markers removed."""
+    i = 0
+    for _ in range(levels):
+        while i < len(line) and line[i] in " \t":
+            i += 1
+        if i >= len(line) or line[i] != ">":
+            break
+        i += 1
+        if i < len(line) and line[i] in " \t":
+            i += 1
+    return line[i:]
+
+
 def _fence_at(body, base=0):
     """`(char, length, suffix)` when `body` is a fence line, else None.
 
@@ -1737,7 +1785,8 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len, list_col, fence_quoted = None, 0, 0, False
+    open_char, open_len, list_col = None, 0, 0
+    fence_quotes, fence_list_col = 0, 0
     in_html_comment = False
     # Code spans are resolved for the whole file up front rather than carried
     # line by line: only a run with a matching close is a span, and that cannot
@@ -1777,12 +1826,17 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
         # the prose after it as Rust. `rustdoc --test` shows the truth plainly:
         # the quoted fences collect as two EMPTY doctests, so the unprefixed
         # line between them was never code.
-        if open_char is not None and fence_quoted and not BLOCKQUOTE.match(line):
+        # A fence opened inside a list item belongs to that item, and the item
+        # ends where the content column stops being honoured. Keeping the stale
+        # column read the unindented line as fence content instead.
+        if open_char is not None and _left_its_container(
+            line, fence_quotes, fence_list_col
+        ):
             if inside:
                 collected.append(current)
                 current = []
             inside, open_char, open_len = False, None, 0
-        body = _fence_body(line, list_col, open_char is not None, fence_quoted)
+        body = _fence_body(line, list_col, open_char is not None, fence_quotes > 0)
         fence = _fence_at(body, list_col)
         handled = False
         if fence:
@@ -1793,7 +1847,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
                 # a fence; treating the inner delimiter as live structure made
                 # the displayed attribute fail the gate.
                 open_char, open_len = char, length
-                fence_quoted = BLOCKQUOTE.match(line) is not None
+                fence_quotes, fence_list_col = _quote_depth(line), list_col
                 inside = _fence_lang(suffix) == "rust"
                 if inside:
                     fences += 1
@@ -1889,24 +1943,81 @@ def _doc_attr_at(lines, idx):
     """
     conditional = DOC_ATTR.match(lines[idx]) is None
     if conditional and CFG_ATTR_DOC.match(lines[idx]) is None:
-        return None, 1
+        return None, 1, ""
     joined = lines[idx]
     for end in range(idx, min(idx + _DOC_ATTR_MAX_LINES, len(lines))):
         if end > idx:
             joined += "\n" + lines[end]
-        text = (
-            _cfg_attr_doc_text(joined) if conditional else _doc_attr_text(joined)
-        )
+        text = _cfg_attr_docs(joined) if conditional else _doc_attr_text(joined)
         if text is not None:
-            return text, end - idx + 1
-    return None, 1
+            # `""` means the attribute was read and supplies nothing — a false
+            # cfg predicate. Stop here rather than joining more lines looking
+            # for a parse that already happened, and hand the line back as
+            # ordinary source, which is what it is.
+            return text or None, end - idx + 1, _attr_tail(joined)
+    return None, 1, ""
 
 
-def _cfg_attr_doc_text(text):
-    """The markdown a `#[cfg_attr(…, doc = "…")]` supplies, or None.
+def _attr_tail(joined):
+    """Source following the `#[…]` that `joined` begins with, on its last line."""
+    open_at = joined.find("[")
+    if open_at == -1:
+        return ""
+    end = _close_of(joined, open_at + 1, "[")
+    return "" if end is None else joined[end + 1 :].split("\n")[-1]
+
+
+def _cfg_true(pred):
+    """Truth of a cfg predicate under rustdoc: True, False, or None for unknown.
+
+    rustdoc builds documentation with `cfg(doc)` set, so `#[cfg_attr(not(doc),
+    doc = "…")]` can never supply a page — `rustdoc --test` reports zero tests
+    for a fence inside one, where the gate was reading the string and failing CI
+    on an example no reader can reach.
+
+    Only `doc` itself is decided. Every other predicate is unknown and its
+    documentation is read, because a predicate that IS live carries a fence a
+    reader copies, and refusing to read it puts the gate back to sleep. So this
+    subtracts provably-dead documentation and nothing else.
+    """
+    pred = pred.strip()
+    if pred == "doc":
+        return True
+    m = re.match(r"^(not|all|any)\s*\(", pred)
+    if m is None:
+        return None
+    end = _close_of(pred, m.end(), "(")
+    if end is None:
+        return None
+    body = pred[m.end() : end]
+    parts = [_cfg_true(body[a:b]) for a, b in _split_top_level(body)]
+    op = m.group(1)
+    if op == "not":
+        if len(parts) != 1 or parts[0] is None:
+            return None
+        return not parts[0]
+    if not parts:
+        return None
+    if op == "all":
+        if any(p is False for p in parts):
+            return False
+        return True if all(p is True for p in parts) else None
+    if any(p is True for p in parts):
+        return True
+    return False if all(p is False for p in parts) else None
+
+
+def _cfg_attr_docs(text):
+    """The markdown a `cfg_attr` supplies: the text, `""` for none, None if unread.
 
     One attribute may carry several `doc =` items; they are joined in order,
-    exactly as rustdoc concatenates them.
+    exactly as rustdoc concatenates them. An item may itself be a `cfg_attr`,
+    which rustdoc expands the same way — reading only direct `doc =` items
+    dropped a nested one whose fence rustdoc collects as a doctest.
+
+    `""` and None are different answers: the first says the attribute was read
+    and documents nothing, so the line is ordinary source; the second says it
+    could not be read at all.
     """
     m = CFG_ATTR_DOC.match(text)
     if m is None:
@@ -1914,16 +2025,33 @@ def _cfg_attr_doc_text(text):
     end = _close_of(text, m.end(), "(")
     if end is None:
         return None
+    body = text[m.end() : end]
+    items = _split_top_level(body)
+    if not items:
+        return None
+    if _cfg_true(body[items[0][0] : items[0][1]]) is False:
+        return ""
     docs = []
-    for start, stop in _split_top_level(text[m.end() : end]):
-        item = text[m.end() :][start:stop]
-        if DOC_ITEM.match(item) is None:
+    for start, stop in items[1:]:
+        item = body[start:stop]
+        if CFG_ATTR_DOC.match("#[" + item.strip()) is not None:
+            got = _cfg_attr_docs("#[" + item.strip() + "]")
+            if got == "":
+                continue
+        elif DOC_ITEM.match(item) is not None:
+            got = _doc_attr_text("#[" + item.strip())
+        else:
             continue
-        got = _doc_attr_text("#[" + item.strip())
         if got is None:
             return None
         docs.append(got)
-    return "\n".join(docs) if docs else None
+    return "\n".join(docs)
+
+
+def _cfg_attr_doc_text(text):
+    """`_cfg_attr_docs`, with "documents nothing" folded back into None."""
+    got = _cfg_attr_docs(text)
+    return got or None
 
 
 # An unterminated literal must not make the reader walk the whole file for
@@ -2011,7 +2139,18 @@ def _after_attribute(line):
 
 def _bracket_delta(text):
     """Net bracket depth `text` adds, skipping literals and comments."""
-    depth, i = 0, 0
+    return _bracket_close(text, 0)[0]
+
+
+def _bracket_close(text, depth):
+    """`(depth after `text`, source after the depth first returned to zero)`.
+
+    A multi-line attribute may close on the line that starts its item —
+    `dead_code)] pub fn a() {}`. The whole line was skipped as attribute
+    continuation, so an open fence above it ran into the next item's docs. The
+    tail is what lets the caller see that boundary.
+    """
+    tail, i = None, 0
     while i < len(text):
         ch = text[i]
         if ch == "/":
@@ -2035,8 +2174,10 @@ def _bracket_delta(text):
             depth += 1
         elif ch in ")]}":
             depth -= 1
+            if depth <= 0 and tail is None:
+                tail = text[i + 1 :]
         i += 1
-    return depth
+    return depth, tail or ""
 
 
 def _block_doc_split(text, depth):
@@ -2099,7 +2240,8 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len, list_col, fence_quoted = None, 0, 0, False
+    open_char, open_len, list_col = None, 0, 0
+    fence_quotes, fence_list_col = 0, 0
     in_block_doc, attr_depth, comment_depth = 0, 0, 0
     in_html_comment, pending_item = False, False
     # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
@@ -2108,13 +2250,20 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     # line number is kept, so a defect still points at the attribute.
     stream, idx = [], 0
     while idx < len(lines):
-        text, used = _doc_attr_at(lines, idx)
+        text, used, tail = _doc_attr_at(lines, idx)
         if text is None:
             stream.append((idx + 1, lines[idx]))
             idx += 1
             continue
         for md in text.split("\n"):
             stream.append((idx + 1, "/// " + md))
+        # The expansion emitted only the markdown, so an item sharing the
+        # attribute's line — `#[doc = "```rust"] pub fn a() {}` — vanished and a
+        # later item's docs were merged into the still-open fence. The tail is
+        # real source, so putting it back lets the scanner's own item rule end
+        # the fence exactly where rustdoc ends it.
+        if _tail_is_item(tail):
+            stream.append((idx + used, tail))
         idx += used
     # Code spans are resolved over the stream for the same reason as in the
     # page scanner. Last commit wired this into the page half and left the doc
@@ -2193,9 +2342,15 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             # ending the fence — the previous commit handled the one-line form
             # and stopped there.
             bare = line.strip()
+            # A multi-line attribute may close on the line that starts its item
+            # — `dead_code)] pub fn a() {}`. Skipping the whole line as
+            # continuation carried an open fence into the next item's docs, the
+            # same defect the one-line form already guards against.
             if attr_depth > 0:
-                attr_depth = max(0, attr_depth + _bracket_delta(line))
-                continue
+                depth, tail = _bracket_close(line, attr_depth)
+                attr_depth = max(0, depth)
+                if attr_depth > 0 or not _tail_is_item(tail):
+                    continue
             # An ordinary block comment is a gap like a line comment or a blank
             # line: rustdoc concatenates the doc attributes on either side of
             # it. Only the line forms were exempt, so `/* note */` between two
@@ -2264,17 +2419,18 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 list_col = col
             elif doc.group(1).strip() and _indent_width(doc.group(1)) == 0:
                 list_col = 0
-        # Same rule as the page scanner: an unquoted line ends a quoted fence.
-        if (
-            open_char is not None
-            and fence_quoted
-            and not BLOCKQUOTE.match(doc.group(1))
+        # Same rule as the page scanner: a fence ends with the quote or the
+        # list item it opened in.
+        if open_char is not None and _left_its_container(
+            doc.group(1), fence_quotes, fence_list_col
         ):
             if inside:
                 collected.append(current)
                 current = []
             inside, open_char, open_len = False, None, 0
-        body = _fence_body(doc.group(1), list_col, open_char is not None, fence_quoted)
+        body = _fence_body(
+            doc.group(1), list_col, open_char is not None, fence_quotes > 0
+        )
         fence = _fence_at(body, list_col)
         handled = False
         if fence:
@@ -2287,7 +2443,8 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 # match whole here too, or ```rustic reads as Rust.
                 token = _fence_lang(suffix)
                 open_char, open_len = char, length
-                fence_quoted = BLOCKQUOTE.match(doc.group(1)) is not None
+                fence_quotes = _quote_depth(doc.group(1))
+                fence_list_col = list_col
                 # Enumerated against `rustdoc --test` rather than recalled, with
                 # a bogus attribute as the control: `standalone_crate` and
                 # `ignore-<reason>` both collect a doctest, `custom` does not.
@@ -3204,6 +3361,139 @@ def self_test():
         scan_text(
             '#[cfg_attr(doc, doc = "```\\n#[secured(policy = \\"x\\")]\\n```")]\n'
             'pub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # rustdoc builds with `cfg(doc)` set, so a predicate that is false there
+    # supplies no page at all — and an unknown one is read, not guessed at.
+    check(
+        "rustdoc: a conditional doc attribute rustdoc cannot reach is skipped",
+        scan_text(
+            '#[cfg_attr(not(doc), doc = "```rust\\n#[secured(policy = \\"x\\")]\\n```")]\n'
+            'pub fn g() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    check(
+        "rustdoc: an all() predicate with a dead term is skipped",
+        scan_text(
+            '#[cfg_attr(all(doc, not(doc)), doc = "```rust\\n'
+            '#[secured(policy = \\"x\\")]\\n```")]\npub fn g() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    # A feature predicate is not decided here, and is read rather than skipped:
+    # `autumn`'s docs.rs metadata names its feature set, so a fence behind one
+    # is a page the reader lands on. Skipping every predicate this cannot prove
+    # would put most of the conditional documentation back out of reach.
+    check(
+        "rustdoc: a predicate this gate cannot decide is still read",
+        scan_text(
+            '#[cfg_attr(feature = "x", doc = "```rust\\n'
+            '#[secured(policy = \\"x\\")]\\n```")]\npub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an any() predicate with one live term is still read",
+        scan_text(
+            '#[cfg_attr(any(not(doc), doc), doc = "```rust\\n'
+            '#[secured(policy = \\"x\\")]\\n```")]\npub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a nested conditional doc attribute is scanned",
+        scan_text(
+            '#[cfg_attr(doc, cfg_attr(doc, doc = "```rust\\n'
+            '#[secured(policy = \\"x\\")]\\n```"))]\npub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # A fence belongs to the containers it opened in and ends with either.
+    check(
+        "markdown: a list-owned fence ends when its list item does",
+        scan_text('- ```rust\n#[secured(policy = "x")]\n```\n', ".md"),
+        [],
+    )
+    check(
+        "rustdoc: a list-owned fence ends when its list item does",
+        scan_text(
+            '/// - ```rust\n/// #[secured(policy = "x")]\n/// ```\npub fn a() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    check(
+        "rustdoc: a list-owned fence survives a blank line",
+        scan_text(
+            '/// - ```rust\n///\n///   #[secured(policy = "x")]\n///   ```\n'
+            'pub fn a() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a shallower quote ends a fence opened in a deeper one",
+        scan_text(
+            '/// >> ```rust\n/// > #[secured(policy = "x")]\n/// >> ```\n'
+            'pub fn a() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    check(
+        "rustdoc: the opener's own quote depth is still inside",
+        scan_text(
+            '/// >> ```rust\n/// >> #[secured(policy = "x")]\n/// >> ```\n'
+            'pub fn a() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # A `>` inside an unquoted fence is Rust, not a container prefix.
+    check(
+        "markdown: a trait bound is not a quote prefix",
+        scan_text(
+            '- item\n\n  ```rust\n  fn f() -> Box<dyn T\n  > + Send> {}\n'
+            '  #[secured(policy = "x")]\n  ```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    # An item sharing a line with an attribute ends the documentation above it,
+    # whichever form that attribute takes and wherever it closes.
+    check(
+        "rustdoc: an explicit doc attribute beside an item ends the fence",
+        scan_text(
+            '#[doc = "```rust"] pub fn a() {}\n\n'
+            '/// Older builds spelled it `#[secured(policy = "x")]`.\n'
+            'pub fn b() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    check(
+        "rustdoc: a multiline attribute closing beside an item ends the fence",
+        scan_text(
+            '/// ```rust\n#[allow(\ndead_code)] pub fn a() {}\n\n'
+            '/// Older builds spelled it `#[secured(policy = "x")]`.\n'
+            'pub fn b() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    check(
+        "rustdoc: a multiline attribute closing alone is still a gap",
+        scan_text(
+            '/// ```rust\n#[allow(\ndead_code)]\n/// #[secured(policy = "x")]\n'
+            '/// ```\npub fn a() {}\n',
             ".rs",
         ),
         [("secured", "policy")],
