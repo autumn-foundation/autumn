@@ -1512,7 +1512,12 @@ def _fence_body(line, base=0):
     """
     marker = LIST_MARKER.match(line)
     if marker is not None:
-        line = " " * _list_content_column(line, marker) + line[marker.end() :]
+        col = _list_content_column(line, marker)
+        # Only the padding actually consumed is dropped; any beyond it stays as
+        # indentation, which is what makes an over-padded marker introduce an
+        # indented code block rather than a fence.
+        used = col - _indent_width(marker.group(1)) - len(marker.group(2))
+        line = " " * col + line[len(marker.group(1)) + len(marker.group(2)) + used :]
     if _indent_width(line) - base > FENCE_INDENT_MAX:
         return line
     return BLOCKQUOTE.sub("", line)
@@ -1537,10 +1542,44 @@ def _list_content_column(line, marker=None):
     m = marker if marker is not None else LIST_MARKER.match(line)
     if m is None:
         return None
-    return _indent_width(m.group(1)) + len(m.group(2)) + _indent_width(m.group(3))
+    # CommonMark counts only 1-4 spaces after the marker as padding. At five or
+    # more, one space is padding and the REST is indentation, so `-     ```rust`
+    # opens an indented code block displaying the delimiter rather than a fence.
+    # Adding the whole run made that display live Rust and failed the gate on it.
+    pad = _indent_width(m.group(3))
+    return _indent_width(m.group(1)) + len(m.group(2)) + (1 if pad >= 5 else pad)
 
 
-def _html_comment_step(text, inside, fence_open, base):
+def _mask_code_spans(text, open_len):
+    """`(text with code spans removed, run length still open)`.
+
+    A code span may cross a physical newline, so a per-line regex could not see
+    that `<!--` on its own line sat inside one — and the marker then opened a
+    comment that swallowed every later fence. A span opens on a backtick run
+    and closes on a run of the same length; the caller resets the state on a
+    blank line, which is where CommonMark ends one.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] != "`":
+            if not open_len:
+                out.append(text[i])
+            i += 1
+            continue
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        run = j - i
+        if open_len:
+            if run == open_len:
+                open_len = 0
+        else:
+            open_len = run
+        i = j
+    return "".join(out), open_len
+
+
+def _html_comment_step(text, inside, fence_open, base, code_span=0):
     """`(skip this line, still inside)` for HTML-comment tracking.
 
     A fence inside an HTML comment is not rendered, so a reader can neither see
@@ -1556,8 +1595,10 @@ def _html_comment_step(text, inside, fence_open, base):
     because an opener with no closer swallows everything after it.
     """
     if inside:
-        return True, "-->" not in text
-    markup = INLINE_CODE.sub("", text)
+        return True, "-->" not in text, code_span
+    if not text.strip():
+        code_span = 0  # CommonMark: a code span cannot contain a blank line
+    markup, code_span = _mask_code_spans(text, code_span)
     displayed = _indent_width(text) - base > FENCE_INDENT_MAX
     if (
         not fence_open
@@ -1565,8 +1606,8 @@ def _html_comment_step(text, inside, fence_open, base):
         and "<!--" in markup
         and "-->" not in markup.split("<!--", 1)[1]
     ):
-        return True, True
-    return False, False
+        return True, True, code_span
+    return False, False, code_span
 
 
 def _fence_lang(suffix):
@@ -1620,15 +1661,15 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
-    in_html_comment = False
+    in_html_comment, code_span = False, 0
     for lineno, line in enumerate(lines, 1):
         # A fence inside an HTML comment is not rendered, so a reader cannot
         # see or copy it — and the gate was failing CI on a block someone had
         # deliberately commented OUT. Only tracked outside a fence, where
         # `<!--` is markup rather than code. Waivers are unaffected: they are
         # collected from the raw lines, not from this scan.
-        skip, in_html_comment = _html_comment_step(
-            line, in_html_comment, open_char is not None, list_col
+        skip, in_html_comment, code_span = _html_comment_step(
+            line, in_html_comment, open_char is not None, list_col, code_span
         )
         if skip:
             continue
@@ -1879,7 +1920,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
     in_block_doc, attr_depth, comment_depth = 0, 0, 0
-    in_html_comment = False
+    in_html_comment, code_span = False, 0
     # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
     # equivalent to, so every rule below — fences, block quotes, indentation,
     # list columns — applies to it without a second implementation. The source
@@ -1990,8 +2031,8 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # A doc comment is markdown, so an HTML comment hides a fence here too —
         # `rustdoc --test` reports no tests for one. Same step as the page
         # scanner rather than a second copy of it.
-        skip, in_html_comment = _html_comment_step(
-            doc.group(1), in_html_comment, open_char is not None, list_col
+        skip, in_html_comment, code_span = _html_comment_step(
+            doc.group(1), in_html_comment, open_char is not None, list_col, code_span
         )
         if skip:
             continue
@@ -2014,8 +2055,15 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 # match whole here too, or ```rustic reads as Rust.
                 token = _fence_lang(suffix)
                 open_char, open_len = char, length
+                # Enumerated against `rustdoc --test` rather than recalled, with
+                # a bogus attribute as the control: `standalone_crate` and
+                # `ignore-<reason>` both collect a doctest, `custom` does not.
+                # The `-reason` form was a miss I noted several rounds ago and
+                # left, on the same "nobody writes that" reasoning that was
+                # wrong about raw identifiers.
                 inside = token == "" or re.fullmatch(
-                    r"rust|ignore|no_run|compile_fail|should_panic|edition\d+",
+                    r"rust|ignore(?:-[\w-]+)?|no_run|compile_fail|should_panic"
+                    r"|edition\d+|standalone_crate",
                     token,
                 ) is not None
                 if inside:
@@ -2748,6 +2796,45 @@ def self_test():
             ".rs",
         ),
         [("secured", "policy")],
+    )
+    # Only 1-4 spaces after a list marker are padding. At five, one is padding
+    # and the rest is indentation, so the fence is a display.
+    check(
+        "markdown: an over-padded list marker introduces a display",
+        scan_text('-     ```rust\n      #[secured(policy = "x")]\n      ```\n', ".md"),
+        [],
+    )
+    check(
+        "markdown: four spaces of padding is still a fence",
+        scan_text('-    ```rust\n     #[secured(policy = "x")]\n     ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    # A code span may cross a newline, so the marker inside one is still text.
+    check(
+        "markdown: a multi-line code span does not open a comment",
+        scan_text(
+            'A marker `start\n<!--\nend` then\n\n```rust\n'
+            '#[secured(policy = "x")]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    # Enumerated against `rustdoc --test`: these collect a doctest, `custom`
+    # does not.
+    check(
+        "rustdoc: a standalone_crate fence is Rust",
+        scan_text('//! ```standalone_crate\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an ignore fence with a reason is Rust",
+        scan_text('//! ```ignore-wasm\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an unknown fence attribute is not Rust",
+        scan_text('//! ```custom\n//! #[secured(policy = "x")]\n//! ```\n', ".rs"),
+        [],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
     check(
