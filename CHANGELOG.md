@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **autumn-media: room heartbeat, and a deploy that provisions what it
+  preflights (#1974):** mesh-room participants can now hold a seat with an
+  explicit `POST /api/media/rooms/{room_id}/heartbeat`. Previously the only
+  liveness signal was a member-gated roster poll, so a client that used the
+  join response and its own peer connections — but never re-polled — was reaped
+  after the idle TTL. The heartbeat refreshes `last_seen_at` and renews the
+  advisory `token_expires_at` to `now + room_token_ttl_seconds`; the token value
+  never rotates, so an in-flight roster poll keeps working. Like the roster it is
+  fail-closed: an unknown room, unknown participant and wrong token are one
+  indistinguishable `404`, so a heartbeat is not a membership oracle. Both the
+  in-memory and DB-backed stores implement it, the latter as a single
+  constant-time-verified update that treats a concurrently-reaped seat as gone.
+  `RoomStore` gains a required `heartbeat` method, so an out-of-tree store must
+  implement it.
+  On the deploy side, `autumn deploy` now `mkdir -p`s `[media.mediamtx]
+  recordings_dir` alongside the config parent, and its recordings-dir preflight
+  accepts a directory that is absent under a writable parent — a fresh host was
+  previously fail-closed out of the very provisioning step that would have
+  created the directory. A new pure-config preflight also grades each MediaMTX
+  listener port against the app-side `[media.mediamtx] *_base` URL that calls it:
+  customizing a port without updating its base URL used to deploy cleanly and
+  fail every request at runtime, and now aborts before cutover. A base URL with
+  no explicit port (reverse-proxied) is skipped, and one carrying a `${...}`
+  placeholder is deferred to runtime as a non-blocking warning, matching the
+  FFmpeg preflight. Finally, `MediaConfig::validate` now rejects an S3 backend on
+  a generic (non-Tigris) endpoint with no `public_base_url`, the same rule
+  `MediaStorage::from_config` already enforced, so config validation and storage
+  construction agree.
+
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
   The backup is SQLite's own `VACUUM INTO` — one transactional statement, so the

@@ -2921,8 +2921,9 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
         println!("  {}. [{}]", i + 1, op.label());
     }
     println!(
-        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}",
+        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}, {}",
         media::CHECK_MEDIAMTX_PORTS_DISTINCT,
+        media::CHECK_MEDIAMTX_PORTS_MATCH_BASES,
         media::CHECK_FFMPEG_PREFLIGHT,
         media::CHECK_MEDIAMTX_BINARY,
         media::CHECK_RECORDINGS_DIR_WRITABLE,
@@ -2936,8 +2937,9 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
 }
 
 /// Grade the media host with the fail-closed, **non-mutating** doctor checks
-/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable, ports
-/// distinct/available) and abort the deploy on any **blocking** failure — so a
+/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable/creatable,
+/// ports distinct/available, ports matching the app's base URLs) and abort the
+/// deploy on any **blocking** failure — so a
 /// host that cannot serve media fails fast BEFORE the app deploy touches
 /// anything. A **deferred** check (an env/interpolation-indirected
 /// `[media.ffmpeg] bin` the deployed service resolves from its own runtime

@@ -66,10 +66,11 @@ pub use retention::{
     sweep_recordings_root, within_root,
 };
 pub use rooms::{
-    InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse, LeaveRequest, ParticipantView,
-    PublishTarget, ReapFuture, ReapStats, RoomError, RoomLeaveResponse, RoomService, RoomSnapshot,
-    RoomStore, RoomStoreFuture, SessionToken, SubscribeTarget, room_participant_path,
-    room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
+    HeartbeatRequest, HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse,
+    LeaveRequest, ParticipantView, PublishTarget, ReapFuture, ReapStats, RoomError,
+    RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore, RoomStoreFuture, SessionToken,
+    SubscribeTarget, room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
+    validate_room_segment,
 };
 pub use rooms_db::DbRoomStore;
 pub use sink::{
@@ -106,8 +107,8 @@ pub mod prelude {
         newest_recording_files_since, recording_segments_covering_window, slugify,
     };
     pub use crate::{
-        InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats, RoomError,
-        RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
+        HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats,
+        RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
         room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
     };
     pub use crate::{
@@ -1014,9 +1015,9 @@ mod conformance_tests {
     }
 
     #[test]
-    fn build_declares_the_four_room_routes_when_rooms_enabled() {
+    fn build_declares_the_five_room_routes_when_rooms_enabled() {
         let routes = super::rooms::room_route_infos(API_PREFIX);
-        assert_eq!(routes.len(), 4, "rooms declare exactly four routes");
+        assert_eq!(routes.len(), 5, "rooms declare exactly five routes");
         assert!(
             routes
                 .iter()

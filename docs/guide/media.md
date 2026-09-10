@@ -166,7 +166,7 @@ that cap is out of scope.
 
 ### The room signaling routes
 
-When `with_rooms()` is enabled, the plugin nests four HTTP routes under the API
+When `with_rooms()` is enabled, the plugin nests five HTTP routes under the API
 prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 
 | Method | Path | Purpose |
@@ -174,6 +174,7 @@ prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 | `POST` | `/api/media/rooms` | Create a room; returns a token-free `RoomSnapshot`. |
 | `POST` | `/api/media/rooms/{room_id}/join` | Join a room; returns a `JoinResponse` (session token + mesh transport targets). |
 | `POST` | `/api/media/rooms/{room_id}/leave` | Leave a room (verifies the session token). |
+| `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness and renew the advisory token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | The **member-gated** roster (`Authorization: Bearer <session token>`). |
 
 > **Security:** these routes ship **no built-in authentication or rate
@@ -248,6 +249,24 @@ a background reaper (`spawn_room_reaper_loop`) reclaims stale participants and
 idle rooms by `last_seen_at` / `created_at`. The `DbRoomStore` reaper is a
 last-write-wins sweep, so concurrent reapers across processes converge with no
 corruption.
+
+Two client signals refresh `last_seen_at`: an explicit heartbeat, and — as a
+side effect — a member-gated roster poll. Do either on any interval well under
+the idle TTL (default 15 minutes, `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS`) and the
+seat is held. Send a heartbeat as:
+
+```http
+POST /api/media/rooms/{room_id}/heartbeat
+{ "participant_id": "...", "session_token": "..." }
+```
+
+It answers `{"alive": true, "token_expires_at": "..."}` with the expiry renewed
+to `now + room_token_ttl_seconds`; the token **value** never rotates, so an
+in-flight roster poll keeps working. Like the roster, it is fail-closed: an
+unknown room, unknown participant and wrong token are one indistinguishable
+`404`. Liveness is client-driven, not media-derived — a participant that neither
+heartbeats nor polls for a full idle TTL loses its signaling record (its live
+`MediaMTX` path is untouched, so it can simply re-join).
 
 ## Broadcast, transport, and encoding
 

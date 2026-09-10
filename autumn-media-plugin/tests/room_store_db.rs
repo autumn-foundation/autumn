@@ -3,8 +3,9 @@
 //!
 //! Spins up a real Postgres container via testcontainers and exercises the
 //! store's full lifecycle — create → join → roster → leave persistence, roster
-//! member-gating, cross-instance sharing (the multi-process property), and the
-//! last-write-wins `reap_stale` sweep — exactly mirroring
+//! member-gating, cross-instance sharing (the multi-process property), the
+//! heartbeat's persisted liveness/expiry renewal, and the last-write-wins
+//! `reap_stale` sweep — exactly mirroring
 //! `autumn-admin-plugin/tests/token_admin_db.rs`.
 //!
 //! **Requires Docker.** These tests are `#[ignore]`d so a default `cargo test`
@@ -129,6 +130,13 @@ async fn seed(
         .await
         .expect("seed participant");
     }
+}
+
+/// One `token_expires_at` column, for reading a renewal back out of the row.
+#[derive(diesel::QueryableByName)]
+struct ExpiryRow {
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    token_expires_at: chrono::NaiveDateTime,
 }
 
 #[tokio::test]
@@ -408,4 +416,72 @@ async fn reap_on_a_clean_store_is_a_zero_count_no_op() {
     assert_eq!(stats.participants_reaped, 0);
     assert_eq!(stats.rooms_reaped, 0);
     assert!(store.roster("", "room-1", "tok").await.is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn heartbeat_holds_a_seat_across_a_sweep_and_renews_the_advisory_expiry() {
+    let (pool, _container) = setup_pool().await;
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let stale = Utc::now() - Duration::hours(1);
+    seed(
+        &pool,
+        "",
+        "room-1",
+        Utc::now() - Duration::hours(2),
+        &[("beating", "tok-a", stale), ("silent", "tok-b", stale)],
+    )
+    .await;
+
+    let renewed = store
+        .heartbeat("", "room-1", "beating", "tok-a", Duration::seconds(300))
+        .await
+        .expect("heartbeat");
+    assert!(renewed > Utc::now(), "expiry renewed into the future");
+
+    // The renewed expiry is persisted, so another process sees it.
+    let persisted: chrono::NaiveDateTime = {
+        let mut conn = pool.get().await.expect("conn");
+        let row: ExpiryRow = diesel::sql_query(
+            "SELECT token_expires_at FROM media_room_participants \
+             WHERE namespace = '' AND room_id = 'room-1' AND participant_id = 'beating'",
+        )
+        .get_result(&mut conn)
+        .await
+        .expect("read expiry");
+        row.token_expires_at
+    };
+    assert_eq!(persisted, renewed.naive_utc());
+
+    // The heartbeat — not a roster poll — is what saves the seat.
+    let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+    assert_eq!(stats.participants_reaped, 1, "only the silent seat reaped");
+    assert!(store.roster("", "room-1", "tok-a").await.is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn heartbeat_is_fail_closed_with_no_membership_oracle() {
+    let (pool, _container) = setup_pool().await;
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let now = Utc::now();
+    seed(&pool, "tenant-a", "room-1", now, &[("p1", "tok", now)]).await;
+    let ttl = Duration::seconds(300);
+
+    for (namespace, room, participant, token, case) in [
+        ("tenant-a", "nope", "p1", "tok", "unknown room"),
+        ("tenant-a", "room-1", "ghost", "tok", "unknown participant"),
+        ("tenant-a", "room-1", "p1", "wrong", "wrong token"),
+        ("tenant-b", "room-1", "p1", "tok", "other namespace"),
+    ] {
+        assert!(
+            matches!(
+                store
+                    .heartbeat(namespace, room, participant, token, ttl)
+                    .await,
+                Err(RoomError::RoomNotFound)
+            ),
+            "{case} must be indistinguishable from a missing room"
+        );
+    }
 }

@@ -26,19 +26,23 @@
 //!   [`DeployExecutor`], so the remote command
 //!   sequence is assertable against a recording fake with no live host. It
 //!   no-ops (empty op vector) when the section is not `enabled`.
-//! - Five fail-closed doctor checks — [`mediamtx_ports_distinct`],
-//!   [`ffmpeg_preflight`], [`mediamtx_binary_preflight`],
-//!   [`recordings_dir_writable`], and [`mediamtx_ports_available`] — most run over
-//!   the same executor and all return the shared [`PreflightCheck`] type, so a
-//!   media host can be graded the same way `autumn deploy check` grades the app
-//!   host. [`mediamtx_ports_distinct`] is a **pure config** check (issue #2051,
-//!   Finding P): it rejects a config that binds two same-protocol listeners to one
-//!   port before provisioning, so `systemctl restart` cannot fail after cutover on
-//!   a config that a fresh-host `ss` scan would pass. The binary preflight runs
-//!   before cutover so a host missing the (deferred-provisioned) `MediaMTX` binary
-//!   fails fast instead of committing the app and then failing the post-cutover
-//!   restart. An unverifiable result (transport error, unparseable output) reports
-//!   a clear failure — never a silent pass.
+//! - Six fail-closed doctor checks — [`mediamtx_ports_distinct`],
+//!   [`mediamtx_ports_match_bases`], [`ffmpeg_preflight`],
+//!   [`mediamtx_binary_preflight`], [`recordings_dir_writable`], and
+//!   [`mediamtx_ports_available`] — most run over the same executor and all
+//!   return the shared [`PreflightCheck`] type, so a media host can be graded the
+//!   same way `autumn deploy check` grades the app host. The first two are **pure
+//!   config** checks that run before any probe: [`mediamtx_ports_distinct`]
+//!   (issue #2051, Finding P) rejects a config binding two same-protocol
+//!   listeners to one port, so `systemctl restart` cannot fail after cutover on a
+//!   config a fresh-host `ss` scan would pass; [`mediamtx_ports_match_bases`]
+//!   (issue #1974) rejects a listener port the app's own base URL does not call,
+//!   so a customized port cannot silently strand the app on an unbound origin.
+//!   The binary preflight runs before cutover so a host missing the
+//!   (deferred-provisioned) `MediaMTX` binary fails fast instead of committing
+//!   the app and then failing the post-cutover restart. An unverifiable result
+//!   (transport error, unparseable output) reports a clear failure — never a
+//!   silent pass.
 //!
 //! ## `FFmpeg` path verification (concrete literals only)
 //!
@@ -105,7 +109,7 @@ use super::exec::{DeployExecutor, DeployOp, FileContents, RemoteCommand};
 
 // ── MediaMTX ports (real u16 constants, NOT parsed from URLs) ────────────────
 
-/// `MediaMTX` RTMP/WHIP ingest port.
+/// `MediaMTX` RTMP ingest port. (`WHIP` ingest publishes on the WebRTC port.)
 pub const MEDIAMTX_RTMP_PORT: u16 = 1935;
 /// `MediaMTX` HLS playback port.
 pub const MEDIAMTX_HLS_PORT: u16 = 8888;
@@ -180,6 +184,32 @@ const fn default_webrtc_local_udp() -> u16 {
     MEDIAMTX_WEBRTC_LOCAL_UDP_PORT
 }
 
+// ── App-side base-URL defaults (MIRRORED from the plugin) ────────────────────
+//
+// `[media.mediamtx]` is one TOML table read by two crates: the `*_port` fields
+// above provision the daemon's listeners, while these `*_base` URLs are what the
+// deployed app and its clients build request URLs from
+// (`autumn_media_plugin::config::MediaMtxConfig`). This module deliberately does
+// not depend on the plugin (see the `MediaMtxHostConfig` note), so the plugin's
+// defaults are mirrored here — the same arrangement as `DEFAULT_FFMPEG_BIN`.
+// They exist ONLY so `mediamtx_ports_match_bases` can grade an unset base
+// against the port it will actually resolve to.
+//
+// KEEP IN SYNC with `autumn-media-plugin/src/config.rs`'s `MediaMtxConfig`
+// defaults. `ports_match_bases_passes_for_default_config` pins that the mirrored
+// defaults agree with the port constants above.
+
+/// Plugin default for `[media.mediamtx] api_base`.
+const DEFAULT_API_BASE: &str = "http://127.0.0.1:9997";
+/// Plugin default for `[media.mediamtx] rtmp_base`.
+const DEFAULT_RTMP_BASE: &str = "rtmp://127.0.0.1:1935/live";
+/// Plugin default for `[media.mediamtx] hls_base`.
+const DEFAULT_HLS_BASE: &str = "http://127.0.0.1:8888";
+/// Plugin default for `[media.mediamtx] webrtc_base`.
+const DEFAULT_WEBRTC_BASE: &str = "http://127.0.0.1:8889";
+/// Plugin default for `[media.mediamtx] playback_base`.
+const DEFAULT_PLAYBACK_BASE: &str = "http://127.0.0.1:9996";
+
 /// Default `FFmpeg` binary path — the plugin's `[media.ffmpeg] bin` default.
 /// Shared so the deploy-side `FFmpeg` preflight and the plugin agree on the
 /// fallback path.
@@ -200,22 +230,22 @@ fn default_ffmpeg_bin() -> String {
 /// `autumn-web`'s strict `AutumnConfig` schema — no `autumn-media-plugin`
 /// dependency and no change to the app config type.
 ///
-/// ## Deploy-side ports ↔ app runtime base URLs must stay consistent
+/// ## Deploy-side ports ↔ app runtime base URLs
 ///
 /// The `*_port` fields here (`api_port` / `rtmp_port` / `hls_port` /
 /// `webrtc_port` / `playback_port`) only **provision the daemon's listeners** in
-/// the rendered `mediamtx.yml` (see [`render_mediamtx_yml`]). They are a separate
-/// config surface from the *app's* runtime `MediaMtxConfig` `*_base` URLs
-/// (`api_base` / `hls_base` / `webrtc_base` / playback base), which the deployed
-/// app/clients build request URLs from and which default to the standard ports
-/// (`9997`/`8888`/`8889`/`9996`). This module deliberately does **not** read or
-/// unify with the plugin's `MediaMtxConfig` — that autumn-cli→autumn-media-plugin
-/// coupling is out of slice-7 scope (a plugin-owned config-model change; issue
-/// #1974, codex PR #2051 finding). Consequence: **if you customize a
-/// `[media.mediamtx] *_port` here you MUST update the matching app-side `*_base`
-/// URL to the same port**, or the app/clients will keep calling the standard-port
-/// origin the daemon no longer binds. The two surfaces are default-aligned, so
-/// the common case needs no action.
+/// the rendered `mediamtx.yml` (see [`render_mediamtx_yml`]). The *app's*
+/// runtime `MediaMtxConfig` `*_base` URLs — which the deployed app/clients build
+/// request URLs from — are a separate surface in the same `[media.mediamtx]`
+/// table, so customizing a port without updating its base URL leaves the app
+/// calling an origin the daemon no longer binds.
+///
+/// This module still does **not** depend on `autumn-media-plugin` (that coupling
+/// was out of slice-7 scope, and the plugin owns its own config model). Instead
+/// the `*_base` keys are deserialized here as opaque strings and read by exactly
+/// one thing — [`mediamtx_ports_match_bases`], which fails the deploy closed when
+/// the two disagree (issue #1974). Provisioning never reads them. The two
+/// surfaces are default-aligned, so the common case needs no action.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MediaMtxHostConfig {
@@ -224,7 +254,8 @@ pub struct MediaMtxHostConfig {
     pub enabled: bool,
     /// Control-API listen port.
     pub api_port: u16,
-    /// RTMP/WHIP ingest listen port.
+    /// RTMP ingest listen port. `WHIP` ingest is WebRTC and publishes on
+    /// [`webrtc_port`](Self::webrtc_port), not here.
     pub rtmp_port: u16,
     /// HLS playback listen port.
     pub hls_port: u16,
@@ -248,6 +279,28 @@ pub struct MediaMtxHostConfig {
     /// Extra hostnames/IPs announced as WebRTC ICE candidates
     /// (`webrtcAdditionalHosts`) — e.g. a public address in production.
     pub webrtc_additional_hosts: Vec<String>,
+
+    // ── App-side runtime keys, read ONLY to cross-check consistency ──────────
+    //
+    // These are the deployed app's `MediaMtxConfig` base URLs, living in this
+    // same `[media.mediamtx]` table. Provisioning never reads them — they feed
+    // `mediamtx_ports_match_bases` and nothing else, so a listener port and the
+    // URL the app calls it on cannot silently drift apart. `None` means "unset",
+    // which resolves to the mirrored plugin default (`DEFAULT_*_BASE`).
+    /// App-side `api_base` (control API), when set.
+    pub api_base: Option<String>,
+    /// App-side `rtmp_base` (RTMP ingest), when set.
+    pub rtmp_base: Option<String>,
+    /// App-side `hls_base` (HLS playback), when set.
+    pub hls_base: Option<String>,
+    /// App-side `hls_probe_base` (server-side HLS probe), when set.
+    pub hls_probe_base: Option<String>,
+    /// App-side `webrtc_base` (WebRTC/WHEP playback and WHIP ingest), when set.
+    pub webrtc_base: Option<String>,
+    /// App-side `playback_base` (recording playback), when set.
+    pub playback_base: Option<String>,
+    /// App-side `playback_probe_base` (server-side playback probe), when set.
+    pub playback_probe_base: Option<String>,
 }
 
 impl Default for MediaMtxHostConfig {
@@ -266,6 +319,13 @@ impl Default for MediaMtxHostConfig {
             binary_path: default_binary_path(),
             unit_name: default_unit_name(),
             webrtc_additional_hosts: Vec::new(),
+            api_base: None,
+            rtmp_base: None,
+            hls_base: None,
+            hls_probe_base: None,
+            webrtc_base: None,
+            playback_base: None,
+            playback_probe_base: None,
         }
     }
 }
@@ -603,11 +663,14 @@ impl MediaMtxController {
     /// Returns an **empty vector when the section is not `enabled`** — the
     /// controller is a no-op for an app that does not provision `MediaMTX`. When
     /// enabled it emits, in order:
-    /// 1. `Run` `mkdir -p <config parent dir>` — `scp` (the upload transport)
-    ///    does not create parents, so the config dir must exist before op 2
-    ///    writes the staged config into it (omitted only for a parent-less
-    ///    `config_path`). The unit's parent (`/etc/systemd/system`) is a standard
-    ///    existing dir and needs no `mkdir`.
+    /// 1. `Run` one `mkdir -p <config parent dir> <recordings_dir>` — `scp` (the
+    ///    upload transport) does not create parents, so the config dir must
+    ///    exist before op 2 writes the staged config into it (that argument is
+    ///    omitted for a parent-less `config_path`), and `recordings_dir` is the
+    ///    `recordPath` root the fail-closed preflight expects provisioning to
+    ///    create. Duplicates are collapsed. The unit's parent
+    ///    (`/etc/systemd/system`) is a standard existing dir and needs no
+    ///    `mkdir`.
     /// 2. `WriteFile` the rendered `mediamtx.yml` to a **temp path**
     ///    (`<config_path>.autumn-new`, mode `0644`) — a sibling of the live file,
     ///    never over it, so the live config is untouched until op 4 proves a real
@@ -638,15 +701,33 @@ impl MediaMtxController {
         let unit_path = self.unit_path();
         let unit_tmp = format!("{unit_path}.autumn-new");
         let mut ops = Vec::new();
-        // Create the config's parent dir before scp writes the staged file into
-        // it — `scp` never creates missing parents, so the default
-        // `/etc/mediamtx/mediamtx.yml` would fail at `media-write-config` on a
-        // fresh host without this. The temp file is a sibling of the live config,
-        // so this one `mkdir` covers both. Skipped for a parent-less path.
-        if let Some(parent) = parent_dir(&self.cfg.config_path) {
+        // Create the host dirs provisioning writes into, before anything writes
+        // into them:
+        // - the config's parent — `scp` never creates missing parents, so the
+        //   default `/etc/mediamtx/mediamtx.yml` would fail at
+        //   `media-write-config` on a fresh host (the temp file is a sibling of
+        //   the live config, so one `mkdir` covers both). Absent for a
+        //   parent-less `config_path`.
+        // - `recordings_dir` — `MediaMTX`'s `recordPath` root. It is
+        //   fail-closed preflighted, so provisioning has to create it or a fresh
+        //   host could never satisfy its own check (see
+        //   [`recordings_dir_writable`], which passes an absent-but-creatable
+        //   dir for exactly this handoff).
+        // Deduplicated and shell-quoted; `mkdir -p` takes them in one command.
+        let mut dirs: Vec<&str> = Vec::new();
+        for dir in parent_dir(&self.cfg.config_path)
+            .into_iter()
+            .chain(std::iter::once(self.cfg.recordings_dir.as_str()))
+        {
+            if !dir.is_empty() && !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        if !dirs.is_empty() {
+            let quoted: Vec<String> = dirs.iter().map(|d| super::exec::shell_quote(d)).collect();
             ops.push(DeployOp::Run(RemoteCommand::new(
                 "media-prepare-dirs",
-                format!("mkdir -p {}", super::exec::shell_quote(parent)),
+                format!("mkdir -p {}", quoted.join(" ")),
             )));
         }
         // Stage config + unit to TEMP paths (never directly over the live files),
@@ -812,12 +893,19 @@ pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> Preflig
     }
 }
 
-/// Grade that the `MediaMTX` recordings directory exists and is writable on the
-/// host.
+/// Grade that the `MediaMTX` recordings directory is usable on the host —
+/// either it exists and is writable, or it is absent under a writable ancestor
+/// so provisioning can create it.
 ///
-/// Runs `test -d <dir> && test -w <dir>` over the executor. Fail-closed: a
-/// missing/unwritable directory (non-zero exit → transport error) and any other
-/// transport failure both report a clear failure.
+/// The absent-but-creatable case is a **pass** by design: provisioning
+/// (`MediaMtxController::ensure_installed_ops`) `mkdir -p`s this dir, so
+/// rejecting a fresh host here would fail-close it out of the very step that
+/// creates the dir. What is graded is therefore the question that actually
+/// blocks a deploy — *can this path hold recordings after provisioning?*
+///
+/// The probe echoes `present` or `creatable`; anything else (no marker, a
+/// transport error, an existing-but-unwritable dir, an ancestor that is a file)
+/// is a clear failure. Fail-closed: an unverifiable result never passes.
 #[must_use]
 pub fn recordings_dir_writable(
     exec: &impl DeployExecutor,
@@ -825,27 +913,50 @@ pub fn recordings_dir_writable(
 ) -> PreflightCheck {
     let dir = &cfg.recordings_dir;
     let quoted = super::exec::shell_quote(dir);
+    // Walk up to the nearest existing ancestor when the dir itself is absent.
+    // `dirname` terminates: it maps `/` to `/` and a bare name to `.`, both of
+    // which exist, so the loop always halts.
     let cmd = RemoteCommand::new(
         "media-recordings-dir",
-        format!("test -d {quoted} && test -w {quoted}"),
+        format!(
+            "if [ -d {quoted} ]; then test -w {quoted} && echo present; \
+             else d={quoted}; while [ ! -e \"$d\" ]; do d=$(dirname \"$d\"); done; \
+             test -d \"$d\" && test -w \"$d\" && echo creatable; fi"
+        ),
     );
-    match exec.run(&cmd) {
-        Ok(_) => PreflightCheck {
-            name: CHECK_RECORDINGS_DIR_WRITABLE,
-            scope: None,
-            passed: true,
-            deferred: false,
-            detail: format!("recordings directory `{dir}` exists and is writable"),
-            hint: None,
+    let (passed, detail) = match exec.run(&cmd) {
+        Ok(output) => match output.stdout.trim() {
+            "present" => (
+                true,
+                format!("recordings directory `{dir}` exists and is writable"),
+            ),
+            "creatable" => (
+                true,
+                format!(
+                    "recordings directory `{dir}` does not exist yet and will be created by \
+                     provisioning (its nearest existing parent is writable)"
+                ),
+            ),
+            other => (
+                false,
+                format!(
+                    "recordings directory `{dir}` could not be verified as writable or \
+                     creatable (probe output: `{other}`)"
+                ),
+            ),
         },
-        Err(err) => PreflightCheck {
-            name: CHECK_RECORDINGS_DIR_WRITABLE,
-            scope: None,
-            passed: false,
-            deferred: false,
-            detail: format!("recordings directory `{dir}` is missing or not writable: {err}"),
-            hint: Some(RECORDINGS_HINT),
-        },
+        Err(err) => (
+            false,
+            format!("recordings directory `{dir}` is not writable or creatable: {err}"),
+        ),
+    };
+    PreflightCheck {
+        name: CHECK_RECORDINGS_DIR_WRITABLE,
+        scope: None,
+        passed,
+        deferred: false,
+        detail,
+        hint: (!passed).then_some(RECORDINGS_HINT),
     }
 }
 
@@ -1257,10 +1368,181 @@ pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
     }
 }
 
-/// Collect the five `MediaMTX` host doctor checks against a live executor.
+/// The check name for the listener-port ↔ app-base-URL consistency preflight.
+pub const CHECK_MEDIAMTX_PORTS_MATCH_BASES: &str = "media_mediamtx_ports_match_bases";
+
+/// Remediation hint shown when a listener port and the app's base URL disagree.
+const PORTS_MATCH_BASES_HINT: &str = "Update the app-side `[media.mediamtx] *_base` URL to the port the daemon is provisioned on \
+     (or drop the explicit port from the base URL if a reverse proxy fronts it)";
+
+/// Extract an **explicit** port from a base URL, or `None` when it carries none.
 ///
-/// Runs the distinct-listener-port **config** check first (pure — no host I/O, so
-/// a duplicated-port config aborts before any probe), then the `FFmpeg` preflight
+/// Strips the scheme, any `user:pw@` userinfo, and the path/query/fragment, then
+/// reads a `:port` off the authority (`[::1]:8888` included). `None` means the
+/// URL names no port — an implicit `80`/`443` behind a reverse proxy, which the
+/// deploy side cannot and must not compare against a listener port. A
+/// non-numeric or out-of-range `:value` is likewise not a port.
+fn explicit_port(url: &str) -> Option<u16> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // An IPv6 literal's own colons are inside the brackets; only a `:` after the
+    // closing `]` introduces a port.
+    let port = match host_port.rsplit_once(']') {
+        Some((_, rest)) => rest.strip_prefix(':')?,
+        None => host_port.split_once(':').map(|(_, port)| port)?,
+    };
+    port.parse().ok()
+}
+
+/// Grade that every provisioned `MediaMTX` listener port agrees with the app's
+/// base URL for that listener.
+///
+/// A **pure config** check (no host I/O), like [`mediamtx_ports_distinct`]. The
+/// `*_port` fields provision the daemon's listeners; the app and its clients
+/// call those listeners on the `[media.mediamtx] *_base` URLs. Both live in one
+/// TOML table, and nothing else keeps them in step: customizing a port without
+/// updating the base points the app at an origin the daemon no longer binds, and
+/// the deploy succeeds while every ingest/playback request fails at runtime.
+/// This catches that before cutover.
+///
+/// Comparison rules, each chosen to avoid a false alarm on a legitimate shape:
+/// - An **unset** base resolves to the plugin default (`DEFAULT_*_BASE`), which
+///   is what the app would actually use.
+/// - A base with **no explicit port** is skipped: an implicit `80`/`443` means a
+///   reverse proxy fronts the listener, so there is nothing to compare.
+/// - A base carrying a `${...}` placeholder is **deferred** — the service
+///   resolves it from its own environment, which the deploy side must not guess
+///   (same rule as [`ffmpeg_preflight`]). Deferred is non-passing but
+///   NON-blocking.
+/// - A genuine mismatch **outranks** any deferral and blocks the deploy.
+/// - The two probe bases are graded only when explicitly set (unset, they fall
+///   back to their public base, which is already graded).
+#[must_use]
+pub fn mediamtx_ports_match_bases(cfg: &MediaMtxHostConfig) -> PreflightCheck {
+    let mut mismatches: Vec<String> = Vec::new();
+    let mut deferred: Vec<&str> = Vec::new();
+    for (port, port_field, base_field, base) in port_base_pairs(cfg) {
+        let Some(base) = base else { continue };
+        if base.contains("${") {
+            deferred.push(base_field);
+            continue;
+        }
+        // No explicit port = proxied / implicit 80|443: nothing to compare.
+        let Some(base_port) = explicit_port(base) else {
+            continue;
+        };
+        if base_port != port {
+            mismatches.push(format!(
+                "`{port_field}` provisions port {port} but `{base_field}` calls port \
+                 {base_port} (`{base}`)"
+            ));
+        }
+    }
+
+    if !mismatches.is_empty() {
+        return PreflightCheck {
+            name: CHECK_MEDIAMTX_PORTS_MATCH_BASES,
+            scope: None,
+            passed: false,
+            deferred: false,
+            detail: format!(
+                "MediaMTX listener ports and the app's base URLs disagree, so the deployed app \
+                 would call an origin the daemon does not bind: {}",
+                mismatches.join("; ")
+            ),
+            hint: Some(PORTS_MATCH_BASES_HINT),
+        };
+    }
+    if !deferred.is_empty() {
+        return PreflightCheck {
+            name: CHECK_MEDIAMTX_PORTS_MATCH_BASES,
+            scope: None,
+            passed: false,
+            deferred: true,
+            detail: format!(
+                "every comparable MediaMTX base URL matches its listener port; {} \
+                 use(s) env/interpolation indirection resolved in the service environment, so \
+                 verification is deferred to runtime",
+                deferred.join(", ")
+            ),
+            hint: None,
+        };
+    }
+    PreflightCheck {
+        name: CHECK_MEDIAMTX_PORTS_MATCH_BASES,
+        scope: None,
+        passed: true,
+        deferred: false,
+        detail: "every MediaMTX base URL matches its provisioned listener port".to_owned(),
+        hint: None,
+    }
+}
+
+/// The `(listener port, port field, base field, effective base URL)` rows
+/// [`mediamtx_ports_match_bases`] grades.
+///
+/// An unset public base resolves to the mirrored plugin default (what the app
+/// would actually use); an unset **probe** base is `None` and skipped, because it
+/// falls back to its public base, which the row above it already grades.
+fn port_base_pairs(
+    cfg: &MediaMtxHostConfig,
+) -> [(u16, &'static str, &'static str, Option<&str>); 7] {
+    [
+        (
+            cfg.api_port,
+            "api_port",
+            "api_base",
+            Some(cfg.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)),
+        ),
+        (
+            cfg.rtmp_port,
+            "rtmp_port",
+            "rtmp_base",
+            Some(cfg.rtmp_base.as_deref().unwrap_or(DEFAULT_RTMP_BASE)),
+        ),
+        (
+            cfg.hls_port,
+            "hls_port",
+            "hls_base",
+            Some(cfg.hls_base.as_deref().unwrap_or(DEFAULT_HLS_BASE)),
+        ),
+        (
+            cfg.webrtc_port,
+            "webrtc_port",
+            "webrtc_base",
+            Some(cfg.webrtc_base.as_deref().unwrap_or(DEFAULT_WEBRTC_BASE)),
+        ),
+        (
+            cfg.playback_port,
+            "playback_port",
+            "playback_base",
+            Some(
+                cfg.playback_base
+                    .as_deref()
+                    .unwrap_or(DEFAULT_PLAYBACK_BASE),
+            ),
+        ),
+        (
+            cfg.hls_port,
+            "hls_port",
+            "hls_probe_base",
+            cfg.hls_probe_base.as_deref(),
+        ),
+        (
+            cfg.playback_port,
+            "playback_port",
+            "playback_probe_base",
+            cfg.playback_probe_base.as_deref(),
+        ),
+    ]
+}
+
+/// Collect the six `MediaMTX` host doctor checks against a live executor.
+///
+/// Runs the two pure **config** checks first (no host I/O, so a duplicated-port
+/// or port/base-URL-inconsistent config aborts before any probe), then the
+/// `FFmpeg` preflight
 /// (against `ffmpeg_bin`), the `MediaMTX` binary-executable preflight, the
 /// recordings-dir probe, and the port-availability probe — returning the shared
 /// [`PreflightCheck`] results so a caller that already holds a [`DeployExecutor`]
@@ -1275,6 +1557,7 @@ pub fn collect_media_doctor_checks(
 ) -> Vec<PreflightCheck> {
     vec![
         mediamtx_ports_distinct(cfg),
+        mediamtx_ports_match_bases(cfg),
         ffmpeg_preflight(exec, ffmpeg_bin),
         mediamtx_binary_preflight(exec, cfg),
         recordings_dir_writable(exec, cfg),
@@ -1738,7 +2021,8 @@ unit_name = \"mediamtx-prod\"
             panic!("op 0 must be the mkdir Run op, got {:?}", ops[0]);
         };
         assert_eq!(mkdir.label, "media-prepare-dirs");
-        assert_eq!(mkdir.shell, "mkdir -p '/etc/mediamtx'");
+        // Both the config parent AND the recordings root, in one mkdir.
+        assert_eq!(mkdir.shell, "mkdir -p '/etc/mediamtx' '/recordings'");
 
         // Finding H: op 1 writes mediamtx.yml to a TEMP path (never over the live
         // file), so op 3 can diff it and restart only on a real change.
@@ -1922,7 +2206,68 @@ unit_name = \"mediamtx-prod\"
             panic!("media-prepare-dirs must be a Run op");
         };
         // The parent is derived from `config_path`, not hardcoded (shell-quoted).
-        assert_eq!(mkdir.shell, "mkdir -p '/opt/media/etc'");
+        assert_eq!(mkdir.shell, "mkdir -p '/opt/media/etc' '/recordings'");
+    }
+
+    #[test]
+    fn controller_creates_the_recordings_dir_it_preflights() {
+        // The recordings root is fail-closed preflighted, so provisioning must
+        // create it — otherwise a fresh host can never satisfy its own check.
+        let cfg = MediaMtxHostConfig {
+            enabled: true,
+            recordings_dir: "/srv/media recordings".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let ops = MediaMtxController::new(cfg).ensure_installed_ops();
+
+        let mkdir_idx = ops
+            .iter()
+            .position(|op| op.label() == "media-prepare-dirs")
+            .expect("a media-prepare-dirs op must be emitted");
+        let DeployOp::Run(mkdir) = &ops[mkdir_idx] else {
+            panic!("media-prepare-dirs must be a Run op");
+        };
+        // Shell-quoted, so a path with a space stays one argument.
+        assert_eq!(
+            mkdir.shell,
+            "mkdir -p '/etc/mediamtx' '/srv/media recordings'"
+        );
+        let write_idx = ops
+            .iter()
+            .position(|op| op.label() == "media-write-config")
+            .expect("a media-write-config op must be emitted");
+        assert!(mkdir_idx < write_idx);
+    }
+
+    #[test]
+    fn controller_mkdirs_the_recordings_dir_even_with_a_parentless_config_path() {
+        // A parent-less `config_path` skips the config mkdir; the recordings
+        // root must still be created.
+        let cfg = MediaMtxHostConfig {
+            enabled: true,
+            config_path: "mediamtx.yml".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let ops = MediaMtxController::new(cfg).ensure_installed_ops();
+        let DeployOp::Run(mkdir) = &ops[0] else {
+            panic!("op 0 must be the mkdir Run op, got {:?}", ops[0]);
+        };
+        assert_eq!(mkdir.shell, "mkdir -p '/recordings'");
+    }
+
+    #[test]
+    fn controller_emits_one_mkdir_when_recordings_dir_is_the_config_parent() {
+        // Deduplicated: the same dir is never listed twice.
+        let cfg = MediaMtxHostConfig {
+            enabled: true,
+            config_path: "/recordings/mediamtx.yml".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let ops = MediaMtxController::new(cfg).ensure_installed_ops();
+        let DeployOp::Run(mkdir) = &ops[0] else {
+            panic!("op 0 must be the mkdir Run op, got {:?}", ops[0]);
+        };
+        assert_eq!(mkdir.shell, "mkdir -p '/recordings'");
     }
 
     #[test]
@@ -2121,22 +2466,59 @@ unit_name = \"mediamtx-prod\"
     // ── Doctor: recordings dir writable ──────────────────────────────────────
 
     #[test]
-    fn recordings_dir_passes_when_writable() {
-        let exec = RecordingExecutor::new();
+    fn recordings_dir_passes_when_present_and_writable() {
+        let exec = RecordingExecutor::new().with_stdout("media-recordings-dir", "present\n");
         let check = recordings_dir_writable(&exec, &MediaMtxHostConfig::default());
         assert!(check.passed, "detail: {}", check.detail);
         assert_eq!(check.name, CHECK_RECORDINGS_DIR_WRITABLE);
+        assert!(check.detail.contains("exists and is writable"));
         assert_eq!(exec.labels(), vec!["media-recordings-dir"]);
     }
 
     #[test]
+    fn recordings_dir_passes_when_absent_but_creatable() {
+        // A fresh host has no recordings dir yet; provisioning creates it, so an
+        // absent dir under a writable ancestor is a pass, not a blocked deploy.
+        let exec = RecordingExecutor::new().with_stdout("media-recordings-dir", "creatable\n");
+        let check = recordings_dir_writable(&exec, &MediaMtxHostConfig::default());
+        assert!(check.passed, "detail: {}", check.detail);
+        assert!(
+            check.detail.contains("will be created"),
+            "detail must say the dir is created by provisioning: {}",
+            check.detail
+        );
+    }
+
+    #[test]
     fn recordings_dir_fails_when_not_writable() {
-        // `test -d && test -w` exits non-zero → transport error → fail-closed.
+        // `test -w` exits non-zero → transport error → fail-closed.
         let exec = RecordingExecutor::failing_on("media-recordings-dir");
         let check = recordings_dir_writable(&exec, &MediaMtxHostConfig::default());
         assert!(!check.passed);
         assert!(check.detail.contains("/recordings"));
         assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn recordings_dir_fails_when_output_proves_nothing() {
+        // Unverifiable output is never a silent pass (module discipline).
+        for stdout in ["", "yes", "presentish"] {
+            let exec = RecordingExecutor::new().with_stdout("media-recordings-dir", stdout);
+            let check = recordings_dir_writable(&exec, &MediaMtxHostConfig::default());
+            assert!(!check.passed, "stdout {stdout:?} must not pass");
+            assert!(check.hint.is_some());
+        }
+    }
+
+    #[test]
+    fn recordings_dir_probe_shell_quotes_the_path() {
+        let exec = RecordingExecutor::new().with_stdout("media-recordings-dir", "present");
+        let cfg = MediaMtxHostConfig {
+            recordings_dir: "/srv/media recordings".to_owned(),
+            ..MediaMtxHostConfig::default()
+        };
+        let check = recordings_dir_writable(&exec, &cfg);
+        assert!(check.passed, "detail: {}", check.detail);
     }
 
     // ── Doctor: mediamtx ports available ─────────────────────────────────────
@@ -2369,17 +2751,22 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
     }
 
     #[test]
-    fn collect_runs_all_five_checks_in_order() {
+    fn collect_runs_all_six_checks_in_order() {
         let exec = RecordingExecutor::new()
             .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1")
+            .with_stdout("media-recordings-dir", "present")
             .with_stdout(
                 "media-ports",
                 "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
             );
         let checks =
             collect_media_doctor_checks(&exec, &MediaMtxHostConfig::default(), "/usr/bin/ffmpeg");
-        assert_eq!(checks.len(), 5);
-        assert!(checks.iter().all(|c| c.passed), "all should pass");
+        assert_eq!(checks.len(), 6);
+        assert!(
+            checks.iter().all(|c| c.passed),
+            "all should pass: {:?}",
+            checks.iter().filter(|c| !c.passed).collect::<Vec<_>>()
+        );
         // The pure ports-distinct config check (Finding P) leads and runs NO
         // command, so the recorded command order is unchanged from the four
         // executor-driven checks.
@@ -2407,10 +2794,12 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
         // the aggregate has zero blocking checks and `deploy up` proceeds (the
         // deploy gate counts `blocking()`, not `!passed`). A concrete missing
         // FFmpeg would instead block.
-        let exec = RecordingExecutor::new().with_stdout(
-            "media-ports",
-            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
-        );
+        let exec = RecordingExecutor::new()
+            .with_stdout("media-recordings-dir", "present")
+            .with_stdout(
+                "media-ports",
+                "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
+            );
         let checks = collect_media_doctor_checks(
             &exec,
             &MediaMtxHostConfig::default(),
@@ -2431,6 +2820,138 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
             0,
             "deferred ffmpeg must not block the deploy"
         );
+    }
+
+    // ── Ports ↔ app base URLs (#1974 slice-7 deferral 6) ─────────────────────
+
+    #[test]
+    fn ports_match_bases_passes_for_default_config() {
+        // The two surfaces ship default-aligned, so the common case is silent.
+        let check = mediamtx_ports_match_bases(&MediaMtxHostConfig::default());
+        assert!(check.passed, "detail: {}", check.detail);
+        assert_eq!(check.name, CHECK_MEDIAMTX_PORTS_MATCH_BASES);
+        assert!(!check.deferred);
+    }
+
+    #[test]
+    fn ports_match_bases_fails_when_a_custom_port_leaves_the_base_behind() {
+        // Customizing a listener port without updating the app's base URL points
+        // the app at an origin the daemon no longer binds — the exact silent
+        // runtime break this check exists to catch before cutover.
+        let cfg = MediaMtxHostConfig {
+            rtmp_port: 1936,
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_match_bases(&cfg);
+        assert!(!check.passed);
+        assert!(check.blocking(), "a real mismatch must block the deploy");
+        assert!(check.detail.contains("rtmp_port"), "{}", check.detail);
+        assert!(check.detail.contains("rtmp_base"), "{}", check.detail);
+        assert!(check.detail.contains("1936"), "{}", check.detail);
+        assert!(check.detail.contains("1935"), "{}", check.detail);
+        assert!(check.hint.is_some());
+    }
+
+    #[test]
+    fn ports_match_bases_passes_when_the_base_is_updated_to_match() {
+        let cfg = MediaMtxHostConfig {
+            rtmp_port: 1936,
+            webrtc_port: 8899,
+            rtmp_base: Some("rtmp://media.example.com:1936/live".to_owned()),
+            webrtc_base: Some("https://media.example.com:8899".to_owned()),
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_match_bases(&cfg);
+        assert!(check.passed, "detail: {}", check.detail);
+    }
+
+    #[test]
+    fn ports_match_bases_ignores_a_base_with_no_explicit_port() {
+        // A reverse-proxied / CDN-fronted base (implicit 80/443) is a legitimate
+        // shape the deploy side cannot compare against a listener port.
+        let cfg = MediaMtxHostConfig {
+            hls_port: 9999,
+            hls_base: Some("https://media.example.com/hls".to_owned()),
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_match_bases(&cfg);
+        assert!(check.passed, "detail: {}", check.detail);
+    }
+
+    #[test]
+    fn ports_match_bases_defers_an_env_indirected_base() {
+        // Same rule as the FFmpeg preflight: a value the service resolves from
+        // its own environment is deferred (non-passing, NON-blocking), never
+        // guessed against the operator's shell.
+        let cfg = MediaMtxHostConfig {
+            hls_port: 9999,
+            hls_base: Some("${MEDIA_HLS_BASE}".to_owned()),
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_match_bases(&cfg);
+        assert!(!check.passed);
+        assert!(check.deferred);
+        assert!(!check.blocking(), "a deferred base must not abort a deploy");
+        assert!(check.detail.contains("hls_base"), "{}", check.detail);
+    }
+
+    #[test]
+    fn ports_match_bases_reports_a_mismatch_even_when_another_base_is_indirected() {
+        // A real mismatch outranks a deferral: the deploy still fails closed.
+        let cfg = MediaMtxHostConfig {
+            rtmp_port: 1936,
+            hls_base: Some("${MEDIA_HLS_BASE}".to_owned()),
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_match_bases(&cfg);
+        assert!(!check.passed);
+        assert!(!check.deferred);
+        assert!(check.blocking());
+        assert!(check.detail.contains("rtmp_base"), "{}", check.detail);
+    }
+
+    #[test]
+    fn ports_match_bases_checks_the_probe_bases_too() {
+        // The server-side probe bases hit the same listeners, so they are graded
+        // when set (and skipped when they fall back to their public base).
+        let cfg = MediaMtxHostConfig {
+            hls_port: 8888,
+            hls_probe_base: Some("http://127.0.0.1:8890".to_owned()),
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_match_bases(&cfg);
+        assert!(!check.passed);
+        assert!(check.detail.contains("hls_probe_base"), "{}", check.detail);
+    }
+
+    #[test]
+    fn ports_match_bases_reports_every_mismatched_pair() {
+        let cfg = MediaMtxHostConfig {
+            api_port: 1,
+            playback_port: 2,
+            ..MediaMtxHostConfig::default()
+        };
+        let check = mediamtx_ports_match_bases(&cfg);
+        assert!(!check.passed);
+        assert!(check.detail.contains("api_base"), "{}", check.detail);
+        assert!(check.detail.contains("playback_base"), "{}", check.detail);
+    }
+
+    #[test]
+    fn explicit_port_parses_authorities_and_skips_portless_ones() {
+        assert_eq!(explicit_port("http://127.0.0.1:9997"), Some(9997));
+        assert_eq!(explicit_port("rtmp://host:1935/live"), Some(1935));
+        assert_eq!(explicit_port("https://user:pw@host:8443/x"), Some(8443));
+        assert_eq!(explicit_port("http://[::1]:8888/hls"), Some(8888));
+        // No explicit port — proxied, or a bare authority.
+        assert_eq!(explicit_port("https://media.example.com/hls"), None);
+        assert_eq!(explicit_port("http://[::1]/hls"), None);
+        assert_eq!(explicit_port("host-only"), None);
+        // Not a port: userinfo colons, non-numeric, and out-of-range values.
+        assert_eq!(explicit_port("https://user:pw@host/x"), None);
+        assert_eq!(explicit_port("http://host:notaport/x"), None);
+        assert_eq!(explicit_port("http://host:99999/x"), None);
+        assert_eq!(explicit_port(""), None);
     }
 
     // ── Distinct listener ports (Finding P) ──────────────────────────────────

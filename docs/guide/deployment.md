@@ -1501,8 +1501,9 @@ enabled = true                 # off by default; the controller is a no-op when 
 # recordings_dir = "/var/lib/mediamtx/recordings"
 # record_delete_after = "72h"  # MediaMTX recordDeleteAfter retention window
 # webrtc_additional_hosts = ["my-app-mediamtx.example.com"]  # extra WebRTC ICE hosts
-# The listen ports below default to MediaMTX's standard values; override only if
-# you also change the app-side *_base URLs to match.
+# The listen ports below default to MediaMTX's standard values. Override one and
+# you must update the matching app-side *_base URL too — a pure-config preflight
+# fails the deploy closed when they disagree.
 # api_port = 9997        # control API
 # rtmp_port = 1935       # RTMP ingest only (OBS / RTMP encoders)
 # hls_port = 8888        # HLS playback
@@ -1521,9 +1522,13 @@ When `enabled = true`, `autumn deploy up`:
 
 1. Runs **four fail-closed host preflight checks before touching the host** —
    FFmpeg resolves (the concrete `[media.ffmpeg] bin`), the MediaMTX binary is
-   executable, the recordings directory is writable, and the MediaMTX ports are
-   free — plus a pure-config precheck that the configured MediaMTX listener ports
-   are distinct, and **aborts the deploy** if the host cannot serve media, rather
+   executable, the recordings directory is writable (or absent under a writable
+   parent, which provisioning then creates), and the MediaMTX ports are
+   free — plus two pure-config prechecks: that the configured MediaMTX listener
+   ports are distinct, and that each listener port matches the app-side
+   `[media.mediamtx] *_base` URL that calls it (so a customized port cannot
+   strand the app on an origin the daemon no longer binds). It **aborts the
+   deploy** if the host cannot serve media, rather
    than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
    **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
    env/interpolation-indirected path (an empty value, or one carrying a `${...}`
@@ -1546,39 +1551,28 @@ collapse to your public MediaMTX origin, and your object-store origin must also
 be allowed in `media-src` for recorded playback.
 
 > **`strict_config` interaction.** The `[media]` table is **plugin-owned** — it
-> is not part of autumn-web's `AutumnConfig` schema. `autumn deploy` reads the
-> `[media.mediamtx]` / `[media.ffmpeg]` **subtree** straight from the merged
-> `autumn.toml` (base ← inline `[profile.<name>]` ← `autumn-<profile>.toml`), so
-> that media-subtree read never itself routes through the strict schema. But that
-> does **not** make strict config deploy-safe. Before it ever reads the raw
-> `[media]` subtree, `deploy::run` calls `AutumnConfig::load()` — the strict
-> loader (`autumn-cli/src/deploy.rs`, ahead of `load_media_host_config`) — for
-> **every** subcommand. So if you turn on autumn-web's strict config validation
-> (`[server] strict_config = true`, or `AUTUMN_SERVER__STRICT_CONFIG=1`) **and**
-> keep a top-level `[media]` table in that strict-loaded config, the `[media]`
-> table is flagged as an **unknown top-level key** and **hard-fails** during that
-> load (unknown top-level keys were already strict pre-#1890, so this fails even
-> without `strict_config_enforce_all`). That means **both**:
->
-> - the **app runtime fails to boot**, *and*
-> - **`autumn deploy plan` / `deploy up` also exit during config load** on the
->   unknown `[media]` key — they never reach `load_media_host_config` and never
->   provision MediaMTX, because the strict `AutumnConfig::load()` runs first.
->
-> **Workaround:** treat `strict_config` and a top-level `[media]` table as
-> mutually exclusive today — don't enable `strict_config` while the strict-loaded
-> config carries a top-level `[media]` table (the validator has no knowledge of
-> the plugin's `[media]` section, on either the app-boot or the deploy path).
+> is not part of autumn-web's `AutumnConfig` schema — and both paths that read a
+> strict config now accept it. The app declares the section
+> (`AppBuilder::config_section("media")`, which `MediaPlugin::build` calls), so
+> `[server] strict_config = true` boots cleanly; every *other* unknown top-level
+> root still hard-fails, so the seam is not a blanket escape hatch. `autumn
+> deploy` cannot know an app's plugin set, so it loads the ambient config with
+> unknown top-level roots accepted **opaque-with-a-warning** while keeping strict
+> validation of every known section (and of typos inside them). Either way,
+> `autumn deploy` still reads the `[media.mediamtx]` / `[media.ffmpeg]` subtree
+> straight from the merged `autumn.toml` (base ← inline `[profile.<name>]` ←
+> `autumn-<profile>.toml`); the plugin, not core, validates its own section.
+
+`autumn deploy` `mkdir -p`s both the MediaMTX config file's parent directory and
+`recordings_dir` (default `/recordings`), so a fresh host needs neither created
+by hand; the preflight passes an absent dir whose nearest existing parent is
+writable and fails closed on anything it cannot verify.
 
 **Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
 installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
-a host-bootstrap step); **creating and permissioning the `recordings_dir`**
-(default `/recordings`) so the media user can write to it — `autumn deploy` only
-`mkdir`s the MediaMTX config file's parent directory, so the fail-closed
-recordings-dir preflight (`test -d && test -w`) aborts `deploy up` when the
-directory is missing or not writable; and wiring the four host preflight checks
-into the offline `autumn doctor` CLI (they run only in the executor-holding
-`deploy up` path today; `deploy plan` names them but never executes them).
+a host-bootstrap step), and wiring the host preflight checks into the offline
+`autumn doctor` CLI (they run only in the executor-holding `deploy up` path
+today; `deploy plan` names them but never executes them).
 
 ### How the deploy path is validated in CI
 

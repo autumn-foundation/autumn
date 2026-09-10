@@ -460,6 +460,63 @@ impl RoomStore for DbRoomStore {
         })
     }
 
+    fn heartbeat<'a>(
+        &'a self,
+        namespace: &'a str,
+        room_id: &'a str,
+        participant_id: &'a str,
+        token: &'a str,
+        token_ttl: Duration,
+    ) -> RoomStoreFuture<'a, DateTime<Utc>> {
+        Box::pin(async move {
+            let mut conn = self.pool.get().await.map_err(map_db_err)?;
+
+            // Fail-closed: an absent row and a token mismatch are the same
+            // `RoomNotFound`, so a heartbeat is no membership oracle. The room
+            // row is not probed separately for the same reason.
+            let stored: String = media_room_participants::table
+                .filter(
+                    media_room_participants::namespace
+                        .eq(namespace)
+                        .and(media_room_participants::room_id.eq(room_id))
+                        .and(media_room_participants::participant_id.eq(participant_id)),
+                )
+                .select(media_room_participants::token)
+                .first(&mut conn)
+                .await
+                .optional()
+                .map_err(map_db_err)?
+                .ok_or(RoomError::RoomNotFound)?;
+            if !autumn_web::auth::constant_time_eq(token.as_bytes(), stored.as_bytes()) {
+                return Err(RoomError::RoomNotFound);
+            }
+
+            let now = Utc::now();
+            let renewed = now + token_ttl;
+            let updated = diesel::update(
+                media_room_participants::table.filter(
+                    media_room_participants::namespace
+                        .eq(namespace)
+                        .and(media_room_participants::room_id.eq(room_id))
+                        .and(media_room_participants::participant_id.eq(participant_id)),
+                ),
+            )
+            .set((
+                media_room_participants::last_seen_at.eq(now.naive_utc()),
+                media_room_participants::token_expires_at.eq(renewed.naive_utc()),
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(map_db_err)?;
+            // A concurrent reaper (or leave) can drop the seat between the read
+            // and the write; renewing nothing is not a live seat.
+            if updated == 0 {
+                return Err(RoomError::RoomNotFound);
+            }
+            Ok(renewed)
+        })
+    }
+
     fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapFuture<'_> {
         Box::pin(async move {
             // Best-effort, exactly like the reaper loop expects: a backend error

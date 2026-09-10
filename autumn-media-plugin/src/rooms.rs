@@ -66,24 +66,22 @@
 //!
 //! # Known limitations
 //!
-//! - **Best-effort participant reaping (no true liveness)**: an idle-room /
-//!   stale-participant reaper ([`spawn_room_reaper_loop`] →
-//!   [`RoomStore::reap_stale`]) reclaims seats and rooms that have gone quiet, so
-//!   a client that crashes or never sends leave no longer holds its seat until
-//!   process restart. It keys on `last_seen_at`, which is seeded at join and
-//!   refreshed **only** when the participant polls the member-gated roster — the
-//!   sole per-participant liveness signal this slice has (there is no heartbeat,
-//!   and `MediaMTX` does not verify the advisory token). This is an
-//!   *approximation*: a participant whose media is live but which has **stopped
-//!   polling the roster** for the whole idle TTL would be reaped from the store
-//!   even though it is connected. Reaping only removes the in-memory signaling
-//!   record (seat + advisory token); it does **not** tear down the participant's
-//!   live `MediaMTX` `WebRTC` path, so a wrongly-reaped participant keeps its
-//!   media flowing and can re-join — it simply stops appearing in peers' future
-//!   roster polls. A real client heartbeat (renewal-on-activity) or `MediaMTX`
-//!   token verification is the documented follow-up that would make this a true
-//!   liveness guarantee; the reaper is deliberately conservative (a generous
-//!   idle TTL, empty-room drops keyed on `created_at`) until then.
+//! - **Client-driven participant reaping**: an idle-room / stale-participant
+//!   reaper ([`spawn_room_reaper_loop`] → [`RoomStore::reap_stale`]) reclaims
+//!   seats and rooms that have gone quiet, so a client that crashes or never
+//!   sends leave no longer holds its seat until process restart. It keys on
+//!   `last_seen_at`, refreshed by two signals: an explicit
+//!   [`heartbeat`](RoomStore::heartbeat) (renewal-on-activity, which also renews
+//!   the advisory token expiry) and, as a side effect, a member-gated roster
+//!   poll. A client doing **either** on any interval under the idle TTL holds
+//!   its seat. Liveness is still client-driven, not media-derived: a participant
+//!   whose media is live but which does neither for the whole idle TTL is
+//!   reaped. That failure stays benign — reaping removes only the signaling
+//!   record (seat + advisory token), never the live `MediaMTX` `WebRTC` path, so
+//!   such a participant keeps its media flowing and can re-join; it simply stops
+//!   appearing in peers' future roster polls. Deriving liveness from `MediaMTX`
+//!   itself (publisher state, or token verification once it lands) remains the
+//!   follow-up for a guarantee that does not depend on the client.
 //! - **Advisory token expiry**: `token_expires_at` is returned to the joiner but
 //!   is **not** enforced anywhere yet (`MediaMTX` does not verify these tokens),
 //!   so it never gates a lifecycle operation — a participant can always leave
@@ -322,23 +320,21 @@ struct RoomParticipant {
     display_name: Option<String>,
     joined_at: DateTime<Utc>,
     token: SessionToken,
-    /// Advisory metadata only, for a future media-auth / renewal slice.
+    /// Advisory metadata only, for a future media-auth slice.
     ///
-    /// Returned to the joiner and surfaced in the join response, but **not**
-    /// enforced anywhere — `MediaMTX` does not verify these tokens yet — so it
-    /// must never gate a lifecycle operation (leave, roster auth). Verification
-    /// is value-only (see [`verify_token`](Self::verify_token)).
+    /// Returned to the joiner and renewed by every
+    /// [`heartbeat`](RoomStore::heartbeat), but **not** enforced anywhere —
+    /// `MediaMTX` does not verify these tokens yet — so it must never gate a
+    /// lifecycle operation (leave, heartbeat, roster auth). Verification is
+    /// value-only (see [`verify_token`](Self::verify_token)).
     token_expires_at: DateTime<Utc>,
     /// Liveness clock for the idle-participant reaper (see [`reap_stale`]).
     ///
-    /// Seeded to `joined_at` and **refreshed to `now` every time this
-    /// participant is observed polling the member-gated roster** (see
-    /// [`RoomStore::roster`]) — the roster poll is the only per-participant
-    /// liveness signal this slice has (there is no heartbeat, and
-    /// `token_expires_at` is advisory). An actively-polling participant stays
-    /// fresh; one that has stopped polling ages out and is reclaimed. This is a
-    /// best-effort liveness *approximation*, not a guarantee — see the
-    /// module-level *Known limitations* note.
+    /// Seeded to `joined_at` and refreshed to `now` by either explicit signal:
+    /// a [`heartbeat`](RoomStore::heartbeat), or a member-gated roster poll (see
+    /// [`RoomStore::roster`]). A client doing either stays fresh; one that does
+    /// neither ages out and is reclaimed. Liveness is client-driven, not
+    /// media-derived — see the module-level *Known limitations* note.
     last_seen_at: DateTime<Utc>,
 }
 
@@ -546,10 +542,35 @@ pub trait RoomStore: Send + Sync {
         auth_token: &'a str,
     ) -> RoomStoreFuture<'a, RoomSnapshot>;
 
+    /// Refresh a participant's liveness clock and renew its advisory token
+    /// expiry to `now + token_ttl`, returning the renewed expiry.
+    ///
+    /// The explicit liveness signal behind the idle reaper: a client that keeps
+    /// heartbeating holds its seat even when it never polls the roster. The
+    /// token **value is never rotated**, so an in-flight roster poll carrying
+    /// the same token keeps working; only the (advisory) expiry moves.
+    ///
+    /// # Errors
+    ///
+    /// [`RoomError::RoomNotFound`] for an unknown room, a namespace mismatch, an
+    /// unknown `participant_id`, or a token that does not match — one opaque
+    /// error, so a heartbeat cannot probe room existence or membership
+    /// (fail-closed, matching [`roster`](RoomStore::roster) rather than
+    /// [`leave_room`](RoomStore::leave_room)).
+    fn heartbeat<'a>(
+        &'a self,
+        namespace: &'a str,
+        room_id: &'a str,
+        participant_id: &'a str,
+        token: &'a str,
+        token_ttl: Duration,
+    ) -> RoomStoreFuture<'a, DateTime<Utc>>;
+
     /// Reclaim stale participants and idle rooms, returning what was reaped.
     ///
     /// Walks every room and evicts each participant whose liveness clock
-    /// (`last_seen_at` — seeded at join, refreshed on every member roster poll)
+    /// (`last_seen_at` — seeded at join, refreshed by a
+    /// [`heartbeat`](RoomStore::heartbeat) or a member roster poll)
     /// is older than `idle_ttl`; a room emptied by that eviction — or an empty
     /// created-never-joined room older than `idle_ttl` — is dropped. `now` is
     /// **injected** (never the wall clock) so the sweep is deterministically
@@ -784,6 +805,36 @@ impl RoomStore for InMemoryRoomStore {
         })
     }
 
+    fn heartbeat<'a>(
+        &'a self,
+        namespace: &'a str,
+        room_id: &'a str,
+        participant_id: &'a str,
+        token: &'a str,
+        token_ttl: Duration,
+    ) -> RoomStoreFuture<'a, DateTime<Utc>> {
+        Box::pin(async move {
+            let mut rooms = self.rooms.write().expect("room store lock poisoned");
+            // Every miss below collapses to `RoomNotFound`: no membership oracle.
+            let room = rooms
+                .get_mut(&(namespace.to_owned(), room_id.to_owned()))
+                .ok_or(RoomError::RoomNotFound)?;
+            let participant = room
+                .participants
+                .get_mut(participant_id)
+                .ok_or(RoomError::RoomNotFound)?;
+            if !participant.verify_token(token) {
+                return Err(RoomError::RoomNotFound);
+            }
+            let now = Utc::now();
+            participant.last_seen_at = now;
+            participant.token_expires_at = now + token_ttl;
+            let renewed = participant.token_expires_at;
+            drop(rooms);
+            Ok(renewed)
+        })
+    }
+
     fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapFuture<'_> {
         Box::pin(async move {
             let mut stats = ReapStats::default();
@@ -794,7 +845,7 @@ impl RoomStore for InMemoryRoomStore {
             rooms.retain(|_key, room| {
                 let before = room.participants.len();
                 // Evict any participant idle past the horizon (last observed —
-                // via join or a roster poll — more than `idle_ttl` ago).
+                // via join, heartbeat or roster poll — more than `idle_ttl` ago).
                 room.participants.retain(|_id, participant| {
                     now.signed_duration_since(participant.last_seen_at) < idle_ttl
                 });
@@ -828,11 +879,11 @@ const ROOM_REAPER_INTERVAL_SECONDS: u64 = 60;
 /// Default participant idle TTL (and empty-room grace), in seconds.
 ///
 /// 15 minutes — deliberately generous. The default room token TTL is only 300s
-/// (5 min), and a live client re-polls the member-gated roster every few seconds
-/// for peer discovery, refreshing its `last_seen_at`; 15 min is 3× the token TTL
-/// and far longer than any reasonable poll cadence, so an actively-connected
-/// participant is never reclaimed — only a client that has stopped polling for a
-/// full 15 minutes (crashed / abandoned / never sent leave) ages out.
+/// (5 min), and a live client refreshes `last_seen_at` every few seconds anyway
+/// (a [`heartbeat`](RoomStore::heartbeat), or a roster poll for peer discovery);
+/// 15 min is 3× the token TTL and far longer than any reasonable cadence, so an
+/// active participant is never reclaimed — only a client silent for a full 15
+/// minutes (crashed / abandoned / never sent leave) ages out.
 const ROOM_IDLE_TTL_SECONDS: u64 = 900;
 
 /// Upper bound (10 years, in seconds) applied to the reaper idle-TTL before it
@@ -1097,6 +1148,37 @@ impl RoomService {
             .await
     }
 
+    /// Refresh `participant_id`'s liveness and renew its advisory token expiry.
+    ///
+    /// Clients call this on an interval (well under the reaper's idle TTL) to
+    /// hold a seat without polling the roster.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`RoomError`] from the store — every miss is
+    /// [`RoomError::RoomNotFound`] (fail-closed, no membership oracle).
+    pub async fn heartbeat(
+        &self,
+        room_id: &str,
+        participant_id: &str,
+        token: &str,
+    ) -> Result<HeartbeatResponse, RoomError> {
+        let token_expires_at = self
+            .store
+            .heartbeat(
+                &self.namespace,
+                room_id,
+                participant_id,
+                token,
+                self.token_ttl,
+            )
+            .await?;
+        Ok(HeartbeatResponse {
+            alive: true,
+            token_expires_at,
+        })
+    }
+
     /// Return the member-gated roster for `room_id`, composing a subscribe
     /// target for every participant.
     ///
@@ -1169,6 +1251,40 @@ impl std::fmt::Debug for LeaveRequest {
     }
 }
 
+/// Body of a room-heartbeat request.
+///
+/// [`std::fmt::Debug`] redacts `session_token` exactly as [`LeaveRequest`] does,
+/// so a request body cannot leak the secret into logs.
+#[derive(serde::Deserialize)]
+pub struct HeartbeatRequest {
+    /// The participant renewing its seat.
+    pub participant_id: String,
+    /// The session token minted at join time.
+    pub session_token: String,
+}
+
+impl std::fmt::Debug for HeartbeatRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HeartbeatRequest")
+            .field("participant_id", &self.participant_id)
+            .field("session_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Acknowledgement returned by a successful heartbeat.
+#[derive(Debug, Serialize)]
+pub struct HeartbeatResponse {
+    /// Always `true` — the seat was refreshed.
+    pub alive: bool,
+    /// The renewed advisory token expiry (`now + room_token_ttl_seconds`).
+    ///
+    /// Advisory only: nothing verifies it yet (see [`RoomStore::heartbeat`]).
+    /// Clients use it to pace the next heartbeat.
+    pub token_expires_at: DateTime<Utc>,
+}
+
 /// Resolve the installed [`RoomService`] or fail with a `500`.
 fn room_service(state: &AppState) -> AutumnResult<Arc<RoomService>> {
     state.extension::<RoomService>().ok_or_else(|| {
@@ -1209,6 +1325,22 @@ async fn rooms_leave(
         .await
         .map_err(RoomError::into_autumn)?;
     Ok(Json(RoomLeaveResponse { left: true }))
+}
+
+/// `POST {prefix}/rooms/{room_id}/heartbeat` — refresh a seat.
+///
+/// Fail-closed: an unknown room, unknown participant or wrong token all yield
+/// the same `404`, so a heartbeat is not a membership oracle.
+async fn rooms_heartbeat(
+    State(state): State<AppState>,
+    Path(room_id): Path<String>,
+    Json(body): Json<HeartbeatRequest>,
+) -> AutumnResult<Json<HeartbeatResponse>> {
+    let response = room_service(&state)?
+        .heartbeat(&room_id, &body.participant_id, &body.session_token)
+        .await
+        .map_err(RoomError::into_autumn)?;
+    Ok(Json(response))
 }
 
 /// Extract a bearer token from the `Authorization` header (case-insensitive
@@ -1262,6 +1394,7 @@ pub fn room_router() -> Router<AppState> {
         .route("/rooms", post(rooms_create))
         .route("/rooms/{room_id}/join", post(rooms_join))
         .route("/rooms/{room_id}/leave", post(rooms_leave))
+        .route("/rooms/{room_id}/heartbeat", post(rooms_heartbeat))
         .route("/rooms/{room_id}", get(rooms_roster))
 }
 
@@ -1281,6 +1414,11 @@ pub fn room_route_infos(api_prefix: &str) -> Vec<RouteInfo> {
             "POST",
             format!("{prefix}/rooms/{{room_id}}/leave"),
             "rooms::rooms_leave",
+        ),
+        room_route(
+            "POST",
+            format!("{prefix}/rooms/{{room_id}}/heartbeat"),
+            "rooms::rooms_heartbeat",
         ),
         room_route(
             "GET",
@@ -1304,10 +1442,10 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        InMemoryRoomStore, JoinRequest, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
-        RoomError, RoomParticipant, RoomService, RoomStore, SessionToken, bearer_token,
-        clamp_reaper_ttl, room_participant_path, room_route_infos, rooms_create, rooms_join,
-        rooms_roster, validate_room_segment,
+        HeartbeatRequest, InMemoryRoomStore, JoinRequest, LeaveRequest, MAX_REAPER_TTL_SECONDS,
+        ReapStats, Room, RoomError, RoomParticipant, RoomService, RoomStore, SessionToken,
+        bearer_token, clamp_reaper_ttl, room_participant_path, room_route_infos, rooms_create,
+        rooms_heartbeat, rooms_join, rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
@@ -1831,7 +1969,7 @@ mod tests {
     // ── Route metadata ───────────────────────────────────────────────────────
 
     #[test]
-    fn room_route_infos_cover_the_four_routes_under_prefix() {
+    fn room_route_infos_cover_the_five_routes_under_prefix() {
         let infos = room_route_infos("/api/media");
         let pairs: Vec<(&str, &str)> = infos
             .iter()
@@ -1843,6 +1981,7 @@ mod tests {
                 ("POST", "/api/media/rooms"),
                 ("POST", "/api/media/rooms/{room_id}/join"),
                 ("POST", "/api/media/rooms/{room_id}/leave"),
+                ("POST", "/api/media/rooms/{room_id}/heartbeat"),
                 ("GET", "/api/media/rooms/{room_id}"),
             ]
         );
@@ -2178,5 +2317,195 @@ mod tests {
             store.roster("", "room-1", "tok-b").await,
             Err(RoomError::RoomNotFound)
         ));
+    }
+
+    // ── Heartbeat (explicit liveness + advisory-expiry renewal) ──────────────
+
+    #[tokio::test]
+    async fn heartbeat_refreshes_last_seen_so_a_non_polling_participant_survives_a_sweep() {
+        // A client that heartbeats but never polls the roster stays live: the
+        // heartbeat is a first-class liveness signal, not a roster side effect.
+        let store = InMemoryRoomStore::new(6);
+        let stale = Utc::now() - Duration::hours(1);
+        seed_room(
+            &store,
+            "",
+            "room-1",
+            Utc::now() - Duration::hours(2),
+            &[("beating", "tok-a", stale), ("silent", "tok-b", stale)],
+        );
+
+        store
+            .heartbeat("", "room-1", "beating", "tok-a", Duration::seconds(300))
+            .await
+            .expect("heartbeat");
+
+        let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+
+        assert_eq!(stats.participants_reaped, 1, "only the silent seat reaped");
+        assert_eq!(stats.rooms_reaped, 0);
+        assert!(store.roster("", "room-1", "tok-a").await.is_ok());
+        assert!(matches!(
+            store.roster("", "room-1", "tok-b").await,
+            Err(RoomError::RoomNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_renews_the_advisory_token_expiry() {
+        // Renewal-on-activity: the surfaced expiry tracks the live session
+        // instead of decaying to a lie while the client is still active.
+        let store = InMemoryRoomStore::new(6);
+        let stale = Utc::now() - Duration::hours(1);
+        seed_room(&store, "", "room-1", stale, &[("p1", "tok", stale)]);
+
+        let renewed = store
+            .heartbeat("", "room-1", "p1", "tok", Duration::seconds(300))
+            .await
+            .expect("heartbeat");
+
+        assert!(
+            renewed > stale,
+            "expiry moved forward from the seeded value"
+        );
+        assert!(
+            renewed > Utc::now(),
+            "renewed expiry is in the future: {renewed}"
+        );
+        // The store record — not just the response — carries the new expiry.
+        let stored = store
+            .rooms
+            .read()
+            .unwrap()
+            .get(&(String::new(), "room-1".to_owned()))
+            .and_then(|room| room.participants.get("p1"))
+            .map(|participant| participant.token_expires_at)
+            .expect("participant present");
+        assert_eq!(stored, renewed);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_the_token_value_stable() {
+        // Renewal extends the expiry; it never rotates the value, so an
+        // in-flight roster poll holding the same token keeps working.
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        seed_room(&store, "", "room-1", now, &[("p1", "tok", now)]);
+
+        store
+            .heartbeat("", "room-1", "p1", "tok", Duration::seconds(300))
+            .await
+            .expect("heartbeat");
+
+        assert!(
+            store.roster("", "room-1", "tok").await.is_ok(),
+            "the original token still authenticates after a heartbeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_fail_closed_with_no_membership_oracle() {
+        // Unknown room, unknown participant and wrong token are indistinguishable
+        // — all `RoomNotFound` — so heartbeating cannot probe room existence or
+        // membership. (Stricter than `leave`, which a departing client needs to
+        // be able to tell apart.)
+        let store = InMemoryRoomStore::new(6);
+        let now = Utc::now();
+        seed_room(&store, "", "room-1", now, &[("p1", "tok", now)]);
+        let ttl = Duration::seconds(300);
+
+        for (room, participant, token, case) in [
+            ("nope", "p1", "tok", "unknown room"),
+            ("room-1", "ghost", "tok", "unknown participant"),
+            ("room-1", "p1", "wrong", "wrong token"),
+        ] {
+            assert!(
+                matches!(
+                    store.heartbeat("", room, participant, token, ttl).await,
+                    Err(RoomError::RoomNotFound)
+                ),
+                "{case} must be indistinguishable from a missing room"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_never_crosses_namespaces() {
+        // Tenant isolation: a value-correct token cannot touch another
+        // namespace's identically-named room.
+        let store = InMemoryRoomStore::new(6);
+        let stale = Utc::now() - Duration::hours(1);
+        seed_room(&store, "tenant-a", "room-1", stale, &[("p1", "tok", stale)]);
+
+        assert!(matches!(
+            store
+                .heartbeat("tenant-b", "room-1", "p1", "tok", Duration::seconds(300))
+                .await,
+            Err(RoomError::RoomNotFound)
+        ));
+
+        // The real tenant's seat is untouched, so it still ages out.
+        let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+        assert_eq!(stats.participants_reaped, 1);
+    }
+
+    #[tokio::test]
+    async fn handler_heartbeat_round_trips_and_fails_closed() {
+        let state = AppState::for_test();
+        state.insert_extension(service("tenant-a"));
+
+        let created = rooms_create(State(state.clone())).await.expect("create").0;
+        let joined = rooms_join(
+            State(state.clone()),
+            Path(created.id.clone()),
+            axum_json(JoinRequest { display_name: None }),
+        )
+        .await
+        .expect("join")
+        .0;
+
+        let beat = rooms_heartbeat(
+            State(state.clone()),
+            Path(created.id.clone()),
+            axum_json(HeartbeatRequest {
+                participant_id: joined.participant_id.clone(),
+                session_token: joined.session_token.expose().to_owned(),
+            }),
+        )
+        .await
+        .expect("heartbeat")
+        .0;
+        assert!(beat.alive);
+        assert!(beat.token_expires_at >= joined.token_expires_at);
+
+        // A wrong token is a fail-closed 404, not a 401 membership oracle.
+        let denied = rooms_heartbeat(
+            State(state),
+            Path(created.id),
+            axum_json(HeartbeatRequest {
+                participant_id: joined.participant_id,
+                session_token: "wrong".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("wrong token → not found");
+        assert_eq!(
+            denied.status(),
+            autumn_web::reexports::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn heartbeat_request_debug_redacts_the_session_token() {
+        let rendered = format!(
+            "{:?}",
+            HeartbeatRequest {
+                participant_id: "p1".to_owned(),
+                session_token: "super-secret".to_owned(),
+            }
+        );
+        assert!(rendered.contains("p1"));
+        assert!(!rendered.contains("super-secret"));
+        assert!(rendered.contains("<redacted>"));
     }
 }
