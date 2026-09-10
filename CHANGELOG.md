@@ -66,6 +66,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
 
+- **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
+  (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
+  inventory of `blog`'s admin post editor — the create/edit HTML form behind
+  `/admin/new` and `/admin/{id}/edit`, `supported`-tier and the only
+  hand-written (non-admin-plugin) content-authoring flow in the example —
+  found both of `NewPost::validated`'s recoverable failure modes (an
+  empty/whitespace-only title, an empty/whitespace-only body) sent the
+  submission through `AutumnError::unprocessable_msg`'s generic
+  `application/problem+json`/error-page response via the handler's `?`,
+  instead of redisplaying the form: 0 of 2 failure modes were adjacent to
+  cause, persisted in place, said how to recover, or preserved the author's
+  draft — a post with a long body and a merely-forgotten title lost the whole
+  body to a dead end with a "Go to homepage" link. This is the same
+  anti-pattern already fixed in `saas`/`teams`'s auth forms (#2530) and
+  `reddit-clone`'s create-community form (#2665). Fix: `NewPost` gains
+  `validate_fields(&self) -> Vec<(&'static str, &'static str)>` (every
+  violation, not just the first) alongside the existing `validated()` —
+  left untouched, since it still backs the JSON API (`routes::api::create`)
+  and the admin-plugin backend (`admin.rs`), both of which already have their
+  own error-reporting conventions. `routes::posts::post_form` now renders
+  from `(&NewPost, &[(&str, &str)])` instead of `Option<&Post>`, wiring
+  `aria-invalid`/`aria-describedby` to a per-field `role="alert"` message and
+  keeping the exact Tailwind classes already in place (no redesign); `create`
+  and `update` share it with their own GET routes via `new_post_page`/
+  `edit_post_page`, so a rejected POST re-renders the same page at 422 with
+  every submitted field (including the untouched one) and the `published`
+  checkbox state intact, instead of losing them to the generic error page.
+  No new dependency: this is `Form<NewPost>` plus a plain `Vec` of field
+  errors, not `ChangesetForm`/`validator::Validate` — `blog` does not already
+  depend on `validator`, and adding it purely for this fix was out of scope.
+  Verified against a live server (`cargo build -p blog`, Postgres): a rejected
+  create (blank title/body, a custom slug, `published` checked) now returns
+  422 with both `aria-invalid="true"`, both messages, the custom slug and the
+  checked box preserved; a rejected update (blank title only) preserves the
+  untouched, still-valid body text and shows `aria-invalid="false"` on that
+  field. `autumn check --a11y` against both the GET form and the rendered 422
+  HTML: 0 violations before and after (the fix is the redisplay, not a11y).
+  Seven new unit tests in `routes::posts::post_form_tests` cover
+  `validate_fields`/`normalized` and the redisplay markup itself
+  (`cargo test -p blog --bin blog routes::posts`: 7 passed).
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue
