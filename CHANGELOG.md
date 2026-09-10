@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rolls the proxy back to the OLD port, and the release stays live and
   reachable there; retry the port change alone in a separate deploy. The rare
   case where the rollback itself fails reports that the proxy's public bind is
-  now unknown and needs a human, rather than silently guessing.
+  now unknown and needs a human, rather than silently guessing. [no-plugin]
 
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
