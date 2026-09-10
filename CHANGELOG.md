@@ -66,6 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
 
+- **auth:** `api_token_error_response` now renders through the canonical
+  problem classification — the rendered status/problem type (including the
+  query-timeout reclassification) and the validation field map — instead of
+  rebuilding the body from `status()` alone. A `query_timeout` from an
+  `ApiTokenStore` previously rendered as `autumn.service_unavailable` and a
+  validation failure as `autumn.unprocessable_entity` with an empty `errors`
+  array; both now agree with `AutumnError::code()` and the standard response,
+  and the `AutumnErrorInfo` extension carries `details`/`problem_type` for
+  exception filters (issue #2635).
+
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue

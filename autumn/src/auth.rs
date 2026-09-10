@@ -2543,20 +2543,27 @@ fn api_token_unauthorized_response<ResBody: From<String> + Default>(
 }
 
 /// Build a Problem Details response from the API token store error.
+///
+/// Renders through the same classification the canonical [`AutumnError`]
+/// response uses: the rendered status/problem type (which carries the
+/// explicit problem type and the query-timeout reclassification) and the
+/// validation field map. Building the body from `status()` alone derived the
+/// wrong `code` and dropped `errors` (issue #2635).
 fn api_token_error_response<ResBody: From<String> + Default>(
     err: &crate::AutumnError,
     request_id: Option<String>,
     instance: Option<String>,
 ) -> Response<ResBody> {
-    let status = err.status();
+    let (status, problem_type) = err.rendered_problem();
     // `message`, not `Display`: this string becomes the response `detail`,
     // which stays the wrapped error even when the error carries a field map.
     let message = err.message();
+    let details = err.details().cloned();
     let body = crate::error::problem_details_json_string(
         status,
         message.clone(),
-        None,
-        None,
+        details.as_ref(),
+        problem_type,
         request_id,
         instance,
         true,
@@ -2571,8 +2578,8 @@ fn api_token_error_response<ResBody: From<String> + Default>(
         .insert(crate::middleware::AutumnErrorInfo {
             status,
             message,
-            details: None,
-            problem_type: None,
+            details,
+            problem_type,
             backtrace_string: None,
         });
     response
@@ -4938,7 +4945,7 @@ mod api_token_tests {
 
     #[test]
     fn api_token_error_response_detail_omits_the_field_map() {
-        // This builds its own body rather than rendering the error, so it
+        // The body renders through the canonical classification, but `detail`
         // must take `message()`. With `Display` a store returning a
         // validation error would put the field list in `detail` (issue
         // #2587).
@@ -4951,6 +4958,101 @@ mod api_token_tests {
         let json: serde_json::Value =
             serde_json::from_str(response.body()).expect("problem+json body");
         assert_eq!(json["detail"], "Validation failed");
+    }
+
+    #[test]
+    fn api_token_error_response_carries_code_and_errors_for_validation() {
+        // Regression for issue #2635: the body dropped the field map and the
+        // explicit problem type, so `code`/`errors` disagreed with the
+        // canonical render (`autumn.unprocessable_entity`, `errors` empty).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["code"], "autumn.validation_failed");
+        assert_eq!(
+            json["type"],
+            "https://autumn.dev/problems/validation-failed"
+        );
+        assert_eq!(
+            json["errors"],
+            serde_json::json!([{"field": "token", "messages": ["Malformed"]}]),
+        );
+        // The canonical render agrees: same error through `code()`.
+        assert_eq!(err.code(), "autumn.validation_failed");
+    }
+
+    #[test]
+    fn api_token_error_response_carries_explicit_problem_type() {
+        // Regression for issue #2635: an explicit problem type rendered under
+        // the status-derived code (`autumn.service_unavailable`).
+        let err = crate::AutumnError::query_timeout("query exceeded statement_timeout");
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], "autumn.query_timeout");
+        assert_eq!(json["type"], "https://autumn.dev/problems/query-timeout");
+        assert_eq!(err.code(), "autumn.query_timeout");
+    }
+
+    #[test]
+    fn api_token_error_response_reclassifies_cancelled_statements() {
+        // A database error from a custom `ApiTokenStore` whose message shows a
+        // cancelled statement renders as a redacted 503 query timeout, like
+        // the canonical `IntoResponse` path, not the assigned 500.
+        let err = crate::AutumnError::internal_server_error_msg(
+            "db: canceling statement due to statement timeout",
+        );
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], "autumn.query_timeout");
+        // Internal detail stays redacted in the body.
+        assert_eq!(json["detail"], "Service unavailable");
+    }
+
+    #[test]
+    fn api_token_error_response_stashes_details_for_exception_filters() {
+        // Regression for issue #2635: the `AutumnErrorInfo` extension dropped
+        // `details`/`problem_type`, so a downstream exception filter could not
+        // recover them either.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let info = response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .expect("AutumnErrorInfo in extensions");
+        assert_eq!(info.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            info.details.as_ref().and_then(|m| m.get("token")),
+            Some(&vec!["Malformed".to_owned()]),
+        );
+        // Validation errors carry no explicit problem type (the type URI is
+        // derived from the 422 + field map at render); explicit types like
+        // `query_timeout` are preserved verbatim.
+        assert_eq!(info.problem_type, None);
+        let timeout_err = crate::AutumnError::query_timeout("slow");
+        let timeout_response: http::Response<String> =
+            super::api_token_error_response(&timeout_err, None, None);
+        let timeout_info = timeout_response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .expect("AutumnErrorInfo in extensions");
+        assert_eq!(
+            timeout_info.problem_type,
+            Some("https://autumn.dev/problems/query-timeout")
+        );
     }
 
     #[tokio::test]

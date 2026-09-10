@@ -836,7 +836,7 @@ impl AutumnError {
     /// demotes it to a `503` query timeout, so [`code`](Self::code) reads the
     /// same classification the body shows. Reads the wrapped error, never
     /// `Display`, so a validation message cannot reclassify a `422`.
-    fn rendered_problem(&self) -> (StatusCode, Option<&'static str>) {
+    pub(crate) fn rendered_problem(&self) -> (StatusCode, Option<&'static str>) {
         let lowered = self.inner.to_string().to_lowercase();
         if lowered.contains("57014")
             || lowered.contains("query_canceled")
