@@ -899,12 +899,25 @@ def top_level_keys(args, macro=None):
             continue
         if "=" in segment.replace("==", ""):
             head = segment.split("=", 1)[0].strip()
-            # `crate = "…"` is stripped before the macro's parser runs and is
-            # accepted in any position, so it never occupies the positional
-            # slot: `#[authorize(crate = "x", update, …)]` still has `update`
-            # as its action verb.
-            if head not in UNIVERSAL_KEYS:
-                first = False
+            # A keyword argument does NOT close the positional slot. The slot
+            # is consumed by the positional argument itself, not by position in
+            # the list: `parse_authorize_args` takes the first bare `Meta::Path`
+            # whenever `args.action` is still unset, so
+            # `#[authorize(resource = Post, update)]` is as valid as
+            # `#[authorize(update, resource = Post)]`. Clearing the flag here
+            # reported the second form's action verb as an unknown flag. This
+            # also subsumes the narrower `crate = "…"` carve-out that stood
+            # here: a universal key was only the most obvious case of a keyword
+            # argument that cannot occupy a positional slot, not a special one.
+            #
+            # Known miss, left deliberately: a leading string literal fills the
+            # action slot too (`parse_with_leading_literal`), so a bare path
+            # after one — `#[authorize("update", draft)]` — is an error this
+            # reads as the action verb. Closing it means giving a positional
+            # literal the power to close the slot, and a stray literal anywhere
+            # else already makes the attribute unparseable for a reason this
+            # gate could not name. A miss is the safe direction; a confidently
+            # wrong message is not.
             if BARE_FLAG.match(head):
                 names.append((head, False))
         elif BARE_FLAG.match(segment):
@@ -1342,7 +1355,13 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             current, inside = [], False
             open_char, open_len = None, 0
             continue
-        body = doc.group(1).strip()
+        # A block quote inside a doc comment is a fence like any other, and the
+        # markdown half has stripped the CommonMark `>` prefix since the guide
+        # pages that carry one were found. This half did not, so `/// > ```rust`
+        # never opened a fence and everything in it went unread. Third time a
+        # rule taught to one scanner had to be taught to the other; they now
+        # share every one of them.
+        body = BLOCKQUOTE.sub("", doc.group(1)).strip()
         # Same delimiter rule as the markdown half: character and run length,
         # not a fixed three. Fixing only that scanner left this one reading
         # ````rust as the language "`rust" and skipping the block.
@@ -1588,6 +1607,27 @@ def self_test():
         ),
         [("job", "uniqe")],
     )
+    # The positional slot is closed by the positional argument, never by
+    # position in the list. `parse_authorize_args` takes the first bare
+    # `Meta::Path` whenever `args.action` is unset, so a keyword argument may
+    # precede the action verb.
+    check(
+        "markdown: the authorize action may follow a keyword argument",
+        scan_text("```rust\n#[authorize(resource = Post, update)]\n```\n", ".md"),
+        [],
+    )
+    check(
+        "markdown: a bad key alongside a trailing action is still caught",
+        scan_text(
+            "```rust\n#[authorize(resource = Post, update, bogus = 1)]\n```\n", ".md"
+        ),
+        [("authorize", "bogus")],
+    )
+    check(
+        "markdown: only the first bare identifier takes the action slot",
+        scan_text("```rust\n#[authorize(resource = Post, update, draft)]\n```\n", ".md"),
+        [("authorize", "draft")],
+    )
 
     # A macro parsing through a `syn::Parse` impl has no `fn(attr: TokenStream)`
     # at all. Rooting at the whole macro entry instead made `agent_operable`
@@ -1716,6 +1756,25 @@ def self_test():
         "markdown: nested block quote is scanned",
         scan_text('> > ```rust\n> > #[secured(policy = "x")]\n> > ```\n', ".md"),
         [("secured", "policy")],
+    )
+    # …and the same in rustdoc, which learned this rule three findings after
+    # the markdown half did.
+    check(
+        "rustdoc: fence inside a block quote is scanned",
+        scan_text('//! > ```rust\n//! > #[secured(policy = "x")]\n//! > ```\n', ".rs"),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: nested block quote is scanned",
+        scan_text(
+            '/// > > ```ignore\n/// > > #[secured(policy = "x")]\n/// > > ```\n', ".rs"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a quoted non-Rust fence is still not judged",
+        scan_text('//! > ```text\n//! > #[secured(policy = "x")]\n//! > ```\n', ".rs"),
+        [],
     )
 
     # `x == "…"` names a key only when `x` is one. `window != "pending"` and
