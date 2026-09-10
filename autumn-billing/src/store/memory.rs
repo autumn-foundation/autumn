@@ -300,7 +300,7 @@ impl BillingStore for MemoryBillingStore {
                 .filter(|s| s.customer_id == customer_id)
                 .cloned()
                 .collect();
-            rows.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at));
+            rows.sort_by_key(|row| std::cmp::Reverse(row.last_event_at));
             rows
         }))
     }
