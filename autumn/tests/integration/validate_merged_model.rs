@@ -1,30 +1,4 @@
-//! #1778 — validate the effective *merged model* on the update path.
-//!
-//! `#[autumn_web::model]` now derives `validator::Validate` on the read model
-//! and keeps the field `#[validate(...)]` rules there. The generated
-//! `from_patch(current, patch)` merges the patch onto a clone of the existing
-//! row and validates the resulting *concrete* model before returning the draft.
-//!
-//! Because the merged model's fields are concrete `T` (not `Patch<T>`), this
-//! path enforces the validators that hit hard `E0119` trait-coherence walls on
-//! `Patch<T>` — `ip` on an `Option<_>` column and `does_not_contain` — and the
-//! cross-field / struct-level ones (`custom`, `must_match`) that no
-//! single-field `Patch<T>` trait can express. All of them are still
-//! (correctly) dropped from the `Update{Model}` `Patch<T>` fields by the
-//! denylist, so the *only* thing that rejects an invalid-once-merged patch
-//! here is the merged-model check. (The last item of #1751's residual list,
-//! `nested`, is not exercised in this file: it would be enforced here through
-//! the same generic mechanism as `custom`, but it also carries a separate,
-//! `ValidateExt`-collision hazard -- scoped to the model's own defining
-//! module -- that has nothing to do with merged-model validation itself. See
-//! `ValidateExt`'s doc comment in `autumn/src/validation.rs` and the
-//! `tests/compile-fail/validate_nested_collides_with_validate_ext.rs` /
-//! `tests/compile-pass/validate_nested_without_validate_ext.rs` fixture pair.)
-//!
-//! Living in the consolidated `integration_tests` binary makes
-//! `cargo build --tests -p autumn-web` the compile-time regression guard: the
-//! module wouldn't compile at all if the merged-model validators reintroduced
-//! the E0119 walls.
+//! Merged-model validation covers rules that cannot validate `Patch<T>`.
 
 #![cfg(feature = "db")]
 
@@ -39,16 +13,70 @@ mod schema {
             ip -> Nullable<Text>,
             blurb -> Text,
             slug -> Text,
+            card -> Text,
+            label -> Text,
+            nested_value -> Text,
         }
     }
 }
 
 use schema::merged_hosts;
 
-/// Reject any value containing an uppercase letter — stands in for the
-/// cross-field / struct-level `custom` validators that have no `Patch<T>` impl
-/// and are therefore create-only on the patch-struct path, but run here against
-/// the concrete merged value.
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    serde::Deserialize,
+    serde::Serialize,
+    autumn_web::reexports::diesel::AsExpression,
+    autumn_web::reexports::diesel::FromSqlRow,
+    validator::Validate,
+)]
+#[diesel(sql_type = autumn_web::reexports::diesel::sql_types::Text)]
+pub struct NestedValue {
+    #[validate(length(min = 1))]
+    value: String,
+}
+
+impl
+    autumn_web::reexports::diesel::serialize::ToSql<
+        autumn_web::reexports::diesel::sql_types::Text,
+        autumn_web::reexports::diesel::pg::Pg,
+    > for NestedValue
+{
+    fn to_sql<'b>(
+        &'b self,
+        out: &mut autumn_web::reexports::diesel::serialize::Output<
+            'b,
+            '_,
+            autumn_web::reexports::diesel::pg::Pg,
+        >,
+    ) -> autumn_web::reexports::diesel::serialize::Result {
+        <String as autumn_web::reexports::diesel::serialize::ToSql<
+            autumn_web::reexports::diesel::sql_types::Text,
+            autumn_web::reexports::diesel::pg::Pg,
+        >>::to_sql(&self.value, out)
+    }
+}
+
+impl
+    autumn_web::reexports::diesel::deserialize::FromSql<
+        autumn_web::reexports::diesel::sql_types::Text,
+        autumn_web::reexports::diesel::pg::Pg,
+    > for NestedValue
+{
+    fn from_sql(
+        bytes: autumn_web::reexports::diesel::pg::PgValue<'_>,
+    ) -> autumn_web::reexports::diesel::deserialize::Result<Self> {
+        <String as autumn_web::reexports::diesel::deserialize::FromSql<
+            autumn_web::reexports::diesel::sql_types::Text,
+            autumn_web::reexports::diesel::pg::Pg,
+        >>::from_sql(bytes)
+        .map(|value| Self { value })
+    }
+}
+
 fn no_uppercase(value: &str) -> Result<(), validator::ValidationError> {
     if value.chars().any(char::is_uppercase) {
         return Err(validator::ValidationError::new("no_uppercase"));
@@ -60,19 +88,18 @@ fn no_uppercase(value: &str) -> Result<(), validator::ValidationError> {
 pub struct MergedHost {
     #[id]
     pub id: i64,
-    // `ip` on an `Option<String>` column: the E0119 wall. Dropped from the
-    // generated `UpdateMergedHost` patch field, enforced here on the merged
-    // concrete `Option<String>`.
     #[validate(ip)]
     pub ip: Option<String>,
-    // `does_not_contain`: blanket-inversion coherence wall on `Patch<T>`.
-    // Dropped from the patch field, enforced on the merged concrete `String`.
     #[validate(does_not_contain(pattern = "bad"))]
     pub blurb: String,
-    // `custom`: no `Patch<T>` impl (struct/cross-field class). Dropped from the
-    // patch field, enforced on the merged concrete value.
     #[validate(custom(function = "no_uppercase"))]
     pub slug: String,
+    #[validate(credit_card)]
+    pub card: String,
+    #[validate(non_control_character)]
+    pub label: String,
+    #[validate(nested)]
+    pub nested_value: NestedValue,
 }
 
 fn valid_current() -> MergedHost {
@@ -81,21 +108,26 @@ fn valid_current() -> MergedHost {
         ip: Some("10.0.0.1".to_string()),
         blurb: "all good".to_string(),
         slug: "host-one".to_string(),
+        card: "4111111111111111".to_string(),
+        label: "server".to_string(),
+        nested_value: NestedValue {
+            value: "value".to_string(),
+        },
     }
 }
 
-/// The `Update{Model}` still (correctly) drops these validators from its
-/// `Patch<T>` fields, so validating the *patch struct* on its own never rejects
-/// them — proving the merged-model path is what does the work below.
 #[test]
 fn update_model_patch_struct_still_drops_walled_validators() {
     let patch = UpdateMergedHost {
         ip: Patch::Set(Some("not-an-ip".to_string())),
         blurb: Patch::Set("this is bad".to_string()),
         slug: Patch::Set("SHOUTING".to_string()),
+        card: Patch::Set("invalid".to_string()),
+        label: Patch::Set("bad\u{0007}".to_string()),
+        nested_value: Patch::Set(NestedValue {
+            value: String::new(),
+        }),
     };
-    // On the patch struct alone every walled/cross-field validator is dropped,
-    // so it "passes". The merged model (below) is where they are enforced.
     assert!(
         patch.validate().is_ok(),
         "patch-struct validation must remain create-only for the walled validators"
@@ -109,6 +141,11 @@ fn from_patch_accepts_a_valid_merged_model() {
         ip: Patch::Set(Some("192.168.0.2".to_string())),
         blurb: Patch::Set("still fine".to_string()),
         slug: Patch::Set("host-two".to_string()),
+        card: Patch::Set("5555555555554444".to_string()),
+        label: Patch::Set("gateway".to_string()),
+        nested_value: Patch::Set(NestedValue {
+            value: "updated".to_string(),
+        }),
     };
     let draft = <UpdateDraft<MergedHost> as MergedHostDraftExt>::from_patch(&current, &patch)
         .expect("a valid merged model must pass validation");
@@ -167,19 +204,53 @@ fn from_patch_rejects_custom_invalid_once_merged() {
     );
 }
 
-// ── `must_match` (issue #1751 residual gap) ─────────────────────────────────
-//
-// `must_match` is cross-field: validator's `validate_must_match<T: Eq>(a, b)`
-// only needs `Eq`, which `Patch<T>` derives, so it DOES compile on a
-// `Patch<T>` field pair -- like `ip`/`does_not_contain`, it compiles with the
-// wrong semantics rather than failing to compile at all. Comparing the raw
-// `Patch<T>` values means `Set(v)` on one side against `Unchanged`/`Clear` on
-// the other (whenever only one of the pair is touched by the patch) would
-// spuriously fail even though nothing invalid was submitted. So it is dropped
-// from the `Update{Model}` patch field the same way `custom` is, and enforced
-// here on the merged concrete struct, where `password`/`password_confirm` are
-// ordinary `String`s being compared to each other, not to a tri-state
-// sentinel.
+#[test]
+fn from_patch_rejects_invalid_credit_card() {
+    let patch = UpdateMergedHost {
+        card: Patch::Set("invalid".to_string()),
+        ..Default::default()
+    };
+    let err = <UpdateDraft<MergedHost> as MergedHostDraftExt>::from_patch(&valid_current(), &patch)
+        .expect_err("an invalid card must be rejected");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert!(err.to_string().contains("card"));
+}
+
+#[test]
+fn from_patch_rejects_control_character() {
+    let patch = UpdateMergedHost {
+        label: Patch::Set("bad\u{0007}".to_string()),
+        ..Default::default()
+    };
+    let err = <UpdateDraft<MergedHost> as MergedHostDraftExt>::from_patch(&valid_current(), &patch)
+        .expect_err("a control character must be rejected");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert!(err.to_string().contains("label"));
+}
+
+#[test]
+fn from_patch_rejects_invalid_nested_value() {
+    let patch = UpdateMergedHost {
+        nested_value: Patch::Set(NestedValue {
+            value: String::new(),
+        }),
+        ..Default::default()
+    };
+    let err = <UpdateDraft<MergedHost> as MergedHostDraftExt>::from_patch(&valid_current(), &patch)
+        .expect_err("an invalid nested value must be rejected");
+    assert_eq!(
+        err.status(),
+        autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY
+    );
+}
+
+// Validate `must_match` after merging because it compares two fields.
 
 mod cross_field_schema {
     autumn_web::reexports::diesel::table! {
@@ -215,8 +286,6 @@ fn update_model_patch_struct_still_drops_must_match() {
         password: Patch::Set("new-secret".to_string()),
         password_confirm: Patch::Set("does-not-match".to_string()),
     };
-    // `must_match` is create-only on the patch struct — a mismatched pair
-    // validates cleanly there. The merged model (below) is what enforces it.
     assert!(
         patch.validate().is_ok(),
         "must_match must remain create-only on the patch struct"
