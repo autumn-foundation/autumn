@@ -800,6 +800,8 @@ RUSTDOC_CRATES = (
 )
 
 BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+# A code span, so that markup markers quoted inside one are read as text.
+INLINE_CODE = re.compile(r"(`+)(?:(?!\1).)*\1")
 WAIVER = re.compile(r"macro-arg-allow:\s*([a-z_0-9]+)\.([A-Za-z_0-9]+)")
 # A keyword argument, but never a `==` comparison.
 KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
@@ -988,7 +990,11 @@ ATTR_SIGIL = re.compile(r"#")
 # contiguous regex cannot express that, so the path is walked segment by
 # segment with the same trivia walker as the rest of the attribute head.
 _CRATE_NAMES = frozenset({"autumn_web", "autumn_macros", "autumn"})
-_SEGMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A path segment may be a raw identifier too. `#[r#secured(…)]` resolves to
+# the same attribute, and the previous commit normalized raw identifiers in the
+# KEY position while leaving the PATH position alone — the one-half-of-a-pair
+# failure, inside the very commit whose message claimed both halves were done.
+_SEGMENT = re.compile(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _macro_path_at(text, i):
@@ -1007,18 +1013,18 @@ def _macro_path_at(text, i):
         # merely ends in a familiar name — `autumn_web::reexports::axum::
         # routing::get` is axum's router macro, which takes a path literal and
         # has none of `#[get]`'s keyword grammar.
-        if first.group(0) not in _CRATE_NAMES:
+        if _plain_ident(first.group(0)) not in _CRATE_NAMES:
             return None
         k = _trivia_end(text, after + 2)
         name = _SEGMENT.match(text, k)
-        if name is None or name.group(0) not in OWNERS:
+        if name is None or _plain_ident(name.group(0)) not in OWNERS:
             return None
-        return name.group(0), start, name.end()
+        return _plain_ident(name.group(0)), start, name.end()
     # A bare name. Rooted, it is a crate NAMED like the macro (`::secured`),
     # not the macro.
-    if rooted or first.group(0) not in OWNERS:
+    if rooted or _plain_ident(first.group(0)) not in OWNERS:
         return None
-    return first.group(0), start, first.end()
+    return _plain_ident(first.group(0)), start, first.end()
 
 
 def _cfg_attr_path_at(text, i):
@@ -1583,7 +1589,11 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
             if "-->" in line:
                 in_html_comment = False
             continue
-        if open_char is None and "<!--" in line and "-->" not in line.split("<!--", 1)[1]:
+        # `<!--` inside an inline code span is text about a comment, not one.
+        # A page explaining the marker would otherwise open a comment that
+        # never closes and swallow the rest of the file.
+        markup = INLINE_CODE.sub("", line)
+        if open_char is None and "<!--" in markup and "-->" not in markup.split("<!--", 1)[1]:
             in_html_comment = True
             continue
         if open_char is None:
@@ -1641,6 +1651,33 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     return _judge_collected(rel, collected, accepted, judgeable, waived), fences
 
 
+def _block_doc_split(text, depth):
+    """`(doc text on this line, depth after it)` inside a block doc comment.
+
+    Rust block comments NEST, so a `/* … */` written as prose inside a `/** …
+    */` does not end the doc. Ending at the first `*/` dropped everything after
+    such an aside. `skip_comment` has counted nested comments since the source
+    balancer was written; this is the same rule, line by line.
+    """
+    out, i = [], 0
+    while i < len(text):
+        if text[i : i + 2] == "/*":
+            depth += 1
+            out.append(text[i : i + 2])
+            i += 2
+            continue
+        if text[i : i + 2] == "*/":
+            depth -= 1
+            if depth == 0:
+                return "".join(out), 0
+            out.append(text[i : i + 2])
+            i += 2
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out), depth
+
+
 def scan_rustdoc(path, accepted, judgeable, _calls=None):
     """Same, over ```-fenced Rust inside `//!` and `///` doc comments."""
     rel = path.relative_to(ROOT)
@@ -1648,7 +1685,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col = None, 0, 0
-    in_block_doc = False
+    in_block_doc = 0
     for lineno, line in enumerate(lines, 1):
         # `/** … */` and `/*! … */` are doc comments too, and `rustdoc --test`
         # collects and runs their fences exactly as it does `///`'s. Only the
@@ -1656,18 +1693,15 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # ungated. Entered only outside a fence, where `/**` is markup rather
         # than code.
         if in_block_doc:
-            text = line
-            if "*/" in text:
-                text = text.split("*/", 1)[0]
-                in_block_doc = False
+            text, in_block_doc = _block_doc_split(line, in_block_doc)
             doc_text = re.sub(r"^\s*\*\s?", "", text)
-        elif open_char is None and re.match(r"^\s*/\*[*!]", line):
+        elif (
+            open_char is None
+            and re.match(r"^\s*/\*[*!]", line)
+            and not re.match(r"^\s*/\*\*/", line)  # `/**/` is an ordinary comment
+        ):
             body_after = re.sub(r"^\s*/\*[*!]\s?", "", line)
-            if "*/" in body_after:
-                body_after = body_after.split("*/", 1)[0]
-            else:
-                in_block_doc = True
-            doc_text = body_after
+            doc_text, in_block_doc = _block_doc_split(body_after, 1)
         else:
             doc_text = None
         if doc_text is not None:
@@ -2256,6 +2290,42 @@ def self_test():
         "rustdoc: an ordinary block comment is not a doc comment",
         scan_text('/* note\n```\n#[secured(policy = "x")]\n```\n*/\npub fn g() {}\n', ".rs"),
         [],
+    )
+    check(
+        "rustdoc: an empty block comment is not a doc comment",
+        scan_text('/**/\n```\n#[secured(policy = "x")]\n```\n', ".rs"),
+        [],
+    )
+    # Rust block comments nest, so a `/* … */` aside written as prose inside a
+    # `/** … */` does not end the doc.
+    check(
+        "rustdoc: a nested comment does not end a block doc",
+        scan_text(
+            '/** doc with /* aside */ prose\n```\n#[secured(policy = "x")]\n```\n*/\n'
+            'pub fn f() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # A raw identifier in the PATH is the same macro, exactly as in the key.
+    check(
+        "markdown: a raw identifier macro path is caught",
+        scan_text('```rust\n#[r#secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a raw identifier crate prefix is caught",
+        scan_text('```rust\n#[r#autumn_web::r#secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    # `<!--` inside an inline code span is text about a marker, not a marker.
+    check(
+        "markdown: a quoted comment opener does not open a comment",
+        scan_text(
+            'The opener `<!--` starts one.\n\n```rust\n#[secured(policy = "x")]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
     check(
