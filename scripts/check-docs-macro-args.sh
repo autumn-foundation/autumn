@@ -1477,7 +1477,7 @@ def _indent_width(line):
     return width
 
 
-def _fence_body(line):
+def _fence_body(line, base=0):
     """A line with its block-quote prefix removed, unless it is over-indented.
 
     The quote marker is itself subject to the indentation rule: at four spaces
@@ -1485,9 +1485,26 @@ def _fence_body(line):
     quote containing one. Stripping the prefix first also stripped the
     indentation that says so, and the display was judged as live Rust.
     """
-    if _indent_width(line) > FENCE_INDENT_MAX:
+    if _indent_width(line) - base > FENCE_INDENT_MAX:
         return line
     return BLOCKQUOTE.sub("", line)
+
+
+# A list item establishes a content column, and CommonMark measures a fence
+# from THERE, not from the left margin: under `10. Step:` the content column is
+# four, so a four-space-indented fence is a fence. An absolute limit read that
+# as an indented code block and went silent. The corpus already nests 222 fence
+# lines in lists at columns two and three; a list numbered past nine is the
+# shape that pushes one to four.
+LIST_MARKER = re.compile(r"^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+)")
+
+
+def _list_content_column(line):
+    """The content column a list marker on `line` opens, or None."""
+    m = LIST_MARKER.match(line)
+    if m is None:
+        return None
+    return _indent_width(m.group(1)) + len(m.group(2)) + _indent_width(m.group(3))
 
 
 def _fence_lang(suffix):
@@ -1502,13 +1519,14 @@ def _fence_lang(suffix):
     return re.split(r"[,\s]", suffix.strip().lower())[0]
 
 
-def _fence_at(body):
+def _fence_at(body, base=0):
     """`(char, length, suffix)` when `body` is a fence line, else None.
 
     `body` has had any block-quote prefix removed but keeps its indentation,
-    which is what decides whether it is a fence at all.
+    which is what decides whether it is a fence at all. `base` is the content
+    column of any enclosing list item; the allowance is measured from there.
     """
-    if _indent_width(body) > FENCE_INDENT_MAX:
+    if _indent_width(body) - base > FENCE_INDENT_MAX:
         return None
     stripped = body.lstrip(" \t")
     for char in ("`", "~"):
@@ -1539,14 +1557,27 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len = None, 0
+    open_char, open_len, list_col = None, 0, 0
     for lineno, line in enumerate(lines, 1):
+        if open_char is None:
+            # Track the innermost list item's content column, but only outside
+            # a fence — inside one, a line beginning `- ` is code, not a list.
+            # The column is given up at the left margin, where a paragraph ends
+            # the list. Conservative on purpose: guessing a LARGER allowance
+            # than the document really has is how an indented display becomes a
+            # live fence again, which is the false positive this rule exists to
+            # avoid.
+            col = _list_content_column(line)
+            if col is not None:
+                list_col = col
+            elif line.strip() and _indent_width(line) == 0:
+                list_col = 0
         # A fenced example inside a block quote is still an example a reader
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
         # one, and without stripping the CommonMark `>` prefix the scanner
         # never entered the fence at all.
-        body = _fence_body(line)
-        fence = _fence_at(body)
+        body = _fence_body(line, list_col)
+        fence = _fence_at(body, list_col)
         handled = False
         if fence:
             char, length, suffix = fence
@@ -1589,7 +1620,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
-    open_char, open_len = None, 0
+    open_char, open_len, list_col = None, 0, 0
     for lineno, line in enumerate(lines, 1):
         doc = re.match(r"^\s*//[!/]\s?(.*)$", line)
         if not doc:
@@ -1602,8 +1633,13 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             # the negative — an item between two doc lines is an error
             # (E0753), so any other non-doc line still ends the fence, and an
             # unterminated one still cannot swallow the rest of the file.
+            #
+            # An outer attribute is the same case and for the same reason: it
+            # is not an item, so `/// ```rust`, `#[allow(dead_code)]`,
+            # `/// …` all still attach to the one item below, and
+            # `rustdoc --test` collects and runs the fence across it.
             bare = line.strip()
-            if not bare or bare.startswith("//"):
+            if not bare or bare.startswith("//") or bare.startswith("#"):
                 continue
             if inside:
                 collected.append(current)
@@ -1619,8 +1655,16 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         # Indentation is kept, not stripped: the same CommonMark rules decide a
         # fence here as in markdown, and both the four-space limit and the
         # closing-suffix check need it.
-        body = _fence_body(doc.group(1))
-        fence = _fence_at(body)
+        # A doc comment is markdown, so a list in one establishes a content
+        # column exactly as it does in a page. Same tracking, same scanner.
+        if open_char is None:
+            col = _list_content_column(doc.group(1))
+            if col is not None:
+                list_col = col
+            elif doc.group(1).strip() and _indent_width(doc.group(1)) == 0:
+                list_col = 0
+        body = _fence_body(doc.group(1), list_col)
+        fence = _fence_at(body, list_col)
         handled = False
         if fence:
             char, length, suffix = fence
@@ -2083,6 +2127,42 @@ def self_test():
     check(
         "markdown: tab-indented content inside a real fence is still scanned",
         scan_text('```rust\n\t#[secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    # A list item establishes a content column and the allowance is measured
+    # from there, so a list numbered past nine can carry a four-column fence.
+    check(
+        "markdown: a fence under a two-digit list item is a fence",
+        scan_text('10. Step:\n\n    ```rust\n    #[secured(policy = "x")]\n    ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a fence under a bullet is a fence",
+        scan_text('- Step:\n\n  ```rust\n  #[secured(policy = "x")]\n  ```\n', ".md"),
+        [("secured", "policy")],
+    )
+    # …and the guard that keeps the earlier false positive fixed: the column is
+    # given up when a paragraph ends the list, so a later indented display does
+    # not inherit the allowance.
+    check(
+        "markdown: an indented display after the list ends is not a fence",
+        scan_text(
+            '1. Step:\n\n   ```rust\n   #[secured(policy = "x")]\n   ```\n\n'
+            'A paragraph ends the list.\n\n'
+            '    ```rust\n    #[secured(policy = "y")]\n    ```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    # rustdoc: an outer attribute is not an item, so it does not break the doc
+    # comment. Verified with `rustdoc --test`.
+    check(
+        "rustdoc: a fence survives an outer attribute",
+        scan_text(
+            '/// ```\n#[allow(dead_code)]\n/// #[secured(policy = "x")]\n/// ```\n'
+            'pub fn f() {}\n',
+            ".rs",
+        ),
         [("secured", "policy")],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
