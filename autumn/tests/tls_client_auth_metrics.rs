@@ -17,8 +17,8 @@ mod tls_support;
 use autumn_web::config::ClientAuthMode;
 
 use crate::mtls_support::{
-    CA_PEM, CLIENT_CERT_PEM, CLIENT_KEY_PEM, CRL_PEM, REVOKED_CERT_PEM, REVOKED_KEY_PEM,
-    TrustFixture, UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM, eventually, mtls_get, serve_mtls,
+    CA_PEM, CRL_PEM, REVOKED_CERT_PEM, REVOKED_KEY_PEM, TrustFixture, UNTRUSTED_CERT_PEM,
+    UNTRUSTED_KEY_PEM, eventually, mtls_get, serve_mtls,
 };
 
 /// The current value of `tls_client_auth_rejected_total` for `reason`.

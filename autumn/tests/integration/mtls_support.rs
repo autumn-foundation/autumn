@@ -232,6 +232,16 @@ pub async fn mtls_get(
     path: &str,
     client: Option<(&str, &str)>,
 ) -> std::io::Result<HttpResponse> {
+    mtls_get_with_headers(addr, path, client, "").await
+}
+
+/// [`mtls_get`] with extra request headers, each `Name: value\r\n`.
+pub async fn mtls_get_with_headers(
+    addr: SocketAddr,
+    path: &str,
+    client: Option<(&str, &str)>,
+    extra_headers: &str,
+) -> std::io::Result<HttpResponse> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -258,8 +268,9 @@ pub async fn mtls_get(
     let work = async move {
         let tcp = tokio::net::TcpStream::connect(addr).await?;
         let mut stream = connector.connect(server_name, tcp).await?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{extra_headers}\r\n"
+        );
         stream.write_all(request.as_bytes()).await?;
         stream.flush().await?;
         let mut raw = Vec::new();

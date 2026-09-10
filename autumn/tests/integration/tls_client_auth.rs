@@ -23,15 +23,15 @@ use autumn_web::tls::client_auth::{ClientIdentity, ClientIdentityLayer};
 use axum::Router;
 use axum::routing::get;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 
 use super::mtls_support::{
     CA_PEM, CLIENT_CERT_PEM, CLIENT_KEY_PEM, CRL_EMPTY_PEM, CRL_PEM, MtlsServer, REVOKED_CERT_PEM,
     REVOKED_KEY_PEM, ROTATED_CA_PEM, ROTATED_CLIENT_CERT_PEM, ROTATED_CLIENT_KEY_PEM, TrustFixture,
-    UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM, eventually, keep_alive_request, mtls_get, serve_mtls,
+    UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM, eventually, keep_alive_request, mtls_get,
+    mtls_get_with_headers, serve_mtls,
 };
-use super::tls_support::{CertFixture, RecordingVerifier, now_unix, parse_response};
+use super::tls_support::{CertFixture, RecordingVerifier, now_unix};
 
 // ── the matrix ──────────────────────────────────────────────────────────────
 
@@ -342,6 +342,142 @@ async fn the_identity_carries_the_sans_a_policy_would_key_on() {
     assert!(response.body.contains("DNS:svc-orders.internal"));
 
     server.shutdown().await;
+}
+
+// ── composition with session auth ───────────────────────────────────────────
+
+#[tokio::test]
+async fn machine_identity_and_session_auth_guard_the_same_route_independently() {
+    // AC: mTLS composes with `Auth<T>`/`RequireAuth` on one router without
+    // conflict. They answer different questions — `RequireAuth` reads the
+    // request's session, `RequireClientCert` reads the connection — so a route
+    // carrying both must demand BOTH, and neither may swallow the other's
+    // rejection.
+    use std::collections::HashMap;
+
+    use autumn_web::auth::RequireAuth;
+    use autumn_web::session::Session;
+
+    let trust = TrustFixture::write(CA_PEM, None);
+    let server_cert = CertFixture::write();
+    let provider = autumn_web::tls::crypto_provider();
+    let (resolver, _reloader) = autumn_web::tls::CertReloader::load(
+        server_cert.cert.clone(),
+        server_cert.key.clone(),
+        Arc::clone(&provider),
+        now_unix(),
+        Duration::from_secs(60),
+    )
+    .expect("load server cert");
+    let (verifier, _trust_reloader) = autumn_web::tls::client_auth::ClientTrustReloader::load(
+        trust.bundle.clone(),
+        None,
+        // `optional`, so the route-level guards — not the handshake — decide.
+        ClientAuthMode::Optional,
+        Arc::clone(&provider),
+        Duration::from_secs(60),
+    )
+    .expect("load trust store");
+    let server_config = autumn_web::tls::build_server_config_with_client_auth(
+        Arc::clone(&provider),
+        resolver as Arc<dyn rustls::server::ResolvesServerCert>,
+        Some(verifier as Arc<dyn rustls::server::danger::ClientCertVerifier>),
+    )
+    .expect("build server config");
+
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = tcp.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let listener = autumn_web::tls::TlsListener::new(
+        tcp,
+        server_config,
+        Duration::from_secs(10),
+        shutdown.child_token(),
+    );
+
+    // A session is stamped only when the request asks for one, standing in for
+    // the session layer without booting an `AppState`.
+    let router = Router::new()
+        .route("/internal/both", get(|| async { "both" }))
+        .layer(RequireAuth::new("user_id"))
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.headers().contains_key("x-test-login") {
+                    let mut data = HashMap::new();
+                    data.insert("user_id".to_owned(), "42".to_owned());
+                    let mut req = req;
+                    req.extensions_mut()
+                        .insert(Session::new_for_test(String::new(), data));
+                    return next.run(req).await;
+                }
+                next.run(req).await
+            },
+        ));
+    let service = tower::Layer::layer(
+        &autumn_web::tls::client_auth::RequireClientCertLayer::for_paths(vec![
+            "/internal/".to_owned(),
+        ]),
+        router,
+    );
+    let service = tower::Layer::layer(&ClientIdentityLayer, service);
+    let make_service =
+        axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+            TlsConnectInfo,
+        >(service);
+    let shutdown_wait = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, make_service)
+            .with_graceful_shutdown(async move {
+                shutdown_wait.cancelled().await;
+            })
+            .await
+    });
+
+    let cert = Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM));
+    // Both guards satisfied.
+    let ok = mtls_get_with_headers(addr, "/internal/both", cert, "x-test-login: 1\r\n")
+        .await
+        .expect("request");
+    assert_eq!(ok.status, 200, "both guards satisfied should serve");
+    assert_eq!(ok.body, "both");
+
+    // Machine identity without a session: `RequireAuth` rejects, and its
+    // rejection is not masked by the mTLS layer.
+    let no_session = mtls_get_with_headers(addr, "/internal/both", cert, "")
+        .await
+        .expect("request");
+    assert_eq!(
+        no_session.status, 401,
+        "a verified machine is still not a logged-in user"
+    );
+
+    // A session without a certificate: the mTLS layer rejects, and its
+    // rejection is not masked by `RequireAuth`.
+    let anonymous: Option<(&str, &str)> = None;
+    let no_cert = mtls_get_with_headers(addr, "/internal/both", anonymous, "x-test-login: 1\r\n")
+        .await
+        .expect("request");
+    assert_eq!(
+        no_cert.status, 403,
+        "a logged-in user still needs the client certificate"
+    );
+
+    // Neither: the outer guard answers first, and it is the mTLS one.
+    let neither = mtls_get_with_headers(addr, "/internal/both", anonymous, "")
+        .await
+        .expect("request");
+    assert_eq!(neither.status, 403);
+
+    MtlsServer {
+        addr,
+        shutdown,
+        handle,
+        _server_cert: server_cert,
+    }
+    .shutdown()
+    .await;
 }
 
 // ── rotation ────────────────────────────────────────────────────────────────
