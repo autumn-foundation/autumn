@@ -820,7 +820,15 @@ KEYWORD_ARG = re.compile(r"\b([a-z_][a-z_0-9]*)\s*=(?!=)")
 # reader can write and the macro really does reject. Python's `\w` is
 # Unicode-aware, and `[^\W\d]` is "a word character that is not a digit" — an
 # identifier start.
-KEY_IDENT = re.compile(r"^[^\W\d]\w*$", re.UNICODE)
+def _is_ident(name):
+    """Whether `name` is a Rust identifier.
+
+    `str.isidentifier` is defined on XID_Start/XID_Continue — the same classes
+    Rust uses — so it accepts a decomposed `polícy` whose accent is a combining
+    mark. Python's `\\w` does not include combining marks, so the regex this
+    replaces rejected exactly the identifiers it was added to catch.
+    """
+    return bool(name) and name.isidentifier()
 
 
 def _is_bare_flag(name):
@@ -831,7 +839,7 @@ def _is_bare_flag(name):
     test is on the first character rather than an ASCII range, so it holds for
     a non-ASCII identifier too.
     """
-    return bool(KEY_IDENT.match(name)) and not name[0].isupper()
+    return _is_ident(name) and not name[0].isupper()
 
 
 def _plain_ident(name):
@@ -958,7 +966,7 @@ def top_level_keys(args, macro=None):
             # gate could not name. A miss is the safe direction; a confidently
             # wrong message is not.
             head = _plain_ident(head)
-            if KEY_IDENT.match(head):
+            if _is_ident(head):
                 names.append((head, False))
         elif _is_bare_flag(_plain_ident(segment)):
             leading, first = first, False
@@ -1511,7 +1519,7 @@ def _indent_width(line):
     return width
 
 
-def _fence_body(line, base=0, in_fence=False):
+def _fence_body(line, base=0, in_fence=False, quoted=False):
     """A line with its block-quote prefix removed, unless it is over-indented.
 
     The quote marker is itself subject to the indentation rule: at four spaces
@@ -1524,12 +1532,15 @@ def _fence_body(line, base=0, in_fence=False):
     column such a marker establishes but still handed the marker itself to the
     fence test, which then saw `-` where the delimiter should be.
     """
-    # Inside a fence NO container prefix is structure — every line is content,
-    # so a `>` or a `- ` there is code. Last round taught the list half this and
-    # left the quote half beside it unguarded, in this same function; a `> ``` `
-    # in a raw string still truncated the block.
+    # Inside a fence a list marker is never structure — every line is content,
+    # so a `- ` there is code. A quote prefix is different, and the previous
+    # round got this wrong by treating them alike: when the fence itself lives
+    # inside a quote, the `>` on each line is the CONTAINER continuing, and
+    # stripping it is how the closing delimiter becomes visible. Refusing to
+    # strip it left the fence open forever and carried Rust mode into every
+    # later quoted block. A `>` inside a fence that is NOT quoted is still code.
     if in_fence:
-        return line
+        return BLOCKQUOTE.sub("", line) if quoted else line
     # Containers are unwrapped in nesting order, outermost first, because
     # `> - ```rust` is a quote holding a list. Testing the marker against the
     # raw line meant a quoted list fence was never recognised at all.
@@ -1771,7 +1782,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
                 collected.append(current)
                 current = []
             inside, open_char, open_len = False, None, 0
-        body = _fence_body(line, list_col, open_char is not None)
+        body = _fence_body(line, list_col, open_char is not None, fence_quoted)
         fence = _fence_at(body, list_col)
         handled = False
         if fence:
@@ -1817,6 +1828,7 @@ DOC_ATTR = re.compile(r"^\s*#!?\[\s*doc\s*=\s*")
 # configuration, a reader can reach that page.
 CFG_ATTR_DOC = re.compile(r"^\s*#!?\[\s*cfg_attr\s*\(")
 DOC_ITEM = re.compile(r"^\s*doc\s*=\s*")
+CONCAT_CALL = re.compile(r"\s*concat\s*!\s*\(")
 
 
 def _doc_attr_text(line):
@@ -1831,6 +1843,22 @@ def _doc_attr_text(line):
     if m is None:
         return None
     rest = line[m.end() :]
+    # `#[doc = concat!("…", "…")]` is expanded by rustdoc, which then renders
+    # and tests the fence the pieces spell out. Only literal arguments are
+    # joined: anything else (a `stringify!`, a const) is a value this scanner
+    # cannot evaluate, and a partial join would invent markdown.
+    concat = CONCAT_CALL.match(rest)
+    if concat is not None:
+        end = _close_of(rest, concat.end(), "(")
+        if end is None:
+            return None
+        parts = []
+        for start, stop in _split_top_level(rest[concat.end() : end]):
+            piece = _doc_attr_text("#[doc = " + rest[concat.end() : end][start:stop].strip())
+            if piece is None:
+                return None
+            parts.append(piece)
+        return "".join(parts) if parts else None
     if rest[:1] == "r":
         opened = re.match(r'r(#*)"', rest)
         if opened is None:
@@ -2012,12 +2040,15 @@ def _bracket_delta(text):
 
 
 def _block_doc_split(text, depth):
-    """`(doc text on this line, depth after it)` inside a block doc comment.
+    """`(doc text, depth after it, source after the closer)` in a block comment.
 
     Rust block comments NEST, so a `/* … */` written as prose inside a `/** …
     */` does not end the doc. Ending at the first `*/` dropped everything after
     such an aside. `skip_comment` has counted nested comments since the source
     balancer was written; this is the same rule, line by line.
+
+    The third element is what follows the closing `*/` on the same line. It used
+    to be discarded, which hid an item sharing that line from the caller.
     """
     out, i = [], 0
     while i < len(text):
@@ -2029,13 +2060,37 @@ def _block_doc_split(text, depth):
         if text[i : i + 2] == "*/":
             depth -= 1
             if depth == 0:
-                return "".join(out), 0
+                return "".join(out), 0, text[i + 2 :]
             out.append(text[i : i + 2])
             i += 2
             continue
         out.append(text[i])
         i += 1
-    return "".join(out), depth
+    return "".join(out), depth, ""
+
+
+def _tail_is_item(tail):
+    """Whether source sharing a line with a comment closer starts an item.
+
+    An attribute or another comment is a gap — rustdoc concatenates the doc
+    attributes on either side of it, so a fence open across the gap keeps
+    running. Anything else is an item, and the documentation above it belongs to
+    that item alone.
+
+    Anything unclear counts as "not an item". A reset that fires early leaves a
+    later closing delimiter to be read as a fresh opener, and the prose after it
+    scanned as code — the one failure direction this gate will not take. A reset
+    that fires late only stops the gate looking, which is what it did before.
+    """
+    bare = tail.strip()
+    while bare.startswith("#"):
+        if _bracket_delta(bare) != 0:
+            return False
+        rest = _after_attribute(bare).strip()
+        if rest == bare:
+            return False
+        bare = rest
+    return bool(bare) and not bare.startswith("//") and not bare.startswith("/*")
 
 
 def scan_rustdoc(path, accepted, judgeable, _calls=None):
@@ -2046,7 +2101,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     inside, fences, collected, current = False, 0, [], []
     open_char, open_len, list_col, fence_quoted = None, 0, 0, False
     in_block_doc, attr_depth, comment_depth = 0, 0, 0
-    in_html_comment = False
+    in_html_comment, pending_item = False, False
     # A `#[doc = "…"]` attribute is expanded into the line-doc form it is
     # equivalent to, so every rule below — fences, block quotes, indentation,
     # list columns — applies to it without a second implementation. The source
@@ -2067,13 +2122,26 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
     # step was shared. The step was; its INPUT was not.
     stream_masked = _code_span_masked([text for _, text in stream])
     for pos, (lineno, line) in enumerate(stream):
+        # A block comment whose closer shares its line with an item —
+        # `/** … */ pub fn a() {}` — ends that item's documentation right there.
+        # Everything after `*/` was discarded, so an unclosed fence ran on into
+        # the NEXT item's prose and reported an attribute merely mentioned in
+        # it. rustdoc ends the fence at `a`'s documentation boundary; so does
+        # this, on the line after, once this line's own doc text has been read.
+        if pending_item:
+            pending_item = False
+            if inside:
+                collected.append(current)
+            current, inside = [], False
+            open_char, open_len = None, 0
         # `/** … */` and `/*! … */` are doc comments too, and `rustdoc --test`
         # collects and runs their fences exactly as it does `///`'s. Only the
         # line forms were recognised, so a whole legitimate doc form was
         # ungated. Entered only outside a fence, where `/**` is markup rather
         # than code.
         if in_block_doc:
-            text, in_block_doc = _block_doc_split(line, in_block_doc)
+            text, in_block_doc, tail = _block_doc_split(line, in_block_doc)
+            pending_item = not in_block_doc and _tail_is_item(tail)
             doc_text = re.sub(r"^\s*\*\s?", "", text)
         # An open fence does NOT disqualify a block doc comment. The guard that
         # said so was added to stop `/**` inside a fence being read as markup,
@@ -2091,7 +2159,8 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             r"^\s*/\*\*/", line
         ):
             body_after = re.sub(r"^\s*/\*[*!]\s?", "", line)
-            doc_text, in_block_doc = _block_doc_split(body_after, 1)
+            doc_text, in_block_doc, tail = _block_doc_split(body_after, 1)
+            pending_item = not in_block_doc and _tail_is_item(tail)
         else:
             doc_text = None
         if doc_text is not None:
@@ -2132,13 +2201,21 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
             # it. Only the line forms were exempt, so `/* note */` between two
             # `///` lines ended the fence. It may span lines, so the depth is
             # carried — the same nesting rule as the block doc form.
+            # It is only a gap while nothing but comment sits on the line. A
+            # closer sharing its line with an item — `/* note */ pub fn a() {}`
+            # — ends the documentation above it, so that case falls through to
+            # the reset below rather than skipping the line as trivia.
             if comment_depth > 0:
-                _, comment_depth = _block_doc_split(line, comment_depth)
-                continue
-            if bare.startswith("/*"):
-                _, comment_depth = _block_doc_split(line[line.index("/*") + 2 :], 1)
-                continue
-            if not bare or bare.startswith("//"):
+                _, comment_depth, tail = _block_doc_split(line, comment_depth)
+                if comment_depth > 0 or not _tail_is_item(tail):
+                    continue
+            elif bare.startswith("/*"):
+                _, comment_depth, tail = _block_doc_split(
+                    line[line.index("/*") + 2 :], 1
+                )
+                if comment_depth > 0 or not _tail_is_item(tail):
+                    continue
+            elif not bare or bare.startswith("//"):
                 continue
             if bare.startswith("#"):
                 depth = _bracket_delta(line)
@@ -2197,7 +2274,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 collected.append(current)
                 current = []
             inside, open_char, open_len = False, None, 0
-        body = _fence_body(doc.group(1), list_col, open_char is not None)
+        body = _fence_body(doc.group(1), list_col, open_char is not None, fence_quoted)
         fence = _fence_at(body, list_col)
         handled = False
         if fence:
@@ -2880,6 +2957,57 @@ def self_test():
         ),
         [("secured", "policy")],
     )
+    # A comment closer sharing its line with an item ends the documentation
+    # above it. The fence inside must still be read; the prose documenting the
+    # NEXT item must not be, or a spelling merely mentioned there is reported.
+    check(
+        "rustdoc: a block doc closer beside an item is scanned to the closer",
+        scan_text(
+            '/** ```rust\n * #[secured(policy = "x")]\n */ pub fn a() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a block doc closer beside an item ends the fence",
+        scan_text(
+            '/** ```rust\n * let x = 1;\n */ pub fn a() {}\n\n'
+            '/// Older builds spelled it `#[secured(policy = "x")]`.\n'
+            'pub fn b() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    check(
+        "rustdoc: an ordinary block comment beside an item ends the fence",
+        scan_text(
+            '/// ```rust\n/// let x = 1;\n/* note */ pub fn a() {}\n\n'
+            '/// Older builds spelled it `#[secured(policy = "x")]`.\n'
+            'pub fn b() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    # A gap is still a gap when the closer's line carries only trivia or an
+    # attribute — rustdoc concatenates the doc attributes on either side of it.
+    check(
+        "rustdoc: a comment closer beside an attribute is still a gap",
+        scan_text(
+            '/// ```rust\n/* note */ #[allow(dead_code)]\n'
+            '/// #[secured(policy = "x")]\n/// ```\npub fn a() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a comment closer beside a line comment is still a gap",
+        scan_text(
+            '/// ```rust\n/* note */ // trailing\n'
+            '/// #[secured(policy = "x")]\n/// ```\npub fn a() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
     # A fence may begin on the marker's own line.
     check(
         "markdown: a fence on the list marker's line is scanned",
@@ -3079,6 +3207,23 @@ def self_test():
             ".rs",
         ),
         [("secured", "policy")],
+    )
+    # rustdoc expands `concat!` before rendering, so its pieces are one page.
+    check(
+        "rustdoc: a concatenated doc attribute is scanned",
+        scan_text(
+            '#[doc = concat!("```\\n", "#[secured(policy = \\"x\\")]\\n", "```")]\n'
+            'pub fn g() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a concatenated argument the gate cannot read is skipped",
+        scan_text(
+            '#[doc = concat!("```\\n", env!("K"), "\\n```")]\npub fn g() {}\n', ".rs"
+        ),
+        [],
     )
     # Inside a fence no container prefix is structure: a `>` there is code.
     check(
