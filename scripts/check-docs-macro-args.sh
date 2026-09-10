@@ -195,6 +195,10 @@
 #     by the item, are read one deep: the first expands, and the rest go back
 #     as ordinary source. rustdoc concatenates all of them, so a fence spanning
 #     them goes unread. Closing it means re-entering the expansion on the tail.
+#   - An info string is classified by its first token, so ```` ```text,rust ````
+#     and ```` ```{.rust} ```` — both of which `rustdoc --test` collects — read
+#     as non-Rust and go unscanned. Closing it means implementing rustdoc's
+#     whole info-string grammar rather than the token this reads today.
 #
 # ── Corpus ───────────────────────────────────────────────────────────────────
 #
@@ -1330,6 +1334,14 @@ def _cfg_attr_payloads(body, base):
     items = _split_top_level(body)
     # The first item is the predicate (`all(feature = "a", …)`), never an
     # applied attribute. Everything after it is one attribute each.
+    #
+    # A predicate that is provably false applies nothing: rustc never resolves
+    # the attribute, so `#[cfg_attr(any(), secured(policy = "x"))]` compiles
+    # clean and reporting it failed the gate on valid Rust. Same conservative
+    # evaluation the conditional-documentation path uses — only provably false
+    # is skipped, everything else is read.
+    if items and _cfg_true(body[items[0][0] : items[0][1]]) is False:
+        return out
     for start, end in items[1:]:
         item = body[start:end]
         # An item may lead with a comment — `cfg_attr(feature = "a",
@@ -1699,18 +1711,35 @@ def _html_comment_step(text, inside, fence_open, base, markup=None):
     because an opener with no closer swallows everything after it.
     """
     if inside:
-        return True, "-->" not in text
+        end = text.find("-->")
+        # A line may close one comment and open another, so the tail after the
+        # closer is read too rather than assumed clear.
+        return True, True if end == -1 else _opens_comment(text[end + 3 :])
     if markup is None:
         markup = text
     displayed = _indent_width(text) - base > FENCE_INDENT_MAX
-    if (
-        not fence_open
-        and not displayed
-        and "<!--" in markup
-        and "-->" not in markup.split("<!--", 1)[1]
-    ):
-        return True, True
-    return False, False
+    if fence_open or displayed or not _opens_comment(markup):
+        return False, False
+    return True, True
+
+
+def _opens_comment(text):
+    """Whether `text` leaves an HTML comment open at its end.
+
+    Every marker on the line is walked, not just the first: `<!-- a --> <!-- b`
+    closes one comment and opens another, and looking only past the first
+    opener found the earlier `-->` and called the line clear — so a fence in
+    the second comment was scanned and reported.
+    """
+    i = 0
+    while True:
+        start = text.find("<!--", i)
+        if start == -1:
+            return False
+        end = text.find("-->", start + 4)
+        if end == -1:
+            return True
+        i = end + 3
 
 
 def _fence_lang(suffix):
@@ -2020,8 +2049,9 @@ def _cfg_true(pred):
         if len(parts) != 1 or parts[0] is None:
             return None
         return not parts[0]
-    if not parts:
-        return None
+    # Vacuous truth, as Rust defines it: `all()` holds and `any()` does not.
+    # `#[cfg_attr(any(), …)]` is the idiom for an attribute deliberately never
+    # applied, and treating the empty list as unknown reported one.
     if op == "all":
         if any(p is False for p in parts):
             return False
@@ -3479,6 +3509,55 @@ def self_test():
             '/// >> ```rust\n/// >> #[secured(policy = "x")]\n/// >> ```\n'
             'pub fn a() {}\n',
             ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    # A predicate that is provably false applies nothing, so the attribute
+    # behind it is not an invocation rustc ever resolves.
+    check(
+        "markdown: an attribute behind an empty any() is not applied",
+        scan_text(
+            '```rust\n#[cfg_attr(any(), secured(policy = "x"))]\npub fn f() {}\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: an attribute behind an empty all() is applied",
+        scan_text(
+            '```rust\n#[cfg_attr(all(), secured(policy = "x"))]\npub fn f() {}\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: an attribute behind a feature predicate is still read",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "x", secured(policy = "x"))]\n'
+            'pub fn f() {}\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    # Every HTML-comment marker on a line is walked, not only the first.
+    check(
+        "markdown: a closed comment beside an open one still hides a fence",
+        scan_text(
+            '<!-- a --> <!-- b\n\n```rust\n#[secured(policy = "x")]\n```\n', ".md"
+        ),
+        [],
+    )
+    check(
+        "markdown: a comment closing beside a new opener stays open",
+        scan_text(
+            '<!-- a\n--> <!-- b\n\n```rust\n#[secured(policy = "x")]\n```\n', ".md"
+        ),
+        [],
+    )
+    check(
+        "markdown: two closed comments on one line hide nothing after them",
+        scan_text(
+            '<!-- a --> <!-- b -->\n\n```rust\n#[secured(policy = "x")]\n```\n', ".md"
         ),
         [("secured", "policy")],
     )
