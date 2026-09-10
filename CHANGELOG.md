@@ -168,6 +168,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **commit hooks:** an immediate after-hook failure now records the hook's
+  `AutumnError` via `message()` — the bare title, e.g. `"Validation failed"`
+  (issue #2596). All nine generated immediate-failure paths stringified the
+  error with `Display`, while the deferred commit-hook worker (migrated in
+  #2592) stores `message()`; for a validation error the two differ
+  (`"Validation failed: email: ..."` vs `"Validation failed"`), so the same
+  logical failure produced two different stored strings. Now they agree.
 - **`#[model]`:** no longer emits an empty-bodied `impl Normalize` for a
   `New*` whose model declares no `#[normalize]` columns (issue #2634). The
   repository probe's `Yes` arm used to win unconditionally, so `save`,
