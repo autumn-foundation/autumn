@@ -302,7 +302,19 @@ OWNERS = {
     "step_up": "step_up.rs",
     "task": "one_off_task.rs",
     "throttle": "throttle.rs",
-    "ws": ("ws.rs", "parse.rs"),
+    # NOT a route alias despite the shape: `ws_macro` calls
+    # `parse::parse_route_path(attr)`, which takes a single path literal, so it
+    # has no keyword grammar of its own. Registering the shared route parser
+    # made `api_version`, `timeout_ms` and the rest look valid here.
+    #
+    # Known residue: reading `ws.rs` alone still yields `seo`, from
+    # `reject_seo_argument`'s `ident == "seo"` — the one key `#[ws]` goes out
+    # of its way to REJECT. The extractor cannot tell an acceptance test from a
+    # rejection test, so `#[ws(.., seo(...))]` is missed. That is the safe
+    # direction (a miss, not a false report) and it is one key on one macro;
+    # the alternative, registering `parse.rs` to reach the path-only parser,
+    # drags the whole route grammar back in with it.
+    "ws": "ws.rs",
 }
 
 # Every shape a macro source uses to name an argument key it accepts. See the
@@ -939,6 +951,38 @@ def skip_raw_literal(text, i):
     return len(text) if end == -1 else end + len(close)
 
 
+def _masked_spans(text):
+    """Spans of `text` that are string/char literals or comments."""
+    spans, i = [], 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "/":
+            end = skip_comment(text, i)
+            if end is not None:
+                spans.append((i, end))
+                i = end
+                continue
+        if ch == "r" and text[i + 1 : i + 2] in ('"', "#"):
+            end = skip_raw_literal(text, i)
+            if end is not None:
+                spans.append((i, end))
+                i = end
+                continue
+        if ch == '"':
+            end = skip_literal(text, i)
+            spans.append((i, end))
+            i = end
+            continue
+        if ch == "'":
+            end = _skip_rust_char(text, i)
+            if end is not None:
+                spans.append((i, end))
+                i = end
+                continue
+        i += 1
+    return spans
+
+
 def _close_of(text, start):
     """Index of the delimiter closing the group opened just before `start`."""
     i, depth = start, 1
@@ -983,9 +1027,20 @@ def find_macro_calls(text):
     lines — the house style for `#[repository(...)]` and `#[lifecycle(...)]`
     once they carry more than one key — is matched like any other.
     """
+    masked = _masked_spans(text)
+
+    def in_literal(pos):
+        return any(start <= pos < end for start, end in masked)
+
     out = []
     for pattern in (MACRO_OPEN, CFG_ATTR_OPEN):
         for match in pattern.finditer(text):
+            if in_literal(match.start()):
+                # Inside a string or comment this is a *value*, not an
+                # invocation: `let shown = r##"#[job(pending = true)]"##;`
+                # never applies the attribute, and reporting it would fail the
+                # gate on a snippet that quotes a spelling on purpose.
+                continue
             end = _close_of(text, match.end())
             if end is None:
                 continue
@@ -1673,6 +1728,54 @@ def self_test():
     check(
         "markdown: tilde fence is scanned",
         scan_text('~~~rust\n#[secured(policy = "x")]\n~~~\n', ".md"),
+        [("secured", "policy")],
+    )
+
+    # `#[ws]` is not a route alias: it takes a path literal and explicitly
+    # rejects the route macros' `seo(...)`.
+    check("ws rejects route keys", "timeout_ms" in accepted["ws"], False)
+    check(
+        "markdown: a route key on ws is caught",
+        scan_text('```rust\n#[ws("/live", timeout_ms = 1000)]\n```\n', ".md"),
+        [("ws", "timeout_ms")],
+    )
+    check(
+        "markdown: a bare ws path passes",
+        scan_text('```rust\n#[ws("/live")]\n```\n', ".md"),
+        [],
+    )
+    # …while the real route aliases keep theirs.
+    check("get keeps timeout_ms", "timeout_ms" in accepted["get"], True)
+    check("static_get keeps params", "params" in accepted["static_get"], True)
+
+    # An attribute quoted inside a literal or a comment is a value, not an
+    # invocation — reporting it would fail the gate on a snippet that shows a
+    # spelling on purpose.
+    check(
+        "markdown: attribute inside a raw string is not an invocation",
+        scan_text(
+            '```rust\nlet shown = r##"#[job(pending = true)]"##;\n```\n', ".md"
+        ),
+        [],
+    )
+    check(
+        "markdown: attribute inside a string is not an invocation",
+        scan_text(
+            '```rust\nlet s = "#[secured(policy = \\"x\\")]";\n```\n', ".md"
+        ),
+        [],
+    )
+    check(
+        "markdown: attribute inside a comment is not an invocation",
+        scan_text("```rust\n// #[model(bogus = 1)]\n```\n", ".md"),
+        [],
+    )
+    check(
+        "markdown: a real attribute beside a quoted one is still caught",
+        scan_text(
+            '```rust\nlet s = "#[job(pending = true)]";\n#[secured(policy = "x")]\n```\n',
+            ".md",
+        ),
         [("secured", "policy")],
     )
 
