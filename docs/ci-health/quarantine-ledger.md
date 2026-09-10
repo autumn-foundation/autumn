@@ -177,21 +177,32 @@ without also filling in the intake form above.
   as a rerun of the CI build itself.
 
   **Correction (post-review): closing this entry needs two separate,
-  larger pieces of evidence, not one dispatch.** An earlier version of this
+  distinct pieces of evidence, not one dispatch — and the macOS half's
+  required sample count was also stated wrong.** An earlier version of this
   paragraph said running `manual-macos-contention-check.yml` once (option
-  (a)) would close the entry. It cannot, on its own, for two reasons: (1)
-  the workflow's `samples` input is a `type: choice` capped at `["5", "10",
-  "20"]` — a single dispatch tops out at 20 macOS samples, short of this
-  role's own ≥50 bar for the macOS cluster's historically sub-10% rate, so
-  closing that half needs ≥50 samples accumulated across multiple
-  dispatches (e.g. three dispatches of 20), not one run; and (2) as
-  established above, this harness is macOS-only and cannot touch either
-  Linux/`Coverage (workspace)` signature at all — those need a
-  still-unbuilt second harness with its own rerun count, run against CI's
-  actual coverage-lane command, before *that* half can close. **Not closing
-  this entry yet, on either half.** Zero organic hits in the small
-  post-merge window sampled here (one push-triggered run on `trunk-dev` at
-  the fix commit itself, success) — reassuring, but n=1, not evidence.
+  (a)) would close the entry, and separately claimed the macOS cluster's
+  historical rate is sub-10% (requiring ≥50 samples). Both need fixing:
+
+  1. **The rate is not sub-10%, so ≥20 is the applicable bar, not ≥50.**
+     The macOS cluster's own measured rate, from this entry's "Observed"
+     line below, is 3/17 (≈17.6%); folding in the 13/13 clean organic
+     samples #2548 banked since #2510 merged gives 3/30 (exactly 10%, not
+     *below* 10%). This role's own operating standard escalates to ≥50 only
+     for genuinely low-rate (sub-10%) flakes — a rate at or above 10% stays
+     on the standard ≥20 bar. A single 20-sample dispatch of
+     `manual-macos-contention-check.yml`, at its `samples` input's maximum
+     (a `type: choice` capped at `["5", "10", "20"]`), can therefore reach
+     the applicable bar for the macOS half in one run, not three.
+  2. **That one dispatch still cannot close the whole entry**, because this
+     harness is macOS-only and cannot touch either Linux/`Coverage
+     (workspace)` signature at all — those need a still-unbuilt second
+     harness with its own rerun count, run against CI's actual
+     coverage-lane command, before *that* half can close.
+
+  **Not closing this entry yet, on either half.** Zero organic hits in the
+  small post-merge window sampled here (one push-triggered run on
+  `trunk-dev` at the fix commit itself, success) — reassuring, but n=1, not
+  evidence.
 
 - **Observed**: 3/17 eligible `macos-latest` CI executions (14 confirmed, 3
   unresolved — see the 2026-09-04 census for the derivation), 0/16-17 on
@@ -270,8 +281,11 @@ without also filling in the intake form above.
   plain runner). #2548 separately banked 13/13 clean organic macOS samples
   on the tracked corpus since #2510 merged — reassuring, still short of the
   ≥20 (≥50 for the sub-10% end) sample size this role's own evidentiary bar
-  calls for before treating an entry as closed. (That specific numeric
-  threshold is Semaphore's own operating standard, not a field defined in
+  calls for before treating an entry as closed — and per the corrected math
+  in the 2026-09-10 update above, 3/30 (10%, not below it) puts this
+  specific cluster on the ≥20 side of that split, not ≥50. (That specific
+  numeric threshold is Semaphore's own operating standard, not a field
+  defined in
   this ledger's intake form above — the intake form's own requirement is
   just a same-commit rerun-rate baseline, `<k>/<n>`, with no minimum `n`
   written into it.)

@@ -8,11 +8,14 @@ it, closing the gap on the one unattributed signature below, or fixing
 `cache_stampede`) still isn't cleared. The headline: PR #2645, merged onto
 `trunk-dev` at `8fae8af` (2026-09-10T04:56:32Z), fixed three named timing
 races in the `live_upgrade` test itself — test-defect, not product-defect,
-per its own local contention-reproduction evidence. That resolves the
-test-vs-product question for the two tracked signatures the fix's own commit
-message credibly explains; a third tracked signature (below, corrected on
-review) does not match any of the three named predicates and remains
-unattributed. None of this yet clears this role's own closure bar (CI-native
+per its own local contention-reproduction evidence. Of the three tracked
+`live_upgrade` signatures, #2645's commit message credibly explains **one**
+(the Linux "new build never served" hit, mechanism 2) — **correction
+(post-review): not two**, as an earlier version of this paragraph claimed.
+The macOS connect-error cluster is tied to a different, earlier fix (#2510,
+per the ledger's own pre-existing text); a third signature (below) does not
+match any of #2645's three named predicates and remains unattributed to any
+fix at all. None of this yet clears this role's own closure bar (CI-native
 ≥20/≥50 same-commit rerun evidence), because the verification harness built
 for exactly this purpose is still sitting undispatched — and, as corrected
 below, only covers part of what needs verifying even once it runs.
