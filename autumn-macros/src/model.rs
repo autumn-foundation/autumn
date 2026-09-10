@@ -4481,6 +4481,7 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // behaviour lives in the field's `Classified<T, Marker>` type, so
                 // the attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("classified")
+                && !a.path().is_ident("confidential")
                 && !a.path().is_ident("private")
                 && !a.path().is_ident("normalize")
                 && !a.path().is_ident("state_machine")
@@ -4636,6 +4637,83 @@ fn parse_field_encrypted_mode(field: &syn::Field) -> syn::Result<EncryptedMode> 
 /// passing a declared declassification boundary.
 fn field_is_classified(field: &syn::Field) -> bool {
     has_attr(field, "classified")
+}
+
+/// `#[confidential]` is a distinct storage/query mode: randomized ciphertext
+/// plus a separately keyed blind index, never deterministic ciphertext.
+fn field_is_confidential(field: &syn::Field) -> bool {
+    has_attr(field, "confidential")
+}
+
+fn confidential_marker_ident(model: &syn::Ident, field: &syn::Ident) -> syn::Ident {
+    let mut camel = String::new();
+    let mut upper = true;
+    for ch in unraw_ident(field).chars() {
+        if ch == '_' {
+            upper = true;
+        } else if upper {
+            camel.extend(ch.to_uppercase());
+            upper = false;
+        } else {
+            camel.push(ch);
+        }
+    }
+    format_ident!(
+        "{}{}Confidential",
+        unraw_ident(model),
+        camel,
+        span = field.span()
+    )
+}
+
+fn validate_confidential_field(field: &syn::Field) -> syn::Result<()> {
+    if !field_is_confidential(field) {
+        return Ok(());
+    }
+    for attr in &field.attrs {
+        if attr.path().is_ident("confidential") && !matches!(attr.meta, syn::Meta::Path(_)) {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "`#[confidential]` takes no arguments",
+            ));
+        }
+    }
+    let conflicts = [
+        "encrypted",
+        "classified",
+        "searchable",
+        "translatable",
+        "normalize",
+        "default",
+        "id",
+        "state_machine",
+        "derived",
+        "derivation",
+        "references",
+        "foreign_key",
+        "shard_key",
+        "position",
+        "unique",
+        "indexed",
+    ];
+    for marker in conflicts {
+        if has_attr(field, marker) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "`#[confidential]` cannot be combined with `#[{marker}]`: confidential values have separate randomized-ciphertext and blind-index storage and support only named blind-index equality"
+                ),
+            ));
+        }
+    }
+    if !matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"))
+    {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[confidential]` is only supported on non-null `String` fields",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse `#[classified]` / `#[classified(personal_data)]`.
@@ -7507,6 +7585,60 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // Confidential is deliberately neither an encrypted mode nor a classified
+    // mode. Validate it independently and emit only its narrow query marker.
+    let mut confidential_columns: Vec<(&syn::Ident, syn::Ident)> = Vec::new();
+    for f in &all_fields {
+        if let Err(err) = validate_confidential_field(f) {
+            return err.to_compile_error();
+        }
+        if field_is_confidential(f) {
+            let ident = f.ident.as_ref().unwrap();
+            confidential_columns.push((ident, confidential_marker_ident(name, ident)));
+        }
+    }
+    if let Some(key) = shard_key_field.as_deref()
+        && confidential_columns
+            .iter()
+            .any(|(field, _)| unraw_ident(field) == key)
+    {
+        return syn::Error::new_spanned(
+            name,
+            "a `#[confidential]` field cannot be the model `#[shard_key]`",
+        )
+        .to_compile_error();
+    }
+    let confidential_items: Vec<TokenStream> = confidential_columns.iter().map(|(field, marker)| {
+        let method = format_ident!("{}_blind_index", unraw_ident(field));
+        let ciphertext = format!("{}_ciphertext", unraw_ident(field));
+        let blind_index = format!("{}_blind_index", unraw_ident(field));
+        quote! {
+            #[doc = "Marker for a confidential field; supports blind-index equality only."]
+            #vis enum #marker {}
+            impl #name {
+                /// Build the only generated query predicate for this confidential field.
+                pub fn #method(token: ::autumn_web::confidential::BlindIndexToken)
+                    -> ::autumn_web::confidential::BlindIndexPredicate<#marker>
+                {
+                    ::autumn_web::confidential::ConfidentialField::<#marker>::blind_index_eq(token)
+                }
+            }
+            const _: (&str, &str) = (#ciphertext, #blind_index);
+        }
+    }).collect();
+    let confidential_storage: Vec<(String, String)> = confidential_columns
+        .iter()
+        .map(|(field, _)| {
+            let field = unraw_ident(field);
+            (
+                format!("{field}_ciphertext"),
+                format!("{field}_blind_index"),
+            )
+        })
+        .collect();
+    let confidential_ciphertext_columns = confidential_storage.iter().map(|(c, _)| c.as_str());
+    let confidential_blind_index_columns = confidential_storage.iter().map(|(_, b)| b.as_str());
+
     // Collect `#[classified]` columns (issue #1654, validated to be non-null
     // `String`). Each entry: (field ident, column name, generated field marker).
     let mut classified_columns: Vec<(&syn::Ident, String, syn::Ident)> = Vec::new();
@@ -9753,6 +9885,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #encrypted_use
 
         #(#classified_items)*
+        #(#confidential_items)*
 
         #list_query_helpers
 
@@ -9825,6 +9958,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             pub const __AUTUMN_CLASSIFIED_COLUMNS: &'static [&'static str] =
                 &[#(#classified_column_names),*];
+
+            /// Physical `(ciphertext, blind_index)` storage generated for
+            /// confidential fields. Ciphertext columns are never surfaced by
+            /// ordinary Autumn repository query helpers.
+            #[doc(hidden)]
+            pub const __AUTUMN_CONFIDENTIAL_STORAGE: &'static [(&'static str, &'static str)] =
+                &[#((#confidential_ciphertext_columns, #confidential_blind_index_columns)),*];
 
             /// Column names on this model declared `#[translatable]` (#1384).
             ///
