@@ -1682,16 +1682,62 @@ def _doc_attr_text(line):
     if rest[:1] != '"':
         return None
     end = skip_literal(rest, 0)
-    raw = rest[1 : end - 1]
+    return _decode_rust_string(rest[1 : end - 1])
+
+
+_SIMPLE_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "\\": "\\",
+    "0": "\0",
+    "'": "'",
+    '"': '"',
+}
+
+
+def _decode_rust_string(raw):
+    """A string literal's body with escapes decoded, or None if it is not valid.
+
+    Every escape Rust accepts is decoded, and anything else is not valid Rust,
+    so the answer is None rather than a guess. The first version of this passed
+    unknown escapes through with the backslash dropped, which silently turned
+    `\\x60` into the three characters `x60` — inventing text instead of reading
+    it, and hiding a fence written that way. Same failure as the half-read raw
+    literal: a wrong answer is worse than none.
+    """
     out, i = [], 0
     while i < len(raw):
-        if raw[i] == "\\" and i + 1 < len(raw):
-            nxt = raw[i + 1]
-            out.append({"n": "\n", "t": "\t", "r": "\r"}.get(nxt, nxt))
+        if raw[i] != "\\":
+            out.append(raw[i])
+            i += 1
+            continue
+        nxt = raw[i + 1 : i + 2]
+        if nxt in _SIMPLE_ESCAPES:
+            out.append(_SIMPLE_ESCAPES[nxt])
             i += 2
             continue
-        out.append(raw[i])
-        i += 1
+        if nxt == "x":
+            digits = raw[i + 2 : i + 4]
+            if len(digits) != 2:
+                return None
+            try:
+                out.append(chr(int(digits, 16)))
+            except ValueError:
+                return None
+            i += 4
+            continue
+        if nxt == "u" and raw[i + 2 : i + 3] == "{":
+            close = raw.find("}", i + 3)
+            if close == -1:
+                return None
+            try:
+                out.append(chr(int(raw[i + 3 : close], 16)))
+            except ValueError:
+                return None
+            i = close + 1
+            continue
+        return None
     return "".join(out)
 
 
@@ -2473,6 +2519,31 @@ def self_test():
     check(
         "rustdoc: an unclosed raw doc attribute invents nothing",
         scan_text('#[doc = r"```\nunclosed\n"]\npub fn i() {}\n', ".rs"),
+        [],
+    )
+    # Every escape Rust accepts is decoded. Passing an unknown one through with
+    # the backslash dropped turned `\x60` into `x60` and hid the fence.
+    check(
+        "rustdoc: a hex-escaped doc attribute fence is scanned",
+        scan_text(
+            '#[doc = "\\x60\\x60\\x60\\n#[secured(policy = \\"x\\")]\\n\\x60\\x60\\x60"]\n'
+            'pub fn f() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a unicode-escaped doc attribute fence is scanned",
+        scan_text(
+            '#[doc = "\\u{60}\\u{60}\\u{60}\\n#[secured(policy = \\"x\\")]\\n'
+            '\\u{60}\\u{60}\\u{60}"]\npub fn f() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: an invalid escape invents nothing",
+        scan_text('#[doc = "bad \\q escape"]\npub fn h() {}\n', ".rs"),
         [],
     )
     # An info string is arbitrary text, so `rust` matches as a whole token.
