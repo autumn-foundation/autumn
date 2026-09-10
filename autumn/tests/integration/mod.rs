@@ -63,6 +63,8 @@ mod compile_fail;
 mod compression_middleware;
 mod config_deprecation;
 mod config_runtime_drift;
+#[cfg(feature = "constela")]
+mod constela;
 #[cfg(feature = "acme")]
 mod custom_domain_issuance;
 mod custom_domains;

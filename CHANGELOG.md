@@ -127,6 +127,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Docs gate: Autumn macro arguments are checked against the macros.**
+  `scripts/check-docs-macro-args.sh` joins the docs-only CI job, gating the
+  seventh thing a reader copies off a page: the keyword arguments inside an
+  attribute macro (`#[secured]`, `#[job]`, `#[scheduled]`, `#[cached]`,
+  `#[model]`, `#[repository]` and 14 siblings). The links, commands,
+  `AUTUMN_*` variables, `autumn.toml` keys, `autumn_web::…` paths and
+  `/actuator/…` URLs were already gated; the surface the guide spends most of
+  its Rust on was not. It reads 215 markdown files (1,004 Rust fences) and 593
+  rustdoc sources (872 fences) — the rustdoc half matters because ```ignore
+  blocks ship to docs.rs and nothing compiles them. Bare and qualified call
+  sites (`#[autumn_web::model(…)]`) and multiline attributes are all read.
+  Accepted keys are read out of `autumn-macros/src/` on every run rather than
+  from a snapshot, so a renamed key lands in the same commit as the rename, and
+  extraction is scoped to each macro's own argument parser — located
+  structurally as the function taking `attr: TokenStream` but not
+  `item: TokenStream` — rather than to its whole source file, so `model.rs`'s
+  ~10k lines of codegen cannot bless `username` as a `#[model(…)]` key. Every
+  `#[proc_macro_attribute]` the crate exports is registered, checked against
+  `lib.rs` by the self-test; a macro whose grammar cannot be read is skipped
+  rather than reported against, and 30 of 33 are judged. Only an attribute's
+  own keys are judged — the identifier introducing a nested group included,
+  since a nested group such as `seo(…)` carries its own interior grammar — and both keyword arguments and bare flags (`#[job(unique)]`) are
+  checked while positional arguments are not. Carries `--list` and a 276-case
+  `--self-test`. The baseline run found five defects.
+
 - **Migration version gate: starter templates no longer collide with their
   examples.** A built-in starter's `migrations/` tree is a byte-for-byte mirror
   of its committed example and the two never coexist in one database, so
@@ -165,6 +190,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `..Default::default()` and the next field will not break it; see
   [the migration guide](docs/migrations/next.md#jobs-jobadminrecord-gains-a-blocked_on_concurrency-field).
 
+- **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
+  (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
+  inventory of `blog`'s admin post editor — the create/edit HTML form behind
+  `/admin/new` and `/admin/{id}/edit`, `supported`-tier and the only
+  hand-written (non-admin-plugin) content-authoring flow in the example —
+  found both of `NewPost::validated`'s recoverable failure modes (an
+  empty/whitespace-only title, an empty/whitespace-only body) sent the
+  submission through `AutumnError::unprocessable_msg`'s generic
+  `application/problem+json`/error-page response via the handler's `?`,
+  instead of redisplaying the form: 0 of 2 failure modes were adjacent to
+  cause, persisted in place, said how to recover, or preserved the author's
+  draft — a post with a long body and a merely-forgotten title lost the whole
+  body to a dead end with a "Go to homepage" link. This is the same
+  anti-pattern already fixed in `saas`/`teams`'s auth forms (#2530) and
+  `reddit-clone`'s create-community form (#2665). Fix: `NewPost` gains
+  `validate_fields(&self) -> Vec<(&'static str, &'static str)>` (every
+  violation, not just the first) alongside the existing `validated()` —
+  left untouched, since it still backs the JSON API (`routes::api::create`)
+  and the admin-plugin backend (`admin.rs`), both of which already have their
+  own error-reporting conventions. `routes::posts::post_form` now renders
+  from `(&NewPost, &[(&str, &str)])` instead of `Option<&Post>`, wiring
+  `aria-invalid`/`aria-describedby` to a per-field `role="alert"` message and
+  keeping the exact Tailwind classes already in place (no redesign); `create`
+  and `update` share it with their own GET routes via `new_post_page`/
+  `edit_post_page`, so a rejected POST re-renders the same page at 422 with
+  every submitted field (including the untouched one) and the `published`
+  checkbox state intact, instead of losing them to the generic error page.
+  No new dependency: this is `Form<NewPost>` plus a plain `Vec` of field
+  errors, not `ChangesetForm`/`validator::Validate` — `blog` does not already
+  depend on `validator`, and adding it purely for this fix was out of scope.
+  Verified against a live server (`cargo build -p blog`, Postgres): a rejected
+  create (blank title/body, a custom slug, `published` checked) now returns
+  422 with both `aria-invalid="true"`, both messages, the custom slug and the
+  checked box preserved; a rejected update (blank title only) preserves the
+  untouched, still-valid body text and shows `aria-invalid="false"` on that
+  field. `autumn check --a11y` against both the GET form and the rendered 422
+  HTML: 0 violations before and after (the fix is the redisplay, not a11y).
+  Seven new unit tests in `routes::posts::post_form_tests` cover
+  `validate_fields`/`normalized` and the redisplay markup itself
+  (`cargo test -p blog --bin blog routes::posts`: 7 passed).
+- **CI:** the manual macOS contention workflow (`Manual macOS contention
+  check`) is dispatch-only, but GitHub records a failed run on every push —
+  the `plan` step then has no `inputs` to evaluate and exits 1 (issue
+  #2594). Both jobs are now guarded on `github.event_name ==
+  'workflow_dispatch'`, so push events skip cleanly instead of failing, and
+  the `macos-latest` steps can never be reached unasked (macOS minutes are
+  the most expensive in the account). Why a dispatch-only workflow is
+  evaluated on push at all — likely an org-level required-workflow
+  configuration — still wants a look in org settings; noted in the workflow
+  file.
+- **commit hooks:** an immediate after-hook failure now records the hook's
+  `AutumnError` via `message()` — the bare title, e.g. `"Validation failed"`
+  (issue #2596). All nine generated immediate-failure paths stringified the
+  error with `Display`, while the deferred commit-hook worker (migrated in
+  #2592) stores `message()`; for a validation error the two differ
+  (`"Validation failed: email: ..."` vs `"Validation failed"`), so the same
+  logical failure produced two different stored strings. Now they agree.
+- **`#[model]`:** no longer emits an empty-bodied `impl Normalize` for a
+  `New*` whose model declares no `#[normalize]` columns (issue #2634). The
+  repository probe's `Yes` arm used to win unconditionally, so `save`,
+  `save_many`, `save_many_skip_invalid` and `find_or_create_by_*` cloned
+  their payload — a full `Vec` copy of a bulk batch — to run a guaranteed
+  no-op normalization. The no-clone fallback arm now wins for unnormalized
+  models. The read-model `Normalize` impl and `NormalizedModel` are unchanged.
+- **build:** renamed colliding example binary targets so no two workspace
+  members produce the same output filename — `todo-app`'s `seed` is now
+  `todo-app-seed`, `bookmarks`' is `bookmarks-seed`, and the two auto-discovered
+  `migrate` bins are `bookmarks-distributed-migrate` /
+  `bookmarks-sharded-migrate`. Duplicate names caused intermittent
+  `LNK1104: cannot open file` failures on `Test (windows-latest)` when two
+  links overlapped (issue #2639). `autumn seed` now resolves the seed binary's
+  real target name from `cargo metadata` instead of hard-coding `--bin seed`,
+  and `scripts/check-example-bin-names.sh` gates the invariant in the future.
+- **docs:** the five doc sites that told readers to write
+  `#[secured(policy = "…")]` now use the form the macro parses,
+  `#[secured(scopes = ["…"])]`. `#[secured]` has never had a `policy` key — its
+  grammar is bare role literals and/or `scopes = ["…"]` — so a reader who
+  pasted the annotation onto their own handler got a build error quoting a
+  grammar they had copied in good faith. Two of the five were the rustdoc
+  module headers of `autumn/src/download.rs` and `autumn/src/range.rs`, which
+  land on docs.rs as the reference pages for `Download` and ranged responses;
+  the others were `docs/guide/downloads.md` (twice) and a `skills/` reference.
+  Both rustdoc fences are ```ignore and markdown fences are compiled by
+  nothing, so the spelling propagated from one file into four unchecked. The
+  ability names are corrected to the corpus's own scope convention
+  (`reports:read`, `media:watch`, matching `docs/guide/openapi.md` and
+  `docs/guide/authentication.md`), and `docs/guide/downloads.md` — which had no
+  outbound links at all — now links to the `#[secured]` reference, so a reader
+  who lands mid-task has somewhere to go.
+
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue
@@ -175,6 +290,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saw a field named as failing with no reason given, while the same error's
   logged `Display` output correctly omitted it. `errors` now filters
   empty-message fields the same way `Display` does.
+- **Constela: parse, validate and server-render LLM-generated UI (`constela`
+  feature):** an app can now serve an interface a language model wrote, without
+  ever handing that model a code path. [Constela] is a constrained JSON UI
+  language — the model emits a *description*, not code, and there is no
+  expression form that calls a function, no attribute that holds script, and no
+  way to spell `eval`. `autumn_web::constela` parses a document, validates it,
+  and renders it to `maud::Markup` on the server.
+
+  The safety guarantee (`constela::policy`) is the UI-tree counterpart of the
+  user-submitted rich-text path's, with four independent controls: an
+  allowlisted tag set (every script-, style- and document-structure element
+  rejected), an allowlisted attribute set (every `on*` handler rejected first
+  and explicitly, `style` absent), an allowlisted URL scheme set checked after
+  stripping the whitespace and control characters a browser ignores — so
+  `java\tscript:` falls with the plain spelling — and every byte of
+  document-derived output routed through one of the renderer's two escape
+  functions, with tag and attribute names written only after clearing those
+  allowlists so they are fixed strings from a fixed set. Literal URLs
+  are checked at validation and **every computed URL is checked again at
+  render time**, where its value is finally known. Unlike the rich-text path,
+  `id` is not banned but *prefixed*: every element id a document writes, and
+  every attribute referencing one (`for`, `aria-labelledby`, …), is rewritten
+  with `RenderContext::id_prefix` — as is a same-document fragment link, so
+  `href="#x"` and `id="x"` stay a matched pair rather than the link escaping to
+  a host-page element of that name — so `<label for>` keeps working inside the
+  fragment while collision with — or clobbering of — a host-page id becomes
+  impossible. `target="_blank"` gets `rel="noopener noreferrer"` whether the
+  document asked or not.
+
+  Validation collects **every** violation rather than returning at the first,
+  and each carries a path into the submitted JSON plus a stable code;
+  `ConstelaError::to_json` renders the list as the repair prompt to hand back
+  to the generator, so a bad document converges in one round rather than six.
+  A `ConstelaError` surfaces as `422`, not `500`.
+
+  Interactivity runs on the server, over htmx: an event binding renders as
+  `data-constela-on-{event}` for the app to wire, and `Document::dispatch` runs
+  an action's pure state steps (`set`, `update`, `setPath`, `if`) against state
+  the app owns. Browser-side steps are **reported** as `Effect`s rather than
+  performed — running a model-authored `fetch` from inside the app would give a
+  prompt injection the app's own network position, which is SSRF by
+  construction. Dispatch **stops** at the first effect
+  (`Dispatched::suspended_at` names where): an effect can bind a `result` that
+  later steps read, the server has no value to bind, and running on would
+  evaluate those reads as `null` and commit the answer — a `fetch` followed by
+  `set data = var(res)` would write `null` over good data. Autumn ships no
+  Constela client runtime and generates no JavaScript.
+
+  Parse bounds (`Limits`: 512 KiB, depth 64, 20 000 nodes) are applied before
+  and around deserialization, so a document engineered to overflow the stack in
+  serde's recursive descent is rejected before it can; render bounds
+  (`RenderLimits`) separately cap the expansion of a small document against a
+  large runtime list, and a `setPath` step's path is capped at that same depth —
+  not because the walk over it would be deep (it is iterative) but because
+  `serde_json::Value` drops *recursively*, so a document that wrote two hundred
+  thousand levels down would overflow the stack whenever that state was next
+  freed, with no visible connection to the request that built it.
+  `RenderLimits::max_output_bytes` (4 MiB) is a separate budget from the node
+  and iteration counts because those do not imply it: one text node can emit as
+  much as `RenderContext::state` holds, so a large string rendered from a
+  5 000-iteration `each` is a few dozen nodes and gigabytes of markup. It spans
+  the body and every portal together, and also caps what a single expression may
+  *build* — `concat`/`array`/`obj`/`+` assemble a finished value inside the
+  evaluator before any of it reaches the output buffer. `max_depth` likewise
+  caps the shape of state on **every** mutation, not only `setPath`: state
+  persists between dispatches, so `set x = array(state x)` adds a level per
+  request until `serde_json::Value`'s recursive drop overflows the stack. Component
+  cycle detection is iterative for the mirror-image reason — components are
+  sibling map entries, so a chain thousands deep is shallow JSON that clears
+  every parse bound, and a recursive walk would overflow during *validation*.
+  All nine
+  modules are enrolled in the #1611 request-path panic gate, so an out-of-range
+  index or an unchecked add in this path is a build failure rather than a 500
+  someone can trigger with a crafted document.
+  Adds **no new dependencies** — `serde`, `serde_json` and `maud` are already
+  in the graph. See `docs/guide/constela.md`; the adversarial corpus is
+  `autumn/tests/integration/constela.rs`.
+
+  [Constela]: https://github.com/yuuichieguchi/constela
 
 ### Security
 
