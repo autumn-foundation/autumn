@@ -182,6 +182,20 @@
 #     `#[secured(/* ) */ policy = "x")]` ends at that `)`. Any argument
 #     carrying a route pattern, regex or glob has the same shape.
 #
+# Two misses are open and known, both on the accepted side of that trade-off:
+#
+#   - `#[job(Uniqe)]`, an upper-case misspelling of a bare flag, is not
+#     reported. The pattern that would catch it is the same one keeping
+#     `#[repository(Post, …)]`'s leading TYPE from being read as a flag, and
+#     widening it reports `Post` on a form the corpus documents throughout.
+#     Closing it needs a hand-maintained list of which macros take a positional
+#     type, and judging that by resemblance is how `static_get` and `ws` were
+#     both registered wrong.
+#   - Several `#[doc = "…"]` attributes on ONE physical line, the last followed
+#     by the item, are read one deep: the first expands, and the rest go back
+#     as ordinary source. rustdoc concatenates all of them, so a fence spanning
+#     them goes unread. Closing it means re-entering the expansion on the tail.
+#
 # ── Corpus ───────────────────────────────────────────────────────────────────
 #
 # Two halves, because this defect class lived in both:
@@ -1533,7 +1547,7 @@ def _indent_width(line):
     return width
 
 
-def _fence_body(line, base=0, in_fence=False, quoted=False):
+def _fence_body(line, base=0, in_fence=False, quotes=0):
     """A line with its block-quote prefix removed, unless it is over-indented.
 
     The quote marker is itself subject to the indentation rule: at four spaces
@@ -1547,14 +1561,18 @@ def _fence_body(line, base=0, in_fence=False, quoted=False):
     fence test, which then saw `-` where the delimiter should be.
     """
     # Inside a fence a list marker is never structure — every line is content,
-    # so a `- ` there is code. A quote prefix is different, and the previous
-    # round got this wrong by treating them alike: when the fence itself lives
-    # inside a quote, the `>` on each line is the CONTAINER continuing, and
+    # so a `- ` there is code. A quote prefix is different: when the fence itself
+    # lives inside a quote, the `>` on each line is the CONTAINER continuing, and
     # stripping it is how the closing delimiter becomes visible. Refusing to
     # strip it left the fence open forever and carried Rust mode into every
     # later quoted block. A `>` inside a fence that is NOT quoted is still code.
+    #
+    # Exactly the levels the fence sits in, though, and no more. Stripping the
+    # whole chain turned the second `>` of a `>> ``` ` line inside a `>`-owned
+    # fence — literal content — into a closing delimiter, ending the fence early
+    # and letting everything after it go unread.
     if in_fence:
-        return BLOCKQUOTE.sub("", line) if quoted else line
+        return _strip_quotes(line, quotes) if quotes else line
     # Containers are unwrapped in nesting order, outermost first, because
     # `> - ```rust` is a quote holding a list. Testing the marker against the
     # raw line meant a quoted list fence was never recognised at all.
@@ -1811,10 +1829,16 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
             # than the document really has is how an indented display becomes a
             # live fence again, which is the false positive this rule exists to
             # avoid.
-            col = _list_content_column(line)
+            # Measured on quote-stripped text, which is what `_fence_body` and
+            # `_fence_at` are handed. Outside a fence every `>` is container
+            # syntax, so the whole chain comes off here — the opposite of the
+            # rule inside one. Tracking it on the raw line left `> - ```rust`
+            # with no column at all, so the fence never ended with its item.
+            unwrapped = BLOCKQUOTE.sub("", line)
+            col = _list_content_column(unwrapped)
             if col is not None:
                 list_col = col
-            elif line.strip() and _indent_width(line) == 0:
+            elif unwrapped.strip() and _indent_width(unwrapped) == 0:
                 list_col = 0
         # A fenced example inside a block quote is still an example a reader
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
@@ -1836,7 +1860,7 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
                 collected.append(current)
                 current = []
             inside, open_char, open_len = False, None, 0
-        body = _fence_body(line, list_col, open_char is not None, fence_quotes > 0)
+        body = _fence_body(line, list_col, open_char is not None, fence_quotes)
         fence = _fence_at(body, list_col)
         handled = False
         if fence:
@@ -2414,10 +2438,11 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
         if skip:
             continue
         if open_char is None:
-            col = _list_content_column(doc.group(1))
+            unwrapped = BLOCKQUOTE.sub("", doc.group(1))
+            col = _list_content_column(unwrapped)
             if col is not None:
                 list_col = col
-            elif doc.group(1).strip() and _indent_width(doc.group(1)) == 0:
+            elif unwrapped.strip() and _indent_width(unwrapped) == 0:
                 list_col = 0
         # Same rule as the page scanner: a fence ends with the quote or the
         # list item it opened in.
@@ -2429,7 +2454,7 @@ def scan_rustdoc(path, accepted, judgeable, _calls=None):
                 current = []
             inside, open_char, open_len = False, None, 0
         body = _fence_body(
-            doc.group(1), list_col, open_char is not None, fence_quotes > 0
+            doc.group(1), list_col, open_char is not None, fence_quotes
         )
         fence = _fence_at(body, list_col)
         handled = False
@@ -3453,6 +3478,31 @@ def self_test():
         scan_text(
             '/// >> ```rust\n/// >> #[secured(policy = "x")]\n/// >> ```\n'
             'pub fn a() {}\n',
+            ".rs",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "rustdoc: a list under a quote still owns its fence",
+        scan_text(
+            '/// > - ```rust\n/// > #[secured(policy = "x")]\n/// > ```\n'
+            'pub fn a() {}\n',
+            ".rs",
+        ),
+        [],
+    )
+    check(
+        "markdown: a list under a quote still owns its fence",
+        scan_text('> - ```rust\n> #[secured(policy = "x")]\n> ```\n', ".md"),
+        [],
+    )
+    # Only the levels the fence sits in are container syntax; a deeper `>` on a
+    # line inside it is literal content, not a delimiter's prefix.
+    check(
+        "rustdoc: a deeper quote inside a quoted fence is content",
+        scan_text(
+            '/// > ```rust\n/// > >> ```\n/// > #[secured(policy = "x")]\n'
+            '/// > ```\npub fn a() {}\n',
             ".rs",
         ),
         [("secured", "policy")],
