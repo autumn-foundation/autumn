@@ -521,7 +521,7 @@ use autumn_web::storage::SharedBlobStore;
 use autumn_web::{secured, AutumnError};
 use http::HeaderMap;
 
-#[secured(policy = "media.watch")]
+#[secured(scopes = ["media:watch"])]
 async fn watch(
     store: SharedBlobStore,
     key: String,

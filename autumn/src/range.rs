@@ -35,7 +35,7 @@
 //! // A browser `<video>` element issues `Range` requests to seek. Returning
 //! // the download through `into_response_ranged` makes the stream seekable:
 //! // the store is asked for only the requested byte slice.
-//! #[secured(policy = "media.watch")]
+//! #[secured(scopes = ["media:watch"])]
 //! async fn watch(
 //!     store: SharedBlobStore,
 //!     key: String,

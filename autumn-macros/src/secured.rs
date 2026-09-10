@@ -472,6 +472,17 @@ mod tests {
         assert!(parse_secured_args(quote! { foo = ["x"] }).is_err());
     }
 
+    /// `#[secured(policy = "…")]` is not a form this macro has ever accepted,
+    /// but it read like one: five doc sites (two of them `ignore`d rustdoc
+    /// fences, which are never compiled) told readers to write it. The grammar
+    /// is bare role literals and/or `scopes = [...]`; a `policy` key lands on
+    /// the catch-all arm and fails the build. Pinned so the spelling cannot
+    /// come back looking supported.
+    #[test]
+    fn rejects_policy_key() {
+        assert!(parse_secured_args(quote! { policy = "reports.read" }).is_err());
+    }
+
     #[test]
     fn rejects_non_string_scope_entries() {
         assert!(parse_secured_args(quote! { scopes = [1, 2] }).is_err());
