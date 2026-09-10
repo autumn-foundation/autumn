@@ -94,7 +94,7 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 bcrypt = "0.19"
 futures = "0.3"
 indexmap = "2"
