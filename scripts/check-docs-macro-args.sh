@@ -281,16 +281,13 @@ OWNERS = {
     "main": "main_macro.rs",
     "model": "model.rs",
     # A forwarder, not a marker: `oauth2_callback_macro` hands its arguments
-    # straight to `route::route_macro` (and `edge::edge_macro`), so it accepts
-    # the whole route grammar. Reading only its own file left it with `crate`
-    # alone and reported the valid `#[oauth2_callback("/cb", timeout_ms = …)]`
-    # as drift.
-    "oauth2_callback": (
-        "oauth2_callback.rs",
-        "route.rs",
-        "parse.rs",
-        "edge.rs",
-    ),
+    # straight to `route::route_macro`, so it accepts the whole route grammar.
+    # Reading only its own file left it with `crate` alone and reported the
+    # valid `#[oauth2_callback("/cb", timeout_ms = …)]` as drift. Its other
+    # call, `edge::reject_if_edge`, takes the ITEM and looks for a separate
+    # `#[edge]` attribute, so `edge.rs` is not part of this grammar —
+    # registering it made `edge`, `needs` and `kv` look like OAuth arguments.
+    "oauth2_callback": ("oauth2_callback.rs", "route.rs", "parse.rs"),
     "patch": ("route.rs", "parse.rs"),
     "post": ("route.rs", "parse.rs"),
     "public": "public.rs",
@@ -383,6 +380,51 @@ def match_arm_keys(text):
 # renamed dependencies — report as drift.
 UNIVERSAL_KEYS = frozenset({"crate"})
 
+def strip_rust_comments(src):
+    """Blank every comment, preserving length so offsets still line up.
+
+    A doc comment is prose, and prose does not balance braces. `route.rs:734`
+    documents its generated code as `/// pub fn __autumn_path_handler(…) {`,
+    which the function scanner read as a real definition whose body then ran
+    21,000 characters into `parse.rs` — far enough to pick up
+    `is_ident("intercept")` and make `intercept`, the name of a *separate*
+    attribute, an accepted `#[get]` key.
+
+    Literals are skipped first: a `//` inside a string is not a comment.
+    """
+    out, i = [], 0
+    while i < len(src):
+        ch = src[i]
+        if ch == "/" and src[i + 1 : i + 2] in ("/", "*"):
+            end = skip_comment(src, i)
+            if end is not None:
+                # Keep newlines so line numbers and `#[cfg(test)] mod` shapes
+                # elsewhere are unaffected.
+                out.append("".join("\n" if c == "\n" else " " for c in src[i:end]))
+                i = end
+                continue
+        if ch == "r" and src[i + 1 : i + 2] in ('"', "#"):
+            nxt = skip_raw_literal(src, i)
+            if nxt is not None:
+                out.append(src[i:nxt])
+                i = nxt
+                continue
+        if ch == '"':
+            nxt = skip_literal(src, i)
+            out.append(src[i:nxt])
+            i = nxt
+            continue
+        if ch == "'":
+            nxt = _skip_rust_char(src, i)
+            if nxt is not None:
+                out.append(src[i:nxt])
+                i = nxt
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 CFG_TEST_MOD = re.compile(r"#\[cfg\(test\)\]\s*(?:pub\s+)?mod\s+[A-Za-z0-9_]+\s*\{")
 
 
@@ -449,13 +491,56 @@ ARG_PARAM = re.compile(
 )
 
 
+def _skip_rust_char(src, i):
+    """Index just past a Rust char literal at `i`, or None if it is a lifetime.
+
+    `'` is ambiguous in Rust: `'{'` is a literal whose brace must not be
+    counted, while `'a` in `&'a str` is a lifetime and consumes nothing. A
+    literal closes on the next `'`, allowing one escape.
+    """
+    if src[i + 1 : i + 2] == "\\":
+        end = src.find("'", i + 2)
+        return end + 1 if end != -1 else None
+    if src[i + 2 : i + 3] == "'":
+        return i + 3
+    return None
+
+
 def _balanced(src, open_idx, opener="{", closer="}"):
-    """Text between `open_idx`'s delimiter and its match."""
+    """Text between `open_idx`'s delimiter and its match, in real Rust.
+
+    Delimiters inside strings, char literals and comments are data. Counting
+    them naively is not a rounding error: `positional_format_string` in
+    `route.rs` matches on `'{'` and `'}'`, so its body ran 69,000 characters
+    past its own closing brace and swallowed the rest of the file. Every
+    identifier in that tail then looked reachable from it, which is how
+    `intercept` — the name of a *separate* attribute, parsed by
+    `extract_interceptors` — became an accepted `#[get]` key.
+    """
     i, depth = open_idx + 1, 1
     while i < len(src) and depth:
-        if src[i] == opener:
+        ch = src[i]
+        if ch == "/":
+            nxt = skip_comment(src, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch == "r" and src[i + 1 : i + 2] in ('"', "#"):
+            nxt = skip_raw_literal(src, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch == '"':
+            i = skip_literal(src, i)
+            continue
+        if ch == "'":
+            nxt = _skip_rust_char(src, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch == opener:
             depth += 1
-        elif src[i] == closer:
+        elif ch == closer:
             depth -= 1
         i += 1
     return src[open_idx + 1 : i - 1], i
@@ -553,7 +638,11 @@ def accepted_keys():
         # only the first left `#[get(api_version = …)]` reported as drift.
         filenames = (owned,) if isinstance(owned, str) else owned
         sources = [
-            strip_test_mods((MACRO_SRC / f).read_text(encoding="utf-8", errors="replace"))
+            strip_test_mods(
+                strip_rust_comments(
+                    (MACRO_SRC / f).read_text(encoding="utf-8", errors="replace")
+                )
+            )
             for f in filenames
             if (MACRO_SRC / f).exists()
         ]
@@ -770,12 +859,21 @@ def top_level_keys(args):
 # `#[autumn_macros::model(...)]` are documented, idiomatic forms and appear in
 # shipped rustdoc (`autumn/src/aggregate.rs`, `autumn/src/classify/mod.rs`).
 # Requiring the bare name would leave every qualified invocation ungated.
-# `cfg_attr(<pred>, <attr>)` applies `<attr>` when the predicate holds, so a
-# conditionally-applied Autumn macro is a real invocation the compiler will
-# reject on a typo. Requiring the name to sit immediately after `#[` skipped
-# every one of them.
 MACRO_OPEN = re.compile(
-    r"#\[(?:cfg_attr\s*\([^,]+,\s*)?(?:autumn_web::|autumn_macros::|autumn::)?("
+    r"#\[(?:autumn_web::|autumn_macros::|autumn::)?("
+    + "|".join(sorted(OWNERS))
+    + r")\("
+)
+# `cfg_attr(<pred>, <attr>, …)` applies each `<attr>` when the predicate holds,
+# so a conditionally-applied Autumn macro is a real invocation the compiler
+# will reject on a typo. Its body is scanned recursively rather than matched
+# with a prefix pattern: a predicate can itself carry commas and parentheses
+# (`all(feature = "a", feature = "b")`), and more than one attribute can
+# follow it (`cfg_attr(feature = "a", inline, secured(…))`), so a `[^,]+`
+# prefix stopped at the predicate's first comma and saw no later payload.
+CFG_ATTR_OPEN = re.compile(r"#\[cfg_attr\s*\(")
+BARE_MACRO_OPEN = re.compile(
+    r"\b(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
     + r")\("
 )
@@ -841,6 +939,34 @@ def skip_raw_literal(text, i):
     return len(text) if end == -1 else end + len(close)
 
 
+def _close_of(text, start):
+    """Index of the delimiter closing the group opened just before `start`."""
+    i, depth = start, 1
+    while i < len(text) and depth:
+        ch = text[i]
+        if ch == "/":
+            nxt = skip_comment(text, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch in "\"'":
+            i = skip_literal(text, i)
+            continue
+        if ch == "r" and text[i + 1 : i + 2] in ('"', "#"):
+            nxt = skip_raw_literal(text, i)
+            if nxt is not None:
+                i = nxt
+                continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
 def find_macro_calls(text):
     """Yield `(macro, args, offset)` for each `#[macro(…)]` call in `text`.
 
@@ -858,32 +984,29 @@ def find_macro_calls(text):
     once they carry more than one key — is matched like any other.
     """
     out = []
-    for match in MACRO_OPEN.finditer(text):
-        i, depth = match.end(), 1
-        while i < len(text) and depth:
-            ch = text[i]
-            if ch == "/":
-                nxt = skip_comment(text, i)
-                if nxt is not None:
-                    i = nxt
-                    continue
-            if ch in "\"'":
-                i = skip_literal(text, i)
+    for pattern in (MACRO_OPEN, CFG_ATTR_OPEN):
+        for match in pattern.finditer(text):
+            end = _close_of(text, match.end())
+            if end is None:
                 continue
-            if ch == "r" and text[i + 1 : i + 2] in ('"', "#"):
-                nxt = skip_raw_literal(text, i)
-                if nxt is not None:
-                    i = nxt
+            body = text[match.end() : end]
+            if pattern is MACRO_OPEN:
+                out.append((match.group(1), body, match.start()))
+                continue
+            # A `cfg_attr` body: every attribute it applies is a real
+            # invocation, so scan it for bare macro calls.
+            base = match.end()
+            for inner in BARE_MACRO_OPEN.finditer(body):
+                inner_end = _close_of(body, inner.end())
+                if inner_end is None:
                     continue
-            if ch in "([":
-                depth += 1
-            elif ch in ")]":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        if depth == 0:
-            out.append((match.group(1), text[match.end() : i], match.start()))
+                out.append(
+                    (
+                        inner.group(1),
+                        body[inner.end() : inner_end],
+                        base + inner.start(),
+                    )
+                )
     return out
 
 
@@ -999,6 +1122,15 @@ def assign_waivers(waived, fences):
 WAIVER_REACH = 6
 
 
+def _fence_run(stripped):
+    """`(char, length)` when `stripped` opens or closes a fence, else None."""
+    for char in ("`", "~"):
+        if stripped.startswith(char * 3):
+            length = len(stripped) - len(stripped.lstrip(char))
+            return char, length
+    return None
+
+
 def _judge_collected(rel, collected, accepted, judgeable, waived):
     """Judge every collected fence, each with only the waivers bound to it."""
     spans = [(block[0][0], block[-1][0]) for block in collected if block]
@@ -1020,21 +1152,31 @@ def scan_markdown(path, accepted, judgeable, _calls=None):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     waived = collect_waivers(lines)
     inside, fences, collected, current = False, 0, [], []
+    open_char, open_len = "`", 3
     for lineno, line in enumerate(lines, 1):
         # A fenced example inside a block quote is still an example a reader
         # copies. `docs/guide/mcp.md` and `docs/guide/openapi.md` both carry
         # one, and without stripping the CommonMark `>` prefix the scanner
         # never entered the fence at all.
         stripped = BLOCKQUOTE.sub("", line).lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
+        run = _fence_run(stripped)
+        if run:
+            char, length = run
             if inside:
-                collected.append(current)
-                current, inside = [], False
+                # CommonMark: a fence closes only on the same character, at
+                # least as long as the opener. Removing a fixed three
+                # characters read ````rust as the language "`rust" and skipped
+                # the block entirely — and longer fences are exactly what an
+                # example containing triple backticks requires.
+                if char == open_char and length >= open_len:
+                    collected.append(current)
+                    current, inside = [], False
             else:
-                lang = stripped[3:].strip().lower()
+                lang = stripped[length:].strip().lower()
                 inside = lang.startswith("rust")
                 if inside:
                     fences += 1
+                    open_char, open_len = char, length
             continue
         if inside:
             current.append((lineno, BLOCKQUOTE.sub("", line)))
@@ -1475,6 +1617,63 @@ def self_test():
             ".md",
         ),
         [],
+    )
+    # A predicate can carry its own commas and parens, and more than one
+    # attribute can follow it.
+    check(
+        "markdown: cfg_attr with a compound predicate",
+        scan_text(
+            '```rust\n#[cfg_attr(all(feature = "a", feature = "b"), secured(policy = "x"))]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: cfg_attr with a later payload",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "a", inline, secured(policy = "y"))]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: compound predicate with a correct payload passes",
+        scan_text(
+            '```rust\n#[cfg_attr(all(feature = "a", feature = "b"), secured(scopes = ["a:b"]))]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+
+    # Body extraction must not count delimiters inside Rust literals or read
+    # code out of doc comments.
+    check("get rejects a sibling attribute's name", "intercept" in accepted["get"], False)
+    check("get keeps its own keys", "api_version" in accepted["get"], True)
+    check(
+        "markdown: a sibling attribute name is not a route key",
+        scan_text('```rust\n#[get("/", intercept = MyLayer)]\n```\n', ".md"),
+        [("get", "intercept")],
+    )
+    check("oauth2_callback excludes the edge grammar", "needs" in accepted["oauth2_callback"], False)
+    check("oauth2_callback keeps route keys", "timeout_ms" in accepted["oauth2_callback"], True)
+
+    # A fence closes only on the same character, at least as long as the opener.
+    check(
+        "markdown: four-backtick fence is scanned",
+        scan_text('````rust\n#[secured(policy = "x")]\n````\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a shorter run does not close a longer fence",
+        scan_text(
+            '````rust\n```\n#[secured(policy = "x")]\n```\n````\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: tilde fence is scanned",
+        scan_text('~~~rust\n#[secured(policy = "x")]\n~~~\n', ".md"),
+        [("secured", "policy")],
     )
 
     check(
