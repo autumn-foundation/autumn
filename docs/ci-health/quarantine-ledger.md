@@ -84,6 +84,74 @@ without also filling in the intake form above.
 
 ### `hot-upgrade::live_upgrade::upgrades_in_place_under_load_without_dropping_a_connection_or_the_state`
 
+- **2026-09-10 update — a third Linux/coverage signature hit, then a
+  same-day fix landed on `trunk-dev` naming three mechanisms.** Sampling
+  the 24.5h since the 2026-09-09 follow-up (86 `pull_request`-triggered
+  `ci.yml` runs, 55 cancelled/23 success/8 failure) turned up one more
+  organic hit, on the same `Coverage (workspace)`/Linux job shape as the
+  prior day's line-567 hit: run 34360601529 (branch
+  `claude/friendly-ritchie-rex1a9`, job id 102530590317), 2026-09-09T13:59Z.
+  Panic at `examples/hot-upgrade/tests/live_upgrade.rs:552:5`: `"every read
+  must be served across the cutover, saw [Observation { status: 0, body:
+  "", latency: 295.896µs }, Observation { status: 0, body: "", latency:
+  406.843µs }]"`, with the connection-error counters printed immediately
+  above it all reading zero: `"connection failures across cutover:
+  refused=0 hard_failures_after_retry=0 mid_flight_resets_retried=0"`. A
+  third distinct assertion/signature on the same test (not the macOS
+  connect-error cluster, not the Linux line-567 "new build never served"
+  hit) — fetched via the job's raw log blob URL after `get_job_logs` with
+  `return_content=true` truncated the tail before reaching the panic line
+  (the test's own per-request tracing spam is large enough that even an
+  8000-line tail landed short; the untruncated blob URL was needed).
+  Two Linux/`Coverage (workspace)` hits on this test inside roughly 24
+  hours (2026-09-09 pre-09:47Z and 2026-09-09T13:59Z), both organic,
+  reinforced that this was not a macOS-only mechanism.
+
+  **Same day, `trunk-dev`'s tip (`8fae8af`, PR #2645, merged
+  2026-09-10T04:56:32Z) landed a fix titled "Fix live_upgrade test: three
+  real timing races, not flakes"**, authored independent of this ledger's
+  own tracking. It names three mechanisms, all test-defect (not
+  product-defect — the hot-upgrade handoff mechanism itself was not
+  changed) and root-caused rather than tolerance-widened:
+  1. The seed request could race v1's own startup barrier
+     (`StartupBarrierLayer` in `router.rs` can still 503 ordinary traffic
+     after `capture_bound_addr` sees the bind-log line but before
+     `on_startup` hooks finish) — fixed with a `wait_until_ready` poll
+     bounded to the codebase's existing 30s upgrade budget.
+  2. The fixed 3.5s post-signal window assumed the cutover itself is fast,
+     with no budget behind that number — this is the mechanism behind the
+     2026-09-09 Linux line-567 "new build never served" hit. Replaced with
+     an adaptive wait (same 30s bound) for `successor_pid`, keeping 3.5s as
+     further sustained traffic after cutover rather than the sole signal.
+  3. A read can land on the *successor's* own startup barrier (v2 can
+     legitimately `accept()` and 503 before `mark_startup_complete`) — this
+     is the mechanism behind the 2026-09-09T13:59Z hit logged just above
+     (note: that hit's `Observation`s show `status: 0`/empty body, not a
+     literal 503 — read as the client-side shape of the same successor-not-
+     ready-yet race, not yet distinguished from a literal 503 response by a
+     byte-for-byte log comparison). `with_startup_barrier_retry` now retries
+     it, bounded, mirroring how `with_reset_retry` already treats a
+     mid-flight reset as expected-but-bounded.
+
+  The fix's own verification, per its commit message: `cargo llvm-cov
+  --no-report -p hot-upgrade --test live_upgrade` (the exact build CI's
+  `Coverage` job uses) passed 9+ consecutive runs across two local
+  contention levels (4-8 and 16 busy loops on 4 cores), including runs that
+  hit the barrier and still passed. That is real evidence and a named
+  mechanism per test, satisfying the hard gate's diagnosis requirement —
+  but it is a local, self-reported rerun count, not the CI-native ≥20
+  (≥50 for the macOS connect-error signature's sub-10% historical rate)
+  same-commit campaign this role's own evidentiary bar calls for before
+  treating an entry as closed. **Not closing this entry yet.** Two things
+  would close it: (a) `manual-macos-contention-check.yml` — still
+  undispatched, `total_count: 0` again as of this check, now ~43 hours
+  idle since #2627 fixed it — actually run against a commit at or after
+  `8fae8af`, giving CI-native rerun evidence across both platforms in one
+  pass; or (b) enough organic post-fix PR traffic passing clean to
+  approximate the same bar. Zero organic hits in the small post-merge
+  window sampled here (one push-triggered run on `trunk-dev` at the fix
+  commit itself, success) — reassuring, but n=1, not evidence.
+
 - **Observed**: 3/17 eligible `macos-latest` CI executions (14 confirmed, 3
   unresolved — see the 2026-09-04 census for the derivation), 0/16-17 on
   `ubuntu-latest`, organic PR-traffic sample, 2026-09-03/04.
