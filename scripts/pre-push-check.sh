@@ -133,7 +133,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # `--all-targets` form.
 step "cargo clippy -p autumn-web --features \"<gated request-path set>\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
-  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" \
+  --features "ws,mail,offline-sync,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme" \
   --lib -- -D warnings
 
 step "cargo clippy -p autumn-web --features \"plugin-sandbox,test-support\" --lib -- -D warnings"

@@ -22,7 +22,7 @@
 //! use autumn_web::storage::SharedBlobStore;
 //! use autumn_web::{secured, AutumnError};
 //!
-//! #[secured(policy = "reports.read")]
+//! #[secured(scopes = ["reports:read"])]
 //! async fn download_report(
 //!     store: SharedBlobStore,
 //!     report_key: String,

@@ -156,6 +156,15 @@ REQUEST_PATH_MODULES=(
   autumn/src/replication/status.rs:db
   autumn/src/replication/s3.rs:http-client
   autumn/src/sigv4.rs:default
+  autumn/src/constela/mod.rs:constela
+  autumn/src/constela/ast.rs:constela
+  autumn/src/constela/error.rs:constela
+  autumn/src/constela/parse.rs:constela
+  autumn/src/constela/policy.rs:constela
+  autumn/src/constela/eval.rs:constela
+  autumn/src/constela/validate.rs:constela
+  autumn/src/constela/render.rs:constela
+  autumn/src/constela/dispatch.rs:constela
   autumn-billing/src/money.rs:default
   autumn-billing/src/reconcile.rs:default
   autumn-billing/src/gate.rs:default
@@ -167,7 +176,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=69
+MODULE_COUNT_FLOOR=78
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny
