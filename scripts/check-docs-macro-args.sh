@@ -969,9 +969,51 @@ ATTR_SIGIL = re.compile(r"#")
 #
 # Widening the path to "any segments ending in a known name" would report the
 # second as `#[get]` drift, which is a false positive on valid Rust.
-_CRATE_PREFIX = r"(?:(?:::)?(?:autumn_web|autumn_macros|autumn)::)?"
-MACRO_NAME = re.compile(_CRATE_PREFIX + r"(" + "|".join(sorted(OWNERS)) + r")\b")
-CFG_ATTR_NAME = re.compile(r"cfg_attr\b")
+# `::` is a token like any other, so trivia goes around it too:
+# `#[autumn_web /* rationale */ :: secured(…)]` resolves to the same macro. A
+# contiguous regex cannot express that, so the path is walked segment by
+# segment with the same trivia walker as the rest of the attribute head.
+_CRATE_NAMES = frozenset({"autumn_web", "autumn_macros", "autumn"})
+_SEGMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _macro_path_at(text, i):
+    """`(name, start, end)` for a macro path at `i` past trivia, else None."""
+    start = _trivia_end(text, i)
+    j, rooted = start, False
+    if text[j : j + 2] == "::":
+        j, rooted = _trivia_end(text, j + 2), True
+    first = _SEGMENT.match(text, j)
+    if first is None:
+        return None
+    after = _trivia_end(text, first.end())
+    if text[after : after + 2] == "::":
+        # A qualified path: the first segment must be a known crate and the
+        # NEXT must be the macro. Anything deeper is a different macro that
+        # merely ends in a familiar name — `autumn_web::reexports::axum::
+        # routing::get` is axum's router macro, which takes a path literal and
+        # has none of `#[get]`'s keyword grammar.
+        if first.group(0) not in _CRATE_NAMES:
+            return None
+        k = _trivia_end(text, after + 2)
+        name = _SEGMENT.match(text, k)
+        if name is None or name.group(0) not in OWNERS:
+            return None
+        return name.group(0), start, name.end()
+    # A bare name. Rooted, it is a crate NAMED like the macro (`::secured`),
+    # not the macro.
+    if rooted or first.group(0) not in OWNERS:
+        return None
+    return first.group(0), start, first.end()
+
+
+def _cfg_attr_path_at(text, i):
+    """`("cfg_attr", start, end)` when `cfg_attr` sits at `i`, else None."""
+    start = _trivia_end(text, i)
+    m = _SEGMENT.match(text, start)
+    if m is None or m.group(0) != "cfg_attr":
+        return None
+    return "cfg_attr", start, m.end()
 
 
 def _trivia_end(text, i):
@@ -987,15 +1029,19 @@ def _trivia_end(text, i):
     return i
 
 
-def _delimited_at(text, i, name_re):
-    """Match `name_re` at `i` past trivia, then its delimiter. -> (m, open, body_start)."""
-    m = name_re.match(text, _trivia_end(text, i))
-    if m is None:
+def _delimited_at(text, i, path_at):
+    """A macro path at `i` and its delimiter. -> (name, start, open, body_start)."""
+    found = path_at(text, i)
+    if found is None:
         return None
-    j = _trivia_end(text, m.end())
+    name, start, end = found
+    j = _trivia_end(text, end)
     if j >= len(text) or text[j] not in "([{":
         return None
-    return m, text[j], j + 1
+    return name, start, text[j], j + 1
+
+
+
 # `cfg_attr(<pred>, <attr>, …)` applies each `<attr>` when the predicate holds,
 # so a conditionally-applied Autumn macro is a real invocation the compiler
 # will reject on a typo. Its body is scanned recursively rather than matched
@@ -1003,10 +1049,8 @@ def _delimited_at(text, i, name_re):
 # (`all(feature = "a", feature = "b")`), and more than one attribute can
 # follow it (`cfg_attr(feature = "a", inline, secured(…))`), so a `[^,]+`
 # prefix stopped at the predicate's first comma and saw no later payload.
-BARE_MACRO_NAME = re.compile(
-    _CRATE_PREFIX + r"(" + "|".join(sorted(OWNERS)) + r")\b"
-)
-BARE_CFG_ATTR_NAME = re.compile(r"cfg_attr\b")
+# A `cfg_attr` payload is the same path grammar as an attribute head, so it
+# uses the same walker rather than a second pattern that could drift from it.
 
 
 def skip_literal(text, i):
@@ -1183,18 +1227,18 @@ def find_macro_calls(text):
         bracket = _trivia_end(text, attr.end())
         if bracket >= len(text) or text[bracket] != "[":
             continue
-        found = _delimited_at(text, bracket + 1, MACRO_NAME)
+        found = _delimited_at(text, bracket + 1, _macro_path_at)
         if found is not None:
-            match, opener, body_start = found
+            name, _, opener, body_start = found
             end = _close_of(text, body_start, opener)
             if end is None:
                 continue
-            out.append((match.group(1), text[body_start:end], attr.start()))
+            out.append((name, text[body_start:end], attr.start()))
             continue
-        found = _delimited_at(text, bracket + 1, CFG_ATTR_NAME)
-        if found is None or found[1] != "(":
+        found = _delimited_at(text, bracket + 1, _cfg_attr_path_at)
+        if found is None or found[2] != "(":
             continue
-        _, _, body_start = found
+        body_start = found[3]
         end = _close_of(text, body_start, "(")
         if end is None:
             continue
@@ -1222,14 +1266,14 @@ def _cfg_attr_payloads(body, base):
         # /* apply auth */ secured(…))`. `_split_top_level` already steps over
         # comments when balancing commas, but it leaves them in the item, so an
         # anchored match had to know about them too.
-        found = _delimited_at(item, 0, BARE_MACRO_NAME)
+        found = _delimited_at(item, 0, _macro_path_at)
         if found is None:
             # Either a bare marker attribute (`inline`), or a name-value one
             # (`doc = "…"`). Neither carries an Autumn argument list. A macro
             # name appearing later inside such an item is part of a value.
-            nested = _delimited_at(item, 0, BARE_CFG_ATTR_NAME)
-            if nested is not None and nested[1] == "(":
-                inner_start = nested[2]
+            nested = _delimited_at(item, 0, _cfg_attr_path_at)
+            if nested is not None and nested[2] == "(":
+                inner_start = nested[3]
                 inner_end = _close_of(item, inner_start, "(")
                 if inner_end is not None:
                     out.extend(
@@ -1239,15 +1283,15 @@ def _cfg_attr_payloads(body, base):
                         )
                     )
             continue
-        match, opener, inner_start = found
+        name, name_start, opener, inner_start = found
         inner_end = _close_of(item, inner_start, opener)
         if inner_end is None:
             continue
         out.append(
             (
-                match.group(1),
+                name,
                 item[inner_start:inner_end],
-                base + start + match.start(),
+                base + start + name_start,
             )
         )
     return out
@@ -1293,8 +1337,15 @@ def is_archived(rel):
 
 
 def markdown_files():
+    # `*.md.tmpl` too: `new.rs` writes `templates/README.md.tmpl` as every
+    # scaffolded application's README, so a fence there reaches a reader by a
+    # route other than opening a page. Three sibling gates already define the
+    # corpus that way — `check-docs-config.sh`, `-routes.sh` and `-symbols.sh`
+    # each carry the same note — and this one did not, which made it the odd
+    # gate out on a surface the others consider reader-facing.
     out = []
-    for path in sorted(ROOT.rglob("*.md")):
+    paths = sorted(set(ROOT.rglob("*.md")) | set(ROOT.rglob("*.md.tmpl")))
+    for path in paths:
         rel = path.relative_to(ROOT)
         parts = rel.parts
         if "target" in parts or ".git" in parts or "node_modules" in parts:
@@ -2141,6 +2192,52 @@ def self_test():
         ),
         [("secured", "policy")],
     )
+    # `::` is a token, so trivia goes around it as well. The negatives below
+    # matter more than the positives: the same trivia must not turn a deeper
+    # path into a match.
+    check(
+        "markdown: a comment around the path separator",
+        scan_text(
+            '```rust\n#[autumn_web /* why */ :: secured(policy = "x")]\n```\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: whitespace around the path separator",
+        scan_text('```rust\n#[ :: autumn_web :: secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a path separator across a line break",
+        scan_text(
+            '```rust\n#[autumn_web\n    :: secured(policy = "x")]\n```\n', ".md"
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: trivia does not make a deeper path match",
+        scan_text(
+            '```rust\n#[autumn_web /* x */ :: reexports :: axum :: routing :: get("/x")]\n```\n',
+            ".md",
+        ),
+        [],
+    )
+    check(
+        "markdown: trivia does not make a rooted bare path match",
+        scan_text('```rust\n#[ :: secured(policy = "x")]\n```\n', ".md"),
+        [],
+    )
+    # A markdown TEMPLATE is documentation a reader will hold: `new.rs` writes
+    # `templates/README.md.tmpl` as every scaffolded application's README.
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".md.tmpl", dir=ROOT, delete=False, encoding="utf-8"
+    ) as fh:
+        fh.write("# generated\n")
+        tmpl = pathlib.Path(fh.name)
+    try:
+        check("corpus: a markdown template is in the corpus", tmpl in set(markdown_files()), True)
+    finally:
+        tmpl.unlink()
 
     # `x == "…"` names a key only when `x` is one. `window != "pending"` and
     # `basis == "deleted_at"` compare values.
