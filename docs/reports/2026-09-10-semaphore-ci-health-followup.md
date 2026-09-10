@@ -38,10 +38,17 @@ fix "CI-natively across both platforms in one dispatch." Checked against
 asserted from memory of its name: its `test` job is
 `runs-on: macos-latest` only, running a plain `cargo test --workspace` (no
 Linux leg, no `cargo llvm-cov` instrumentation). It can produce CI-native
-rerun evidence for the macOS-observed connect-error cluster, and for
-mechanisms 1/2 under ordinary (non-instrumented) load — but it cannot touch
-either Linux/`Coverage (workspace)` signature, both of which only manifest
-under `cargo llvm-cov`'s instrumentation overhead. Dispatching it is still
+rerun evidence for the macOS-observed connect-error cluster, and — per the
+fix's own in-code comment on mechanism 2 (`live_upgrade.rs:597-603`: the
+window can still expire "under an instrumented coverage binary … or a
+contended CI runner") — plausibly for mechanism 2 under ordinary contention
+too, without `cargo llvm-cov` necessarily being required. What it cannot do
+is reproduce the Linux/`Coverage (workspace)` job shape either tracked
+Linux signature was actually observed under, since this harness only ever
+runs macOS VMs — a platform gap, not necessarily an instrumentation one;
+whether `cargo llvm-cov` is strictly required for either Linux signature to
+manifest, versus plain contention on a Linux runner sufficing, remains
+untested. Dispatching it is still
 worth doing (it is the only rerun harness that exists for this
 investigation today, and a clean run narrows the macOS cluster), but it is
 not the full verification this report originally implied — the 2026-09-09
@@ -89,10 +96,15 @@ failure**. Triaged each by job/log inspection:
   alone, it is not: the fix's mechanism 3 (`is_startup_barrier_response`)
   only retries an exact HTTP 503 with body `"Service is still starting
   up"`, and this hit's observations are `status: 0` with an empty body —
-  the connection-level shape, not an HTTP 503 response — so that predicate
-  does not match and the retry would not have fired. This signature stays
-  unattributed to any of the three named mechanisms; see the ledger entry
-  for the full correction.
+  not an HTTP 503 response either way — so that predicate does not match
+  and the retry would not have fired. (A second correction on review: don't
+  read `status: 0` as proof of "no response received" / a connection-level
+  failure — `get()`'s source shows it's also what an `Ok` response gets
+  assigned whenever the reply can't be parsed into a status line, which a
+  malformed or truncated non-empty reply could produce just as well as an
+  empty one; call it unparseable/unknown, not connection-level.) This
+  signature stays unattributed to any of the three named mechanisms; see
+  the ledger entry for the full correction.
 - **1 test-suite failure gate closing failed jobs already counted above**
   (run 34413188863's `Test suite` gate reports failure because its own
   `Clippy`/`SQLite runtime` jobs failed — not a distinct failure, not
@@ -170,11 +182,18 @@ opening a duplicate fix would be pure waste. What this pass does instead:
   after `8fae8af`. It is macOS-only, plain `cargo test --workspace` — it
   can produce CI-native rerun evidence for the macOS connect-error cluster
   (tracked against #2510, not #2645 — see the corrected table row above),
-  but it cannot exercise either Linux/`Coverage (workspace)` signature
-  (both need `cargo llvm-cov` instrumentation to manifest at all), and a
-  single dispatch caps at 20 samples — short of the ≥50 this role's own bar
-  calls for at the macOS cluster's historical rate, so closing that half
-  needs multiple dispatches accumulated, not one. It is still the only rerun harness
+  and, per the fix's own in-code comment (`live_upgrade.rs:597-603`, "under
+  an instrumented coverage binary … or a contended CI runner"), plain
+  contention alone may be enough to probe mechanism 2 too, without needing
+  `cargo llvm-cov` specifically. What it cannot do is reproduce either
+  Linux/`Coverage (workspace)` job shape those two signatures were actually
+  observed under — this harness only ever spins macOS VMs, so a clean
+  macOS run narrows the macOS cluster but says nothing directly about the
+  two Linux hits. The macOS cluster's own measured rate (3/17, or 3/30
+  folding in the 13/13 clean samples #2548 already banked — exactly 10%,
+  not below it) puts it on this role's standard ≥20 bar, not the ≥50
+  reserved for genuinely low-rate flakes, so a single 20-sample dispatch
+  (the input's max) can reach it in one run. It is still the only rerun harness
   this investigation has, and 43 hours idle is 43 hours of not even that
   much evidence. A second, Linux/coverage-shaped harness — flagged as
   future work in the 2026-09-09 report — remains not built. New macOS CI

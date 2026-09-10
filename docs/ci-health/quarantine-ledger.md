@@ -139,9 +139,21 @@ without also filling in the intake form above.
   "Service is still starting up"` — and `with_startup_barrier_retry` only
   retries when that predicate holds; any other outcome, `status: 0`
   included, is returned immediately, unretried (`live_upgrade.rs:394`).
-  A `status: 0`/empty-body observation is the connection-level shape (no
-  HTTP response received at all), not an HTTP 503 response, so it fails
-  that predicate and mechanism 3's retry would not have touched it. Since
+  A `status: 0`/empty-body observation is not an HTTP 503 response either
+  way, so it fails that predicate and mechanism 3's retry would not have
+  touched it. **Correction (post-review): do not narrow this to
+  "connection-level."** An earlier version of this paragraph read
+  `status: 0` as meaning no HTTP response was received at all. Checked
+  against `get()` itself (`live_upgrade.rs:93-125`): a connect/write/read
+  syscall failure returns `Err` and feeds `refused_errors`/`hard_failures`
+  directly — a genuinely distinct path from this observation. `status: 0`
+  is instead assigned via `.unwrap_or(0)` on the `Ok` path, whenever the
+  response text's second whitespace-separated token isn't there or doesn't
+  parse as a status code — which an empty read after a bare `accept()`
+  would produce, but so would a malformed or truncated *non-empty* reply;
+  the raw bytes weren't logged, so which of those actually happened here is
+  unknown. Classify this as an unparseable/unknown response, not a
+  connection-level failure. Since
   the failing run's own counter line (`refused=0
   hard_failures_after_retry=0 mid_flight_resets_retried=0`, with no
   `startup_barrier_hits` figure — that counter didn't exist yet in the
