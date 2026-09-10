@@ -4,14 +4,18 @@ Follow-up to `docs/reports/2026-09-09-semaphore-ci-health-followup.md` and the
 running investigation in `docs/ci-health/quarantine-ledger.md`. No fix PR from
 this pass — someone else already shipped the fix this ledger has been
 tracking evidence toward, and the hard gate for a *different* fix (verifying
-it, or fixing `cache_stampede`) still isn't cleared. The headline: PR #2645,
-merged onto `trunk-dev` at `8fae8af` (2026-09-10T04:56:32Z), fixed three named
-timing races in the `live_upgrade` test itself — test-defect, not
-product-defect, per its own local contention-reproduction evidence. That
-resolves the test-vs-product question this investigation has been carrying
-open since 2026-09-04. It does not yet clear this role's own closure bar
-(CI-native ≥20/≥50 same-commit rerun evidence), because the verification
-harness built for exactly this purpose is still sitting undispatched.
+it, closing the gap on the one unattributed signature below, or fixing
+`cache_stampede`) still isn't cleared. The headline: PR #2645, merged onto
+`trunk-dev` at `8fae8af` (2026-09-10T04:56:32Z), fixed three named timing
+races in the `live_upgrade` test itself — test-defect, not product-defect,
+per its own local contention-reproduction evidence. That resolves the
+test-vs-product question for the two tracked signatures the fix's own commit
+message credibly explains; a third tracked signature (below, corrected on
+review) does not match any of the three named predicates and remains
+unattributed. None of this yet clears this role's own closure bar (CI-native
+≥20/≥50 same-commit rerun evidence), because the verification harness built
+for exactly this purpose is still sitting undispatched — and, as corrected
+below, only covers part of what needs verifying even once it runs.
 
 ## 🎯 Verdict path
 
@@ -22,10 +26,24 @@ contention-check.yml` — `actionlint`-clean and dispatchable since #2627
 (`total_count: 0`, checked 2026-09-10T09:5x UTC, roughly 43 hours after it
 became dispatchable). That number has not moved across three consecutive
 daily passes (2026-09-08, 2026-09-09, 2026-09-10) despite the investigation
-it exists to serve reaching a diagnosed-and-fixed mechanism in the meantime —
-the harness is now more valuable, not less, since it can verify the fix
-CI-natively across both platforms in one dispatch, and nobody has spent the
-sign-off to run it.
+it exists to serve reaching a diagnosed-and-fixed mechanism in the meantime.
+
+**Correction (post-review): this harness does not cover both platforms.**
+An earlier version of this report claimed dispatching it would verify the
+fix "CI-natively across both platforms in one dispatch." Checked against
+`.github/workflows/manual-macos-contention-check.yml` itself rather than
+asserted from memory of its name: its `test` job is
+`runs-on: macos-latest` only, running a plain `cargo test --workspace` (no
+Linux leg, no `cargo llvm-cov` instrumentation). It can produce CI-native
+rerun evidence for the macOS-observed connect-error cluster, and for
+mechanisms 1/2 under ordinary (non-instrumented) load — but it cannot touch
+either Linux/`Coverage (workspace)` signature, both of which only manifest
+under `cargo llvm-cov`'s instrumentation overhead. Dispatching it is still
+worth doing (it is the only rerun harness that exists for this
+investigation today, and a clean run narrows the macOS cluster), but it is
+not the full verification this report originally implied — the 2026-09-09
+follow-up already flagged a second, Linux/coverage-shaped harness as a
+future need; this pass should not have re-conflated the two.
 
 ## 🌡️ Symptom
 
@@ -34,7 +52,7 @@ Sampled the 86 `pull_request`-triggered `ci.yml` runs completed since the
 55 cancelled (superseded pushes, not a health signal), 23 success, **8
 failure**. Triaged each by job/log inspection:
 
-- **5 are ordinary WIP-branch failures**, not CI health issues: `Clippy`
+- **6 are ordinary WIP-branch failures**, not CI health issues: `Clippy`
   failures across four `codex/*` branches' in-progress commits (runs
   34433194077, 34413188863, 34413165387, 34411840985 — three of these are
   the same `Clippy` step failing on not-yet-fixed lint issues in new code;
@@ -61,8 +79,17 @@ failure**. Triaged each by job/log inspection:
 - **1 is the `live_upgrade` hit fully written up in the ledger update
   below** (run 34360601529, job `Coverage (workspace)`, 2026-09-09T13:59Z) —
   a third distinct assertion/signature on the same test, on the same
-  Linux/coverage job shape as the prior day's line-567 hit, now retroactively
-  explained by one of the three mechanisms PR #2645 fixed same-day.
+  Linux/coverage job shape as the prior day's line-567 hit. **Correction
+  (post-review):** an earlier version of this report claimed this hit was
+  "retroactively explained by one of the three mechanisms PR #2645 fixed."
+  Checked against the merged source rather than asserted from the log
+  alone, it is not: the fix's mechanism 3 (`is_startup_barrier_response`)
+  only retries an exact HTTP 503 with body `"Service is still starting
+  up"`, and this hit's observations are `status: 0` with an empty body —
+  the connection-level shape, not an HTTP 503 response — so that predicate
+  does not match and the retry would not have fired. This signature stays
+  unattributed to any of the three named mechanisms; see the ledger entry
+  for the full correction.
 - **1 test-suite failure gate closing failed jobs already counted above**
   (run 34413188863's `Test suite` gate reports failure because its own
   `Clippy`/`SQLite runtime` jobs failed — not a distinct failure, not
@@ -73,8 +100,10 @@ No new `cache_stampede` or `sim_fault_plan` hits this pass.
 
 ## 🔍 Diagnosis
 
-**`live_upgrade`: verdict now rendered — test defect, not product defect,
-for all three named mechanisms.** Full mechanism writeup copied into
+**`live_upgrade`: verdict rendered for three named mechanisms — test defect,
+not product defect. Whether those three mechanisms cover every organic hit
+this ledger has logged is a separate, still-open question**, per the
+correction above. Full mechanism writeup copied into
 `docs/ci-health/quarantine-ledger.md`'s `live_upgrade` entry rather than
 duplicated here. In short: two of the three races involve a request landing
 on a startup barrier (the seed request racing v1's own barrier; a cutover
@@ -87,7 +116,11 @@ file. All three are textbook "fixed sleep/assumption about environment
 speed, breaks under contention or an instrumented binary" — exactly the
 `sleep()`-as-synchronization anti-pattern this role's charter names, except
 here it's diagnosed and replaced with condition-polling rather than a wider
-timeout, which is the sanctioned direction.
+timeout, which is the sanctioned direction. The 2026-09-09T13:59Z hit's
+`status: 0` observations don't fit any of the three predicates as written
+(see the correction above) — either a fourth, still-unnamed mechanism
+remains, or mechanisms 1/2 happen to resolve it as a side effect despite not
+naming it directly. Only a rerun shows which.
 
 The fix's own evidence (9+ consecutive local `cargo llvm-cov` runs across
 two contention levels, using the literal build CI's `Coverage` job runs) is
@@ -114,20 +147,25 @@ opening a duplicate fix would be pure waste. What this pass does instead:
 
 - **`docs/ci-health/quarantine-ledger.md` updated**: the third `live_upgrade`
   signature (2026-09-09T13:59Z hit) written up in full, PR #2645's fix
-  recorded against all three now-explained mechanisms, and the entry kept
-  **open** (not moved to Closed) pending CI-native verification — diagnosed-
-  and-fixed is not the same claim as closed-per-this-role's-bar, and
-  conflating them is exactly the "merged is not the same as verified" trap
-  the 2026-09-09 report already called out once for a different PR (#2510)
-  in this same investigation.
-- **Recommendation for a human, now more urgent than the prior two passes**:
-  dispatch `manual-macos-contention-check.yml` against a `trunk-dev` commit
-  at or after `8fae8af`. Before today it would have collected root-cause
-  evidence toward an undiagnosed flake; today it would additionally verify
-  a specific, already-landed fix CI-natively across both platforms in one
-  run — a strictly more valuable use of the same one dispatch that's been
-  sitting available, unused, for 43 hours. New macOS CI spend still needs
-  sign-off; that has not changed.
+  recorded against the two mechanisms it credibly explains, the third left
+  explicitly unattributed after checking the predicate against the merged
+  source, and the entry kept **open** (not moved to Closed) pending
+  CI-native verification — diagnosed-and-fixed is not the same claim as
+  closed-per-this-role's-bar, and conflating them is exactly the "merged is
+  not the same as verified" trap the 2026-09-09 report already called out
+  once for a different PR (#2510) in this same investigation.
+- **Recommendation for a human, still more urgent than the prior two
+  passes, but narrower than this report first claimed**: dispatch
+  `manual-macos-contention-check.yml` against a `trunk-dev` commit at or
+  after `8fae8af`. It is macOS-only, plain `cargo test --workspace` — it
+  can produce CI-native rerun evidence for the macOS connect-error cluster
+  and for mechanisms 1/2 under ordinary load, but it cannot exercise either
+  Linux/`Coverage (workspace)` signature (both need `cargo llvm-cov`
+  instrumentation to manifest at all). It is still the only rerun harness
+  this investigation has, and 43 hours idle is 43 hours of not even that
+  much evidence. A second, Linux/coverage-shaped harness — flagged as
+  future work in the 2026-09-09 report — remains not built. New macOS CI
+  spend still needs sign-off; that has not changed.
 - **Windows LNK1104 logged, not actioned.** One occurrence, no rerun,
   plausible infra cause. Revisit if it repeats.
 
@@ -138,9 +176,9 @@ already-shipped fix, not a rerun campaign this pass ran itself.
 
 | Test | Hits (this pass) | Cumulative organic hits | Platforms seen | Status |
 |---|---|---|---|---|
-| `live_upgrade` (connection-error assertion) | 0 | 3/17 macOS (2026-09-03/04) | macOS only | Mechanism #1 or #3 fixed in #2645; unverified CI-natively |
-| `live_upgrade` (new-build-never-served) | 0 | 1 (2026-09-09) | Linux (coverage) | Mechanism #2 fixed in #2645; unverified CI-natively |
-| `live_upgrade` (every-read-must-be-served, refused=0/hard=0) | 1 | 1 (2026-09-09) | Linux (coverage) | Mechanism #3 fixed in #2645; unverified CI-natively |
+| `live_upgrade` (connection-error assertion) | 0 | 3/17 macOS (2026-09-03/04) | macOS only | Plausibly mechanism #1 or #3 in #2645, not confirmed against these specific hits' logs; `manual-macos-contention-check.yml` can verify CI-natively, still undispatched |
+| `live_upgrade` (new-build-never-served) | 0 | 1 (2026-09-09) | Linux (coverage) | Mechanism #2 in #2645 — directly supported by the fix's own commit message; unverified CI-natively (no Linux/coverage harness exists) |
+| `live_upgrade` (every-read-must-be-served, refused=0/hard=0) | 1 | 1 (2026-09-09) | Linux (coverage) | **Not attributed to any of the three mechanisms** — `status: 0` observations don't match mechanism 3's exact-503 predicate (checked against merged source); unverified CI-natively (no Linux/coverage harness exists) |
 | `cache_stampede` (line 501) | 0 | 2 (2026-09-03, 2026-09-09) | macOS only | Undiagnosed |
 | `sim_fault_plan` | 0 | 1 (2026-09-03) | macOS only | Undiagnosed |
 | Windows `LNK1104` (link-stage, `todo-app`/`seed`) | 1 | 1 (2026-09-09) | Windows | New, unclassified, n=1 |

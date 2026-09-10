@@ -124,14 +124,34 @@ without also filling in the intake form above.
      an adaptive wait (same 30s bound) for `successor_pid`, keeping 3.5s as
      further sustained traffic after cutover rather than the sole signal.
   3. A read can land on the *successor's* own startup barrier (v2 can
-     legitimately `accept()` and 503 before `mark_startup_complete`) — this
-     is the mechanism behind the 2026-09-09T13:59Z hit logged just above
-     (note: that hit's `Observation`s show `status: 0`/empty body, not a
-     literal 503 — read as the client-side shape of the same successor-not-
-     ready-yet race, not yet distinguished from a literal 503 response by a
-     byte-for-byte log comparison). `with_startup_barrier_retry` now retries
-     it, bounded, mirroring how `with_reset_retry` already treats a
-     mid-flight reset as expected-but-bounded.
+     legitimately `accept()` and 503 before `mark_startup_complete`) —
+     `with_startup_barrier_retry` now retries it, bounded, mirroring how
+     `with_reset_retry` already treats a mid-flight reset as
+     expected-but-bounded.
+
+  **Correction (post-review): do not attribute the 2026-09-09T13:59Z hit to
+  mechanism 3.** An earlier version of this entry read that hit's
+  `Observation { status: 0, body: "" }` pair as "the client-side shape of
+  the same successor-not-ready-yet race." Checked against the merged
+  source (`examples/hot-upgrade/tests/live_upgrade.rs`) rather than
+  asserted from the log alone: `is_startup_barrier_response` requires an
+  *exact* match — `observation.status == 503 && observation.body ==
+  "Service is still starting up"` — and `with_startup_barrier_retry` only
+  retries when that predicate holds; any other outcome, `status: 0`
+  included, is returned immediately, unretried (`live_upgrade.rs:394`).
+  A `status: 0`/empty-body observation is the connection-level shape (no
+  HTTP response received at all), not an HTTP 503 response, so it fails
+  that predicate and mechanism 3's retry would not have touched it. Since
+  the failing run's own counter line (`refused=0
+  hard_failures_after_retry=0 mid_flight_resets_retried=0`, with no
+  `startup_barrier_hits` figure — that counter didn't exist yet in the
+  pre-fix test) shows none of the *named* failure modes fired either, this
+  signature is **not yet explained by any of the three mechanisms above**
+  and stays an open, unattributed data point. Whether PR #2645 happens to
+  fix it anyway (as a side effect of mechanism 1 or 2, which do run earlier
+  in the same request path) is untested — that is exactly the kind of claim
+  the CI-native rerun campaign below exists to settle, not something to
+  assert from a single log.
 
   The fix's own verification, per its commit message: `cargo llvm-cov
   --no-report -p hot-upgrade --test live_upgrade` (the exact build CI's
@@ -146,11 +166,16 @@ without also filling in the intake form above.
   would close it: (a) `manual-macos-contention-check.yml` — still
   undispatched, `total_count: 0` again as of this check, now ~43 hours
   idle since #2627 fixed it — actually run against a commit at or after
-  `8fae8af`, giving CI-native rerun evidence across both platforms in one
-  pass; or (b) enough organic post-fix PR traffic passing clean to
-  approximate the same bar. Zero organic hits in the small post-merge
-  window sampled here (one push-triggered run on `trunk-dev` at the fix
-  commit itself, success) — reassuring, but n=1, not evidence.
+  `8fae8af`. Note this only covers the macOS-observed cluster and
+  mechanisms 1/2 under ordinary load: its `test` job is `runs-on:
+  macos-latest` only, plain `cargo test --workspace`, no Linux leg, no
+  `cargo llvm-cov` instrumentation (checked against the workflow file
+  itself), so it cannot touch either Linux/`Coverage (workspace)`
+  signature — those need a still-unbuilt second harness; or (b) enough
+  organic post-fix PR traffic passing clean to approximate the same bar,
+  on whichever platform/job shape. Zero organic hits in the small
+  post-merge window sampled here (one push-triggered run on `trunk-dev` at
+  the fix commit itself, success) — reassuring, but n=1, not evidence.
 
 - **Observed**: 3/17 eligible `macos-latest` CI executions (14 confirmed, 3
   unresolved — see the 2026-09-04 census for the derivation), 0/16-17 on
