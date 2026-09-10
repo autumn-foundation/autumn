@@ -1,0 +1,5 @@
+error: `#[collaborative]` is only supported on non-null `String` fields
+ --> tests/compile-fail/model_collaborative_non_string.rs:4:24
+  |
+4 | struct Note { id: i32, #[collaborative] body: i32 }
+  |                        ^^^^^^^^^^^^^^^^^

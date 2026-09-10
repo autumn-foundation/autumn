@@ -25,6 +25,9 @@ default = ["db"]
 # time, yet a no-database app can reach neither macro — `autumn-web` already
 # gates both re-exports on its own `db` feature (issue #2309).
 db = []
+# Enables `#[collaborative]` model-field code generation. Kept separate so the
+# macro can emit an actionable diagnostic when the runtime feature is missing.
+collaboration = []
 
 [dependencies]
 syn.workspace = true

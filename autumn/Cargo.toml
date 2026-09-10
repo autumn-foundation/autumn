@@ -16,6 +16,9 @@ autotests = false
 default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
+# Collaborative plain-text fields: CRDT replay uses offline sync, accepted
+# operations use Channels, and cursors/selections use Presence.
+collaboration = ["offline-sync", "ws", "presence", "autumn-macros/collaboration"]
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]

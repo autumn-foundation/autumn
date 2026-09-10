@@ -122,6 +122,18 @@ pub struct PushRequest {
     pub changes: Vec<Change>,
 }
 
+/// Offline replay envelope for collaborative fields. Unlike [`Change`], these
+/// operations are never resolved as row replacements by `LwwResolver`; callers
+/// submit them to [`crate::collaboration::CollaborationSession`].
+#[cfg(feature = "collaboration")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborativePushRequest {
+    pub version: u16,
+    pub topic: crate::collaboration::CollaborativeTopic,
+    pub actor: crate::collaboration::ActorId,
+    pub operations: Vec<crate::collaboration::TextOperation>,
+}
+
 /// A server-side row (or tombstone) as returned by pull and conflict
 /// resolutions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

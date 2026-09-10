@@ -20,6 +20,19 @@ Supported examples participate in normal workspace validation, have a documented
 journey, and each carries a README quickstart. A failure in any supported example
 blocks publishing `autumn-web` or `autumn-cli`.
 
+### `examples/collaborative-notes` — Offline Collaborative Text
+
+<!-- catalog:example name=collaborative-notes tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer adding multi-user plain-text editing |
+| **Journey** | Apply concurrent stable-ID operations and materialize a convergent note |
+| **Key capabilities** | `collaboration`, text CRDT, deterministic concurrent insertion |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p collaborative-notes` |
+| **Success proof** | Prints `Collaborative note: AB` |
+
 ---
 
 ### `examples/hello` — First Route

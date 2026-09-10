@@ -4494,6 +4494,7 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // the behaviour lives in the field's `Translated` type, so the
                 // attribute itself must never reach the Diesel derives.
                 && !a.path().is_ident("translatable")
+                && !a.path().is_ident("collaborative")
         })
         .collect()
 }
@@ -6871,6 +6872,50 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Classify fields
     let all_fields: Vec<&Field> = fields.named.iter().collect();
+
+    // Collaborative text is deliberately narrow in v1: plain, non-null UTF-8
+    // strings only. Consuming the marker here also prevents it reaching Diesel.
+    let mut collaborative_columns = Vec::new();
+    for field in &all_fields {
+        let markers: Vec<_> = field
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("collaborative"))
+            .collect();
+        if markers.len() > 1 {
+            return syn::Error::new_spanned(markers[1], "duplicate `#[collaborative]` annotation")
+                .to_compile_error();
+        }
+        if let Some(marker) = markers.first() {
+            if !cfg!(feature = "collaboration") {
+                return syn::Error::new_spanned(
+                    marker,
+                    "`#[collaborative]` requires the `autumn-web/collaboration` feature",
+                )
+                .to_compile_error();
+            }
+            if !matches!(&field.ty, syn::Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "String"))
+            {
+                return syn::Error::new_spanned(
+                    marker,
+                    "`#[collaborative]` is only supported on non-null `String` fields",
+                )
+                .to_compile_error();
+            }
+            if !matches!(marker.meta, syn::Meta::Path(_)) {
+                return syn::Error::new_spanned(marker, "`#[collaborative]` takes no arguments")
+                    .to_compile_error();
+            }
+            if let Some(ident) = &field.ident {
+                collaborative_columns.push(unraw_ident(ident));
+            }
+        }
+    }
+    let collaborative_impl = (!collaborative_columns.is_empty()).then(|| quote! {
+        impl ::autumn_web::collaboration::CollaborativeField for #name {
+            const COLLABORATIVE_FIELDS: &'static [&'static str] = Self::__AUTUMN_COLLABORATIVE_FIELDS;
+        }
+    });
 
     // Validate the declarative-schema field markers (#1975) before any codegen,
     // so a malformed `#[unique]` / `#[references(...)]` yields a single clean
@@ -9826,6 +9871,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub const __AUTUMN_CLASSIFIED_COLUMNS: &'static [&'static str] =
                 &[#(#classified_column_names),*];
 
+            /// Fields whose updates bypass row-level LWW and use text CRDT operations.
+            pub const __AUTUMN_COLLABORATIVE_FIELDS: &'static [&'static str] =
+                &[#(#collaborative_columns),*];
+
             /// Column names on this model declared `#[translatable]` (#1384).
             ///
             /// Emitted for every model (empty when none are translatable) so
@@ -9835,6 +9884,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub const __AUTUMN_TRANSLATABLE_COLUMNS: &'static [&'static str] =
                 &[#(#translatable_column_names),*];
         }
+
+        #collaborative_impl
 
         #(#encrypted_inventory)*
 
