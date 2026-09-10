@@ -23,10 +23,19 @@
 //! redelivery is applied again; every step is idempotent.
 
 use autumn_web::AppState;
+use chrono::{DateTime, Utc};
 
-use crate::BillingService;
+use crate::dunning::{self, DunningRetryArgs, DunningRetryJob};
 use crate::error::BillingError;
-use crate::event::BillingEvent;
+use crate::event::{
+    BillingEvent, BillingEventKind, CheckoutSnapshot, InvoiceSnapshot, SubscriptionSnapshot,
+};
+use crate::model::{Customer, DunningAttempt, DunningState, Invoice, SubscriptionStatus};
+use crate::notify;
+use crate::store::{
+    CustomerUpsert, EventClaim, InvoiceUpsert, SubscriptionUpsert, Write as StoreWrite,
+};
+use crate::{BillingService, EVENT_CLAIM_STALE_AFTER};
 
 /// What `apply` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +65,349 @@ pub async fn apply(
     service: &BillingService,
     event: BillingEvent,
 ) -> Result<ReconcileOutcome, BillingError> {
-    let _ = (state, service, event);
-    Err(BillingError::Unsupported("reconcile"))
+    let now = state.clock().now();
+    let store = service.store();
+    let kind = event.kind.label();
+    let claim = store
+        .claim_event(&event.id, kind, now, EVENT_CLAIM_STALE_AFTER)
+        .await?;
+    if claim == EventClaim::Duplicate {
+        tracing::debug!(event_id = %event.id, kind, "🍂 Autumn Billing: duplicate event");
+        return Ok(ReconcileOutcome::Duplicate);
+    }
+    let event_id = event.id.clone();
+    let ctx = Ctx {
+        state,
+        service,
+        now,
+    };
+    match ctx.apply_claimed(event).await {
+        Ok(outcome) => {
+            store.finish_event(&event_id, now).await?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            tracing::warn!(
+                event_id = %event_id,
+                kind,
+                error = %error,
+                "🍂 Autumn Billing: event not applied; claim released for redelivery"
+            );
+            if let Err(release) = store.release_event(&event_id).await {
+                tracing::error!(
+                    event_id = %event_id,
+                    error = %release,
+                    "🍂 Autumn Billing: could not release the event claim"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// One claimed event in flight.
+struct Ctx<'a> {
+    state: &'a AppState,
+    service: &'a BillingService,
+    now: DateTime<Utc>,
+}
+
+impl Ctx<'_> {
+    fn new_id(&self) -> String {
+        self.state.entropy().uuid_v4().to_string()
+    }
+
+    async fn apply_claimed(&self, event: BillingEvent) -> Result<ReconcileOutcome, BillingError> {
+        let kind = event.kind.label();
+        let occurred_at = event.occurred_at;
+        match event.kind {
+            BillingEventKind::Ignored { event_type } => {
+                return Ok(ReconcileOutcome::Ignored { event_type });
+            }
+            BillingEventKind::CheckoutCompleted(snapshot) => self.checkout(&snapshot).await?,
+            BillingEventKind::SubscriptionChanged(snapshot) => {
+                self.subscription(&snapshot, snapshot.status, occurred_at)
+                    .await?;
+            }
+            BillingEventKind::SubscriptionDeleted(snapshot) => {
+                self.subscription(&snapshot, SubscriptionStatus::Canceled, occurred_at)
+                    .await?;
+            }
+            BillingEventKind::InvoicePaymentFailed(snapshot) => {
+                self.payment_failed(&snapshot, occurred_at).await?;
+            }
+            BillingEventKind::InvoicePaid(snapshot) => self.paid(&snapshot, occurred_at).await?,
+        }
+        Ok(ReconcileOutcome::Applied { kind })
+    }
+
+    /// The customer for a provider id: found, or created without a user link.
+    /// `email` replaces the stored email when `Some`.
+    async fn customer(
+        &self,
+        provider_customer_id: &crate::model::ProviderId,
+        email: Option<&str>,
+    ) -> Result<Customer, BillingError> {
+        let mut upsert = CustomerUpsert::new(
+            self.new_id(),
+            self.service.provider().name(),
+            provider_customer_id.clone(),
+            self.now,
+        );
+        if let Some(email) = email {
+            upsert = upsert.with_email(email);
+        }
+        self.service.store().upsert_customer(upsert).await
+    }
+
+    /// A completed checkout refreshes the customer email. The user link was
+    /// made by the checkout route before the redirect; the event never links
+    /// a user, and never by email.
+    async fn checkout(&self, snapshot: &CheckoutSnapshot) -> Result<(), BillingError> {
+        let store = self.service.store();
+        let own_row = match snapshot.local_customer_ref.as_deref() {
+            Some(local_id) => store
+                .customer_by_id(local_id)
+                .await?
+                .filter(|row| row.provider_customer_id == snapshot.provider_customer_id),
+            None => None,
+        };
+        match (&own_row, &snapshot.local_customer_ref) {
+            (Some(row), _) => tracing::debug!(
+                customer_id = %row.id,
+                linked = row.user_id.is_some(),
+                "🍂 Autumn Billing: checkout completed for a known customer"
+            ),
+            (None, Some(reference)) => tracing::warn!(
+                reference,
+                provider_customer_id = %snapshot.provider_customer_id,
+                "🍂 Autumn Billing: checkout reference does not match a local customer; not linked"
+            ),
+            (None, None) => {}
+        }
+        self.customer(&snapshot.provider_customer_id, snapshot.email.as_deref())
+            .await?;
+        Ok(())
+    }
+
+    async fn subscription(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        status: SubscriptionStatus,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(), BillingError> {
+        let store = self.service.store();
+        let customer = self.customer(&snapshot.provider_customer_id, None).await?;
+        let previous = store
+            .subscription_by_provider_id(&snapshot.provider_subscription_id)
+            .await?;
+        let mut upsert = SubscriptionUpsert::new(
+            self.new_id(),
+            customer.id.clone(),
+            snapshot.provider_subscription_id.clone(),
+            status,
+            occurred_at,
+            self.now,
+        )
+        .with_quantity(snapshot.quantity)
+        .with_cancel_at_period_end(snapshot.cancel_at_period_end);
+        if let Some(price_id) = &snapshot.provider_price_id {
+            upsert = upsert.with_price(price_id.clone());
+            if let Some(plan) = self.service.catalog().by_price_id(price_id) {
+                upsert = upsert.with_plan(plan.id.clone());
+            } else {
+                tracing::warn!(
+                    price_id = %price_id,
+                    "🍂 Autumn Billing: provider price is not in the plan catalog"
+                );
+            }
+        }
+        if let Some(end) = snapshot.current_period_end {
+            upsert = upsert.with_period_end(end);
+        }
+        let StoreWrite::Applied(subscription) = store.upsert_subscription(upsert).await? else {
+            tracing::debug!(
+                provider_subscription_id = %snapshot.provider_subscription_id,
+                "🍂 Autumn Billing: stale subscription event; mirror unchanged"
+            );
+            return Ok(());
+        };
+        if subscription.status == SubscriptionStatus::Canceled {
+            self.close_dunning_for(&subscription.id).await?;
+            notify::send_to_customer(
+                self.state,
+                self.service,
+                &customer,
+                notify::KIND_SUBSCRIPTION_CANCELED,
+                notify::subscription_canceled_payload(&subscription),
+            )
+            .await;
+        }
+        self.service
+            .hooks()
+            .on_subscription_changed(&subscription, previous.as_ref())
+            .await;
+        Ok(())
+    }
+
+    /// Cancel every open dunning row of `subscription_id`.
+    async fn close_dunning_for(&self, subscription_id: &str) -> Result<(), BillingError> {
+        let store = self.service.store();
+        for mut row in store.open_dunning().await? {
+            if row.subscription_id.as_deref() != Some(subscription_id) {
+                continue;
+            }
+            row.state = DunningState::Canceled;
+            row.updated_at = self.now;
+            store.upsert_dunning(row).await?;
+        }
+        Ok(())
+    }
+
+    /// Guarded invoice upsert from a snapshot.
+    async fn upsert_invoice(
+        &self,
+        snapshot: &InvoiceSnapshot,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(Customer, StoreWrite<Invoice>), BillingError> {
+        let store = self.service.store();
+        let customer = self.customer(&snapshot.provider_customer_id, None).await?;
+        let subscription = match &snapshot.provider_subscription_id {
+            Some(id) => store.subscription_by_provider_id(id).await?,
+            None => None,
+        };
+        let mut upsert = InvoiceUpsert::new(
+            self.new_id(),
+            customer.id.clone(),
+            snapshot.provider_invoice_id.clone(),
+            snapshot.status,
+            snapshot.amount_due,
+            snapshot.amount_paid,
+            occurred_at,
+            self.now,
+        )
+        .with_attempt_count(snapshot.attempt_count);
+        if let Some(subscription) = subscription {
+            upsert = upsert.with_subscription(subscription.id);
+        }
+        if let Some(next) = snapshot.next_payment_attempt {
+            upsert = upsert.with_next_payment_attempt(next);
+        }
+        let write = store.upsert_invoice(upsert).await?;
+        Ok((customer, write))
+    }
+
+    async fn payment_failed(
+        &self,
+        snapshot: &InvoiceSnapshot,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(), BillingError> {
+        let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
+        let StoreWrite::Applied(invoice) = write else {
+            tracing::debug!(
+                provider_invoice_id = %snapshot.provider_invoice_id,
+                "🍂 Autumn Billing: stale payment_failed event; mirror unchanged"
+            );
+            return Ok(());
+        };
+        let policy = &self.service.config().dunning;
+        let row = if policy.enabled {
+            self.open_dunning(&invoice).await?
+        } else {
+            None
+        };
+        notify::send_to_customer(
+            self.state,
+            self.service,
+            &customer,
+            notify::KIND_PAYMENT_FAILED,
+            notify::payment_failed_payload(&invoice, row.as_ref().map(|r| r.attempt), None),
+        )
+        .await;
+        if let Some(row) = &row {
+            self.service.hooks().on_payment_failed(&invoice, row).await;
+        }
+        Ok(())
+    }
+
+    /// The open schedule row for `invoice`: kept when one is in progress,
+    /// else a new first attempt.
+    async fn open_dunning(&self, invoice: &Invoice) -> Result<Option<DunningAttempt>, BillingError> {
+        let store = self.service.store();
+        if let Some(row) = store.dunning_by_invoice(&invoice.id).await?
+            && matches!(row.state, DunningState::Pending | DunningState::Running)
+        {
+            tracing::debug!(
+                invoice_id = %invoice.id,
+                attempt = row.attempt,
+                "🍂 Autumn Billing: dunning already open; schedule kept"
+            );
+            return Ok(Some(row));
+        }
+        let Some(delay) = self.service.config().dunning.delay_for(1) else {
+            tracing::debug!(
+                invoice_id = %invoice.id,
+                "🍂 Autumn Billing: no retry delays configured; dunning not opened"
+            );
+            return Ok(None);
+        };
+        let due = dunning::due_at(self.now, delay)?;
+        let mut row = DunningAttempt::new(
+            invoice.id.clone(),
+            invoice.customer_id.clone(),
+            1,
+            due,
+            DunningState::Pending,
+            self.now,
+        );
+        if let Some(subscription_id) = &invoice.subscription_id {
+            row = row.with_subscription(subscription_id.clone());
+        }
+        store.upsert_dunning(row.clone()).await?;
+        DunningRetryJob::enqueue_at(
+            DunningRetryArgs {
+                invoice_id: invoice.id.clone(),
+            },
+            due,
+        )
+        .await
+        .map_err(|error| BillingError::store(format!("enqueue dunning retry: {error}")))?;
+        tracing::info!(
+            invoice_id = %invoice.id,
+            due = %due,
+            "🍂 Autumn Billing: dunning opened"
+        );
+        Ok(Some(row))
+    }
+
+    async fn paid(
+        &self,
+        snapshot: &InvoiceSnapshot,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(), BillingError> {
+        let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
+        let StoreWrite::Applied(invoice) = write else {
+            return Ok(());
+        };
+        let store = self.service.store();
+        let Some(mut row) = store.dunning_by_invoice(&invoice.id).await? else {
+            return Ok(());
+        };
+        if !matches!(row.state, DunningState::Pending | DunningState::Running) {
+            return Ok(());
+        }
+        row.state = DunningState::Recovered;
+        row.updated_at = self.now;
+        store.upsert_dunning(row).await?;
+        notify::send_to_customer(
+            self.state,
+            self.service,
+            &customer,
+            notify::KIND_PAYMENT_RECOVERED,
+            notify::payment_recovered_payload(&invoice),
+        )
+        .await;
+        self.service.hooks().on_payment_recovered(&invoice).await;
+        Ok(())
+    }
 }

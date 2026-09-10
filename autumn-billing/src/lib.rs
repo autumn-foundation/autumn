@@ -344,14 +344,16 @@ impl Plugin for BillingPlugin {
                 let provider = Self::resolve_provider(&state, &config, provider)?;
                 let store = Self::resolve_store(&state, store);
                 verify_webhook_endpoint(&state, &config)?;
-                let service = Arc::new(BillingService {
+                // `insert_extension` wraps the value in its own `Arc`, keyed
+                // by `BillingService`; read that handle back for the re-arm.
+                state.insert_extension(BillingService {
                     provider,
                     store,
                     catalog: Arc::new(catalog),
                     config: Arc::new(config),
                     hooks,
                 });
-                state.insert_extension(Arc::clone(&service));
+                let service = BillingService::require(&state)?;
                 dunning::rearm_pending(state.clone(), service);
                 Ok(())
             }

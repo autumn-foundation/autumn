@@ -20,7 +20,7 @@ const T3D: i64 = 1_789_257_600;
 /// Period end of the test subscription: 2026-10-10T00:00:00Z.
 const PERIOD_END: i64 = 1_791_590_400;
 
-fn at(unix: i64) -> DateTime<Utc> {
+const fn at(unix: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(unix, 0).unwrap()
 }
 
@@ -36,7 +36,7 @@ fn fixture_json(name: &str) -> Value {
     serde_json::from_slice(&fixture(name)).unwrap()
 }
 
-fn usd(minor: i64) -> Money {
+const fn usd(minor: i64) -> Money {
     Money::from_minor(minor, Currency::USD)
 }
 

@@ -196,7 +196,7 @@ fn position(error: &serde_json::Error) -> String {
     format!("line {}, column {}", error.line(), error.column())
 }
 
-fn unix(secs: i64) -> Option<DateTime<Utc>> {
+const fn unix(secs: i64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(secs, 0)
 }
 

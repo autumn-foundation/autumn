@@ -56,6 +56,10 @@ impl StripeProvider {
     /// # Errors
     ///
     /// Returns [`BillingError::Config`] when the secret key is missing.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "public signature; `with_base_url` borrows and returns a fresh client"
+    )]
     pub fn new(
         config: StripeConfig,
         client: autumn_web::http::Client,
