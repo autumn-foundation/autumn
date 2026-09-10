@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `saas` and `cms` gates. No behavior change for `saas`.
 ### Fixed
 
+- **`#[model]`:** no longer emits an empty-bodied `impl Normalize` for a
+  `New*` whose model declares no `#[normalize]` columns (issue #2634). The
+  repository probe's `Yes` arm used to win unconditionally, so `save`,
+  `save_many`, `save_many_skip_invalid` and `find_or_create_by_*` cloned
+  their payload — a full `Vec` copy of a bulk batch — to run a guaranteed
+  no-op normalization. The no-clone fallback arm now wins for unnormalized
+  models. The read-model `Normalize` impl and `NormalizedModel` are unchanged.
+
 - **web:** the `application/problem+json` `errors` array no longer includes a
   field whose validation entry carries zero messages — it now matches
   `AutumnError`'s `Display`, which already skipped such a field (issue
