@@ -4,7 +4,7 @@
 //! Two implementations: [`MemoryBillingStore`] (tests, DB-less apps) and
 //! [`DbBillingStore`] (Postgres / `SQLite` through `RuntimeConnection`).
 //! The ordering guard for upserts lives in the store: an upsert applies only
-//! when [`should_apply`] says so.
+//! when `should_apply` says so.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -69,7 +69,7 @@ impl<T> Write<T> {
 /// Apply when the incoming event is newer, or is at the same instant and its
 /// status ranks higher. Never leave a terminal status.
 #[must_use]
-pub fn should_apply(
+pub(crate) fn should_apply(
     existing_at: DateTime<Utc>,
     existing_rank: u8,
     existing_terminal: bool,

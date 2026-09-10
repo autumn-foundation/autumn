@@ -87,8 +87,8 @@ pub enum ExhaustionAction {
 pub struct DunningPolicy {
     /// `false` mirrors provider events and notifies, but never retries.
     pub enabled: bool,
-    /// Delay before retry `n` counted from the failure (`n = 1`) or from the
-    /// previous retry. Length = number of retries.
+    /// Delay before retry `n`. Retry 1 counts from the failure. Later
+    /// retries count from the previous retry. Length = number of retries.
     pub retry_delays: Vec<Duration>,
     /// Action after the last retry fails.
     pub on_exhausted: ExhaustionAction,

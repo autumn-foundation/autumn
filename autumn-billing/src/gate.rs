@@ -102,6 +102,16 @@ pub struct SubscriptionView {
 }
 
 impl SubscriptionView {
+    /// Build a view. `entitled` is the caller's decision.
+    #[must_use]
+    pub const fn new(subscription: Subscription, plan: Option<Plan>, entitled: bool) -> Self {
+        Self {
+            subscription,
+            plan,
+            entitled,
+        }
+    }
+
     /// `true` when the view is entitled and its plan satisfies `rule`.
     fn satisfies(&self, rule: &PlanRule) -> bool {
         self.entitled && self.plan.as_ref().is_some_and(|plan| rule.accepts(plan))
@@ -141,6 +151,16 @@ impl Billing {
     #[must_use]
     pub const fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// The logged-in user id in `session`, read with the configured auth
+    /// session key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError::Unauthenticated`] when no user is logged in.
+    pub async fn current_user(&self, session: &Session) -> Result<String, BillingError> {
+        user_id_in(session, &self.state).await
     }
 
     /// The user's current subscription from the mirror. No provider call.
@@ -201,11 +221,7 @@ impl Billing {
         let plan = resolve_plan(self.service.catalog(), &subscription).cloned();
         let entitled =
             plan.is_some() && self.status_ok(subscription.status) && self.in_period(&subscription);
-        SubscriptionView {
-            subscription,
-            plan,
-            entitled,
-        }
+        SubscriptionView::new(subscription, plan, entitled)
     }
 
     fn status_ok(&self, status: SubscriptionStatus) -> bool {
@@ -302,6 +318,11 @@ pub async fn session_user_id(
         Ok(session) => session,
         Err(never) => match never {},
     };
+    user_id_in(&session, state).await
+}
+
+/// The non-empty user id stored under the configured auth session key.
+async fn user_id_in(session: &Session, state: &AppState) -> Result<String, BillingError> {
     session
         .get(state.auth_session_key())
         .await

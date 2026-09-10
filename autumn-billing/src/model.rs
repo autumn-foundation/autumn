@@ -212,6 +212,41 @@ pub struct Customer {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Customer {
+    /// Build a row with no user link and no email. `now` is the app clock.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        provider: impl Into<String>,
+        provider_customer_id: impl Into<ProviderId>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            user_id: None,
+            provider: provider.into(),
+            provider_customer_id: provider_customer_id.into(),
+            email: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Link the application user.
+    #[must_use]
+    pub fn with_user(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = Some(user_id.into());
+        self
+    }
+
+    /// Set the email.
+    #[must_use]
+    pub fn with_email(mut self, email: impl Into<String>) -> Self {
+        self.email = Some(email.into());
+        self
+    }
+}
+
 /// A mirrored subscription.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -242,6 +277,70 @@ pub struct Subscription {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Subscription {
+    /// Build a row with quantity 1, no price, no plan and no period end.
+    /// `now` is the app clock.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        customer_id: impl Into<String>,
+        provider_subscription_id: impl Into<ProviderId>,
+        status: SubscriptionStatus,
+        last_event_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            customer_id: customer_id.into(),
+            provider_subscription_id: provider_subscription_id.into(),
+            provider_price_id: None,
+            plan_id: None,
+            status,
+            quantity: 1,
+            current_period_end: None,
+            cancel_at_period_end: false,
+            last_event_at,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Set the provider price id.
+    #[must_use]
+    pub fn with_price(mut self, price_id: impl Into<ProviderId>) -> Self {
+        self.provider_price_id = Some(price_id.into());
+        self
+    }
+
+    /// Set the catalog plan.
+    #[must_use]
+    pub fn with_plan(mut self, plan_id: impl Into<PlanId>) -> Self {
+        self.plan_id = Some(plan_id.into());
+        self
+    }
+
+    /// Set the seat quantity.
+    #[must_use]
+    pub const fn with_quantity(mut self, quantity: i64) -> Self {
+        self.quantity = quantity;
+        self
+    }
+
+    /// Set the period end.
+    #[must_use]
+    pub const fn with_period_end(mut self, end: DateTime<Utc>) -> Self {
+        self.current_period_end = Some(end);
+        self
+    }
+
+    /// Set `cancel_at_period_end`.
+    #[must_use]
+    pub const fn with_cancel_at_period_end(mut self, cancel: bool) -> Self {
+        self.cancel_at_period_end = cancel;
+        self
+    }
+}
+
 /// A mirrored invoice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -270,6 +369,62 @@ pub struct Invoice {
     pub created_at: DateTime<Utc>,
     /// Last update time (app clock).
     pub updated_at: DateTime<Utc>,
+}
+
+impl Invoice {
+    /// Build a row with no subscription link and no provider attempts.
+    /// `now` is the app clock.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every argument is a required column; the optional ones use `with_*`"
+    )]
+    pub fn new(
+        id: impl Into<String>,
+        customer_id: impl Into<String>,
+        provider_invoice_id: impl Into<ProviderId>,
+        status: InvoiceStatus,
+        amount_due: Money,
+        amount_paid: Money,
+        last_event_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            customer_id: customer_id.into(),
+            subscription_id: None,
+            provider_invoice_id: provider_invoice_id.into(),
+            status,
+            amount_due,
+            amount_paid,
+            attempt_count: 0,
+            next_payment_attempt: None,
+            last_event_at,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Link the local subscription.
+    #[must_use]
+    pub fn with_subscription(mut self, subscription_id: impl Into<String>) -> Self {
+        self.subscription_id = Some(subscription_id.into());
+        self
+    }
+
+    /// Set the provider attempt count.
+    #[must_use]
+    pub const fn with_attempt_count(mut self, count: i64) -> Self {
+        self.attempt_count = count;
+        self
+    }
+
+    /// Set the provider's next attempt time.
+    #[must_use]
+    pub const fn with_next_payment_attempt(mut self, at: DateTime<Utc>) -> Self {
+        self.next_payment_attempt = Some(at);
+        self
+    }
 }
 
 /// State of a dunning schedule row.

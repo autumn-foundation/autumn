@@ -40,6 +40,9 @@ impl std::fmt::Debug for StripeProvider {
 }
 
 impl StripeProvider {
+    /// Provider name, as returned by [`BillingProvider::name`].
+    pub const NAME: &'static str = PROVIDER_NAME;
+
     /// Build from app state (shared HTTP client, mocks in tests).
     ///
     /// # Errors
@@ -78,7 +81,8 @@ impl StripeProvider {
         Ok(Self { config, client })
     }
 
-    /// Decode a raw Stripe event body. Public for fixture tests.
+    /// Decode a raw Stripe event body. Exposed for fixture tests; application
+    /// code uses [`BillingProvider::parse_event`].
     ///
     /// Known event types map to their [`crate::event::BillingEventKind`]; any
     /// other type decodes to `Ignored`. Both the current and the previous
@@ -89,6 +93,7 @@ impl StripeProvider {
     /// Returns [`BillingError::Malformed`] for a body that is not an event
     /// envelope, or for a known type whose object cannot be decoded. The
     /// message never contains the body.
+    #[doc(hidden)]
     pub fn parse_event_body(raw: &[u8]) -> Result<BillingEvent, BillingError> {
         events::parse(raw)
     }

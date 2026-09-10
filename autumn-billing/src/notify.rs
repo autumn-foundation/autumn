@@ -23,7 +23,7 @@ pub const KIND_SUBSCRIPTION_CANCELED: &str = "billing.subscription_canceled";
 
 /// Send an in-app notification to `recipient`. Never fails the caller: a
 /// store error is logged.
-pub async fn send(state: &AppState, recipient: i64, kind: &str, payload: Value) {
+pub(crate) async fn send(state: &AppState, recipient: i64, kind: &str, payload: Value) {
     let notifications = state.extension_or_insert_with::<Notifications>(|| default_for(state));
     if let Err(error) = notifications.notify(recipient, kind, payload).await {
         tracing::warn!(

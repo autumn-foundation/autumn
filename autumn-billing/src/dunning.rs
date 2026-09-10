@@ -355,7 +355,7 @@ async fn declined(
 
 /// Re-enqueue every open schedule row at its due time. Waits for the job
 /// runtime (the test harness starts it after startup hooks).
-pub fn rearm_pending(state: AppState, service: Arc<BillingService>) {
+pub(crate) fn rearm_pending(state: AppState, service: Arc<BillingService>) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("🍂 Autumn Billing: no async runtime; dunning rows not re-armed");
         return;

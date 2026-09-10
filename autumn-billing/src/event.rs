@@ -11,6 +11,7 @@ use crate::money::Money;
 
 /// One normalized provider event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct BillingEvent {
     /// Provider event id. The idempotency key of the ledger.
     pub id: String,
@@ -18,6 +19,18 @@ pub struct BillingEvent {
     pub occurred_at: DateTime<Utc>,
     /// What happened.
     pub kind: BillingEventKind,
+}
+
+impl BillingEvent {
+    /// Build an event.
+    #[must_use]
+    pub fn new(id: impl Into<String>, occurred_at: DateTime<Utc>, kind: BillingEventKind) -> Self {
+        Self {
+            id: id.into(),
+            occurred_at,
+            kind,
+        }
+    }
 }
 
 /// The payload of a [`BillingEvent`].

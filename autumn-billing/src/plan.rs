@@ -65,7 +65,7 @@ pub struct Plan {
     pub id: PlanId,
     /// Display name.
     pub name: String,
-    /// Provider price id (Stripe `price_...`).
+    /// Provider price id (for example Stripe `price_…`).
     pub provider_price_id: ProviderId,
     /// Recurring price.
     pub price: Money,

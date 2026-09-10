@@ -71,7 +71,7 @@ impl CustomerRequest {
 pub struct CheckoutRequest {
     /// Provider customer id.
     pub provider_customer_id: ProviderId,
-    /// Local customer id. Sent as `client_reference_id`.
+    /// Local customer id. Sent to the provider as the checkout reference.
     pub local_customer_id: String,
     /// Provider price id to subscribe to.
     pub provider_price_id: ProviderId,
@@ -148,7 +148,7 @@ pub enum PaymentAttemptOutcome {
     AlreadyPaid,
 }
 
-/// A billing provider (Stripe, later Paddle or Lemon Squeezy).
+/// A billing provider.
 ///
 /// Object safe. New capabilities land as defaulted methods.
 pub trait BillingProvider: Send + Sync + 'static {

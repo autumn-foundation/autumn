@@ -433,3 +433,44 @@ fn route_infos_match_the_mounted_paths() {
     let prefixed = route_infos(&support::config().route_prefix("/pay/"));
     assert_eq!(prefixed[3].path, "/pay/webhook");
 }
+
+#[tokio::test]
+async fn boot_fails_when_declared_endpoint_preset_differs_from_provider() {
+    let billing = support::config();
+    let mut autumn = support::autumn_config(&billing);
+    let endpoint = autumn
+        .security
+        .webhooks
+        .endpoints
+        .first_mut()
+        .expect("declared endpoint");
+    endpoint.provider = autumn_web::webhook::WebhookProvider::Github;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        support::harness_with(
+            billing,
+            autumn,
+            MemoryBillingStore::shared(),
+            FakeProvider::new(),
+            pinned,
+        )
+    }));
+    let payload = result.err().expect("boot fails on a preset mismatch");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        });
+    // The payload carries the error's `Debug` form, so quotes are escaped.
+    assert!(
+        message.contains("declares provider = ") && message.contains("github"),
+        "{message}"
+    );
+    assert!(
+        message.contains("needs provider = ") && message.contains("stripe"),
+        "{message}"
+    );
+}

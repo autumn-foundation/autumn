@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local state, default-deny. Failed payments open a durable dunning schedule
   (`billing_dunning`) driven by a `#[job]`; the schedule row is the source of
   truth, so the job survives a restart and re-arms on startup, and every step
-  notifies through the in-app notification store (#1148). Money is
-  `Money { minor: i64, currency }` with an exact `Decimal` bridge; no floats.
+  notifies through the in-app notification store (#1148). `Money` holds
+  `i64` minor units and a `Currency`; read them with `minor()` and
+  `currency()`. An exact `Decimal` bridge; no floats.
   The `BillingProvider` trait hides Stripe types so a second provider can
   land without a breaking change.
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /

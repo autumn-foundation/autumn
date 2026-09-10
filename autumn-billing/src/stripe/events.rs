@@ -157,11 +157,7 @@ pub(super) fn parse(raw: &[u8]) -> Result<BillingEvent, BillingError> {
             event_type: envelope.event_type.clone(),
         },
     };
-    Ok(BillingEvent {
-        id: envelope.id,
-        occurred_at,
-        kind,
-    })
+    Ok(BillingEvent::new(envelope.id, occurred_at, kind))
 }
 
 /// Event id and type, for error messages. Never the body.

@@ -1,6 +1,6 @@
 # Billing: Stripe subscriptions and dunning (`autumn-billing`)
 
-`autumn-billing` turns an Autumn app into a business: hosted checkout, the
+`autumn-billing` adds subscription billing to an Autumn app: hosted checkout, the
 customer portal, a webhook-fed local mirror of billing state, a plan gate for
 handlers, and durable retries for failed payments. Stripe ships first behind a
 provider-neutral `BillingProvider` trait.
@@ -82,7 +82,7 @@ The plugin registers its migration through `plugin_migrations`; the next
 
 | Method | Path                    | Purpose                                                  |
 |--------|-------------------------|----------------------------------------------------------|
-| POST   | `/billing/checkout`     | `{ "plan": "pro" }` → 303 to hosted checkout (JSON: `{url}`) |
+| POST   | `/billing/checkout`     | `{ "plan": "pro" }` → 303 to hosted checkout (JSON: `{ "url", "id" }`); 404 unknown plan |
 | POST   | `/billing/portal`       | 303 to the hosted billing portal                         |
 | GET    | `/billing/subscription` | Current subscription + plan from the local mirror        |
 | POST   | `/billing/webhook`      | Signed provider webhook receiver                         |
@@ -111,11 +111,14 @@ service form:
 
 ```rust,ignore
 async fn export(billing: Billing, session: Session) -> AutumnResult<&'static str> {
-    let user = session.get("user_id").await.ok_or_else(|| AutumnError::unauthorized_msg("login"))?;
+    let user = billing.current_user(&session).await.map_err(BillingError::into_autumn)?;
     billing.require(&user, &PlanRule::entitlement("export")).await.map_err(BillingError::into_autumn)?;
     Ok("csv")
 }
 ```
+
+`Billing::current_user` reads the user id with the app's configured auth
+session key and answers 401 when nobody is logged in.
 
 Entitled means: status `active` or `trialing` (`past_due` only with
 `allow_past_due`), the price maps to a catalog plan, and
@@ -149,18 +152,32 @@ stable idempotency key:
 - transport error → the job returns an error and the runtime retries with
   backoff; the schedule does not advance
 
-Defaults: retries after 1, 3 and 5 days. Stripe's own Smart Retries would run
-in parallel; turn them off in the Stripe dashboard, or keep them and mount
-`DunningPolicy::disabled()` so the plugin only mirrors and notifies.
+Defaults: three retries. The first retry runs 1 day after the failure, the
+second 3 days after that, the third 5 days after that (days 1, 4 and 9).
+Stripe's own Smart Retries would run in parallel; turn them off in the Stripe
+dashboard, or keep them and mount `DunningPolicy::disabled()` so the plugin
+only mirrors and notifies.
 
-Notifications go to the in-app notification store for the customer's user id.
-Map a non-numeric user id with `BillingHooks::recipient_for`.
+Notifications go to the in-app notification store. The recipient is
+`BillingHooks::recipient_for(user_id)` for the customer's linked user; the
+default parses a numeric id. Returning `None` suppresses the notification.
+
+| Kind                            | Payload fields                                                                                      |
+|---------------------------------|-----------------------------------------------------------------------------------------------------|
+| `billing.payment_failed`        | `invoice_id`, `provider_invoice_id`, `subscription_id`, `amount_due`, `attempt`, `provider_attempt_count`, `reason` |
+| `billing.payment_recovered`     | `invoice_id`, `provider_invoice_id`, `subscription_id`, `amount_paid`                               |
+| `billing.dunning_exhausted`     | `invoice_id`, `provider_invoice_id`, `subscription_id`, `amount_due`, `attempts`, `action`          |
+| `billing.subscription_canceled` | `subscription_id`, `provider_subscription_id`, `plan_id`                                            |
+
+`attempt` is the number of the retry the plugin scheduled (`null` when dunning
+is disabled). `reason` is the provider decline reason, when known.
 
 ## 7. Money
 
-`Money { minor: i64, currency: Currency }`. Amounts are integer minor units;
-`Money::from_decimal` and `to_decimal` bridge to `rust_decimal::Decimal`
-exactly. The crate contains no `f32` or `f64` (a test enforces it).
+`Money` holds `i64` minor units and a `Currency`; read them with `minor()` and
+`currency()`. Amounts are integer minor units; `Money::from_decimal` and
+`to_decimal` bridge to `rust_decimal::Decimal` exactly. The crate contains no
+`f32` or `f64` (a test enforces it).
 
 ## 8. Testing
 

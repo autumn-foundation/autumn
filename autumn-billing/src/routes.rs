@@ -58,10 +58,9 @@ use crate::provider::{CheckoutRequest, CustomerRequest, HostedSession, PortalReq
 use crate::reconcile::{self, ReconcileOutcome};
 use crate::store::CustomerUpsert;
 
-/// The plugin router (paths relative to the prefix).
-pub fn router(config: &BillingConfig) -> Router<AppState> {
-    // Every option the routes read comes from the service on `AppState`.
-    let _ = config;
+/// The plugin router (paths relative to the prefix). Every option the
+/// routes read comes from the service on `AppState`.
+pub fn router() -> Router<AppState> {
     Router::new()
         .route("/checkout", post(checkout))
         .route("/portal", post(portal))

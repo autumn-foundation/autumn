@@ -413,11 +413,7 @@ pub fn event(
     occurred_at: chrono::DateTime<chrono::Utc>,
     kind: autumn_billing::BillingEventKind,
 ) -> BillingEvent {
-    BillingEvent {
-        id: id.to_owned(),
-        occurred_at,
-        kind,
-    }
+    BillingEvent::new(id, occurred_at, kind)
 }
 
 /// A `checkout_completed` kind. Built through serde because the snapshot is
