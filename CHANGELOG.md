@@ -44,10 +44,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generated Rust for constructs SQLite has no diesel implementation for. Both
   scans matter: SQLite accepts an unknown type name (so `id BIGSERIAL PRIMARY
   KEY` applies cleanly and merely stops auto-incrementing), and applying SQL
-  cannot see a generated crate that would not compile. `counter_cache` was audited and left alone: its
+  cannot see a generated crate that would not compile. `counter_cache` was
+  audited and left alone: its
   `ALTER TABLE ... ADD COLUMN ... BIGINT NOT NULL DEFAULT 0` / `DROP COLUMN` is
   already portable, since SQLite gives `BIGINT` integer affinity and so reads
   back without schema drift.
+- **cli/generate:** the scaffolded `docs/guide/authentication.md` is now
+  **backend-aware** (#1927). `generate auth` made its two sibling guides
+  dialect-aware under #1908 (`session-management.md`, the OAuth guide) but left
+  this one emitting unconditional Postgres SQL: two `ALTER TABLE ... ADD COLUMN
+  IF NOT EXISTS ...` retrofit blocks (lockout columns, email-confirmation
+  columns), their `DROP COLUMN IF EXISTS` rollbacks, and an
+  `email_confirmed_at = NOW()` backfill. SQLite rejects all of those outright —
+  `IF NOT EXISTS` is a syntax error on `ADD COLUMN`, only one column may be
+  added per statement, and there is no `NOW()` — so an operator copy-pasting
+  from the guide got a migration that would not apply. A SQLite app now gets one
+  `ALTER TABLE` per column, `TEXT` timestamps, and `CURRENT_TIMESTAMP`. Postgres
+  output is unchanged.
 
 - **SQLite backup, restore and deploy persistence (#1909):** `autumn db backup` /
   `autumn db restore` now support a `sqlite://` target with no external tools.
