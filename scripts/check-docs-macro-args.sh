@@ -944,11 +944,44 @@ def top_level_keys(args, macro=None):
 # Requiring the bare name would leave every qualified invocation ungated.
 # Rust permits whitespace between an attribute path and its delimiter, so
 # `#[secured (policy = "x")]` is a valid invocation the macro still rejects.
-MACRO_OPEN = re.compile(
-    r"#\[\s*(?:autumn_web::|autumn_macros::|autumn::)?("
+# A comment is a token separator like whitespace, so Rust accepts one anywhere
+# whitespace goes: `#[/* a */ secured /* b */ (policy = "x")]` is a real
+# invocation. The two gaps inside an attribute head — after `#[` and before the
+# delimiter — are therefore walked by `_trivia_end` rather than matched by the
+# regex, because a regex separator means `\s*` and `\s*` does not know what a
+# comment is. Writing one that did would also have to give up nested block
+# comments, which `skip_comment` already handles.
+ATTR_OPEN = re.compile(r"#\[")
+MACRO_NAME = re.compile(
+    r"(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
-    + r")\s*([(\[{])"
+    + r")\b"
 )
+CFG_ATTR_NAME = re.compile(r"cfg_attr\b")
+
+
+def _trivia_end(text, i):
+    """Index past the whitespace and comments starting at `i`."""
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+            continue
+        nxt = skip_comment(text, i)
+        if nxt is None:
+            break
+        i = nxt
+    return i
+
+
+def _delimited_at(text, i, name_re):
+    """Match `name_re` at `i` past trivia, then its delimiter. -> (m, open, body_start)."""
+    m = name_re.match(text, _trivia_end(text, i))
+    if m is None:
+        return None
+    j = _trivia_end(text, m.end())
+    if j >= len(text) or text[j] not in "([{":
+        return None
+    return m, text[j], j + 1
 # `cfg_attr(<pred>, <attr>, …)` applies each `<attr>` when the predicate holds,
 # so a conditionally-applied Autumn macro is a real invocation the compiler
 # will reject on a typo. Its body is scanned recursively rather than matched
@@ -956,12 +989,12 @@ MACRO_OPEN = re.compile(
 # (`all(feature = "a", feature = "b")`), and more than one attribute can
 # follow it (`cfg_attr(feature = "a", inline, secured(…))`), so a `[^,]+`
 # prefix stopped at the predicate's first comma and saw no later payload.
-CFG_ATTR_OPEN = re.compile(r"#\[\s*cfg_attr\s*\(")
-BARE_MACRO_OPEN = re.compile(
-    r"\b(?:autumn_web::|autumn_macros::|autumn::)?("
+BARE_MACRO_NAME = re.compile(
+    r"(?:autumn_web::|autumn_macros::|autumn::)?("
     + "|".join(sorted(OWNERS))
-    + r")\s*([(\[{])"
+    + r")\b"
 )
+BARE_CFG_ATTR_NAME = re.compile(r"cfg_attr\b")
 
 
 def skip_literal(text, i):
@@ -1128,31 +1161,37 @@ def find_macro_calls(text):
         return any(start <= pos < end for start, end in masked)
 
     out = []
-    for pattern in (MACRO_OPEN, CFG_ATTR_OPEN):
-        for match in pattern.finditer(text):
-            if in_literal(match.start()):
-                # Inside a string or comment this is a *value*, not an
-                # invocation: `let shown = r##"#[job(pending = true)]"##;`
-                # never applies the attribute, and reporting it would fail the
-                # gate on a snippet that quotes a spelling on purpose.
-                continue
-            opener = match.group(2) if pattern is MACRO_OPEN else "("
-            end = _close_of(text, match.end(), opener)
+    for attr in ATTR_OPEN.finditer(text):
+        if in_literal(attr.start()):
+            # Inside a string or comment this is a *value*, not an
+            # invocation: `let shown = r##"#[job(pending = true)]"##;`
+            # never applies the attribute, and reporting it would fail the
+            # gate on a snippet that quotes a spelling on purpose.
+            continue
+        found = _delimited_at(text, attr.end(), MACRO_NAME)
+        if found is not None:
+            match, opener, body_start = found
+            end = _close_of(text, body_start, opener)
             if end is None:
                 continue
-            body = text[match.end() : end]
-            if pattern is MACRO_OPEN:
-                out.append((match.group(1), body, match.start()))
-                continue
-            # A `cfg_attr` body applies each of its attributes, so each is a
-            # real invocation — but only the attributes are. Searching the
-            # whole body for macro openers also found them inside an
-            # attribute's *value*: `doc = stringify!(secured(policy = "x"))`
-            # passes `secured(…)` to a macro as tokens and applies nothing, and
-            # reporting it forced a waiver onto valid Rust. The body is now
-            # read as what the grammar says it is — a predicate followed by
-            # attribute meta items.
-            out.extend(_cfg_attr_payloads(body, match.end()))
+            out.append((match.group(1), text[body_start:end], attr.start()))
+            continue
+        found = _delimited_at(text, attr.end(), CFG_ATTR_NAME)
+        if found is None or found[1] != "(":
+            continue
+        _, _, body_start = found
+        end = _close_of(text, body_start, "(")
+        if end is None:
+            continue
+        # A `cfg_attr` body applies each of its attributes, so each is a
+        # real invocation — but only the attributes are. Searching the
+        # whole body for macro openers also found them inside an
+        # attribute's *value*: `doc = stringify!(secured(policy = "x"))`
+        # passes `secured(…)` to a macro as tokens and applies nothing, and
+        # reporting it forced a waiver onto valid Rust. The body is now
+        # read as what the grammar says it is — a predicate followed by
+        # attribute meta items.
+        out.extend(_cfg_attr_payloads(text[body_start:end], body_start))
     return out
 
 
@@ -1164,32 +1203,36 @@ def _cfg_attr_payloads(body, base):
     # applied attribute. Everything after it is one attribute each.
     for start, end in items[1:]:
         item = body[start:end]
-        opener = BARE_MACRO_OPEN.match(item.lstrip())
-        lead = len(item) - len(item.lstrip())
-        if opener is None:
+        # An item may lead with a comment — `cfg_attr(feature = "a",
+        # /* apply auth */ secured(…))`. `_split_top_level` already steps over
+        # comments when balancing commas, but it leaves them in the item, so an
+        # anchored match had to know about them too.
+        found = _delimited_at(item, 0, BARE_MACRO_NAME)
+        if found is None:
             # Either a bare marker attribute (`inline`), or a name-value one
             # (`doc = "…"`). Neither carries an Autumn argument list. A macro
             # name appearing later inside such an item is part of a value.
-            if item.lstrip().startswith("cfg_attr"):
-                nested = re.match(r"\s*cfg_attr\s*\(", item)
-                if nested:
-                    inner_end = _close_of(item, nested.end(), "(")
-                    if inner_end is not None:
-                        out.extend(
-                            _cfg_attr_payloads(
-                                item[nested.end() : inner_end],
-                                base + start + nested.end(),
-                            )
+            nested = _delimited_at(item, 0, BARE_CFG_ATTR_NAME)
+            if nested is not None and nested[1] == "(":
+                inner_start = nested[2]
+                inner_end = _close_of(item, inner_start, "(")
+                if inner_end is not None:
+                    out.extend(
+                        _cfg_attr_payloads(
+                            item[inner_start:inner_end],
+                            base + start + inner_start,
                         )
+                    )
             continue
-        inner_end = _close_of(item, lead + opener.end(), opener.group(2))
+        match, opener, inner_start = found
+        inner_end = _close_of(item, inner_start, opener)
         if inner_end is None:
             continue
         out.append(
             (
-                opener.group(1),
-                item[lead + opener.end() : inner_end],
-                base + start + lead + opener.start(),
+                match.group(1),
+                item[inner_start:inner_end],
+                base + start + match.start(),
             )
         )
     return out
@@ -2098,6 +2141,41 @@ def self_test():
             ".md",
         ),
         [("secured", "policy")],
+    )
+    # A comment is a token separator like whitespace, so it can sit in either
+    # gap of an attribute head, and in front of a `cfg_attr` payload.
+    check(
+        "markdown: a block comment before the delimiter",
+        scan_text('```rust\n#[secured /* why */ (policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a block comment before the macro name",
+        scan_text('```rust\n#[/* why */ secured(policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a line comment before the delimiter",
+        scan_text('```rust\n#[secured // why\n    (policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a nested block comment before the delimiter",
+        scan_text('```rust\n#[secured /* a /* b */ c */ (policy = "x")]\n```\n', ".md"),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a comment before a cfg_attr payload",
+        scan_text(
+            '```rust\n#[cfg_attr(feature = "a", /* apply */ secured(policy = "x"))]\n```\n',
+            ".md",
+        ),
+        [("secured", "policy")],
+    )
+    check(
+        "markdown: a comment does not invent an invocation",
+        scan_text('```rust\n#[derive(Debug)] /* secured(policy = "x") */\n```\n', ".md"),
+        [],
     )
     # The name left of an `=` is a key whatever its case, and no macro has an
     # upper-case one.
